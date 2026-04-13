@@ -50,6 +50,76 @@ sign_message() {
   rm -f "$tmpfile"
 }
 
+PAIR_PORT=7547
+
+cmd_listen() {
+  # One-shot TCP listener for key exchange during pairing
+  # Joiner connects, sends its SSH pubkey + signing pubkey as JSON
+  # We reply with ours, then both sides authorize each other
+  local my_ssh_pub my_sign_pub
+  my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
+  my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
+  local my_name
+  my_name=$(get_name)
+  local my_host
+  my_host="$(whoami)@$(get_host)"
+
+  # Use python3 for a simple one-shot TCP server
+  python3 -c "
+import socket, json, sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('0.0.0.0', $PAIR_PORT))
+sock.listen(1)
+conn, addr = sock.accept()
+data = b''
+while True:
+    chunk = conn.recv(4096)
+    if not chunk: break
+    data += chunk
+    if b'\n' in data: break
+
+# Parse joiner's info
+joiner = json.loads(data.decode().strip())
+
+# Send our info back
+response = json.dumps({
+    'name': '$my_name',
+    'host': '$my_host',
+    'ssh_pub': '''$my_ssh_pub''',
+    'sign_pub': '''$my_sign_pub'''
+})
+conn.sendall((response + '\n').encode())
+conn.close()
+sock.close()
+
+# Authorize joiner's SSH key
+import os
+ssh_dir = os.path.expanduser('~/.ssh')
+os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+ak = os.path.join(ssh_dir, 'authorized_keys')
+ssh_key = joiner.get('ssh_pub', '')
+if ssh_key:
+    existing = open(ak).read() if os.path.exists(ak) else ''
+    if ssh_key not in existing:
+        with open(ak, 'a') as f:
+            f.write(ssh_key + '\n')
+        os.chmod(ak, 0o600)
+
+# Save joiner as peer
+peers_dir = os.path.expanduser('$PEERS_DIR')
+os.makedirs(peers_dir, exist_ok=True)
+jname = joiner['name']
+with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
+    f.write(joiner.get('sign_pub', ''))
+with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
+    json.dump({'name': jname, 'host': joiner['host'], 'paired': '$(timestamp)'}, f, indent=2)
+
+print(f'  Paired with {jname} ({joiner[\"host\"]})')
+" || die "Listener failed"
+}
+
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   if [ -f "$ssh_key" ]; then
@@ -178,6 +248,11 @@ PEER
     echo "  On the other machine, run:"
     echo ""
     echo "    relay join ${name}@${user}@${host}"
+    echo ""
+    echo "  Waiting for peer to join (listening on port 7547)..."
+    # Start key-exchange listener — joiner sends its SSH pubkey, we reply with ours
+    # This bootstraps SSH access without requiring pre-existing auth
+    cmd_listen
   fi
   echo ""
 }
@@ -186,18 +261,17 @@ cmd_join() {
   local target="${1:-}"
   [ -z "$target" ] && die "Usage: relay join <name@user@host>"
 
-  # Parse name@user@host
   local peer_name ssh_target
   peer_name="${target%%@*}"
   ssh_target="${target#*@}"
+  local peer_host_only="${ssh_target##*@}"
 
   [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host"
 
   # Initialize ourselves if not already done
   if [ ! -f "$CONFIG" ]; then
     local my_name
-    read -rp "Your name: " my_name
-    [ -z "$my_name" ] && die "Name required"
+    my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
     cmd_start "$my_name"
   fi
 
@@ -216,52 +290,66 @@ cmd_join() {
     }
   fi
 
-  echo "Connecting to $ssh_target..."
+  echo "Connecting to $peer_host_only:$PAIR_PORT for key exchange..."
 
-  # Push our SSH public key to the peer's authorized_keys so future connections work both ways
-  relay_ssh "$ssh_target" "
-    mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    KEY='$(cat "${ssh_key}.pub")'
-    grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
-    chmod 600 ~/.ssh/authorized_keys
-  " 2>/dev/null || die "Can't reach $ssh_target. Check SSH access."
+  # TCP key exchange — no SSH auth needed
+  # Send our info, receive host's info
+  local my_name my_host my_ssh_pub my_sign_pub
+  my_name=$(get_name)
+  my_host="$(whoami)@$(get_host)"
+  my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
+  my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
 
-  # Fetch peer's public signing key
-  local remote_pubkey
-  remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) \
-    || die "Peer not initialized. Run 'relay start <name>' on $ssh_target first."
+  local response
+  response=$(python3 -c "
+import socket, json, sys
 
-  # Fetch peer's SSH public key and authorize it locally
-  local remote_ssh_pubkey
-  remote_ssh_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/ssh_key.pub" 2>/dev/null)
-  if [ -n "$remote_ssh_pubkey" ]; then
-    grep -qF "$remote_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
-      echo "$remote_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+payload = json.dumps({
+    'name': '$my_name',
+    'host': '$my_host',
+    'ssh_pub': '''$my_ssh_pub''',
+    'sign_pub': '''$my_sign_pub'''
+})
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(30)
+try:
+    sock.connect(('$peer_host_only', $PAIR_PORT))
+    sock.sendall((payload + '\n').encode())
+    sock.shutdown(socket.SHUT_WR)
+    data = b''
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk: break
+        data += chunk
+    sock.close()
+    host_info = json.loads(data.decode().strip())
+    print(json.dumps(host_info))
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || die "Can't reach $peer_host_only:$PAIR_PORT. Is 'relay start' running on the host?"
+
+  # Parse host's response
+  local host_ssh_pub host_sign_pub
+  host_ssh_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null)
+  host_sign_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sign_pub',''))" 2>/dev/null)
+
+  # Authorize host's SSH key locally (so host can send us messages via SSH)
+  if [ -n "$host_ssh_pub" ]; then
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+      echo "$host_ssh_pub" >> "$HOME/.ssh/authorized_keys"
+      chmod 600 "$HOME/.ssh/authorized_keys"
     }
   fi
 
   # Save peer
-  echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
+  echo "$host_sign_pub" > "$PEERS_DIR/${peer_name}.pub"
   cat > "$PEERS_DIR/${peer_name}.json" << EOF
 {
   "name": "$peer_name",
   "host": "$ssh_target",
-  "paired": "$(timestamp)"
-}
-EOF
-
-  # Push our signing key + peer info to remote
-  local my_name
-  my_name=$(get_name)
-  relay_ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
-  cat "$IDENTITY_DIR/public.pem" | relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
-
-  local my_host
-  my_host="$(whoami)@$(get_host)"
-  relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
-{
-  "name": "$my_name",
-  "host": "$my_host",
   "paired": "$(timestamp)"
 }
 EOF
