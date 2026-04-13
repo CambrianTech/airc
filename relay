@@ -109,16 +109,19 @@ monitor() {
       done
     fi
 
-    # Reminder nudge if no activity
+    # Reminder: nudge once if no SEND for interval, don't repeat until next send
     local reminder_file="$RELAY_HOME/reminder"
-    if [ -f "$reminder_file" ]; then
+    local reminded_file="$RELAY_HOME/reminded"
+    if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
       local interval; interval=$(cat "$reminder_file" 2>/dev/null)
       if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
         local now; now=$(date +%s)
-        local silent=$(( now - last_activity ))
-        if [ "$silent" -ge "$interval" ]; then
-          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: no messages for ${silent}s. 'relay reminder off' to disable.\"}"
-          last_activity=$now
+        local last_sent=0
+        [ -f "$RELAY_HOME/last_sent" ] && last_sent=$(cat "$RELAY_HOME/last_sent" 2>/dev/null)
+        local silent=$(( now - last_sent ))
+        if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
+          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'relay reminder off' to disable.\"}"
+          touch "$reminded_file"  # Don't fire again until next send
         fi
       fi
     fi
@@ -369,6 +372,10 @@ cmd_send() {
   else
     echo "$full_msg" >> "$MESSAGES"
   fi
+
+  # Reset reminder — you sent something, clock restarts
+  date +%s > "$RELAY_HOME/last_sent" 2>/dev/null
+  rm -f "$RELAY_HOME/reminded" 2>/dev/null
 }
 
 cmd_send_file() {
