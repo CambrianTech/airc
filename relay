@@ -267,6 +267,17 @@ print(data.decode().strip())
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
     fi
 
+    # Record the host as a peer so `relay peers` shows it (host-side writes
+    # the joiner symmetrically; joiner-side was missing this).
+    mkdir -p "$PEERS_DIR"
+    cat > "$PEERS_DIR/$peer_name.json" << EOF
+{
+  "name": "$peer_name",
+  "host": "$ssh_target",
+  "paired": "$(timestamp)"
+}
+EOF
+
     echo "  Monitoring for messages..."
     monitor
 
@@ -382,10 +393,12 @@ cmd_send() {
   host_target=$(get_config_val host_target "")
 
   if [ -n "$host_target" ]; then
-    relay_ssh "$host_target" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+    # Pipe via stdin so message content cannot break shell quoting
+    # (apostrophes in user messages previously broke the single-quoted echo).
+    printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
       || die "Failed to deliver to host ($host_target)"
   else
-    echo "$full_msg" >> "$MESSAGES"
+    printf '%s\n' "$full_msg" >> "$MESSAGES"
   fi
 
   # Reset reminder — you sent something, clock restarts
@@ -427,7 +440,9 @@ cmd_peers() {
     host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null)
     echo "  $name → $host"
   done
-  [ "$found" = false ] && echo "  No peers yet."
+  if [ "$found" = false ]; then
+    echo "  No peers yet."
+  fi
 }
 
 cmd_logs() {
