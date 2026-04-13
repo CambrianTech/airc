@@ -50,6 +50,28 @@ sign_message() {
   rm -f "$tmpfile"
 }
 
+ensure_sshd() {
+  # Make sure this machine can receive SSH connections
+  if [ "$(uname)" = "Darwin" ]; then
+    # macOS: check if Remote Login is on
+    if ! sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
+      echo "  Enabling Remote Login (SSH)..."
+      sudo -n systemsetup -setremotelogin on 2>/dev/null \
+        || launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null \
+        || true
+    fi
+  else
+    # Linux: start sshd if not running
+    if ! pgrep -x sshd >/dev/null 2>&1; then
+      echo "  Starting sshd..."
+      sudo -n systemctl start sshd 2>/dev/null \
+        || sudo -n service ssh start 2>/dev/null \
+        || /usr/sbin/sshd 2>/dev/null \
+        || true
+    fi
+  fi
+}
+
 PAIR_PORT=7547
 
 cmd_listen() {
@@ -168,6 +190,9 @@ cmd_start() {
 
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
 
+  # Ensure SSH daemon is running so peers can deliver messages
+  ensure_sshd
+
   # Generate Ed25519 signing keypair if needed
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
     openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
@@ -278,6 +303,7 @@ cmd_join() {
   fi
 
   ensure_init
+  ensure_sshd
   mkdir -p "$PEERS_DIR"
 
   # Ensure we have an SSH key
