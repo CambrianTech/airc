@@ -50,18 +50,35 @@ sign_message() {
 }
 
 ensure_sshd() {
+  # Check if port 22 is accepting connections locally
+  if nc -z localhost 22 2>/dev/null; then
+    return 0
+  fi
+
+  echo "  SSH (Remote Login) is not running."
   if [ "$(uname)" = "Darwin" ]; then
-    if ! sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
-      sudo -n systemsetup -setremotelogin on 2>/dev/null \
-        || launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null \
-        || true
+    if sudo -n systemsetup -setremotelogin on 2>/dev/null; then
+      echo "  Enabled Remote Login."
+    else
+      echo "  Opening System Settings — please enable Remote Login..."
+      open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null \
+        || open "x-apple.systempreferences:com.apple.preference.sharing" 2>/dev/null \
+        || echo "  → Open System Settings > General > Sharing > Remote Login"
+      # Wait for user to enable it
+      local attempts=0
+      while ! nc -z localhost 22 2>/dev/null; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -ge 30 ] && echo "  Timed out waiting for Remote Login." && return 1
+        sleep 2
+      done
+      echo "  Remote Login enabled!"
     fi
   else
-    if ! pgrep -x sshd >/dev/null 2>&1; then
-      sudo -n systemctl start sshd 2>/dev/null \
-        || sudo -n service ssh start 2>/dev/null \
-        || /usr/sbin/sshd 2>/dev/null \
-        || true
+    if sudo -n systemctl start sshd 2>/dev/null || sudo -n service ssh start 2>/dev/null; then
+      echo "  Started sshd."
+    else
+      echo "  Run: sudo systemctl start sshd"
+      return 1
     fi
   fi
 }
@@ -329,7 +346,22 @@ EOF
       echo "  Paired with '$peer_name' (bidirectional)"
     else
       echo "  Paired with '$peer_name' (one-way: you→host works, host→you FAILED)"
-      echo "  Check that sshd is running and port 22 is open on this machine."
+      echo ""
+      echo "  Remote Login (SSH) needs to be enabled on THIS machine."
+      if [ "$(uname)" = "Darwin" ]; then
+        echo "  Trying to enable it..."
+        if sudo -n systemsetup -setremotelogin on 2>/dev/null; then
+          echo "  Enabled! Retry: relay join $1"
+        else
+          echo "  Need manual step — opening System Settings..."
+          open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null \
+            || open "x-apple.systempreferences:com.apple.preference.sharing" 2>/dev/null \
+            || true
+          echo "  → Turn on 'Remote Login' then retry: relay join $1"
+        fi
+      else
+        echo "  Run: sudo systemctl start sshd"
+      fi
     fi
     echo ""
     echo "  Send a message:  relay send $peer_name 'hello'"
