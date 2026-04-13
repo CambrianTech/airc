@@ -84,9 +84,25 @@ init_identity() {
 }
 
 monitor() {
-  local my_name host_target last=0
+  local my_name host_target last
   my_name=$(get_name)
   host_target=$(get_config_val host_target "")
+  local offset_file="$RELAY_HOME/monitor_offset"
+
+  # Resume from last-seen offset so monitor doesn't replay history
+  # every time it (re)starts. On first-ever run, skip to end-of-file
+  # (historical messages are available via `relay logs`).
+  if [ -f "$offset_file" ]; then
+    last=$(cat "$offset_file" 2>/dev/null || echo 0)
+  else
+    if [ -n "$host_target" ]; then
+      last=$(relay_ssh "$host_target" "wc -l < ~/.agent-relay/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d ' ' || echo 0)
+    else
+      last=$(wc -l < "$MESSAGES" 2>/dev/null | tr -d ' ' || echo 0)
+    fi
+    echo "$last" > "$offset_file"
+  fi
+  [ -z "$last" ] && last=0
   local last_activity; last_activity=$(date +%s)
 
   while true; do
@@ -99,6 +115,7 @@ monitor() {
     if [ -n "$lines" ]; then
       local count; count=$(echo "$lines" | wc -l)
       last=$((last + count))
+      echo "$last" > "$offset_file"
       last_activity=$(date +%s)
       echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
