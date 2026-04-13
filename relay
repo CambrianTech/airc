@@ -215,8 +215,18 @@ SIGNKEY
       echo 'OK'
     " 2>/dev/null | grep -q 'OK'; then
       echo "  Connected to '$peer_name'"
+      echo "  Monitoring for messages..."
+      monitor
     else
-      die "Can't reach $ssh_target:$peer_port. Is the host running 'relay connect'?"
+      echo ""
+      echo "  FAILED to connect to $ssh_target:$peer_port"
+      echo ""
+      echo "  Diagnostics:"
+      echo "    Host reachable: $(nc -z "$peer_host_only" "$peer_port" 2>/dev/null && echo 'yes' || echo 'NO — host may not be running relay connect')"
+      echo "    SSH handshake:  $(relay_ssh -p "$peer_port" -o ConnectTimeout=3 "$ssh_target" 'echo ok' 2>&1 | tail -1)"
+      echo ""
+      echo "  Check that the host has run 'relay connect' and SSH is working there."
+      exit 1
     fi
 
   else
@@ -225,9 +235,9 @@ SIGNKEY
     [ -z "$name" ] && name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
 
     init_identity "$name"
-    ensure_sshd || die "SSH is not working. See instructions above."
 
-    cat > "$CONFIG" << EOF
+    if ensure_sshd; then
+      cat > "$CONFIG" << EOF
 {
   "name": "$name",
   "host": "$(get_host)",
@@ -235,22 +245,24 @@ SIGNKEY
 }
 EOF
 
-    local ssh_pubkey_b64
-    ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
-    local host; host=$(get_host)
-    local user; user=$(whoami)
+      local ssh_pubkey_b64
+      ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
+      local host; host=$(get_host)
+      local user; user=$(whoami)
 
-    echo ""
-    echo "  Hosting as '$name'"
-    echo ""
-    echo "  On the other machine:"
-    echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
-    echo ""
+      echo ""
+      echo "  Hosting as '$name'"
+      echo ""
+      echo "  On the other machine:"
+      echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
+      echo ""
+      echo "  Monitoring for messages..."
+      monitor
+    else
+      # ensure_sshd already printed diagnostics and fix instructions
+      exit 1
+    fi
   fi
-
-  # Both modes: start monitoring
-  echo "  Monitoring for messages..."
-  monitor
 }
 
 cmd_send() {
