@@ -1,0 +1,253 @@
+#!/bin/bash
+# Claude Relay — secure peer-to-peer messaging between Claude Code instances.
+# Two commands to connect: `relay start <name>` on one machine, `relay join <name@host>` on the other.
+
+set -euo pipefail
+
+RELAY_HOME="${CLAUDE_RELAY_HOME:-$HOME/.claude-relay}"
+CONFIG="$RELAY_HOME/config.json"
+IDENTITY_DIR="$RELAY_HOME/identity"
+PEERS_DIR="$RELAY_HOME/peers"
+MESSAGES="$RELAY_HOME/messages.jsonl"
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+ensure_init() {
+  [ -f "$CONFIG" ] || die "Not initialized. Run: relay start <name>"
+  [ -f "$IDENTITY_DIR/private.pem" ] || die "No keypair. Run: relay start <name>"
+}
+
+get_name() {
+  python3 -c "import json; print(json.load(open('$CONFIG'))['name'])" 2>/dev/null || echo "unknown"
+}
+
+get_host() {
+  # Prefer Tailscale hostname (globally reachable), fall back to local hostname
+  if command -v tailscale >/dev/null 2>&1; then
+    local ts_name
+    ts_name=$(tailscale status --self --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null || true)
+    [ -n "$ts_name" ] && echo "$ts_name" && return
+  fi
+  hostname
+}
+
+timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+sign_message() {
+  printf '%s' "$1" | openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" 2>/dev/null | base64
+}
+
+# ── Commands ────────────────────────────────────────────────────────────
+
+cmd_start() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "Usage: relay start <your-name>"
+
+  mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
+
+  # Generate Ed25519 keypair if needed
+  if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
+    openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
+    openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
+    chmod 600 "$IDENTITY_DIR/private.pem"
+  fi
+
+  # Write config
+  cat > "$CONFIG" << EOF
+{
+  "name": "$name",
+  "host": "$(get_host)",
+  "created": "$(timestamp)"
+}
+EOF
+
+  touch "$MESSAGES"
+
+  local host
+  host=$(get_host)
+  local user
+  user=$(whoami)
+
+  echo ""
+  echo "  Relay initialized as '$name'"
+  echo ""
+  echo "  On the other machine, run:"
+  echo ""
+  echo "    relay join ${name}@${user}@${host}"
+  echo ""
+}
+
+cmd_join() {
+  local target="${1:-}"
+  [ -z "$target" ] && die "Usage: relay join <name@user@host>"
+
+  # Parse name@user@host
+  local peer_name ssh_target
+  peer_name="${target%%@*}"
+  ssh_target="${target#*@}"
+
+  [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host"
+
+  # Initialize ourselves if not already done
+  if [ ! -f "$CONFIG" ]; then
+    local my_name
+    read -rp "Your name: " my_name
+    [ -z "$my_name" ] && die "Name required"
+    cmd_start "$my_name"
+  fi
+
+  ensure_init
+  mkdir -p "$PEERS_DIR"
+
+  echo "Connecting to $ssh_target..."
+
+  # Fetch peer's public key
+  local remote_pubkey
+  remote_pubkey=$(ssh "$ssh_target" "cat ~/.claude-relay/identity/public.pem" 2>/dev/null) \
+    || die "Can't reach $ssh_target. Check SSH access."
+
+  # Save peer
+  echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
+  cat > "$PEERS_DIR/${peer_name}.json" << EOF
+{
+  "name": "$peer_name",
+  "host": "$ssh_target",
+  "paired": "$(timestamp)"
+}
+EOF
+
+  # Push our key to peer
+  local my_name
+  my_name=$(get_name)
+  ssh "$ssh_target" "mkdir -p ~/.claude-relay/peers" 2>/dev/null
+  cat "$IDENTITY_DIR/public.pem" | ssh "$ssh_target" "cat > ~/.claude-relay/peers/${my_name}.pub" 2>/dev/null
+
+  local my_host
+  my_host="$(whoami)@$(get_host)"
+  ssh "$ssh_target" "cat > ~/.claude-relay/peers/${my_name}.json" << EOF
+{
+  "name": "$my_name",
+  "host": "$my_host",
+  "paired": "$(timestamp)"
+}
+EOF
+
+  echo ""
+  echo "  Paired with '$peer_name'"
+  echo ""
+  echo "  Send a message:  relay send $peer_name 'hello'"
+  echo "  Start monitor:   relay monitor"
+  echo ""
+}
+
+cmd_send() {
+  local peer_name="${1:-}"
+  shift 2>/dev/null || true
+  local msg="$*"
+  [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: relay send <peer> <message>"
+  ensure_init
+
+  local peer_file="$PEERS_DIR/${peer_name}.json"
+  [ -f "$peer_file" ] || die "Unknown peer: $peer_name. Run: relay peers"
+
+  local peer_host my_name ts
+  peer_host=$(python3 -c "import json; print(json.load(open('$peer_file'))['host'])" 2>/dev/null)
+  my_name=$(get_name)
+  ts=$(timestamp)
+
+  # Escape message for JSON
+  local escaped_msg
+  escaped_msg=$(printf '%s' "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+
+  # Build + sign
+  local payload="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\"}"
+  local sig
+  sig=$(sign_message "$payload")
+  local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+
+  # Deliver via SSH
+  ssh "$peer_host" "echo '$full_msg' >> ~/.claude-relay/messages.jsonl" 2>/dev/null \
+    || die "Failed to deliver to $peer_host"
+
+  # Log locally
+  echo "$full_msg" >> "$MESSAGES"
+}
+
+cmd_monitor() {
+  ensure_init
+  local filter="${1:-}"
+
+  local last
+  last=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
+  while true; do
+    local now
+    now=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
+    if [ "$now" -gt "$last" ] 2>/dev/null; then
+      if [ -n "$filter" ]; then
+        sed -n "$(($last+1)),${now}p" "$MESSAGES" | grep --line-buffered "$filter" || true
+      else
+        sed -n "$(($last+1)),${now}p" "$MESSAGES"
+      fi
+      last=$now
+    fi
+    sleep 5
+  done
+}
+
+cmd_peers() {
+  ensure_init
+  local found=false
+  for f in "$PEERS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    found=true
+    local name host
+    name=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null)
+    host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null)
+    echo "  $name → $host"
+  done
+  [ "$found" = false ] && echo "  No peers. Run: relay join <name@user@host>"
+}
+
+cmd_pubkey() {
+  ensure_init
+  cat "$IDENTITY_DIR/public.pem"
+}
+
+cmd_logs() {
+  ensure_init
+  local count="${1:-20}"
+  tail -"$count" "$MESSAGES" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        m = json.loads(line.strip())
+        print(f\"[{m.get('ts','')}] {m.get('from','?')}: {m.get('msg','')}\")
+    except: pass
+"
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  start)   shift; cmd_start "$@" ;;
+  join)    shift; cmd_join "$@" ;;
+  send)    shift; cmd_send "$@" ;;
+  monitor) shift; cmd_monitor "$@" ;;
+  peers)   cmd_peers ;;
+  pubkey)  cmd_pubkey ;;
+  logs)    shift; cmd_logs "$@" ;;
+  help|--help|-h)
+    echo "Claude Relay — secure messaging between Claude Code instances"
+    echo ""
+    echo "  relay start <name>             Initialize and show join command"
+    echo "  relay join <name@user@host>    Pair with the other machine"
+    echo "  relay send <peer> <message>    Send a signed message"
+    echo "  relay monitor [filter]         Stream incoming (for Claude Code)"
+    echo "  relay peers                    List paired machines"
+    echo "  relay logs [count]             Show recent messages"
+    echo "  relay pubkey                   Print your public key"
+    ;;
+  *) die "Unknown command: $1" ;;
+esac
