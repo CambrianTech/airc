@@ -306,12 +306,23 @@ cmd_send() {
   sig=$(sign_message "$payload")
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
-  # Deliver via SSH
-  relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
-    || die "Failed to deliver to $peer_host"
+  # Detect if peer is local (same machine — messages.jsonl is shared/symlinked)
+  local peer_hostname my_hostname is_local=false
+  peer_hostname="${peer_host##*@}"
+  my_hostname=$(hostname)
+  [ "$peer_hostname" = "$my_hostname" ] && is_local=true
+  [ "$peer_hostname" = "localhost" ] && is_local=true
+  [ "$peer_hostname" = "$(get_host)" ] && is_local=true
 
-  # Log locally
-  echo "$full_msg" >> "$MESSAGES"
+  if [ "$is_local" = true ]; then
+    # Local peer — shared messages file, write once only
+    echo "$full_msg" >> "$MESSAGES"
+  else
+    # Remote peer — deliver via SSH, then log locally
+    relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+      || die "Failed to deliver to $peer_host"
+    echo "$full_msg" >> "$MESSAGES"
+  fi
 }
 
 cmd_send_file() {
@@ -345,8 +356,20 @@ cmd_send_file() {
   sig=$(sign_message "$payload")
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"},\"sig\":\"$sig\"}"
 
-  relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null
-  echo "$full_msg" >> "$MESSAGES"
+  # Detect if peer is local (same machine — messages.jsonl is shared/symlinked)
+  local peer_hostname my_hostname is_local=false
+  peer_hostname="${peer_host##*@}"
+  my_hostname=$(hostname)
+  [ "$peer_hostname" = "$my_hostname" ] && is_local=true
+  [ "$peer_hostname" = "localhost" ] && is_local=true
+  [ "$peer_hostname" = "$(get_host)" ] && is_local=true
+
+  if [ "$is_local" = true ]; then
+    echo "$full_msg" >> "$MESSAGES"
+  else
+    relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null
+    echo "$full_msg" >> "$MESSAGES"
+  fi
 
   echo "Sent $filename ($filesize bytes) to $peer_name"
 }
