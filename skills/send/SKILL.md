@@ -2,7 +2,7 @@
 name: relay:send
 description: Send a message to a paired machine via Agent Relay.
 user-invocable: true
-allowed-tools: Bash
+allowed-tools: Bash, Monitor
 argument-hint: "<peer> <message>"
 ---
 
@@ -19,6 +19,11 @@ Parse the first word of `$ARGUMENTS` as the peer name, the rest as the message:
 
 ```bash
 relay send $ARGUMENTS
+```
+
+After sending, start the monitor if it isn't already running so you can receive replies:
+```
+Monitor(persistent=true, command="relay monitor")
 ```
 
 If no arguments provided, ask the user who to message and what to say.
