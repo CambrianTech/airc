@@ -309,6 +309,16 @@ EOF
 }
 EOF
 
+    # Verify reverse direction: host SSHes back to us
+    echo "  Verifying reverse connectivity..."
+    if relay_ssh "$ssh_target" "ssh -i ~/.agent-relay/identity/ssh_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ${my_host} 'echo ok'" 2>/dev/null; then
+      echo "  Bidirectional SSH verified"
+    else
+      echo "  WARNING: Host cannot reach you via SSH."
+      echo "  Host can receive your messages but cannot send to you."
+      echo "  Check that sshd is running and port 22 is accessible on this machine."
+    fi
+
     echo ""
     echo "  Paired with '$peer_name'"
     echo ""
