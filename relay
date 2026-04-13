@@ -117,6 +117,13 @@ cmd_connect() {
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
+    # Parse name@user@host#pubkey
+    local host_ssh_pubkey_b64=""
+    if echo "$target" | grep -q '#'; then
+      host_ssh_pubkey_b64="${target##*#}"
+      target="${target%%#*}"
+    fi
+
     local peer_name ssh_target
     peer_name="${target%%@*}"
     ssh_target="${target#*@}"
@@ -137,6 +144,20 @@ cmd_connect() {
 EOF
 
     # Exchange keys with host via TCP (port 7547) — public keys only
+    # Pre-authorize host's pubkey if in join string
+    if [ -n "$host_ssh_pubkey_b64" ]; then
+      local host_ssh_pubkey
+      host_ssh_pubkey=$(echo "$host_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$host_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
+      if [ -n "$host_ssh_pubkey" ]; then
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        grep -qF "$host_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+          echo "$host_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+        }
+      fi
+    fi
+
+    # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
     echo "  Connecting to $peer_host_only:7547..."
     local my_ssh_pub my_sign_pub
@@ -204,12 +225,13 @@ EOF
 
     local host; host=$(get_host)
     local user; user=$(whoami)
+    local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
 
     echo ""
     echo "  Hosting as '$name'"
     echo ""
     echo "  On the other machine:"
-    echo "    relay connect ${name}@${user}@${host}"
+    echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
     echo ""
     echo "  Waiting for peers on port 7547..."
     # Background: accept peer registrations via TCP (public keys only)
