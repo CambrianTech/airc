@@ -61,77 +61,39 @@ sign_message() {
 }
 
 ensure_sshd() {
-  # Check if port 22 is accepting connections AND sshd is actually working
-  if nc -z localhost 22 2>/dev/null; then
-    # Port open — but is sshd actually responding? (macOS ghost listener bug)
-    if relay_ssh -o ConnectTimeout=3 localhost "echo ok" 2>/dev/null; then
-      return 0
-    fi
-    # Port open but handshake fails — ghost sshd. Restart it.
-    echo "  SSH port 22 is open but not responding (ghost listener)."
-    echo "  Restarting SSH daemon..."
-    if [ "$(uname)" = "Darwin" ]; then
-      # Try every known way to restart macOS sshd
-      sudo -n launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
-        || { sudo -n launchctl bootout system/com.openssh.sshd 2>/dev/null; \
-             sudo -n launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-        || { sudo -n launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; \
-             sudo -n launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-        || sudo -n /usr/sbin/sshd 2>/dev/null \
-        || true
-      sleep 1
-      if relay_ssh -o ConnectTimeout=3 localhost "echo ok" 2>/dev/null; then
-        echo "  SSH daemon restarted."
-        return 0
-      fi
-      echo "  Auto-restart failed."
-      echo "  Remote Login may be on but sshd is not responding (ghost listener)."
-      echo "  Run: curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash"
-      echo "  (The installer has sudo access to fix sshd.)"
-      local attempts=0
-      while ! relay_ssh -o ConnectTimeout=2 localhost "echo ok" 2>/dev/null; do
-        attempts=$((attempts + 1))
-        [ "$attempts" -ge 30 ] && echo "  Timed out waiting for SSH." && return 1
-        sleep 2
-      done
-      echo "  SSH is working!"
-      return 0
-    else
-      sudo -n systemctl restart sshd 2>/dev/null \
-        || sudo -n service ssh restart 2>/dev/null \
-        || { sudo -n /usr/sbin/sshd -t 2>/dev/null && sudo -n /usr/sbin/sshd 2>/dev/null; } \
-        || true
-      sleep 1
-      relay_ssh -o ConnectTimeout=3 localhost "echo ok" 2>/dev/null && return 0
-    fi
+  # Check if sshd is responding
+  if relay_ssh -o ConnectTimeout=3 localhost "echo ok" 2>/dev/null; then
+    return 0
   fi
 
-  echo "  SSH (Remote Login) is not running."
-  if [ "$(uname)" = "Darwin" ]; then
-    if sudo -n systemsetup -setremotelogin on 2>/dev/null; then
-      echo "  Enabled Remote Login."
-    else
-      echo "  Opening System Settings — please enable Remote Login..."
-      open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null \
-        || open "x-apple.systempreferences:com.apple.preference.sharing" 2>/dev/null \
-        || echo "  → Open System Settings > General > Sharing > Remote Login"
-      # Wait for user to enable it
-      local attempts=0
-      while ! nc -z localhost 22 2>/dev/null; do
-        attempts=$((attempts + 1))
-        [ "$attempts" -ge 30 ] && echo "  Timed out waiting for Remote Login." && return 1
-        sleep 2
-      done
-      echo "  Remote Login enabled!"
-    fi
-  else
-    if sudo -n systemctl start sshd 2>/dev/null || sudo -n service ssh start 2>/dev/null; then
-      echo "  Started sshd."
-    else
-      echo "  Run: sudo systemctl start sshd"
-      return 1
-    fi
+  # Try passwordless sudo (might work on some setups)
+  sudo -n launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
+    || sudo -n /usr/sbin/sshd 2>/dev/null \
+    || sudo -n systemctl start sshd 2>/dev/null \
+    || true
+  sleep 1
+
+  # Check again
+  if relay_ssh -o ConnectTimeout=3 localhost "echo ok" 2>/dev/null; then
+    echo "  SSH started."
+    return 0
   fi
+
+  # Can't fix without sudo — give clear instructions
+  echo ""
+  echo "  SSH is not working (required for hosting)."
+  echo ""
+  if [ "$(uname)" = "Darwin" ]; then
+    echo "  Fix with ONE of:"
+    echo "    sudo launchctl kickstart -k system/com.openssh.sshd"
+    echo "    sudo /usr/sbin/sshd"
+    echo "  Or: System Settings > General > Sharing > Remote Login (toggle OFF then ON if already on)"
+  else
+    echo "  Fix with: sudo systemctl start sshd"
+  fi
+  echo ""
+  echo "  Then retry: relay connect"
+  return 1
 }
 
 relay_ssh() {
