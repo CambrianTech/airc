@@ -200,10 +200,9 @@ EOF
       fi
     fi
 
-    # Register with host
+    # Register with host via SSH
     echo "  Connecting to $ssh_target:$peer_port..."
-    local ssh_output
-    ssh_output=$(relay_ssh -p "$peer_port" "$ssh_target" "
+    local register_cmd="
       mkdir -p ~/.ssh && chmod 700 ~/.ssh
       KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
       grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
@@ -214,7 +213,21 @@ EOF
 $(cat "$IDENTITY_DIR/public.pem")
 SIGNKEY
       echo 'OK'
-    " 2>&1)
+    "
+
+    # Try relay key + defaults, then tailscale ssh
+    local ssh_output=""
+    ssh_output=$(relay_ssh -p "$peer_port" "$ssh_target" "$register_cmd" 2>&1) || true
+    if ! echo "$ssh_output" | grep -q 'OK'; then
+      # Try tailscale ssh (auth via tailscale identity, no keys needed)
+      local ts_bin=""
+      command -v tailscale >/dev/null 2>&1 && ts_bin="tailscale"
+      [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ] && ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+      if [ -n "$ts_bin" ]; then
+        local ts_host="${ssh_target##*@}"
+        ssh_output=$($ts_bin ssh "$ssh_target" "$register_cmd" 2>&1) || true
+      fi
+    fi
 
     if echo "$ssh_output" | grep -q 'OK'; then
       echo "  Connected to '$peer_name'"
@@ -222,11 +235,14 @@ SIGNKEY
       monitor
     else
       echo ""
-      echo "  FAILED to connect to $ssh_target:$peer_port"
+      echo "  Can't SSH to $ssh_target:$peer_port"
       echo ""
-      echo "  SSH output: $ssh_output"
+      echo "  $ssh_output"
       echo ""
-      echo "  Check that the host has run 'relay connect' and SSH is working there."
+      echo "  To fix, have the host authorize your key:"
+      echo "    echo '$(cat "$IDENTITY_DIR/ssh_key.pub")' >> ~/.ssh/authorized_keys"
+      echo ""
+      echo "  Or enable Tailscale SSH on both machines."
       exit 1
     fi
 
