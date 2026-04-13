@@ -635,7 +635,7 @@ cmd_setup() {
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
-  setup)     shift; cmd_setup "$@" ;;
+  setup|connect) shift; cmd_setup "$@" ;;
   start)     shift; cmd_start "$@" ;;
   join)      shift; cmd_join "$@" ;;
   accept)    shift; cmd_accept "$@" ;;
@@ -648,8 +648,8 @@ case "${1:-help}" in
   help|--help|-h)
     echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
-    echo "  relay setup                      Initialize this machine as host"
-    echo "  relay setup <name@user@host#key> Join another machine"
+    echo "  relay connect                        Start hosting, wait for peer"
+    echo "  relay connect <name@user@host#key>  Connect to another machine"
     echo "  relay send <peer> <message>      Send a message"
     echo "  relay send-file <peer> <path>    Send a file"
     echo "  relay peers                      List paired machines"
