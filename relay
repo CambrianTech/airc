@@ -39,6 +39,17 @@ get_host() {
   hostname
 }
 
+get_ssh_port() {
+  # Check config for non-standard SSH port, default to 22
+  python3 -c "import json; print(json.load(open('$CONFIG')).get('ssh_port', 22))" 2>/dev/null || echo "22"
+}
+
+get_peer_port() {
+  # Get SSH port for a peer, default to 22
+  local peer_file="$1"
+  python3 -c "import json; print(json.load(open('$peer_file')).get('port', 22))" 2>/dev/null || echo "22"
+}
+
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 sign_message() {
@@ -243,10 +254,14 @@ PEER
     echo ""
     echo "  Use with:  AGENT_RELAY_HOME=$RELAY_HOME relay send <peer> <msg>"
   else
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    local host_with_port="${host}"
+    [ "$ssh_port" != "22" ] && host_with_port="${host}:${ssh_port}"
     echo ""
     echo "  On the other machine, run:"
     echo ""
-    echo "    relay join ${name}@${user}@${host}#${ssh_pubkey_b64}"
+    echo "    relay join ${name}@${user}@${host_with_port}#${ssh_pubkey_b64}"
   fi
   echo ""
 }
@@ -255,16 +270,22 @@ cmd_join() {
   local target="${1:-}"
   [ -z "$target" ] && die "Usage: relay join <name@user@host#pubkey>"
 
-  # Parse name@user@host#base64-ssh-pubkey
+  # Parse name@user@host:port#base64-ssh-pubkey
   local host_ssh_pubkey_b64=""
   if echo "$target" | grep -q '#'; then
     host_ssh_pubkey_b64="${target##*#}"
     target="${target%%#*}"
   fi
 
-  local peer_name ssh_target
+  local peer_name ssh_target peer_port=22
   peer_name="${target%%@*}"
   ssh_target="${target#*@}"
+
+  # Parse port from host if present (user@host:port)
+  if echo "$ssh_target" | grep -q ':'; then
+    peer_port="${ssh_target##*:}"
+    ssh_target="${ssh_target%:*}"
+  fi
 
   [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host#pubkey"
 
@@ -326,7 +347,7 @@ EOF
 
   # One SSH session: push our key, grab their keys, register peer, test reverse
   local exchange_result
-  exchange_result=$(relay_ssh "$ssh_target" "
+  exchange_result=$(relay_ssh -p "$peer_port" "$ssh_target" "
     # 1. Authorize joiner's SSH key
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
@@ -377,6 +398,7 @@ SIGNKEY
 {
   "name": "$peer_name",
   "host": "$ssh_target",
+  "port": $peer_port,
   "paired": "$(timestamp)"
 }
 EOF
@@ -413,6 +435,7 @@ EOF
 {
   "name": "$peer_name",
   "host": "$ssh_target",
+  "port": $peer_port,
   "paired": "$(timestamp)"
 }
 EOF
@@ -518,8 +541,10 @@ cmd_send() {
   if [ "$is_local" = true ]; then
     echo "$full_msg" >> "$MESSAGES"
   else
-    relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
-      || die "Failed to deliver to $peer_host"
+    local peer_port
+    peer_port=$(get_peer_port "$peer_file")
+    relay_ssh -p "$peer_port" "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+      || die "Failed to deliver to $peer_host:$peer_port"
     echo "$full_msg" >> "$MESSAGES"
   fi
 }
@@ -540,8 +565,10 @@ cmd_send_file() {
   filename=$(basename "$filepath")
   filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
 
-  relay_ssh "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
-  relay_scp -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
+  local peer_port
+  peer_port=$(get_peer_port "$peer_file")
+  relay_ssh -p "$peer_port" "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
+  relay_scp -P "$peer_port" -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
     || die "Failed to transfer $filename to $peer_host"
 
   local escaped_name

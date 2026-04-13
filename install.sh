@@ -99,7 +99,15 @@ if ! nc -z localhost 22 2>/dev/null || ! ssh -i "$ssh_key" -o IdentitiesOnly=yes
       sudo /usr/sbin/sshd -p 2222 2>&1 || true
       if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new -p 2222 localhost "echo ok" >/dev/null 2>&1; then
         ok "SSH working on port 2222 (sshd started manually)"
-        info "NOTE: relay will need port 2222 — adding to config"
+        # Save port to config so relay uses it
+        if [ -f "$RELAY_HOME/config.json" ]; then
+          python3 -c "
+import json
+c = json.load(open('$RELAY_HOME/config.json'))
+c['ssh_port'] = 2222
+json.dump(c, open('$RELAY_HOME/config.json','w'), indent=2)
+" 2>/dev/null
+        fi
       else
         info "SSH not working. System log:"
         log show --predicate 'process == "sshd"' --last 1m --style compact 2>/dev/null | tail -10 || true
