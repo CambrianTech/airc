@@ -15,8 +15,11 @@ Do everything yourself — don't ask the user to run commands.
    curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
    ```
 
-2. If `$ARGUMENTS` contains an `@`, it's a join target:
-   - Run `relay join $ARGUMENTS` — this initializes if needed, exchanges keys via SSH.
+2. If `$ARGUMENTS` contains an `@`, it's a join target. Pass the ENTIRE argument including the `#key` portion — that's the host's SSH public key:
+   ```bash
+   relay join $ARGUMENTS
+   ```
+   This initializes if needed, authorizes the host's key, and exchanges keys via SSH.
    - If join fails with SSH errors, **diagnose and fix it yourself**:
      - Check if sshd is running: `pgrep -x sshd` or `launchctl list | grep ssh`
      - If not running, enable it:
