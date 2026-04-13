@@ -73,9 +73,14 @@ ensure_sshd() {
         echo "  SSH daemon restarted."
         return 0
       fi
-      echo "  Auto-restart failed. Opening System Settings..."
+      echo "  Auto-restart failed."
+      if sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
+        echo "  Remote Login is ON but sshd is not responding (ghost listener)."
+        echo "  → Toggle Remote Login OFF, wait 3 seconds, toggle ON."
+      else
+        echo "  → Enable Remote Login in System Settings."
+      fi
       open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null || true
-      echo "  → Toggle Remote Login OFF, wait 3 seconds, toggle ON."
       local attempts=0
       while ! ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; do
         attempts=$((attempts + 1))

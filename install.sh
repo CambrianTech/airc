@@ -88,21 +88,26 @@ fi
 if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
-    sudo -n launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
-      || { sudo -n launchctl bootout system/com.openssh.sshd 2>/dev/null; \
-           sudo -n launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-      || { sudo -n launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; \
-           sudo -n launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-      || sudo -n systemsetup -setremotelogin on 2>/dev/null \
-      || sudo -n /usr/sbin/sshd 2>/dev/null \
+    sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
+      || { sudo launchctl bootout system/com.openssh.sshd 2>/dev/null; \
+           sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
+      || { sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; \
+           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
+      || sudo systemsetup -setremotelogin on 2>/dev/null \
+      || sudo /usr/sbin/sshd 2>/dev/null \
       || true
     sleep 1
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
-      info "Could not enable SSH automatically."
-      open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null || true
-      info "Please enable Remote Login in System Settings, then re-run this installer."
+      # We have sudo here — keep trying
+      sudo systemsetup -setremotelogin off 2>/dev/null; sleep 1
+      sudo systemsetup -setremotelogin on 2>/dev/null; sleep 1
+      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+        ok "SSH is working (toggled Remote Login)"
+      else
+        info "SSH still not responding. Please check System Settings > Remote Login."
+      fi
     fi
   else
     sudo -n systemctl start sshd 2>/dev/null \
