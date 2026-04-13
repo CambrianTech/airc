@@ -175,6 +175,43 @@ cmd_send() {
   echo "$full_msg" >> "$MESSAGES"
 }
 
+cmd_send_file() {
+  local peer_name="${1:-}" filepath="${2:-}"
+  [ -z "$peer_name" ] || [ -z "$filepath" ] && die "Usage: relay send-file <peer> <path>"
+  [ -f "$filepath" ] || die "File not found: $filepath"
+  ensure_init
+
+  local peer_file="$PEERS_DIR/${peer_name}.json"
+  [ -f "$peer_file" ] || die "Unknown peer: $peer_name. Run: relay peers"
+
+  local peer_host my_name ts filename filesize
+  peer_host=$(python3 -c "import json; print(json.load(open('$peer_file'))['host'])" 2>/dev/null)
+  my_name=$(get_name)
+  ts=$(timestamp)
+  filename=$(basename "$filepath")
+  filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
+
+  # Create files dir on peer
+  ssh "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
+
+  # Transfer via scp
+  scp -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
+    || die "Failed to transfer $filename to $peer_host"
+
+  # Notify peer via message
+  local escaped_name
+  escaped_name=$(printf '%s' "$filename" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  local payload="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"}}"
+  local sig
+  sig=$(sign_message "$payload")
+  local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"},\"sig\":\"$sig\"}"
+
+  ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null
+  echo "$full_msg" >> "$MESSAGES"
+
+  echo "Sent $filename ($filesize bytes) to $peer_name"
+}
+
 cmd_monitor() {
   ensure_init
   local filter="${1:-}"
@@ -231,20 +268,22 @@ for line in sys.stdin:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
-  start)   shift; cmd_start "$@" ;;
-  join)    shift; cmd_join "$@" ;;
-  send)    shift; cmd_send "$@" ;;
-  monitor) shift; cmd_monitor "$@" ;;
-  peers)   cmd_peers ;;
-  pubkey)  cmd_pubkey ;;
-  logs)    shift; cmd_logs "$@" ;;
+  start)     shift; cmd_start "$@" ;;
+  join)      shift; cmd_join "$@" ;;
+  send)      shift; cmd_send "$@" ;;
+  send-file) shift; cmd_send_file "$@" ;;
+  monitor)   shift; cmd_monitor "$@" ;;
+  peers)     cmd_peers ;;
+  pubkey)    cmd_pubkey ;;
+  logs)      shift; cmd_logs "$@" ;;
   help|--help|-h)
     echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
     echo "  relay start <name>             Initialize and show join command"
     echo "  relay join <name@user@host>    Pair with the other machine"
     echo "  relay send <peer> <message>    Send a signed message"
-    echo "  relay monitor [filter]         Stream incoming (for Claude Code)"
+    echo "  relay send-file <peer> <path>  Send a file (diffs, patches, images)"
+    echo "  relay monitor [filter]         Stream incoming (for agent monitors)"
     echo "  relay peers                    List paired machines"
     echo "  relay logs [count]             Show recent messages"
     echo "  relay pubkey                   Print your public key"

@@ -41,10 +41,11 @@ Tailscale handles DNS, NAT traversal, and encrypted transport. The relay just us
 ## Usage
 
 ```bash
-relay send peer "your message"     # send a signed message
-relay monitor                       # stream incoming (background)
-relay logs 20                       # show recent messages
-relay peers                         # list paired machines
+relay send peer "your message"          # send a signed message
+relay send-file peer ./patch.diff       # send a file (diffs, patches, images, models)
+relay monitor                            # stream incoming (background)
+relay logs 20                            # show recent messages
+relay peers                              # list paired machines
 ```
 
 ## Agent Integrations
@@ -87,6 +88,7 @@ Each peer is independent. Star topology or full mesh.
 | `relay send <peer> <msg>` | Send a signed message |
 | `relay monitor [filter]` | Stream incoming messages (for agent Monitor tools) |
 | `relay peers` | List paired machines |
+| `relay send-file <peer> <path>` | Send a file (arrives in `~/.agent-relay/files/`) |
 | `relay logs [count]` | Show recent messages |
 | `relay pubkey` | Print your public key |
 
