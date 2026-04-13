@@ -53,7 +53,7 @@ ensure_sshd() {
   # Check if port 22 is accepting connections AND sshd is actually working
   if nc -z localhost 22 2>/dev/null; then
     # Port open — but is sshd actually responding? (macOS ghost listener bug)
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
+    if ssh -i "$IDENTITY_DIR/ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
       return 0
     fi
     # Port open but handshake fails — ghost sshd. Restart it.
@@ -69,7 +69,7 @@ ensure_sshd() {
         || sudo -n /usr/sbin/sshd 2>/dev/null \
         || true
       sleep 1
-      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
+      if ssh -i "$IDENTITY_DIR/ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
         echo "  SSH daemon restarted."
         return 0
       fi
@@ -78,7 +78,7 @@ ensure_sshd() {
       echo "  Run: curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash"
       echo "  (The installer has sudo access to fix sshd.)"
       local attempts=0
-      while ! ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; do
+      while ! ssh -i "$IDENTITY_DIR/ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; do
         attempts=$((attempts + 1))
         [ "$attempts" -ge 30 ] && echo "  Timed out waiting for SSH." && return 1
         sleep 2
@@ -91,7 +91,7 @@ ensure_sshd() {
         || { sudo -n /usr/sbin/sshd -t 2>/dev/null && sudo -n /usr/sbin/sshd 2>/dev/null; } \
         || true
       sleep 1
-      ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null && return 0
+      ssh -i "$IDENTITY_DIR/ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null && return 0
     fi
   fi
 

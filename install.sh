@@ -85,7 +85,7 @@ fi
 
 # ── Ensure SSH daemon is running ────────────────────────────────────────
 
-if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+if ! nc -z localhost 22 2>/dev/null || ! ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
     # Kill ghost listener, start sshd fresh
@@ -93,7 +93,7 @@ if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKe
     sleep 1
     sudo /usr/sbin/sshd 2>&1 || true
     sleep 1
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+    if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
       info "SSH still not responding. Diagnostics:"
@@ -108,7 +108,7 @@ if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKe
       || sudo -n /usr/sbin/sshd 2>/dev/null \
       || true
     sleep 1
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+    if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
       info "Could not start sshd. Run: sudo systemctl start sshd"
