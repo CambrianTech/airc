@@ -249,10 +249,12 @@ PEER
     echo ""
     echo "    relay join ${name}@${user}@${host}"
     echo ""
-    echo "  Waiting for peer to join (listening on port 7547)..."
-    # Start key-exchange listener — joiner sends its SSH pubkey, we reply with ours
-    # This bootstraps SSH access without requiring pre-existing auth
-    cmd_listen
+    echo "  Listening for pairing on port $PAIR_PORT..."
+    # Background listener for key exchange — joiner connects via TCP
+    cmd_listen &
+    LISTEN_PID=$!
+    # Wait for pairing to complete (listener exits after one connection)
+    wait $LISTEN_PID 2>/dev/null || true
   fi
   echo ""
 }
