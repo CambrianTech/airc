@@ -29,7 +29,7 @@ Do everything yourself — don't ask the user to run commands.
    ```bash
    host=$(python3 -c "import json; print(json.load(open('$HOME/.agent-relay/config.json'))['host'])")
    user=$(whoami)
-   ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new ${user}@${host} "echo ok" 2>&1
+   ssh -i ~/.agent-relay/identity/ssh_key -o IdentitiesOnly=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new ${user}@${host} "echo ok" 2>&1
    ```
    If that fails, diagnose and fix SSH access before proceeding (e.g., enable Remote Login on macOS). Do NOT give the user a join command for a host that can't be reached.
 
