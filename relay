@@ -648,16 +648,14 @@ case "${1:-help}" in
   help|--help|-h)
     echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
-    echo "  relay setup [name@user@host#key] One command — join or start"
-    echo "  relay start <name>               Initialize and show join command"
-    echo "  relay join <name@user@host#key>  Pair with the other machine"
-    echo "  relay accept <name@user@host#key> Complete pairing (if join couldn't SSH)"
-    echo "  relay send <peer> <message>      Send a signed message"
-    echo "  relay send-file <peer> <path>    Send a file (diffs, patches, images)"
-    echo "  relay monitor [filter]           Stream incoming (for agent monitors)"
+    echo "  relay setup                      Initialize this machine as host"
+    echo "  relay setup <name@user@host#key> Join another machine"
+    echo "  relay send <peer> <message>      Send a message"
+    echo "  relay send-file <peer> <path>    Send a file"
     echo "  relay peers                      List paired machines"
     echo "  relay logs [count]               Show recent messages"
-    echo "  relay pubkey                     Print your public key"
+    echo ""
+    echo "  Monitor starts automatically after setup."
     ;;
   *) die "Unknown command: $1" ;;
 esac
