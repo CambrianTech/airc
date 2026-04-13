@@ -622,9 +622,20 @@ for line in sys.stdin:
 "
 }
 
+cmd_setup() {
+  # All-in-one: if arg has @, join. Otherwise, start.
+  local target="${1:-}"
+  if [ -n "$target" ] && echo "$target" | grep -q '@'; then
+    cmd_join "$target"
+  else
+    cmd_start "${target:-$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)}"
+  fi
+}
+
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
+  setup)     shift; cmd_setup "$@" ;;
   start)     shift; cmd_start "$@" ;;
   join)      shift; cmd_join "$@" ;;
   accept)    shift; cmd_accept "$@" ;;
@@ -637,15 +648,16 @@ case "${1:-help}" in
   help|--help|-h)
     echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
-    echo "  relay start <name>              Initialize and show join command"
-    echo "  relay join <name@user@host#key> Pair with the other machine"
+    echo "  relay setup [name@user@host#key] One command — join or start"
+    echo "  relay start <name>               Initialize and show join command"
+    echo "  relay join <name@user@host#key>  Pair with the other machine"
     echo "  relay accept <name@user@host#key> Complete pairing (if join couldn't SSH)"
-    echo "  relay send <peer> <message>     Send a signed message"
-    echo "  relay send-file <peer> <path>   Send a file (diffs, patches, images)"
-    echo "  relay monitor [filter]          Stream incoming (for agent monitors)"
-    echo "  relay peers                     List paired machines"
-    echo "  relay logs [count]              Show recent messages"
-    echo "  relay pubkey                    Print your public key"
+    echo "  relay send <peer> <message>      Send a signed message"
+    echo "  relay send-file <peer> <path>    Send a file (diffs, patches, images)"
+    echo "  relay monitor [filter]           Stream incoming (for agent monitors)"
+    echo "  relay peers                      List paired machines"
+    echo "  relay logs [count]               Show recent messages"
+    echo "  relay pubkey                     Print your public key"
     ;;
   *) die "Unknown command: $1" ;;
 esac
