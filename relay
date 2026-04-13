@@ -53,7 +53,8 @@ sign_message() {
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   if [ -f "$ssh_key" ]; then
-    ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes "$@"
+    # Include relay key but allow default keys too (needed for initial join)
+    ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new "$@"
   else
     ssh -o StrictHostKeyChecking=accept-new "$@"
   fi
@@ -62,7 +63,7 @@ relay_ssh() {
 relay_scp() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   if [ -f "$ssh_key" ]; then
-    scp -i "$ssh_key" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes "$@"
+    scp -i "$ssh_key" -o StrictHostKeyChecking=accept-new "$@"
   else
     scp -o StrictHostKeyChecking=accept-new "$@"
   fi
