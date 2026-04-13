@@ -165,6 +165,7 @@ relay_scp() {
 
 cmd_start() {
   local name="${1:-}"
+  local skip_listen="${2:-}"
   [ -z "$name" ] && die "Usage: relay start <your-name>"
 
   local PRIMARY_HOME="$HOME/.agent-relay"
@@ -274,12 +275,12 @@ PEER
     echo ""
     echo "    relay join ${name}@${user}@${host}"
     echo ""
-    echo "  Listening for pairing on port $PAIR_PORT..."
-    # Background listener for key exchange — joiner connects via TCP
-    cmd_listen &
-    LISTEN_PID=$!
-    # Wait for pairing to complete (listener exits after one connection)
-    wait $LISTEN_PID 2>/dev/null || true
+    if [ "$skip_listen" != "--no-listen" ]; then
+      echo "  Listening for pairing on port $PAIR_PORT..."
+      cmd_listen &
+      LISTEN_PID=$!
+      wait $LISTEN_PID 2>/dev/null || true
+    fi
   fi
   echo ""
 }
@@ -299,7 +300,7 @@ cmd_join() {
   if [ ! -f "$CONFIG" ]; then
     local my_name
     my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
-    cmd_start "$my_name"
+    cmd_start "$my_name" --no-listen
   fi
 
   ensure_init
