@@ -32,7 +32,6 @@ mkdir -p "$BIN_DIR"
 ln -sf "$CLONE_DIR/relay" "$BIN_DIR/relay"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-  # Add to shell profile automatically
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -f "$rc" ] && ! grep -q 'agent-relay' "$rc"; then
       echo 'export PATH="$HOME/.local/bin:$PATH"  # agent-relay' >> "$rc"
@@ -48,9 +47,9 @@ fi
 if [ -d "$CLONE_DIR/skills" ]; then
   mkdir -p "$SKILLS_TARGET"
 
-  # Clean up old relay-prefixed symlinks from previous installs
-  for old in "$SKILLS_TARGET"/relay-*; do
-    [ -L "$old" ] && rm "$old" && info "Removed old symlink: $(basename "$old")"
+  # Clean up old symlinks from previous installs
+  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup "$SKILLS_TARGET"/uninstall "$SKILLS_TARGET"/update; do
+    [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
   for skill_dir in "$CLONE_DIR"/skills/*/; do
@@ -63,35 +62,12 @@ if [ -d "$CLONE_DIR/skills" ]; then
   done
 fi
 
-# ── SSH key for relay connections ───────────────────────────────────────
-
-RELAY_HOME="$HOME/.agent-relay"
-IDENTITY_DIR="$RELAY_HOME/identity"
-mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$RELAY_HOME/peers"
-
-ssh_key="$IDENTITY_DIR/ssh_key"
-if [ ! -f "$ssh_key" ]; then
-  ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay" -q
-  ok "Generated SSH key"
-fi
-
-mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-pubkey=$(cat "${ssh_key}.pub")
-if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-  echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
-  chmod 600 "$HOME/.ssh/authorized_keys"
-  ok "Added relay key to authorized_keys"
-fi
-
-# SSH is only needed for hosting — relay connect (with no args) handles that.
-# Joiners just SSH out, which always works.
-
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
-ok "Installed."
+ok "Installed. Requires Tailscale: https://tailscale.com"
 echo ""
-echo "  relay connect                        # host — wait for peers"
-echo "  relay connect <name@user@host#key>   # join a host"
-echo "  relay send <peer> <message>          # send a message"
+echo "  relay connect                    # host — wait for peers"
+echo "  relay connect <name@user@host>   # join a host"
+echo "  relay send <peer> <message>      # send a message"
 echo ""
