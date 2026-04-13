@@ -1,10 +1,10 @@
 #!/bin/bash
-# Claude Relay — secure peer-to-peer messaging between Claude Code instances.
+# Agent Relay — secure peer-to-peer messaging between AI agent instances.
 # Two commands to connect: `relay start <name>` on one machine, `relay join <name@host>` on the other.
 
 set -euo pipefail
 
-RELAY_HOME="${CLAUDE_RELAY_HOME:-$HOME/.claude-relay}"
+RELAY_HOME="${AGENT_RELAY_HOME:-$HOME/.agent-relay}"
 CONFIG="$RELAY_HOME/config.json"
 IDENTITY_DIR="$RELAY_HOME/identity"
 PEERS_DIR="$RELAY_HOME/peers"
@@ -105,7 +105,7 @@ cmd_join() {
 
   # Fetch peer's public key
   local remote_pubkey
-  remote_pubkey=$(ssh "$ssh_target" "cat ~/.claude-relay/identity/public.pem" 2>/dev/null) \
+  remote_pubkey=$(ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) \
     || die "Can't reach $ssh_target. Check SSH access."
 
   # Save peer
@@ -121,12 +121,12 @@ EOF
   # Push our key to peer
   local my_name
   my_name=$(get_name)
-  ssh "$ssh_target" "mkdir -p ~/.claude-relay/peers" 2>/dev/null
-  cat "$IDENTITY_DIR/public.pem" | ssh "$ssh_target" "cat > ~/.claude-relay/peers/${my_name}.pub" 2>/dev/null
+  ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
+  cat "$IDENTITY_DIR/public.pem" | ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
 
   local my_host
   my_host="$(whoami)@$(get_host)"
-  ssh "$ssh_target" "cat > ~/.claude-relay/peers/${my_name}.json" << EOF
+  ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
 {
   "name": "$my_name",
   "host": "$my_host",
@@ -168,7 +168,7 @@ cmd_send() {
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
   # Deliver via SSH
-  ssh "$peer_host" "echo '$full_msg' >> ~/.claude-relay/messages.jsonl" 2>/dev/null \
+  ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
     || die "Failed to deliver to $peer_host"
 
   # Log locally
@@ -239,7 +239,7 @@ case "${1:-help}" in
   pubkey)  cmd_pubkey ;;
   logs)    shift; cmd_logs "$@" ;;
   help|--help|-h)
-    echo "Claude Relay — secure messaging between Claude Code instances"
+    echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
     echo "  relay start <name>             Initialize and show join command"
     echo "  relay join <name@user@host>    Pair with the other machine"

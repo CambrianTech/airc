@@ -1,12 +1,12 @@
-# Claude Relay
+# Agent Relay
 
-Secure real-time messaging between Claude Code instances on different machines.
+Secure real-time messaging between AI agent instances on different machines.
 
 ## 30-Second Setup
 
 **Machine A:**
 ```bash
-git clone https://github.com/CambrianTech/claude-relay && cd claude-relay
+git clone https://github.com/CambrianTech/agent-relay && cd agent-relay
 ./install.sh
 relay start myname
 ```
@@ -15,7 +15,7 @@ It prints one line. Copy it.
 
 **Machine B:**
 ```bash
-git clone https://github.com/CambrianTech/claude-relay && cd claude-relay
+git clone https://github.com/CambrianTech/agent-relay && cd agent-relay
 ./install.sh
 relay join myname@machineA.tail1234.ts.net
 ```
@@ -66,7 +66,7 @@ No passwords. No tokens. No accounts. Just SSH + public key crypto.
 ## File Layout
 
 ```
-~/.claude-relay/
+~/.agent-relay/
 ├── config.json           # your name
 ├── identity/
 │   ├── private.pem       # never leaves this machine
