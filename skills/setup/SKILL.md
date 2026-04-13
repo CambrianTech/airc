@@ -3,7 +3,7 @@ name: relay:setup
 description: Set up Agent Relay — initialize this machine and pair with another.
 user-invocable: true
 allowed-tools: Bash, Monitor
-argument-hint: "<peer@user@host>"
+argument-hint: "<peer@user@host#key>"
 ---
 
 # Set Up Agent Relay
@@ -16,9 +16,16 @@ Do everything yourself — don't ask the user to run commands.
    ```
 
 2. If `$ARGUMENTS` contains an `@`, it's a join target:
-   - If not already initialized, pick a short name from the local hostname and run `relay start <name>` (this will auto-detect it's a secondary and not block on the listener).
-   - Run `relay join $ARGUMENTS` to pair via TCP key exchange.
-   - Start the monitor, then send a test message:
+   - Run `relay join $ARGUMENTS` — this initializes if needed, exchanges keys via SSH.
+   - If join fails with SSH errors, **diagnose and fix it yourself**:
+     - Check if sshd is running: `pgrep -x sshd` or `launchctl list | grep ssh`
+     - If not running, enable it:
+       - macOS: `sudo systemsetup -setremotelogin on` or `sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist`
+       - Linux: `sudo systemctl start sshd` or `sudo service ssh start`
+     - Check if port 22 is reachable on the host: `nc -z <host-ip> 22`
+     - Check if your SSH key is authorized: look at `~/.ssh/authorized_keys`
+     - Fix whatever is broken and retry `relay join`.
+   - Once paired, start the monitor and send a test message:
    ```
    Monitor(persistent=true, command="relay monitor")
    ```
@@ -27,9 +34,9 @@ Do everything yourself — don't ask the user to run commands.
    ```
 
 3. If no arguments (or no `@` in arguments), this machine is the host:
-   - Run `relay start <name>` — this prints the join command and waits for the joiner to connect via TCP key exchange (port 7547). No SSH needed for pairing.
-   - Once pairing completes, start the monitor:
+   - Run `relay start <name>` — picks a name from local hostname if not specified.
+   - Start the monitor:
    ```
    Monitor(persistent=true, command="relay monitor")
    ```
-   - Tell the user: "Give this to the other Claude:" followed by `/relay:setup <the join string from relay start output>`
+   - Show the join string from `relay start` output. Tell the user: "Give this to the other Claude:" followed by `/relay:setup <the join string>`

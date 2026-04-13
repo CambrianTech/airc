@@ -32,7 +32,6 @@ get_host() {
     ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
   fi
   if [ -n "$ts_bin" ]; then
-    # Use IPv4 Tailscale address — works regardless of MagicDNS config
     local ts_ip
     ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
     [ -n "$ts_ip" ] && echo "$ts_ip" && return
@@ -51,19 +50,14 @@ sign_message() {
 }
 
 ensure_sshd() {
-  # Make sure this machine can receive SSH connections
   if [ "$(uname)" = "Darwin" ]; then
-    # macOS: check if Remote Login is on
     if ! sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
-      echo "  Enabling Remote Login (SSH)..."
       sudo -n systemsetup -setremotelogin on 2>/dev/null \
         || launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null \
         || true
     fi
   else
-    # Linux: start sshd if not running
     if ! pgrep -x sshd >/dev/null 2>&1; then
-      echo "  Starting sshd..."
       sudo -n systemctl start sshd 2>/dev/null \
         || sudo -n service ssh start 2>/dev/null \
         || /usr/sbin/sshd 2>/dev/null \
@@ -72,80 +66,9 @@ ensure_sshd() {
   fi
 }
 
-PAIR_PORT=7547
-
-cmd_listen() {
-  # One-shot TCP listener for key exchange during pairing
-  # Joiner connects, sends its SSH pubkey + signing pubkey as JSON
-  # We reply with ours, then both sides authorize each other
-  local my_ssh_pub my_sign_pub
-  my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
-  my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
-  local my_name
-  my_name=$(get_name)
-  local my_host
-  my_host="$(whoami)@$(get_host)"
-
-  # Use python3 for a simple one-shot TCP server
-  python3 -c "
-import socket, json, sys
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(('0.0.0.0', $PAIR_PORT))
-sock.listen(1)
-conn, addr = sock.accept()
-data = b''
-while True:
-    chunk = conn.recv(4096)
-    if not chunk: break
-    data += chunk
-    if b'\n' in data: break
-
-# Parse joiner's info
-joiner = json.loads(data.decode().strip())
-
-# Send our info back
-response = json.dumps({
-    'name': '$my_name',
-    'host': '$my_host',
-    'ssh_pub': '''$my_ssh_pub''',
-    'sign_pub': '''$my_sign_pub'''
-})
-conn.sendall((response + '\n').encode())
-conn.close()
-sock.close()
-
-# Authorize joiner's SSH key
-import os
-ssh_dir = os.path.expanduser('~/.ssh')
-os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-ak = os.path.join(ssh_dir, 'authorized_keys')
-ssh_key = joiner.get('ssh_pub', '')
-if ssh_key:
-    existing = open(ak).read() if os.path.exists(ak) else ''
-    if ssh_key not in existing:
-        with open(ak, 'a') as f:
-            f.write(ssh_key + '\n')
-        os.chmod(ak, 0o600)
-
-# Save joiner as peer
-peers_dir = os.path.expanduser('$PEERS_DIR')
-os.makedirs(peers_dir, exist_ok=True)
-jname = joiner['name']
-with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
-    f.write(joiner.get('sign_pub', ''))
-with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
-    json.dump({'name': jname, 'host': joiner['host'], 'paired': '$(timestamp)'}, f, indent=2)
-
-print(f'  Paired with {jname} ({joiner[\"host\"]})')
-" || die "Listener failed"
-}
-
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   if [ -f "$ssh_key" ]; then
-    # Include relay key but allow default keys too (needed for initial join)
     ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new "$@"
   else
     ssh -o StrictHostKeyChecking=accept-new "$@"
@@ -165,7 +88,6 @@ relay_scp() {
 
 cmd_start() {
   local name="${1:-}"
-  local skip_listen="${2:-}"
   [ -z "$name" ] && die "Usage: relay start <your-name>"
 
   local PRIMARY_HOME="$HOME/.agent-relay"
@@ -175,7 +97,6 @@ cmd_start() {
     local existing_name
     existing_name=$(python3 -c "import json; print(json.load(open('$PRIMARY_HOME/config.json'))['name'])" 2>/dev/null)
     if [ "$existing_name" = "$name" ] || echo "$existing_name" | grep -qE "^${name}(-[0-9]+)?$"; then
-      # Find next available number
       local n=1
       while [ -d "$HOME/.agent-relay-${name}-${n}" ]; do
         n=$((n + 1))
@@ -190,24 +111,20 @@ cmd_start() {
   fi
 
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
-
-  # Ensure SSH daemon is running so peers can deliver messages
   ensure_sshd
 
-  # Generate Ed25519 signing keypair if needed
+  # Generate Ed25519 signing keypair
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
     openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
     openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
     chmod 600 "$IDENTITY_DIR/private.pem"
   fi
 
-  # Generate SSH keypair for relay connections
+  # Generate SSH keypair
   local ssh_key="$IDENTITY_DIR/ssh_key"
   if [ ! -f "$ssh_key" ]; then
     ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay-${name}" -q
-    # Authorize this key for incoming connections
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
     local pubkey
     pubkey=$(cat "${ssh_key}.pub")
     if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
@@ -229,14 +146,11 @@ EOF
 
   # Share message log with primary instance for local multi-agent
   if [ "$RELAY_HOME" != "$PRIMARY_HOME" ] && [ -f "$PRIMARY_HOME/messages.jsonl" ]; then
-    # Use the primary's message log so all local agents see each other
     rm -f "$MESSAGES"
     ln -sf "$PRIMARY_HOME/messages.jsonl" "$MESSAGES"
-    # Copy peers from primary
     for f in "$PRIMARY_HOME/peers/"*.json "$PRIMARY_HOME/peers/"*.pub; do
       [ -f "$f" ] && cp "$f" "$PEERS_DIR/" 2>/dev/null
     done
-    # Register as local peer of primary
     cat > "$PRIMARY_HOME/peers/${name}.json" << PEER
 {
   "name": "$name",
@@ -245,7 +159,6 @@ EOF
 }
 PEER
     cp "$IDENTITY_DIR/public.pem" "$PRIMARY_HOME/peers/${name}.pub" 2>/dev/null
-    # Register primary as our peer
     local primary_name
     primary_name=$(python3 -c "import json; print(json.load(open('$PRIMARY_HOME/config.json'))['name'])" 2>/dev/null)
     cat > "$PEERS_DIR/${primary_name}.json" << PEER
@@ -258,10 +171,13 @@ PEER
     cp "$PRIMARY_HOME/identity/public.pem" "$PEERS_DIR/${primary_name}.pub" 2>/dev/null
   fi
 
-  local host
+  local host user
   host=$(get_host)
-  local user
   user=$(whoami)
+
+  # Encode SSH public key into join string
+  local ssh_pubkey_b64
+  ssh_pubkey_b64=$(base64 < "${IDENTITY_DIR}/ssh_key.pub" | tr -d '\n')
 
   echo ""
   echo "  Relay initialized as '$name'"
@@ -273,108 +189,190 @@ PEER
     echo ""
     echo "  On the other machine, run:"
     echo ""
-    echo "    relay join ${name}@${user}@${host}"
-    echo ""
-    if [ "$skip_listen" != "--no-listen" ]; then
-      echo "  Listening for pairing on port $PAIR_PORT..."
-      cmd_listen &
-      LISTEN_PID=$!
-      wait $LISTEN_PID 2>/dev/null || true
-    fi
+    echo "    relay join ${name}@${user}@${host}#${ssh_pubkey_b64}"
   fi
   echo ""
 }
 
 cmd_join() {
   local target="${1:-}"
-  [ -z "$target" ] && die "Usage: relay join <name@user@host>"
+  [ -z "$target" ] && die "Usage: relay join <name@user@host#pubkey>"
+
+  # Parse name@user@host#base64-ssh-pubkey
+  local host_ssh_pubkey_b64=""
+  if echo "$target" | grep -q '#'; then
+    host_ssh_pubkey_b64="${target##*#}"
+    target="${target%%#*}"
+  fi
 
   local peer_name ssh_target
   peer_name="${target%%@*}"
   ssh_target="${target#*@}"
-  local peer_host_only="${ssh_target##*@}"
 
-  [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host"
+  [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host#pubkey"
 
-  # Initialize ourselves if not already done
+  # Initialize if needed (non-interactive)
   if [ ! -f "$CONFIG" ]; then
     local my_name
     my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
-    cmd_start "$my_name" --no-listen
+    # Inline init — no listener, no blocking
+    mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
+    ensure_sshd
+    if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
+      openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
+      openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
+      chmod 600 "$IDENTITY_DIR/private.pem"
+    fi
+    local ssh_key="$IDENTITY_DIR/ssh_key"
+    if [ ! -f "$ssh_key" ]; then
+      ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay-${my_name}" -q
+      mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+      local pubkey; pubkey=$(cat "${ssh_key}.pub")
+      grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+        echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+      }
+    fi
+    cat > "$CONFIG" << EOF
+{
+  "name": "$my_name",
+  "host": "$(get_host)",
+  "created": "$(timestamp)"
+}
+EOF
+    touch "$MESSAGES"
+    echo "  Initialized as '$my_name'"
   fi
 
   ensure_init
   ensure_sshd
-  mkdir -p "$PEERS_DIR"
 
-  # Ensure we have an SSH key
-  local ssh_key="$IDENTITY_DIR/ssh_key"
-  if [ ! -f "$ssh_key" ]; then
-    ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay-$(get_name)" -q
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-    local pubkey; pubkey=$(cat "${ssh_key}.pub")
-    grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
-      echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
-      chmod 600 "$HOME/.ssh/authorized_keys"
-    }
+  # Authorize host's SSH public key locally (so host can send us messages)
+  if [ -n "$host_ssh_pubkey_b64" ]; then
+    local host_ssh_pubkey
+    host_ssh_pubkey=$(echo "$host_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$host_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
+    if [ -n "$host_ssh_pubkey" ]; then
+      mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+      grep -qF "$host_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+        echo "$host_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+      }
+      echo "  Authorized host's SSH key"
+    fi
   fi
 
-  echo "Connecting to $peer_host_only:$PAIR_PORT for key exchange..."
-
-  # TCP key exchange — no SSH auth needed
-  # Send our info, receive host's info
-  local my_name my_host my_ssh_pub my_sign_pub
+  # Try SSH to host to complete bidirectional key exchange
+  echo "  Connecting to $ssh_target..."
+  local my_name my_host
   my_name=$(get_name)
   my_host="$(whoami)@$(get_host)"
-  my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
-  my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
 
-  local response
-  response=$(python3 -c "
-import socket, json, sys
+  if relay_ssh "$ssh_target" "
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
+    grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+  " 2>/dev/null; then
+    # SSH worked — full exchange
+    # Fetch host's signing key
+    local remote_pubkey
+    remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) || true
 
-payload = json.dumps({
-    'name': '$my_name',
-    'host': '$my_host',
-    'ssh_pub': '''$my_ssh_pub''',
-    'sign_pub': '''$my_sign_pub'''
-})
+    # Fetch host's SSH public key (belt + suspenders with join string key)
+    local remote_ssh_pubkey
+    remote_ssh_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/ssh_key.pub" 2>/dev/null) || true
+    if [ -n "$remote_ssh_pubkey" ]; then
+      grep -qF "$remote_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+        echo "$remote_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+      }
+    fi
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.settimeout(30)
-try:
-    sock.connect(('$peer_host_only', $PAIR_PORT))
-    sock.sendall((payload + '\n').encode())
-    sock.shutdown(socket.SHUT_WR)
-    data = b''
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk: break
-        data += chunk
-    sock.close()
-    host_info = json.loads(data.decode().strip())
-    print(json.dumps(host_info))
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    sys.exit(1)
-" 2>/dev/null) || die "Can't reach $peer_host_only:$PAIR_PORT. Is 'relay start' running on the host?"
+    # Save peer
+    mkdir -p "$PEERS_DIR"
+    [ -n "$remote_pubkey" ] && echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
+    cat > "$PEERS_DIR/${peer_name}.json" << EOF
+{
+  "name": "$peer_name",
+  "host": "$ssh_target",
+  "paired": "$(timestamp)"
+}
+EOF
 
-  # Parse host's response
-  local host_ssh_pub host_sign_pub
-  host_ssh_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null)
-  host_sign_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sign_pub',''))" 2>/dev/null)
+    # Push our signing key + peer info to host
+    relay_ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
+    cat "$IDENTITY_DIR/public.pem" | relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
+    relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
+{
+  "name": "$my_name",
+  "host": "$my_host",
+  "paired": "$(timestamp)"
+}
+EOF
 
-  # Authorize host's SSH key locally (so host can send us messages via SSH)
-  if [ -n "$host_ssh_pub" ]; then
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-    grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
-      echo "$host_ssh_pub" >> "$HOME/.ssh/authorized_keys"
-      chmod 600 "$HOME/.ssh/authorized_keys"
-    }
+    echo ""
+    echo "  Paired with '$peer_name'"
+    echo ""
+    echo "  Send a message:  relay send $peer_name 'hello'"
+    echo "  Start monitor:   relay monitor"
+    echo ""
+  else
+    # SSH failed — save what we can, tell user how to complete
+    mkdir -p "$PEERS_DIR"
+    cat > "$PEERS_DIR/${peer_name}.json" << EOF
+{
+  "name": "$peer_name",
+  "host": "$ssh_target",
+  "paired": "$(timestamp)"
+}
+EOF
+
+    local my_ssh_pubkey_b64
+    my_ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
+
+    echo ""
+    echo "  Partially paired with '$peer_name'"
+    echo "  Host can send to you, but you can't send to host yet."
+    echo ""
+    echo "  To complete pairing, have the host run:"
+    echo ""
+    echo "    relay accept ${my_name}@${my_host}#${my_ssh_pubkey_b64}"
+    echo ""
+  fi
+}
+
+cmd_accept() {
+  local target="${1:-}"
+  [ -z "$target" ] && die "Usage: relay accept <name@user@host#pubkey>"
+  ensure_init
+
+  # Parse name@user@host#base64-ssh-pubkey
+  local peer_ssh_pubkey_b64=""
+  if echo "$target" | grep -q '#'; then
+    peer_ssh_pubkey_b64="${target##*#}"
+    target="${target%%#*}"
+  fi
+
+  local peer_name ssh_target
+  peer_name="${target%%@*}"
+  ssh_target="${target#*@}"
+
+  [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host#pubkey"
+
+  # Authorize peer's SSH public key
+  if [ -n "$peer_ssh_pubkey_b64" ]; then
+    local peer_ssh_pubkey
+    peer_ssh_pubkey=$(echo "$peer_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$peer_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
+    if [ -n "$peer_ssh_pubkey" ]; then
+      mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+      grep -qF "$peer_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+        echo "$peer_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+      }
+    fi
   fi
 
   # Save peer
-  echo "$host_sign_pub" > "$PEERS_DIR/${peer_name}.pub"
+  mkdir -p "$PEERS_DIR"
   cat > "$PEERS_DIR/${peer_name}.json" << EOF
 {
   "name": "$peer_name",
@@ -383,11 +381,13 @@ except Exception as e:
 }
 EOF
 
+  # Try to fetch signing key via SSH
+  local remote_pubkey
+  remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) || true
+  [ -n "$remote_pubkey" ] && echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
+
   echo ""
-  echo "  Paired with '$peer_name'"
-  echo ""
-  echo "  Send a message:  relay send $peer_name 'hello'"
-  echo "  Start monitor:   relay monitor"
+  echo "  Accepted '$peer_name' ($ssh_target)"
   echo ""
 }
 
@@ -406,17 +406,15 @@ cmd_send() {
   my_name=$(get_name)
   ts=$(timestamp)
 
-  # Escape message for JSON
   local escaped_msg
   escaped_msg=$(printf '%s' "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
 
-  # Build + sign
   local payload="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\"}"
   local sig
   sig=$(sign_message "$payload")
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
-  # Detect if peer is local (same machine — messages.jsonl is shared/symlinked)
+  # Detect local peer
   local peer_hostname my_hostname is_local=false
   peer_hostname="${peer_host##*@}"
   my_hostname=$(hostname)
@@ -425,10 +423,8 @@ cmd_send() {
   [ "$peer_hostname" = "$(get_host)" ] && is_local=true
 
   if [ "$is_local" = true ]; then
-    # Local peer — shared messages file, write once only
     echo "$full_msg" >> "$MESSAGES"
   else
-    # Remote peer — deliver via SSH, then log locally
     relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
       || die "Failed to deliver to $peer_host"
     echo "$full_msg" >> "$MESSAGES"
@@ -451,14 +447,10 @@ cmd_send_file() {
   filename=$(basename "$filepath")
   filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
 
-  # Create files dir on peer
   relay_ssh "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
-
-  # Transfer via scp
   relay_scp -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
     || die "Failed to transfer $filename to $peer_host"
 
-  # Notify peer via message
   local escaped_name
   escaped_name=$(printf '%s' "$filename" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
   local payload="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"}}"
@@ -466,7 +458,6 @@ cmd_send_file() {
   sig=$(sign_message "$payload")
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"},\"sig\":\"$sig\"}"
 
-  # Detect if peer is local (same machine — messages.jsonl is shared/symlinked)
   local peer_hostname my_hostname is_local=false
   peer_hostname="${peer_host##*@}"
   my_hostname=$(hostname)
@@ -498,7 +489,6 @@ cmd_monitor() {
     if [ "$now" -gt "$last" ] 2>/dev/null; then
       local new_lines
       new_lines=$(sed -n "$(($last+1)),${now}p" "$MESSAGES")
-      # Filter out own messages — only show incoming
       echo "$new_lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
         local msg_from
@@ -553,6 +543,7 @@ for line in sys.stdin:
 case "${1:-help}" in
   start)     shift; cmd_start "$@" ;;
   join)      shift; cmd_join "$@" ;;
+  accept)    shift; cmd_accept "$@" ;;
   send)      shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
   monitor)   shift; cmd_monitor "$@" ;;
@@ -562,14 +553,15 @@ case "${1:-help}" in
   help|--help|-h)
     echo "Agent Relay — secure messaging between AI agent instances"
     echo ""
-    echo "  relay start <name>             Initialize and show join command"
-    echo "  relay join <name@user@host>    Pair with the other machine"
-    echo "  relay send <peer> <message>    Send a signed message"
-    echo "  relay send-file <peer> <path>  Send a file (diffs, patches, images)"
-    echo "  relay monitor [filter]         Stream incoming (for agent monitors)"
-    echo "  relay peers                    List paired machines"
-    echo "  relay logs [count]             Show recent messages"
-    echo "  relay pubkey                   Print your public key"
+    echo "  relay start <name>              Initialize and show join command"
+    echo "  relay join <name@user@host#key> Pair with the other machine"
+    echo "  relay accept <name@user@host#key> Complete pairing (if join couldn't SSH)"
+    echo "  relay send <peer> <message>     Send a signed message"
+    echo "  relay send-file <peer> <path>   Send a file (diffs, patches, images)"
+    echo "  relay monitor [filter]          Stream incoming (for agent monitors)"
+    echo "  relay peers                     List paired machines"
+    echo "  relay logs [count]              Show recent messages"
+    echo "  relay pubkey                    Print your public key"
     ;;
   *) die "Unknown command: $1" ;;
 esac
