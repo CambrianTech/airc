@@ -83,57 +83,15 @@ if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
   ok "Added relay key to authorized_keys"
 fi
 
-# ── Ensure SSH daemon is running ────────────────────────────────────────
-
-if ! nc -z localhost 22 2>/dev/null || ! ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
-  info "Enabling SSH (Remote Login)..."
-  if [ "$(uname)" = "Darwin" ]; then
-    # Try to get sshd working — check why launchd won't spawn it
-    info "Checking sshd config..."
-    sudo /usr/sbin/sshd -t 2>&1 && ok "sshd config OK" || info "sshd config error (see above)"
-    info "Checking system log for sshd..."
-    log show --predicate 'process == "sshd"' --last 2m --style compact 2>/dev/null | tail -5 || true
-    # Try triggering sshd spawn by connecting
-    ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1 && { ok "SSH is working"; } || {
-      info "sshd not spawning. Trying direct start on port 2222 as fallback..."
-      sudo /usr/sbin/sshd -p 2222 2>&1 || true
-      if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new -p 2222 localhost "echo ok" >/dev/null 2>&1; then
-        ok "SSH working on port 2222 (sshd started manually)"
-        # Save port to config so relay uses it
-        if [ -f "$RELAY_HOME/config.json" ]; then
-          python3 -c "
-import json
-c = json.load(open('$RELAY_HOME/config.json'))
-c['ssh_port'] = 2222
-json.dump(c, open('$RELAY_HOME/config.json','w'), indent=2)
-" 2>/dev/null
-        fi
-      else
-        info "SSH not working. System log:"
-        log show --predicate 'process == "sshd"' --last 1m --style compact 2>/dev/null | tail -10 || true
-      fi
-    }
-  else
-    sudo -n systemctl start sshd 2>/dev/null \
-      || sudo -n service ssh start 2>/dev/null \
-      || sudo -n /usr/sbin/sshd 2>/dev/null \
-      || true
-    sleep 1
-    if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
-      ok "SSH is working"
-    else
-      info "Could not start sshd. Run: sudo systemctl start sshd"
-    fi
-  fi
-else
-  ok "SSH is working"
-fi
+# SSH is only needed for hosting — relay connect (with no args) handles that.
+# Joiners just SSH out, which always works.
 
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
 ok "Installed."
 echo ""
-echo "  relay start <your-name>    # on this machine"
-echo "  relay join <name@host>     # on the other machine"
+echo "  relay connect                        # host — wait for peers"
+echo "  relay connect <name@user@host#key>   # join a host"
+echo "  relay send <peer> <message>          # send a message"
 echo ""

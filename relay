@@ -268,7 +268,7 @@ PEER
 
 cmd_join() {
   local target="${1:-}"
-  [ -z "$target" ] && die "Usage: relay join <name@user@host#pubkey>"
+  [ -z "$target" ] && die "Usage: relay connect <name@user@host#pubkey>"
 
   # Parse name@user@host:port#base64-ssh-pubkey
   local host_ssh_pubkey_b64=""
@@ -281,7 +281,6 @@ cmd_join() {
   peer_name="${target%%@*}"
   ssh_target="${target#*@}"
 
-  # Parse port from host if present (user@host:port)
   if echo "$ssh_target" | grep -q ':'; then
     peer_port="${ssh_target##*:}"
     ssh_target="${ssh_target%:*}"
@@ -289,13 +288,11 @@ cmd_join() {
 
   [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Invalid target. Format: name@user@host#pubkey"
 
-  # Initialize if needed (non-interactive)
+  # Initialize if needed
   if [ ! -f "$CONFIG" ]; then
     local my_name
     my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
-    # Inline init — no listener, no blocking
     mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
-    ensure_sshd || die "SSH is not working on this machine. Cannot proceed."
     if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
       openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
       openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
@@ -315,17 +312,27 @@ cmd_join() {
 {
   "name": "$my_name",
   "host": "$(get_host)",
+  "host_target": "$ssh_target",
+  "host_port": $peer_port,
   "created": "$(timestamp)"
 }
 EOF
     touch "$MESSAGES"
     echo "  Initialized as '$my_name'"
+  else
+    # Update config with host info
+    python3 -c "
+import json
+c = json.load(open('$CONFIG'))
+c['host_target'] = '$ssh_target'
+c['host_port'] = $peer_port
+json.dump(c, open('$CONFIG','w'), indent=2)
+" 2>/dev/null
   fi
 
   ensure_init
-  ensure_sshd || die "SSH is not working on this machine. Cannot proceed."
 
-  # Authorize host's SSH public key locally (so host can send us messages)
+  # Authorize host's SSH pubkey locally (for future use)
   if [ -n "$host_ssh_pubkey_b64" ]; then
     local host_ssh_pubkey
     host_ssh_pubkey=$(echo "$host_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$host_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
@@ -335,124 +342,32 @@ EOF
         echo "$host_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
         chmod 600 "$HOME/.ssh/authorized_keys"
       }
-      echo "  Authorized host's SSH key"
     fi
   fi
 
-  # Try SSH to host to complete bidirectional key exchange
-  echo "  Connecting to $ssh_target..."
-  local my_name my_host
+  # Connect to host, register ourselves
+  echo "  Connecting to $ssh_target:$peer_port..."
+  local my_name
   my_name=$(get_name)
-  my_host="$(whoami)@$(get_host)"
 
-  # One SSH session: push our key, grab their keys, register peer, test reverse
-  local exchange_result
-  exchange_result=$(relay_ssh -p "$peer_port" "$ssh_target" "
-    # 1. Authorize joiner's SSH key
+  if relay_ssh -p "$peer_port" "$ssh_target" "
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
     grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
-
-    # 2. Register joiner as peer
     mkdir -p ~/.agent-relay/peers
-    cat > ~/.agent-relay/peers/${my_name}.json << PEER
-{\"name\":\"${my_name}\",\"host\":\"${my_host}\",\"paired\":\"$(timestamp)\"}
-PEER
+    echo '{\"name\":\"${my_name}\",\"host\":\"$(whoami)@$(get_host)\",\"paired\":\"$(timestamp)\"}' > ~/.agent-relay/peers/${my_name}.json
     cat > ~/.agent-relay/peers/${my_name}.pub << SIGNKEY
 $(cat "$IDENTITY_DIR/public.pem")
 SIGNKEY
-
-    # 3. Output host's keys for joiner to save
-    echo \"SSH_PUB:\$(cat ~/.agent-relay/identity/ssh_key.pub 2>/dev/null)\"
-    echo \"SIGN_PUB_START\"
-    cat ~/.agent-relay/identity/public.pem 2>/dev/null
-    echo \"SIGN_PUB_END\"
-
-    # 4. Test reverse: SSH back to joiner
-    if ssh -i ~/.agent-relay/identity/ssh_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ${my_host} 'echo ok' 2>/dev/null; then
-      echo 'REVERSE:OK'
-    else
-      echo 'REVERSE:FAIL'
-    fi
-  " 2>/dev/null)
-
-  if [ -n "$exchange_result" ]; then
-    # Parse host's SSH pubkey
-    local remote_ssh_pubkey
-    remote_ssh_pubkey=$(echo "$exchange_result" | grep '^SSH_PUB:' | sed 's/^SSH_PUB://')
-    if [ -n "$remote_ssh_pubkey" ]; then
-      grep -qF "$remote_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
-        echo "$remote_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
-      }
-    fi
-
-    # Parse host's signing pubkey
-    local remote_pubkey
-    remote_pubkey=$(echo "$exchange_result" | sed -n '/^SIGN_PUB_START$/,/^SIGN_PUB_END$/p' | grep -v 'SIGN_PUB_')
-
-    # Save peer
-    mkdir -p "$PEERS_DIR"
-    [ -n "$remote_pubkey" ] && echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
-    cat > "$PEERS_DIR/${peer_name}.json" << EOF
-{
-  "name": "$peer_name",
-  "host": "$ssh_target",
-  "port": $peer_port,
-  "paired": "$(timestamp)"
-}
-EOF
-
-    # Check reverse result
-    if echo "$exchange_result" | grep -q 'REVERSE:OK'; then
-      echo "  Paired with '$peer_name' (bidirectional)"
-    else
-      echo "  Paired with '$peer_name' (one-way: you→host works, host→you FAILED)"
-      echo ""
-      echo "  Remote Login (SSH) needs to be enabled on THIS machine."
-      if [ "$(uname)" = "Darwin" ]; then
-        echo "  Trying to enable it..."
-        if sudo -n systemsetup -setremotelogin on 2>/dev/null; then
-          echo "  Enabled! Retry: relay join $1"
-        else
-          echo "  Need manual step — opening System Settings..."
-          open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null \
-            || open "x-apple.systempreferences:com.apple.preference.sharing" 2>/dev/null \
-            || true
-          echo "  → Turn on 'Remote Login' then retry: relay join $1"
-        fi
-      else
-        echo "  Run: sudo systemctl start sshd"
-      fi
-    fi
+    echo 'OK'
+  " 2>/dev/null | grep -q 'OK'; then
+    echo "  Connected to '$peer_name'"
     echo ""
     echo "  Starting monitor..."
     cmd_monitor &
   else
-    # SSH failed — save what we can, tell user how to complete
-    mkdir -p "$PEERS_DIR"
-    cat > "$PEERS_DIR/${peer_name}.json" << EOF
-{
-  "name": "$peer_name",
-  "host": "$ssh_target",
-  "port": $peer_port,
-  "paired": "$(timestamp)"
-}
-EOF
-
-    local my_ssh_pubkey_b64
-    my_ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
-
-    echo ""
-    echo "  Partially paired with '$peer_name'"
-    echo "  Host can send to you, but you can't send to host yet."
-    echo ""
-    echo "  To complete pairing, have the host run:"
-    echo ""
-    echo "    relay accept ${my_name}@${my_host}#${my_ssh_pubkey_b64}"
-    echo ""
-    echo "  Starting monitor..."
-    cmd_monitor &
+    die "Can't reach $ssh_target:$peer_port. Check that the host has SSH enabled and relay is running."
   fi
 }
 
@@ -514,37 +429,29 @@ cmd_send() {
   [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: relay send <peer> <message>"
   ensure_init
 
-  local peer_file="$PEERS_DIR/${peer_name}.json"
-  [ -f "$peer_file" ] || die "Unknown peer: $peer_name. Run: relay peers"
-
-  local peer_host my_name ts
-  peer_host=$(python3 -c "import json; print(json.load(open('$peer_file'))['host'])" 2>/dev/null)
+  local my_name ts
   my_name=$(get_name)
   ts=$(timestamp)
 
   local escaped_msg
   escaped_msg=$(printf '%s' "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
 
-  local payload="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\"}"
+  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\"}"
   local sig
   sig=$(sign_message "$payload")
-  local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
-  # Detect local peer
-  local peer_hostname my_hostname is_local=false
-  peer_hostname="${peer_host##*@}"
-  my_hostname=$(hostname)
-  [ "$peer_hostname" = "$my_hostname" ] && is_local=true
-  [ "$peer_hostname" = "localhost" ] && is_local=true
-  [ "$peer_hostname" = "$(get_host)" ] && is_local=true
+  # All messages go to the host's log
+  local host_target host_port
+  host_target=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('host_target',''))" 2>/dev/null || true)
+  host_port=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('host_port', 22))" 2>/dev/null || echo "22")
 
-  if [ "$is_local" = true ]; then
-    echo "$full_msg" >> "$MESSAGES"
+  if [ -n "$host_target" ]; then
+    # Joiner: send to host via SSH
+    relay_ssh -p "$host_port" "$host_target" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+      || die "Failed to deliver to host ($host_target)"
   else
-    local peer_port
-    peer_port=$(get_peer_port "$peer_file")
-    relay_ssh -p "$peer_port" "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
-      || die "Failed to deliver to $peer_host:$peer_port"
+    # Host: write locally
     echo "$full_msg" >> "$MESSAGES"
   fi
 }
@@ -601,15 +508,27 @@ cmd_monitor() {
   local my_name
   my_name=$(get_name)
 
-  local last
-  last=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
+  # Determine if we're a joiner (read from host) or host (read local)
+  local host_target host_port
+  host_target=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('host_target',''))" 2>/dev/null || true)
+  host_port=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('host_port', 22))" 2>/dev/null || echo "22")
+
+  local last=0
   while true; do
-    local now
-    now=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
-    if [ "$now" -gt "$last" ] 2>/dev/null; then
-      local new_lines
-      new_lines=$(sed -n "$(($last+1)),${now}p" "$MESSAGES")
-      echo "$new_lines" | while IFS= read -r line; do
+    local lines
+    if [ -n "$host_target" ]; then
+      # Joiner: read host's messages via SSH
+      lines=$(relay_ssh -p "$host_port" "$host_target" "tail -n +$((last+1)) ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+    else
+      # Host: read local
+      lines=$(tail -n +$((last+1)) "$MESSAGES" 2>/dev/null) || true
+    fi
+
+    if [ -n "$lines" ]; then
+      local count
+      count=$(echo "$lines" | wc -l)
+      last=$((last + count))
+      echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
         local msg_from
         msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
@@ -620,7 +539,6 @@ cmd_monitor() {
           echo "$line"
         fi
       done
-      last=$now
     fi
     sleep 5
   done
