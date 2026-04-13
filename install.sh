@@ -88,8 +88,8 @@ fi
 if ! nc -z localhost 22 2>/dev/null || ! ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
-    # Kill ghost listener, start sshd fresh
-    sudo kill -9 $(sudo lsof -t -i :22) 2>/dev/null || true
+    # Unload launchd's ssh plist (frees port 22), then start sshd directly
+    sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
     sleep 1
     sudo /usr/sbin/sshd 2>&1 || true
     sleep 1
