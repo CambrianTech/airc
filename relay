@@ -267,25 +267,51 @@ EOF
   my_name=$(get_name)
   my_host="$(whoami)@$(get_host)"
 
-  if relay_ssh "$ssh_target" "
+  # One SSH session: push our key, grab their keys, register peer, test reverse
+  local exchange_result
+  exchange_result=$(relay_ssh "$ssh_target" "
+    # 1. Authorize joiner's SSH key
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
     grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
-  " 2>/dev/null; then
-    # SSH worked — full exchange
-    # Fetch host's signing key
-    local remote_pubkey
-    remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) || true
 
-    # Fetch host's SSH public key (belt + suspenders with join string key)
+    # 2. Register joiner as peer
+    mkdir -p ~/.agent-relay/peers
+    cat > ~/.agent-relay/peers/${my_name}.json << PEER
+{\"name\":\"${my_name}\",\"host\":\"${my_host}\",\"paired\":\"$(timestamp)\"}
+PEER
+    cat > ~/.agent-relay/peers/${my_name}.pub << SIGNKEY
+$(cat "$IDENTITY_DIR/public.pem")
+SIGNKEY
+
+    # 3. Output host's keys for joiner to save
+    echo \"SSH_PUB:\$(cat ~/.agent-relay/identity/ssh_key.pub 2>/dev/null)\"
+    echo \"SIGN_PUB_START\"
+    cat ~/.agent-relay/identity/public.pem 2>/dev/null
+    echo \"SIGN_PUB_END\"
+
+    # 4. Test reverse: SSH back to joiner
+    if ssh -i ~/.agent-relay/identity/ssh_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ${my_host} 'echo ok' 2>/dev/null; then
+      echo 'REVERSE:OK'
+    else
+      echo 'REVERSE:FAIL'
+    fi
+  " 2>/dev/null)
+
+  if [ -n "$exchange_result" ]; then
+    # Parse host's SSH pubkey
     local remote_ssh_pubkey
-    remote_ssh_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/ssh_key.pub" 2>/dev/null) || true
+    remote_ssh_pubkey=$(echo "$exchange_result" | grep '^SSH_PUB:' | sed 's/^SSH_PUB://')
     if [ -n "$remote_ssh_pubkey" ]; then
       grep -qF "$remote_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
         echo "$remote_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
       }
     fi
+
+    # Parse host's signing pubkey
+    local remote_pubkey
+    remote_pubkey=$(echo "$exchange_result" | sed -n '/^SIGN_PUB_START$/,/^SIGN_PUB_END$/p' | grep -v 'SIGN_PUB_')
 
     # Save peer
     mkdir -p "$PEERS_DIR"
@@ -298,29 +324,13 @@ EOF
 }
 EOF
 
-    # Push our signing key + peer info to host
-    relay_ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
-    cat "$IDENTITY_DIR/public.pem" | relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
-    relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
-{
-  "name": "$my_name",
-  "host": "$my_host",
-  "paired": "$(timestamp)"
-}
-EOF
-
-    # Verify reverse direction: host SSHes back to us
-    echo "  Verifying reverse connectivity..."
-    if relay_ssh "$ssh_target" "ssh -i ~/.agent-relay/identity/ssh_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ${my_host} 'echo ok'" 2>/dev/null; then
-      echo "  Bidirectional SSH verified"
+    # Check reverse result
+    if echo "$exchange_result" | grep -q 'REVERSE:OK'; then
+      echo "  Paired with '$peer_name' (bidirectional)"
     else
-      echo "  WARNING: Host cannot reach you via SSH."
-      echo "  Host can receive your messages but cannot send to you."
-      echo "  Check that sshd is running and port 22 is accessible on this machine."
+      echo "  Paired with '$peer_name' (one-way: you→host works, host→you FAILED)"
+      echo "  Check that sshd is running and port 22 is open on this machine."
     fi
-
-    echo ""
-    echo "  Paired with '$peer_name'"
     echo ""
     echo "  Send a message:  relay send $peer_name 'hello'"
     echo "  Start monitor:   relay monitor"
