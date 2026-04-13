@@ -202,7 +202,8 @@ EOF
 
     # Register with host
     echo "  Connecting to $ssh_target:$peer_port..."
-    if relay_ssh -p "$peer_port" "$ssh_target" "
+    local ssh_output
+    ssh_output=$(relay_ssh -p "$peer_port" "$ssh_target" "
       mkdir -p ~/.ssh && chmod 700 ~/.ssh
       KEY='$(cat "$IDENTITY_DIR/ssh_key.pub")'
       grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
@@ -213,7 +214,9 @@ EOF
 $(cat "$IDENTITY_DIR/public.pem")
 SIGNKEY
       echo 'OK'
-    " 2>/dev/null | grep -q 'OK'; then
+    " 2>&1)
+
+    if echo "$ssh_output" | grep -q 'OK'; then
       echo "  Connected to '$peer_name'"
       echo "  Monitoring for messages..."
       monitor
@@ -221,9 +224,7 @@ SIGNKEY
       echo ""
       echo "  FAILED to connect to $ssh_target:$peer_port"
       echo ""
-      echo "  Diagnostics:"
-      echo "    Host reachable: $(nc -z "$peer_host_only" "$peer_port" 2>/dev/null && echo 'yes' || echo 'NO — host may not be running relay connect')"
-      echo "    SSH handshake:  $(relay_ssh -p "$peer_port" -o ConnectTimeout=3 "$ssh_target" 'echo ok' 2>&1 | tail -1)"
+      echo "  SSH output: $ssh_output"
       echo ""
       echo "  Check that the host has run 'relay connect' and SSH is working there."
       exit 1
