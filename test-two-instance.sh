@@ -47,7 +47,7 @@ case "$MODE" in
     echo "[verify] 1. config on join side:"
     cat .airc/config.json
     echo ""
-    echo "[verify] 2. peer record (should contain host_relay_home):"
+    echo "[verify] 2. peer record (should contain host_airc_home):"
     ls .airc/peers/ && cat .airc/peers/*.json
     echo ""
     echo "[verify] 3. sending test message to host-test:"

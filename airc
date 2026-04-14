@@ -37,7 +37,7 @@ relay_list() {
 }
 
 # Common paths via the resolver. Legacy global vars remain for back-compat.
-RELAY_HOME="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
+AIRC_WRITE_DIR="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
 CONFIG="$(relay_path config.json)"
 IDENTITY_DIR="$(relay_path identity)"
 PEERS_DIR="$(relay_path peers)"
@@ -92,18 +92,18 @@ relay_ssh() {
   fi
 }
 
-# Return the remote's RELAY_HOME path (from config), or ~/.airc as fallback.
+# Return the remote's AIRC_WRITE_DIR path (from config), or ~/.airc as fallback.
 # Used for constructing SSH paths when talking to the host we joined.
 remote_home() {
   local h
-  h=$(get_config_val host_relay_home "")
+  h=$(get_config_val host_airc_home "")
   [ -z "$h" ] && h='$HOME/.airc'
   echo "$h"
 }
 
 # Resolve this session's peer name.
 # Priority: AIRC_NAME env > config.json name > cwd basename > hostname.
-# Multiple sessions on one machine get distinct names by using different RELAY_HOMEs
+# Multiple sessions on one machine get distinct names by using different AIRC_WRITE_DIRs
 # with cwd-derived defaults, or by setting AIRC_NAME explicitly.
 resolve_name() {
   local name=""
@@ -125,7 +125,7 @@ resolve_name() {
 
 init_identity() {
   local name="$1"
-  mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
+  mkdir -p "$AIRC_WRITE_DIR" "$IDENTITY_DIR" "$PEERS_DIR"
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
     openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
     openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
@@ -180,7 +180,16 @@ monitor() {
             new_pub="$(dirname "$old_json")/$new_n.pub"
             mv "$old_json" "$new_json" 2>/dev/null || true
             [ -f "$old_pub" ] && mv "$old_pub" "$new_pub" 2>/dev/null
-            echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
+            # Update the name field inside the JSON so `airc peers` reflects it
+            python3 -c "
+import json
+try:
+    d = json.load(open('$new_json'))
+    d['name'] = '$new_n'
+    json.dump(d, open('$new_json', 'w'), indent=2)
+except: pass
+" 2>/dev/null || true
+            echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
             continue
           fi
         fi
@@ -189,17 +198,17 @@ monitor() {
     fi
 
     # Reminder: nudge once if no SEND for interval, don't repeat until next send
-    local reminder_file="$RELAY_HOME/reminder"
-    local reminded_file="$RELAY_HOME/reminded"
+    local reminder_file="$AIRC_WRITE_DIR/reminder"
+    local reminded_file="$AIRC_WRITE_DIR/reminded"
     if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
       local interval; interval=$(cat "$reminder_file" 2>/dev/null)
       if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
         local now; now=$(date +%s)
         local last_sent=0
-        [ -f "$RELAY_HOME/last_sent" ] && last_sent=$(cat "$RELAY_HOME/last_sent" 2>/dev/null)
+        [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
         local silent=$(( now - last_sent ))
         if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'airc reminder off' to disable.\"}"
+          echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'airc reminder off' to disable.\"}"
           touch "$reminded_file"  # Don't fire again until next send
         fi
       fi
@@ -212,7 +221,7 @@ monitor() {
 cmd_reminder() {
   ensure_init
   local arg="${1:-status}"
-  local reminder_file="$RELAY_HOME/reminder"
+  local reminder_file="$AIRC_WRITE_DIR/reminder"
 
   case "$arg" in
     off|0)
@@ -310,7 +319,7 @@ payload = json.dumps({
     'host': '$(whoami)@$(get_host)',
     'ssh_pub': '''$my_ssh_pub''',
     'sign_pub': '''$my_sign_pub''',
-    'relay_home': '$RELAY_HOME'
+    'airc_home': '$AIRC_WRITE_DIR'
 })
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(30)
@@ -337,9 +346,9 @@ print(data.decode().strip())
       }
     fi
 
-    # Save host as a peer (with their relay_home so wire paths are correct)
-    local host_relay_home
-    host_relay_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('relay_home',''))" 2>/dev/null || true)
+    # Save host as a peer (with their airc_home so wire paths are correct)
+    local host_airc_home
+    host_airc_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
     python3 -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
@@ -347,18 +356,18 @@ os.makedirs(peers_dir, exist_ok=True)
 record = {
     'name': '$peer_name',
     'host': '$ssh_target',
-    'relay_home': '$host_relay_home',
+    'airc_home': '$host_airc_home',
     'paired': '$(timestamp)'
 }
 with open(os.path.join(peers_dir, '$peer_name.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
 
-    # Persist host_relay_home in own config for quick wire-path lookups
+    # Persist host_airc_home in own config for quick wire-path lookups
     python3 -c "
 import json
 c = json.load(open('$CONFIG'))
-c['host_relay_home'] = '$host_relay_home'
+c['host_airc_home'] = '$host_airc_home'
 json.dump(c, open('$CONFIG', 'w'), indent=2)
 " 2>/dev/null || true
 
@@ -366,8 +375,8 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
     local host_reminder
     host_reminder=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
     if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
-      echo "$host_reminder" > "$RELAY_HOME/reminder"
-      date +%s > "$RELAY_HOME/last_sent"
+      echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
+      date +%s > "$AIRC_WRITE_DIR/last_sent"
     fi
 
     # Verify SSH works
@@ -406,8 +415,8 @@ EOF
 
     # Set reminder interval from host
     if [ "$reminder_interval" -gt 0 ] 2>/dev/null; then
-      echo "$reminder_interval" > "$RELAY_HOME/reminder"
-      date +%s > "$RELAY_HOME/last_sent"
+      echo "$reminder_interval" > "$AIRC_WRITE_DIR/reminder"
+      date +%s > "$AIRC_WRITE_DIR/last_sent"
     fi
 
     echo ""
@@ -456,20 +465,20 @@ with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
     json.dump({
         'name': jname,
         'host': joiner.get('host',''),
-        'relay_home': joiner.get('relay_home', ''),
+        'airc_home': joiner.get('airc_home', ''),
         'paired': '$(timestamp)'
     }, f, indent=2)
 if joiner.get('sign_pub'):
     with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
         f.write(joiner['sign_pub'])
 
-# Send back host's SSH pubkey and relay_home
+# Send back host's SSH pubkey and airc_home
 host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
 response = json.dumps({
     'ssh_pub': host_pub,
     'name': '$name',
     'reminder': $reminder_interval,
-    'relay_home': '$RELAY_HOME'
+    'airc_home': '$AIRC_WRITE_DIR'
 })
 conn.sendall((response + '\n').encode())
 conn.close()
@@ -547,8 +556,8 @@ cmd_send() {
   fi
 
   # Reset reminder — you sent something, clock restarts
-  date +%s > "$RELAY_HOME/last_sent" 2>/dev/null
-  rm -f "$RELAY_HOME/reminded" 2>/dev/null
+  date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+  rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
 }
 
 cmd_send_file() {
