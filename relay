@@ -8,11 +8,40 @@
 
 set -euo pipefail
 
-RELAY_HOME="${AGENT_RELAY_HOME:-$HOME/.agent-relay}"
-CONFIG="$RELAY_HOME/config.json"
-IDENTITY_DIR="$RELAY_HOME/identity"
-PEERS_DIR="$RELAY_HOME/peers"
-MESSAGES="$RELAY_HOME/messages.jsonl"
+# Two-tier state. Opt-in local: create $PWD/.agent-relay/ for per-project identity.
+# Otherwise $HOME/.agent-relay/ is the one-identity-per-machine default (vanilla).
+# AGENT_RELAY_HOME collapses everything to one explicit tier (explicit override).
+HOME_TIER="${AGENT_RELAY_HOME:-$HOME/.agent-relay}"
+LOCAL_TIER=""
+[ -z "${AGENT_RELAY_HOME:-}" ] && [ -d "$PWD/.agent-relay" ] && LOCAL_TIER="$PWD/.agent-relay"
+
+# Resolver: give it a subpath, get the effective file path.
+# Reads: returns the tier that owns the file (local wins).
+# Writes: new files land in local if opted in, else home; updates hit their owner.
+relay_path() {
+  local sub="$1"
+  [ -n "$LOCAL_TIER" ] && [ -e "$LOCAL_TIER/$sub" ] && { echo "$LOCAL_TIER/$sub"; return; }
+  [ -e "$HOME_TIER/$sub" ]                        && { echo "$HOME_TIER/$sub";  return; }
+  [ -n "$LOCAL_TIER" ]                            && { echo "$LOCAL_TIER/$sub"; return; }
+  echo "$HOME_TIER/$sub"
+}
+
+# Union listing of entries under a subdir, local-first, deduped by name.
+# Use when you want every <name> across tiers, e.g. peers.
+relay_list() {
+  local sub="$1"
+  {
+    [ -n "$LOCAL_TIER" ] && [ -d "$LOCAL_TIER/$sub" ] && ls -1 "$LOCAL_TIER/$sub" 2>/dev/null
+    [ -d "$HOME_TIER/$sub" ] && ls -1 "$HOME_TIER/$sub" 2>/dev/null
+  } | awk '!seen[$0]++'
+}
+
+# Common paths via the resolver. Legacy global vars remain for back-compat.
+RELAY_HOME="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
+CONFIG="$(relay_path config.json)"
+IDENTITY_DIR="$(relay_path identity)"
+PEERS_DIR="$(relay_path peers)"
+MESSAGES="$(relay_path messages.jsonl)"
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -140,12 +169,17 @@ monitor() {
         # Handle [rename] protocol messages: update peer record and surface as info
         msg_text=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('msg',''))" 2>/dev/null || true)
         if [[ "$msg_text" == "[rename] old="* ]]; then
-          local old_n new_n
+          local old_n new_n old_json old_pub new_json new_pub
           old_n=$(echo "$msg_text" | sed -n 's/.*old=\([a-z0-9-]*\).*/\1/p')
           new_n=$(echo "$msg_text" | sed -n 's/.*new=\([a-z0-9-]*\).*/\1/p')
-          if [ -n "$old_n" ] && [ -n "$new_n" ] && [ -f "$PEERS_DIR/$old_n.json" ]; then
-            mv "$PEERS_DIR/$old_n.json" "$PEERS_DIR/$new_n.json" 2>/dev/null || true
-            [ -f "$PEERS_DIR/$old_n.pub" ] && mv "$PEERS_DIR/$old_n.pub" "$PEERS_DIR/$new_n.pub" 2>/dev/null
+          old_json=$(relay_path "peers/$old_n.json")
+          if [ -n "$old_n" ] && [ -n "$new_n" ] && [ -f "$old_json" ]; then
+            # Rename within the same tier that owns the peer record
+            new_json="$(dirname "$old_json")/$new_n.json"
+            old_pub="$(dirname "$old_json")/$old_n.pub"
+            new_pub="$(dirname "$old_json")/$new_n.pub"
+            mv "$old_json" "$new_json" 2>/dev/null || true
+            [ -f "$old_pub" ] && mv "$old_pub" "$new_pub" 2>/dev/null
             echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
             continue
           fi
@@ -216,16 +250,21 @@ cmd_connect() {
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
-    # Parse name@user@host#pubkey
+    # Parse name@user@host[:port]#pubkey
     local host_ssh_pubkey_b64=""
     if echo "$target" | grep -q '#'; then
       host_ssh_pubkey_b64="${target##*#}"
       target="${target%%#*}"
     fi
 
-    local peer_name ssh_target
+    local peer_name ssh_target peer_port="7547"
     peer_name="${target%%@*}"
     ssh_target="${target#*@}"
+    # Extract :port if present at the end of the host part
+    if echo "$ssh_target" | grep -qE ':[0-9]+$'; then
+      peer_port="${ssh_target##*:}"
+      ssh_target="${ssh_target%:*}"
+    fi
 
     [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: relay connect name@user@host"
 
@@ -258,7 +297,7 @@ EOF
 
     # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
-    echo "  Connecting to $peer_host_only:7547..."
+    echo "  Connecting to $peer_host_only:$peer_port..."
     local my_ssh_pub my_sign_pub
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
@@ -275,7 +314,7 @@ payload = json.dumps({
 })
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(30)
-sock.connect(('$peer_host_only', 7547))
+sock.connect(('$peer_host_only', $peer_port))
 sock.sendall((payload + '\n').encode())
 sock.shutdown(socket.SHUT_WR)
 data = b''
@@ -285,7 +324,7 @@ while True:
     data += chunk
 sock.close()
 print(data.decode().strip())
-" 2>&1) || die "Can't reach $peer_host_only:7547. Is the host running 'relay connect'?"
+" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'relay connect'?"
 
     # Authorize host's SSH pubkey
     local host_ssh_pub
@@ -359,6 +398,11 @@ EOF
     local host; host=$(get_host)
     local user; user=$(whoami)
     local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
+    # Port override: AGENT_RELAY_PORT env var, default 7547. Only include
+    # :port in the join string when non-default, keeping strings compact.
+    local host_port="${AGENT_RELAY_PORT:-7547}"
+    local port_suffix=""
+    [ "$host_port" != "7547" ] && port_suffix=":$host_port"
 
     # Set reminder interval from host
     if [ "$reminder_interval" -gt 0 ] 2>/dev/null; then
@@ -370,9 +414,9 @@ EOF
     echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
     echo "  On the other machine:"
-    echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
+    echo "    relay connect ${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
     echo ""
-    echo "  Waiting for peers on port 7547..."
+    echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
     while true; do
       python3 -c "
@@ -380,7 +424,7 @@ import socket, json, sys, os
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(('0.0.0.0', 7547))
+sock.bind(('0.0.0.0', $host_port))
 sock.listen(1)
 conn, addr = sock.accept()
 data = b''
@@ -463,15 +507,14 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 "
   echo "  Renamed: $old_name → $new_name"
 
-  # Best-effort broadcast to paired peers so they can update their records
+  # Best-effort broadcast to every paired peer across tiers.
   # Peer consumers recognize '[rename]' prefix and update peer file accordingly.
-  if [ -d "$PEERS_DIR" ]; then
-    for peer_json in "$PEERS_DIR"/*.json; do
-      [ -f "$peer_json" ] || continue
-      local peer; peer=$(basename "$peer_json" .json)
-      cmd_send "$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
-    done
-  fi
+  local entry
+  for entry in $(relay_list peers); do
+    case "$entry" in *.json) ;; *) continue ;; esac
+    local peer; peer="${entry%.json}"
+    cmd_send "$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
+  done
 }
 
 cmd_send() {
@@ -535,7 +578,10 @@ cmd_send_file() {
 cmd_peers() {
   ensure_init
   local found=false
-  for f in "$PEERS_DIR"/*.json; do
+  local entry
+  for entry in $(relay_list peers); do
+    case "$entry" in *.json) ;; *) continue ;; esac
+    local f; f=$(relay_path "peers/$entry")
     [ -f "$f" ] || continue
     found=true
     local name host
@@ -593,6 +639,8 @@ case "${1:-help}" in
     echo "Identity resolution (highest priority first):"
     echo "  AGENT_RELAY_NAME env var > config.json name > cwd basename > hostname"
     echo "  AGENT_RELAY_HOME env var overrides state dir (default \$HOME/.agent-relay)"
+    echo "  AGENT_RELAY_PORT env var overrides host listen port (default 7547)"
+    echo "  Join string may include :port after host, e.g. name@user@host:7548#key"
     ;;
   *) die "Unknown command: $1. Try: relay help" ;;
 esac
