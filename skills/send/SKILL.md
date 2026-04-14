@@ -15,12 +15,14 @@ If `relay` is not on PATH, install it first:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
 ```
 
+Project-scoped state: always prefix with `AGENT_RELAY_HOME=$PWD/.agent-relay` so you target the identity and peer list established via `/relay:connect`. If `AGENT_RELAY_HOME` is already exported, respect it.
+
 Parse the first word of `$ARGUMENTS` as the peer name, the rest as the message:
 
 ```bash
-relay send $ARGUMENTS
+AGENT_RELAY_HOME=$PWD/.agent-relay relay send $ARGUMENTS
 ```
 
 If no arguments provided, ask the user who to message and what to say.
 
-Note: `relay connect` must be running (it handles monitoring). If not connected, tell the user to run `/relay:connect` first.
+Note: `relay connect` must be running in a Monitor (it handles the inbound stream). If not connected, tell the user to run `/relay:connect` first.

@@ -63,6 +63,37 @@ relay_ssh() {
   fi
 }
 
+# Return the remote's RELAY_HOME path (from config), or ~/.agent-relay as fallback.
+# Used for constructing SSH paths when talking to the host we joined.
+remote_home() {
+  local h
+  h=$(get_config_val host_relay_home "")
+  [ -z "$h" ] && h='$HOME/.agent-relay'
+  echo "$h"
+}
+
+# Resolve this session's peer name.
+# Priority: AGENT_RELAY_NAME env > config.json name > cwd basename > hostname.
+# Multiple sessions on one machine get distinct names by using different RELAY_HOMEs
+# with cwd-derived defaults, or by setting AGENT_RELAY_NAME explicitly.
+resolve_name() {
+  local name=""
+  if [ -n "${AGENT_RELAY_NAME:-}" ]; then
+    name="$AGENT_RELAY_NAME"
+  elif [ -f "$CONFIG" ]; then
+    name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  fi
+  if [ -z "$name" ]; then
+    # Auto-derive from cwd basename — contextual and human-readable
+    # e.g. /path/to/vHSM → vhsm, /path/to/continuum → continuum
+    local cwd_base
+    cwd_base=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+    [ -n "$cwd_base" ] && [ "$cwd_base" != "-" ] && name="$cwd_base"
+  fi
+  [ -z "$name" ] && name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+  echo "$name"
+}
+
 init_identity() {
   local name="$1"
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
@@ -92,7 +123,8 @@ monitor() {
   while true; do
     local lines=""
     if [ -n "$host_target" ]; then
-      lines=$(relay_ssh "$host_target" "tail -n +$((last+1)) ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+      local rhome; rhome=$(remote_home)
+      lines=$(relay_ssh "$host_target" "tail -n +$((last+1)) $rhome/messages.jsonl 2>/dev/null" 2>/dev/null) || true
     else
       lines=$(tail -n +$((last+1)) "$MESSAGES" 2>/dev/null) || true
     fi
@@ -102,9 +134,22 @@ monitor() {
       last_activity=$(date +%s)
       echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
-        local msg_from
+        local msg_from msg_text
         msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
         [ "$msg_from" = "$my_name" ] && continue
+        # Handle [rename] protocol messages: update peer record and surface as info
+        msg_text=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('msg',''))" 2>/dev/null || true)
+        if [[ "$msg_text" == "[rename] old="* ]]; then
+          local old_n new_n
+          old_n=$(echo "$msg_text" | sed -n 's/.*old=\([a-z0-9-]*\).*/\1/p')
+          new_n=$(echo "$msg_text" | sed -n 's/.*new=\([a-z0-9-]*\).*/\1/p')
+          if [ -n "$old_n" ] && [ -n "$new_n" ] && [ -f "$PEERS_DIR/$old_n.json" ]; then
+            mv "$PEERS_DIR/$old_n.json" "$PEERS_DIR/$new_n.json" 2>/dev/null || true
+            [ -f "$PEERS_DIR/$old_n.pub" ] && mv "$PEERS_DIR/$old_n.pub" "$PEERS_DIR/$new_n.pub" 2>/dev/null
+            echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
+            continue
+          fi
+        fi
         echo "$line"
       done
     fi
@@ -185,7 +230,7 @@ cmd_connect() {
     [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: relay connect name@user@host"
 
     local my_name
-    my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+    my_name=$(resolve_name)
     init_identity "$my_name"
 
     cat > "$CONFIG" << EOF
@@ -225,7 +270,8 @@ payload = json.dumps({
     'name': '$my_name',
     'host': '$(whoami)@$(get_host)',
     'ssh_pub': '''$my_ssh_pub''',
-    'sign_pub': '''$my_sign_pub'''
+    'sign_pub': '''$my_sign_pub''',
+    'relay_home': '$RELAY_HOME'
 })
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(30)
@@ -252,6 +298,31 @@ print(data.decode().strip())
       }
     fi
 
+    # Save host as a peer (with their relay_home so wire paths are correct)
+    local host_relay_home
+    host_relay_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('relay_home',''))" 2>/dev/null || true)
+    python3 -c "
+import json, os
+peers_dir = os.path.expanduser('$PEERS_DIR')
+os.makedirs(peers_dir, exist_ok=True)
+record = {
+    'name': '$peer_name',
+    'host': '$ssh_target',
+    'relay_home': '$host_relay_home',
+    'paired': '$(timestamp)'
+}
+with open(os.path.join(peers_dir, '$peer_name.json'), 'w') as f:
+    json.dump(record, f, indent=2)
+" 2>/dev/null || true
+
+    # Persist host_relay_home in own config for quick wire-path lookups
+    python3 -c "
+import json
+c = json.load(open('$CONFIG'))
+c['host_relay_home'] = '$host_relay_home'
+json.dump(c, open('$CONFIG', 'w'), indent=2)
+" 2>/dev/null || true
+
     # Pick up reminder setting from host
     local host_reminder
     host_reminder=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
@@ -273,7 +344,7 @@ print(data.decode().strip())
   else
     # ── HOST MODE ─────────────────────────────────────────────────
     local name="${target:-}"
-    [ -z "$name" ] && name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+    [ -z "$name" ] && name=$(resolve_name)
 
     init_identity "$name"
 
@@ -338,14 +409,24 @@ peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
 jname = joiner['name']
 with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
-    json.dump({'name': jname, 'host': joiner.get('host',''), 'paired': '$(timestamp)'}, f, indent=2)
+    json.dump({
+        'name': jname,
+        'host': joiner.get('host',''),
+        'relay_home': joiner.get('relay_home', ''),
+        'paired': '$(timestamp)'
+    }, f, indent=2)
 if joiner.get('sign_pub'):
     with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
         f.write(joiner['sign_pub'])
 
-# Send back host's SSH pubkey
+# Send back host's SSH pubkey and relay_home
 host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
-response = json.dumps({'ssh_pub': host_pub, 'name': '$name', 'reminder': $reminder_interval})
+response = json.dumps({
+    'ssh_pub': host_pub,
+    'name': '$name',
+    'reminder': $reminder_interval,
+    'relay_home': '$RELAY_HOME'
+})
 conn.sendall((response + '\n').encode())
 conn.close()
 sock.close()
@@ -357,6 +438,39 @@ print(f'  Peer joined: {jname}')
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null
+  fi
+}
+
+cmd_rename() {
+  local new_name="${1:-}"
+  [ -z "$new_name" ] && die "Usage: relay rename <new-name>"
+  new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
+  [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
+  [ ! -f "$CONFIG" ] && die "Not initialized — run 'relay connect' first"
+
+  local old_name
+  old_name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  if [ "$old_name" = "$new_name" ]; then
+    echo "  Already named '$new_name'."
+    return
+  fi
+
+  python3 -c "
+import json
+c = json.load(open('$CONFIG'))
+c['name'] = '$new_name'
+json.dump(c, open('$CONFIG', 'w'), indent=2)
+"
+  echo "  Renamed: $old_name → $new_name"
+
+  # Best-effort broadcast to paired peers so they can update their records
+  # Peer consumers recognize '[rename]' prefix and update peer file accordingly.
+  if [ -d "$PEERS_DIR" ]; then
+    for peer_json in "$PEERS_DIR"/*.json; do
+      [ -f "$peer_json" ] || continue
+      local peer; peer=$(basename "$peer_json" .json)
+      cmd_send "$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
+    done
   fi
 }
 
@@ -382,7 +496,8 @@ cmd_send() {
   host_target=$(get_config_val host_target "")
 
   if [ -n "$host_target" ]; then
-    relay_ssh "$host_target" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+    local rhome; rhome=$(remote_home)
+    relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl" 2>/dev/null \
       || die "Failed to deliver to host ($host_target)"
   else
     echo "$full_msg" >> "$MESSAGES"
@@ -407,8 +522,9 @@ cmd_send_file() {
   local target_host="$host_target"
   [ -z "$target_host" ] && target_host="localhost"
 
-  relay_ssh "$target_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
-  scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
+  local rhome; rhome=$(remote_home)
+  relay_ssh "$target_host" "mkdir -p $rhome/files/${my_name}" 2>/dev/null
+  scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>/dev/null \
     || die "Failed to transfer $filename"
 
   local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
@@ -438,7 +554,8 @@ cmd_logs() {
 
   local raw
   if [ -n "$host_target" ]; then
-    raw=$(relay_ssh "$host_target" "tail -${count} ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+    local rhome; rhome=$(remote_home)
+    raw=$(relay_ssh "$host_target" "tail -${count} $rhome/messages.jsonl 2>/dev/null" 2>/dev/null) || true
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
@@ -458,6 +575,7 @@ case "${1:-help}" in
   connect|setup|start|join) shift; cmd_connect "$@" ;;
   send)      shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
+  rename)    shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     cmd_peers ;;
   logs)      shift; cmd_logs "$@" ;;
@@ -468,8 +586,13 @@ case "${1:-help}" in
     echo "  relay connect                    Host — wait for peers"
     echo "  relay connect <name@user@host>   Join a host"
     echo "  relay send <peer> <message>      Send a message"
+    echo "  relay rename <new-name>          Rename this session (notifies peers)"
     echo "  relay reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  relay peers                      List connected peers"
+    echo ""
+    echo "Identity resolution (highest priority first):"
+    echo "  AGENT_RELAY_NAME env var > config.json name > cwd basename > hostname"
+    echo "  AGENT_RELAY_HOME env var overrides state dir (default \$HOME/.agent-relay)"
     ;;
   *) die "Unknown command: $1. Try: relay help" ;;
 esac
