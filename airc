@@ -601,6 +601,70 @@ cmd_peers() {
   [ "$found" = false ] && echo "  No peers yet."
 }
 
+cmd_teardown() {
+  # Kill all airc processes for this user and free any ports they hold.
+  # Add --flush to also wipe the state dir (identity, peers, messages) — nuclear.
+  local flush=0
+  [ "${1:-}" = "--flush" ] && flush=1
+
+  local killed=0
+  for pattern in "airc connect" "AIRC_NAME=" "airc monitor" "/airc$"; do
+    local pids
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      echo "  killing: $pattern ($pids)"
+      kill -9 $pids 2>/dev/null || true
+      killed=1
+    fi
+  done
+
+  # Free any TCP ports airc was holding. Default 7547; also try 7548 (common alt).
+  # If AIRC_PORT is set, add it too.
+  local ports="7547 7548"
+  [ -n "${AIRC_PORT:-}" ] && ports="$ports $AIRC_PORT"
+  for port in $ports; do
+    local pids
+    pids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      # Only kill if it's a Python process (the airc listener pattern) —
+      # don't nuke the user's other services.
+      for pid in $pids; do
+        if ps -p "$pid" -o command= 2>/dev/null | grep -q "socket.SOCK_STREAM"; then
+          echo "  freeing port $port (pid $pid)"
+          kill -9 "$pid" 2>/dev/null || true
+          killed=1
+        fi
+      done
+    fi
+  done
+
+  if [ "$flush" = "1" ]; then
+    # Wipe current tier's state. Leaves the other tier alone.
+    local dir="$AIRC_WRITE_DIR"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      echo "  flushing state: $dir"
+      rm -rf "$dir"
+    fi
+  fi
+
+  [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
+}
+
+cmd_doctor() {
+  # Self-diagnose: run the bundled integration test script.
+  # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
+  # when running from a git checkout.
+  local script="${AIRC_DIR:-$HOME/.airc-src}/test/integration.sh"
+  if [ ! -x "$script" ]; then
+    # Try next to the binary itself (dev checkout case)
+    local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
+    local here; here="$(dirname "$self")"
+    [ -x "$here/test/integration.sh" ] && script="$here/test/integration.sh"
+  fi
+  [ -x "$script" ] || die "Can't find test script. Expected at \$AIRC_DIR/test/integration.sh"
+  exec bash "$script" "$@"
+}
+
 cmd_logs() {
   ensure_init
   local count="${1:-20}"
@@ -634,6 +698,8 @@ case "${1:-help}" in
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     cmd_peers ;;
   logs)      shift; cmd_logs "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  teardown|stop|flush) shift; cmd_teardown "$@" ;;
   monitor)   shift; monitor "$@" ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
@@ -644,6 +710,8 @@ case "${1:-help}" in
     echo "  airc rename <new-name>          Rename this session (notifies peers)"
     echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  airc peers                      List connected peers"
+    echo "  airc doctor [tabs|scope|all]    Self-test: pairing, send, rename, scope"
+    echo "  airc teardown [--flush]         Kill local airc processes (and wipe state with --flush)"
     echo ""
     echo "Identity resolution (highest priority first):"
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
