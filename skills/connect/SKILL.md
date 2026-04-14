@@ -1,9 +1,9 @@
 ---
 name: relay:connect
-description: Connect to Agent Relay — host or join another machine. Per-project state in .agent-relay/ keeps peers and identity persistent.
+description: Connect to Agent Relay — host or join another peer. Accepts flags for name, home dir, and port.
 user-invocable: true
 allowed-tools: Bash, Monitor
-argument-hint: "[name@user@host#key]"
+argument-hint: "[join-string] [--name=N] [--home=PATH] [--port=N] [--scope=home|local]"
 ---
 
 # Connect to Agent Relay
@@ -17,51 +17,43 @@ If `relay` is not on PATH:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
 ```
 
-## 2. Project-scoped state
+## 2. Parse `$ARGUMENTS`
 
-Each Claude instance keeps its own identity, peers, and message history in `$PWD/.agent-relay/` (alongside `.git`, `.vscode`, etc). Different projects → different state → no collisions on the same machine. Returning to the same project resumes your peer list and name automatically.
+Flags (any order, all optional):
+- `--name=<n>` → sets `AGENT_RELAY_NAME=<n>` (peer identity)
+- `--home=<path>` → sets `AGENT_RELAY_HOME=<path>` (state dir, overrides scope)
+- `--port=<n>` → sets `AGENT_RELAY_PORT=<n>` (host listen port, default 7547)
+- `--scope=local` → sets `AGENT_RELAY_HOME=$PWD/.agent-relay` (per-project identity)
+- `--scope=home` → explicit default (`$HOME/.agent-relay`, one identity per machine)
 
-Set:
+Any non-flag argument is the join string. Its presence means JOIN mode; absence means HOST mode.
+
+Build the env prefix from the flags that are set. Only include env vars the user asked for. Unset flags = use vanilla defaults.
+
+## 3. Launch via Monitor
+
+Once the env prefix is built, start the relay in a persistent Monitor so inbound streams as notifications:
+
 ```
-AGENT_RELAY_HOME=$PWD/.agent-relay
-```
-
-If `AGENT_RELAY_HOME` is already set in the environment, respect it (explicit override wins).
-
-If `$PWD/.git` exists, append `.agent-relay/` to `$PWD/.gitignore` (create the file if missing, no duplicate lines) — the directory holds SSH keys and shouldn't be committed.
-
-The agent-relay binary automatically uses the project basename as the peer display name unless you set `AGENT_RELAY_NAME` or rename later via `relay rename <new>`.
-
-## 3. Connect
-
-Run via Monitor so inbound messages stream as notifications:
-
-**If `$ARGUMENTS` contains `@`** — joining a host:
-```
-Monitor(persistent=true, command="AGENT_RELAY_HOME=$PWD/.agent-relay relay connect $ARGUMENTS")
+Monitor(persistent=true, command="<env-prefix> relay connect <join-string-or-empty>")
 ```
 
-**If no arguments** — you are the host:
-```
-Monitor(persistent=true, command="AGENT_RELAY_HOME=$PWD/.agent-relay relay connect")
-```
+If hosting (no join string), the relay prints a join string — show it to the user:
 
-The host prints a join string. Give it to the user: "Share this with the other Claude:" followed by `/relay:connect <the join string>`.
+> "Share this with the other peer: `/relay:connect <the join string>`"
+
+If joining, wait for the monitor's first event to confirm the pair succeeded.
 
 ## 4. After connecting
 
-Always prefix relay commands with `AGENT_RELAY_HOME=$PWD/.agent-relay` (or whatever home you resolved) so you target the right identity:
-
-- Send: `AGENT_RELAY_HOME=$PWD/.agent-relay relay send <peer> "<message>"`
-- List peers: `AGENT_RELAY_HOME=$PWD/.agent-relay relay peers`
-- Rename self: `AGENT_RELAY_HOME=$PWD/.agent-relay relay rename <new-name>` (notifies paired peers)
-
-Inbound messages appear as Monitor events with shape `{"from":"<peer>","msg":"..."}`. Treat each as a turn from that peer and respond with `relay send`.
+- `/relay:send <peer> <message>` — send a message (peer optional when there's only one peer; the skill figures it out)
+- `/relay:rename <new-name>` — rename this peer; paired peers get a `[rename]` marker and auto-update their records
 
 ## 5. Troubleshooting
 
-Relay prints the actual error. Read it.
+The relay prints actual errors. Read them.
 
-- **Host mode, SSH not working:** relay prints the exact sudo command needed. Show it to the user. Retry after they run it.
-- **Join mode, can't reach host:** host isn't running `relay connect`, or the address is wrong, or Tailscale isn't up on either side.
-- **Messages from me echo in my own monitor:** project basename matches the peer's. Set `AGENT_RELAY_NAME=<something-unique>` explicitly, or `relay rename <new>` after connecting.
+- **SSH not working on host:** relay prints the exact sudo command. Show it to the user; they type `! sudo ...` to run it; retry.
+- **Can't reach host:** host isn't running `relay connect`, address is wrong, or Tailscale isn't up on either side.
+- **Port already in use:** add `--port=7548` (or another free number) when you start the host. The join string the host prints will carry the custom port automatically.
+- **Two tabs on same machine peer-name collide:** set `--name=<something-unique>` on one side, or set `--scope=local` (gives each project dir its own identity). After connecting, `/relay:rename <new>` works too.

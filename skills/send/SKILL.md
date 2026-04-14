@@ -3,7 +3,7 @@ name: relay:send
 description: Send a message to a peer via Agent Relay.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<peer> <message>"
+argument-hint: "[<peer>] <message> [--home=PATH]"
 ---
 
 # Send a Relay Message
@@ -15,14 +15,20 @@ If `relay` is not on PATH, install it first:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
 ```
 
-Project-scoped state: always prefix with `AGENT_RELAY_HOME=$PWD/.agent-relay` so you target the identity and peer list established via `/relay:connect`. If `AGENT_RELAY_HOME` is already exported, respect it.
+## Parse `$ARGUMENTS`
 
-Parse the first word of `$ARGUMENTS` as the peer name, the rest as the message:
+- `--home=<path>` → sets `AGENT_RELAY_HOME=<path>`. If omitted, use vanilla default.
+- Remaining args, in order: `<peer> <message>`. If the first arg matches a known peer name (check via `relay peers`), treat it as the peer; everything else is the message. If the first arg isn't a known peer and there's only one peer paired, treat all args as the message and auto-address the sole peer.
+
+## Send
 
 ```bash
-AGENT_RELAY_HOME=$PWD/.agent-relay relay send $ARGUMENTS
+<env-prefix> relay send <peer> <message>
 ```
 
-If no arguments provided, ask the user who to message and what to say.
+If no peer is specified and more than one is paired, ask the user who to message.
 
-Note: `relay connect` must be running in a Monitor (it handles the inbound stream). If not connected, tell the user to run `/relay:connect` first.
+## Notes
+
+- `/relay:connect` must be running in a Monitor somewhere so inbound stream gets surfaced. If not connected, tell the user to run `/relay:connect` first.
+- Messages sent to `<peer>` land in that peer's message log over SSH. The peer's monitor surfaces them as notifications. No other routing needed.
