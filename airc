@@ -396,6 +396,10 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
     fi
 
+    # Write PID file so `airc teardown` can find us later.
+    echo $$ > "$AIRC_WRITE_DIR/airc.pid"
+    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null' EXIT
+
     echo "  Monitoring for messages..."
     monitor
 
@@ -498,6 +502,11 @@ print(f'  Peer joined: {jname}')
     done &
     PAIR_PID=$!
 
+    # Write PID file so `airc teardown` can find us later. Record both us and
+    # the PAIR_PID (the backgrounded TCP-accept loop) so teardown can reap both.
+    echo "$$ $PAIR_PID" > "$AIRC_WRITE_DIR/airc.pid"
+    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null; kill $PAIR_PID 2>/dev/null' EXIT
+
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null
@@ -559,7 +568,12 @@ cmd_send() {
 
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
-    relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl" 2>/dev/null \
+    # Trust the append, not the ssh exit code: some shells bubble a non-zero
+    # up for benign stderr warnings ("Permanently added..."). Have the remote
+    # confirm with __APPENDED__; if we see it on stdout, the write happened.
+    local out
+    out=$(relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl && echo __APPENDED__" 2>/dev/null)
+    echo "$out" | grep -q '^__APPENDED__$' \
       || die "Failed to deliver to host ($host_target)"
   else
     echo "$full_msg" >> "$MESSAGES"
@@ -618,34 +632,51 @@ cmd_teardown() {
   [ "${1:-}" = "--flush" ] && flush=1
 
   local killed=0
-  for pattern in "airc connect" "AIRC_NAME=" "airc monitor" "/airc$"; do
-    local pids
-    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
-    if [ -n "$pids" ]; then
-      echo "  killing: $pattern ($pids)"
-      kill -9 $pids 2>/dev/null || true
-      killed=1
-    fi
-  done
-
-  # Free any TCP ports airc was holding. Default 7547; also try 7548 (common alt).
-  # If AIRC_PORT is set, add it too.
-  local ports="7547 7548"
-  [ -n "${AIRC_PORT:-}" ] && ports="$ports $AIRC_PORT"
-  for port in $ports; do
-    local pids
-    pids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
-    if [ -n "$pids" ]; then
-      # Only kill if it's a Python process (the airc listener pattern) —
-      # don't nuke the user's other services.
-      for pid in $pids; do
-        if ps -p "$pid" -o command= 2>/dev/null | grep -q "socket.SOCK_STREAM"; then
-          echo "  freeing port $port (pid $pid)"
-          kill -9 "$pid" 2>/dev/null || true
-          killed=1
-        fi
+  # Scope-aware via PID file: cmd_connect wrote its PID(s) to $AIRC_WRITE_DIR/airc.pid.
+  # We kill ONLY those PIDs + their descendants. Never touches other scopes.
+  local pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ -f "$pidfile" ]; then
+    local main_pids
+    main_pids=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$main_pids" ]; then
+      # Collect descendants (Python listener etc) before killing the parent.
+      local all_pids="$main_pids"
+      for pid in $main_pids; do
+        local kids
+        kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ' || true)
+        [ -n "$kids" ] && all_pids="$all_pids $kids"
       done
+      all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+      if [ -n "$all_pids" ]; then
+        echo "  killing scope $AIRC_WRITE_DIR: $(echo $all_pids | tr '\n' ' ')"
+        kill -9 $all_pids 2>/dev/null || true
+        killed=1
+      fi
     fi
+    rm -f "$pidfile" 2>/dev/null
+  fi
+
+  # Brief pause to let the kernel reparent any airc python listener children
+  # to init (PID 1) after we killed their bash parent. Then reap orphans.
+  [ "$killed" = "1" ] && sleep 0.5
+
+  # Free the TCP port we were listening on. Kill any python socket listener
+  # that's now orphaned (parent=1). Don't touch anything else.
+  local ports="${AIRC_PORT:-7547}"
+  [ "$ports" != "7547" ] && ports="$ports 7547"
+  for port in $ports; do
+    local lpids
+    lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    for lpid in $lpids; do
+      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ')
+      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null)
+      # Reap if orphaned AND is a python socket listener.
+      if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
+        echo "  freeing orphaned port $port (pid $lpid)"
+        kill -9 "$lpid" 2>/dev/null || true
+        killed=1
+      fi
+    done
   done
 
   if [ "$flush" = "1" ]; then

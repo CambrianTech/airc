@@ -27,10 +27,32 @@ fail() { echo "  ${RED}✗${RST} $1"; FAIL=$((FAIL+1)); TRACE+=("$1"); }
 section() { echo; echo "${YLO}── $1 ──${RST}"; }
 
 cleanup_procs() {
-  # Dogfood the binary's own teardown — if this is broken, the test should fail
-  # visibly, not silently mask it with pkill. Also nukes anything our test ports
-  # were holding (teardown targets 7547/7548 by default).
-  AIRC_PORT=7548 "$AIRC" teardown >/dev/null 2>&1 || true
+  # Kill everything associated with prior test scenarios by walking airc.pid
+  # files under /tmp/airc-it-*. These files are the canonical scope markers
+  # written by `airc connect`. Each file contains PID(s) of its test host.
+  local pidfile
+  for pidfile in /tmp/airc-it-*/state/airc.pid; do
+    [ -f "$pidfile" ] || continue
+    local pids; pids=$(cat "$pidfile" 2>/dev/null)
+    if [ -n "$pids" ]; then
+      # Include direct children (python listeners)
+      local all="$pids"
+      for p in $pids; do
+        all="$all $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+      done
+      kill -9 $all 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  done
+  # Safety net: reap any python listener still on port 7548 — if it's ours it
+  # had a chance to exit with its parent; if it's not, someone's squatting.
+  local lpids
+  lpids=$(lsof -tiTCP:7548 -sTCP:LISTEN 2>/dev/null || true)
+  for lpid in $lpids; do
+    if ps -p "$lpid" -o command= 2>/dev/null | grep -q "socket.SOCK_STREAM"; then
+      kill -9 "$lpid" 2>/dev/null || true
+    fi
+  done
   sleep 1
 }
 
@@ -256,7 +278,10 @@ scenario_teardown() {
   lsof -tiTCP:7548 -sTCP:LISTEN >/dev/null 2>&1 && pass "port 7548 held pre-teardown" \
                                                || fail "port 7548 not held — host not really up?"
 
-  AIRC_PORT=7548 "$AIRC" teardown >/dev/null 2>&1
+  # Scope-aware teardown needs AIRC_HOME matching the host's scope, otherwise
+  # it'll refuse to kill processes outside its tier (which is the whole point
+  # of the scoping — different Claude tabs can't nuke each other's hosts).
+  AIRC_HOME=/tmp/airc-it-td/state AIRC_PORT=7548 "$AIRC" teardown >/dev/null 2>&1
   sleep 1
 
   lsof -tiTCP:7548 -sTCP:LISTEN >/dev/null 2>&1 && fail "port 7548 still held after teardown" \
@@ -268,6 +293,14 @@ scenario_teardown() {
   # State should survive a non-flush teardown
   [ -f /tmp/airc-it-td/state/config.json ] && pass "state preserved (identity kept for resume)" \
                                             || fail "state wiped by teardown (should only flush with --flush)"
+
+  # Now test the scope-isolation guarantee: another host spawned in a different
+  # AIRC_HOME should NOT be killed by a teardown running in yet-another scope.
+  spawn_host /tmp/airc-it-td2 td-host-2 7548 || { fail "host failed for scope-isolation test"; return; }
+  AIRC_HOME=/tmp/airc-some-unrelated-scope AIRC_PORT=7548 "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+  lsof -tiTCP:7548 -sTCP:LISTEN >/dev/null 2>&1 && pass "teardown in different scope did NOT kill unrelated host" \
+                                               || fail "teardown crossed scope boundary and killed a foreign host"
 
   cleanup_all
 }
