@@ -1,23 +1,25 @@
 ---
 name: airc:doctor
-description: Self-diagnose AIRC. Runs the integration tests to validate that pairing, sending, renaming, and the two-tier scope resolver actually work on this machine.
+description: Self-diagnose AIRC. Runs the integration tests to validate pairing, send, rename, send-file, reminder heartbeat, teardown scope isolation, and the two-tier home/local resolver.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "[tabs|scope|all]"
+argument-hint: "[tabs|scope|reminder|teardown|all]"
 ---
 
 # airc doctor
 
-Run this yourself — don't ask the user. It's fast (~30s) and self-contained.
+Run this yourself — don't ask the user. It's fast (~45s) and self-contained.
 
 ## What it does
 
-Invokes `airc doctor` (a first-class command baked into the binary) which runs the bundled integration suite at `$AIRC_DIR/test/integration.sh`. Verifies:
+Invokes `airc doctor`, which runs the bundled integration suite at `$AIRC_DIR/test/integration.sh`. 31 assertions across 4 scenarios:
 
-- **tabs** — two airc processes on one machine with isolated homes + different ports. Covers port override, pairing, bidirectional send, rename propagation, peer-record persistence, and monitor correctness (does the listener actually surface inbound messages).
-- **scope** — per-project `$PWD/.airc/` opt-in tier. Covers that local shadows home on name collision and home peers are inherited when local is empty.
+- **tabs** — two airc processes on one machine with isolated homes + port override. Pairing, bidirectional send, monitor correctness, rename propagation, peer-record persistence, send-file with `-i` key, local outbound mirror (audit trail).
+- **scope** — per-project `$PWD/.airc/` opt-in tier. Home peers inherited when local is empty; local shadows home on name collision.
+- **reminder** — `AIRC_REMINDER` env var, interval persisted, heartbeat fires after silence, `reminded` marker prevents spam, `airc reminder off/<n>` controls.
+- **teardown** — host killed, port freed, state preserved without `--flush`; teardown in a different scope does NOT kill unrelated hosts (scope isolation).
 
-The script is idempotent: it cleans up before and after, kills its own processes, removes temp dirs. It does NOT disturb any running airc mesh — it uses `AIRC_HOME=/tmp/airc-it-*` and a non-default port.
+The script uses **port 7549** (test-reserved) and `AIRC_HOME=/tmp/airc-it-*`. It will NOT touch any live airc session running on the default 7547 or the common alt 7548. Cleans up after itself via pidfiles — no broad process kills.
 
 ## Run
 
@@ -25,21 +27,22 @@ The script is idempotent: it cleans up before and after, kills its own processes
 airc doctor $ARGUMENTS
 ```
 
-If `$ARGUMENTS` is empty or `all`, both scenarios run. `tabs` or `scope` narrows.
+Empty or `all` runs all 4 scenarios sequentially. `tabs`, `scope`, `reminder`, `teardown` run one.
 
 ## Read the result
 
-Look for the final line: `N passed, M failed`. Anything other than `0 failed` is a problem. The script prints each failure by name — report them verbatim to the user.
+Final line: `N passed, M failed`. `0 failed` means green. Otherwise the suite prints each failure by name — report them verbatim.
 
 ## When to run
 
 - Right after install, before pairing for real
-- After an AIRC upgrade, to confirm the new binary behaves
-- When something feels off (sends not arriving, peer list looks wrong) — rule out a binary-level regression before blaming the network
+- After an upgrade, to confirm the new binary behaves
+- When something feels off — rule out a binary-level regression before blaming the network
 
 ## Interpreting failures
 
-- **alpha hosting failed** — port 7548 in use (another airc host is running there), or the `airc` binary isn't on PATH
-- **beta join failed** — SSH (Remote Login) isn't enabled on this machine, or a firewall is blocking the TCP handshake
-- **monitor did NOT see** — the signed-message-over-SSH path is broken. Check `~/.ssh/authorized_keys` contains the test keys during the run, or trace with `bash -x`
-- **scope: local tier shadows home** — the two-tier resolver in the binary is regressed. Upstream bug, not environment
+- **alpha hosting failed** — `airc` not on PATH, or port 7549 taken (rare; port 7549 is test-reserved). Check `lsof -iTCP:7549`.
+- **beta join failed** — SSH Remote Login isn't enabled on this machine, or a firewall is blocking TCP to 7549.
+- **send/monitor did NOT see** — the signed-message-over-SSH path is broken. Check `~/.ssh/authorized_keys` has the test keys mid-run, or trace with `bash -x`.
+- **scope: local tier shadows home** — the two-tier resolver in the binary is regressed. Upstream bug, not environment.
+- **teardown in different scope killed foreign host** — scope isolation regression. Critical — would mean one Claude tab can nuke another's live session. File an issue.

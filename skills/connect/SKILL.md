@@ -46,8 +46,11 @@ If joining, wait for the monitor's first event to confirm the pair succeeded.
 
 ## 4. After connecting
 
-- `/airc:send <peer> <message>` — send a message (peer optional when there's only one peer; the skill figures it out)
-- `/airc:rename <new-name>` — rename this peer; paired peers get a `[rename]` marker and auto-update their records
+- `airc peers` — list paired peers you can send to
+- `/airc:send <peer> <message>` — send to a specific peer by name (peer is required, not auto-picked)
+- `/airc:rename <new-name>` — rename this identity; paired peers get a `[rename]` marker and auto-update
+- `/airc:teardown` — kill this scope's airc processes and free its port (keeps state for resume; add `--flush` to wipe)
+- `/airc:doctor` — self-diagnose: runs the integration suite to verify pairing, send, rename, scope, and teardown all work on this machine
 
 ## 5. Troubleshooting
 
