@@ -1,4 +1,4 @@
-# Collaborative Multi-Agent Development Across Domains
+# Agentic Internet Relay Chat
 
 Secure real-time messaging between AI agents on different machines.
 
