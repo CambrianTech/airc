@@ -158,9 +158,26 @@ init_identity() {
 }
 
 monitor() {
-  local my_name host_target last=0
+  local my_name host_target last
   my_name=$(get_name)
   host_target=$(get_config_val host_target "")
+
+  # Persist the last-seen line offset so monitor doesn't replay history
+  # on every (re)start. On first-ever run, skip to end-of-file — history
+  # is available via `airc logs`.
+  local offset_file="$AIRC_WRITE_DIR/monitor_offset"
+  if [ -f "$offset_file" ]; then
+    last=$(cat "$offset_file" 2>/dev/null || echo 0)
+  else
+    if [ -n "$host_target" ]; then
+      local rhome; rhome=$(remote_home)
+      last=$(relay_ssh "$host_target" "wc -l < $rhome/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d ' ' || echo 0)
+    else
+      last=$(wc -l < "$MESSAGES" 2>/dev/null | tr -d ' ' || echo 0)
+    fi
+    echo "$last" > "$offset_file"
+  fi
+  [ -z "$last" ] && last=0
   local last_activity; last_activity=$(date +%s)
 
   while true; do
@@ -174,6 +191,7 @@ monitor() {
     if [ -n "$lines" ]; then
       local count; count=$(echo "$lines" | wc -l)
       last=$((last + count))
+      echo "$last" > "$offset_file"
       last_activity=$(date +%s)
       echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -584,9 +602,11 @@ cmd_send() {
     # itself succeeded. We check stdout for the marker, not the exit code.
     # `|| true` prevents set -e from aborting when ssh itself fails (exit 255
     # on unreachable host); we want to reach the failure-marker branch below.
+    # Pipe message via stdin so apostrophes (or any shell metachar) in the
+    # payload cannot break the single-quoted remote echo.
     local out err
     err=$(mktemp -t airc-send-err.XXXXXX)
-    out=$(relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
+    out=$(printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
     if ! echo "$out" | grep -q '^__APPENDED__$'; then
       # Wire failed. Append a failure marker next to the mirrored line so the
       # user's `airc logs` shows the message AND the failure reason.
@@ -656,7 +676,9 @@ cmd_peers() {
     host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null)
     echo "  $name → $host"
   done
-  [ "$found" = false ] && echo "  No peers yet."
+  if [ "$found" = false ]; then
+    echo "  No peers yet."
+  fi
 }
 
 cmd_teardown() {
