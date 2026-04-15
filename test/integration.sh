@@ -162,8 +162,9 @@ scenario_tabs() {
     || fail "send-file ran but no payload on host"
 
   # Resilience: if the wire fails, the outbound MUST still be in local log
-  # with a [SEND FAILED] marker. Simulate by sending with a bogus host_target
-  # via a temp config override. Prevents silent loss.
+  # with a [QUEUED] marker AND enqueued in pending.jsonl for automatic retry.
+  # (Prior to send-queue: a [SEND FAILED] marker and no retry; see scenario_queue
+  # for the end-to-end drain test.) Simulate by sending with a bogus host_target.
   local fake_home=/tmp/airc-it-fail-test
   mkdir -p "$fake_home/state/peers" "$fake_home/state/identity"
   cp /tmp/airc-it-j/state/identity/* "$fake_home/state/identity/" 2>/dev/null
@@ -183,9 +184,13 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
   grep -q '"this-should-fail-but-still-mirror"' "$fake_home/state/messages.jsonl" 2>/dev/null && \
     pass "failed send: outbound still mirrored to local log (no silent loss)" \
     || fail "failed send: outbound NOT in local log (silent loss regression)"
-  grep -q 'SEND FAILED' "$fake_home/state/messages.jsonl" 2>/dev/null && \
-    pass "failed send: [SEND FAILED] marker present in local log" \
-    || fail "failed send: no [SEND FAILED] marker — user can't tell it failed"
+  grep -q 'QUEUED' "$fake_home/state/messages.jsonl" 2>/dev/null && \
+    pass "failed send: [QUEUED] marker present in local log" \
+    || fail "failed send: no [QUEUED] marker — user can't tell it was queued"
+  [ -s "$fake_home/state/pending.jsonl" ] && \
+    grep -q 'this-should-fail-but-still-mirror' "$fake_home/state/pending.jsonl" 2>/dev/null && \
+    pass "failed send: message also enqueued in pending.jsonl for retry" \
+    || fail "failed send: pending.jsonl missing — message won't auto-retry"
   rm -rf "$fake_home"
 
   send_err=$(as_home /tmp/airc-it-h send @beta "m2-from-alpha" 2>&1 >/dev/null)
@@ -507,6 +512,78 @@ scenario_reconnect() {
   cleanup_all
 }
 
+scenario_queue() {
+  section "queue: SSH-unreachable sends land in pending.jsonl, drain when host returns"
+  cleanup_all
+
+  # Realistic #5 scenario isn't "airc process killed on host" (SSH still up +
+  # cat >> messages.jsonl still works without airc running). It's "host MACHINE
+  # unreachable" — laptop asleep, network out, SSH times out. We simulate by
+  # pointing host_target at an unreachable IP, then restoring it to test drain.
+
+  spawn_host /tmp/airc-it-q-h qhost 7549 || { fail "qhost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-q-h)
+  spawn_joiner /tmp/airc-it-q-j qjoiner "$join" || { fail "qjoiner join failed"; return; }
+  sleep 3
+
+  # Snapshot the real host_target, then flip to an unreachable address.
+  local real_target
+  real_target=$(python3 -c "import json; print(json.load(open('/tmp/airc-it-q-j/state/config.json'))['host_target'])")
+  [ -n "$real_target" ] || { fail "no host_target recorded in joiner config"; return; }
+
+  python3 -c "
+import json
+p = '/tmp/airc-it-q-j/state/config.json'
+c = json.load(open(p))
+c['host_target'] = 'nobody@127.0.0.99'
+json.dump(c, open(p, 'w'))
+"
+  # Also fake the peer record so resolution doesn't fail on @qhost
+  echo '{"name":"qhost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' \
+    > /tmp/airc-it-q-j/state/peers/qhost.json
+  pass "joiner: host_target flipped to unreachable (outage simulation)"
+
+  # ── Send during outage ─────────────────────────────────────────────
+  AIRC_HOME=/tmp/airc-it-q-j/state "$AIRC" send @qhost "queued-during-outage" >/dev/null 2>&1
+  local send_exit=$?
+  [ $send_exit -eq 0 ] && pass "send during outage: exit 0 (queued is success)" \
+                       || fail "send during outage: exit $send_exit — should queue gracefully, not die"
+
+  local pending=/tmp/airc-it-q-j/state/pending.jsonl
+  [ -f "$pending" ] && grep -q 'queued-during-outage' "$pending" \
+    && pass "send during outage: message landed in pending.jsonl" \
+    || fail "send during outage: pending.jsonl missing or empty"
+
+  grep -q 'QUEUED' /tmp/airc-it-q-j/state/messages.jsonl \
+    && pass "send during outage: [QUEUED] marker visible in local log" \
+    || fail "send during outage: no [QUEUED] marker in local messages.jsonl"
+
+  # ── Recovery: restore real host_target, wait for flush loop ─────────
+  python3 -c "
+import json
+p = '/tmp/airc-it-q-j/state/config.json'
+c = json.load(open(p))
+c['host_target'] = '$real_target'
+json.dump(c, open(p, 'w'))
+"
+  pass "joiner: host_target restored (recovery simulation)"
+
+  # Flush loop on joiner polls every ~5s; give up to 25s.
+  local delivered=0 drained=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    sleep 1
+    grep -q 'queued-during-outage' /tmp/airc-it-q-h/state/messages.jsonl 2>/dev/null && delivered=1
+    [ ! -s "$pending" ] && drained=1
+    [ "$delivered" = "1" ] && [ "$drained" = "1" ] && break
+  done
+  [ "$delivered" = "1" ] && pass "recovery: queued message drained to host (${i}s)" \
+                         || fail "recovery: queued message NOT delivered to host within 25s"
+  [ "$drained" = "1" ] && pass "recovery: pending.jsonl cleared after successful drain" \
+                       || fail "recovery: pending.jsonl still has content ($(wc -l < "$pending" 2>/dev/null) lines)"
+
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)        scenario_tabs  ;;
   scope)       scenario_scope ;;
@@ -514,8 +591,9 @@ case "$MODE" in
   reminder)    scenario_reminder ;;
   resilience)  scenario_resilience ;;
   reconnect)   scenario_reconnect ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|all]"; exit 2 ;;
+  queue)       scenario_queue ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|all]"; exit 2 ;;
 esac
 
 echo

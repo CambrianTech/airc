@@ -180,7 +180,11 @@ monitor() {
   # interval, resets when the user sends (cmd_send removes the marker).
   ( reminder_timer_loop ) &
   local reminder_pid=$!
-  trap "kill $reminder_pid 2>/dev/null" EXIT INT TERM
+  # Background pending-flush loop — drains queued sends when the host comes
+  # back. No-op on host-mode (empty host_target short-circuits).
+  ( flush_pending_loop ) &
+  local flush_pid=$!
+  trap "kill $reminder_pid $flush_pid 2>/dev/null" EXIT INT TERM
 
   # Stream inbound via `tail -n 0 -F` (inotify/kqueue) — no polling, every
   # new line surfaces the moment it's written. Joiner tails the host over
@@ -354,6 +358,81 @@ for line in sys.stdin:
         label = fr
     print(f"[{ts}] {label}: {msg}", flush=True)
 '
+}
+
+# Drain pending.jsonl when the host is reachable again. Runs in background
+# during monitor. If the joiner tried to send while the host was unreachable
+# (laptop asleep, network out, SSH timing out), cmd_send appended the full
+# signed payload to pending.jsonl and returned 0 instead of die()ing. This
+# loop periodically retries each pending line; on success, the line is
+# dropped; on failure, it stays for the next attempt.
+#
+# Atomicity note: we snapshot pending.jsonl (mv to tmp) before replaying so
+# concurrent cmd_send invocations during the drain still land in a fresh
+# pending.jsonl rather than getting clobbered. Anything we couldn't deliver
+# gets prepended back to the current pending file.
+flush_pending_loop() {
+  local pending="$AIRC_WRITE_DIR/pending.jsonl"
+  local host_target; host_target=$(get_config_val host_target "")
+  # Host-mode: no wire, no pending — nothing to do.
+  [ -z "$host_target" ] && return 0
+  local rhome; rhome=$(remote_home)
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+
+  while true; do
+    sleep 5
+    [ -s "$pending" ] || continue
+
+    # Re-read host_target each iteration — user might have re-paired.
+    host_target=$(get_config_val host_target "")
+    [ -z "$host_target" ] && continue
+    rhome=$(remote_home)
+
+    local snapshot; snapshot=$(mktemp -t airc-pending-snap.XXXXXX)
+    local unsent;   unsent=$(mktemp -t airc-pending-unsent.XXXXXX)
+    # Atomic-ish snapshot: mv is atomic on same filesystem, so new sends that
+    # arrive after this line go to a fresh pending.jsonl and aren't in-flight.
+    mv "$pending" "$snapshot" 2>/dev/null || { rm -f "$snapshot" "$unsent"; continue; }
+
+    local delivered=0 failed=0
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local out
+      out=$(printf '%s\n' "$line" | \
+            ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new \
+                -o ConnectTimeout=5 -o BatchMode=yes \
+                "$host_target" \
+                "cat >> $rhome/messages.jsonl && echo __APPENDED__" \
+                2>/dev/null || true)
+      if echo "$out" | grep -q '^__APPENDED__$'; then
+        delivered=$((delivered + 1))
+      else
+        echo "$line" >> "$unsent"
+        failed=$((failed + 1))
+      fi
+    done < "$snapshot"
+
+    # Put failures back at the head of pending, preserving any sends that
+    # landed while we were draining (they'd be in a fresh pending file now).
+    if [ -s "$unsent" ]; then
+      if [ -s "$pending" ]; then
+        cat "$unsent" "$pending" > "${pending}.new" && mv "${pending}.new" "$pending"
+      else
+        mv "$unsent" "$pending"
+        unsent=""
+      fi
+    fi
+
+    # Announce success in the local log so `airc logs` shows the drain event.
+    if [ "$delivered" -gt 0 ]; then
+      local drain_marker
+      drain_marker=$(printf '{"from":"airc","ts":"%s","msg":"[DRAINED %d queued message(s) to host]"}' \
+        "$(timestamp)" "$delivered")
+      echo "$drain_marker" >> "$MESSAGES"
+    fi
+
+    rm -f "$snapshot" "$unsent" 2>/dev/null
+  done
 }
 
 # Separate loop, runs in background during monitor.
@@ -902,16 +981,21 @@ cmd_send() {
     err=$(mktemp -t airc-send-err.XXXXXX)
     out=$(printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
     if ! echo "$out" | grep -q '^__APPENDED__$'; then
-      # Wire failed. Append a failure marker next to the mirrored line so the
-      # user's `airc logs` shows the message AND the failure reason.
+      # Wire failed. Queue the payload for automatic retry by flush_pending_loop
+      # in the monitor, then annotate the local log with a [QUEUED] marker so
+      # `airc logs` makes the state obvious. Don't die() — queued is a form of
+      # success. The user's shell scripts can still check pending.jsonl if
+      # they need to block on delivery.
       local stderr; stderr=$(tr '\n' ' ' < "$err" | sed 's/"/\\"/g' | cut -c1-200)
       rm -f "$err"
-      local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","msg":"[SEND FAILED to %s] %s"}' \
+      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — host unreachable, will retry] %s"}' \
         "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
-      echo "$fail_marker" >> "$MESSAGES"
-      die "Failed to deliver to host ($host_target): ${stderr:-no stderr}"
+      echo "$queue_marker" >> "$MESSAGES"
+      echo "  Host unreachable — message queued for retry. Monitor will flush when host returns." >&2
+    else
+      rm -f "$err"
     fi
-    rm -f "$err"
   else
     echo "$full_msg" >> "$MESSAGES"
   fi
