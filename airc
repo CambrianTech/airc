@@ -1043,8 +1043,11 @@ else:
     [ -f "$f" ] || continue
     found=true
     local name host
-    name=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null)
-    host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null)
+    # `|| true` — a malformed peer record shouldn't abort the whole peers list
+    # under `set -euo pipefail`. Empty name/host gets printed and the user can
+    # tell the record is broken; the rest of the list still enumerates.
+    name=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null || true)
+    host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null || true)
     echo "  $name → $host"
   done
   if [ "$found" = false ]; then
@@ -1064,7 +1067,10 @@ cmd_teardown() {
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ -f "$pidfile" ]; then
     local main_pids
-    main_pids=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ')
+    # `|| true` — same class as #6: if $pidfile is racily removed between the
+    # `-f` test and this read, cat+pipefail would abort cmd_teardown before we
+    # reach `rm -f` below. Empty main_pids → we fall through cleanly.
+    main_pids=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ' || true)
     if [ -n "$main_pids" ]; then
       # Collect descendants (Python listener etc) before killing the parent.
       local all_pids="$main_pids"
@@ -1095,8 +1101,12 @@ cmd_teardown() {
     local lpids
     lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
     for lpid in $lpids; do
-      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ')
-      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null)
+      # `|| true` on both — $lpid came from lsof a moment ago; if the process
+      # exited in the interim, `ps -p` returns 1 and pipefail/errexit would
+      # abort the port-reap loop mid-scan, leaving later ports unchecked.
+      # Empty parent/cmd → the `if` below falls through, which is correct.
+      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
       # Reap if orphaned AND is a python socket listener.
       if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
         echo "  freeing orphaned port $port (pid $lpid)"
