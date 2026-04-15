@@ -424,11 +424,14 @@ flush_pending_loop() {
     fi
 
     # Announce success in the local log so `airc logs` shows the drain event.
+    # Also advance last_delivered — these messages did make it to the host,
+    # just out-of-band from cmd_send's own success path. (#15)
     if [ "$delivered" -gt 0 ]; then
       local drain_marker
       drain_marker=$(printf '{"from":"airc","ts":"%s","msg":"[DRAINED %d queued message(s) to host]"}' \
         "$(timestamp)" "$delivered")
       echo "$drain_marker" >> "$MESSAGES"
+      date +%s > "$AIRC_WRITE_DIR/last_delivered" 2>/dev/null
     fi
 
     rm -f "$snapshot" "$unsent" 2>/dev/null
@@ -1018,14 +1021,24 @@ cmd_send() {
         "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
       echo "$queue_marker" >> "$MESSAGES"
       echo "  Host unreachable — message queued for retry. Monitor will flush when host returns." >&2
+      # NOTE: don't update last_delivered — delivery didn't happen.
     else
       rm -f "$err"
+      # Wire succeeded — this is the ONLY place last_delivered advances.
+      # See #15: airc status' "last delivered" must reflect successful wire
+      # appends, not mere send attempts.
+      date +%s > "$AIRC_WRITE_DIR/last_delivered" 2>/dev/null
     fi
   else
+    # Host-mode: local messages.jsonl IS the shared log. Writing to it counts
+    # as delivery (it's also what tailing joiners read).
     echo "$full_msg" >> "$MESSAGES"
+    date +%s > "$AIRC_WRITE_DIR/last_delivered" 2>/dev/null
   fi
 
-  # Reset reminder — you sent something, clock restarts
+  # last_sent = "user attempted to send anything" (drives reminder-reset).
+  # Separate from last_delivered (#15) which tracks successful wire-append.
+  # Both fields are surfaced by airc status; the reminder loop reads last_sent.
   date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
   rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
 }
@@ -1369,19 +1382,36 @@ cmd_status() {
     fi
   fi
 
-  # Last send / receive timestamps. last_sent is a unix epoch written by
-  # cmd_send. last receive: tail the local messages.jsonl for the most recent
-  # inbound line (from != $my_name).
+  # Last delivered / attempted. #15: these are SEPARATE for a reason —
+  # last_sent reflects "user tried to send" (what reminder-reset cares about);
+  # last_delivered reflects "the host's messages.jsonl actually got the line"
+  # (what "did my message land?" cares about). Pre-#15 these were one file and
+  # status lied about delivery during outages. Report both; flag when they
+  # diverge.
   local now; now=$(date +%s)
-  if [ -f "$AIRC_WRITE_DIR/last_sent" ]; then
-    local ls; ls=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
-    if [ -n "$ls" ] && [ "$ls" -gt 0 ] 2>/dev/null; then
-      echo "  last send:   $(( now - ls ))s ago"
-    else
-      echo "  last send:   never"
-    fi
+  local ld_epoch=0 ls_epoch=0
+  [ -f "$AIRC_WRITE_DIR/last_delivered" ] && ld_epoch=$(cat "$AIRC_WRITE_DIR/last_delivered" 2>/dev/null || echo 0)
+  [ -f "$AIRC_WRITE_DIR/last_sent" ]      && ls_epoch=$(cat "$AIRC_WRITE_DIR/last_sent"      2>/dev/null || echo 0)
+  # Bail out to 0 on non-integer contents.
+  [ "$ld_epoch" -gt 0 ] 2>/dev/null || ld_epoch=0
+  [ "$ls_epoch" -gt 0 ] 2>/dev/null || ls_epoch=0
+
+  if [ "$ld_epoch" -gt 0 ]; then
+    echo "  last delivered: $(( now - ld_epoch ))s ago"
   else
-    echo "  last send:   never"
+    echo "  last delivered: never"
+  fi
+
+  # Show last attempt only if it's newer than last delivered — i.e. the user
+  # tried to send something that hasn't landed. Otherwise it's redundant.
+  if [ "$ls_epoch" -gt "$ld_epoch" ]; then
+    local pending_count_for_attempt=0
+    [ -f "$AIRC_WRITE_DIR/pending.jsonl" ] && pending_count_for_attempt=$(grep -c '^.' "$AIRC_WRITE_DIR/pending.jsonl" 2>/dev/null || echo 0)
+    if [ "$pending_count_for_attempt" -gt 0 ]; then
+      echo "  last attempt:   $(( now - ls_epoch ))s ago (QUEUED — host unreachable)"
+    else
+      echo "  last attempt:   $(( now - ls_epoch ))s ago (no pending — delivery status unknown)"
+    fi
   fi
 
   if [ -s "$MESSAGES" ]; then

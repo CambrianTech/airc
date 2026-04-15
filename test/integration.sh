@@ -615,8 +615,13 @@ scenario_status() {
   as_home /tmp/airc-it-s-j send @shost "status-probe" >/dev/null 2>&1
   sleep 1
   local j_out2; j_out2=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
-  echo "$j_out2" | grep -Eq 'last send:\s+[0-9]+s ago' && pass "joiner status: last-send shows elapsed seconds" \
-                                                       || fail "joiner status: last send not updated (got: $(echo "$j_out2" | grep 'last send'))"
+  echo "$j_out2" | grep -Eq 'last delivered:\s+[0-9]+s ago' && pass "joiner status: last-delivered shows elapsed seconds after successful send" \
+                                                            || fail "joiner status: last delivered not updated (got: $(echo "$j_out2" | grep -E 'last (delivered|send|attempt)'))"
+  # #15: after a successful send, there should NOT be a "last attempt" line —
+  # it's redundant with last_delivered unless they diverge.
+  echo "$j_out2" | grep -Eq 'last attempt:' \
+    && fail "joiner status: last attempt shown even though delivery succeeded (regression from #15 spec)" \
+    || pass "joiner status: last attempt hidden when delivered >= attempted"
 
   # Pending queue: simulate an outage by flipping host_target and sending, then assert queue size.
   # Reuse the same fake-target pattern as scenario_queue.
@@ -634,6 +639,13 @@ json.dump(c, open(p, 'w'))
   echo "$j_out3" | grep -Eq 'queue:\s+[1-9][0-9]* pending' \
     && pass "joiner status: queue shows 1+ pending after outage send" \
     || fail "joiner status: queue line didn't reflect pending (got: $(echo "$j_out3" | grep 'queue'))"
+
+  # #15: after an outage send, last_delivered must NOT advance (nothing reached
+  # the host), but last_attempt MUST surface with QUEUED state. This is the
+  # exact lie the old "last send" line was telling.
+  echo "$j_out3" | grep -Eq 'last attempt:\s+[0-9]+s ago.*QUEUED' \
+    && pass "joiner status: last-attempt surfaces QUEUED after outage send" \
+    || fail "joiner status: no QUEUED last-attempt after outage (got: $(echo "$j_out3" | grep -E 'last (delivered|attempt)'))"
 
   cleanup_all
 }
