@@ -373,13 +373,74 @@ scenario_teardown() {
   cleanup_all
 }
 
+scenario_resilience() {
+  section "resilience: stale-pidfile recovery + malformed peer + dead-pidfile teardown"
+  cleanup_all
+
+  # ── Regression for #6 (airc-96dd PR #8) ──────────────────────────────
+  # A dead PID in airc.pid used to wedge cmd_connect: `pgrep -P <dead>` exits 1,
+  # pipefail promoted it, and the script aborted before the self-healing rm -f.
+  # Fix guards the pipeline with `|| true`. Regression test: seed a dead PID,
+  # run connect in host mode, assert it reaches "Hosting as" AND clears the pid.
+  local sp_home=/tmp/airc-it-stalepid
+  mkdir -p "$sp_home/state"
+  # PID 1 always exists but can't be our parent, and pgrep -P 999999 always returns 1.
+  echo "999999" > "$sp_home/state/airc.pid"
+  ( cd "$sp_home" && AIRC_HOME="$sp_home/state" AIRC_NAME=stalepid-host AIRC_PORT=7549 \
+      "$AIRC" connect > "$sp_home/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6; do sleep 1; grep -q 'Hosting as' "$sp_home/out.log" 2>/dev/null && break; done
+  grep -q 'Hosting as' "$sp_home/out.log" && pass "stale pidfile: cmd_connect recovers and reaches Hosting" \
+                                          || fail "stale pidfile wedged cmd_connect (log: $(tail -3 "$sp_home/out.log"))"
+  # After recovery, pidfile should reflect the NEW process (not the old 999999).
+  local new_pid; new_pid=$(cat "$sp_home/state/airc.pid" 2>/dev/null | head -1)
+  [ -n "$new_pid" ] && [ "$new_pid" != "999999" ] && \
+    pass "stale pidfile: replaced by live PID on recovery ($new_pid)" \
+    || fail "stale pidfile: .airc/airc.pid still '$new_pid' — self-heal didn't overwrite"
+
+  # ── Regression for #9 teardown-with-dead-pidfile ──────────────────────
+  # cmd_teardown's `cat pidfile | tr` had the same pipefail shape; if the file
+  # was racily removed between -f and cat, teardown aborted. Fix adds || true.
+  # Seed dead PIDs, run teardown, assert it completes cleanly.
+  local td_home=/tmp/airc-it-deadtd
+  mkdir -p "$td_home/state"
+  echo "888888 888889" > "$td_home/state/airc.pid"
+  local td_out
+  td_out=$(AIRC_HOME="$td_home/state" AIRC_PORT=7550 "$AIRC" teardown 2>&1)
+  # Teardown with all-dead PIDs and no live listener should not print "killing
+  # scope" (kill -0 gate in cmd_connect's block, none alive). Either way, it
+  # must exit 0 and clear the pidfile.
+  [ -f "$td_home/state/airc.pid" ] && fail "dead-pidfile teardown: airc.pid not removed" \
+                                   || pass "dead-pidfile teardown: pidfile cleared without wedging"
+  echo "$td_out" | grep -q 'Teardown complete' && pass "dead-pidfile teardown: reached 'Teardown complete'" \
+                                               || fail "dead-pidfile teardown: aborted before completion ($td_out)"
+
+  # ── Regression for #9 peers-with-malformed-record ────────────────────
+  # cmd_peers' `python3 -c json.load(...)[key]` exits 1 on malformed JSON,
+  # which under set -e aborted the whole loop. Fix adds || true so one bad
+  # record doesn't hide all the good ones.
+  local pr_home=/tmp/airc-it-peersbad
+  mkdir -p "$pr_home/state/peers" "$pr_home/state/identity"
+  echo '{"name":"test"}' > "$pr_home/state/config.json"
+  # One valid peer, one broken (missing required keys, not even valid JSON)
+  echo '{"name":"good-peer","host":"user@1.2.3.4","airc_home":"/tmp/x"}' > "$pr_home/state/peers/good.json"
+  echo 'not-json-at-all' > "$pr_home/state/peers/broken.json"
+  local peers_out
+  peers_out=$(AIRC_HOME="$pr_home/state" "$AIRC" peers 2>&1)
+  echo "$peers_out" | grep -q 'good-peer' && pass "malformed peer: valid peer still enumerated" \
+                                          || fail "malformed peer: good-peer missing from output ($peers_out)"
+
+  cleanup_all
+}
+
 case "$MODE" in
-  tabs)      scenario_tabs  ;;
-  scope)     scenario_scope ;;
-  teardown)  scenario_teardown ;;
-  reminder)  scenario_reminder ;;
-  all)       scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|all]"; exit 2 ;;
+  tabs)        scenario_tabs  ;;
+  scope)       scenario_scope ;;
+  teardown)    scenario_teardown ;;
+  reminder)    scenario_reminder ;;
+  resilience)  scenario_resilience ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|all]"; exit 2 ;;
 esac
 
 echo
