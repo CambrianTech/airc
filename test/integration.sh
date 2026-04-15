@@ -54,7 +54,23 @@ cleanup_dirs() {
   find /tmp -maxdepth 1 -name 'airc-it-*' -exec rm -rf {} + 2>/dev/null || true
 }
 
-cleanup_all() { cleanup_procs; cleanup_dirs; }
+cleanup_known_hosts() {
+  # Test alpha/beta hosts run on the user's real SSH target
+  # (joelteply@100.91.51.87 or similar), so their pair handshake writes
+  # ephemeral test host keys into ~/.ssh/known_hosts. Left behind, those
+  # stale keys collide with the user's real airc host running on the
+  # same IP — SSH to the real host fails with REMOTE HOST IDENTIFICATION
+  # HAS CHANGED. Clear any entries for this machine's address between runs.
+  local addr; addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [ -z "$addr" ] && addr=$(ipconfig getifaddr en0 2>/dev/null)
+  if [ -n "$addr" ]; then
+    ssh-keygen -R "$addr" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+  fi
+  # Also the tailscale IP family airc tests commonly use
+  ssh-keygen -R 100.91.51.87 -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+}
+
+cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; }
 
 # Boot a host. Args: home, name, port
 spawn_host() {
