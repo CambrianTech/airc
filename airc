@@ -513,7 +513,12 @@ sock.close()
 print(data.decode().strip())
 " 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
 
-    # Authorize host's SSH pubkey
+    # Authorize host's SSH pubkey AND install it into our known_hosts so the
+    # first ssh/scp call does not fall back to interactive verification (or
+    # worse, fail because a prior host pubkey is cached from an earlier
+    # pair).  Real-world UX gap: memento on a different machine hit
+    # "REMOTE HOST IDENTIFICATION HAS CHANGED" after the host re-keyed
+    # across teardown --flush cycles.
     local host_ssh_pub
     host_ssh_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null || true)
     if [ -n "$host_ssh_pub" ]; then
@@ -522,6 +527,12 @@ print(data.decode().strip())
         echo "$host_ssh_pub" >> "$HOME/.ssh/authorized_keys"
         chmod 600 "$HOME/.ssh/authorized_keys"
       }
+      # Seed known_hosts with the freshly-received host key. Clears any
+      # stale entry first so a re-pair after the host re-keyed just works.
+      local host_addr="${ssh_target##*@}"
+      touch "$HOME/.ssh/known_hosts" && chmod 600 "$HOME/.ssh/known_hosts"
+      ssh-keygen -R "$host_addr" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+      echo "$host_addr $host_ssh_pub" >> "$HOME/.ssh/known_hosts"
     fi
 
     # Save host as a peer (with their airc_home so wire paths are correct).
