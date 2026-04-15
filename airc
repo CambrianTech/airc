@@ -370,6 +370,23 @@ cmd_connect() {
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
 
+  # Resume case: no join-string arg and we already have state for this scope.
+  # If config records host_target, we were a joiner — just restart the monitor
+  # against the saved host (identity + authorized_keys + peer records persist
+  # on disk, so no fresh handshake needed). Makes `airc connect` after a
+  # Claude Code restart trivially resume the conversation.
+  if [ -z "$target" ] && [ -f "$CONFIG" ]; then
+    local prior_host_target; prior_host_target=$(get_config_val host_target "")
+    if [ -n "$prior_host_target" ]; then
+      local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
+      echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
+      echo $$ > "$AIRC_WRITE_DIR/airc.pid"
+      trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null' EXIT
+      monitor
+      return
+    fi
+  fi
+
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
     # Parse name@user@host[:port]#pubkey
