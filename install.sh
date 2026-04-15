@@ -30,8 +30,9 @@ fi
 
 mkdir -p "$BIN_DIR"
 ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-# Clean up legacy `relay` symlink from pre-rename installs
-[ -L "$BIN_DIR/relay" ] && rm "$BIN_DIR/relay"
+# Back-compat: `relay` still works for muscle-memory and stale docs.
+# The airc binary detects the invocation name and behaves identically.
+ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
@@ -58,7 +59,13 @@ if [ -d "$CLONE_DIR/skills" ]; then
     [ -d "$skill_dir" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$SKILLS_TARGET/$skill_name"
-    [ -L "$target" ] && rm "$target"
+    # If the target is a real directory (from a pre-rename hand-install
+    # or an old copy-based installer), it shadows the new symlink. Nuke it.
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      rm -rf "$target"
+    elif [ -L "$target" ]; then
+      rm "$target"
+    fi
     ln -sf "$skill_dir" "$target"
     ok "Skill: /airc:$skill_name"
   done
