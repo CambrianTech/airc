@@ -283,12 +283,12 @@ for line in sys.stdin:
     fr = m.get("from", "?")
     to = m.get("to", "")
     msg = m.get("msg", "")
-    if handle_rename(msg, ts):
-        continue
-    # Filter own sends — they create self-echo noise in Claude Code
-    # notifications. Outbounds are still in airc logs for audit; the
-    # send command itself returns status on success/failure.
+    # Filter own sends early, including our own [rename] markers. Our own
+    # rename does not apply to our peer records, and the host-fallback
+    # match would wrongly touch another peer sharing our host.
     if fr == my_name:
+        continue
+    if handle_rename(msg, ts):
         continue
     if fr in ("airc", "sys"):
         label = "airc"
