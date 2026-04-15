@@ -126,6 +126,10 @@ resolve_name() {
   elif [ -f "$CONFIG" ]; then
     name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
   fi
+  # Reject flag-shaped names that may have leaked in from a buggy prior rename
+  # (e.g. `airc rename --help` writing '--help' into config.json). Fall through
+  # to auto-derivation so the user isn't stuck until they rename again.
+  case "$name" in -*) name="" ;; esac
   if [ -z "$name" ]; then
     # Auto-derive from cwd basename — contextual and human-readable
     # e.g. /path/to/Aria → aria, /path/to/continuum → continuum
@@ -537,7 +541,17 @@ print(f'  Peer joined: {jname}')
 
 cmd_rename() {
   local new_name="${1:-}"
-  [ -z "$new_name" ] && die "Usage: airc rename <new-name>"
+  # Intercept help flags BEFORE sanitization — otherwise `--help` looks like a
+  # valid name (all chars are in [a-z0-9-]) and gets written into config.json.
+  case "$new_name" in
+    ""|-h|--help)
+      echo "Usage: airc rename <new-name>"
+      echo "  Renames this identity and broadcasts [rename] to paired peers."
+      [ -z "$new_name" ] && exit 1 || exit 0
+      ;;
+  esac
+  # Reject leading dash so no flag-shaped string can ever become an identity.
+  case "$new_name" in -*) die "Name must not start with '-' (got '$new_name')" ;; esac
   new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
