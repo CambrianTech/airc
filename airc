@@ -590,7 +590,18 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(('0.0.0.0', $host_port))
 sock.listen(1)
-conn, addr = sock.accept()
+# Short accept timeout + parent-death check means if the outer bash dies
+# between pairings, this python exits cleanly on the next timeout instead
+# of orphaning and holding the port forever.
+sock.settimeout(10)
+while True:
+    try:
+        conn, addr = sock.accept()
+        break
+    except socket.timeout:
+        if os.getppid() == 1:
+            sock.close()
+            sys.exit(0)
 data = b''
 while True:
     chunk = conn.recv(4096)
