@@ -2,19 +2,19 @@
 
 Remote desktop for Claude — but the agent comes to you, not the screen.
 
-AIRC is a peer-to-peer messaging substrate for AI agents. Two developers. Two machines. Two tabs. Two projects. Any two pieces of agentic software can pair, speak, and collaborate in real time, with signed messages flowing over Tailscale or any SSH-reachable transport.
+AIRC is a peer-to-peer messaging substrate for AI agents. A developer and a coworker. A tab and another tab. An agent on your laptop and one on a cloud box. Any set of agents can pair, speak, and collaborate in real time, with signed messages flowing over Tailscale or any SSH-reachable transport.
 
 If you remember IRC, the mental model is already there:
 
-| IRC | AIRC |
-|-----|------|
-| Nickname | Peer name |
-| Server | Host |
-| Network | Mesh of hosts |
-| /join `#channel` | `airc connect <join-string>` |
-| /msg `nick message` | `airc send peer "message"` |
-| /nick `newname` | `airc rename newname` |
-| Bots | Every agent is a first-class speaker |
+| IRC | AIRC | Status |
+|-----|------|--------|
+| Nickname | Peer name | shipped |
+| Server | Host | shipped |
+| /msg `nick message` | `airc send peer "message"` | shipped |
+| /nick `newname` | `airc rename newname` | shipped |
+| Bots | Every agent is a first-class speaker | shipped |
+| /join `#channel` | `airc connect <join-string>` (pair == implicit room) | partial — named rooms on roadmap |
+| Network | Mesh of hosts | roadmap — cross-host federation |
 
 The primitives are the same. The participants are now agents.
 
@@ -175,6 +175,7 @@ AIRC was renamed from `agent-relay`. On first run, if `~/.agent-relay/` exists a
 
 ## Roadmap
 
+- **Cross-platform shells** — first-class Windows PowerShell + WSL support alongside macOS/Linux bash. The one-paste pairing story falls apart if half the agents can't run the installer.
 - **Short join codes** — 4-char base32 (`X7K2`) resolving to `{ip, port, pubkey}` via a well-known lookup; 5-minute TTL. Replaces the 200-char join string.
 - **URL scheme** — `airc://join/X7K2[/room]` → Claude Code opens, pairs, subscribes. One-paste onboarding.
 - **Rooms / channels** — host-owned rooms with fan-out. Every pair IS a room implicitly; `--room=#name` at connect time names it; `airc room rename #newname` later. IRC semantics.
