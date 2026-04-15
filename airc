@@ -189,20 +189,32 @@ monitor() {
   # Wrapped in a reconnect loop so a dropped SSH session / transient
   # filesystem error doesn't permanently stop notifications. A brief sleep
   # between retries avoids hot-looping if the remote is down.
+  # Start position for tail: resume from saved offset if we've run before.
+  # This prevents [rename] markers that arrived during a teardown window
+  # from being skipped on reconnect. First-ever run starts at current EOF
+  # (no history replay).
+  local offset_file="$AIRC_WRITE_DIR/monitor_offset"
+  local tail_pos
+  if [ -f "$offset_file" ]; then
+    tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
+  else
+    tail_pos="-n 0"
+  fi
+
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
     while true; do
-      ssh $ssh_opts "$host_target" "tail -n 0 -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
-      # If we fall out, the ssh session ended (drop/timeout/remote restart).
-      # Brief pause then reconnect. Messages that arrived during the gap are
-      # retrievable via `airc logs`.
+      ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      # Subsequent reconnects use the now-persisted offset updated by the formatter.
+      tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
       sleep 3
     done
   else
     while true; do
-      tail -n 0 -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name" || true
+      tail $tail_pos -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name" || true
+      tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
       sleep 1
     done
   fi
@@ -219,6 +231,7 @@ peers_dir = os.environ.get("PEERS_DIR", "")
 scope_dir = os.path.dirname(peers_dir)
 config_path = os.path.join(scope_dir, "config.json")
 local_log = os.path.join(scope_dir, "messages.jsonl")
+offset_path = os.path.join(scope_dir, "monitor_offset")
 
 def current_name():
     """Read identity name fresh from config.json each time so a rename
@@ -285,9 +298,22 @@ def handle_rename(msg, ts):
             return True
     return False
 
+offset_counter = 0
+try:
+    with open(offset_path) as f:
+        offset_counter = int(f.read().strip() or 0)
+except Exception:
+    pass
+
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
+    offset_counter += 1
+    try:
+        with open(offset_path, "w") as f:
+            f.write(str(offset_counter))
+    except Exception:
+        pass
     try:
         m = json.loads(line)
     except Exception:
