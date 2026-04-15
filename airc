@@ -453,7 +453,10 @@ cmd_connect() {
       local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
       echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
       echo $$ > "$AIRC_WRITE_DIR/airc.pid"
-      trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null' EXIT
+      trap '
+        rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+        for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
+      ' EXIT INT TERM
       monitor
       return
     fi
@@ -623,7 +626,12 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 
     # Write PID file so `airc teardown` can find us later.
     echo $$ > "$AIRC_WRITE_DIR/airc.pid"
-    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null' EXIT
+    # Clean exit on tab close / signal: reap the ssh tail subprocess so the
+    # remote doesn't see an orphaned session and the port doesn't linger.
+    trap '
+      rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+      for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
+    ' EXIT INT TERM
 
     echo "  Monitoring for messages..."
     monitor
@@ -775,7 +783,16 @@ print(f'  Peer joined: {jname}')
     # Write PID file so `airc teardown` can find us later. Record both us and
     # the PAIR_PID (the backgrounded TCP-accept loop) so teardown can reap both.
     echo "$$ $PAIR_PID" > "$AIRC_WRITE_DIR/airc.pid"
-    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null; kill $PAIR_PID 2>/dev/null' EXIT
+    # Clean exit on tab close (SIGTERM/SIGINT from Claude Code's Monitor tool
+    # going away, or any other signal): reap the accept loop, its python
+    # listener, and any active ssh tail — don't leave orphans holding the
+    # port or the SSH session.
+    trap '
+      rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+      for p in $PAIR_PID $(pgrep -P $PAIR_PID 2>/dev/null) $(pgrep -P $$ 2>/dev/null); do
+        kill $p 2>/dev/null
+      done
+    ' EXIT INT TERM
 
     echo "  Monitoring for messages..."
     monitor
@@ -1096,6 +1113,29 @@ cmd_teardown() {
   [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
 }
 
+cmd_disconnect() {
+  # "Leave the room" — kill running processes in scope, then clear only the
+  # host-pairing fields from config.json. Your identity (name + keys), peers
+  # list, and message history are all preserved. Next `airc connect` (no
+  # args) starts fresh host mode instead of auto-resuming the prior pairing.
+  # Use when you want to switch to a different mesh or host a new one, but
+  # keep your agent identity stable.
+  cmd_teardown >/dev/null 2>&1 || true
+  if [ -f "$CONFIG" ]; then
+    python3 -c "
+import json
+try:
+    c = json.load(open('$CONFIG'))
+    for k in ('host_target', 'host_name', 'host_airc_home', 'host_port', 'host_ssh_pub'):
+        c.pop(k, None)
+    json.dump(c, open('$CONFIG', 'w'), indent=2)
+except Exception:
+    pass
+" 2>/dev/null || true
+  fi
+  echo "  Disconnected. Identity preserved. Next 'airc connect' starts fresh (not a resume)."
+}
+
 cmd_update() {
   # Refresh install dir (git pull) AND re-run install.sh so new skills get
   # symlinked into ~/.claude/skills/ and old ones get cleaned up. install.sh
@@ -1198,6 +1238,7 @@ case "${1:-help}" in
   logs)      shift; cmd_logs "$@" ;;
   doctor)    shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
+  disconnect|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;
