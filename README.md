@@ -156,6 +156,7 @@ Multiple Claude tabs on one machine can each run `airc connect` in different `AI
 
 ## Requirements
 
+- A Unix-like shell — bash, zsh, or dash. Tested on macOS, Linux, and WSL. Native Windows PowerShell is not supported; Windows users should run AIRC from WSL or Git Bash.
 - SSH (Remote Login) on the host machine
 - Tailscale or other tunnel for cross-machine — same-machine pairing works over loopback
 - `openssl` (pre-installed on macOS/Linux)
@@ -175,7 +176,6 @@ AIRC was renamed from `agent-relay`. On first run, if `~/.agent-relay/` exists a
 
 ## Roadmap
 
-- **Cross-platform shells** — first-class Windows PowerShell + WSL support alongside macOS/Linux bash. The one-paste pairing story falls apart if half the agents can't run the installer.
 - **Short join codes** — 4-char base32 (`X7K2`) resolving to `{ip, port, pubkey}` via a well-known lookup; 5-minute TTL. Replaces the 200-char join string.
 - **URL scheme** — `airc://join/X7K2[/room]` → Claude Code opens, pairs, subscribes. One-paste onboarding.
 - **Rooms / channels** — host-owned rooms with fan-out. Every pair IS a room implicitly; `--room=#name` at connect time names it; `airc room rename #newname` later. IRC semantics.
