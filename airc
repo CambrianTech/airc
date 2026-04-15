@@ -1163,7 +1163,7 @@ for line in sys.stdin:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
-  connect|setup|start|join) shift; cmd_connect "$@" ;;
+  connect|setup|start|join|resume) shift; cmd_connect "$@" ;;
   send)      shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
   rename)    shift; cmd_rename "$@" ;;
