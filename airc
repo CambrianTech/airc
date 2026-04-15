@@ -18,27 +18,43 @@ if [ -z "${AIRC_HOME:-}" ] && [ -d "$HOME/.agent-relay" ] && [ ! -L "$HOME/.agen
     echo "  Migrated $HOME/.agent-relay → $HOME/.airc (symlink left for back-compat)" >&2
 fi
 
-# Scope auto-detect. No env vars required for normal use.
+# Scope = $PWD/.airc. Your identity is tied to where you are.
 #
-# Priority (first match wins):
-#   1. $AIRC_HOME — explicit override. Escape hatch for tests / edge cases.
-#   2. <git-repo-root>/.airc/ — if cwd is inside a git repo. Identity scoped
-#      to the project the agent is working on. Auto-created on first connect.
-#   3. $HOME/.airc/ — no repo context. One identity per machine.
+# Run `airc` from the same cwd each time for a persistent identity in that
+# context. Different cwd = different scope = different peer. Multi-tab on
+# one machine? Open each tab in its own dir (or repo) — they're distinct
+# peers automatically.
 #
-# Users/agents never set env vars in practice. Just run `airc connect`.
+# AIRC_HOME env var overrides, for tests / edge cases. Normal users don't
+# touch it.
 detect_scope() {
   if [ -n "${AIRC_HOME:-}" ]; then
     echo "$AIRC_HOME"
     return
   fi
-  local git_root
-  git_root=$(git rev-parse --show-toplevel 2>/dev/null)
-  if [ -n "$git_root" ] && [ -d "$git_root" ]; then
-    echo "$git_root/.airc"
-  else
-    echo "$HOME/.airc"
-  fi
+  # Resolve symlinks so /tmp/x and /private/tmp/x are the same scope.
+  echo "$(pwd -P)/.airc"
+}
+
+# Short, clash-resistant name auto-derived from the scope path.
+# Format: <basename>-<4-char-hash>. Hash disambiguates same-basename
+# directories across different parent paths (two "src" dirs don't collide).
+# Users can override any time with `airc rename <new>`.
+derive_name() {
+  local dir="${1:-$(pwd -P)}"
+  # Prefer git root basename — more meaningful than a subdir basename when
+  # the user happens to be deep in a repo — but hash the actual cwd so
+  # subdirs still get unique names.
+  local base_dir git_root
+  git_root=$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)
+  base_dir="${git_root:-$dir}"
+  local base
+  base=$(basename "$base_dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-12)
+  [ -z "$base" ] && base="airc"
+  local hash
+  hash=$(printf '%s' "$dir" | shasum -a 256 2>/dev/null | cut -c1-4)
+  [ -z "$hash" ] && hash=$(printf '%s' "$dir" | cksum | cut -c1-4)
+  echo "${base}-${hash}"
 }
 
 AIRC_WRITE_DIR="$(detect_scope)"
@@ -127,17 +143,10 @@ resolve_name() {
   elif [ -f "$CONFIG" ]; then
     name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
   fi
-  # Reject flag-shaped names that may have leaked in from a buggy prior rename
-  # (e.g. `airc rename --help` writing '--help' into config.json). Fall through
-  # to auto-derivation so the user isn't stuck until they rename again.
+  # Reject flag-shaped names that may have leaked in from a buggy prior rename.
   case "$name" in -*) name="" ;; esac
-  if [ -z "$name" ]; then
-    # Auto-derive from cwd basename — contextual and human-readable
-    # e.g. /path/to/Aria → aria, /path/to/continuum → continuum
-    local cwd_base
-    cwd_base=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
-    [ -n "$cwd_base" ] && [ "$cwd_base" != "-" ] && name="$cwd_base"
-  fi
+  # Fallback: derive from scope path — basename + 4-char hash for clash-resistance.
+  [ -z "$name" ] && name=$(derive_name)
   [ -z "$name" ] && name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
   echo "$name"
 }
@@ -819,6 +828,7 @@ case "${1:-help}" in
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
+  debug-name)  resolve_name ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo ""

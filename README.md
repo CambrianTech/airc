@@ -107,12 +107,13 @@ airc teardown [--flush]           # kill this scope's airc processes (--flush wi
 
 ## Identity & State
 
-Scope is auto-detected — you never set it.
+**Your identity is tied to where you are.** Run `airc` from any directory — state lives at `$PWD/.airc/`, auto-created on first `airc connect`. Different cwd = different scope = different peer. Multi-tab on one machine? Open each tab in its own dir (or repo); they're distinct automatically.
 
-- **Inside a git repo?** State lives at `<repo-root>/.airc/`. One identity per project, shared across every subdir of the repo. Auto-created on first `airc connect`.
-- **Not in a repo?** State lives at `$HOME/.airc/`. One identity per machine.
+Identity name auto-derives: `<basename>-<4-char-hash>`. Basename is the git-repo-root name if you're in a repo (so nested subdirs don't fragment the display name), else the cwd basename. The 4-char hash disambiguates — two "src" dirs in different projects never collide.
 
-Identity name auto-derives from repo basename (or cwd basename if not in a repo, or hostname as last resort). Use `airc rename <new>` to change it any time; paired peers auto-update via a `[rename]` broadcast.
+Example: `/Users/joel/Development/cambrian/airc` → `airc-96dd`.
+
+Rename any time: `airc rename <new>` — paired peers auto-update via the `[rename]` broadcast.
 
 Power-user escape hatches (normal users ignore these entirely):
 - `AIRC_HOME=/some/path` — force a specific scope (tests and edge cases only)

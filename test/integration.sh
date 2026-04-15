@@ -211,46 +211,51 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
 # ── Scenario: scope ─────────────────────────────────────────────────────
 
 scenario_scope() {
-  section "scope: auto-detect git-root / HOME / AIRC_HOME override"
+  section "scope: $PWD/.airc with AIRC_HOME override"
   cleanup_all
 
-  # Build a fake git repo with a subdir; from both cwds, airc must resolve to
-  # the SAME scope (<repo-root>/.airc), not a subdir-local one.
-  local repo="/tmp/airc-it-repo"
-  rm -rf "$repo"
-  mkdir -p "$repo/sub/deeper"
-  ( cd "$repo" && git init -q 2>/dev/null )
-  # macOS: /tmp is a symlink to /private/tmp. git resolves to the real path,
-  # so compare against the resolved repo root.
-  local repo_real; repo_real=$(cd "$repo" && pwd -P)
+  local a="/tmp/airc-it-scope-a"
+  local b="/tmp/airc-it-scope-b"
+  local asub="$a/sub"
+  rm -rf "$a" "$b"
+  mkdir -p "$asub" "$b"
 
-  local scope_at_root scope_at_sub scope_at_deeper
-  scope_at_root=$(cd "$repo" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
-  scope_at_sub=$(cd "$repo/sub" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
-  scope_at_deeper=$(cd "$repo/sub/deeper" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
+  # Resolve symlinks: detect_scope uses `pwd -P`, so compare against resolved.
+  local a_real asub_real b_real
+  a_real=$(cd "$a" && pwd -P)
+  asub_real=$(cd "$asub" && pwd -P)
+  b_real=$(cd "$b" && pwd -P)
 
-  [ "$scope_at_root" = "$repo_real/.airc" ] && pass "at repo root: scope = <repo>/.airc" \
-                                             || fail "at repo root: got '$scope_at_root'"
-  [ "$scope_at_sub" = "$repo_real/.airc" ] && pass "in subdir: scope still = <repo>/.airc" \
-                                           || fail "in subdir: got '$scope_at_sub'"
-  [ "$scope_at_deeper" = "$repo_real/.airc" ] && pass "in nested subdir: scope still = <repo>/.airc" \
-                                              || fail "nested subdir: got '$scope_at_deeper'"
+  local scope_a scope_asub scope_b
+  scope_a=$(cd "$a" && "$AIRC" debug-scope 2>&1)
+  scope_asub=$(cd "$asub" && "$AIRC" debug-scope 2>&1)
+  scope_b=$(cd "$b" && "$AIRC" debug-scope 2>&1)
 
-  # Outside any git repo: fall back to HOME.
-  local fakehome="/tmp/airc-it-nogit-home"
-  mkdir -p "$fakehome" "/tmp/airc-it-nogit"
-  local scope_nogit
-  scope_nogit=$(cd /tmp/airc-it-nogit && HOME="$fakehome" "$AIRC" debug-scope 2>&1)
-  [ "$scope_nogit" = "$fakehome/.airc" ] && pass "no git repo: scope = \$HOME/.airc" \
-                                         || fail "no git repo: got '$scope_nogit'"
+  [ "$scope_a" = "$a_real/.airc" ] && pass "cwd=$a: scope = \$PWD/.airc" \
+                                   || fail "cwd=$a: got '$scope_a' (expected $a_real/.airc)"
+  [ "$scope_asub" = "$asub_real/.airc" ] && pass "subdir: scope differs from parent (per-cwd)" \
+                                         || fail "subdir scope: got '$scope_asub'"
+  [ "$scope_b" = "$b_real/.airc" ] && pass "different cwd: different scope" \
+                                   || fail "cwd=$b: got '$scope_b'"
 
-  # AIRC_HOME override wins over everything else.
+  # AIRC_HOME override wins.
   local scope_override
-  scope_override=$(cd "$repo" && AIRC_HOME=/tmp/airc-it-override HOME="$fakehome" "$AIRC" debug-scope 2>&1)
-  [ "$scope_override" = "/tmp/airc-it-override" ] && pass "AIRC_HOME overrides git-root detection" \
-                                                  || fail "AIRC_HOME override ignored: got '$scope_override'"
+  scope_override=$(cd "$a" && AIRC_HOME=/tmp/airc-it-override "$AIRC" debug-scope 2>&1)
+  [ "$scope_override" = "/tmp/airc-it-override" ] && pass "AIRC_HOME overrides cwd detection" \
+                                                  || fail "override ignored: got '$scope_override'"
 
-  rm -rf "$repo" "$fakehome" /tmp/airc-it-nogit /tmp/airc-it-override
+  # Derived name: basename + 4-char hash, same-basename-different-dirs don't collide.
+  local same_base_1="/tmp/airc-it-proj-alpha/src"
+  local same_base_2="/tmp/airc-it-proj-beta/src"
+  mkdir -p "$same_base_1" "$same_base_2"
+  local name_1 name_2
+  name_1=$(cd "$same_base_1" && "$AIRC" debug-name 2>&1)
+  name_2=$(cd "$same_base_2" && "$AIRC" debug-name 2>&1)
+  [ -n "$name_1" ] && [ -n "$name_2" ] && [ "$name_1" != "$name_2" ] \
+    && pass "same basename different dirs: unique names ('$name_1' vs '$name_2')" \
+    || fail "same-basename clash: '$name_1' vs '$name_2'"
+
+  rm -rf "$a" "$b" /tmp/airc-it-override /tmp/airc-it-proj-alpha /tmp/airc-it-proj-beta
 }
 
 # ── Entry point ─────────────────────────────────────────────────────────
