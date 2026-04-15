@@ -216,7 +216,9 @@ monitor_formatter() {
 import sys, json, os, re, time
 
 peers_dir = os.environ.get("PEERS_DIR", "")
-config_path = os.path.join(os.path.dirname(peers_dir), "config.json")
+scope_dir = os.path.dirname(peers_dir)
+config_path = os.path.join(scope_dir, "config.json")
+local_log = os.path.join(scope_dir, "messages.jsonl")
 
 def current_name():
     """Read identity name fresh from config.json each time so a rename
@@ -298,6 +300,15 @@ for line in sys.stdin:
     # the name fresh so a mid-session rename takes effect immediately.
     if fr == current_name():
         continue
+    # Mirror every inbound event to the local messages.jsonl. Lets a
+    # legacy monitor (or any tool) tail $AIRC_HOME/messages.jsonl as
+    # the single source of truth, regardless of whether the events
+    # originated locally or arrived via SSH tail from the host.
+    try:
+        with open(local_log, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
     if handle_rename(msg, ts):
         continue
     if fr in ("airc", "sys"):
