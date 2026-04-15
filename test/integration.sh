@@ -708,6 +708,84 @@ scenario_auth_failure() {
   cleanup_all
 }
 
+scenario_resume_stale_auth() {
+  section "resume_stale_auth: teardown + resume with stale SSH key must fail LOUDLY, not silently"
+  cleanup_all
+
+  # This is the "default broken" path joel flagged. A user runs `airc teardown`
+  # (without --flush, so saved pairing stays) and then `airc connect` (no args,
+  # resume path). If their SSH key has been invalidated on the host — by a
+  # reinstall regenerating identity keys, by authorized_keys rotation, by ANY
+  # cause — the old resume path silently started a tail loop that retried
+  # forever while the user waited for a mesh that was never coming back.
+
+  spawn_host /tmp/airc-it-rsa-h rsahost 7549 || { fail "rsahost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-rsa-h)
+  spawn_joiner /tmp/airc-it-rsa-j rsajoiner "$join" || { fail "rsajoiner join failed"; return; }
+  sleep 3
+
+  # Baseline: confirm fresh pair works
+  as_home /tmp/airc-it-rsa-j send @rsahost "baseline" >/dev/null 2>&1 \
+    && pass "baseline: fresh pair works" || { fail "baseline broken"; return; }
+
+  # ── Simulate the stale-auth state: kill the joiner (non-flush — preserves
+  # config.json + identity + peer records), then regenerate the identity key
+  # BEHIND the host's back (the host's authorized_keys still has the old key).
+  AIRC_HOME=/tmp/airc-it-rsa-j/state AIRC_PORT=7549 "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+  rm -f /tmp/airc-it-rsa-j/state/identity/ssh_key \
+        /tmp/airc-it-rsa-j/state/identity/ssh_key.pub
+  ssh-keygen -t ed25519 -f /tmp/airc-it-rsa-j/state/identity/ssh_key \
+             -N '' -q -C 'airc-stale-post-reinstall' 2>/dev/null
+
+  # ── Now attempt a resume. PRE-FIX: silently starts a tail loop that
+  # retries forever. POST-FIX: auth probe detects the stale key and dies.
+  local resume_out; resume_out=$(mktemp -t airc-rsa-out.XXXXXX)
+  local resume_err; resume_err=$(mktemp -t airc-rsa-err.XXXXXX)
+  # Background with a timeout so the pre-fix silent-loop doesn't hang the test.
+  ( AIRC_HOME=/tmp/airc-it-rsa-j/state "$AIRC" connect >"$resume_out" 2>"$resume_err" ) &
+  local resume_pid=$!
+  # Give it up to 10s to either exit (post-fix) or go silent into the tail
+  # retry loop (pre-fix — we'll kill it).
+  local exited=0 i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if ! kill -0 $resume_pid 2>/dev/null; then exited=1; break; fi
+  done
+  if [ "$exited" = "0" ]; then
+    # Still running after 10s — pre-fix behavior. Kill it, record the failure.
+    kill -9 $resume_pid 2>/dev/null
+    fail "resume_stale_auth: connect still running after 10s — silent retry loop (pre-fix bug)"
+  else
+    pass "resume_stale_auth: connect exited promptly (${i}s) rather than silently looping"
+  fi
+
+  wait $resume_pid 2>/dev/null
+  local resume_exit=$?
+
+  # Post-fix expectations
+  if [ "$resume_exit" -ne 0 ]; then
+    pass "resume_stale_auth: connect exited non-zero ($resume_exit) on stale auth"
+  else
+    fail "resume_stale_auth: connect exited 0 despite broken auth"
+  fi
+
+  grep -qiE 'auth|permission|publickey' "$resume_err" \
+    && pass "resume_stale_auth: stderr surfaces the SSH auth error" \
+    || fail "resume_stale_auth: stderr doesn't mention auth (got: $(cat "$resume_err"))"
+
+  grep -qE 'teardown --flush' "$resume_err" \
+    && pass "resume_stale_auth: stderr tells user HOW to fix" \
+    || fail "resume_stale_auth: no --flush repair command in stderr"
+
+  grep -qE 'invite string' "$resume_err" \
+    && pass "resume_stale_auth: stderr reconstructs the saved invite string for convenience" \
+    || fail "resume_stale_auth: no reconstructed invite string in stderr"
+
+  rm -f "$resume_out" "$resume_err"
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -718,8 +796,9 @@ case "$MODE" in
   queue)        scenario_queue ;;
   status)       scenario_status ;;
   auth_failure) scenario_auth_failure ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|all]"; exit 2 ;;
+  resume_stale_auth) scenario_resume_stale_auth ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|all]"; exit 2 ;;
 esac
 
 echo

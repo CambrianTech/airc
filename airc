@@ -536,6 +536,47 @@ cmd_connect() {
     if [ -n "$prior_host_target" ]; then
       local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
       echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
+
+      # Auth probe BEFORE committing to the monitor loop. Prior behavior
+      # went straight into tail-over-SSH; if auth was broken (stale keys
+      # after reinstall, authorized_keys rotation on host), ssh exited 255
+      # silently, the while loop retried forever, and the user's mesh was
+      # dead without any visible error. This was the "default broken" path:
+      # `airc teardown` + `airc connect` (no args = resume) is what every
+      # user does, and it silently bricked on stale auth.
+      local probe_key="$IDENTITY_DIR/ssh_key"
+      local probe_err; probe_err=$(mktemp -t airc-resume-probe.XXXXXX)
+      local probe_out
+      probe_out=$(ssh -i "$probe_key" -o StrictHostKeyChecking=accept-new \
+                      -o ConnectTimeout=5 -o BatchMode=yes \
+                      "$prior_host_target" "echo __AUTH_OK__" 2>"$probe_err" || true)
+      if ! echo "$probe_out" | grep -q '^__AUTH_OK__$'; then
+        local probe_stderr; probe_stderr=$(cat "$probe_err" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+        rm -f "$probe_err"
+        # Auth failure → re-pair needed. Network failure → fall through,
+        # monitor's retry loop handles transient outages correctly.
+        if echo "$probe_stderr" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
+          echo "  SSH auth to host FAILED on resume. Saved pairing is stale." >&2
+          echo "  SSH stderr: ${probe_stderr}" >&2
+          echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
+          # Reconstruct the invite string from saved config as a convenience.
+          local host_ssh_pub; host_ssh_pub=$(get_config_val host_ssh_pub "")
+          local host_port; host_port=$(get_config_val host_port 7547)
+          if [ -n "$host_ssh_pub" ] && [ -n "$prior_name" ]; then
+            local pub_b64; pub_b64=$(printf '%s\n' "$host_ssh_pub" | base64 | tr -d '\n')
+            local suffix=""; [ "$host_port" != "7547" ] && suffix=":$host_port"
+            echo "  Your saved invite string (for the above command):" >&2
+            echo "    ${prior_name}@${prior_host_target}${suffix}#${pub_b64}" >&2
+          fi
+          die "Resume aborted — re-pair required"
+        else
+          echo "  Host probe failed (non-auth). Monitor will retry in background." >&2
+          echo "  SSH stderr: ${probe_stderr:-<none>}" >&2
+        fi
+      else
+        rm -f "$probe_err"
+      fi
+
       echo $$ > "$AIRC_WRITE_DIR/airc.pid"
       trap '
         rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
