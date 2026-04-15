@@ -217,29 +217,59 @@ import sys, json, os, re, time
 
 peers_dir = os.environ.get("PEERS_DIR", "")
 my_name = os.environ.get("MY_NAME", "")
-RENAME_RE = re.compile(r"^\[rename\] old=([a-z0-9-]+) new=([a-z0-9-]+)")
+# Marker may carry an optional `host=user@ip` so receivers can find the
+# sender via stable host field even when name-keyed lookup would miss
+# (chain break from a dropped rename, stale records, etc).
+RENAME_RE = re.compile(r"^\[rename\] old=([a-z0-9-]+) new=([a-z0-9-]+)(?:\s+host=(\S+))?")
+
+def _rename_files(old, new):
+    old_json = os.path.join(peers_dir, f"{old}.json")
+    new_json = os.path.join(peers_dir, f"{new}.json")
+    if not os.path.isfile(old_json):
+        return False
+    try:
+        os.rename(old_json, new_json)
+        d = json.load(open(new_json))
+        d["name"] = new
+        json.dump(d, open(new_json, "w"), indent=2)
+    except Exception:
+        pass
+    old_pub = os.path.join(peers_dir, f"{old}.pub")
+    new_pub = os.path.join(peers_dir, f"{new}.pub")
+    if os.path.isfile(old_pub):
+        try: os.rename(old_pub, new_pub)
+        except Exception: pass
+    return True
+
+def _find_peer_by_host(host):
+    """Return current name of the peer record whose host matches, or None."""
+    if not host or not os.path.isdir(peers_dir):
+        return None
+    for entry in os.listdir(peers_dir):
+        if not entry.endswith(".json"): continue
+        try:
+            d = json.load(open(os.path.join(peers_dir, entry)))
+        except Exception:
+            continue
+        if d.get("host") == host:
+            return d.get("name") or entry[:-5]
+    return None
 
 def handle_rename(msg, ts):
     m = RENAME_RE.match(msg)
     if not m: return False
-    old, new = m.group(1), m.group(2)
-    old_json = os.path.join(peers_dir, f"{old}.json")
-    new_json = os.path.join(peers_dir, f"{new}.json")
-    if os.path.isfile(old_json):
-        try:
-            os.rename(old_json, new_json)
-            d = json.load(open(new_json))
-            d["name"] = new
-            json.dump(d, open(new_json, "w"), indent=2)
-        except Exception:
-            pass
-        old_pub = os.path.join(peers_dir, f"{old}.pub")
-        new_pub = os.path.join(peers_dir, f"{new}.pub")
-        if os.path.isfile(old_pub):
-            try: os.rename(old_pub, new_pub)
-            except Exception: pass
+    old, new, host = m.group(1), m.group(2), m.group(3)
+    # Primary path: name-keyed rename.
+    if _rename_files(old, new):
         print(f"[{ts}] airc: Peer renamed: {old} -> {new}", flush=True)
         return True
+    # Fallback: peer file sits under a different (older) name due to a
+    # previous chain break. Resolve via stable host field.
+    if host:
+        current = _find_peer_by_host(host)
+        if current and current != new and _rename_files(current, new):
+            print(f"[{ts}] airc: Peer renamed (chain-repair via host): {current} -> {new}", flush=True)
+            return True
     return False
 
 for line in sys.stdin:
@@ -419,20 +449,38 @@ print(data.decode().strip())
       }
     fi
 
-    # Save host as a peer (with their airc_home so wire paths are correct)
+    # Save host as a peer (with their airc_home so wire paths are correct).
+    # Drop any existing peer records with the same host first — stale names
+    # from a prior rename chain must not linger alongside the current one.
     local host_airc_home
     host_airc_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
     python3 -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
+peer_name = '$peer_name'
+ssh_target = '$ssh_target'
+if os.path.isdir(peers_dir):
+    for entry in os.listdir(peers_dir):
+        if not entry.endswith('.json'): continue
+        if entry == peer_name + '.json': continue
+        try:
+            d = json.load(open(os.path.join(peers_dir, entry)))
+        except Exception:
+            continue
+        if d.get('host') == ssh_target:
+            for ext in ('.json', '.pub'):
+                p = os.path.join(peers_dir, entry[:-5] + ext)
+                if os.path.isfile(p):
+                    try: os.remove(p)
+                    except Exception: pass
 record = {
-    'name': '$peer_name',
-    'host': '$ssh_target',
+    'name': peer_name,
+    'host': ssh_target,
     'airc_home': '$host_airc_home',
     'paired': '$(timestamp)'
 }
-with open(os.path.join(peers_dir, '$peer_name.json'), 'w') as f:
+with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
 
@@ -554,10 +602,28 @@ if ssh_key:
             f.write(ssh_key.strip() + '\n')
         os.chmod(ak, 0o600)
 
-# Save joiner as peer
+# Save joiner as peer — but first drop any existing records that share
+# this joiner's host (stable identity across renames). Otherwise a
+# rename chain leaves stale '<old-name>.json' alongside the new one.
 peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
 jname = joiner['name']
+jhost = joiner.get('host','')
+if jhost and os.path.isdir(peers_dir):
+    for entry in os.listdir(peers_dir):
+        if not entry.endswith('.json'): continue
+        if entry == jname + '.json': continue
+        try:
+            d = json.load(open(os.path.join(peers_dir, entry)))
+        except Exception:
+            continue
+        if d.get('host') == jhost:
+            # Same machine+user pairing under a different name — stale.
+            for ext in ('.json', '.pub'):
+                p = os.path.join(peers_dir, entry[:-5] + ext)
+                if os.path.isfile(p):
+                    try: os.remove(p)
+                    except Exception: pass
 with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
     json.dump({
         'name': jname,
@@ -628,14 +694,12 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 "
   echo "  Renamed: $old_name → $new_name"
 
-  # Best-effort broadcast to every paired peer across tiers.
-  # Peer consumers recognize '[rename]' prefix and update peer file accordingly.
-  local entry
-  for entry in $(relay_list peers); do
-    case "$entry" in *.json) ;; *) continue ;; esac
-    local peer; peer="${entry%.json}"
-    cmd_send "@$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
-  done
+  # Broadcast the rename. Include a stable `host` field so receivers can
+  # find THIS peer's record even if their name-keyed lookup would miss
+  # (e.g. a prior rename marker got dropped; their peer file for us
+  # still sits under an older name). host is immutable per machine+user.
+  local my_host; my_host="$(whoami)@$(get_host)"
+  cmd_send "[rename] old=$old_name new=$new_name host=$my_host" >/dev/null 2>&1 || true
 }
 
 cmd_send() {
@@ -787,6 +851,47 @@ cmd_invite() {
 
 cmd_peers() {
   ensure_init
+  # `airc peers --prune` — remove stale records that share a host with a
+  # newer record (cruft left from rename chain-breaks before the stable-host
+  # matching logic landed).
+  if [ "${1:-}" = "--prune" ]; then
+    python3 -c "
+import json, os, sys
+peers_dir = os.path.expanduser('$PEERS_DIR')
+if not os.path.isdir(peers_dir):
+    sys.exit(0)
+# Group records by host; keep the most-recently-paired, remove the rest.
+by_host = {}
+for entry in sorted(os.listdir(peers_dir)):
+    if not entry.endswith('.json'): continue
+    p = os.path.join(peers_dir, entry)
+    try:
+        d = json.load(open(p))
+    except Exception:
+        continue
+    host = d.get('host', '')
+    if not host: continue
+    by_host.setdefault(host, []).append((d.get('paired', ''), entry, d.get('name', entry[:-5])))
+removed = []
+for host, records in by_host.items():
+    if len(records) < 2: continue
+    records.sort(reverse=True)  # newest paired first
+    for _, entry, name in records[1:]:
+        for ext in ('.json', '.pub'):
+            f = os.path.join(peers_dir, entry[:-5] + ext)
+            if os.path.isfile(f):
+                try: os.remove(f)
+                except Exception: pass
+        removed.append((name, host))
+if removed:
+    for name, host in removed:
+        print(f'  pruned: {name} -> {host}')
+else:
+    print('  No stale records to prune.')
+"
+    return
+  fi
+
   local found=false
   local entry
   for entry in $(relay_list peers); do
@@ -916,7 +1021,7 @@ case "${1:-help}" in
   send-file) shift; cmd_send_file "$@" ;;
   rename)    shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
-  peers)     cmd_peers ;;
+  peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
   logs)      shift; cmd_logs "$@" ;;
   doctor)    shift; cmd_doctor "$@" ;;
