@@ -638,17 +638,88 @@ json.dump(c, open(p, 'w'))
   cleanup_all
 }
 
+scenario_auth_failure() {
+  section "auth_failure: fresh-install joiner with stale authorized_keys must fail LOUDLY"
+  cleanup_all
+
+  # This scenario mimics the exact situation memento hit today: a joiner
+  # reinstalls airc (regenerating identity keys), then runs `airc connect`
+  # with no args (resume from saved pairing). The host still has the OLD
+  # authorized_keys, so SSH auth fails. Pre-this-fix, cmd_send silently
+  # queued with a misleading "Host unreachable" message and exit 0 — the
+  # user thought their send succeeded when nothing reached the host.
+  #
+  # Correct behavior: auth failure is fundamentally different from a
+  # transient network error. Retry won't help — every attempt auths with
+  # the same (wrong) key. Must die() with clear stderr + repair instructions.
+
+  spawn_host /tmp/airc-it-af-h afhost 7549 || { fail "afhost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-af-h)
+  spawn_joiner /tmp/airc-it-af-j afjoiner "$join" || { fail "afjoiner join failed"; return; }
+  sleep 3
+
+  # Baseline: normal send works (pair-handshake added joiner's key).
+  as_home /tmp/airc-it-af-j send @afhost "pre-reinstall" >/dev/null 2>&1 \
+    && pass "baseline: send to host works after fresh pair" \
+    || { fail "baseline send broken — can't set up auth-fail test"; return; }
+
+  # ── Simulate joiner reinstall: regenerate identity keys in-place,
+  # keeping config.json (host_target etc) intact so `airc connect` with no
+  # args resumes with the stale host pairing. Host's authorized_keys still
+  # has the ORIGINAL joiner key, not the new one.
+  rm -f /tmp/airc-it-af-j/state/identity/ssh_key \
+        /tmp/airc-it-af-j/state/identity/ssh_key.pub
+  ssh-keygen -t ed25519 -f /tmp/airc-it-af-j/state/identity/ssh_key \
+             -N '' -q -C 'airc-fresh-reinstall' 2>/dev/null
+
+  # ── The test: joiner tries `airc send`. Expected: die loudly with
+  # auth stderr + repair instructions. NOT silent queue.
+  local err_file; err_file=$(mktemp -t airc-af-err.XXXXXX)
+  AIRC_HOME=/tmp/airc-it-af-j/state "$AIRC" send @afhost "post-reinstall" >/dev/null 2>"$err_file"
+  local af_exit=$?
+
+  [ $af_exit -ne 0 ] && pass "auth failure: cmd_send exits non-zero (was $af_exit)" \
+                     || fail "auth failure: cmd_send exited 0 — silent regression"
+
+  grep -qiE 'auth|permission|publickey' "$err_file" \
+    && pass "auth failure: stderr surfaces the actual SSH error" \
+    || fail "auth failure: stderr doesn't mention auth (got: $(cat "$err_file"))"
+
+  grep -qE 'teardown --flush|re-pair|invite' "$err_file" \
+    && pass "auth failure: stderr tells user HOW to fix (re-pair command)" \
+    || fail "auth failure: no repair guidance in stderr (got: $(cat "$err_file"))"
+
+  # Critically: message must NOT have been queued. Every retry would fail
+  # the same way, so queuing creates user confusion + log spam.
+  if [ -f /tmp/airc-it-af-j/state/pending.jsonl ]; then
+    grep -q 'post-reinstall' /tmp/airc-it-af-j/state/pending.jsonl \
+      && fail "auth failure: message WAS queued — will retry-fail forever" \
+      || pass "auth failure: message not queued (correct — retry wouldn't help)"
+  else
+    pass "auth failure: no pending.jsonl created (correct — retry wouldn't help)"
+  fi
+
+  # And the host's messages.jsonl must NOT contain the post-reinstall message.
+  grep -q 'post-reinstall' /tmp/airc-it-af-h/state/messages.jsonl 2>/dev/null \
+    && fail "auth failure: message somehow reached host (how? auth was broken)" \
+    || pass "auth failure: host correctly never received the message"
+
+  rm -f "$err_file"
+  cleanup_all
+}
+
 case "$MODE" in
-  tabs)        scenario_tabs  ;;
-  scope)       scenario_scope ;;
-  teardown)    scenario_teardown ;;
-  reminder)    scenario_reminder ;;
-  resilience)  scenario_resilience ;;
-  reconnect)   scenario_reconnect ;;
-  queue)       scenario_queue ;;
-  status)      scenario_status ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|all]"; exit 2 ;;
+  tabs)         scenario_tabs  ;;
+  scope)        scenario_scope ;;
+  teardown)     scenario_teardown ;;
+  reminder)     scenario_reminder ;;
+  resilience)   scenario_resilience ;;
+  reconnect)    scenario_reconnect ;;
+  queue)        scenario_queue ;;
+  status)       scenario_status ;;
+  auth_failure) scenario_auth_failure ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|all]"; exit 2 ;;
 esac
 
 echo
