@@ -18,45 +18,40 @@ if [ -z "${AIRC_HOME:-}" ] && [ -d "$HOME/.agent-relay" ] && [ ! -L "$HOME/.agen
     echo "  Migrated $HOME/.agent-relay → $HOME/.airc (symlink left for back-compat)" >&2
 fi
 
-# Two-tier state. Opt-in local: create $PWD/.airc/ for per-project identity.
-# Otherwise $HOME/.airc/ is the one-identity-per-machine default (vanilla).
-# AIRC_HOME collapses everything to one explicit tier (explicit override).
-HOME_TIER="${AIRC_HOME:-$HOME/.airc}"
-LOCAL_TIER=""
-[ -z "${AIRC_HOME:-}" ] && [ -d "$PWD/.airc" ] && LOCAL_TIER="$PWD/.airc"
-
-# Resolver: give it a subpath, get the effective file path.
-# Reads: returns the tier that owns the file (local wins).
-# Writes: new files land in local if opted in, else home; updates hit their owner.
-relay_path() {
-  local sub="$1"
-  [ -n "$LOCAL_TIER" ] && [ -e "$LOCAL_TIER/$sub" ] && { echo "$LOCAL_TIER/$sub"; return; }
-  [ -e "$HOME_TIER/$sub" ]                        && { echo "$HOME_TIER/$sub";  return; }
-  [ -n "$LOCAL_TIER" ]                            && { echo "$LOCAL_TIER/$sub"; return; }
-  echo "$HOME_TIER/$sub"
+# Scope auto-detect. No env vars required for normal use.
+#
+# Priority (first match wins):
+#   1. $AIRC_HOME — explicit override. Escape hatch for tests / edge cases.
+#   2. <git-repo-root>/.airc/ — if cwd is inside a git repo. Identity scoped
+#      to the project the agent is working on. Auto-created on first connect.
+#   3. $HOME/.airc/ — no repo context. One identity per machine.
+#
+# Users/agents never set env vars in practice. Just run `airc connect`.
+detect_scope() {
+  if [ -n "${AIRC_HOME:-}" ]; then
+    echo "$AIRC_HOME"
+    return
+  fi
+  local git_root
+  git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$git_root" ] && [ -d "$git_root" ]; then
+    echo "$git_root/.airc"
+  else
+    echo "$HOME/.airc"
+  fi
 }
 
-# Union listing of entries under a subdir, local-first, deduped by name.
-# Use when you want every <name> across tiers, e.g. peers.
-relay_list() {
-  local sub="$1"
-  {
-    [ -n "$LOCAL_TIER" ] && [ -d "$LOCAL_TIER/$sub" ] && ls -1 "$LOCAL_TIER/$sub" 2>/dev/null
-    [ -d "$HOME_TIER/$sub" ] && ls -1 "$HOME_TIER/$sub" 2>/dev/null
-  } | awk '!seen[$0]++'
-}
-
-# Scope-local paths. Identity, config, peers, and messages live in the
-# scope this invocation owns — NEVER cross-tier resolved. Cross-tier lookup
-# was leaking the home-tier identity into a fresh local scope: if $PWD/.airc
-# had no config.json yet, `relay_path config.json` returned $HOME/.airc's
-# config, so a local-scoped connect inherited the home identity instead of
-# auto-deriving from cwd.
-AIRC_WRITE_DIR="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
+AIRC_WRITE_DIR="$(detect_scope)"
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
 PEERS_DIR="$AIRC_WRITE_DIR/peers"
 MESSAGES="$AIRC_WRITE_DIR/messages.jsonl"
+
+# Legacy shims: kept so the monitor's [rename] handler and cmd_peers listing
+# keep working. In the single-scope world they're thin wrappers around the
+# direct paths. (No cross-tier merging anymore.)
+relay_path() { echo "$AIRC_WRITE_DIR/$1"; }
+relay_list() { [ -d "$AIRC_WRITE_DIR/$1" ] && ls -1 "$AIRC_WRITE_DIR/$1" 2>/dev/null; }
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -64,17 +59,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 ensure_init() {
   [ -f "$CONFIG" ] && return 0
-  # Give a useful error: the usual case is a fresh install, but if a partial
-  # local tier was opted into without finishing `airc connect`, the user can
-  # easily loop on "Not initialized" without knowing why the home identity
-  # stopped appearing. Point at the stale local tier explicitly.
-  if [ -n "$LOCAL_TIER" ] && [ -f "$HOME_TIER/config.json" ]; then
-    die "Not initialized in local scope ($LOCAL_TIER) even though home scope has an identity.
-    This cwd has a .airc/ dir, which opts into a project-local scope. Either:
-    - finish setting it up:   airc connect  (or 'airc connect <join-string>')
-    - drop the local scope:   rm -rf $LOCAL_TIER   (falls back to $HOME_TIER)"
-  fi
-  die "Not initialized. Run: airc connect"
+  die "Not initialized ($AIRC_WRITE_DIR). Run: airc connect"
 }
 
 get_name() {
@@ -833,6 +818,7 @@ case "${1:-help}" in
   doctor)    shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   monitor)   shift; monitor "$@" ;;
+  debug-scope) echo "$AIRC_WRITE_DIR" ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo ""

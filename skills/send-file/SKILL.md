@@ -1,9 +1,9 @@
 ---
 name: airc:send-file
-description: Send a file to a paired peer via AIRC. Uses the isolated airc identity key so it works in scoped homes.
+description: Send a file to a paired peer via AIRC.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<peer> <file-path> [--home=PATH]"
+argument-hint: "<peer> <file-path>"
 ---
 
 # airc send-file
@@ -17,17 +17,16 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 ## Parse `$ARGUMENTS`
 
-- `--home=<path>` → sets `AIRC_HOME=<path>`. Uses default resolution otherwise.
-- First non-flag arg: peer name (must appear in `airc peers`).
-- Second non-flag arg: local file path to send.
+- First arg: peer name (must appear in `airc peers`).
+- Second arg: local file path to send.
 
 ## Execute
 
 ```bash
-<env-prefix> airc send-file <peer> <file-path>
+airc send-file <peer> <file-path>
 ```
 
-File is scp'd (using the airc identity key at `$AIRC_WRITE_DIR/identity/ssh_key`) to the peer's state dir under `files/<your-name>/<basename>`. On success, airc also sends a signed message noting `Sent file: <basename> (<size> bytes)` so the peer's monitor surfaces the transfer.
+File is scp'd (using the airc identity key) to the peer's state dir under `files/<your-name>/<basename>`. On success, airc also sends a signed message noting `Sent file: <basename> (<size> bytes)` so the peer's monitor surfaces the transfer.
 
 ## Failure modes
 

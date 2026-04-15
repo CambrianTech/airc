@@ -211,72 +211,46 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
 # ── Scenario: scope ─────────────────────────────────────────────────────
 
 scenario_scope() {
-  section "scope: per-project .airc/ precedence + home fallthrough"
+  section "scope: auto-detect git-root / HOME / AIRC_HOME override"
   cleanup_all
 
-  # Seed home tier with a known peer record.
-  local home="/tmp/airc-it-homefake/.airc"
-  mkdir -p "$home/peers" "$home/identity"
-  echo '{"name":"home-peer","host":"joel@1.2.3.4"}' > "$home/peers/home-peer.json"
-  echo '{"name":"home-self"}' > "$home/config.json"
+  # Build a fake git repo with a subdir; from both cwds, airc must resolve to
+  # the SAME scope (<repo-root>/.airc), not a subdir-local one.
+  local repo="/tmp/airc-it-repo"
+  rm -rf "$repo"
+  mkdir -p "$repo/sub/deeper"
+  ( cd "$repo" && git init -q 2>/dev/null )
+  # macOS: /tmp is a symlink to /private/tmp. git resolves to the real path,
+  # so compare against the resolved repo root.
+  local repo_real; repo_real=$(cd "$repo" && pwd -P)
 
-  # From a dir with NO .airc/: airc should read home tier.
-  local visible
-  visible=$(cd /tmp/airc-it-homefake && HOME=/tmp/airc-it-homefake "$AIRC" peers 2>&1 | grep home-peer)
-  [ -n "$visible" ] && pass "no local tier: airc reads home peers" \
-                    || fail "no local tier: home peers not visible"
+  local scope_at_root scope_at_sub scope_at_deeper
+  scope_at_root=$(cd "$repo" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
+  scope_at_sub=$(cd "$repo/sub" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
+  scope_at_deeper=$(cd "$repo/sub/deeper" && HOME=/tmp/airc-it-homefake "$AIRC" debug-scope 2>&1)
 
-  # From a dir WITH empty .airc/: should still see home peers (union).
-  local testdir="/tmp/airc-it-project"
-  mkdir -p "$testdir/.airc/peers"
-  cp "$home/config.json" "$testdir/.airc/config.json"
-  visible=$(cd "$testdir" && HOME=/tmp/airc-it-homefake "$AIRC" peers 2>&1 | grep home-peer)
-  [ -n "$visible" ] && pass "local tier present, no local peers: home peers still visible" \
-                    || fail "local tier should inherit home peers"
+  [ "$scope_at_root" = "$repo_real/.airc" ] && pass "at repo root: scope = <repo>/.airc" \
+                                             || fail "at repo root: got '$scope_at_root'"
+  [ "$scope_at_sub" = "$repo_real/.airc" ] && pass "in subdir: scope still = <repo>/.airc" \
+                                           || fail "in subdir: got '$scope_at_sub'"
+  [ "$scope_at_deeper" = "$repo_real/.airc" ] && pass "in nested subdir: scope still = <repo>/.airc" \
+                                              || fail "nested subdir: got '$scope_at_deeper'"
 
-  # Add a local peer with same name — local should shadow home.
-  echo '{"name":"home-peer","host":"LOCAL-OVERRIDE"}' > "$testdir/.airc/peers/home-peer.json"
-  visible=$(cd "$testdir" && HOME=/tmp/airc-it-homefake "$AIRC" peers 2>&1 | grep home-peer)
-  echo "$visible" | grep -q LOCAL-OVERRIDE && pass "local tier shadows home when name collides" \
-                                           || fail "local tier did NOT shadow home peer"
+  # Outside any git repo: fall back to HOME.
+  local fakehome="/tmp/airc-it-nogit-home"
+  mkdir -p "$fakehome" "/tmp/airc-it-nogit"
+  local scope_nogit
+  scope_nogit=$(cd /tmp/airc-it-nogit && HOME="$fakehome" "$AIRC" debug-scope 2>&1)
+  [ "$scope_nogit" = "$fakehome/.airc" ] && pass "no git repo: scope = \$HOME/.airc" \
+                                         || fail "no git repo: got '$scope_nogit'"
 
-  # Regression (commit 0b3b2a0): fresh local tier with no config.json must
-  # auto-derive identity from cwd basename, NOT inherit home tier's config.
-  # Pre-fix, cross-tier relay_path() fell back to home's config.json so the
-  # local scope silently adopted home's identity.
-  local localproj="/tmp/airc-it-mylocalproj"
-  rm -rf "$localproj"
-  mkdir -p "$localproj/.airc"   # opt into local tier, no config/identity yet
-  ( cd "$localproj" && HOME=/tmp/airc-it-homefake AIRC_PORT=7550 \
-      "$AIRC" connect > "$localproj/out.log" 2>&1 ) &
-  local conn_pid=$!
-  local i
-  for i in 1 2 3 4 5; do
-    sleep 1
-    [ -f "$localproj/.airc/config.json" ] && break
-  done
-  kill -9 "$conn_pid" 2>/dev/null
-  for p in $(pgrep -P "$conn_pid" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+  # AIRC_HOME override wins over everything else.
+  local scope_override
+  scope_override=$(cd "$repo" && AIRC_HOME=/tmp/airc-it-override HOME="$fakehome" "$AIRC" debug-scope 2>&1)
+  [ "$scope_override" = "/tmp/airc-it-override" ] && pass "AIRC_HOME overrides git-root detection" \
+                                                  || fail "AIRC_HOME override ignored: got '$scope_override'"
 
-  if [ -f "$localproj/.airc/config.json" ]; then
-    local local_name
-    local_name=$(python3 -c "import json; print(json.load(open('$localproj/.airc/config.json')).get('name',''))" 2>/dev/null)
-    case "$local_name" in
-      airc-it-*) pass "local scope auto-derives name from cwd (got '$local_name')" ;;
-      home-self) fail "local scope inherited home identity — cross-tier leak regressed" ;;
-      *)         fail "local scope got unexpected name: '$local_name'" ;;
-    esac
-  else
-    fail "local scope connect didn't write config.json to local tier"
-  fi
-
-  # Home tier's config.json must be untouched by the local-scope connect.
-  local home_name
-  home_name=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('name',''))" 2>/dev/null)
-  [ "$home_name" = "home-self" ] && pass "home tier config untouched by local-scope connect" \
-                                 || fail "home tier polluted by local-scope connect (name='$home_name')"
-
-  rm -rf /tmp/airc-it-homefake /tmp/airc-it-project /tmp/airc-it-mylocalproj
+  rm -rf "$repo" "$fakehome" /tmp/airc-it-nogit /tmp/airc-it-override
 }
 
 # ── Entry point ─────────────────────────────────────────────────────────

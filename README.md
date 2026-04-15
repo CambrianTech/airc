@@ -107,23 +107,17 @@ airc teardown [--flush]           # kill this scope's airc processes (--flush wi
 
 ## Identity & State
 
-Two tiers. Pick one; the default works for most users.
+Scope is auto-detected — you never set it.
 
-- **`$HOME/.airc/`** — machine-level default. One identity per machine. Vanilla; most people want this.
-- **`$PWD/.airc/`** — per-project identity. Create the directory in a project dir to opt in; reads merge from home, writes land local. Lets one machine have multiple airc identities (one per project).
+- **Inside a git repo?** State lives at `<repo-root>/.airc/`. One identity per project, shared across every subdir of the repo. Auto-created on first `airc connect`.
+- **Not in a repo?** State lives at `$HOME/.airc/`. One identity per machine.
 
-Identity name resolution, highest priority first:
-1. `AIRC_NAME` env var — explicit override
-2. `name` field in `config.json`
-3. Current directory basename
-4. Hostname
+Identity name auto-derives from repo basename (or cwd basename if not in a repo, or hostname as last resort). Use `airc rename <new>` to change it any time; paired peers auto-update via a `[rename]` broadcast.
 
-Override any config knob via flags:
-```bash
-airc connect --name=aria --home=$PWD/.airc --port=7548
-```
-
-Env vars (all optional): `AIRC_NAME`, `AIRC_HOME`, `AIRC_PORT`, `AIRC_REMINDER`.
+Power-user escape hatches (normal users ignore these entirely):
+- `AIRC_HOME=/some/path` — force a specific scope (tests and edge cases only)
+- `AIRC_PORT=7548` — host on a non-default TCP port
+- `AIRC_NAME=custom` — override the auto-derived identity
 
 ## How Pairing Works
 
