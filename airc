@@ -986,13 +986,41 @@ cmd_send() {
       # `airc logs` makes the state obvious. Don't die() — queued is a form of
       # success. The user's shell scripts can still check pending.jsonl if
       # they need to block on delivery.
-      local stderr; stderr=$(tr '\n' ' ' < "$err" | sed 's/"/\\"/g' | cut -c1-200)
+      # Distinguish auth failures (user must re-pair — retrying won't help)
+      # from network failures (queue + retry makes sense). Prior behavior
+      # silently queued both the same way, hiding auth errors behind a
+      # misleading "Host unreachable" message. This bit the cross-mesh
+      # coordination: fresh-install joiner's SSH key wasn't in host's
+      # authorized_keys, cmd_send queued + returned 0, the joiner thought
+      # their send succeeded when the host never saw anything.
+      local stderr_raw; stderr_raw=$(cat "$err" 2>/dev/null)
+      local stderr; stderr=$(printf '%s' "$stderr_raw" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c1-300)
       rm -f "$err"
+
+      local is_auth_fail=0
+      if echo "$stderr_raw" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
+        is_auth_fail=1
+      fi
+
+      if [ "$is_auth_fail" = "1" ]; then
+        local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
+          "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
+        echo "$fail_marker" >> "$MESSAGES"
+        echo "  SSH auth to host FAILED. Message NOT queued — every retry would fail identically." >&2
+        echo "  SSH stderr: ${stderr}" >&2
+        echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
+        die "Authentication failure — re-pair required"
+      fi
+
+      # Network-class wire failure: legitimately transient, queue for retry.
       echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — host unreachable, will retry] %s"}' \
+      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
         "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
       echo "$queue_marker" >> "$MESSAGES"
-      echo "  Host unreachable — message queued for retry. Monitor will flush when host returns." >&2
+      echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
+      # Surface the actual stderr so the user understands WHY — the old
+      # generic "host unreachable" was hiding real errors.
+      echo "  SSH stderr: ${stderr:-<none>}" >&2
     else
       rm -f "$err"
     fi
