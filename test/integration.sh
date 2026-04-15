@@ -433,14 +433,89 @@ scenario_resilience() {
   cleanup_all
 }
 
+scenario_reconnect() {
+  section "reconnect: joiner survives host down/up cycle without manual intervention"
+  cleanup_all
+
+  # ── Setup: alpha hosts on 7549, beta joins ──────────────────────────
+  spawn_host /tmp/airc-it-rec-h alpha 7549 || { fail "alpha host failed to start"; return; }
+  pass "alpha hosting on 7549"
+
+  local join; join=$(read_join_string /tmp/airc-it-rec-h)
+  [ -n "$join" ] || { fail "no join string"; return; }
+
+  spawn_joiner /tmp/airc-it-rec-j beta "$join" || { fail "beta join failed"; return; }
+  pass "beta joined alpha"
+
+  sleep 3
+
+  # Baseline: pre-outage send must reach the joiner's monitor.
+  as_home /tmp/airc-it-rec-j send @alpha "pre-outage" >/dev/null 2>&1 || true
+  sleep 4
+  grep -q 'pre-outage' /tmp/airc-it-rec-h/out.log \
+    && pass "pre-outage message delivered to host" \
+    || fail "pre-outage send didn't reach host (baseline broken — skip rest)"
+
+  # ── Outage: kill alpha's process tree, keep state on disk ────────────
+  # Non-flush teardown: identity + messages.jsonl survive for restart.
+  AIRC_HOME=/tmp/airc-it-rec-h/state AIRC_PORT=7549 "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+  lsof -tiTCP:7549 -sTCP:LISTEN >/dev/null 2>&1 \
+    && fail "alpha still listening after teardown (outage simulation failed)" \
+    || pass "alpha down: port 7549 freed"
+
+  # Beta's monitor should still be running — just retrying silently.
+  local beta_pid; beta_pid=$(cat /tmp/airc-it-rec-j/state/airc.pid 2>/dev/null | head -1)
+  [ -n "$beta_pid" ] && kill -0 "$beta_pid" 2>/dev/null \
+    && pass "beta monitor still alive during outage (PID $beta_pid)" \
+    || fail "beta monitor exited when alpha went down (should have retried)"
+
+  sleep 4
+
+  # ── Recovery: restart alpha with same home+port+identity ────────────
+  # Re-spawn using same state dir so identity/keys/peers persist.
+  # (Can't use spawn_host as-is because it mkdir's and overwrites state.
+  #  Instead re-invoke connect directly pointing at the same state.)
+  ( cd /tmp/airc-it-rec-h && AIRC_HOME=/tmp/airc-it-rec-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      "$AIRC" connect >> /tmp/airc-it-rec-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    lsof -tiTCP:7549 -sTCP:LISTEN >/dev/null 2>&1 && break
+  done
+  lsof -tiTCP:7549 -sTCP:LISTEN >/dev/null 2>&1 \
+    && pass "alpha back up on 7549" \
+    || { fail "alpha didn't restart"; return; }
+
+  # ── Critical: post-outage send must reach joiner without manual reconnect ──
+  # Give beta's monitor one reconnect cycle (sleep 3 in the retry loop).
+  sleep 5
+  as_home /tmp/airc-it-rec-h send @beta "post-outage" >/dev/null 2>&1 || true
+
+  # Beta's monitor tails host's messages.jsonl over SSH with offset resume.
+  # Message should appear in beta's local mirror (monitor_formatter mirrors
+  # joiner-side inbound to the local log for audit).
+  local saw=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 1
+    grep -q 'post-outage' /tmp/airc-it-rec-j/state/messages.jsonl 2>/dev/null && { saw=1; break; }
+  done
+  [ "$saw" = "1" ] \
+    && pass "post-outage: beta monitor resumed and delivered message (${i}s after send)" \
+    || fail "post-outage: beta monitor did NOT pick up new message within 15s"
+
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)        scenario_tabs  ;;
   scope)       scenario_scope ;;
   teardown)    scenario_teardown ;;
   reminder)    scenario_reminder ;;
   resilience)  scenario_resilience ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|all]"; exit 2 ;;
+  reconnect)   scenario_reconnect ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|all]"; exit 2 ;;
 esac
 
 echo
