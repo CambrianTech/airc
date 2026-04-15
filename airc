@@ -46,12 +46,17 @@ relay_list() {
   } | awk '!seen[$0]++'
 }
 
-# Common paths via the resolver. Legacy global vars remain for back-compat.
+# Scope-local paths. Identity, config, peers, and messages live in the
+# scope this invocation owns — NEVER cross-tier resolved. Cross-tier lookup
+# was leaking the home-tier identity into a fresh local scope: if $PWD/.airc
+# had no config.json yet, `relay_path config.json` returned $HOME/.airc's
+# config, so a local-scoped connect inherited the home identity instead of
+# auto-deriving from cwd.
 AIRC_WRITE_DIR="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
-CONFIG="$(relay_path config.json)"
-IDENTITY_DIR="$(relay_path identity)"
-PEERS_DIR="$(relay_path peers)"
-MESSAGES="$(relay_path messages.jsonl)"
+CONFIG="$AIRC_WRITE_DIR/config.json"
+IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
+PEERS_DIR="$AIRC_WRITE_DIR/peers"
+MESSAGES="$AIRC_WRITE_DIR/messages.jsonl"
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
