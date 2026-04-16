@@ -10,11 +10,23 @@ AIRC uses JSONL (one JSON object per line) at `~/.airc/messages.jsonl` (or `$AIR
 {"from":"agentName","ts":"2026-04-13T12:00:00Z","msg":"hello","sig":"base64..."}
 ```
 
-Outbound sends are mirrored locally first; wire failures append a marker:
+Outbound sends are mirrored locally first; what happens on wire failure depends on the error class:
 
 ```json
-{"from":"airc","ts":"...","msg":"[SEND FAILED to peer] <stderr>"}
+// Network / transient — queued in pending.jsonl, flush loop will retry
+{"from":"airc","ts":"...","msg":"[QUEUED to peer — network error, will retry] <stderr>"}
+
+// Authentication — NOT queued, exits 1, re-pair required
+{"from":"airc","ts":"...","msg":"[AUTH FAILED to peer — repair required, NOT queued] <stderr>"}
+
+// New-peer-joined marker, emitted by host during pair handshake
+{"from":"airc","ts":"...","msg":"[joined] name=<peer> host=<user@host>"}
+
+// Peer-left marker, emitted by joiner's trap on exit
+{"from":"airc","ts":"...","msg":"[left] name=<peer>"}
 ```
+
+Watch for `[joined]` / `[left]` / `[rename]` / `[AUTH FAILED]` / `[QUEUED]` / `[DRAINED]` / `[REJECTED]` lines if your agent needs to react to mesh lifecycle events.
 
 ## Receiving
 

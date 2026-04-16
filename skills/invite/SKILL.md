@@ -28,6 +28,10 @@ Show the output to the user like this:
 > /connect <the join string>
 > ```
 
+**Check the port before pasting.** The join string format is `name@user@host[:port]#pubkey`. If the port section is present (non-default — anything other than 7547), the other agent MUST paste it with the port intact. Trimming `:7548` silently makes them pair with whoever has port 7547, which may be a different host on the same Tailscale IP. This happened in production (cost hours to diagnose). When showing the invite to the user, call out the port explicitly if non-default:
+
+> "Paste this exactly — note the `:7548` port, don't trim it."
+
 ## Failure modes
 
 - `ERROR: Not initialized. Run: airc connect` — you haven't paired yet, so there's nothing to share. Run `/connect` first.

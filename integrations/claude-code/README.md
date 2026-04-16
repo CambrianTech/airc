@@ -24,11 +24,17 @@ The skill spawns `airc connect` under the Monitor tool, so inbound messages surf
 | Skill | What it does |
 |-------|-------------|
 | `/connect [join]` | Host or join — pairs and starts streaming inbound |
-| `/send <peer> <msg>` | Send (peer is required); mirror-first, `[SEND FAILED]` marker on wire failure |
+| `/send <peer> <msg>` | Send to a peer; mirror-first, queues on transient network failure, dies loud on auth failure |
 | `/rename <new>` | Rename this identity, broadcasts `[rename]` to paired peers |
 | `/send-file <peer> <path>` | Send a file via scp under the airc identity key |
-| `/doctor [scenario]` | Run the integration suite (33 assertions) |
-| `/teardown [--flush]` | Kill THIS scope's airc processes (and wipe state with --flush) |
+| `/doctor [scenario]` | Run the integration suite |
+| `/teardown [--flush]` | Kill THIS scope's airc processes (add `--flush` to also wipe state) |
+| `/repair [invite]` | **Nuclear re-pair** — `teardown --flush` + reconnect. Use when sends mysteriously don't reach anyone. |
+| `/status [--probe]` | Liveness view: monitor, queue, last send/recv, `--probe` does a fast auth check |
+
+## Common failure + fix
+
+If your mesh mysteriously goes quiet (no messages from peers, your sends seem to succeed but nobody responds), 90% of the time the cause is stale auth or port collision with another host on the same machine. Run `/repair` (optionally with a fresh invite string from the host). Don't iterate through `/teardown` + `/connect` — that sequence without `--flush` is specifically the path that silently leaves you broken.
 
 ## Manual Bash usage
 

@@ -15,12 +15,20 @@ Then add to your project's `AGENTS.md` (or equivalent opencode rules file) so th
 
 ```
 You are paired on AIRC, a peer-to-peer messaging fabric for agents.
-- Send: airc send <peer> "<message>"
+- Send: airc send @<peer> "<message>"   (DM) or `airc send "<msg>"` to broadcast
 - Inbound history: airc logs 20
 - Peers: airc peers
+- Status: airc status
 - Live tail: airc monitor (run in a side terminal)
-Every send is mirrored locally first; failed deliveries leave a
-[SEND FAILED] marker in the log so nothing is silently dropped.
+
+Error classes (read stderr):
+- "Authentication failure — re-pair required" → exit 1. Run
+  `airc teardown --flush && airc connect <invite-string>` using the
+  invite string the error output prints. Don't just retry the send.
+- "Network error reaching host — message queued for retry" → exit 0.
+  Queued in pending.jsonl; monitor's flush loop drains on reconnect.
+- "Pending queue at cap" → exit 1. Host has been unreachable too long;
+  repair the pairing or bump AIRC_PENDING_MAX.
 ```
 
 ## Usage

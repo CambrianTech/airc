@@ -33,10 +33,13 @@ airc send @alice quick question
 
 On success: exit 0. Message is written to the host's shared `messages.jsonl` over SSH AND mirrored to your own local mirror so `airc logs` shows the audit trail.
 
-On failure: exit 1 with `ERROR: Failed to deliver to host (…)`. Common causes:
-- SSH auth broken — try `airc teardown` and re-pair
-- Peer's host is down — they need to re-run `airc connect`
-- Wrong peer name — check `airc peers` for the canonical list
+On failure, read the stderr — it tells you which class:
+
+- **`Authentication failure — re-pair required`**: SSH key no longer authenticates against the host. Retry will fail identically. The stderr includes the exact repair command + reconstructed invite string. Run `airc teardown --flush && airc connect <invite-string>`.
+- **`Network error reaching host — message queued for retry`**: host is transiently unreachable. Message is queued in `pending.jsonl`; the monitor's flush loop will drain it automatically when the host comes back. Exit 0 in this case (queued = success for resilience purposes).
+- **`Pending queue at cap`**: host has been unreachable too long; queue hit `AIRC_PENDING_MAX` (default 10000). Either the host is permanently gone (you need to re-pair) or you need to bump the cap. Exit 1.
+
+Past guidance said "try `airc teardown` and re-pair" which is wrong — it needs `--flush` to actually wipe the stale state. See `/teardown` skill.
 
 ## Notes
 

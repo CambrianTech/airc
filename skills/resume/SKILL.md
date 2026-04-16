@@ -27,6 +27,8 @@ Wrap with the Monitor tool so inbound streams as Claude Code notifications. `air
 ## Failure modes
 
 - `Not initialized (<scope>). Run: airc connect` — scope is fresh (no saved pairing). The user needs an actual join string from the host; use `/connect <join>` instead.
+- `Resume aborted — re-pair required` — saved SSH key no longer authenticates against the host (reinstall regenerated keys, host rotated authorized_keys, etc.). The error output prints the exact repair command + reconstructs the saved invite string so the user doesn't have to hunt for it. Follow it verbatim: `airc teardown --flush && airc connect <invite-string>`.
+- Silent resume (monitor running but no inbound ever arrives): used to be a silent failure mode pre-fix. Now the auth probe catches it at connect time. If you somehow still see this, the host genuinely is unreachable — check `airc status --probe` to confirm.
 
 ## Notes
 

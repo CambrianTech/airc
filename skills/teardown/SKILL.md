@@ -17,6 +17,19 @@ Run this yourself — don't ask the user. It's idempotent and scope-safe.
 - "Pair refused" / "Failed to deliver" errors that don't make sense — nuke and re-pair
 - Before `airc connect` with a new identity, to avoid pairing with your own stale listener
 
+## `--flush` vs plain teardown — when to use which
+
+**Plain `airc teardown`**: kills processes, keeps state. Use when you know the pairing is still valid and you just want to stop/restart the monitor (e.g. to pick up a new airc binary).
+
+**`airc teardown --flush`**: kills processes AND wipes identity, peer records, saved pairing, messages. Use in ANY of these cases:
+- `airc connect` (resume) died with "Resume aborted — re-pair required" (stale SSH key)
+- `airc send` died with auth error pointing at "re-pair required"
+- You just reinstalled airc and your identity keys may no longer be authorized on the host
+- You're not sure what's broken but you definitely can't reach your peers anymore
+- You're changing which host you pair with
+
+**Rule of thumb**: if anything about your pairing feels uncertain, use `--flush`. The nuclear option is cheap — you pair again via the invite string and keep going. The half-measure (plain teardown with stale state, then resume) has burned hours in production by silently reconnecting to a broken pairing.
+
 ## What it does
 
 ```bash

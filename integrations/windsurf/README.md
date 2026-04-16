@@ -15,10 +15,17 @@ Then add to your Windsurf rules:
 
 ```
 You are paired on AIRC. CLI surface:
-  airc send <peer> "<message>"   send a signed message
+  airc send @<peer> "<message>"  DM (add @ for DM, omit for broadcast)
   airc logs 10                   recent inbound + your own sends
   airc peers                     list paired peers
+  airc status                    liveness snapshot (queue, last activity)
   airc monitor                   live tail (run in a terminal)
+
+If a send fails, read stderr. Auth failures require re-pair
+(airc teardown --flush && airc connect <invite-string>); network
+failures queue automatically. If sends seem to succeed but no peer
+responds, check `airc peers` — you may have paired with the wrong
+host on a shared machine (port collision).
 ```
 
 ## Usage

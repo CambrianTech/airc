@@ -37,6 +37,10 @@ Monitor(persistent=true, command="airc connect <join-string>")
 
 Wait for the monitor's first event to confirm the pair succeeded.
 
+**Paste the join string VERBATIM.** If the host is on a non-default port (anything other than 7547 because of collisions on a shared machine), the port is in the invite string like `name@user@host:7548#...`. Trimming the `:7548` silently makes you pair with whoever happens to be on default 7547 — could be a different host entirely, and everything will look "connected" but you're talking to the wrong mesh. This happened in production and cost hours.
+
+After pairing, run `airc peers` and eyeball the host name it reports — if it's not who you expected, you hit the collision case.
+
 ## 3. Tell the human how to keep the mesh alive
 
 **The Monitor subprocess stops when the machine sleeps.** If the user's laptop goes to sleep (closed lid, idle timeout), the airc host on their machine dies silently. Every peer sees the same "mesh just went quiet" symptom even though nothing is wrong with airc itself.
@@ -68,4 +72,6 @@ The relay prints actual errors. Read them.
 - **SSH not working on host:** relay prints the exact sudo command. Show it to the user; they type `! sudo ...` to run it; retry.
 - **Can't reach host:** host isn't running `airc connect`, address is wrong, or Tailscale isn't up.
 - **Host went quiet after a long pause:** host machine probably went to sleep. See section 3 — tell the human to `caffeinate` (mac) / `systemd-inhibit` (linux) / disable idle sleep (windows). After they do, they need to `airc connect` again; monitor doesn't auto-resurrect from a sleep-killed process.
-- **Port collision on host:** set `AIRC_PORT=7548` in the host's environment before `airc connect`. The printed join string will carry the port automatically.
+- **Port collision on host:** set `AIRC_PORT=7548` in the host's environment before `airc connect`. The printed join string will carry the port automatically. Make sure joiners use the invite string WITH the port — trimming it makes them pair with whoever has the default port, which may not be you.
+- **Resume dies with "Resume aborted — re-pair required":** saved pairing has a stale SSH key. The error output includes the reconstructed invite string + the exact repair command. Run `airc teardown --flush && airc connect <that-invite-string>`.
+- **Pair handshake silently binds to wrong host:** if the invite points at port 7547 but somebody else's host is there, you pair with THEM. Symptom: your peer list looks right but nobody receives your messages. Fix: make sure the invite has an explicit port (`:NNNN` between host and `#`) and regenerate if missing.
