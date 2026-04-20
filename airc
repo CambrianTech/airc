@@ -235,7 +235,24 @@ monitor() {
 monitor_formatter() {
   local my_name="$1"
   PEERS_DIR="$PEERS_DIR" python3 -u -c '
-import sys, json, os, re, time
+import sys, json, os, re, time, signal
+
+# Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
+# exit with a distinct code so the caller'\''s while-loop reconnects.
+# Why: the outer SSH tail can hang silently — middleboxes drop idle
+# TCP while still ACK'\''ing SSH ServerAlive keepalives, so SSH does
+# not notice the channel is dead, and tail -F never returns EOF. The
+# Python read just blocks forever. With an application-level watchdog,
+# a truly dead channel forces the formatter out and the reconnect loop
+# restarts the ssh. Normal chat traffic keeps resetting the alarm so
+# there is no penalty when the channel is healthy.
+WATCHDOG_SEC = 180
+def _watchdog_exit(signum, frame):
+    sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — restarting\\n")
+    sys.stderr.flush()
+    os._exit(2)
+signal.signal(signal.SIGALRM, _watchdog_exit)
+signal.alarm(WATCHDOG_SEC)
 
 peers_dir = os.environ.get("PEERS_DIR", "")
 scope_dir = os.path.dirname(peers_dir)
@@ -326,6 +343,9 @@ except Exception:
     pass
 
 for line in sys.stdin:
+    # Any inbound line — real message, heartbeat, whatever — means the
+    # channel is alive. Reset the watchdog.
+    signal.alarm(WATCHDOG_SEC)
     line = line.strip()
     if not line: continue
     offset_counter += 1
