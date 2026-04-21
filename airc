@@ -1211,8 +1211,72 @@ else:
 cmd_teardown() {
   # Kill all airc processes for this user and free any ports they hold.
   # Add --flush to also wipe the state dir (identity, peers, messages) — nuclear.
-  local flush=0
-  [ "${1:-}" = "--flush" ] && flush=1
+  # Add --all to nuke EVERY airc-looking process on this machine, ignoring
+  # scope/PID file — for the "I just want it all dead" case after stale
+  # zombies survive across sessions (verified 2026-04-21: /tmp/airc-prefix
+  # connect processes from a previous session were still alive 2 days later
+  # because teardown's PID file no longer existed for them).
+  local flush=0 all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --flush) flush=1 ;;
+      --all)   all=1 ;;
+      *) echo "  unknown teardown flag: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  # ── --all: nuclear, scope-blind ───────────────────────────────────
+  # Find every airc-related process for THIS user and kill it. Targets:
+  #   - bash processes running `airc connect` (any scope)
+  #   - bash processes running `<dir>/airc connect` or `/tmp/airc-prefix connect`
+  #   - python processes spawned by airc (the inline -u -c monitor with
+  #     the `WATCHDOG_SEC` heredoc) — identified by ppid pointing at one
+  #     of the bash processes we're killing
+  #   - python listeners holding any TCP port in the airc range (7547-7559)
+  # Then proceeds to the scope-aware path below to clean up our own pidfile
+  # + reap any orphaned listener on our specific port.
+  if [ "$all" = "1" ]; then
+    local nuked=0
+    # Bash airc-connect processes (any path that ends in /airc connect or
+    # the /tmp/airc-prefix bootstrap variant the curl|bash installer uses).
+    local bash_pids
+    bash_pids=$(pgrep -u "$(id -u)" -f '(airc|airc-prefix)[[:space:]]+connect' 2>/dev/null || true)
+    if [ -n "$bash_pids" ]; then
+      echo "  --all: killing airc bash processes: $(echo $bash_pids | tr '\n' ' ')"
+      kill -9 $bash_pids 2>/dev/null || true
+      nuked=1
+    fi
+    # Python listeners on airc port range (7547-7559). Don't touch python
+    # outside that range — could be unrelated processes.
+    local port
+    for port in 7547 7548 7549 7550 7551 7552 7553 7554 7555 7556 7557 7558 7559; do
+      local lpids
+      lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+      for lpid in $lpids; do
+        local cmd
+        cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
+        if echo "$cmd" | grep -q "socket.SOCK_STREAM\|socket.AF_INET"; then
+          echo "  --all: freeing port $port (python pid $lpid)"
+          kill -9 "$lpid" 2>/dev/null || true
+          nuked=1
+        fi
+      done
+    done
+    # Stale tail/ssh subprocesses that look like airc message tails
+    # (ssh ... tail -F .../.airc/messages.jsonl).
+    local tail_pids
+    tail_pids=$(pgrep -u "$(id -u)" -f '\.airc/messages\.jsonl' 2>/dev/null || true)
+    if [ -n "$tail_pids" ]; then
+      echo "  --all: killing stale airc message tails: $(echo $tail_pids | tr '\n' ' ')"
+      kill -9 $tail_pids 2>/dev/null || true
+      nuked=1
+    fi
+    [ "$nuked" = "0" ] && echo "  --all: no machine-wide airc processes to kill."
+    # Fall through to scope-aware path below to also clean up THIS scope's
+    # pidfile + flush if requested. (--all is additive, not exclusive.)
+  fi
+
 
   local killed=0
   # Scope-aware via PID file: cmd_connect wrote its PID(s) to $AIRC_WRITE_DIR/airc.pid.
@@ -1555,7 +1619,7 @@ case "${1:-help}" in
     echo "  airc peers                      List connected peers"
     echo "  airc status [--probe]           Liveness: monitor, queue, last send/recv (add --probe for SSH check)"
     echo "  airc doctor [tabs|scope|all]    Self-test: pairing, send, rename, scope"
-    echo "  airc teardown [--flush]         Kill local airc processes (and wipe state with --flush)"
+    echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state; --all = nuke every airc on this machine, ignoring scope)"
     echo ""
     echo "Identity resolution (highest priority first):"
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
