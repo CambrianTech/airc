@@ -387,19 +387,29 @@ for line in sys.stdin:
     pong_match = re.match(r"^\[PONG:([a-f0-9-]+)\]", msg or "")
     if ping_match:
         ping_id = ping_match.group(1)
-        # Auto-reply pong via subprocess. Fire-and-forget. Uses
-        # airc send so the reply rides the same signed-message path
-        # as normal traffic (no protocol divergence).
-        import subprocess
-        try:
-            subprocess.Popen(
-                ["airc", "send", f"@{fr}", f"[PONG:{ping_id}]"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-        # Suppress from user-visible output (control traffic).
+        # Only auto-pong when the ping is addressed to US specifically.
+        # Without this check every peer on the mesh auto-replies to
+        # every ping they see in the log (monitor tails are shared
+        # across the whole host), so a single ping fans out to N
+        # PONGs and makes liveness diagnosis meaningless. Broadcast
+        # pings (to=all) also skip here  a broadcast ping is a
+        # discovery message the operator reads, not a round-trip.
+        my_current = current_name()
+        if to == my_current:
+            # Auto-reply pong via subprocess. Fire-and-forget. Uses
+            # airc send so the reply rides the same signed-message
+            # path as normal traffic (no protocol divergence).
+            import subprocess
+            try:
+                subprocess.Popen(
+                    ["airc", "send", f"@{fr}", f"[PONG:{ping_id}]"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+        # Suppress from user-visible output (control traffic),
+        # regardless of whether we auto-ponged.
         continue
     if pong_match:
         # cmd_ping picks PONG up by tailing messages.jsonl directly.
