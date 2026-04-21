@@ -1304,7 +1304,36 @@ cmd_teardown() {
     fi
   fi
 
-  [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
+  if [ "$killed" = "0" ]; then
+    echo "  No airc processes running."
+    # Don't leave the user thinking they're clean when on-disk state still
+    # routes to a dead host. If config.json carries a host_target pointing
+    # at a host that's been torn down and rebuilt, a subsequent `airc
+    # connect` auto-resumes to the stale target and enters a zombie
+    # reconnect loop. The user sees "last recv: stale hours" and has to
+    # discover --flush themselves. Surface the hint at teardown time —
+    # it's the only chance the user has to act on it before the next
+    # connect attempt.
+    if [ "$flush" = "0" ]; then
+      local dir="$AIRC_WRITE_DIR"
+      local has_stale_state=0
+      if [ -f "$dir/config.json" ]; then
+        # Any config at all is potentially stale — even host-mode configs
+        # carry identity tied to a port that might be taken on next boot.
+        has_stale_state=1
+      elif [ -d "$dir/peers" ] && [ -n "$(ls -A "$dir/peers" 2>/dev/null)" ]; then
+        has_stale_state=1
+      fi
+      if [ "$has_stale_state" = "1" ]; then
+        echo "  (state dir still populated: $dir)"
+        echo "  If your remote host was torn down or rebuilt, run:"
+        echo "    airc teardown --flush"
+        echo "  to wipe identity/peers/config before the next connect."
+      fi
+    fi
+  else
+    echo "  Teardown complete."
+  fi
 }
 
 cmd_disconnect() {
