@@ -378,6 +378,33 @@ for line in sys.stdin:
             pass
     if handle_rename(msg, ts):
         continue
+    # Ping/pong monitor-liveness probe. Prefix marker on a normal
+    # message so non-implementing clients (older airc, Codex, etc)
+    # just see a weird message. Auto-pong here is opportunistic;
+    # cmd_ping tails the log for PONG with matching uuid + timeout,
+    # which distinguishes wire-dead vs monitor-dead vs peer-no-support.
+    ping_match = re.match(r"^\[PING:([a-f0-9-]+)\]", msg or "")
+    pong_match = re.match(r"^\[PONG:([a-f0-9-]+)\]", msg or "")
+    if ping_match:
+        ping_id = ping_match.group(1)
+        # Auto-reply pong via subprocess. Fire-and-forget. Uses
+        # airc send so the reply rides the same signed-message path
+        # as normal traffic (no protocol divergence).
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["airc", "send", f"@{fr}", f"[PONG:{ping_id}]"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        # Suppress from user-visible output (control traffic).
+        continue
+    if pong_match:
+        # cmd_ping picks PONG up by tailing messages.jsonl directly.
+        # Suppress to keep the chat surface clean.
+        continue
     if fr in ("airc", "sys"):
         label = "airc"
     else:
@@ -1100,6 +1127,87 @@ cmd_send() {
   rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
 }
 
+# Ping a peer to verify their monitor is alive AND processing traffic.
+#
+# Sends [PING:<uuid>] to the peer via cmd_send, then tails the local
+# messages.jsonl for a [PONG:<uuid>] response from that peer with a
+# timeout. Three outcomes the caller can distinguish:
+#
+#   - PONG arrives within timeout → peer's monitor is alive + running
+#     a compatible airc version (one with the auto-pong handler in
+#     monitor_formatter).
+#   - Timeout, but [PING:<uuid>] IS visible in local log → the ping
+#     landed on the wire (SSH append succeeded) but no response. Either
+#     (a) peer's monitor is dead, or (b) peer is running an older airc
+#     without the auto-pong handler, or (c) peer is a non-airc agent
+#     (e.g., Codex) that reads the log but doesn't respond.
+#   - Timeout, [PING:<uuid>] NOT visible → the send itself failed or
+#     queued (see cmd_send's wire-failure branch). Wire is broken.
+#
+# Design: ping is a regular signed message with a prefix marker. Clients
+# that don't implement auto-pong see it as "a message starting with
+# [PING:]" — harmless, logs it, life continues. Forward-compatible +
+# gracefully-degrading across airc versions AND across agent types.
+#
+# Usage:
+#   airc ping @peer           # default 10s timeout
+#   airc ping @peer 30        # 30s timeout
+cmd_ping() {
+  local first="${1:-}"
+  [ -z "$first" ] && die "Usage: airc ping @peer [timeout_secs]"
+  case "$first" in
+    @*) ;;
+    *) die "Usage: airc ping @peer — ping requires an @peer target (broadcast ping not supported)" ;;
+  esac
+  local peer_name="${first#@}"
+  local timeout="${2:-10}"
+  # Basic sanity: timeout must be a positive integer. Guards against
+  # typos that would make the wait-loop spin forever or exit early.
+  case "$timeout" in
+    ''|*[!0-9]*) die "timeout must be a positive integer (got '$timeout')" ;;
+  esac
+  ensure_init
+
+  # uuid from python for format consistency with the regex in monitor_formatter.
+  local ping_id
+  ping_id=$(python3 -c "import uuid; print(uuid.uuid4())")
+
+  local start_time
+  start_time=$(date +%s)
+
+  # Use cmd_send so the ping rides the same signed-message path as
+  # normal traffic — guaranteed shape parity with what the receiver's
+  # monitor_formatter reads.
+  cmd_send "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed — check SSH/auth state (airc status)"
+
+  echo "ping sent to $peer_name (id=$ping_id) — waiting up to ${timeout}s for pong..."
+
+  # Poll local messages.jsonl for the matching pong. We check the FULL
+  # log since the ping was written (cmd_send mirrors locally first).
+  # 0.5s poll is responsive without spinning.
+  while true; do
+    local now elapsed
+    now=$(date +%s)
+    elapsed=$((now - start_time))
+    if grep -q "\[PONG:$ping_id\]" "$MESSAGES" 2>/dev/null; then
+      echo "PONG received from $peer_name after ${elapsed}s — monitor alive + auto-responder working."
+      return 0
+    fi
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo "TIMEOUT after ${timeout}s — no pong from $peer_name."
+      # Secondary diagnosis: did the ping land on the wire at all?
+      if grep -q "\[PING:$ping_id\]" "$MESSAGES" 2>/dev/null; then
+        echo "  Ping IS visible in local log (cmd_send mirrored it). That proves our outbound works."
+        echo "  No pong likely means: (a) peer's monitor is dead, (b) peer runs older airc without auto-pong, or (c) peer is a non-airc agent."
+      else
+        echo "  Ping is NOT in local log — cmd_send's mirror may have failed. Check: airc status, airc logs."
+      fi
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
 cmd_send_file() {
   local peer_name="${1:-}" filepath="${2:-}"
   [ -z "$peer_name" ] || [ -z "$filepath" ] && die "Usage: airc send-file <peer> <path>"
@@ -1556,6 +1664,7 @@ case "${1:-help}" in
   connect|setup|start|join|resume) shift; cmd_connect "$@" ;;
   send)      shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
+  ping)      shift; cmd_ping "$@" ;;
   rename)    shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
@@ -1576,6 +1685,7 @@ case "${1:-help}" in
     echo "  airc connect                    Host — wait for peers"
     echo "  airc connect <name@user@host>   Join a host"
     echo "  airc send <peer> <message>      Send a message"
+    echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
     echo "  airc rename <new-name>          Rename this session (notifies peers)"
     echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  airc peers                      List connected peers"
