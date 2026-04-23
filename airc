@@ -560,6 +560,67 @@ cmd_connect() {
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
 
+  # ── Notification-sink liveness ─────────────────────────────────────
+  # `airc connect` is only useful when a CONSUMER is reading our stdout —
+  # that's how inbound peer messages reach the AI agent or human. The
+  # canonical launcher is Claude Code's Monitor (persistent=true, command=
+  # "airc connect ...") which streams every stdout line as a notification.
+  #
+  # Failure mode this catches: someone runs `airc connect <invite>` via a
+  # one-shot Bash tool / nohup / background `&` / detached shell. The
+  # python formatter + ssh tail get spawned, the pairing succeeds, the
+  # local messages.jsonl fills correctly — but stdout has no reader (the
+  # bash that exec'd us already exited and closed the pipe), so inbound
+  # NEVER reaches the agent's notification surface. Looks paired, is
+  # functionally deaf. Cost a session of debugging on 2026-04-23.
+  #
+  # Approach: install a SIGPIPE handler that exits LOUDLY (to stderr,
+  # which usually survives) the moment any write to stdout fails. Plus a
+  # periodic heartbeat line every 60s so SIGPIPE actually fires if there's
+  # no reader. With both:
+  #   - Monitor reading: heartbeats succeed silently (Monitor surfaces
+  #     them as benign notifications, but they're harmless)
+  #   - One-shot bash / nohup / background: first heartbeat triggers
+  #     SIGPIPE → airc exits with a clear error pointing at the right
+  #     launch pattern → no silent deafness
+  #
+  # Opt out: AIRC_BACKGROUND_OK=1 disables the heartbeat for legitimate
+  # background launches (systemd unit + dedicated tail consumer, tests).
+  trap '
+    {
+      echo ""
+      echo "❌ airc connect: stdout pipe closed — no notification consumer."
+      echo ""
+      echo "   Inbound peer messages would have been silently lost. Most"
+      echo "   common cause: airc was launched as a one-shot bash exec,"
+      echo "   nohup, background \"&\", or detached shell. The pairing"
+      echo "   succeeds and messages.jsonl fills, but the AI agent never"
+      echo "   sees inbound notifications. That is the worst kind of"
+      echo "   silent failure — looks fine, is broken."
+      echo ""
+      echo "   Right launchers:"
+      echo "     • Claude Code skill:   /airc:connect <invite>"
+      echo "     • Monitor tool:        Monitor(persistent=true, command=\"airc connect <invite>\")"
+      echo "     • Interactive shell:   just type \`airc connect <invite>\` at a TTY"
+      echo ""
+      echo "   Bypass for legitimate background use (systemd + log tail,"
+      echo "   tests): export AIRC_BACKGROUND_OK=1"
+      echo ""
+    } >&2
+    exit 3
+  ' PIPE
+  if [ -z "${AIRC_BACKGROUND_OK:-}" ]; then
+    # Heartbeat to stdout every 60s. If nobody reads, the next write
+    # triggers SIGPIPE → trap above fires → airc exits loudly. Background
+    # subshell so it doesn't block the main connect flow. Killed by the
+    # main trap (EXIT/INT/TERM) along with the rest of the descendants.
+    (
+      while sleep 60; do
+        echo "  [airc heartbeat $(date -u +%H:%M:%SZ)]"
+      done
+    ) &
+  fi
+
   # Auto-teardown any stale airc process in this scope before starting fresh.
   # Previously users had to run `airc teardown` manually before `airc connect`
   # if a prior monitor was still around — easy to forget, often resulted in
