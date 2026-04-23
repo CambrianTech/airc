@@ -621,6 +621,58 @@ cmd_connect() {
     ) &
   fi
 
+  # ── Branch-behind notification (issue #33) ─────────────────────────
+  # When two AI peers are paired on the same git repo, silently working on a
+  # stale checkout duplicates fixes (we have a "pull-before-work" discipline
+  # rule, but discipline is fragile). If the airc scope IS a git repo, poll
+  # `git ls-remote origin <branch>` periodically and emit a one-shot
+  # notification when the remote SHA advances past local HEAD. The notification
+  # surfaces on stdout where Claude Code's Monitor (or any other reader)
+  # picks it up immediately.
+  #
+  # Cheap: ls-remote is a HEAD ref query, no objects fetched. Quiet by
+  # default: emits ONE line per actual remote change, not per poll.
+  # Opt out: AIRC_NO_PULL_PROMPT=1 disables the poll entirely.
+  if [ -z "${AIRC_NO_PULL_PROMPT:-}" ] && command -v git >/dev/null 2>&1; then
+    local scope_git_dir; scope_git_dir="$(cd "$AIRC_WRITE_DIR/.." 2>/dev/null && git rev-parse --git-dir 2>/dev/null || true)"
+    if [ -n "$scope_git_dir" ]; then
+      local scope_repo_dir; scope_repo_dir="$(cd "$AIRC_WRITE_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
+      if [ -n "$scope_repo_dir" ]; then
+        # State file: last remote SHA we notified about. Empty on first run.
+        # Stored INSIDE the airc scope so it follows the pairing identity.
+        local pull_state_file="$AIRC_WRITE_DIR/last_remote_sha"
+        (
+          # Always work in the scope's git repo
+          cd "$scope_repo_dir" || exit 0
+          while sleep 60; do
+            local branch; branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+            [ -z "$branch" ] || [ "$branch" = "HEAD" ] && continue  # detached HEAD or no repo
+            # Cheap remote head check — no object fetch.
+            local remote_sha; remote_sha="$(git ls-remote --heads origin "$branch" 2>/dev/null | awk '{print $1}')"
+            [ -z "$remote_sha" ] && continue  # no remote tracking, skip
+            local local_sha; local_sha="$(git rev-parse HEAD 2>/dev/null)"
+            # Only notify when remote is AHEAD and we haven't already notified
+            # about THIS exact remote SHA.
+            if [ "$remote_sha" != "$local_sha" ]; then
+              local already_notified=""
+              [ -f "$pull_state_file" ] && already_notified="$(cat "$pull_state_file" 2>/dev/null)"
+              if [ "$remote_sha" != "$already_notified" ]; then
+                # Verify remote is actually AHEAD (not just different — could
+                # be a force-push scenario, still worth flagging but with
+                # different verbiage).
+                local ahead_count; ahead_count="$(git rev-list --count HEAD.."$remote_sha" 2>/dev/null || echo "?")"
+                local short_remote; short_remote="${remote_sha:0:9}"
+                local short_local;  short_local="${local_sha:0:9}"
+                echo "  [airc] origin/$branch is at $short_remote (you have $short_local, $ahead_count commits ahead). Run \`git pull\` before next edit. AIRC_NO_PULL_PROMPT=1 to silence."
+                echo "$remote_sha" > "$pull_state_file"
+              fi
+            fi
+          done
+        ) &
+      fi
+    fi
+  fi
+
   # Auto-teardown any stale airc process in this scope before starting fresh.
   # Previously users had to run `airc teardown` manually before `airc connect`
   # if a prior monitor was still around — easy to forget, often resulted in
