@@ -2063,26 +2063,108 @@ except Exception:
 }
 
 cmd_update() {
-  # Refresh install dir (git pull) AND re-run install.sh so new skills get
-  # symlinked into ~/.claude/skills/ and old ones get cleaned up. install.sh
-  # is idempotent — it handles the pull, the binary symlink, and the skill
+  # Refresh install dir AND re-run install.sh so new skills get symlinked
+  # into ~/.claude/skills/ and old ones get cleaned up. install.sh is
+  # idempotent — it handles the pull, the binary symlink, and the skill
   # directory refresh in one pass. Does NOT teardown or reconnect.
+  #
+  # Channels (#40 followup): airc supports release channels for opt-in
+  # pre-merge testing. main = stable; canary = features-not-yet-promoted.
+  # The chosen channel persists in $AIRC_DIR/.channel so subsequent
+  # `airc update` (no args) keeps the user on their chosen track.
+  #   airc update                    # stay on current channel (default: main)
+  #   airc update --channel canary   # switch to canary + update
+  #   airc update --channel main     # switch back to main + update
+  #   airc channel                   # show current channel without updating
   local dir="${AIRC_DIR:-$HOME/.airc-src}"
+  local channel_file="$dir/.channel"
+  local requested_channel=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channel|-c)
+        requested_channel="${2:-}"
+        [ -z "$requested_channel" ] && die "Usage: airc update --channel <name>"
+        shift 2
+        ;;
+      --canary) requested_channel="canary"; shift ;;
+      --main)   requested_channel="main";   shift ;;
+      *) shift ;;
+    esac
+  done
+
   if [ ! -d "$dir/.git" ]; then
     die "No git checkout at $dir. Reinstall: curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash"
   fi
+
+  # Determine target channel: explicit request > saved preference > main.
+  local channel
+  if [ -n "$requested_channel" ]; then
+    channel="$requested_channel"
+  elif [ -f "$channel_file" ]; then
+    channel=$(cat "$channel_file" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$channel" ] && channel="main"
+  else
+    channel="main"
+  fi
+
+  # Switch to the target branch BEFORE pulling. install.sh will then ff-pull
+  # whatever branch is checked out. Fail loud if the channel doesn't exist
+  # on origin — silently falling back to main would defeat the opt-in test
+  # purpose.
   local before; before=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+  local current_branch; current_branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$current_branch" != "$channel" ]; then
+    git -C "$dir" fetch --quiet origin "$channel" 2>/dev/null \
+      || die "Channel '$channel' not found on origin. Try: airc channel (to see options)."
+    git -C "$dir" checkout -q "$channel" 2>/dev/null \
+      || git -C "$dir" checkout -q -B "$channel" "origin/$channel" 2>/dev/null \
+      || die "Failed to checkout '$channel'. Resolve manually in $dir."
+  fi
+
   if [ ! -x "$dir/install.sh" ]; then
     die "install.sh missing at $dir. Reinstall via curl|bash."
   fi
   AIRC_DIR="$dir" bash "$dir/install.sh" || die "install.sh failed."
+
+  # Persist channel choice AFTER successful update so a failed switch
+  # doesn't leave a dangling preference for a broken state.
+  echo "$channel" > "$channel_file"
+
   local after; after=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
   if [ "$before" = "$after" ]; then
-    echo "  Already at ${after}. Skills refreshed."
+    echo "  Already at ${after} on channel '${channel}'. Skills refreshed."
   else
-    echo "  Updated: ${before} -> ${after}. Skills refreshed."
+    echo "  Updated: ${before} -> ${after} on channel '${channel}'. Skills refreshed."
     echo "  Running monitor still uses the old code. To pick up:  airc teardown && airc connect"
   fi
+}
+
+# ── cmd_channel: show or set the release channel without pulling ──────
+# `airc channel`           → print current channel + how to switch
+# `airc channel canary`    → set preferred channel; doesn't pull (use
+#                            `airc update` after to actually switch)
+# Allows the AI / human to inspect + decide before the heavier update.
+cmd_channel() {
+  local dir="${AIRC_DIR:-$HOME/.airc-src}"
+  local channel_file="$dir/.channel"
+  local current="main"
+  [ -f "$channel_file" ] && current=$(cat "$channel_file" 2>/dev/null | tr -d '[:space:]')
+  [ -z "$current" ] && current="main"
+
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    echo "  Channel: $current"
+    echo "  Available channels (any branch on origin can be a channel):"
+    echo "    main      — stable, what most users run"
+    echo "    canary    — features queued for the next main merge; opt-in testing"
+    echo "  Switch:"
+    echo "    airc channel <name>           # set preference (run 'airc update' after)"
+    echo "    airc update --channel <name>  # set + pull in one step"
+    return 0
+  fi
+
+  echo "$target" > "$channel_file"
+  echo "  Channel preference set: '$target'. Run 'airc update' to actually switch + pull."
 }
 
 cmd_version() {
@@ -2296,7 +2378,9 @@ case "${1:-help}" in
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
   version|--version|-v) cmd_version ;;
-  update|upgrade|pull) cmd_update ;;
+  update|upgrade|pull) shift; cmd_update "$@" ;;
+  channel) shift; cmd_channel "$@" ;;
+  canary) shift; cmd_update --channel canary "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor|tests|test) shift; cmd_doctor "$@" ;;
@@ -2315,6 +2399,10 @@ case "${1:-help}" in
     echo "  airc connect <name@user@host>   Join via inline invite string (legacy)"
     echo "  airc rooms / list / ls          List open rooms + invites on your gh account"
     echo "  airc part                       Leave current room (host: deletes room gist)"
+    echo "  airc update [--channel <name>]  Pull latest on current channel; switch with --channel canary|main"
+    echo "  airc channel [<name>]           Show or set release channel (main = stable, canary = pre-merge testing)"
+    echo "  airc canary                     Shortcut: airc update --channel canary"
+    echo "  airc tests / doctor [scenario]  Run integration suite (88 assertions across 11 scenarios)"
     echo "  airc send <peer> <message>      Send a message"
     echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
     echo "  airc rename <new-name>          Rename this session (notifies peers)"
