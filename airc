@@ -310,7 +310,7 @@ monitor() {
     # cold-restart and join as peers. Standard distributed-systems leader
     # election with optimistic conflict resolution via gh-create.
     local consecutive_timeouts=0
-    local ESCALATE_AFTER=3   # ~9 minutes of dead host (3 × WATCHDOG_SEC=180)
+    local ESCALATE_AFTER=2   # 5 min total dead-host detection (2 × WATCHDOG_SEC=150)
     while true; do
       local cycle_start; cycle_start=$(date +%s)
       ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
@@ -321,11 +321,30 @@ monitor() {
       # Subsequent reconnects use the now-persisted offset updated by the formatter.
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
 
-      # Count this iteration as a "timeout" if formatter exited with code 2
-      # (its watchdog-no-inbound exit) OR the whole pipe died in under 30s
-      # (likely SSH refused / connection reset — host gone). Anything else,
-      # especially a long-lived formatter that received traffic, resets.
-      if [ "$fmt_exit" = "2" ] || [ "$cycle_lifetime" -lt 30 ]; then
+      # Probe-before-count for fmt_exit=2 (watchdog: no inbound for
+      # WATCHDOG_SEC). Without a probe, healthy-but-idle channels look
+      # identical to dead-host channels — both produce fmt_exit=2 — so
+      # we'd notify+escalate every WATCHDOG_SEC on quiet conversations
+      # (constant restart spam). The probe distinguishes:
+      #   probe success → host is alive, channel is just idle. Reset
+      #     counter, no notification, silent reconnect of the tail.
+      #   probe failure → host is genuinely unreachable. Notify, count
+      #     toward escalation. After ESCALATE_AFTER consecutive REAL
+      #     failures, exit 99 → daemon respawn → self-heal.
+      #
+      # cycle_lifetime < 30s also counts as a timeout (SSH refused or
+      # connection reset before tail even started reading) — that's
+      # the dead-host signature too, no probe needed.
+      if [ "$fmt_exit" = "2" ]; then
+        if ssh $ssh_opts -o ConnectTimeout=5 -o BatchMode=yes "$host_target" "true" 2>/dev/null; then
+          # Healthy idle. Stay quiet.
+          consecutive_timeouts=0
+        else
+          echo "airc: host went quiet (probe failed) — restarting"
+          consecutive_timeouts=$((consecutive_timeouts + 1))
+        fi
+      elif [ "$cycle_lifetime" -lt 30 ]; then
+        echo "airc: host unreachable (cycle <30s) — restarting"
         consecutive_timeouts=$((consecutive_timeouts + 1))
       else
         consecutive_timeouts=0
@@ -381,27 +400,26 @@ import sys, json, os, re, time, signal
 # there is no penalty when the channel is healthy.
 #
 # Joel 2026-04-24: heartbeat is OFF by default (canary 95d9907), so
-# any idle channel WILL hit the watchdog if WATCHDOG_SEC is short.
-# At 180s, two genuinely-idle peers triggered restart-and-notification
-# every 3 minutes — pure noise that masked real events. 600s (10 min)
-# gives idle conversations breathing room without losing the dead-
-# channel detection (zombie connections still get caught within 10
-# minutes of going truly silent). Ratio: with reminder-interval=300s
-# and heartbeat OFF, the watchdog is now 2x the would-be heartbeat
-# cycle — large enough that any plausibly-alive channel still resets
-# it before firing.
-WATCHDOG_SEC = 600
+# every fmt_exit=2 used to look like "host went quiet" and spam restart
+# notifications on healthy idle. Fix is in the bash retry loop: it
+# probes the host on fmt_exit=2 BEFORE counting/notifying. Probe
+# success = healthy idle (silent reset); probe failure = real death
+# (notify + count toward escalation).
+#
+# With the probe, WATCHDOG_SEC is just the polling cadence at which
+# we re-check the channel. 150s × ESCALATE_AFTER=2 = 5 minutes total
+# dead-host detection per Joel'\''s spec. The watchdog itself only fires
+# the python exit; the bash probe is what decides whether the user
+# sees a notification.
+WATCHDOG_SEC = 150
 def _watchdog_exit(signum, frame):
-    # Emit on stdout AS WELL as stderr so the line surfaces in the
-    # Monitor task notification stream (which only sees stdout). Without
-    # the stdout side, watchdog-triggered restarts are invisible — the
-    # Monitor task <summary> still shows whatever stale chat line was
-    # latest, telling humans/AIs nothing about the actual event.
-    msg = f"host went quiet ({WATCHDOG_SEC}s) — restarting"
-    sys.stderr.write(f"[airc:monitor] {msg}\\n")
+    # Diagnostic to stderr only. The bash retry loop owns the
+    # user-visible notification — it probes the host on fmt_exit=2
+    # to decide whether silence means "healthy idle" (silent reset)
+    # or "host actually unreachable" (notify + count). Emitting from
+    # python here would notify on every healthy-idle cycle.
+    sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — exiting for probe\\n")
     sys.stderr.flush()
-    sys.stdout.write(f"airc: {msg}\\n")
-    sys.stdout.flush()
     os._exit(2)
 signal.signal(signal.SIGALRM, _watchdog_exit)
 signal.alarm(WATCHDOG_SEC)
