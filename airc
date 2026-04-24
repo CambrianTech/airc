@@ -403,6 +403,16 @@ try:
 except Exception:
     pass
 
+# Room name for the chat-line prefix. Read once at startup; a rename
+# of the room would require a fresh airc connect to pick up. Default
+# is "general"; legacy single-pair invite scope shows "1:1" as the
+# visual marker.
+room_path = os.path.join(scope_dir, "room_name")
+try:
+    room_name = open(room_path).read().strip() or "general"
+except Exception:
+    room_name = "1:1"
+
 def current_name():
     """Read identity name fresh from config.json each time so a rename
     during the session immediately takes effect for own-send filtering.
@@ -549,10 +559,19 @@ for line in sys.stdin:
         # Suppress to keep the chat surface clean.
         continue
     if fr in ("airc", "sys"):
-        label = "airc"
+        # System events (joins, parts, drain markers, auth failures) keep
+        # the airc-prefixed format — easy to scan past.
+        print(f"[#{room_name}] airc: {msg}", flush=True)
     else:
-        label = fr
-    print(f"[{ts}] {label}: {msg}", flush=True)
+        # Real chat: compact IRC-feel format.
+        # Broadcast:  [#general] bigmama: hello everyone
+        # DM:         [#general] bigmama → alice: hey
+        # Joel 2026-04-24: "the goings on of our agents is fascinating
+        # to humans" — keep it readable, drop the verbose ISO timestamp.
+        if to and to not in ("all", ""):
+            print(f"[#{room_name}] {fr} → {to}: {msg}", flush=True)
+        else:
+            print(f"[#{room_name}] {fr}: {msg}", flush=True)
 '
 }
 
@@ -785,13 +804,21 @@ cmd_connect() {
     } >&2
     exit 3
   ' PIPE
-  if [ -z "${AIRC_BACKGROUND_OK:-}" ]; then
-    # Heartbeat to stdout every 60s. If nobody reads, the next write
-    # triggers SIGPIPE → trap above fires → airc exits loudly. Background
-    # subshell so it doesn't block the main connect flow. Killed by the
-    # main trap (EXIT/INT/TERM) along with the rest of the descendants.
+  # Heartbeat to stdout for SIGPIPE-pipe-death detection. OFF BY DEFAULT
+  # as of 2026-04-24 — at 60s it was filling Claude Code chat history
+  # with a notification per minute per peer, drowning real peer events.
+  # Joel: "I'd rather only see the messages."
+  #
+  # Real peer traffic still triggers SIGPIPE on pipe death, so we lose
+  # detection only when the channel is genuinely silent for a long time.
+  # That tradeoff is worth it for the cleaner Monitor surface.
+  #
+  # Set AIRC_HEARTBEAT_SEC=<seconds> to opt back in (tests, diagnostic
+  # sessions, one-shot-bash launchers that need the safety net). 0 or
+  # unset = no heartbeat.
+  if [ -z "${AIRC_BACKGROUND_OK:-}" ] && [ -n "${AIRC_HEARTBEAT_SEC:-}" ] && [ "$AIRC_HEARTBEAT_SEC" -gt 0 ] 2>/dev/null; then
     (
-      while sleep 60; do
+      while sleep "$AIRC_HEARTBEAT_SEC"; do
         echo "  [airc heartbeat $(date -u +%H:%M:%SZ)]"
       done
     ) &
