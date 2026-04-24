@@ -10,8 +10,14 @@ set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
 CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
-BIN_DIR="$HOME/.local/bin"
-SKILLS_TARGET="$HOME/.claude/skills"
+# BIN_DIR + SKILLS_TARGET respect env-var overrides so test harnesses
+# (and packagers, distros, etc.) can point install.sh at a sandbox
+# instead of stomping ~/.local/bin and ~/.claude/skills. Pre-fix, a
+# test passing BIN_DIR=/tmp/foo would be silently ignored and the
+# real ~/.local/bin/airc symlink would get rewritten to point at the
+# test dir — caught when our own canary test corrupted the real install.
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
 info()  { printf '  \033[1;34m->\033[0m %s\n' "$*"; }
 ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
