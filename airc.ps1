@@ -362,11 +362,16 @@ function Resolve-OpenSSL {
 $script:OpenSSLBin = Resolve-OpenSSL
 
 function Invoke-OpenSSL {
-    param([Parameter(ValueFromRemainingArguments)] [string[]] $SslArgs)
+    # NOTE: deliberately NO param() block. Adding [Parameter()] makes this
+    # an advanced function and PowerShell injects common parameters
+    # (-OutBuffer / -OutVariable / etc). Then any openssl flag that has
+    # 'out' as a prefix -- e.g. `-out file.pem` -- gets parsed as a
+    # PS parameter and fails with the ambiguity error before reaching
+    # openssl.exe at all. Use $args to collect verbatim.
     if (-not $script:OpenSSLBin) {
         Die "openssl not found. Install Git for Windows (it bundles openssl) or run 'airc doctor'."
     }
-    & $script:OpenSSLBin @SslArgs
+    & $script:OpenSSLBin @args
 }
 
 function Sign-Message {
