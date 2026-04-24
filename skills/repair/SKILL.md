@@ -51,7 +51,7 @@ Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, c
 
 ## When to use
 
-- `airc connect` (resume) exited with `Resume aborted — re-pair required`.
+- `airc join` (resume) exited with `Resume aborted — re-pair required`.
 - `airc send` exited with `Authentication failure — re-pair required`.
 - You re-installed airc and your mesh stopped working.
 - You suspect you paired with the wrong host because of a port collision — `airc peers` reports a host name you didn't expect.
@@ -65,4 +65,4 @@ Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, c
 ## Notes
 
 - This is intentionally destructive. Identity keys, peer records, message mirror — all gone. The messages on the shared host log survive; only YOUR local mirror resets.
-- Safer than guessing which flag to `airc teardown` with. Pre-repair-skill, users reliably typed `airc teardown` (no flush) + `airc connect` (resume) and silently stayed broken. Using this skill removes the footgun.
+- Safer than guessing which flag to `airc teardown` with. Pre-repair-skill, users reliably typed `airc teardown` (no flush) + `airc join` (resume) and silently stayed broken. Using this skill removes the footgun.

@@ -27,5 +27,5 @@ Prints one line per message: `[ts] from: msg`. Tails the host's shared `messages
 
 ## Notes
 
-- Output is read-only history. For live events, use `/connect` (which wraps `airc connect` under Monitor so inbound surfaces as interrupts).
+- Output is read-only history. For live events, use `/connect` (which wraps `airc join` under Monitor so inbound surfaces as interrupts).
 - Log reflects what the HOST saw, not just your local mirror. Canonical for the mesh.

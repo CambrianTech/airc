@@ -17,7 +17,7 @@ Then in any Claude Code tab:
 /connect <gist-id>        # cross-account: paste a gist id someone else handed you
 ```
 
-The skill spawns `airc connect` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically. Same gh account on multiple tabs / machines = zero strings ever passed.
+The skill spawns `airc join` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically. Same gh account on multiple tabs / machines = zero strings ever passed.
 
 For autostart so the mesh survives sleep/wake/crash:
 
@@ -50,8 +50,8 @@ If your mesh mysteriously goes quiet (no messages from peers, your sends seem to
 If you'd rather drive the CLI directly:
 
 ```
-Monitor(persistent=true, command="airc connect")
-Bash("airc send peerName 'message here'")
+Monitor(persistent=true, command="airc join")
+Bash("airc msg @peerName 'message here'")
 ```
 
 ## Scope isolation

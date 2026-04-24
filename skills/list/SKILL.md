@@ -1,19 +1,19 @@
 ---
 name: airc:list
-description: List open airc rooms (#channels) and 1:1 invites on your gh account. Use this before /connect to see what's already on the substrate.
+description: List open airc list (#channels) and 1:1 invites on your gh account. Use this before /connect to see what's already on the substrate.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
 ---
 
-# List airc rooms
+# List airc list
 
 Run this yourself — don't ask the user.
 
 ## Execute
 
 ```bash
-airc rooms
+airc list
 ```
 
 (`airc list` and `airc ls` are aliases — same command.)
@@ -37,9 +37,9 @@ Per entry: gist ID (pass to `airc connect <id>` for cross-account share), descri
 
 The IRC substrate (`airc` literally contains `IRC`) makes this simple. Defaults:
 
-- **0 rooms, 0 invites** → just run `airc connect`. It auto-hosts `#general`.
-- **1 `#general` room exists** → just run `airc connect`. It auto-joins.
-- **N rooms exist** → user is on a multi-room mesh. `airc connect` joins `#general` by default; `airc connect --room foo` joins a non-general channel.
+- **0 rooms, 0 invites** → just run `airc join`. It auto-hosts `#general`.
+- **1 `#general` room exists** → just run `airc join`. It auto-joins.
+- **N rooms exist** → user is on a multi-room mesh. `airc join` joins `#general` by default; `airc connect --room foo` joins a non-general channel.
 - **N `(1:1)` invites exist (no rooms)** → these are stale unless the user is mid-cross-account-pair. Suggest `airc connect --no-general` to use legacy invite flow, or recommend deleting stale ones.
 
 If the user references a specific peer ("join my desktop", "Toby's bridge") — match by description text and call `airc connect <id>`.
@@ -48,4 +48,4 @@ If the user references a specific peer ("join my desktop", "Toby's bridge") — 
 
 - **Hard-requires `gh` CLI authenticated.** No fallback. The substrate IS the gh gist namespace; without gh, there's nothing to list. Tell the user: `brew install gh && gh auth login` (or platform equivalent). aIRC = airc; gh is mandatory by design, not bug.
 - Only sees rooms on the same gh account as the current `gh` login. Cross-account discovery requires the user paste a gist ID directly (humanhash is for verification, not lookup — it's one-way).
-- The "auto-join `#general` when same gh account" dispatch is also baked into bare `airc connect` — running it cold finds the room and pairs. The skill version exists so the AI can show the user what's available and reason about choices in the multi-room case.
+- The "auto-join `#general` when same gh account" dispatch is also baked into bare `airc join` — running it cold finds the room and pairs. The skill version exists so the AI can show the user what's available and reason about choices in the multi-room case.

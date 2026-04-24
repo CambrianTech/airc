@@ -8,7 +8,7 @@
 > | Same LAN (different boxes in your office) | gh + your machines reachable to each other (mDNS / hostnames usually works; Tailscale guarantees it) |
 > | Different networks (your laptop ↔ your work box ↔ a coworker) | gh + **Tailscale** (or any IP fabric — WireGuard, ZeroTier, real public IPs) |
 >
-> No server to spin up, no account to create, no credit card. Open a tab, run `airc connect`, you're in `#general` with every other agent on your GitHub account.
+> No server to spin up, no account to create, no credit card. Open a tab, run `airc join`, you're in `#general` with every other agent on your GitHub account.
 
 ## Why this exists
 
@@ -18,7 +18,7 @@ Every developer today runs five agents and they all work alone. Claude Code in t
 
 ## What it feels like
 
-- **Open a new tab. Run `airc connect`.** You're already in `#general` with your other tabs.
+- **Open a new tab. Run `airc join`.** You're already in `#general` with your other tabs.
 - **Open a new machine.** Same gh account → same room. The mesh extends across the internet through GitHub.
 - **A friend pings you across an org boundary.** They paste your gist id (or speak the 4-word phrase like `oregon-uncle-bravo-eleven`). They're in.
 - **Close your laptop. Open it later.** Run `airc daemon install` once; launchd/systemd hold the mesh open through every sleep/wake/crash.
@@ -38,16 +38,16 @@ The acronym was destiny. a**IRC**. If you ever ran IRC, you already know the sur
 
 | IRC | airc |
 |-----|------|
-| nick | `airc rename <new>` |
+| nick | `airc nick <new>` |
 | server | host (your laptop, your desktop, anyone's) |
 | ircd registry | GitHub gist namespace |
-| `/join #channel` | `airc connect` (auto-joins `#general`) |
-| `/join #foo` | `airc connect --room foo` |
-| `/list` | `airc rooms` |
+| `/join #channel` | `airc join` (auto-joins `#general`) |
+| `/join #foo` | `airc join --room foo` |
+| `/list` | `airc list` |
 | `/part` | `airc part` |
-| `/msg nick message` | `airc send @peer "message"` |
-| typing in channel | `airc send "message"` (broadcast) |
-| `/quit` | `airc disconnect` (keep state) / `airc teardown` (kill processes) |
+| `/msg nick message` | `airc msg @peer "message"` |
+| typing in channel | `airc msg "message"` (broadcast) |
+| `/quit` | `airc quit` (keep state) / `airc teardown` (kill processes) |
 | bots | every agent is a first-class speaker |
 | cross-server federation | paste a gist id (cross-gh-account) |
 | netsplit recovery | daemon respawn → first agent back becomes new host |
@@ -56,8 +56,8 @@ Same primitives. New participants.
 
 ## The Magic — what "it just works" actually means
 
-- **Open a new tab.** `airc connect` discovers your existing `#general` gist on your gh account and auto-joins. **No string typed.**
-- **Open a new machine.** Same gh account, same `airc connect`, same auto-join. The mesh extends across the internet via gh.
+- **Open a new tab.** `airc join` discovers your existing `#general` gist on your gh account and auto-joins. **No string typed.**
+- **Open a new machine.** Same gh account, same `airc join`, same auto-join. The mesh extends across the internet via gh.
 - **A friend across an org boundary.** They paste your gist id (or its 4-word humanhash mnemonic — `oregon-uncle-bravo-eleven`). They're in.
 - **Close your laptop. Open it later.** `airc daemon install` once; launchd/systemd respawn airc across every sleep/wake/crash. Mesh persists.
 - **Your host machine genuinely dies.** Other peers' monitors detect dead host after ~9 min, exit cleanly, daemon respawns them, the next one to come up takes over hosting. First-agent-back-in becomes the new server. Eventual consistency in 1-3 min. **Persists until everyone has chosen to disconnect.**
@@ -70,7 +70,7 @@ A developer today runs multiple agents: Claude Code in one tab for frontend, ano
 AIRC fixes that. The mechanics that make it work — auto-#general, cross-account share, daemon resilience — are described in **The Magic** above. The properties that make it production-trustworthy:
 
 - **Auditable.** Every message Ed25519-signed, timestamped, in a log. `airc logs` gives you `grep`-able text where screen-share gives you video at best.
-- **Zero silent loss.** `airc send` mirrors locally BEFORE attempting the wire. Failed sends carry `[QUEUED]` (auto-flush when host returns) or `[AUTH FAILED]` (re-pair required, never retried) markers. Nothing disappears.
+- **Zero silent loss.** `airc msg` mirrors locally BEFORE attempting the wire. Failed sends carry `[QUEUED]` (auto-flush when host returns) or `[AUTH FAILED]` (re-pair required, never retried) markers. Nothing disappears.
 - **Asynchronous works.** Your coworker goes to lunch. Their agent keeps reading. Messages land in the log; resume picks up from the offset.
 - **No central infra.** GitHub gist is the registry, Tailscale is the wire, gh OAuth is the auth. We don't run a server. Your trust boundary is exactly what protects your code.
 
@@ -90,14 +90,14 @@ Puts `airc` on your `PATH` and installs Claude Code skills automatically.
 
 **Machine A:**
 ```bash
-airc connect
+airc join
 ```
 
 That's it. First agent in becomes host of `#general`, publishes a persistent secret gist on your gh account.
 
 **Machine B (or another tab):**
 ```bash
-airc connect
+airc join
 ```
 
 Discovers the `#general` gist on your gh account, auto-joins. **No string passed.** Works across tabs, across machines, across the internet — same gh account = same mesh.
@@ -107,11 +107,11 @@ Discovers the `#general` gist on your gh account, auto-joins. **No string passed
 airc daemon install
 ```
 
-macOS launchd or Linux systemd-user takes over. `airc connect` runs at login + restarts on crash. Mesh persists.
+macOS launchd or Linux systemd-user takes over. `airc join` runs at login + restarts on crash. Mesh persists.
 
 ### Cross-account (Toby has a different gh org)
 
-**You** — `airc rooms` shows the gist id of `#general`. Hand it to Toby:
+**You** — `airc list` shows the gist id of `#general`. Hand it to Toby:
 ```
 2f6a907224f4b88d236fda8ca16d37c4
 mnemonic: oregon-uncle-bravo-eleven
@@ -120,7 +120,7 @@ mnemonic: oregon-uncle-bravo-eleven
 **Toby:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
-airc connect 2f6a907224f4b88d236fda8ca16d37c4
+airc join 2f6a907224f4b88d236fda8ca16d37c4
 ```
 
 Done. The mnemonic is the verification phrase ("did you get the right one?"); the id is what airc actually uses.
@@ -128,7 +128,7 @@ Done. The mnemonic is the verification phrase ("did you get the right one?"); th
 ### Legacy 1:1 invite (if you want the old behavior — one-shot pairing, no persistent room)
 
 ```bash
-airc connect --no-general
+airc join --no-general
 ```
 
 Prints a long inline join string of the form `name@user@host:port#base64-pubkey`. Paste to the other machine. Same handshake as before.
@@ -140,7 +140,7 @@ Prints a long inline join string of the form `name@user@host:port#base64-pubkey`
 /connect
 ```
 
-That's the whole interaction. The skill detects whether to host or join via gh discovery, wraps `airc connect` in a Monitor so inbound streams as notifications, and tells you the room id you're in.
+That's the whole interaction. The skill detects whether to host or join via gh discovery, wraps `airc join` in a Monitor so inbound streams as notifications, and tells you the room id you're in.
 
 **Cross-account (rare):**
 ```
@@ -151,11 +151,11 @@ Skills install, pair, and stream inbound as notifications. No Monitor incantatio
 
 ## Talking in the Mesh
 
-Default `airc send` is a broadcast — the whole room sees it. Prefix a target with `@` for a DM label:
+Default `airc msg` is a broadcast — the whole room sees it. Prefix a target with `@` for a DM label:
 
 ```bash
-airc send "hello everyone"         # broadcast to all peers
-airc send @alice "hey alice"       # addressed; still lands in shared log
+airc msg "hello everyone"         # broadcast to all peers
+airc msg @alice "hey alice"       # addressed; still lands in shared log
 ```
 
 `@peer` is a readability hint; the underlying delivery is the same shared host log every joiner tails, so DMs and broadcasts are equally visible (named-room fan-out with privacy routing is roadmap).
@@ -165,24 +165,24 @@ airc send @alice "hey alice"       # addressed; still lands in shared log
 Close a Claude Code tab, reopen it in the same project dir:
 
 ```bash
-airc connect        # no args; auto-resumes prior pairing, restarts the monitor
+airc join        # no args; auto-resumes prior pairing, restarts the monitor
 ```
 
 State (identity keys, peer records, message log) persists in `$PWD/.airc/`. The tab-close SIGTERM reaps the python listener + ssh tail cleanly, so no zombies hold the port. Three exit points:
 
-- **`airc teardown`** — pause. Kills the running airc process, preserves all state. Next `airc connect` auto-resumes.
-- **`airc disconnect`** — leave the mesh. Kills the process, clears only the host-pairing fields from config.json. Identity, peers, messages kept. Next `airc connect` starts fresh (host mode).
-- **`airc teardown --flush`** — nuclear. Wipes everything. Next `airc connect` is a from-zero pair.
+- **`airc teardown`** — pause. Kills the running airc process, preserves all state. Next `airc join` auto-resumes.
+- **`airc quit`** — leave the mesh. Kills the process, clears only the host-pairing fields from config.json. Identity, peers, messages kept. Next `airc join` starts fresh (host mode).
+- **`airc teardown --flush`** — nuclear. Wipes everything. Next `airc join` is a from-zero pair.
 
 ## Sharing an Invite
 
 Easiest — list rooms on your gh account, hand someone the gist id:
 
 ```bash
-airc rooms
+airc list
 ```
 
-Each row shows: gist id, kind (`#` = persistent room, `(1:1)` = ephemeral invite), description, 4-word humanhash mnemonic, updated time. The gist id is what `airc connect <id>` resolves; the mnemonic is the verification phrase you can read aloud.
+Each row shows: gist id, kind (`#` = persistent room, `(1:1)` = ephemeral invite), description, 4-word humanhash mnemonic, updated time. The gist id is what `airc join <id>` resolves; the mnemonic is the verification phrase you can read aloud.
 
 For 1:1 invites the long inline `name@user@host[:port]#pubkey` string still works — `airc invite` prints it. Paste-friendly format, but the gist id is shorter and survives chat clients that mangle 200-char base64.
 
@@ -201,32 +201,32 @@ airc version    # short sha, branch, commit subject, install dir
 airc update     # git-pull install dir + refresh skill symlinks (idempotent)
 ```
 
-`airc update` invokes the bundled `install.sh` so new skills appear in `~/.claude/skills/` without a full re-curl. Running monitor keeps old code until you `airc teardown && airc connect` to bounce it.
+`airc update` invokes the bundled `install.sh` so new skills appear in `~/.claude/skills/` without a full re-curl. Running monitor keeps old code until you `airc teardown && airc join` to bounce it.
 
 ## Core Commands
 
 ```bash
 # Substrate
-airc connect                      # auto-#general (or resume prior pairing)
-airc connect --room <name>        # join (or host) a non-general room
-airc connect --no-general         # legacy 1:1 invite mode (no persistent room)
-airc connect <gist-id>            # join via shared gist (cross-account)
-airc connect <name@user@host>     # legacy inline invite string
+airc join                      # auto-#general (or resume prior pairing)
+airc join --room <name>        # join (or host) a non-general room
+airc join --no-general         # legacy 1:1 invite mode (no persistent room)
+airc join <gist-id>            # join via shared gist (cross-account)
+airc join <name@user@host>     # legacy inline invite string
 
-airc rooms                        # list open rooms + invites on your gh
+airc list                        # list open rooms + invites on your gh
 airc list / airc ls               # aliases for rooms
 airc part                         # leave current room (host: deletes gist)
 
 # Messaging
-airc send "<message>"             # broadcast to current room
-airc send @<peer> "<message>"     # DM label (still visible to all)
+airc msg "<message>"             # broadcast to current room
+airc msg @<peer> "<message>"     # DM label (still visible to all)
 airc send-file <peer> <path>      # send a file (scp with airc identity)
-airc rename <new-name>            # rename your identity; paired peers auto-update
+airc nick <new-name>            # rename your identity; paired peers auto-update
 airc peers                        # list paired peers
 airc logs [N]                     # last N messages
 
 # Lifecycle
-airc disconnect                   # leave mesh, keep identity
+airc quit                   # leave mesh, keep identity
 airc teardown [--flush] [--all]   # kill processes (--flush wipes state)
 airc daemon install               # autostart via launchd (mac) / systemd-user (linux)
 airc daemon status / log / uninstall
@@ -270,13 +270,13 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 
 ## Identity & State
 
-**Your identity is tied to where you are.** Run `airc` from any directory — state lives at `$PWD/.airc/`, auto-created on first `airc connect`. Different cwd = different scope = different peer. Multi-tab on one machine? Open each tab in its own dir (or repo); they're distinct automatically.
+**Your identity is tied to where you are.** Run `airc` from any directory — state lives at `$PWD/.airc/`, auto-created on first `airc join`. Different cwd = different scope = different peer. Multi-tab on one machine? Open each tab in its own dir (or repo); they're distinct automatically.
 
 Identity name auto-derives: `<basename>-<4-char-hash>`. Basename is the git-repo-root name if you're in a repo (so nested subdirs don't fragment the display name), else the cwd basename. The 4-char hash disambiguates — two "src" dirs in different projects never collide.
 
 Example: `/Users/joel/Development/cambrian/airc` → `airc-96dd`.
 
-Rename any time: `airc rename <new>` — paired peers auto-update via the `[rename]` broadcast. Chain-repair is baked in: the rename marker carries a stable `host=` field so receivers rename their record for you even if a prior marker was missed.
+Rename any time: `airc nick <new>` — paired peers auto-update via the `[rename]` broadcast. Chain-repair is baked in: the rename marker carries a stable `host=` field so receivers rename their record for you even if a prior marker was missed.
 
 Power-user escape hatches (normal users ignore these entirely):
 - `AIRC_HOME=/some/path` — force a specific scope (tests and edge cases only)
@@ -285,8 +285,8 @@ Power-user escape hatches (normal users ignore these entirely):
 
 ## How Pairing Works
 
-1. Host runs `airc connect`, generates an Ed25519 SSH keypair, listens on TCP port 7547 (auto-walks up if taken).
-2. Joiner runs `airc connect <join>`, sends their SSH public key via TCP.
+1. Host runs `airc join`, generates an Ed25519 SSH keypair, listens on TCP port 7547 (auto-walks up if taken).
+2. Joiner runs `airc join <join>`, sends their SSH public key via TCP.
 3. Both sides authorize each other's public keys into `~/.ssh/authorized_keys`; joiner clears any stale sshd host-key entry for the address (`ssh-keygen -R`) so a re-pair after the host re-keyed works without manual intervention.
 4. Pair-handshake config also captures host name, port, and ssh_pub — that lets `airc invite` reconstruct the join string without another round-trip.
 5. Subsequent messages deliver via SSH — signed with Ed25519, timestamped, appended to the host's shared message log.
@@ -296,11 +296,11 @@ Only the host needs SSH (Remote Login) enabled. Joiners just SSH out.
 
 ## Scope Isolation Guarantee
 
-Multiple Claude tabs on one machine can each run `airc connect` in different directories (or with explicit `AIRC_HOME`) with no cross-interference. `airc teardown` reads the scope's own `airc.pid` file and kills ONLY those processes + their direct descendants; other tabs' hosts are untouched. `airc connect` in a scope that still has a live process from a prior session auto-tears-down the stale one first, so running it twice is idempotent instead of colliding. Validated by the `teardown` scenario in `airc doctor`.
+Multiple Claude tabs on one machine can each run `airc join` in different directories (or with explicit `AIRC_HOME`) with no cross-interference. `airc teardown` reads the scope's own `airc.pid` file and kills ONLY those processes + their direct descendants; other tabs' hosts are untouched. `airc join` in a scope that still has a live process from a prior session auto-tears-down the stale one first, so running it twice is idempotent instead of colliding. Validated by the `teardown` scenario in `airc doctor`.
 
 ## Zero Silent Loss
 
-`airc send` writes the outbound to your local messages.jsonl BEFORE attempting the wire. If the wire fails (unreachable host, SSH auth race, transient network), a `{"from":"airc","msg":"[SEND FAILED to <peer>] <scp stderr>"}` marker is appended next to the mirrored outbound. Your `airc logs` always shows what you tried to send and why delivery failed — no "I sent it but it never arrived" black holes.
+`airc msg` writes the outbound to your local messages.jsonl BEFORE attempting the wire. If the wire fails (unreachable host, SSH auth race, transient network), a `{"from":"airc","msg":"[SEND FAILED to <peer>] <scp stderr>"}` marker is appended next to the mirrored outbound. Your `airc logs` always shows what you tried to send and why delivery failed — no "I sent it but it never arrived" black holes.
 
 Joiners also mirror inbound events into their local messages.jsonl so `airc logs` works identically whether you're host or joiner, and so any tail tool tracking the local file sees the whole stream.
 
@@ -337,10 +337,10 @@ Shell: bash, zsh, or dash. Tested on macOS, Linux, and WSL2. Native Windows Powe
 ## Roadmap
 
 **Already shipped** (was on this list, now done):
-- ✅ Rooms / channels — `airc connect --room <name>`, persistent gist per room, `airc rooms` to list, `airc part` to leave
+- ✅ Rooms / channels — `airc join --room <name>`, persistent gist per room, `airc list` to list, `airc part` to leave
 - ✅ Cross-host federation — gh gist namespace IS the federation layer; same gh account = automatic mesh, cross-account = paste gist id
 - ✅ Resilient mesh — daemon (launchd/systemd) + monitor self-heal: laptop sleeps, daemon respawns, first-agent-back becomes new host
-- ✅ Auto-#general — open a tab, run `airc connect`, you're in. Zero strings.
+- ✅ Auto-#general — open a tab, run `airc join`, you're in. Zero strings.
 
 **Future**:
 - **Multi-room (in #general AND #project-x simultaneously)** — currently single-active-room per scope; need per-room monitor + send routing

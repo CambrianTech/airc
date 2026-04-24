@@ -38,7 +38,7 @@ lsof -iTCP:7549 -sTCP:LISTEN 2>/dev/null | head -3 || echo "7549: free"
 - **`sshd: NOT running`** (macOS) → `sudo systemsetup -setremotelogin on` (the user has to run this; needs sudo). Or System Settings → General → Sharing → Remote Login.
 - **`7549: <pid>`** → port held by something else; `lsof -tiTCP:7549 -sTCP:LISTEN | xargs kill` if the process is one you can identify and kill safely. Otherwise tell the user.
 
-Why this comes BEFORE the tests: the integration suite is `gh`-free by design (uses inline invites + local SSH), so missing gh wouldn't fail the tests — but the user will still be unable to use the substrate (`airc connect` zero-arg auto-discovery, `airc rooms`). Doctor should catch and fix that.
+Why this comes BEFORE the tests: the integration suite is `gh`-free by design (uses inline invites + local SSH), so missing gh wouldn't fail the tests — but the user will still be unable to use the substrate (`airc join` zero-arg auto-discovery, `airc list`). Doctor should catch and fix that.
 
 ## Step 2 — run the integration suite
 
@@ -54,7 +54,7 @@ Final line: `N passed, M failed`.
 
 ### Green (`0 failed`)
 
-- Environment OK + tests OK → tell the user "airc is healthy. Run `airc connect` to join the substrate."
+- Environment OK + tests OK → tell the user "airc is healthy. Run `airc join` to join the substrate."
 - Make sure to mention what you fixed (if anything) in step 1.
 
 ### Red
@@ -91,6 +91,6 @@ One line: "Fixed X, Y. All tests green." OR "Fixed X. Tests N passed M failed; f
 
 ## Notes
 
-- Scenarios are gh-free; the substrate ITSELF (`airc connect` zero-arg, `airc rooms`) requires gh. That's a feature, not a bug — gh is the comm layer.
+- Scenarios are gh-free; the substrate ITSELF (`airc join` zero-arg, `airc list`) requires gh. That's a feature, not a bug — gh is the comm layer.
 - Suite runtime is ~2 minutes for `all`; individual scenarios are 10-30s.
 - This skill assumes you can run shell commands. The user should not have to type anything except the interactive `gh auth login` flow if you encounter it.

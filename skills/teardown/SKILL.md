@@ -12,17 +12,17 @@ Run this yourself — don't ask the user. It's idempotent and scope-safe.
 
 ## When to use
 
-- A previous `airc connect` left a zombie holding this scope's port
+- A previous `airc join` left a zombie holding this scope's port
 - You're switching projects and want a clean slate
 - "Pair refused" / "Failed to deliver" errors that don't make sense — nuke and re-pair
-- Before `airc connect` with a new identity, to avoid pairing with your own stale listener
+- Before `airc join` with a new identity, to avoid pairing with your own stale listener
 
 ## `--flush` vs plain teardown — when to use which
 
 **Plain `airc teardown`**: kills processes, keeps state. Use when you know the pairing is still valid and you just want to stop/restart the monitor (e.g. to pick up a new airc binary).
 
 **`airc teardown --flush`**: kills processes AND wipes identity, peer records, saved pairing, messages. Use in ANY of these cases:
-- `airc connect` (resume) died with "Resume aborted — re-pair required" (stale SSH key)
+- `airc join` (resume) died with "Resume aborted — re-pair required" (stale SSH key)
 - `airc send` died with auth error pointing at "re-pair required"
 - You just reinstalled airc and your identity keys may no longer be authorized on the host
 - You're not sure what's broken but you definitely can't reach your peers anymore
@@ -36,15 +36,15 @@ Run this yourself — don't ask the user. It's idempotent and scope-safe.
 airc teardown
 ```
 
-**Scope-aware.** Reads `$AIRC_WRITE_DIR/airc.pid` (written by `airc connect` at startup), kills ONLY those PIDs plus their direct descendants (python listeners). Then checks the scope's port and reaps any now-orphaned listener parented to init. Will NOT touch other tabs' sessions running under different `AIRC_HOME` values.
+**Scope-aware.** Reads `$AIRC_WRITE_DIR/airc.pid` (written by `airc join` at startup), kills ONLY those PIDs plus their direct descendants (python listeners). Then checks the scope's port and reaps any now-orphaned listener parented to init. Will NOT touch other tabs' sessions running under different `AIRC_HOME` values.
 
-State is preserved: identity keys, peer records, message log all stay on disk. Next `airc connect` resumes.
+State is preserved: identity keys, peer records, message log all stay on disk. Next `airc join` resumes.
 
 ```bash
 airc teardown --flush
 ```
 
-Additionally wipes `$AIRC_WRITE_DIR` (identity, peers, messages, config — everything). Nuclear option. Next `airc connect` generates a fresh identity and pairs from scratch.
+Additionally wipes `$AIRC_WRITE_DIR` (identity, peers, messages, config — everything). Nuclear option. Next `airc join` generates a fresh identity and pairs from scratch.
 
 ## Read the result
 
@@ -53,7 +53,7 @@ Additionally wipes `$AIRC_WRITE_DIR` (identity, peers, messages, config — ever
 
 ## Scope-awareness guarantee
 
-If another Claude tab is running `airc connect` in a different `AIRC_HOME` (even on a different port), this command will NOT touch it. The guarantee is tested by `airc doctor` — the `teardown` scenario spawns two hosts in different scopes and asserts a teardown from scope A doesn't kill scope B.
+If another Claude tab is running `airc join` in a different `AIRC_HOME` (even on a different port), this command will NOT touch it. The guarantee is tested by `airc doctor` — the `teardown` scenario spawns two hosts in different scopes and asserts a teardown from scope A doesn't kill scope B.
 
 ## Aliases
 

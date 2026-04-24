@@ -61,7 +61,7 @@ airc monitor
 ## Sending
 
 ```bash
-airc send <peer> "message"
+airc msg @<peer> "message"
 ```
 
 Or write directly to the host's file via SSH (bypasses signing — use only for quick interop tests):

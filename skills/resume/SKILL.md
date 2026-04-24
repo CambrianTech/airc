@@ -1,6 +1,6 @@
 ---
 name: airc:resume
-description: Resume a prior airc session in this scope. Alias for `airc connect` with no args — picks up the saved pairing and restarts the monitor without re-pasting the join string.
+description: Resume a prior airc session in this scope. Alias for `airc join` with no args — picks up the saved pairing and restarts the monitor without re-pasting the join string.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -16,7 +16,7 @@ Run this yourself — don't ask the user.
 Monitor(persistent=true, command="airc connect")
 ```
 
-Wrap with the Monitor tool so inbound streams as Claude Code notifications. `airc connect` with no args detects the stored pairing in this scope's config.json and restarts the monitor — no fresh handshake, no join string, no env vars.
+Wrap with the Monitor tool so inbound streams as Claude Code notifications. `airc join` with no args detects the stored pairing in this scope's config.json and restarts the monitor — no fresh handshake, no join string, no env vars.
 
 ## When to use
 
@@ -32,5 +32,5 @@ Wrap with the Monitor tool so inbound streams as Claude Code notifications. `air
 
 ## Notes
 
-- `airc connect` (no args) and `airc resume` are the same command — `resume` is just a mnemonic alias.
-- Skills `/connect` and `/resume` both resolve to the same `airc connect` invocation; which one to use is a matter of user-facing intent ("I'm starting" vs "I'm coming back").
+- `airc join` (no args) and `airc resume` are the same command — `resume` is just a mnemonic alias.
+- Skills `/connect` and `/resume` both resolve to the same `airc join` invocation; which one to use is a matter of user-facing intent ("I'm starting" vs "I'm coming back").

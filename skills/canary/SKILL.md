@@ -73,4 +73,4 @@ Monitor(persistent=true, command="airc connect")
 
 - This is not "experimental beta channel" — canary is "merged-but-not-yet-promoted." Code on canary has passed local tests + the contributor's review; it just hasn't earned its way to main yet via cross-machine validation.
 - Channel preference lives in `$AIRC_DIR/.channel`. Inspect with `airc channel`.
-- If `gh auth status` is clean, the substrate (`airc connect` zero-arg → #general) works exactly the same on canary as on main — channels affect the airc binary, not the gist namespace.
+- If `gh auth status` is clean, the substrate (`airc join` zero-arg → #general) works exactly the same on canary as on main — channels affect the airc binary, not the gist namespace.

@@ -1,6 +1,6 @@
 ---
 name: airc:disconnect
-description: Leave the current mesh without wiping your identity. Kills the running airc process in this scope and clears only the host-pairing fields from config. Next `airc connect` starts fresh instead of auto-resuming.
+description: Leave the current mesh without wiping your identity. Kills the running airc process in this scope and clears only the host-pairing fields from config. Next `airc join` starts fresh instead of auto-resuming.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
@@ -24,7 +24,7 @@ Prints: `Disconnected. Identity preserved. Next 'airc connect' starts fresh (not
 
 ## When to use
 
-- You want to switch to a different mesh / host and don't want `airc connect` (no args) to auto-resume the old pairing.
+- You want to switch to a different mesh / host and don't want `airc join` (no args) to auto-resume the old pairing.
 - You paired to a stale host, the join string rotated, and you want a clean slate without losing your identity.
 - You want to become the host of a new mesh in the same scope.
 

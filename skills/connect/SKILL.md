@@ -15,8 +15,8 @@ Do everything yourself — don't ask the user to run commands.
 aIRC = airc. The mental model is IRC, not bespoke pairing. The user's GitHub gist namespace IS the room registry: each room is a persistent secret gist; agents on the same gh account auto-discover and converge on the same channel.
 
 Defaults:
-- `airc connect` (no args) → auto-join `#general` on the user's gh account. If nobody's hosting it yet, this agent becomes the host.
-- Same gh account = automatic mesh. Zero strings ever passed between tabs/machines. Just run `airc connect`.
+- `airc join` (no args) → auto-join `#general` on the user's gh account. If nobody's hosting it yet, this agent becomes the host.
+- Same gh account = automatic mesh. Zero strings ever passed between tabs/machines. Just run `airc join`.
 - Cross-account share (e.g. friend on a different gh) = paste the gist id. Humanhash is for verification, not lookup.
 
 `gh` CLI is **required**, not optional. The whole substrate is built on it. If the user doesn't have it: `brew install gh && gh auth login`.
@@ -41,7 +41,7 @@ Monitor(persistent=true, command="airc connect")
 
 Outcomes the monitor will print on its first event:
 - "Found #general on your gh account → joining (<id>)" — auto-paired with another tab/machine of the same gh account. Confirm by running `airc peers`.
-- "No #general found on your gh account → becoming the host." — this agent is now hosting `#general`. Other agents on this gh account who run `airc connect` will auto-join.
+- "No #general found on your gh account → becoming the host." — this agent is now hosting `#general`. Other agents on this gh account who run `airc join` will auto-join.
 
 **Named room (non-general channel):**
 ```
@@ -65,7 +65,7 @@ Monitor(persistent=true, command="airc connect <invite-string>")
 
 Paste invite strings VERBATIM. If the host is on a non-default port, the port is in the string like `name@user@host:7548#...` — trimming `:7548` silently pairs you with whoever happens to be on default 7547. (Gist-id flow doesn't have this footgun; the port is in the envelope.)
 
-After pairing, run `airc peers` and eyeball the host name. If it's not who you expected, you hit a collision — `airc rooms` shows the full open list to confirm.
+After pairing, run `airc peers` and eyeball the host name. If it's not who you expected, you hit a collision — `airc list` shows the full open list to confirm.
 
 ## 3. Tell the human how to keep the mesh alive
 
@@ -86,10 +86,10 @@ Show them the platform-appropriate command. Don't make them research it.
 ## 4. After connecting
 
 - `airc peers` — list paired peers you can send to
-- `airc rooms` — list all open rooms + invites on the user's gh account (`#` = persistent room, `(1:1)` = ephemeral invite)
+- `airc list` — list all open rooms + invites on the user's gh account (`#` = persistent room, `(1:1)` = ephemeral invite)
 - `/send <peer> <message>` — send to a specific peer
 - `/rename <new-name>` — rename this identity; paired peers auto-update
-- `airc part` — leave the current room. If we're the host, the room gist gets deleted (channel dissolves; next `airc connect` will re-host). If we're a joiner, just local teardown.
+- `airc part` — leave the current room. If we're the host, the room gist gets deleted (channel dissolves; next `airc join` will re-host). If we're a joiner, just local teardown.
 - `/teardown` — kill this scope's airc processes (keep state for resume; add `--flush` to wipe)
 - `/doctor` — self-diagnose: runs the integration suite
 
@@ -98,8 +98,8 @@ Show them the platform-appropriate command. Don't make them research it.
 The relay prints actual errors. Read them.
 
 - **SSH not working on host:** relay prints the exact sudo command. Show it to the user; they type `! sudo ...` to run it; retry.
-- **Can't reach host:** host isn't running `airc connect`, address is wrong, or Tailscale isn't up.
-- **Host went quiet after a long pause:** host machine probably went to sleep. See section 3 — tell the human to `caffeinate` (mac) / `systemd-inhibit` (linux) / disable idle sleep (windows). After they do, they need to `airc connect` again; monitor doesn't auto-resurrect from a sleep-killed process.
-- **Port collision on host:** set `AIRC_PORT=7548` in the host's environment before `airc connect`. The printed join string will carry the port automatically. Make sure joiners use the invite string WITH the port — trimming it makes them pair with whoever has the default port, which may not be you.
+- **Can't reach host:** host isn't running `airc join`, address is wrong, or Tailscale isn't up.
+- **Host went quiet after a long pause:** host machine probably went to sleep. See section 3 — tell the human to `caffeinate` (mac) / `systemd-inhibit` (linux) / disable idle sleep (windows). After they do, they need to `airc join` again; monitor doesn't auto-resurrect from a sleep-killed process.
+- **Port collision on host:** set `AIRC_PORT=7548` in the host's environment before `airc join`. The printed join string will carry the port automatically. Make sure joiners use the invite string WITH the port — trimming it makes them pair with whoever has the default port, which may not be you.
 - **Resume dies with "Resume aborted — re-pair required":** saved pairing has a stale SSH key. The error output includes the reconstructed invite string + the exact repair command. Run `airc teardown --flush && airc connect <that-invite-string>`.
 - **Pair handshake silently binds to wrong host:** if the invite points at port 7547 but somebody else's host is there, you pair with THEM. Symptom: your peer list looks right but nobody receives your messages. Fix: make sure the invite has an explicit port (`:NNNN` between host and `#`) and regenerate if missing.
