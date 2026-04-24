@@ -2210,6 +2210,12 @@ try {
         default { Die "Unknown command: $cmd. Try: airc help" }
     }
 } catch {
-    Write-Error $_
+    # Surface the real error -- `Write-Error $_` confuses the parser with
+    # ambiguous parameter binding when $_ is an ErrorRecord (its
+    # properties collide with -OutVariable / -OutBuffer). Use the host's
+    # error stream directly with the rendered message + script location.
+    $errMsg = "{0}`n  at {1}:{2}" -f $_.Exception.Message,
+        $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber
+    [Console]::Error.WriteLine($errMsg)
     exit 1
 }
