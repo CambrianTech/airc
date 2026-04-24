@@ -926,12 +926,17 @@ cmd_connect() {
             else
               echo "  (no #${saved_room} gist on this gh — host was likely cross-account or already cleaned)"
             fi
+            # Preserve identity name across re-exec — without this the
+            # name re-derives from cwd and can drift if the path resolves
+            # with different case (macOS HFS+/APFS case-insensitive but
+            # case-preserving), causing peers to see us as a "new" peer.
+            local _preserved_name; _preserved_name=$(get_config_val name "")
             # Wipe joiner state so re-exec falls into host mode cleanly.
             rm -f "$CONFIG"
             rm -f "$AIRC_WRITE_DIR/room_name"
             echo "  Re-execing into host mode for #${saved_room}..."
             echo ""
-            exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$saved_room"
+            exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$saved_room"
           fi
           # No saved room (legacy 1:1 invite scope) OR no gh: fall through to
           # the existing retry-in-monitor behavior. Monitor's retry loop
@@ -1320,6 +1325,10 @@ print(data.decode().strip())
           echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
           echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
         fi
+        # Preserve identity name across re-exec (same reason as the resume
+        # path's self-heal — without this, derive_name re-runs from cwd
+        # and can drift on case-aliasing, peers see a "new" peer).
+        local _preserved_name; _preserved_name=$(get_config_val name "")
         # Wipe the CONFIG we just wrote — it points at the dead host and
         # would trigger 'resume joiner' on next airc connect, looping back
         # into this same failure.
@@ -1330,7 +1339,7 @@ print(data.decode().strip())
         # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
         # ensures the new instance doesn't try to re-discover the just-deleted gist
         # (gh's gist-list cache might still show it for a few seconds).
-        exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$resolved_room_name"
+        exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
