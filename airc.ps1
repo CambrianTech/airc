@@ -821,7 +821,13 @@ function Start-AircMonitor {
                 '-o', 'ServerAliveCountMax=3',
                 $hostTarget, $remoteCmd
             )
-            & ssh @tailArgs 2>$null `
+            # Capture ssh stderr to a per-scope log so we can diagnose
+            # silent failures of the long-running tail. Without this,
+            # `2>$null` swallowed every error and the formatter just
+            # never received input -- looks identical to a healthy idle
+            # channel for 150s, then watchdog fires and we loop.
+            $sshErr = Join-Path $AIRC_WRITE_DIR 'monitor_ssh.log'
+            & ssh @tailArgs 2>$sshErr `
               | & $script:PythonResolved.Bin @($script:PythonResolved.Args + @('-u', '-c', $script:MonitorFormatterPython))
             $fmtExit = $LASTEXITCODE
             $cycleLifetime = ((Get-Date) - $cycleStart).TotalSeconds
