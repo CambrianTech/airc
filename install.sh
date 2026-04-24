@@ -20,7 +20,67 @@ ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 
 if [ -d "$CLONE_DIR/.git" ]; then
   info "Updating existing install"
-  git -C "$CLONE_DIR" pull --ff-only --quiet
+  # Recovery: if the install dir is on a non-channel branch (e.g. someone
+  # / some AI checked out a feature branch for testing and forgot to
+  # switch back), the ff-pull below fails with cryptic "Not possible to
+  # fast-forward". Worse, the user can't escape via `airc canary` if
+  # they're on a pre-channels binary — `canary` is an unknown command
+  # there. So install.sh itself takes responsibility: detect non-channel
+  # branches + auto-switch to the saved channel (or main) before pulling.
+  CURRENT_BRANCH=$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  SAVED_CHANNEL=""
+  [ -f "$CLONE_DIR/.channel" ] && SAVED_CHANNEL=$(tr -d '[:space:]' < "$CLONE_DIR/.channel")
+  TARGET_BRANCH="${SAVED_CHANNEL:-main}"
+  case "$CURRENT_BRANCH" in
+    main|canary)
+      # On a known channel — leave it alone unless the saved channel
+      # disagrees (e.g. user just `airc channel canary`'d but didn't
+      # update yet).
+      if [ -n "$SAVED_CHANNEL" ] && [ "$SAVED_CHANNEL" != "$CURRENT_BRANCH" ]; then
+        info "Saved channel '$SAVED_CHANNEL' differs from current branch '$CURRENT_BRANCH' — switching"
+        git -C "$CLONE_DIR" fetch --quiet origin "$SAVED_CHANNEL"
+        git -C "$CLONE_DIR" checkout -q "$SAVED_CHANNEL" \
+          || git -C "$CLONE_DIR" checkout -q -B "$SAVED_CHANNEL" "origin/$SAVED_CHANNEL"
+      fi
+      ;;
+    *)
+      info "Install dir on '$CURRENT_BRANCH' (not a known channel) — switching to '$TARGET_BRANCH'"
+      git -C "$CLONE_DIR" fetch --quiet origin "$TARGET_BRANCH" || {
+        echo "ERROR: Couldn't fetch origin/$TARGET_BRANCH. Network? gh auth?" >&2
+        exit 1
+      }
+      git -C "$CLONE_DIR" checkout -q "$TARGET_BRANCH" \
+        || git -C "$CLONE_DIR" checkout -q -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH" \
+        || {
+          cat >&2 <<EOF
+ERROR: Couldn't switch $CLONE_DIR to '$TARGET_BRANCH'.
+Recover manually:
+  cd $CLONE_DIR
+  git fetch origin
+  git status               # see why checkout was blocked
+  git stash                # if you have local edits worth keeping
+  git checkout $TARGET_BRANCH
+  git pull --ff-only
+  bash install.sh
+EOF
+          exit 1
+        }
+      ;;
+  esac
+  if ! git -C "$CLONE_DIR" pull --ff-only --quiet 2>&1; then
+    cat >&2 <<EOF
+ERROR: Couldn't fast-forward $CLONE_DIR (currently on $(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)).
+Likely cause: local edits or a divergent history.
+Recover with:
+  cd $CLONE_DIR
+  git status
+  git stash               # if you have local edits worth keeping
+  git fetch origin
+  git reset --hard origin/$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  bash install.sh
+EOF
+    exit 1
+  fi
 else
   info "Installing AIRC"
   git clone --quiet "$REPO_URL" "$CLONE_DIR"
