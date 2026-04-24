@@ -789,27 +789,40 @@ for line in sys.stdin:
         # cmd_ping picks PONG up by tailing messages.jsonl directly.
         # Suppress to keep the chat surface clean.
         continue
-    # Compact one-liner per event. Every line starts with `airc:` so
-    # the source is unambiguous when other Monitor tasks (continuum,
-    # tests, etc.) are also firing notifications. Long messages
-    # truncate to PREVIEW_LEN; full content stays in messages.jsonl
-    # for `airc logs` audit.
-    PREVIEW_LEN = 100
-    msg_preview = msg.replace("\\n", " ").strip()
-    if len(msg_preview) > PREVIEW_LEN:
-        msg_preview = msg_preview[:PREVIEW_LEN] + "…"
-    if fr in ("airc", "sys"):
-        # System events (joins, parts, drain, auth, watchdog).
-        # Example:  airc: [#general] alice joined
-        print(f"airc: [#{room_name}] {msg_preview}", flush=True)
-    elif to and to not in ("all", ""):
-        # DM with addressed recipient.
-        # Example:  airc: [#general] bigmama → alice: quick question
-        print(f"airc: [#{room_name}] {fr} → {to}: {msg_preview}", flush=True)
-    else:
-        # Broadcast.
-        # Example:  airc: [#general] bigmama: hello everyone
-        print(f"airc: [#{room_name}] {fr}: {msg_preview}", flush=True)
+    # One-liner per event. Every line starts with `airc:` so the source
+    # is unambiguous when other Monitor tasks (continuum, tests, etc.)
+    # are also firing notifications.
+    #
+    # No length cap any more -- consumers (Claude Code Monitor, Codex,
+    # log tailers, etc.) decide their own display truncation. Truncating
+    # in the substrate forced everyone downstream to fall back to
+    # `airc logs` to see anything past the cap, which is exactly the
+    # polling-vs-substrate anti-pattern Joel called out 2026-04-24.
+    # Newlines collapsed to spaces so each emitted event is still a
+    # single line, but the full body always reaches the consumer.
+    msg_one_line = (msg or "").replace("\\n", " ").replace("\\r", " ").strip()
+    try:
+        if fr in ("airc", "sys"):
+            # System events (joins, parts, drain, auth, watchdog).
+            # Example:  airc: [#general] alice joined
+            print(f"airc: [#{room_name}] {msg_one_line}", flush=True)
+        elif to and to not in ("all", ""):
+            # DM with addressed recipient.
+            # Example:  airc: [#general] bigmama → alice: quick question
+            print(f"airc: [#{room_name}] {fr} → {to}: {msg_one_line}", flush=True)
+        else:
+            # Broadcast.
+            # Example:  airc: [#general] bigmama: hello everyone
+            print(f"airc: [#{room_name}] {fr}: {msg_one_line}", flush=True)
+    except Exception as e:
+        # Belt-and-suspenders -- one bad message must never take the
+        # whole monitor down. Surface to stderr (which the bash retry
+        # loop captures) and keep going.
+        try:
+            sys.stderr.write(f"[airc:formatter] skipped one line: {e}\\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 '
 }
 
