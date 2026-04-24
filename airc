@@ -2326,6 +2326,269 @@ else:
   fi
 }
 
+# ── cmd_daemon: install / manage the OS auto-restart for `airc connect` ────
+# Issue followup to #39 substrate: the channel must auto-resume across machine
+# sleep/wake/crash so users walk away and come back to a live mesh. Without
+# this, every laptop sleep kills airc + the user must remember to restart it.
+#
+# Implementation: install a platform-native autostart that wraps `airc connect`
+# with KeepAlive/Restart=always. AIRC_BACKGROUND_OK=1 is set in the env so
+# airc's heartbeat-stdout-pipe-trap doesn't exit-3 under launchd/systemd
+# (which have no notification-consumer reading stdout).
+#
+# Subcommands:
+#   airc daemon install    Install + start the autostart entry
+#   airc daemon uninstall  Stop + remove the autostart entry
+#   airc daemon status     Show install state + running pid + log path
+#   airc daemon log [N]    Tail the daemon stdout log
+#
+# Scope: defaults to the GLOBAL scope ($HOME/.airc), since the daemon is the
+# user's "always-on" mesh presence — not tied to a specific project dir. If
+# the user wants a per-project always-on daemon, they pass AIRC_HOME=<dir>
+# in the environment when running install (and the generated unit/plist
+# will carry that scope).
+cmd_daemon() {
+  local action="${1:-status}"
+  shift 2>/dev/null || true
+  case "$action" in
+    install)   cmd_daemon_install "$@" ;;
+    uninstall|remove|stop) cmd_daemon_uninstall "$@" ;;
+    status)    cmd_daemon_status "$@" ;;
+    log|logs)  cmd_daemon_log "$@" ;;
+    *)         die "Usage: airc daemon [install|uninstall|status|log]" ;;
+  esac
+}
+
+# Detect the OS: darwin / linux / wsl / unknown.
+_daemon_os() {
+  case "$(uname -s)" in
+    Darwin) echo "darwin" ;;
+    Linux)
+      # WSL2 detection — systemd may or may not be enabled; we still treat
+      # it as linux (user must have [boot] systemd=true in wsl.conf).
+      if grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
+        echo "wsl"
+      else
+        echo "linux"
+      fi
+      ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Resolve the absolute path to airc binary that should run under the daemon.
+# install.sh symlinks $HOME/.local/bin/airc → $AIRC_DIR/airc; we want the
+# real path so a future `airc update` (which mutates $AIRC_DIR/airc in
+# place) is picked up by launchd/systemd without re-installing the unit.
+_daemon_airc_path() {
+  local airc_link="${HOME}/.local/bin/airc"
+  if [ -L "$airc_link" ] || [ -x "$airc_link" ]; then
+    echo "$airc_link"
+  elif [ -x "${AIRC_DIR:-$HOME/.airc-src}/airc" ]; then
+    echo "${AIRC_DIR:-$HOME/.airc-src}/airc"
+  else
+    echo "/usr/local/bin/airc"  # last-resort guess; install will fail loud if wrong
+  fi
+}
+
+# The scope the daemon will run under. If AIRC_HOME is set at install time,
+# that's recorded in the unit/plist so future starts use the same scope.
+_daemon_scope() {
+  echo "${AIRC_HOME:-$HOME/.airc}"
+}
+
+cmd_daemon_install() {
+  local os; os=$(_daemon_os)
+  local airc_bin; airc_bin=$(_daemon_airc_path)
+  local scope; scope=$(_daemon_scope)
+  mkdir -p "$scope"
+
+  case "$os" in
+    darwin) _daemon_install_launchd "$airc_bin" "$scope" ;;
+    linux|wsl) _daemon_install_systemd "$airc_bin" "$scope" "$os" ;;
+    *) die "Daemon install not supported on $(uname -s). Manual workaround: run 'airc connect' under your platform's preferred autostart mechanism." ;;
+  esac
+}
+
+_daemon_install_launchd() {
+  local airc_bin="$1" scope="$2"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist_path="$plist_dir/com.cambriantech.airc.plist"
+  mkdir -p "$plist_dir"
+  cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cambriantech.airc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${airc_bin}</string>
+        <string>connect</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AIRC_BACKGROUND_OK</key>
+        <string>1</string>
+        <key>AIRC_HOME</key>
+        <string>${scope}</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${HOME}/.local/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${scope}/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>${scope}/daemon.err</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+PLIST
+  echo "  Wrote $plist_path"
+  # Bootout first to reset any prior load (idempotent install).
+  launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 \
+    || die "launchctl bootstrap failed. Plist written but not loaded; check Console.app for errors."
+  launchctl enable "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  echo "  ✓ Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)"
+  echo "  airc will now auto-start at login + restart on crash + survive sleep/wake."
+  echo "  Logs:   $scope/daemon.log"
+  echo "  Status: airc daemon status"
+  echo ""
+  echo "  Note: gh keychain access — if 'airc canary' / gist push fails under"
+  echo "        launchd, the gh keychain may not be unlocked at boot. Workaround:"
+  echo "        run 'gh auth status' once after login to unlock, then airc daemon"
+  echo "        will pick up gh credentials on next restart."
+}
+
+_daemon_install_systemd() {
+  local airc_bin="$1" scope="$2" os="$3"
+  local unit_dir="$HOME/.config/systemd/user"
+  local unit_path="$unit_dir/airc.service"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    if [ "$os" = "wsl" ]; then
+      die "systemctl not found. Enable systemd in WSL: edit /etc/wsl.conf to add [boot]\nsystemd=true, then 'wsl --shutdown' from PowerShell + restart your distro."
+    else
+      die "systemctl not found. Daemon install requires systemd."
+    fi
+  fi
+  mkdir -p "$unit_dir"
+  cat > "$unit_path" <<UNIT
+[Unit]
+Description=airc — agentic IRC chat for AI peers (auto-resume mesh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${airc_bin} connect
+Restart=always
+RestartSec=5
+Environment="AIRC_BACKGROUND_OK=1"
+Environment="AIRC_HOME=${scope}"
+StandardOutput=append:${scope}/daemon.log
+StandardError=append:${scope}/daemon.err
+
+[Install]
+WantedBy=default.target
+UNIT
+  echo "  Wrote $unit_path"
+  systemctl --user daemon-reload || die "systemctl --user daemon-reload failed."
+  systemctl --user enable --now airc.service \
+    || die "systemctl --user enable --now airc.service failed."
+  echo "  ✓ Loaded into systemd-user (airc.service)"
+  echo "  airc will now auto-start at login + restart on crash."
+  echo "  Logs:   $scope/daemon.log  (or: journalctl --user -u airc -f)"
+  echo "  Status: airc daemon status"
+  echo ""
+  echo "  Note: systemd-user units stop at logout unless lingering is enabled."
+  echo "        For 'always on across logout' (typical for an always-up mesh):"
+  echo "          sudo loginctl enable-linger \$USER"
+}
+
+cmd_daemon_uninstall() {
+  local os; os=$(_daemon_os)
+  case "$os" in
+    darwin)
+      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+        && echo "  ✓ Unloaded from launchd" \
+        || echo "  (was not loaded)"
+      [ -f "$plist_path" ] && rm "$plist_path" && echo "  ✓ Removed $plist_path" \
+        || echo "  (no plist on disk)"
+      ;;
+    linux|wsl)
+      systemctl --user disable --now airc.service 2>/dev/null \
+        && echo "  ✓ Stopped + disabled airc.service" \
+        || echo "  (was not enabled)"
+      local unit_path="$HOME/.config/systemd/user/airc.service"
+      [ -f "$unit_path" ] && rm "$unit_path" && systemctl --user daemon-reload && echo "  ✓ Removed $unit_path" \
+        || echo "  (no unit on disk)"
+      ;;
+    *) echo "  Daemon uninstall not supported on $(uname -s)."; return 1 ;;
+  esac
+}
+
+cmd_daemon_status() {
+  local os; os=$(_daemon_os)
+  case "$os" in
+    darwin)
+      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      if [ -f "$plist_path" ]; then
+        echo "  Plist:   $plist_path"
+        # launchctl print returns rich state; grep the key fields.
+        local state; state=$(launchctl print "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+          | grep -E 'state =|pid =|last exit code' | head -3)
+        if [ -n "$state" ]; then
+          echo "  Loaded:  yes"
+          printf '%s\n' "$state" | sed 's/^[[:space:]]*/    /'
+        else
+          echo "  Loaded:  no (plist present but not bootstrapped — try 'airc daemon install' to reload)"
+        fi
+        local scope; scope=$(_daemon_scope)
+        echo "  Logs:    $scope/daemon.log"
+      else
+        echo "  No daemon installed. Run: airc daemon install"
+      fi
+      ;;
+    linux|wsl)
+      local unit_path="$HOME/.config/systemd/user/airc.service"
+      if [ -f "$unit_path" ]; then
+        echo "  Unit:    $unit_path"
+        local active; active=$(systemctl --user is-active airc.service 2>/dev/null)
+        local enabled; enabled=$(systemctl --user is-enabled airc.service 2>/dev/null)
+        echo "  Active:  $active"
+        echo "  Enabled: $enabled"
+        local scope; scope=$(_daemon_scope)
+        echo "  Logs:    $scope/daemon.log  (journalctl --user -u airc -f for live)"
+      else
+        echo "  No daemon installed. Run: airc daemon install"
+      fi
+      ;;
+    *) echo "  Daemon status not supported on $(uname -s)." ;;
+  esac
+}
+
+cmd_daemon_log() {
+  local n="${1:-50}"
+  local scope; scope=$(_daemon_scope)
+  local log="$scope/daemon.log"
+  if [ ! -f "$log" ]; then
+    echo "  No log at $log. Daemon may not have started yet."
+    return 1
+  fi
+  tail -"$n" "$log"
+}
+
 cmd_doctor() {
   # Self-diagnose: run the bundled integration test script.
   # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
@@ -2384,6 +2647,7 @@ case "${1:-help}" in
   logs)      shift; cmd_logs "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor|tests|test) shift; cmd_doctor "$@" ;;
+  daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   disconnect|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
@@ -2403,6 +2667,7 @@ case "${1:-help}" in
     echo "  airc channel [<name>]           Show or set release channel (main = stable, canary = pre-merge testing)"
     echo "  airc canary                     Shortcut: airc update --channel canary"
     echo "  airc tests / doctor [scenario]  Run integration suite (88 assertions across 11 scenarios)"
+    echo "  airc daemon [install|status|uninstall|log]  Auto-resume across sleep/wake/crash via launchd (mac) or systemd (linux)"
     echo "  airc send <peer> <message>      Send a message"
     echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
     echo "  airc rename <new-name>          Rename this session (notifies peers)"
