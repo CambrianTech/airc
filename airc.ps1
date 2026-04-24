@@ -713,6 +713,25 @@ for line in sys.stdin:
             import subprocess, sys
             try:
                 pong_msg = f"[PONG:{ping_id}]"
+                # Pass AIRC_HOME explicitly so the subprocess's scope
+                # detection lands on THIS scope no matter what cwd it
+                # inherits through cmd.exe -> pwsh -> airc.ps1. Without
+                # this, cwd ambiguity (Python -> cmd -> .cmd shim ->
+                # pwsh) can land the spawned `airc send` in a sibling
+                # scope where there's no host_target -- it then writes
+                # only to a local mirror and never reaches the wire.
+                child_env = os.environ.copy()
+                child_env["AIRC_HOME"] = scope_dir
+                # Capture auto-pong stderr to a per-scope log so we can
+                # diagnose silent failures of the subprocess chain
+                # (cmd.exe -> airc.cmd -> pwsh -> airc.ps1 send). Without
+                # this, every link in the chain swallows errors with
+                # nowhere to surface them. Append-mode so consecutive
+                # pings accumulate. Tail with: airc auto-pong-log
+                pong_log = os.path.join(scope_dir, "auto_pong.log")
+                pong_err = open(pong_log, "ab")
+                pong_err.write(f"--- pong attempt for {fr} ping {ping_id} ---\n".encode())
+                pong_err.flush()
                 if sys.platform == "win32":
                     # Windows CreateProcess can't run .cmd files directly
                     # when shell=False -- it only handles real PE binaries.
@@ -721,16 +740,18 @@ for line in sys.stdin:
                     # every argv element (peer name + uuid).
                     subprocess.Popen(
                         ["cmd.exe", "/c", airc_cmd, "send", f"@{fr}", pong_msg],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stdout=pong_err,
+                        stderr=pong_err,
                         shell=False,
+                        env=child_env,
                     )
                 else:
                     subprocess.Popen(
                         [airc_cmd, "send", f"@{fr}", pong_msg],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stdout=pong_err,
+                        stderr=pong_err,
                         shell=False,
+                        env=child_env,
                     )
             except Exception:
                 pass
