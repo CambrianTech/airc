@@ -101,11 +101,7 @@ get_host() {
   # coordination without dragging guests into their tailnet.
   local ts_bin=""
   if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
-    if command -v tailscale >/dev/null 2>&1; then
-      ts_bin="tailscale"
-    elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
-      ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-    fi
+    ts_bin=$(resolve_tailscale_bin || true)
   fi
   if [ -n "$ts_bin" ]; then
     local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
@@ -148,6 +144,41 @@ finally:
   hostname
 }
 
+# Resolve the path to a working tailscale CLI binary across platforms.
+# Returns the path on stdout, or empty if not found. Used by both
+# get_host (Tailscale-IP detection) and advise_tailscale_if_down (down
+# diagnosis). Without this helper, each callsite did `command -v
+# tailscale` only, which silently fails on Windows / Git Bash where
+# the executable is `tailscale.exe` and PATHEXT handling is unreliable —
+# resulting in false "Tailscale appears down" advice when it's actually
+# up. Joel 2026-04-24: "now says your tailscale is down" — that was
+# this bug.
+resolve_tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then
+    echo "tailscale"
+    return 0
+  fi
+  # Windows / Git Bash: command -v doesn't always honor PATHEXT, and
+  # the executable is .exe-suffixed.
+  if command -v tailscale.exe >/dev/null 2>&1; then
+    echo "tailscale.exe"
+    return 0
+  fi
+  # Known-path fallbacks. Both common Windows install locations + the
+  # macOS .app bundle. Order matters: try the cheap PATH cases first.
+  local candidate
+  for candidate in \
+    "/c/Program Files/Tailscale/tailscale.exe" \
+    "/mnt/c/Program Files/Tailscale/tailscale.exe" \
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 advise_tailscale_if_down() {
   # When the saved pairing points at a Tailscale CGNAT address (100.64/10)
   # and the local Tailscale daemon is NOT running, `airc join` silently
@@ -175,14 +206,17 @@ advise_tailscale_if_down() {
 
   # CLI present AND daemon up? fall through — if the SSH probe still
   # fails it's a peer-offline problem, not a tailnet-down problem.
-  if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  # resolve_tailscale_bin() handles Windows tailscale.exe + the macOS
+  # .app bundle path that PATH lookups miss.
+  local ts_bin; ts_bin=$(resolve_tailscale_bin)
+  if [ -n "$ts_bin" ] && "$ts_bin" status >/dev/null 2>&1; then
     return 0
   fi
 
   echo "" >&2
   echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale appears down on this machine." >&2
   echo "" >&2
-  if ! command -v tailscale >/dev/null 2>&1; then
+  if [ -z "$ts_bin" ]; then
     echo "   Tailscale is not installed. airc needs it only for cross-machine mesh." >&2
     echo "   Install:" >&2
     echo "     https://tailscale.com/download" >&2
