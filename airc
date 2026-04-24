@@ -310,7 +310,7 @@ monitor() {
     # cold-restart and join as peers. Standard distributed-systems leader
     # election with optimistic conflict resolution via gh-create.
     local consecutive_timeouts=0
-    local ESCALATE_AFTER=3   # ~9 minutes of dead host (3 × WATCHDOG_SEC=180)
+    local ESCALATE_AFTER=2   # 5 min total dead-host detection (2 × WATCHDOG_SEC=150)
     while true; do
       local cycle_start; cycle_start=$(date +%s)
       ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
@@ -321,11 +321,30 @@ monitor() {
       # Subsequent reconnects use the now-persisted offset updated by the formatter.
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
 
-      # Count this iteration as a "timeout" if formatter exited with code 2
-      # (its watchdog-no-inbound exit) OR the whole pipe died in under 30s
-      # (likely SSH refused / connection reset — host gone). Anything else,
-      # especially a long-lived formatter that received traffic, resets.
-      if [ "$fmt_exit" = "2" ] || [ "$cycle_lifetime" -lt 30 ]; then
+      # Probe-before-count for fmt_exit=2 (watchdog: no inbound for
+      # WATCHDOG_SEC). Without a probe, healthy-but-idle channels look
+      # identical to dead-host channels — both produce fmt_exit=2 — so
+      # we'd notify+escalate every WATCHDOG_SEC on quiet conversations
+      # (constant restart spam). The probe distinguishes:
+      #   probe success → host is alive, channel is just idle. Reset
+      #     counter, no notification, silent reconnect of the tail.
+      #   probe failure → host is genuinely unreachable. Notify, count
+      #     toward escalation. After ESCALATE_AFTER consecutive REAL
+      #     failures, exit 99 → daemon respawn → self-heal.
+      #
+      # cycle_lifetime < 30s also counts as a timeout (SSH refused or
+      # connection reset before tail even started reading) — that's
+      # the dead-host signature too, no probe needed.
+      if [ "$fmt_exit" = "2" ]; then
+        if ssh $ssh_opts -o ConnectTimeout=5 -o BatchMode=yes "$host_target" "true" 2>/dev/null; then
+          # Healthy idle. Stay quiet.
+          consecutive_timeouts=0
+        else
+          echo "airc: host went quiet (probe failed) — restarting"
+          consecutive_timeouts=$((consecutive_timeouts + 1))
+        fi
+      elif [ "$cycle_lifetime" -lt 30 ]; then
+        echo "airc: host unreachable (cycle <30s) — restarting"
         consecutive_timeouts=$((consecutive_timeouts + 1))
       else
         consecutive_timeouts=0
@@ -379,9 +398,27 @@ import sys, json, os, re, time, signal
 # a truly dead channel forces the formatter out and the reconnect loop
 # restarts the ssh. Normal chat traffic keeps resetting the alarm so
 # there is no penalty when the channel is healthy.
-WATCHDOG_SEC = 180
+#
+# Joel 2026-04-24: heartbeat is OFF by default (canary 95d9907), so
+# every fmt_exit=2 used to look like "host went quiet" and spam restart
+# notifications on healthy idle. Fix is in the bash retry loop: it
+# probes the host on fmt_exit=2 BEFORE counting/notifying. Probe
+# success = healthy idle (silent reset); probe failure = real death
+# (notify + count toward escalation).
+#
+# With the probe, WATCHDOG_SEC is just the polling cadence at which
+# we re-check the channel. 150s × ESCALATE_AFTER=2 = 5 minutes total
+# dead-host detection per Joel'\''s spec. The watchdog itself only fires
+# the python exit; the bash probe is what decides whether the user
+# sees a notification.
+WATCHDOG_SEC = 150
 def _watchdog_exit(signum, frame):
-    sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — restarting\\n")
+    # Diagnostic to stderr only. The bash retry loop owns the
+    # user-visible notification — it probes the host on fmt_exit=2
+    # to decide whether silence means "healthy idle" (silent reset)
+    # or "host actually unreachable" (notify + count). Emitting from
+    # python here would notify on every healthy-idle cycle.
+    sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — exiting for probe\\n")
     sys.stderr.flush()
     os._exit(2)
 signal.signal(signal.SIGALRM, _watchdog_exit)
@@ -467,14 +504,14 @@ def handle_rename(msg, ts):
     old, new, host = m.group(1), m.group(2), m.group(3)
     # Primary path: name-keyed rename.
     if _rename_files(old, new):
-        print(f"[{ts}] airc: Peer renamed: {old} -> {new}", flush=True)
+        print(f"airc: nick {old} → {new}", flush=True)
         return True
     # Fallback: peer file sits under a different (older) name due to a
     # previous chain break. Resolve via stable host field.
     if host:
         current = _find_peer_by_host(host)
         if current and current != new and _rename_files(current, new):
-            print(f"[{ts}] airc: Peer renamed (chain-repair via host): {current} -> {new}", flush=True)
+            print(f"airc: nick (chain-repair) {current} → {new}", flush=True)
             return True
     return False
 
@@ -558,20 +595,27 @@ for line in sys.stdin:
         # cmd_ping picks PONG up by tailing messages.jsonl directly.
         # Suppress to keep the chat surface clean.
         continue
+    # Compact one-liner per event. Every line starts with `airc:` so
+    # the source is unambiguous when other Monitor tasks (continuum,
+    # tests, etc.) are also firing notifications. Long messages
+    # truncate to PREVIEW_LEN; full content stays in messages.jsonl
+    # for `airc logs` audit.
+    PREVIEW_LEN = 100
+    msg_preview = msg.replace("\\n", " ").strip()
+    if len(msg_preview) > PREVIEW_LEN:
+        msg_preview = msg_preview[:PREVIEW_LEN] + "…"
     if fr in ("airc", "sys"):
-        # System events (joins, parts, drain markers, auth failures) keep
-        # the airc-prefixed format — easy to scan past.
-        print(f"[#{room_name}] airc: {msg}", flush=True)
+        # System events (joins, parts, drain, auth, watchdog).
+        # Example:  airc: [#general] alice joined
+        print(f"airc: [#{room_name}] {msg_preview}", flush=True)
+    elif to and to not in ("all", ""):
+        # DM with addressed recipient.
+        # Example:  airc: [#general] bigmama → alice: quick question
+        print(f"airc: [#{room_name}] {fr} → {to}: {msg_preview}", flush=True)
     else:
-        # Real chat: compact IRC-feel format.
-        # Broadcast:  [#general] bigmama: hello everyone
-        # DM:         [#general] bigmama → alice: hey
-        # Joel 2026-04-24: "the goings on of our agents is fascinating
-        # to humans" — keep it readable, drop the verbose ISO timestamp.
-        if to and to not in ("all", ""):
-            print(f"[#{room_name}] {fr} → {to}: {msg}", flush=True)
-        else:
-            print(f"[#{room_name}] {fr}: {msg}", flush=True)
+        # Broadcast.
+        # Example:  airc: [#general] bigmama: hello everyone
+        print(f"airc: [#{room_name}] {fr}: {msg_preview}", flush=True)
 '
 }
 
@@ -1719,6 +1763,29 @@ conn.sendall((response + '\n').encode())
 conn.close()
 sock.close()
 print(f'  Peer joined: {jname}')
+# Surface the join as a system event in messages.jsonl so the monitor
+# formatter (and downstream Monitor task summaries on every paired peer)
+# render a one-liner like '[#general] airc: <peer> joined' instead of
+# silence. Without this, peer-joined is invisible to anyone reading
+# notifications — they only learn about the new peer when chat traffic
+# starts flowing. Joel 2026-04-24: 'preview of the message or the
+# connection or whatever happened, Anvil joined instead of generic'.
+import datetime
+try:
+    room_name_path = '$AIRC_WRITE_DIR/room_name'
+    room_name = open(room_name_path).read().strip() if os.path.isfile(room_name_path) else 'general'
+    event = {
+        'ts': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'from': 'airc',
+        'to': 'all',
+        'msg': f'{jname} joined #{room_name}',
+    }
+    with open('$MESSAGES', 'a') as f:
+        f.write(json.dumps(event) + '\n')
+except Exception:
+    # Don't fail the pair on event-emit error — pairing already
+    # succeeded by this point; the missing event line is cosmetic.
+    pass
 " 2>/dev/null || true
     done &
     PAIR_PID=$!

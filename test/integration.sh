@@ -226,7 +226,11 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
                                                       || fail "rename failed"
 
   sleep 8
-  grep -q 'Peer renamed' /tmp/airc-it-j/out.log && pass "beta saw [rename] marker" \
+  # Joel 2026-04-24: rename print format changed from 'Peer renamed: <old> -> <new>'
+  # to 'nick: <old> → <new>' (IRC-canonical). Match the new format; old-format
+  # backward-compat is intentionally NOT kept since the wire protocol [rename]
+  # marker is what peers actually exchange — only the human-visible print changed.
+  grep -qE 'nick.*alpha.*gamma|Peer renamed' /tmp/airc-it-j/out.log && pass "beta saw [rename] marker" \
                                                 || fail "beta did NOT see rename marker"
 
   as_home /tmp/airc-it-j peers 2>/dev/null | grep -q gamma && pass "beta peers shows gamma" \
@@ -922,6 +926,88 @@ scenario_room() {
   cleanup_all
 }
 
+# ── Scenario: events (Joel's monitor-preview ask) ──────────────────────
+# Joel 2026-04-24: "Anvil joined" instead of generic "monitor yada yada"
+# in Monitor task notifications. The preview comes from messages.jsonl
+# lines with from=airc; the formatter renders them as `[#room] airc:`.
+# Without lifecycle events flowing through the log, Monitor's <summary>
+# falls back to whatever stale chat line was latest — telling humans
+# nothing about what just happened.
+#
+# What we verify:
+#   - After successful pair, host's messages.jsonl contains a system
+#     event line with from=airc and msg matching '<peer> joined #<room>'
+#   - The line lands within a few seconds of pair (not stuck behind
+#     the formatter's own loop)
+scenario_events() {
+  section "events: pair-handshake emits 'beta joined #<room>' system event"
+  cleanup_all
+
+  local rname="test-events-$$"
+
+  mkdir -p /tmp/airc-it-h
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room "$rname" > /tmp/airc-it-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 1
+    grep -q 'Hosting as' /tmp/airc-it-h/out.log 2>/dev/null && break
+  done
+  grep -q 'Hosting as' /tmp/airc-it-h/out.log \
+    && pass "alpha hosting (--room ${rname}, --no-gist)" \
+    || { fail "alpha host failed to start"; cleanup_all; return; }
+
+  local join; join=$(read_join_string /tmp/airc-it-h)
+  [ -n "$join" ] && pass "alpha join string captured" \
+                 || { fail "no join string in alpha log"; cleanup_all; return; }
+
+  spawn_joiner /tmp/airc-it-j beta "$join" \
+    && pass "beta joined alpha's room" \
+    || { fail "beta join failed"; cleanup_all; return; }
+
+  # Allow up to ~5s for the pair-accept python to finish writing the
+  # event line. The handshake itself completes in <1s; the event-emit
+  # is wrapped in try/except so any path that fails doesn't break the
+  # pair, which means we need to check what actually landed.
+  local seen=""
+  for i in 1 2 3 4 5; do
+    if [ -f /tmp/airc-it-h/state/messages.jsonl ] \
+       && grep -q '"from": *"airc"' /tmp/airc-it-h/state/messages.jsonl \
+       && grep -q "beta joined #${rname}" /tmp/airc-it-h/state/messages.jsonl; then
+      seen="yes"
+      break
+    fi
+    sleep 1
+  done
+  [ -n "$seen" ] \
+    && pass "host messages.jsonl contains 'beta joined #${rname}' event line" \
+    || fail "no 'beta joined' event line in host's messages.jsonl after 5s"
+
+  # The event must be JSON-parseable and have the structure the formatter
+  # expects (from=airc, to=all, msg + ts present). Otherwise it'll be
+  # silently skipped by the monitor formatter's json.loads guard.
+  if [ -n "$seen" ]; then
+    python3 -c "
+import json,sys
+ok=False
+for line in open('/tmp/airc-it-h/state/messages.jsonl'):
+    try:
+        m=json.loads(line)
+    except Exception:
+        continue
+    if m.get('from')=='airc' and 'beta joined' in m.get('msg',''):
+        if m.get('to')=='all' and m.get('ts'):
+            ok=True
+sys.exit(0 if ok else 1)
+" 2>/dev/null \
+      && pass "event has required fields (from=airc, to=all, ts, msg)" \
+      || fail "event line malformed — formatter will skip it"
+  fi
+
+  cleanup_all
+}
+
 # ── Scenario: get_host (LAN IP fallback when Tailscale absent/disabled) ─
 # Per Joel: Tailscale should be optional for same-LAN use. The new
 # get_host priority is Tailscale → LAN-IP-via-UDP-trick → hostname.
@@ -1049,9 +1135,10 @@ case "$MODE" in
   auth_failure) scenario_auth_failure ;;
   resume_stale_auth) scenario_resume_stale_auth ;;
   room)         scenario_room ;;
+  events)       scenario_events ;;
   get_host)     scenario_get_host ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_get_host ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|get_host|all]"; exit 2 ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|all]"; exit 2 ;;
 esac
 
 echo
