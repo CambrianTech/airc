@@ -1,14 +1,15 @@
 name: enforce-canary-staging
 
 # Block PRs to main unless they come from `canary` (the staging branch)
-# OR carry the hotfix escape hatch:
-#   - Label any of: hotfix, urgent, emergency
-#   - Title contains "hotfix" (case-insensitive)
+# OR carry an audit-visible bypass:
+#   - Label any of: hotfix, urgent, emergency, docs-only, skills-only
+#   - Title contains "hotfix" anywhere (case-insensitive)
+#   - Title prefixed with "docs:", "docs(scope):", "skills:", "skills(scope):"
 #
 # Discipline: feature work goes canary → main as one integration PR after
-# bigmama / memento / anvil cross-validate. Hotfixes are the audit-visible
-# escape hatch when something needs to skip staging (rare, intentional,
-# show-the-evidence).
+# bigmama / memento / anvil cross-validate. Hotfixes are the urgent escape
+# hatch (rare, intentional). Docs + skills are non-runtime — can't be
+# canary-tested usefully — so they skip directly to main.
 
 on:
   pull_request:
@@ -34,21 +35,32 @@ jobs:
             exit 0
           fi
 
-          if printf '%s' "$TITLE_LC" | grep -q 'hotfix'; then
-            echo "✓ PR title contains 'hotfix' — hotfix escape hatch satisfied."
+          # Title-based bypass — case-insensitive match against:
+          #   - 'hotfix' anywhere (urgent escape hatch)
+          #   - 'docs' / 'doc' / 'skills' as conventional-commits prefix
+          #     (e.g. "docs:", "docs(readme):", "skills(connect):")
+          # Rationale per Joel 2026-04-24: docs and skills aren't
+          # runtime-testable in canary — they're prose. Going direct to
+          # main is appropriate; canary→main staging is for behavioral
+          # changes that benefit from cross-machine validation.
+          if printf '%s' "$TITLE_LC" | grep -qE 'hotfix|^(docs?|skills)([:(])'; then
+            echo "✓ PR title matches bypass (hotfix / docs / skills) — escape hatch satisfied."
             exit 0
           fi
 
           # Labels arrive as a JSON array string. Check for any of the
           # accepted bypass labels.
-          if printf '%s' "$LABELS" | grep -qE '"(hotfix|urgent|emergency)"'; then
-            echo "✓ PR carries hotfix/urgent/emergency label — escape hatch satisfied."
+          if printf '%s' "$LABELS" | grep -qE '"(hotfix|urgent|emergency|docs-only|skills-only)"'; then
+            echo "✓ PR carries bypass label — escape hatch satisfied."
             exit 0
           fi
 
           echo "::error::PRs to main must come from 'canary' (the staging branch),"
-          echo "::error::OR have 'hotfix' in the title,"
-          echo "::error::OR carry one of the 'hotfix' / 'urgent' / 'emergency' labels."
+          echo "::error::OR have 'hotfix' anywhere in the title (case-insensitive),"
+          echo "::error::OR have 'docs:' / 'docs(scope):' / 'skills:' / 'skills(scope):' as title prefix,"
+          echo "::error::OR carry one of the 'hotfix' / 'urgent' / 'emergency' / 'docs-only' / 'skills-only' labels."
+          echo "::error::"
+          echo "::error::Rationale: docs + skills are prose, not runtime — can't be canary-tested usefully."
           echo "::error::"
           echo "::error::This PR's head: ${HEAD_REF}"
           echo "::error::Title:          ${PR_TITLE}"
