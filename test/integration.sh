@@ -55,19 +55,33 @@ cleanup_dirs() {
 }
 
 cleanup_known_hosts() {
-  # Test alpha/beta hosts run on the user's real SSH target
-  # (joelteply@100.91.51.87 or similar), so their pair handshake writes
-  # ephemeral test host keys into ~/.ssh/known_hosts. Left behind, those
-  # stale keys collide with the user's real airc host running on the
-  # same IP — SSH to the real host fails with REMOTE HOST IDENTIFICATION
-  # HAS CHANGED. Clear any entries for this machine's address between runs.
+  # Test alpha/beta hosts run on the user's real SSH target, so their
+  # pair handshake writes ephemeral test host keys into
+  # ~/.ssh/known_hosts. Left behind, those stale keys collide with the
+  # user's real airc host running on the same IP — SSH to the real host
+  # fails with REMOTE HOST IDENTIFICATION HAS CHANGED. Clear any entries
+  # for THIS machine's address between runs.
+  #
+  # We only clean addresses we discover dynamically:
+  #   - hostname -I (Linux/WSL) primary local IP
+  #   - ipconfig getifaddr en0 (macOS) primary interface
+  #   - tailscale ip -4 (cross-platform) the tailnet address airc most
+  #     commonly pairs over
+  # No hardcoded IPs — the prior version pinned 100.91.51.87 (the airc
+  # author's tailnet IP), which was a dead branch for any other user
+  # AND a low-grade PII leak in the repo.
   local addr; addr=$(hostname -I 2>/dev/null | awk '{print $1}')
   [ -z "$addr" ] && addr=$(ipconfig getifaddr en0 2>/dev/null)
   if [ -n "$addr" ]; then
     ssh-keygen -R "$addr" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
   fi
-  # Also the tailscale IP family airc tests commonly use
-  ssh-keygen -R 100.91.51.87 -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+  # Tailscale address (if up) — same machine, different routable IP.
+  if command -v tailscale >/dev/null 2>&1; then
+    local ts_ip; ts_ip=$(tailscale ip -4 2>/dev/null | head -1)
+    if [ -n "$ts_ip" ]; then
+      ssh-keygen -R "$ts_ip" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; }
