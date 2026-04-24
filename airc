@@ -2930,10 +2930,11 @@ for line in sys.stdin:
 
 case "${1:-help}" in
   connect|setup|start|join|resume) shift; cmd_connect "$@" ;;
-  send)      shift; cmd_send "$@" ;;
+  send|msg|say)   shift; cmd_send "$@" ;;
+  privmsg)   shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
   ping)      shift; cmd_ping "$@" ;;
-  rename)    shift; cmd_rename "$@" ;;
+  rename|nick) shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
@@ -2948,34 +2949,37 @@ case "${1:-help}" in
   doctor|tests|test) shift; cmd_doctor "$@" ;;
   daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
-  disconnect|leave|unbind) cmd_disconnect ;;
+  disconnect|quit|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;
   debug-host)  get_host ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
+    echo "(IRC verbs work as primary; airc-classic names also accepted)"
     echo ""
-    echo "  airc connect                    Auto-#general: join the room on your gh account, or host it"
-    echo "  airc connect --room <name>      Join (or host) a named channel instead of #general"
-    echo "  airc connect --no-general       Single-pair invite mode (legacy 1:1 invite)"
-    echo "  airc connect <gist-id>          Join via shared room/invite gist (cross-account)"
-    echo "  airc connect <name@user@host>   Join via inline invite string (legacy)"
-    echo "  airc rooms / list / ls          List open rooms + invites on your gh account"
-    echo "  airc part                       Leave current room (host: deletes room gist)"
-    echo "  airc update [--channel <name>]  Pull latest on current channel; switch with --channel canary|main"
-    echo "  airc channel [<name>]           Show or set release channel (main = stable, canary = pre-merge testing)"
-    echo "  airc canary                     Shortcut: airc update --channel canary"
-    echo "  airc tests / doctor [scenario]  Run integration suite (88 assertions across 11 scenarios)"
-    echo "  airc daemon [install|status|uninstall|log]  Auto-resume across sleep/wake/crash via launchd (mac) or systemd (linux)"
-    echo "  airc send <peer> <message>      Send a message"
-    echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
-    echo "  airc rename <new-name>          Rename this session (notifies peers)"
-    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc join                       Auto-#general: enter the room on your gh account, or host it"
+    echo "  airc join --room <name>         Enter (or host) a named channel instead of #general"
+    echo "  airc join <gist-id>             Enter via shared gist id (cross-account)"
+    echo "  airc join <mnemonic>            Enter via humanhash like oregon-uncle-bravo-eleven (same gh account)"
+    echo "  airc list / rooms / ls          List open rooms + invites on your gh account"
+    echo "  airc part                       Leave the current room"
+    echo "  airc msg / send <text>          Broadcast to the current room"
+    echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
+    echo "  airc nick / rename <new>        Rename this session (notifies peers)"
+    echo "  airc quit / disconnect          Leave the mesh (keep identity for next time)"
     echo "  airc peers                      List connected peers"
-    echo "  airc status [--probe]           Liveness: monitor, queue, last send/recv (add --probe for SSH check)"
-    echo "  airc doctor [tabs|scope|all]    Self-test: pairing, send, rename, scope"
-    echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state; --all = nuke every airc on this machine, ignoring scope)"
+    echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong)"
+    echo ""
+    echo "Operations:"
+    echo "  airc update [--channel <name>]  Pull latest; switch channel with --channel canary|main"
+    echo "  airc channel [<name>]           Show or set release channel"
+    echo "  airc canary                     Shortcut: airc update --channel canary"
+    echo "  airc daemon [install|status|uninstall|log]  Autostart via launchd (mac) / systemd (linux)"
+    echo "  airc tests / doctor [scenario]  Run integration suite + environment health"
+    echo "  airc status [--probe]           Liveness snapshot (--probe for SSH check)"
+    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state)"
     echo ""
     echo "Identity resolution (highest priority first):"
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
