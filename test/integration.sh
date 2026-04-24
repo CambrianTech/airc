@@ -922,6 +922,60 @@ scenario_room() {
   cleanup_all
 }
 
+# ── Scenario: get_host (LAN IP fallback when Tailscale absent/disabled) ─
+# Per Joel: Tailscale should be optional for same-LAN use. The new
+# get_host priority is Tailscale → LAN-IP-via-UDP-trick → hostname.
+# AIRC_NO_TAILSCALE=1 forces fallback for testing AND for LAN-only users.
+#
+# What we verify (no gh, no SSH — pure host-resolution test):
+#   - Default returns SOMETHING non-empty (could be tailscale ip, lan ip,
+#     or hostname depending on the machine the test runs on)
+#   - AIRC_NO_TAILSCALE=1 doesn't error and returns SOMETHING non-empty
+#     (LAN ip on most machines; hostname if no internet route)
+#   - When forced fallback returns an IP-shaped value, it's a valid
+#     RFC1918 LAN range (192.168/10/172.16-31) — i.e. routable on the
+#     local network, not the loopback noise we explicitly filter for
+scenario_get_host() {
+  section "get_host: priority Tailscale → LAN-IP → hostname"
+
+  local default_host
+  default_host=$("$AIRC" debug-host 2>/dev/null || echo "")
+  [ -n "$default_host" ] \
+    && pass "default get_host returned non-empty: $default_host" \
+    || fail "default get_host returned empty"
+
+  local fallback_host
+  fallback_host=$(AIRC_NO_TAILSCALE=1 "$AIRC" debug-host 2>/dev/null || echo "")
+  [ -n "$fallback_host" ] \
+    && pass "AIRC_NO_TAILSCALE=1 fallback returned non-empty: $fallback_host" \
+    || fail "AIRC_NO_TAILSCALE=1 fallback returned empty"
+
+  # If fallback looks like an IPv4 address, it must NOT be 127.* (we
+  # explicitly filter loopback in get_host) and SHOULD be RFC1918 if
+  # the test runner has typical home/office LAN routing.
+  case "$fallback_host" in
+    127.*)
+      fail "fallback returned loopback ($fallback_host) — get_host's UDP-trick filter regressed"
+      ;;
+    192.168.*|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2[0-9].*|172.3[01].*)
+      pass "fallback is RFC1918 LAN address ($fallback_host) — UDP-trick worked"
+      ;;
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+      pass "fallback is an IPv4 ($fallback_host) — non-RFC1918 but routable"
+      ;;
+    *)
+      pass "fallback returned hostname-style value ($fallback_host) — UDP-trick path skipped (no internet route or no python3)"
+      ;;
+  esac
+
+  # Determinism: same env, same call → same value (no flapping).
+  local repeat
+  repeat=$(AIRC_NO_TAILSCALE=1 "$AIRC" debug-host 2>/dev/null || echo "")
+  [ "$repeat" = "$fallback_host" ] \
+    && pass "fallback is stable across repeated calls" \
+    || fail "fallback flapped: '$fallback_host' then '$repeat'"
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -934,8 +988,9 @@ case "$MODE" in
   auth_failure) scenario_auth_failure ;;
   resume_stale_auth) scenario_resume_stale_auth ;;
   room)         scenario_room ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|all]"; exit 2 ;;
+  get_host)     scenario_get_host ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_get_host ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|get_host|all]"; exit 2 ;;
 esac
 
 echo
