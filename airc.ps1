@@ -441,10 +441,16 @@ function Init-Identity {
     $sshKey    = Join-Path $IDENTITY_DIR 'ssh_key'
     $sshKeyPub = "$sshKey.pub"
     if (-not (Test-Path $sshKey)) {
-        & ssh-keygen -t ed25519 -f $sshKey -N '""' -C "airc-$Name" -q 2>$null
-        # Some Windows ssh-keygen builds reject -N '""' literally; retry with empty arg.
+        # ssh-keygen -N '' = empty passphrase (no encryption on the key).
+        # Single-quoted empty string in PS is a true zero-length string and
+        # survives intact through .NET native-command marshaling. The prior
+        # `-N '""'` form passed the literal two-character string `""` as the
+        # passphrase on some Windows shells, producing a key that ssh.exe
+        # could not use without prompting -- exact symptom: "auth failed"
+        # at use time despite the key being in authorized_keys.
+        & ssh-keygen -t ed25519 -f $sshKey -N '' -C "airc-$Name" -q
         if (-not (Test-Path $sshKey)) {
-            & ssh-keygen -t ed25519 -f $sshKey -N "" -C "airc-$Name" -q
+            Die "ssh-keygen failed to create $sshKey"
         }
         & icacls $sshKey /inheritance:r /grant:r "$($env:USERNAME):F" 2>$null | Out-Null
         $sshDir = Join-Path $env:USERPROFILE '.ssh'
