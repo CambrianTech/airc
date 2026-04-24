@@ -141,10 +141,146 @@ if [ -d "$CLONE_DIR/skills" ]; then
   done
 fi
 
+# ── Tailscale (optional, cross-machine only) ─────────────────────────────
+#
+# airc works fully local — multiple tabs on the same machine pair via
+# localhost / LAN IP, no Tailscale needed. Tailscale is the wire ONLY
+# for cross-machine mesh (bigmama-wsl ↔ joels-macbook, office ↔ home,
+# coworker's laptop on a different network).
+#
+# Install-time behavior:
+#   - If tailscale CLI is present AND daemon is up → skip silently, we're good.
+#   - If tailscale is missing OR daemon is down → Y/N prompt. Default N
+#     because local-only is the common case. Y does install + sudoers +
+#     start daemon + `tailscale up --ssh --accept-routes`.
+#   - Non-interactive stdin (curl | bash, CI, AIRC_TAILSCALE=skip) → skip
+#     without prompting. User can re-run `bash install.sh` in a real
+#     terminal when they want cross-machine.
+#   - AIRC_TAILSCALE=yes forces the setup without prompting (scripted
+#     provisioning). AIRC_TAILSCALE=skip forces skip.
+
+airc_setup_tailscale() {
+  local ts_status="missing"
+  if command -v tailscale >/dev/null 2>&1; then
+    if tailscale status >/dev/null 2>&1; then
+      ts_status="up"
+    else
+      ts_status="installed-but-down"
+    fi
+  fi
+
+  # Already good → nothing to do.
+  [ "$ts_status" = "up" ] && { ok "Tailscale: up ($(tailscale ip -4 2>/dev/null | head -1))"; return 0; }
+
+  # Resolve intent: env override > TTY prompt > silent skip.
+  local intent="${AIRC_TAILSCALE:-}"
+  if [ -z "$intent" ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+      echo ""
+      case "$ts_status" in
+        missing)
+          echo "  Tailscale is not installed. airc needs it only for CROSS-MACHINE"
+          echo "  mesh (laptop ↔ desktop, you ↔ coworker). Local-only (multiple"
+          echo "  tabs on this machine) works without it."
+          ;;
+        installed-but-down)
+          echo "  Tailscale is installed but the daemon is not running. Same"
+          echo "  story — only needed for cross-machine mesh."
+          ;;
+      esac
+      printf "  Install/start Tailscale now? [y/N] "
+      local reply=""
+      read -r reply
+      case "$reply" in y|Y|yes|YES) intent="yes" ;; *) intent="skip" ;; esac
+    else
+      intent="skip"
+    fi
+  fi
+
+  if [ "$intent" != "yes" ]; then
+    info "Skipping Tailscale setup (local-only airc works as-is)"
+    echo "     Cross-machine later: re-run bash install.sh in a terminal,"
+    echo "     or set AIRC_TAILSCALE=yes and re-run."
+    return 0
+  fi
+
+  # Install CLI if missing.
+  if [ "$ts_status" = "missing" ]; then
+    info "Installing Tailscale (will prompt for sudo once)"
+    if ! curl -fsSL https://tailscale.com/install.sh | sh; then
+      echo "  ⚠ Tailscale install failed. Skipping — airc still works local-only." >&2
+      return 0
+    fi
+  fi
+
+  # Passwordless sudoers for tailscale + tailscaled so the daemon can be
+  # started non-interactively later (by `airc status --probe`, by a
+  # systemd unit, by a future `airc self-repair`). Written only if
+  # missing. Matches continuum/src/scripts/install-tailscale.sh's
+  # sudoers line so they coexist safely.
+  if [ ! -f /etc/sudoers.d/airc-tailscale ]; then
+    info "Writing /etc/sudoers.d/airc-tailscale (passwordless sudo for tailscale + tailscaled)"
+    # Derive the tailscaled path. Common locations.
+    local tsd_bin=""
+    for cand in /usr/sbin/tailscaled /usr/bin/tailscaled /usr/local/sbin/tailscaled /usr/local/bin/tailscaled; do
+      [ -x "$cand" ] && tsd_bin="$cand" && break
+    done
+    local ts_bin
+    ts_bin=$(command -v tailscale 2>/dev/null || echo "/usr/bin/tailscale")
+    # Only write if we actually found a tailscaled.
+    if [ -n "$tsd_bin" ]; then
+      # Use `sudo tee` so the install works even when install.sh itself
+      # wasn't run as root.
+      printf '%s ALL=(ALL) NOPASSWD: %s, %s\n' "$USER" "$ts_bin" "$tsd_bin" \
+        | sudo tee /etc/sudoers.d/airc-tailscale >/dev/null
+      sudo chmod 440 /etc/sudoers.d/airc-tailscale
+    else
+      echo "  ⚠ Couldn't locate tailscaled binary; skipping sudoers setup." >&2
+    fi
+  fi
+
+  # Start the daemon if it's not already running.
+  if ! tailscale status >/dev/null 2>&1; then
+    info "Starting tailscaled"
+    local tsd_bin=""
+    for cand in /usr/sbin/tailscaled /usr/bin/tailscaled /usr/local/sbin/tailscaled /usr/local/bin/tailscaled; do
+      [ -x "$cand" ] && tsd_bin="$cand" && break
+    done
+    if [ -n "$tsd_bin" ]; then
+      sudo "$tsd_bin" --state=/var/lib/tailscale/tailscaled.state > /tmp/tailscaled.airc.log 2>&1 &
+      disown 2>/dev/null || true
+      # Poll up to 5s for daemon to come up.
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        tailscale status >/dev/null 2>&1 && break
+        sleep 0.5
+      done
+    fi
+    if ! tailscale status >/dev/null 2>&1; then
+      echo "  ⚠ tailscaled didn't come up within 5s. Check: /tmp/tailscaled.airc.log" >&2
+      return 0
+    fi
+  fi
+
+  # Bring the node up on the tailnet + enable Tailscale SSH (for
+  # tailscale's own SSH infrastructure; airc uses its own SSH identity
+  # over port 7547 but --ssh gives the user console access via
+  # `tailscale ssh` which is handy for debugging).
+  info "Running: sudo tailscale up --ssh --accept-routes"
+  if sudo tailscale up --ssh --accept-routes 2>&1; then
+    ok "Tailscale: up ($(tailscale ip -4 2>/dev/null | head -1))"
+  else
+    echo "  ⚠ 'tailscale up' failed (likely needs login). Run manually:" >&2
+    echo "     sudo tailscale up --ssh --accept-routes" >&2
+  fi
+}
+
+airc_setup_tailscale
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
-ok "Installed. Requires Tailscale: https://tailscale.com"
+ok "Installed."
 echo ""
 echo "  airc join                       # auto-#general (joins existing or hosts)"
 echo "  airc join <gist-id>             # cross-account share via gist id"
