@@ -128,14 +128,6 @@ airc join oregon-uncle-bravo-eleven
 
 Done. Toby's airc resolves the mnemonic to the gist on your gh account, fetches the room invite, pairs over Tailscale (or whatever IP fabric you both share). If the mnemonic doesn't resolve from his side (cross-account gh visibility), `airc list` on yours also shows the raw gist id as a fallback to paste.
 
-### Legacy 1:1 invite (if you want the old behavior — one-shot pairing, no persistent room)
-
-```bash
-airc join --no-general
-```
-
-Done. (Their airc resolves the mnemonic against your gh account if they have read access; otherwise the mnemonic doubles as a verification phrase against the gist id you also share.)
-
 ## With Claude Code
 
 **Same gh account (most cases):**
@@ -212,13 +204,11 @@ airc update     # git-pull install dir + refresh skill symlinks (idempotent)
 # Substrate
 airc join                      # auto-#general (or resume prior pairing)
 airc join --room <name>        # join (or host) a non-general room
-airc join --no-general         # legacy 1:1 invite mode (no persistent room)
-airc join <gist-id>            # join via shared gist (cross-account)
-airc join <name@user@host>     # legacy inline invite string
+airc join <gist-id>            # join via shared gist (cross-account fallback)
+airc join <mnemonic>           # join via humanhash like oregon-uncle-bravo-eleven
 
-airc list                        # list open rooms + invites on your gh
-airc list / airc ls               # aliases for rooms
-airc part                         # leave current room (host: deletes gist)
+airc list                      # list open rooms on your gh
+airc part                      # leave current room (host: deletes gist)
 
 # Messaging
 airc msg "<message>"             # broadcast to current room
