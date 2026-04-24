@@ -1736,6 +1736,12 @@ function Invoke-Connect {
                 }
             }
             Write-AircPidFile -Pids @($PID)
+            # Same banner the fresh-pair / host paths emit. Without this,
+            # the resume path drops straight into the monitor with no
+            # console signal that anything is up -- looks indistinguishable
+            # from a hung process to anyone watching stdout. Joel
+            # 2026-04-24: parity gap noted across all implementations.
+            Write-Host '  Monitoring for messages...'
             Start-AircMonitor -MyName (Get-Name)
             return
         }
