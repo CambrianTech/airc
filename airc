@@ -602,12 +602,24 @@ cmd_connect() {
   # because gist is now the default when gh is available. Gist push silently
   # falls through to long-invite-only when gh is missing or unauthed, so
   # the host command never fails just because GitHub isn't reachable.
+  #
+  # Issue #39 — IRC-style rooms (aIRC, get it):
+  #   --room <name>       : join (or host) a named room (default: 'general')
+  #   --no-general        : skip the auto-#general default (host an unnamed
+  #                         single-pair invite, today's invite-only flow)
+  #   --no-room           : alias for --no-general (kept for symmetry)
+  # Default behavior: every `airc connect` joins '#general' on the gh account.
+  # First in hosts, rest auto-join. Matches IRC's "everyone's in the lobby."
   local use_gist=1   # default ON; runtime probe later checks gh availability
+  local room_name="general"
+  local use_room=1   # default ON — auto-#general substrate
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
+      --room|-room) room_name="${2:-general}"; use_room=1; shift 2 ;;
+      --no-general|-no-general|--no-room|-no-room) use_room=0; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -767,51 +779,76 @@ cmd_connect() {
     fi
   fi
 
-  # ── Zero-arg gist discovery (issue #38) ──────────────────────────
-  # If we got here with no target AND no saved config, the user just
-  # ran `airc connect` cold. Before assuming "you must be the host",
-  # check whether their gh account already has an open airc invite
-  # gist sitting around — that's almost certainly what they want to
-  # join (sibling tab, prior machine, friend in the same org). Tailscale
-  # parity: open the tab, run the command, you're in.
+  # ── Zero-arg discovery: rooms first, then legacy invites (#38, #39)
+  # If we got here with no target AND no saved config, the user just ran
+  # `airc connect` cold. The IRC substrate (#39) makes this simple:
   #
-  # Decision tree:
-  #   0 open rooms → fall through to host mode (original default)
-  #   1 open room  → join it (auto-pair)
-  #   N open rooms → list them, exit cleanly with instruction. The skill
-  #                  layer (Claude Code /connect) reads the list and uses
-  #                  conversation context to pick.
+  #   1. Look for the named room gist (default `airc room: general`).
+  #      Found → auto-join it.
+  #   2. Fall back to legacy `airc invite for ...` single-pair gists.
+  #      Found 1 → auto-join. Found N → list + exit.
+  #   3. Found nothing → become the host and create the room (the
+  #      auto-#general default — first agent in is the channel host).
   #
-  # Skipped if `gh` isn't available — nothing to discover, fall through
-  # to host. Skipped on AIRC_NO_DISCOVERY=1 for users who explicitly
-  # don't want gist-namespace probing.
+  # Skipped if `gh` isn't available (degraded → host invite-only) or
+  # AIRC_NO_DISCOVERY=1 (explicit opt-out). With `--no-general` the room
+  # path is skipped and we go straight to single-pair invite host mode.
+  local _did_room_discovery=0
   if [ -z "$target" ] && [ ! -f "$CONFIG" ] && \
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
-    # Cheap: list our recent gists, filter by airc-invite description
-    # marker. Two-column format: ID + description.
-    local _candidates; _candidates=$(gh gist list --limit 30 2>/dev/null \
-      | awk -F'\t' '/airc invite for/ { print $1 "\t" $2 }')
-    local _count; _count=$(printf '%s' "$_candidates" | grep -c . || true)
-    if [ "$_count" = "1" ]; then
-      local _picked_id; _picked_id=$(printf '%s' "$_candidates" | awk -F'\t' '{print $1}')
-      local _picked_desc; _picked_desc=$(printf '%s' "$_candidates" | awk -F'\t' '{print $2}')
-      echo "  Found 1 open airc room on your gh account: $_picked_desc"
-      echo "  → auto-joining $_picked_id"
-      target="$_picked_id"
-      # fall through to gist resolver below
-    elif [ "$_count" -ge 2 ]; then
-      echo ""
-      echo "  $_count open airc rooms on your gh account:"
-      echo ""
-      printf '%s\n' "$_candidates" | while IFS=$'\t' read -r _id _desc; do
-        local _hh; _hh=$(humanhash "$_id" 2>/dev/null)
-        printf '    %s   %s\n      mnemonic: %s\n' "$_id" "$_desc" "$_hh"
-      done
-      echo ""
-      echo "  Pick one to join:  airc connect <id>"
-      echo "  Host a new mesh:   AIRC_NO_DISCOVERY=1 airc connect"
-      exit 0
+
+    # ── Room discovery (the substrate path) ──────────────────────
+    # Match exact room name to avoid `airc room: general-test` colliding
+    # with `airc room: general`. Pick the most-recent if duplicates exist
+    # (stale hosts get re-elected on next reconnect when SSH fails).
+    if [ "$use_room" = "1" ]; then
+      _did_room_discovery=1
+      local _room_filter="airc room: ${room_name}\$"
+      local _room_candidates; _room_candidates=$(gh gist list --limit 50 2>/dev/null \
+        | awk -F'\t' -v re="$_room_filter" '$2 ~ re { print $1 "\t" $2 "\t" $4 }')
+      local _room_count; _room_count=$(printf '%s' "$_room_candidates" | grep -c . || true)
+      if [ "$_room_count" -ge 1 ]; then
+        # Most recent wins (gh gist list is reverse-chrono by update).
+        local _picked_id; _picked_id=$(printf '%s' "$_room_candidates" | head -1 | awk -F'\t' '{print $1}')
+        echo "  Found #${room_name} on your gh account → joining ($_picked_id)"
+        target="$_picked_id"
+        # fall through to gist resolver below — kind:room → invite handshake
+      else
+        echo "  No #${room_name} found on your gh account → becoming the host."
+        # fall through to host mode below; cmd_connect's host path will
+        # publish a kind:room gist instead of kind:invite (see use_room
+        # check at gist push).
+      fi
+    fi
+
+    # ── Legacy single-pair invite discovery (only if no room flow) ──
+    # Preserves the #38 behavior for users running with --no-general
+    # OR for room-mode users whose room discovery missed (we already
+    # set target in that case, so this block won't fire).
+    if [ -z "$target" ] && [ "$use_room" = "0" ]; then
+      local _candidates; _candidates=$(gh gist list --limit 30 2>/dev/null \
+        | awk -F'\t' '/airc invite for/ { print $1 "\t" $2 }')
+      local _count; _count=$(printf '%s' "$_candidates" | grep -c . || true)
+      if [ "$_count" = "1" ]; then
+        local _picked_id; _picked_id=$(printf '%s' "$_candidates" | awk -F'\t' '{print $1}')
+        local _picked_desc; _picked_desc=$(printf '%s' "$_candidates" | awk -F'\t' '{print $2}')
+        echo "  Found 1 open airc invite on your gh account: $_picked_desc"
+        echo "  → auto-joining $_picked_id"
+        target="$_picked_id"
+      elif [ "$_count" -ge 2 ]; then
+        echo ""
+        echo "  $_count open airc invite(s) on your gh account:"
+        echo ""
+        printf '%s\n' "$_candidates" | while IFS=$'\t' read -r _id _desc; do
+          local _hh; _hh=$(humanhash "$_id" 2>/dev/null)
+          printf '    %s   %s\n      mnemonic: %s\n' "$_id" "$_desc" "$_hh"
+        done
+        echo ""
+        echo "  Pick one to join:  airc connect <id>"
+        echo "  Host a new mesh:   AIRC_NO_DISCOVERY=1 airc connect --no-general"
+        exit 0
+      fi
     fi
   fi
 
@@ -865,6 +902,7 @@ cmd_connect() {
       # field, dispatch on `kind`. Otherwise, treat raw_content as the
       # legacy raw-invite-string format (backward compat).
       local resolved=""
+      local resolved_room_name=""   # set when kind==room, used to remember which room we joined
       if command -v jq >/dev/null 2>&1; then
         local airc_ver kind
         airc_ver=$(printf '%s' "$raw_content" | jq -r '.airc // empty' 2>/dev/null)
@@ -873,8 +911,19 @@ cmd_connect() {
           # Versioned envelope — dispatch on kind.
           case "$kind" in
             invite)
+              # Single-pair invite (legacy + --no-general flow). Gist is
+              # ephemeral; host deletes after pair.
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
+              ;;
+            room)
+              # Persistent IRC-style channel (issue #39, the substrate).
+              # Same SSH-pair handshake as invite, but the gist persists
+              # so additional joiners can keep arriving. The room.invite
+              # field carries today's name@user@host:port#pubkey string.
+              resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
+                         | head -1 | tr -d '\r\n ')
+              resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.name // empty' 2>/dev/null)
               ;;
             "")
               die "Gist has airc envelope (v$airc_ver) but no 'kind' field — malformed."
@@ -882,7 +931,7 @@ cmd_connect() {
             *)
               # Unknown kind — fail loud. Old peers should reject
               # rather than silently misinterpret a future kind.
-              die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite'. Update airc: 'airc update'."
+              die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite' and 'room'. Update airc: 'airc update'."
               ;;
           esac
         fi
@@ -932,6 +981,16 @@ cmd_connect() {
   "created": "$(timestamp)"
 }
 EOF
+
+    # Remember which room we joined (issue #39). Lets `airc rooms` and
+    # status/diagnostics report channel context, and gives the joiner
+    # something to hand to a friend ("airc connect <this-id>"). We don't
+    # need the gist_id for cmd_part on joiner side — only the host owns
+    # the gist lifecycle — but we save the room name for display.
+    if [ -n "$resolved_room_name" ]; then
+      echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
+      echo "  Joined #${resolved_room_name}"
+    fi
 
     # Exchange keys with host via TCP (port 7547) — public keys only
     # Pre-authorize host's pubkey if in join string
@@ -1158,11 +1217,41 @@ EOF
         echo "     Skipping gist push; long invite above is the only handoff."
       else
         local _gist_tmp; _gist_tmp=$(mktemp -t airc-invite.XXXXXX)
-        # Versioned JSON envelope — see above. `kind: "invite"` is
-        # today's flow; future kinds slot in without renaming `invite`
-        # or breaking parsers that only know v1.
         local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        cat > "$_gist_tmp" <<JSON
+        local _gist_kind="invite"
+        local _gist_desc="airc invite for $name (delete after pair)"
+        local _gist_payload=""
+
+        if [ "$use_room" = "1" ]; then
+          # Room mode (#39 substrate): persistent gist, not deleted after
+          # pair. Lets additional joiners discover + auto-join the same
+          # channel. Same SSH-pair handshake under the hood — only the
+          # gist lifecycle + envelope kind differ.
+          _gist_kind="room"
+          _gist_desc="airc room: ${room_name}"
+          _gist_payload=$(cat <<JSON
+{
+  "airc": 1,
+  "kind": "room",
+  "name": "${room_name}",
+  "topic": "",
+  "invite": "$_invite_long",
+  "host": {
+    "name": "$name",
+    "user": "$user",
+    "address": "$host",
+    "port": $host_port
+  },
+  "created": "$_now",
+  "updated": "$_now"
+}
+JSON
+)
+        else
+          # Single-pair invite (--no-general / legacy). Same envelope
+          # shape as before — host deletes the gist after the joiner
+          # pairs successfully.
+          _gist_payload=$(cat <<JSON
 {
   "airc": 1,
   "kind": "invite",
@@ -1176,21 +1265,42 @@ EOF
   "created": "$_now"
 }
 JSON
+)
+        fi
+
+        printf '%s\n' "$_gist_payload" > "$_gist_tmp"
         # Secret gist: URL-only-discoverable, not searchable. The gist
         # ID itself is the secret. Same threat model as the long invite:
-        # whoever holds the string can pair.
-        local _gist_url; _gist_url=$(gh gist create -d "airc invite for $name (delete after pair)" "$_gist_tmp" 2>/dev/null | tail -1)
+        # whoever holds the string can pair. Room gists persist; invite
+        # gists should be deleted by the host after the first joiner.
+        local _gist_url; _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
         rm -f "$_gist_tmp"
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
-          echo "  On the other machine (pick whichever is easiest to share):"
-          echo ""
-          echo "    airc connect $_gist_id"
-          [ -n "$_hh" ] && echo "      # mnemonic: $_hh"
-          echo "    airc connect $_invite_long"
-          echo ""
-          echo "  (Gist: $_gist_url — secret, single-use; delete after pairing.)"
+          # Persist the gist id locally so cmd_part can delete the room
+          # gist on graceful host exit (room mode only — invite mode is
+          # one-shot and the joiner-pair flow already prompts cleanup).
+          if [ "$_gist_kind" = "room" ]; then
+            echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+            echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+            echo "  Hosting #${room_name} (gh-account substrate)."
+            echo "  Other agents on your gh account auto-join via:  airc connect"
+            echo "  Cross-account share (rare):"
+            echo "    airc connect $_gist_id"
+            [ -n "$_hh" ] && echo "      # mnemonic: $_hh"
+            echo "    airc connect $_invite_long"
+            echo ""
+            echo "  (Room gist: $_gist_url — persistent; deleted on 'airc part'.)"
+          else
+            echo "  On the other machine (pick whichever is easiest to share):"
+            echo ""
+            echo "    airc connect $_gist_id"
+            [ -n "$_hh" ] && echo "      # mnemonic: $_hh"
+            echo "    airc connect $_invite_long"
+            echo ""
+            echo "  (Gist: $_gist_url — secret, single-use; delete after pairing.)"
+          fi
         else
           echo ""
           echo "  ⚠  Gist push failed (gh auth?). Falling back to long invite:"
@@ -1554,26 +1664,80 @@ cmd_ping() {
 cmd_rooms() {
   if ! command -v gh >/dev/null 2>&1; then
     echo "  airc rooms requires the 'gh' CLI: https://cli.github.com" >&2
+    echo "  airc IS aIRC — github gist is the coordination layer; gh is mandatory." >&2
     return 1
   fi
+  # Match BOTH the persistent IRC-style rooms (#39, prefix `airc room:`)
+  # and the legacy single-pair invites (#37/#38, prefix `airc invite for`).
+  # Show kind explicitly so the AI / human can tell them apart.
   local raw; raw=$(gh gist list --limit 50 2>/dev/null \
-    | awk -F'\t' '/airc invite for/ { print $1 "\t" $2 "\t" $4 }')
+    | awk -F'\t' '
+        /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $4 }
+        /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $4 }
+      ')
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
-    echo "  No open airc rooms found on your gh account."
-    echo "  Host one:  airc connect"
+    echo "  No open airc rooms or invites on your gh account."
+    echo "  Host the default room:  airc connect"
+    echo "  Host a named room:      airc connect --room <name>"
     return 0
   fi
   echo ""
-  echo "  $count open airc room(s):"
+  echo "  $count open on your gh account:"
   echo ""
-  printf '%s\n' "$raw" | while IFS=$'\t' read -r id desc updated; do
+  printf '%s\n' "$raw" | while IFS=$'\t' read -r kind id desc updated; do
     local hh; hh=$(humanhash "$id" 2>/dev/null)
-    printf '    %s\n      %s\n      mnemonic: %s\n      updated:  %s\n\n' \
-      "$id" "$desc" "$hh" "$updated"
+    local marker
+    case "$kind" in
+      room)   marker="#" ;;     # persistent channel
+      invite) marker="(1:1)" ;; # ephemeral pairing
+    esac
+    printf '    %s %s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
+      "$marker" "$desc" "$id" "$hh" "$updated"
   done
-  echo "  Join: airc connect <id>"
+  echo "  Join (auto-resolves on same gh account): airc connect"
+  echo "  Join by id (cross-account share):        airc connect <id>"
   echo ""
+}
+
+# ── cmd_part: leave the current room ──────────────────────────────────
+# Issue #39. Two paths:
+#   - Host: delete the room gist (graceful channel teardown — joiners
+#     will see SSH die and re-host on next reconnect, IRC-style "ircd
+#     restart"). Then teardown local processes.
+#   - Joiner: just teardown local processes. Host's gist stays open for
+#     other joiners (we're one of N).
+# Either way, local config + identity + peer records persist (use
+# `airc teardown --flush` for nuclear).
+cmd_part() {
+  ensure_init
+
+  local gist_id_file="$AIRC_WRITE_DIR/room_gist_id"
+  local room_name_file="$AIRC_WRITE_DIR/room_name"
+  local room_name="(unnamed)"
+  [ -f "$room_name_file" ] && room_name=$(cat "$room_name_file")
+
+  if [ -f "$gist_id_file" ]; then
+    # We were the host. Delete the room gist so future `airc connect`
+    # in this gh account doesn't keep trying to pair against a dead
+    # SSH endpoint.
+    local gid; gid=$(cat "$gist_id_file")
+    if command -v gh >/dev/null 2>&1; then
+      echo "  Host of #${room_name} parting — deleting room gist ${gid}..."
+      gh gist delete "$gid" --yes 2>/dev/null \
+        && echo "  ✓ Room gist deleted." \
+        || echo "  ⚠  Couldn't delete gist ${gid} (already gone? gh auth?). Continuing teardown."
+    else
+      echo "  ⚠  gh CLI not available — can't delete room gist ${gid} automatically."
+      echo "     Delete it manually:  gh gist delete ${gid} --yes"
+    fi
+    rm -f "$gist_id_file" "$room_name_file"
+  else
+    echo "  Joiner of #${room_name} parting — host's gist stays open for others."
+    rm -f "$room_name_file"
+  fi
+
+  cmd_teardown
 }
 
 cmd_send_file() {
@@ -2102,6 +2266,7 @@ case "${1:-help}" in
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
+  part) shift; cmd_part "$@" ;;
   version|--version|-v) cmd_version ;;
   update|upgrade|pull) cmd_update ;;
   logs)      shift; cmd_logs "$@" ;;
@@ -2115,8 +2280,13 @@ case "${1:-help}" in
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo ""
-    echo "  airc connect                    Host — wait for peers"
-    echo "  airc connect <name@user@host>   Join a host"
+    echo "  airc connect                    Auto-#general: join the room on your gh account, or host it"
+    echo "  airc connect --room <name>      Join (or host) a named channel instead of #general"
+    echo "  airc connect --no-general       Single-pair invite mode (legacy 1:1 invite)"
+    echo "  airc connect <gist-id>          Join via shared room/invite gist (cross-account)"
+    echo "  airc connect <name@user@host>   Join via inline invite string (legacy)"
+    echo "  airc rooms / list / ls          List open rooms + invites on your gh account"
+    echo "  airc part                       Leave current room (host: deletes room gist)"
     echo "  airc send <peer> <message>      Send a message"
     echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
     echo "  airc rename <new-name>          Rename this session (notifies peers)"

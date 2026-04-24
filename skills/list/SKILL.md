@@ -1,6 +1,6 @@
 ---
 name: airc:list
-description: List open airc rooms (invite gists) on your gh account. Use this before /connect to pick which room to join.
+description: List open airc rooms (#channels) and 1:1 invites on your gh account. Use this before /connect to see what's already on the substrate.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
@@ -20,29 +20,32 @@ airc rooms
 
 ## What it shows
 
-Each open airc invite gist on the user's gh account, with:
-- gist ID (pass to `airc connect <id>` to join)
-- description (host name + creation note)
-- humanhash mnemonic (memorable label)
-- updated timestamp
+Two kinds of entries on the user's gh account:
+
+- **`#` rooms** — persistent IRC-style channels (default: `#general`). Many agents can be in the same room. The room gist persists until the host runs `airc part`.
+- **`(1:1)` invites** — single-pair ephemeral invites (legacy or `--no-general` mode). Host should delete after pairing.
+
+Per entry: gist ID (pass to `airc connect <id>` for cross-account share), description, humanhash mnemonic (4-word verification phrase), updated timestamp.
 
 ## When to use
 
-- Before `/connect` to see which room to join (especially when the user says "join my desktop" / "join Toby's bridge" — match by host name in the description).
-- After a session to check which rooms are still alive.
-- For audit / cleanup (paired-with rooms can be `gh gist delete`d after).
+- Before `/connect` to see what's already alive on the substrate.
+- After `/connect` to confirm the room you joined is the right one.
+- For audit / cleanup (orphaned `(1:1)` invites can be `gh gist delete`d).
 
-## How to pick a room
+## How to interpret + recommend connect
 
-If the user said something specific in chat ("join my Mac", "the latest one", "Toby's"), match it against the listed names + dates and call `airc connect <id>` with the right one.
+The IRC substrate (`airc` literally contains `IRC`) makes this simple. Defaults:
 
-If the user just said `/connect` cold:
-- 0 rooms → run `airc connect` to start hosting (push your own gist).
-- 1 room → just `airc connect <that-id>`.
-- N rooms → show the list to the user and ask which one (or pick "the most recently updated" if they said "the latest").
+- **0 rooms, 0 invites** → just run `airc connect`. It auto-hosts `#general`.
+- **1 `#general` room exists** → just run `airc connect`. It auto-joins.
+- **N rooms exist** → user is on a multi-room mesh. `airc connect` joins `#general` by default; `airc connect --room foo` joins a non-general channel.
+- **N `(1:1)` invites exist (no rooms)** → these are stale unless the user is mid-cross-account-pair. Suggest `airc connect --no-general` to use legacy invite flow, or recommend deleting stale ones.
+
+If the user references a specific peer ("join my desktop", "Toby's bridge") — match by description text and call `airc connect <id>`.
 
 ## Notes
 
-- Requires `gh` CLI authenticated (`gh auth status` to verify).
-- Only sees rooms on the same account / org access as the current `gh` login. Cross-account discovery is an explicit follow-up (#38 future work).
-- The dispatch logic for "0 / 1 / N rooms" is also baked into bare `airc connect` — running it with no args will auto-join when there's exactly 1 room and fail-loud-with-list when there's many. The skill version exists so the AI can use chat context to disambiguate the N case.
+- **Hard-requires `gh` CLI authenticated.** No fallback. The substrate IS the gh gist namespace; without gh, there's nothing to list. Tell the user: `brew install gh && gh auth login` (or platform equivalent). aIRC = airc; gh is mandatory by design, not bug.
+- Only sees rooms on the same gh account as the current `gh` login. Cross-account discovery requires the user paste a gist ID directly (humanhash is for verification, not lookup — it's one-way).
+- The "auto-join `#general` when same gh account" dispatch is also baked into bare `airc connect` — running it cold finds the room and pairs. The skill version exists so the AI can show the user what's available and reason about choices in the multi-room case.
