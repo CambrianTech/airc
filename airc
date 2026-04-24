@@ -618,6 +618,12 @@ cmd_connect() {
   # entirely; resolved_room_name only gets a value when we resolved a
   # kind:room gist envelope).
   local resolved_room_name=""
+  # _resolved_gist_id is captured by the gist resolver when discovery resolves
+  # a kind:"room" gist. Used by JOIN MODE's self-heal path: if the pair
+  # handshake fails because the host listed in the room gist is unreachable
+  # (sleep/crash/network), the joiner deletes the stale gist and re-execs
+  # itself in host mode — first-agent-back-in becomes the new host.
+  local _resolved_gist_id=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -767,6 +773,45 @@ cmd_connect() {
           fi
           die "Resume aborted — re-pair required"
         else
+          # Non-auth probe failure = TCP unreachable / timeout / network blip.
+          # If we have a saved room_name (i.e. we were in a #general-style
+          # persistent channel), this is likely the prior host going away.
+          # Per Joel's "no claude left behind" rule, take over as new host.
+          # First-agent-back wins; the prior host (if it returns) will
+          # discover OUR fresh gist on next reconnect and join as a peer.
+          local saved_room=""
+          [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+          if [ -n "$saved_room" ] && command -v gh >/dev/null 2>&1; then
+            echo ""
+            echo "  ⚠  Host of #${saved_room} unreachable on resume — self-healing as new host..."
+            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — likely went away)"
+            # Best-effort: delete any stale `airc room: <name>` gists on our
+            # gh account. We don't know the gist id from saved state (the
+            # joiner doesn't track that), so we sweep by description match.
+            # If the gist isn't on our gh (the host was a peer on a different
+            # account), gh-list returns nothing and we silently skip.
+            local stale_ids; stale_ids=$(gh gist list --limit 50 2>/dev/null \
+              | awk -F'\t' -v re="airc room: ${saved_room}\$" '$2 ~ re { print $1 }')
+            if [ -n "$stale_ids" ]; then
+              while IFS= read -r _gid; do
+                [ -z "$_gid" ] && continue
+                gh gist delete "$_gid" --yes 2>/dev/null \
+                  && echo "  ✓ Removed stale gist $_gid" \
+                  || echo "  ⚠  Couldn't delete gist $_gid (already gone? not on this account?)"
+              done <<< "$stale_ids"
+            else
+              echo "  (no #${saved_room} gist on this gh — host was likely cross-account or already cleaned)"
+            fi
+            # Wipe joiner state so re-exec falls into host mode cleanly.
+            rm -f "$CONFIG"
+            rm -f "$AIRC_WRITE_DIR/room_name"
+            echo "  Re-execing into host mode for #${saved_room}..."
+            echo ""
+            exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$saved_room"
+          fi
+          # No saved room (legacy 1:1 invite scope) OR no gh: fall through to
+          # the existing retry-in-monitor behavior. Monitor's retry loop
+          # handles transient outages correctly for the legacy case.
           echo "  Host probe failed (non-auth). Monitor will retry in background." >&2
           echo "  SSH stderr: ${probe_stderr:-<none>}" >&2
         fi
@@ -885,6 +930,10 @@ cmd_connect() {
   # if JSON parse fails. Lets pre-envelope gists keep working.
   if [ -n "$target" ] && ! echo "$target" | grep -q '@'; then
     local gist_id="${target#gist:}"
+    # Capture for self-heal in JOIN MODE: if the host in this gist turns
+    # out to be unreachable, JOIN MODE deletes the gist by this id + takes
+    # over as the new host of the same room.
+    _resolved_gist_id="$gist_id"
     # Gist IDs are hex strings, typically 20-32 chars but accept any
     # plausible length so future GH ID schemes don't break us.
     if echo "$gist_id" | grep -qE '^[a-zA-Z0-9]{6,40}$'; then
@@ -1018,6 +1067,7 @@ EOF
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
 
     local response
+    local _pair_ok=1
     response=$(python3 -c "
 import socket, json, sys
 payload = json.dumps({
@@ -1039,7 +1089,56 @@ while True:
     data += chunk
 sock.close()
 print(data.decode().strip())
-" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+" 2>&1) || _pair_ok=0
+
+    if [ "$_pair_ok" = "0" ]; then
+      # ── Self-heal: stale-host takeover ─────────────────────────────
+      # If discovery handed us a kind:room gist AND the host listed in it
+      # is unreachable, the most likely cause is the prior host went away
+      # (laptop sleep, crash, network blip). Per Joel: "no claude left
+      # behind" — first agent back in becomes the new host of #general.
+      #
+      # Mechanics:
+      #   1. Delete the stale gist (we have gh perms because it's on our
+      #      own gh account, same auth as the discovery that found it).
+      #   2. Tear down the half-written CONFIG that pointed at the dead
+      #      host (else resume on next start would loop into the same
+      #      stale pair).
+      #   3. exec into a fresh airc connect in HOST mode for the same
+      #      room name. AIRC_NO_DISCOVERY=1 so we don't re-find the gist
+      #      we just deleted (gh propagation lag).
+      #
+      # Only fires when ALL three are true:
+      #   - We resolved a kind:room gist (resolved_room_name + _resolved_gist_id non-empty)
+      #   - gh CLI is available (to delete the stale gist)
+      #   - Pair handshake failed (TCP unreachable / timeout)
+      # If any condition isn't met, fall through to the original die().
+      if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
+         && command -v gh >/dev/null 2>&1; then
+        echo ""
+        echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
+        echo "     (prior host's gist: $_resolved_gist_id)"
+        if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
+          echo "  ✓ Stale gist removed."
+        else
+          echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
+          echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+        fi
+        # Wipe the CONFIG we just wrote — it points at the dead host and
+        # would trigger 'resume joiner' on next airc connect, looping back
+        # into this same failure.
+        rm -f "$CONFIG"
+        rm -f "$AIRC_WRITE_DIR/room_name"
+        echo "  Re-execing into host mode for #${resolved_room_name}..."
+        echo ""
+        # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
+        # ensures the new instance doesn't try to re-discover the just-deleted gist
+        # (gh's gist-list cache might still show it for a few seconds).
+        exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$resolved_room_name"
+      fi
+      # Either not a room flow, or no gh, or no resolved_room_name → original die.
+      die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+    fi
 
     # Authorize host's SSH pubkey (for the joiner->host auth direction).
     # NOTE: the handshake's ssh_pub is airc's USER identity key — not the
