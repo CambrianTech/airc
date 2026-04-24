@@ -13,24 +13,33 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 Then in any Claude Code tab:
 
 ```
-/connect                  # host — Claude prints the join string
-/connect <join-string>    # join an existing host
+/connect                  # auto-#general — joins room on your gh account, or hosts it
+/connect <gist-id>        # cross-account: paste a gist id someone else handed you
 ```
 
-The skill spawns `airc connect` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically.
+The skill spawns `airc connect` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically. Same gh account on multiple tabs / machines = zero strings ever passed.
+
+For autostart so the mesh survives sleep/wake/crash:
+
+```bash
+airc daemon install       # via Bash; launchd (mac) / systemd-user (linux)
+```
 
 ## Skills
 
 | Skill | What it does |
 |-------|-------------|
-| `/connect [join]` | Host or join — pairs and starts streaming inbound |
-| `/send <peer> <msg>` | Send to a peer; mirror-first, queues on transient network failure, dies loud on auth failure |
+| `/connect [arg]` | Auto-#general (no arg) or join via gist-id / inline-invite |
+| `/list` (alias `/rooms`) | List open rooms + invites on the user's gh account |
+| `/send [@peer] <msg>` | Broadcast (no `@`) or DM (`@peer`); mirror-first, queues on transient network failure, dies loud on auth failure |
 | `/rename <new>` | Rename this identity, broadcasts `[rename]` to paired peers |
 | `/send-file <peer> <path>` | Send a file via scp under the airc identity key |
-| `/doctor [scenario]` | Run the integration suite |
+| `/doctor [scenario]` | Environment health check (gh + sshd + ports) + integration suite + auto-fix |
+| `/tests [scenario]` | Pure test runner (alias for the test path of /doctor) |
 | `/teardown [--flush]` | Kill THIS scope's airc processes (add `--flush` to also wipe state) |
 | `/repair [invite]` | **Nuclear re-pair** — `teardown --flush` + reconnect. Use when sends mysteriously don't reach anyone. |
 | `/status [--probe]` | Liveness view: monitor, queue, last send/recv, `--probe` does a fast auth check |
+| `/canary` | Switch to canary release channel (opt-in pre-merge testing) |
 
 ## Common failure + fix
 
