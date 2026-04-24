@@ -379,7 +379,18 @@ import sys, json, os, re, time, signal
 # a truly dead channel forces the formatter out and the reconnect loop
 # restarts the ssh. Normal chat traffic keeps resetting the alarm so
 # there is no penalty when the channel is healthy.
-WATCHDOG_SEC = 180
+#
+# Joel 2026-04-24: heartbeat is OFF by default (canary 95d9907), so
+# any idle channel WILL hit the watchdog if WATCHDOG_SEC is short.
+# At 180s, two genuinely-idle peers triggered restart-and-notification
+# every 3 minutes — pure noise that masked real events. 600s (10 min)
+# gives idle conversations breathing room without losing the dead-
+# channel detection (zombie connections still get caught within 10
+# minutes of going truly silent). Ratio: with reminder-interval=300s
+# and heartbeat OFF, the watchdog is now 2x the would-be heartbeat
+# cycle — large enough that any plausibly-alive channel still resets
+# it before firing.
+WATCHDOG_SEC = 600
 def _watchdog_exit(signum, frame):
     # Emit on stdout AS WELL as stderr so the line surfaces in the
     # Monitor task notification stream (which only sees stdout). Without
@@ -475,14 +486,14 @@ def handle_rename(msg, ts):
     old, new, host = m.group(1), m.group(2), m.group(3)
     # Primary path: name-keyed rename.
     if _rename_files(old, new):
-        print(f"airc: nick: {old} → {new}", flush=True)
+        print(f"airc: nick {old} → {new}", flush=True)
         return True
     # Fallback: peer file sits under a different (older) name due to a
     # previous chain break. Resolve via stable host field.
     if host:
         current = _find_peer_by_host(host)
         if current and current != new and _rename_files(current, new):
-            print(f"airc: nick (chain-repair): {current} → {new}", flush=True)
+            print(f"airc: nick (chain-repair) {current} → {new}", flush=True)
             return True
     return False
 
@@ -566,20 +577,27 @@ for line in sys.stdin:
         # cmd_ping picks PONG up by tailing messages.jsonl directly.
         # Suppress to keep the chat surface clean.
         continue
+    # Compact one-liner per event. Every line starts with `airc:` so
+    # the source is unambiguous when other Monitor tasks (continuum,
+    # tests, etc.) are also firing notifications. Long messages
+    # truncate to PREVIEW_LEN; full content stays in messages.jsonl
+    # for `airc logs` audit.
+    PREVIEW_LEN = 100
+    msg_preview = msg.replace("\\n", " ").strip()
+    if len(msg_preview) > PREVIEW_LEN:
+        msg_preview = msg_preview[:PREVIEW_LEN] + "…"
     if fr in ("airc", "sys"):
-        # System events (joins, parts, drain markers, auth failures) keep
-        # the airc-prefixed format — easy to scan past.
-        print(f"[#{room_name}] airc: {msg}", flush=True)
+        # System events (joins, parts, drain, auth, watchdog).
+        # Example:  airc: [#general] alice joined
+        print(f"airc: [#{room_name}] {msg_preview}", flush=True)
+    elif to and to not in ("all", ""):
+        # DM with addressed recipient.
+        # Example:  airc: [#general] bigmama → alice: quick question
+        print(f"airc: [#{room_name}] {fr} → {to}: {msg_preview}", flush=True)
     else:
-        # Real chat: compact IRC-feel format.
-        # Broadcast:  [#general] bigmama: hello everyone
-        # DM:         [#general] bigmama → alice: hey
-        # Joel 2026-04-24: "the goings on of our agents is fascinating
-        # to humans" — keep it readable, drop the verbose ISO timestamp.
-        if to and to not in ("all", ""):
-            print(f"[#{room_name}] {fr} → {to}: {msg}", flush=True)
-        else:
-            print(f"[#{room_name}] {fr}: {msg}", flush=True)
+        # Broadcast.
+        # Example:  airc: [#general] bigmama: hello everyone
+        print(f"airc: [#{room_name}] {fr}: {msg_preview}", flush=True)
 '
 }
 

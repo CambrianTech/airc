@@ -230,7 +230,7 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
   # to 'nick: <old> → <new>' (IRC-canonical). Match the new format; old-format
   # backward-compat is intentionally NOT kept since the wire protocol [rename]
   # marker is what peers actually exchange — only the human-visible print changed.
-  grep -qE 'nick:.*alpha.*gamma|Peer renamed' /tmp/airc-it-j/out.log && pass "beta saw [rename] marker" \
+  grep -qE 'nick.*alpha.*gamma|Peer renamed' /tmp/airc-it-j/out.log && pass "beta saw [rename] marker" \
                                                 || fail "beta did NOT see rename marker"
 
   as_home /tmp/airc-it-j peers 2>/dev/null | grep -q gamma && pass "beta peers shows gamma" \

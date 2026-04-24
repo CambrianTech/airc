@@ -13,7 +13,7 @@ Run this yourself — don't ask the user.
 ## Execute
 
 ```
-Monitor(persistent=true, command="airc join")
+Monitor(persistent=true, description="airc events", command="airc join")
 ```
 
 Wrap with the Monitor tool so inbound streams as Claude Code notifications. `airc join` with no args detects the stored pairing in this scope's config.json and restarts the monitor — no fresh handshake, no join string, no env vars.
