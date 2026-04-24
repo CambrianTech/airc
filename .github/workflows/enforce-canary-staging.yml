@@ -1,0 +1,59 @@
+name: enforce-canary-staging
+
+# Block PRs to main unless they come from `canary` (the staging branch)
+# OR carry the hotfix escape hatch:
+#   - Label any of: hotfix, urgent, emergency
+#   - Title contains "hotfix" (case-insensitive)
+#
+# Discipline: feature work goes canary → main as one integration PR after
+# bigmama / memento / anvil cross-validate. Hotfixes are the audit-visible
+# escape hatch when something needs to skip staging (rare, intentional,
+# show-the-evidence).
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+jobs:
+  require-canary-or-hotfix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR source against staging policy
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          # Lowercase the title so 'HOTFIX', 'Hotfix', 'hotfix' all match.
+          TITLE_LC="$(printf '%s' "$PR_TITLE" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$HEAD_REF" = "canary" ]; then
+            echo "✓ PR source is canary — staging policy satisfied."
+            exit 0
+          fi
+
+          if printf '%s' "$TITLE_LC" | grep -q 'hotfix'; then
+            echo "✓ PR title contains 'hotfix' — hotfix escape hatch satisfied."
+            exit 0
+          fi
+
+          # Labels arrive as a JSON array string. Check for any of the
+          # accepted bypass labels.
+          if printf '%s' "$LABELS" | grep -qE '"(hotfix|urgent|emergency)"'; then
+            echo "✓ PR carries hotfix/urgent/emergency label — escape hatch satisfied."
+            exit 0
+          fi
+
+          echo "::error::PRs to main must come from 'canary' (the staging branch),"
+          echo "::error::OR have 'hotfix' in the title,"
+          echo "::error::OR carry one of the 'hotfix' / 'urgent' / 'emergency' labels."
+          echo "::error::"
+          echo "::error::This PR's head: ${HEAD_REF}"
+          echo "::error::Title:          ${PR_TITLE}"
+          echo "::error::Labels:         ${LABELS}"
+          echo "::error::"
+          echo "::error::Standard flow: open the PR against canary first; after validation,"
+          echo "::error::canary→main is promoted as one integration commit."
+          exit 1
