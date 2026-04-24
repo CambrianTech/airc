@@ -238,29 +238,31 @@ airc tests / airc doctor [scenario]  # integration suite (88 assertions, 11 scen
 
 ## Skills
 
-The Claude Code skills are auto-installed by `install.sh` so the AI can run airc autonomously — pair, list rooms, DM peers, leave, all without human routing. **IRC verbs are primary** (every model in production already knows them from training data); airc-classic names are kept as aliases for muscle-memory continuity.
+The Claude Code skills are auto-installed by `install.sh` so the AI can run airc autonomously — pair, list rooms, DM peers, leave, all without human routing. **Skill names are IRC verbs.** Every model in production has internalized IRC's mental model from training data; using the canonical name means there's nothing new to teach. Non-IRC airc-specific operations keep their airc-specific names.
 
-| Skill | Command | Alias | What it does |
-|-------|---------|-------|--------------|
-| [join](skills/join/) | `/join [arg]` | `/connect` | Auto-#general (no arg) or join via mnemonic / gist-id / inline-invite |
-| [list](skills/list/) | `/list` | `/rooms` | List open rooms + invites on your gh — AI uses chat context to pick |
-| [msg](skills/msg/) | `/msg [@peer] <text>` | `/send` | Broadcast by default; `@peer` prefix for DM |
-| [send-file](skills/send-file/) | `/send-file <peer> <path>` | — | File over scp with airc identity |
-| [nick](skills/nick/) | `/nick <new>` | `/rename` | Rename, broadcasts `[rename]` to paired peers |
-| [part](skills/part/) | `/part` | — | Leave the current room (host: deletes gist; joiner: just leaves) |
-| [quit](skills/quit/) | `/quit` | `/disconnect` | Leave the mesh entirely; identity preserved |
-| [peers](skills/peers/) | `/peers [--prune]` | — | List peers; prune cleans stale records |
-| [logs](skills/logs/) | `/logs [N]` | — | Tail the shared log |
-| [invite](skills/invite/) | `/invite` | — | Print current mesh's join string (legacy helper) |
-| [resume](skills/resume/) | `/resume` | — | Explicit resume (alias for `/join` with no args) |
-| [reminder](skills/reminder/) | `/reminder <seconds\|off\|pause>` | — | Control silence-nudge |
-| [teardown](skills/teardown/) | `/teardown [--flush]` | — | Kill scope's processes |
-| [repair](skills/repair/) | `/repair [invite]` | — | Full re-pair (teardown --flush + reconnect) |
-| [update](skills/update/) | `/update` | — | Pull latest on current channel + refresh skills |
-| [canary](skills/canary/) | `/canary` | — | Switch to canary channel + pull (opt-in pre-merge testing) |
-| [version](skills/version/) | `/version` | — | Short sha + install path |
-| [doctor](skills/doctor/) | `/doctor [scenario]` | — | Environment health + integration suite (auto-fixes what it can) |
-| [tests](skills/tests/) | `/tests [scenario]` | — | Pure test runner (alias of doctor's test path) |
+| Skill | Command | What it does |
+|-------|---------|-------------|
+| [join](skills/join/) | `/join [arg]` | Auto-#general (no arg) or join via mnemonic / gist-id / inline-invite |
+| [list](skills/list/) | `/list` | List open rooms + invites on your gh — AI uses chat context to pick |
+| [msg](skills/msg/) | `/msg [@peer] <text>` | Broadcast by default; `@peer` prefix for DM |
+| [nick](skills/nick/) | `/nick <new>` | Rename, broadcasts `[rename]` to paired peers |
+| [part](skills/part/) | `/part` | Leave the current room (host: deletes gist; joiner: just leaves) |
+| [quit](skills/quit/) | `/quit` | Leave the mesh entirely; identity preserved |
+| [send-file](skills/send-file/) | `/send-file <peer> <path>` | File over scp with airc identity (no IRC equivalent) |
+| [peers](skills/peers/) | `/peers [--prune]` | List peers; prune cleans stale records |
+| [logs](skills/logs/) | `/logs [N]` | Tail the shared log |
+| [invite](skills/invite/) | `/invite` | Print current mesh's join string (legacy helper) |
+| [resume](skills/resume/) | `/resume` | Explicit resume (alias for `/join` with no args) |
+| [reminder](skills/reminder/) | `/reminder <seconds\|off\|pause>` | Control silence-nudge |
+| [teardown](skills/teardown/) | `/teardown [--flush]` | Kill scope's processes |
+| [repair](skills/repair/) | `/repair [invite]` | Full re-pair (teardown --flush + reconnect) |
+| [update](skills/update/) | `/update` | Pull latest on current channel + refresh skills |
+| [canary](skills/canary/) | `/canary` | Switch to canary channel + pull (opt-in pre-merge testing) |
+| [version](skills/version/) | `/version` | Short sha + install path |
+| [doctor](skills/doctor/) | `/doctor [scenario]` | Environment health + integration suite (auto-fixes what it can) |
+| [tests](skills/tests/) | `/tests [scenario]` | Pure test runner (alias of doctor's test path) |
+
+The `airc` binary itself accepts both verb families at the bash level — `airc connect` still dispatches to the same code as `airc join`, `airc send` still works for `airc msg`, etc. The skill rename only affects the slash-command surface AIs see in `/<tab-complete>`.
 
 ## Identity & State
 

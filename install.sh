@@ -116,8 +116,12 @@ fi
 if [ -d "$CLONE_DIR/skills" ]; then
   mkdir -p "$SKILLS_TARGET"
 
-  # Clean up old symlinks from previous installs
-  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup "$SKILLS_TARGET"/uninstall "$SKILLS_TARGET"/update; do
+  # Clean up old symlinks from previous installs.
+  # Includes the airc-classic skill names (connect/send/rename/disconnect) that
+  # were renamed to IRC-canonical (join/msg/nick/quit) — leaving the old symlinks
+  # in place would shadow the new skills with stale content.
+  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup "$SKILLS_TARGET"/uninstall \
+             "$SKILLS_TARGET"/connect "$SKILLS_TARGET"/send "$SKILLS_TARGET"/rename "$SKILLS_TARGET"/disconnect; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
