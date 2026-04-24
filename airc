@@ -121,11 +121,7 @@ get_host() {
   # coordination without dragging guests into their tailnet.
   local ts_bin=""
   if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
-    if command -v tailscale >/dev/null 2>&1; then
-      ts_bin="tailscale"
-    elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
-      ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-    fi
+    ts_bin=$(resolve_tailscale_bin || true)
   fi
   if [ -n "$ts_bin" ]; then
     local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
@@ -166,6 +162,163 @@ finally:
   fi
 
   hostname
+}
+
+# Resolve the path to a working tailscale CLI binary across platforms.
+# Returns the path on stdout, or empty if not found. Used by both
+# get_host (Tailscale-IP detection) and advise_tailscale_if_down (down
+# diagnosis). Without this helper, each callsite did `command -v
+# tailscale` only, which silently fails on Windows / Git Bash where
+# the executable is `tailscale.exe` and PATHEXT handling is unreliable —
+# resulting in false "Tailscale appears down" advice when it's actually
+# up. Joel 2026-04-24: "now says your tailscale is down" — that was
+# this bug.
+resolve_tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then
+    echo "tailscale"
+    return 0
+  fi
+  # Windows / Git Bash: command -v doesn't always honor PATHEXT, and
+  # the executable is .exe-suffixed.
+  if command -v tailscale.exe >/dev/null 2>&1; then
+    echo "tailscale.exe"
+    return 0
+  fi
+  # Known-path fallbacks. Both common Windows install locations + the
+  # macOS .app bundle. Order matters: try the cheap PATH cases first.
+  local candidate
+  for candidate in \
+    "/c/Program Files/Tailscale/tailscale.exe" \
+    "/mnt/c/Program Files/Tailscale/tailscale.exe" \
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_peer_offline_in_tailnet() {
+  # Return 0 if we can CONFIRM the peer at $1 (a Tailscale CGNAT IP) is
+  # offline according to our local tailscale status. Return 1 in every
+  # other case (online, unknown, not a CGNAT target, no tailscale CLI).
+  #
+  # Used as a fast-path gate in cmd_send: when tailscale already knows
+  # the peer is offline, skip the 10s ssh ConnectTimeout and queue
+  # straight away with a cleaner "peer offline, will auto-deliver when
+  # they return" marker. flush_pending_loop + the monitor reconnect
+  # both already handle the drain side — we're just not wasting the
+  # user's time blocking on a predictable failure.
+  local target_host="${1:-}"
+  [ -z "$target_host" ] && return 1
+  # CGNAT range only. LAN / DNS targets fall through to the normal path.
+  case "$target_host" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
+    *) return 1 ;;
+  esac
+  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  [ -z "$ts_bin" ] && return 1
+  # `tailscale status` plain-text format:
+  #   <IP>  <hostname>  <owner>  <os>  <state...>
+  # When a peer is offline the state column includes the literal word
+  # "offline" followed by "last seen …". Match the target IP at column 1
+  # + the word offline anywhere on that line. No JSON parse dependency
+  # (keeps the pure-shell constraint).
+  "$ts_bin" status 2>/dev/null \
+    | awk -v ip="$target_host" '$1 == ip && /offline/ { found=1 } END { exit !found }'
+}
+
+advise_tailscale_if_down() {
+  # When the saved pairing points at a Tailscale CGNAT address (100.64/10)
+  # and the local Tailscale daemon is NOT running, `airc join` silently
+  # hangs in the SSH probe's ConnectTimeout, then the monitor loop retries
+  # forever, and every `airc msg` queues with no visible sign that THE
+  # USER has to start their tailnet. Silent queue is the opposite of fail-
+  # loud.
+  #
+  # Fix: detect-and-instruct. Do NOT install tailscale. Do NOT sudo. Do
+  # NOT prompt. Just print the platform-appropriate one-liner the user
+  # runs themselves, then return non-zero so the caller exits instead of
+  # falling into retry-silence.
+  #
+  # Scope:
+  #   - only fires when target is 100.64.0.0/10 (Tailscale CGNAT)
+  #   - LAN peers / localhost / DNS-name targets skip entirely
+  #   - AIRC_NO_TAILSCALE=1 short-circuits for LAN-only workflows
+  [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
+  local target_host="${1:-}"
+  [ -z "$target_host" ] && return 0
+  case "$target_host" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
+    *) return 0 ;;
+  esac
+
+  # CLI present AND daemon up? fall through — if the SSH probe still
+  # fails it's a peer-offline problem, not a tailnet-down problem.
+  # resolve_tailscale_bin() handles Windows tailscale.exe + the macOS
+  # .app bundle path that PATH lookups miss.
+  local ts_bin; ts_bin=$(resolve_tailscale_bin)
+  if [ -n "$ts_bin" ] && "$ts_bin" status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "" >&2
+  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale appears down on this machine." >&2
+  echo "" >&2
+  if [ -z "$ts_bin" ]; then
+    echo "   Tailscale is not installed. airc needs it only for cross-machine mesh." >&2
+    echo "   Install:" >&2
+    echo "     https://tailscale.com/download" >&2
+    echo "   Or via package manager:" >&2
+    echo "     curl -fsSL https://tailscale.com/install.sh | sh" >&2
+    echo "" >&2
+    echo "   After install, bring the tailnet up and re-run airc join." >&2
+    return 1
+  fi
+
+  # CLI present, daemon down → platform-specific start instruction.
+  local uname_s; uname_s=$(uname -s 2>/dev/null || echo "")
+  local uname_r; uname_r=$(uname -r 2>/dev/null || echo "")
+  echo "   Tailscale CLI is installed but the daemon is not running. Start it:" >&2
+  case "$uname_s" in
+    Darwin)
+      echo "     (macOS) Click the Tailscale tray icon to start the app, or if you" >&2
+      echo "     installed the CLI-only build:" >&2
+      echo "       sudo launchctl kickstart -k system/com.tailscale.tailscaled" >&2
+      ;;
+    Linux)
+      case "$uname_r" in
+        *microsoft*|*WSL*|*wsl*)
+          echo "     (WSL2) WSL has no systemd by default — run tailscaled directly:" >&2
+          echo "       sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &" >&2
+          echo "       sudo tailscale up --ssh --accept-routes" >&2
+          echo "     Or if Tailscale is installed on the Windows side, start it" >&2
+          echo "     from the Windows tray icon (WSL2 will use the Windows-side" >&2
+          echo "     daemon when routing allows)." >&2
+          ;;
+        *)
+          if [ -d /run/systemd/system ]; then
+            echo "     (Linux) sudo systemctl start tailscaled" >&2
+            echo "             sudo tailscale up --ssh --accept-routes" >&2
+          else
+            echo "     (Linux, no systemd) sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &" >&2
+            echo "                         sudo tailscale up --ssh --accept-routes" >&2
+          fi
+          ;;
+      esac
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      echo "     (Windows Git Bash) Click the Tailscale tray icon to start the service." >&2
+      ;;
+    *)
+      echo "     sudo tailscaled &   # background the daemon" >&2
+      echo "     sudo tailscale up   # join the tailnet" >&2
+      ;;
+  esac
+  echo "" >&2
+  echo "   Then re-run: airc join" >&2
+  return 1
 }
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -948,6 +1101,17 @@ cmd_connect() {
     if [ -n "$prior_host_target" ]; then
       local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
       echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
+
+      # Tailscale-down pre-flight: when the saved host is a Tailscale
+      # CGNAT address and the local daemon isn't running, the SSH probe
+      # below would block on ConnectTimeout, the monitor retry loop would
+      # keep retrying forever, and every subsequent `airc msg` would queue
+      # with a cryptic "connection timed out." Surface the real cause
+      # with a platform-appropriate start command so the user can fix it
+      # and re-run. No install, no sudo, no prompt — just instruct + exit.
+      if ! advise_tailscale_if_down "$prior_host_target"; then
+        die "Re-run airc join after starting Tailscale."
+      fi
 
       # Auth probe BEFORE committing to the monitor loop. Prior behavior
       # went straight into tail-over-SSH; if auth was broken (stale keys
@@ -1936,6 +2100,22 @@ cmd_send() {
     # This prevents silent loss where both sides forget a message that
     # never arrived.
     echo "$full_msg" >> "$MESSAGES"
+
+    # Fast-path: when tailscale status already reports this peer offline,
+    # don't burn 10s on the ssh ConnectTimeout — queue immediately with a
+    # cleaner "peer offline in tailnet" marker. flush_pending_loop +
+    # monitor reconnect handle the drain automatically when the peer
+    # wakes. Skipped entirely for non-CGNAT targets, LAN peers, or when
+    # tailscale CLI is unavailable (falls through to normal ssh attempt).
+    if is_peer_offline_in_tailnet "$host_target"; then
+      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — peer offline in tailnet, auto-delivers on wake]"}' \
+        "$(timestamp)" "$peer_name")
+      echo "$queue_marker" >> "$MESSAGES"
+      date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+      rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+      return 0
+    fi
 
     # Attempt the wire. Trust the remote's __APPENDED__ marker — some shells
     # bubble benign ssh stderr warnings up as non-zero exit, but the append
