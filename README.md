@@ -119,19 +119,14 @@ macOS launchd or Linux systemd-user takes over. `airc join` runs at login + rest
 
 ### Cross-account (Toby has a different gh org)
 
-**You** — `airc list` shows the gist id of `#general`. Hand it to Toby:
-```
-2f6a907224f4b88d236fda8ca16d37c4
-mnemonic: oregon-uncle-bravo-eleven
-```
+**You** — `airc list` prints a 4-word mnemonic for `#general` (e.g. `oregon-uncle-bravo-eleven`). Read it to Toby over the phone or paste it in chat.
 
 **Toby:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
-airc join 2f6a907224f4b88d236fda8ca16d37c4
+airc join oregon-uncle-bravo-eleven
 ```
 
-Done. The mnemonic is the verification phrase ("did you get the right one?"); the id is what airc actually uses.
+Done. Toby's airc resolves the mnemonic to the gist on your gh account, fetches the room invite, pairs over Tailscale (or whatever IP fabric you both share). If the mnemonic doesn't resolve from his side (cross-account gh visibility), `airc list` on yours also shows the raw gist id as a fallback to paste.
 
 ### Legacy 1:1 invite (if you want the old behavior — one-shot pairing, no persistent room)
 
