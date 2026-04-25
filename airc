@@ -1296,6 +1296,42 @@ cmd_connect() {
         die "Re-run airc join after starting Tailscale."
       fi
 
+      # Stale-pairing detect (#83): if we resolved into the room via a
+      # gist (joiner-side gist_id was cached at pair time) and that gist
+      # is now gone or replaced, the room dissolved or got rehosted —
+      # the cached host_target is stale even if TCP would still answer.
+      # Catch this BEFORE SSH probe so we self-heal cleanly instead of
+      # silently re-pairing against a dead-but-reachable host or
+      # accidentally landing in a different room.
+      local _saved_gist_id=""
+      [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _saved_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
+      local _saved_room_resume=""
+      [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_resume=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+      if [ -n "$_saved_gist_id" ] && command -v gh >/dev/null 2>&1; then
+        if ! gh api "gists/$_saved_gist_id" >/dev/null 2>&1; then
+          # Gist gone (host parted, or peer self-healed and replaced it).
+          # Trigger fresh discovery: clear the stale joiner state and
+          # re-exec ourselves into airc connect, which will re-resolve
+          # via the room name (or fall through to host-mode if no room
+          # gist exists — first-back-in-becomes-new-host).
+          echo ""
+          echo "  ⚠  Saved room gist ($_saved_gist_id) no longer on your gh — room dissolved or rehosted."
+          if [ -n "$_saved_room_resume" ]; then
+            echo "  Re-discovering #${_saved_room_resume} via fresh gist lookup..."
+          else
+            echo "  Re-pairing via fresh discovery..."
+          fi
+          # Wipe stale joiner state. Identity + peer records persist.
+          rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_gist_id"
+          local _preserved_name; _preserved_name=$(get_name 2>/dev/null || echo "")
+          if [ -n "$_saved_room_resume" ]; then
+            exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$_saved_room_resume"
+          else
+            exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect
+          fi
+        fi
+      fi
+
       # Auth probe BEFORE committing to the monitor loop. Prior behavior
       # went straight into tail-over-SSH; if auth was broken (stale keys
       # after reinstall, authorized_keys rotation on host), ssh exited 255
@@ -1867,6 +1903,14 @@ record = {
 with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
+
+    # If we resolved this pair via gist discovery (vs. inline-invite),
+    # persist the gist id so resume-time freshness checks can detect a
+    # gist-deletion / replacement before re-pairing against a stale host
+    # (issue #83). Cleared by cmd_part on graceful leave.
+    if [ -n "$_resolved_gist_id" ]; then
+      echo "$_resolved_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+    fi
 
     # Persist host details in own config so `airc invite` can reconstruct
     # the join string for onward sharing without a fresh handshake. Also
@@ -4157,7 +4201,7 @@ _doctor_connect_preflight() {
     printf "  [BLOCKED] gh authenticated\n"
     printf "         Fix: gh auth login -s gist\n"
     issues=$((issues+1))
-  elif ! gh auth status 2>&1 | grep -qiE "(scopes:|token scopes:)[^\\n]*\\bgist\\b"; then
+  elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))

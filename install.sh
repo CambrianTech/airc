@@ -45,6 +45,19 @@ detect_pkgmgr() {
       if command -v pacman  >/dev/null 2>&1; then echo "pacman"; return; fi
       if command -v apk     >/dev/null 2>&1; then echo "apk";    return; fi
       ;;
+    MINGW*|MSYS*|CYGWIN*|MINGW64*)
+      # Windows Git Bash / MSYS2 / Cygwin. winget is the standard
+      # package manager on modern Windows and what install.ps1 uses;
+      # it's reachable from Git Bash as winget.exe via PATH or as
+      # `cmd /c winget`. If winget isn't there (older Win10), fall
+      # through to the unknown branch which emits the manual prereq
+      # list. Issue #83 follow-up: pre-fix, install.sh on Git Bash
+      # said "Unknown package manager (uname=MINGW64_NT-10.0-26200)"
+      # and skipped prereq install entirely.
+      if command -v winget.exe >/dev/null 2>&1 || command -v winget >/dev/null 2>&1; then
+        echo "winget"; return
+      fi
+      ;;
   esac
   echo "unknown"
 }
@@ -61,11 +74,28 @@ pkgname_for() {
         dnf)    echo "openssh-clients" ;;
         pacman) echo "openssh" ;;
         apk)    echo "openssh-client" ;;
+        winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
+      esac ;;
+    openssl)
+      case "$mgr" in
+        winget) echo "" ;;  # bundled with Git for Windows; if Git is installed, openssl is there
+        *)      echo "openssl" ;;
       esac ;;
     python3)
       case "$mgr" in
         pacman) echo "python" ;;
+        winget) echo "Python.Python.3.12" ;;
         *)      echo "python3" ;;
+      esac ;;
+    git)
+      case "$mgr" in
+        winget) echo "Git.Git" ;;
+        *)      echo "git" ;;
+      esac ;;
+    gh)
+      case "$mgr" in
+        winget) echo "GitHub.cli" ;;
+        *)      echo "gh" ;;
       esac ;;
     *) echo "$prereq" ;;
   esac
@@ -81,6 +111,18 @@ install_with_pkgmgr() {
     dnf)    sudo dnf install -y "${pkgs[@]}" ;;
     pacman) sudo pacman -S --noconfirm --needed "${pkgs[@]}" ;;
     apk)    sudo apk add --no-cache "${pkgs[@]}" ;;
+    winget)
+      # winget on Git Bash: install one ID at a time, --accept-* flags so
+      # it doesn't prompt during the script. winget.exe is the binary;
+      # plain `winget` works if PATHEXT is honored.
+      local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+      [ -z "$wbin" ] && return 1
+      local pkg
+      for pkg in "${pkgs[@]}"; do
+        [ -z "$pkg" ] && continue
+        "$wbin" install --id "$pkg" --silent --accept-source-agreements --accept-package-agreements 2>&1 \
+          || warn "winget install $pkg returned non-zero (may already be installed; continuing)"
+      done ;;
     *)      return 1 ;;
   esac
 }

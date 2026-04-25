@@ -1337,7 +1337,7 @@ function Invoke-DoctorConnectPreflight {
             $script:DoctorIssues += 'gh-auth'
         } else {
             $authStatus = & gh auth status 2>&1 | Out-String
-            if ($authStatus -notmatch '(?im)^\s*(?:Token scopes|scopes):.*\bgist\b') {
+            if ($authStatus -notmatch '(?i)(?:Token scopes|scopes):.*\bgist\b') {
                 Write-Host "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)"
                 Write-Host '         Fix: gh auth refresh -s gist'
                 $script:DoctorIssues += 'gh-gist-scope'
@@ -2125,6 +2125,44 @@ function Invoke-Connect {
             if (Advise-TailscaleIfDown -TargetHost $priorHost) {
                 Die 'Re-run airc join after starting Tailscale.'
             }
+
+            # Stale-pairing detect (#83): if we resolved into the room
+            # via gist discovery (joiner-side gist_id was cached at pair
+            # time) and that gist is now gone or replaced, the room
+            # dissolved or got rehosted. Catch BEFORE SSH probe so we
+            # self-heal cleanly instead of silently re-pairing against
+            # a dead-but-reachable host or the wrong room.
+            $savedGistFile = Join-Path $AIRC_WRITE_DIR 'room_gist_id'
+            $savedRoomFile = Join-Path $AIRC_WRITE_DIR 'room_name'
+            if ((Test-Path $savedGistFile) -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+                $savedGistId = (Get-Content $savedGistFile -Raw -ErrorAction SilentlyContinue).Trim()
+                if ($savedGistId) {
+                    & gh api "gists/$savedGistId" 2>$null | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        $savedRoom = ''
+                        if (Test-Path $savedRoomFile) {
+                            $savedRoom = (Get-Content $savedRoomFile -Raw -ErrorAction SilentlyContinue).Trim()
+                        }
+                        Write-Host ''
+                        Write-Host "  ! Saved room gist ($savedGistId) no longer on your gh -- room dissolved or rehosted."
+                        if ($savedRoom) {
+                            Write-Host "  Re-discovering #$savedRoom via fresh gist lookup..."
+                        } else {
+                            Write-Host '  Re-pairing via fresh discovery...'
+                        }
+                        # Wipe stale joiner state (identity + peers persist).
+                        Remove-Item -Force $CONFIG -ErrorAction SilentlyContinue
+                        Remove-Item -Force $savedGistFile -ErrorAction SilentlyContinue
+                        $preservedName = Get-Name 2>$null
+                        $reExecArgs = @('connect')
+                        if ($savedRoom) { $reExecArgs += @('--room', $savedRoom) }
+                        if ($preservedName) { $env:AIRC_NAME = $preservedName }
+                        & $PSCommandPath @reExecArgs
+                        exit $LASTEXITCODE
+                    }
+                }
+            }
+
             # Auth probe before committing to monitor loop
             $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
             $probeErr = [System.IO.Path]::GetTempFileName()
@@ -2376,6 +2414,14 @@ function Invoke-Connect {
             host_name      = $peerName
             host_port      = $peerPort
             host_ssh_pub   = $resp.ssh_pub
+        }
+
+        # If we resolved this pair via gist discovery (vs. inline-invite),
+        # persist the gist id so resume-time freshness checks (#83) can
+        # detect a gist-deletion / replacement before re-pairing against
+        # a stale host. Cleared by Invoke-Part on graceful leave.
+        if ($resolvedGistId) {
+            Set-Content -Path (Join-Path $AIRC_WRITE_DIR 'room_gist_id') -Value $resolvedGistId -NoNewline
         }
 
         # Reminder from host
