@@ -310,6 +310,12 @@ is_peer_offline_in_tailnet() {
   # user's time blocking on a predictable failure.
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 1
+  # Strip leading user@ if present — host_target is stored as `user@host`
+  # in config.json, but the CGNAT match below only recognizes strings
+  # starting with 100.x. Without this strip, every call from a resume
+  # path silently bypassed the CGNAT gate (issue #78 root cause, caught
+  # in PR #84 Copilot review).
+  target_host="${target_host##*@}"
   # CGNAT range only. LAN / DNS targets fall through to the normal path.
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
@@ -347,6 +353,10 @@ advise_tailscale_if_down() {
   [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 0
+  # Strip leading user@ if present — host_target from config.json is
+  # `user@host` form. Without this strip, every resume-path call
+  # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+  target_host="${target_host##*@}"
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
     *) return 0 ;;
@@ -1648,6 +1658,19 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 
     # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
+
+    # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
+    # Resume path (line ~1241) already calls advise_tailscale_if_down, but
+    # that gate doesn't cover (a) cold-start `airc join <invite>` from a
+    # fresh scope or (b) the gist-discovery resolution that lands here
+    # with a tailnet host_target. Without this check, a logged-out
+    # Tailscale produced a silent unreachable-host + self-heal cascade
+    # (issue #78, Memento's case 2026-04-25). Same call site shape as the
+    # resume path: detect-and-instruct, do not auto-tailscale-up.
+    if ! advise_tailscale_if_down "$peer_host_only"; then
+      die "Re-run airc join after starting Tailscale."
+    fi
+
     echo "  Connecting to $peer_host_only:$peer_port..."
     local my_ssh_pub my_sign_pub
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
