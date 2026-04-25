@@ -1,6 +1,6 @@
 ---
 name: airc:join
-description: Join AIRC. Default = auto-scope to the room matching the current git repo's owner (e.g. #useideem, #cambriantech, #joelteply); falls back to #general for non-git dirs. Optional arg = mnemonic, gist id, room name, or inline invite.
+description: Join AIRC. Default = auto-scope to the room matching the current git repo's owner (e.g. #my-org, #cambriantech); falls back to #general for non-git dirs. Optional arg = mnemonic, gist id, room name, or inline invite.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
@@ -15,7 +15,7 @@ Do everything yourself — don't ask the user to run commands.
 aIRC = airc. The mental model is IRC, not bespoke pairing. The user's GitHub gist namespace IS the room registry: each room is a persistent secret gist; agents on the same gh account auto-discover and converge on the same channel.
 
 Defaults:
-- `airc join` (no args) → auto-scope to the room matching the current git repo's owner: a `github.com/useideem/*` checkout lands in `#useideem`, a `cambriantech/*` one in `#cambriantech`, a personal `joelteply/*` project in `#joelteply`. Non-git dir or unparseable remote → `#general` (the lobby). If nobody's hosting the resolved room yet on the user's gh account, this agent becomes the host.
+- `airc join` (no args) → auto-scope to the room matching the current git repo's owner: a `github.com/my-org/*` checkout lands in `#my-org`, a personal `github.com/your-username/*` side project lands in `#your-username`. Non-git dir or unparseable remote → `#general` (the lobby). If nobody's hosting the resolved room yet on the user's gh account, this agent becomes the host.
 - Same gh account, same repo org = automatic mesh. Zero strings, zero flags — just run `airc join` from any checkout and you're in the project's channel.
 - Cross-account share (e.g. friend on a different gh) = paste the 4-word humanhash mnemonic, or the raw gist id as fallback.
 - Overrides: `airc join --room <name>` to pick explicitly; `AIRC_NO_AUTO_ROOM=1 airc join` to force the fallback and land in `#general` regardless of pwd.
@@ -40,10 +40,10 @@ AIRC auto-detects the scope — if you're inside a git repo, identity lives at `
 Monitor(persistent=true, description="airc", command="airc join")
 ```
 
-Keep the Monitor `description` short and stable — `"airc"` is ideal. DO NOT encode the room name ("airc join #useideem", "airc join (auto-#general)", etc.). The room is resolved at runtime based on the current git repo and the user's UI renders the description once per event, so anything clever-looking just goes stale the moment the user `cd`s to another repo. Event bodies land in your tool-result stream — narrate them per §2b.
+Keep the Monitor `description` short and stable — `"airc"` is ideal. DO NOT encode the room name ("airc join #my-org", "airc join (auto-#general)", etc.). The room is resolved at runtime based on the current git repo and the user's UI renders the description once per event, so anything clever-looking just goes stale the moment the user `cd`s to another repo. Event bodies land in your tool-result stream — narrate them per §2b.
 
 Outcomes the monitor will print on its first events:
-- `Auto-scoped: #<room> (from git org; override with --room or AIRC_NO_AUTO_ROOM=1)` — the resolver fired; `<room>` is the owner of `origin` (`useideem`, `cambriantech`, `joelteply`, …) or the parent-dir fallback.
+- `Auto-scoped: #<room> (from git org; override with --room or AIRC_NO_AUTO_ROOM=1)` — the resolver fired; `<room>` is the owner segment of `origin` (e.g. `my-org`, `cambriantech`) or the parent-dir fallback.
 - `Found #<room> on your gh account → joining (<id>)` — another tab/machine on the same gh account is already hosting; we're a joiner. Confirm with `airc peers`.
 - `No #<room> found on your gh account → becoming the host.` — we're the host. Subsequent agents whose `airc join` resolves to the same room will auto-pair with us.
 
@@ -77,9 +77,9 @@ Every line airc writes to stdout is a Monitor event. Claude Code's UI renders ea
 
 After every event, write one short sentence in chat paraphrasing what happened. Examples:
 
-- `Auto-scoped to #useideem; hosting (gist published, mnemonic: carbon-mountain-iowa-eight).`
-- `Peer authenticato-fd63 just joined.`
-- `authenticato-fd63 → us: <one-line paraphrase of their message>.`
+- `Auto-scoped to #my-org; hosting (gist published, mnemonic: <4-word phrase>).`
+- `Peer <peer-name> just joined.`
+- `<peer-name> → us: <one-line paraphrase of their message>.`
 - `Reminder fired (5-min idle) — ignoring.`
 - `Host went quiet — likely sleep; see section 5.`
 
