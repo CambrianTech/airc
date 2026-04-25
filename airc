@@ -3906,18 +3906,25 @@ cmd_daemon_log() {
 }
 
 cmd_doctor() {
-  # Two modes:
+  # Three modes:
   #   airc doctor           -- environment health check (default).
   #                            Probes each prereq and prints the exact
   #                            install command for whichever package
   #                            manager this platform uses, so any AI
   #                            reading the output can `proactively fix
   #                            recoverable issues` (per /doctor SKILL.md).
+  #   airc doctor --connect -- pre-flight before `airc connect`. Runs
+  #                            the default health probes PLUS connect-
+  #                            specific checks (tailscale UP not just
+  #                            installed, gist API reachable, port free,
+  #                            cached host_target reachable). Issue #80.
+  #                            Use case: airc doctor --connect && airc connect
   #   airc doctor --tests   -- run the integration test suite (the
   #   airc doctor tests        prior default behavior; aliased on the
   #                            dispatch via `tests|test`).
   case "${1:-}" in
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
+    --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
   esac
 
   echo ""
@@ -4060,6 +4067,120 @@ _doctor_probe_tailscale() {
   printf "  [info] tailscale (optional) -- not installed; only needed for cross-LAN mesh\n"
   printf "         Install: %s\n" "$fix"
   return 0
+}
+
+_doctor_connect_preflight() {
+  # Pre-flight check before `airc connect`. Issue #80. Runs the default
+  # prereq probes PLUS connect-specific checks. Output is a checklist
+  # with fix commands; exit non-zero if any blocking issue. Use case:
+  #
+  #   airc doctor --connect && airc connect
+  #
+  # Catches the silent-fail classes that produced #78 / #85 / #79
+  # cascades for first-time users and surfaced as detective-work bugs.
+  echo ""
+  echo "  airc doctor --connect -- pre-flight checks"
+  echo "  ------------------------------------------"
+  echo ""
+  local issues=0
+  local mgr; mgr=$(_doctor_detect_pkgmgr)
+
+  # ── Required prereqs (same as default doctor) ──
+  _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
+  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"    || issues=$((issues+1))
+  _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
+  _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
+  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
+
+  # ── gh chain: installed → authed → gist scope → gists API reachable.
+  # Single chain (early-return on first failure) so a missing gh isn't
+  # counted 3-4x as a separate issue per dependent probe. Gist scope is
+  # checked explicitly because `gh auth status` alone passes for a
+  # gist-scope-less token (Copilot caught this on #87 review).
+  if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
+    issues=$((issues+1))
+  elif ! gh auth status >/dev/null 2>&1; then
+    printf "  [BLOCKED] gh authenticated\n"
+    printf "         Fix: gh auth login -s gist\n"
+    issues=$((issues+1))
+  elif ! gh auth status 2>&1 | grep -qiE "(scopes:|token scopes:)[^\\n]*\\bgist\\b"; then
+    printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
+    printf "         Fix: gh auth refresh -s gist\n"
+    issues=$((issues+1))
+  elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
+    printf "  [BLOCKED] gist API not reachable -- network outage or rate-limit\n"
+    printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    issues=$((issues+1))
+  else
+    printf "  [ok] gh authed with gist scope, gists API reachable\n"
+  fi
+
+  # ── Connect-specific: tailscale state. The default doctor only marks
+  # tailscale as "info" since it's optional for LAN-only mesh. In
+  # --connect mode, if there's a saved host_target in tailnet CGNAT
+  # range, Tailscale being UP is a HARD requirement.
+  local prior_host_target=""
+  [ -f "$CONFIG" ] && prior_host_target=$(get_config_val host_target "")
+  local prior_host_only="${prior_host_target##*@}"
+  local target_is_cgnat=0
+  case "$prior_host_only" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) target_is_cgnat=1 ;;
+  esac
+  if [ "$target_is_cgnat" = "1" ]; then
+    # Use resolve_tailscale_bin so the .app-bundle / Program Files paths
+    # are checked, not just PATH (consistency with the rest of airc).
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      if "$ts_bin" status >/dev/null 2>&1; then
+        printf "  [ok] tailscale UP (cached host_target is tailnet CGNAT)\n"
+      else
+        printf "  [BLOCKED] tailscale CLI installed but DOWN -- cached host is tailnet, can't reach\n"
+        printf "         Fix: tailscale up\n"
+        issues=$((issues+1))
+      fi
+    else
+      printf "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach\n"
+      printf "         Fix: install tailscale (https://tailscale.com/download), then 'tailscale up'\n"
+      issues=$((issues+1))
+    fi
+  else
+    _doctor_probe_tailscale "$mgr"  # optional, info-only
+  fi
+
+  # ── Connect-specific: AIRC_PORT free or auto-shift available ──
+  local target_port="${AIRC_PORT:-7547}"
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
+      printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
+    else
+      printf "  [ok] port %s available for hosting\n" "$target_port"
+    fi
+  fi
+
+  # ── Connect-specific: cached host_target reachable (resume scenario) ──
+  if [ -n "$prior_host_target" ]; then
+    local probe_key="$IDENTITY_DIR/ssh_key"
+    if [ -f "$probe_key" ]; then
+      if ssh -i "$probe_key" -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=3 -o BatchMode=yes \
+              "$prior_host_target" "echo __PROBE_OK__" 2>/dev/null | grep -q __PROBE_OK__; then
+        printf "  [ok] cached host %s reachable + auth works\n" "$prior_host_target"
+      else
+        printf "  [warn] cached host %s not reachable -- may need re-pair\n" "$prior_host_target"
+        printf "         Fix: airc teardown --flush && airc join (fresh pairing)\n"
+        # Not blocking — fresh-pair flow handles this
+      fi
+    fi
+  fi
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "  ✓ READY -- airc connect should work."
+    return 0
+  else
+    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc connect'."
+    return 1
+  fi
 }
 
 _doctor_run_tests() {
