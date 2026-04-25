@@ -34,6 +34,48 @@ function OK($msg)   { Write-Host "  -> $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "  ! $msg"  -ForegroundColor Yellow }
 function FailOut($msg) { Write-Host "`nERROR: $msg" -ForegroundColor Red; exit 1 }
 
+# 0. PowerShell 7+ check — re-launch under pwsh if running on Windows PS 5.1
+# (the default Windows shell). airc.ps1 requires PS 7+; if we don't
+# re-launch here, every subsequent `airc` invocation in this script
+# fails with version-mismatch errors. Issue #91 (Toby's case 2026-04-25).
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwshCandidates = @(
+        "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+        "${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe"
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe"
+    )
+    $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    if (-not $pwshPath) {
+        foreach ($p in $pwshCandidates) {
+            if ($p -and (Test-Path $p)) { $pwshPath = $p; break }
+        }
+    }
+    if (-not $pwshPath) {
+        Step 'PowerShell 7+ not found -- installing via winget (airc.ps1 requires it)'
+        $winget = Get-Command winget -ErrorAction SilentlyContinue
+        if (-not $winget) {
+            FailOut 'winget not available. Install PowerShell 7 manually from https://github.com/PowerShell/PowerShell/releases, then re-run this script.'
+        }
+        & winget install --id Microsoft.PowerShell --silent --accept-source-agreements --accept-package-agreements
+        # Re-scan for pwsh
+        $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+        if (-not $pwshPath) {
+            foreach ($p in $pwshCandidates) {
+                if ($p -and (Test-Path $p)) { $pwshPath = $p; break }
+            }
+        }
+        if (-not $pwshPath) {
+            FailOut 'PowerShell 7 install completed but pwsh.exe still not found. Restart your shell + re-run this script.'
+        }
+        OK "Installed: $pwshPath"
+    }
+    Step "Re-launching under PowerShell 7 ($pwshPath)..."
+    $relaunchArgs = @('-NoProfile', '-File', $PSCommandPath)
+    if ($Mnemonic) { $relaunchArgs += @('-Mnemonic', $Mnemonic) }
+    & $pwshPath @relaunchArgs
+    exit $LASTEXITCODE
+}
+
 # 1. install if not present
 $airc = Get-Command airc -ErrorAction SilentlyContinue
 if (-not $airc) {

@@ -1337,7 +1337,7 @@ function Invoke-DoctorConnectPreflight {
             $script:DoctorIssues += 'gh-auth'
         } else {
             $authStatus = & gh auth status 2>&1 | Out-String
-            if ($authStatus -notmatch '(?im)^\s*(?:Token scopes|scopes):.*\bgist\b') {
+            if ($authStatus -notmatch '(?i)(?:Token scopes|scopes):.*\bgist\b') {
                 Write-Host "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)"
                 Write-Host '         Fix: gh auth refresh -s gist'
                 $script:DoctorIssues += 'gh-gist-scope'

@@ -4201,7 +4201,7 @@ _doctor_connect_preflight() {
     printf "  [BLOCKED] gh authenticated\n"
     printf "         Fix: gh auth login -s gist\n"
     issues=$((issues+1))
-  elif ! gh auth status 2>&1 | grep -qiE "(scopes:|token scopes:)[^\\n]*\\bgist\\b"; then
+  elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))
