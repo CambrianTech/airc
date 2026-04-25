@@ -1303,31 +1303,53 @@ cmd_connect() {
       # Catch this BEFORE SSH probe so we self-heal cleanly instead of
       # silently re-pairing against a dead-but-reachable host or
       # accidentally landing in a different room.
+      #
+      # Two safety guards (Copilot caught both on PR #92 review):
+      # (a) Confirm gh is healthy first. Auth issues, missing scope,
+      #     rate limits, transient network all return non-zero from
+      #     `gh api gists/<id>` — treating those as "gist deleted"
+      #     would spuriously wipe joiner state on every flaky network
+      #     blip. Only act when we got an authoritative 404.
+      # (b) Capture the preserved name BEFORE deleting CONFIG; otherwise
+      #     get_name reads the now-deleted file and falls back to
+      #     "unknown", changing peer identity on re-exec.
       local _saved_gist_id=""
       [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _saved_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
       local _saved_room_resume=""
       [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_resume=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
       if [ -n "$_saved_gist_id" ] && command -v gh >/dev/null 2>&1; then
-        if ! gh api "gists/$_saved_gist_id" >/dev/null 2>&1; then
-          # Gist gone (host parted, or peer self-healed and replaced it).
-          # Trigger fresh discovery: clear the stale joiner state and
-          # re-exec ourselves into airc connect, which will re-resolve
-          # via the room name (or fall through to host-mode if no room
-          # gist exists — first-back-in-becomes-new-host).
-          echo ""
-          echo "  ⚠  Saved room gist ($_saved_gist_id) no longer on your gh — room dissolved or rehosted."
-          if [ -n "$_saved_room_resume" ]; then
-            echo "  Re-discovering #${_saved_room_resume} via fresh gist lookup..."
-          else
-            echo "  Re-pairing via fresh discovery..."
-          fi
-          # Wipe stale joiner state. Identity + peer records persist.
-          rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_gist_id"
-          local _preserved_name; _preserved_name=$(get_name 2>/dev/null || echo "")
-          if [ -n "$_saved_room_resume" ]; then
-            exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$_saved_room_resume"
-          else
-            exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect
+        # Guard: only proceed if gh auth is healthy. If not, skip the
+        # check entirely — the regular SSH probe below handles network/
+        # auth issues with their own diagnosis. We never want a flaky
+        # network to be misread as "the host's gist disappeared."
+        if gh auth status >/dev/null 2>&1; then
+          # Probe with --silent so gh's own error text doesn't pollute
+          # our output. Capture stderr for 404-vs-other classification.
+          local _gist_probe_err; _gist_probe_err=$(mktemp -t airc-gist-probe.XXXXXX)
+          gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err"
+          local _gist_probe_rc=$?
+          local _gist_probe_stderr; _gist_probe_stderr=$(cat "$_gist_probe_err" 2>/dev/null)
+          rm -f "$_gist_probe_err"
+          # 404 (gist gone) shows as "Not Found" or "404" in gh's stderr.
+          # Other failures (rate limit "API rate limit", auth "401",
+          # network "could not resolve") are explicitly NOT treated as
+          # gist-deleted.
+          if [ "$_gist_probe_rc" -ne 0 ] && echo "$_gist_probe_stderr" | grep -qiE '404|not found'; then
+            local _preserved_name; _preserved_name=$(get_name 2>/dev/null || echo "")
+            echo ""
+            echo "  ⚠  Saved room gist ($_saved_gist_id) no longer on your gh — room dissolved or rehosted."
+            if [ -n "$_saved_room_resume" ]; then
+              echo "  Re-discovering #${_saved_room_resume} via fresh gist lookup..."
+            else
+              echo "  Re-pairing via fresh discovery..."
+            fi
+            # Wipe stale joiner state. Identity + peer records persist.
+            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_gist_id"
+            if [ -n "$_saved_room_resume" ]; then
+              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$_saved_room_resume"
+            else
+              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect
+            fi
           fi
         fi
       fi
@@ -3145,7 +3167,12 @@ cmd_part() {
   else
     # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
-    rm -f "$room_name_file"
+    # Clear our cached gist_id too, matching the comment on the joiner-
+    # side cache write site (PR #92 Copilot feedback). Without this, a
+    # parted joiner that later reconnects via the same scope would
+    # incorrectly trigger the stale-pairing-detect path on the next
+    # resume even though they parted intentionally.
+    rm -f "$room_name_file" "$gist_id_file"
   fi
 
   cmd_teardown

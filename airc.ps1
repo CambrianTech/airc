@@ -1529,7 +1529,11 @@ function Invoke-Part {
         Remove-Item $gistIdFile, $roomFile -Force -ErrorAction SilentlyContinue
     } else {
         Write-Host "  Joiner of #$roomName parting - host gist stays open for others."
-        Remove-Item $roomFile -Force -ErrorAction SilentlyContinue
+        # Clear cached gist_id too, matching #83's joiner-side cache
+        # write-site comment (Copilot caught this on PR #92 review).
+        # Without this, a parted joiner reconnecting in the same scope
+        # would spuriously trigger stale-pairing detect on next resume.
+        Remove-Item $roomFile, $gistIdFile -Force -ErrorAction SilentlyContinue
     }
     Invoke-Teardown
 }
@@ -2132,33 +2136,50 @@ function Invoke-Connect {
             # dissolved or got rehosted. Catch BEFORE SSH probe so we
             # self-heal cleanly instead of silently re-pairing against
             # a dead-but-reachable host or the wrong room.
+            #
+            # Two safety guards (Copilot caught both on PR #92 review):
+            # (a) Only trigger on authoritative 404. Auth/scope/rate-
+            #     limit/network issues all return non-zero from
+            #     `gh api gists/<id>` -- misreading those as "gist
+            #     deleted" would spuriously wipe joiner state on every
+            #     flaky network blip.
+            # (b) Capture preservedName BEFORE removing CONFIG; otherwise
+            #     Get-Name reads the deleted file and falls back to
+            #     "unknown", changing peer identity on re-exec.
             $savedGistFile = Join-Path $AIRC_WRITE_DIR 'room_gist_id'
             $savedRoomFile = Join-Path $AIRC_WRITE_DIR 'room_name'
             if ((Test-Path $savedGistFile) -and (Get-Command gh -ErrorAction SilentlyContinue)) {
                 $savedGistId = (Get-Content $savedGistFile -Raw -ErrorAction SilentlyContinue).Trim()
                 if ($savedGistId) {
-                    & gh api "gists/$savedGistId" 2>$null | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        $savedRoom = ''
-                        if (Test-Path $savedRoomFile) {
-                            $savedRoom = (Get-Content $savedRoomFile -Raw -ErrorAction SilentlyContinue).Trim()
+                    & gh auth status 2>$null | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        # Capture stderr to distinguish 404 from other failures.
+                        $probeErrFile = [System.IO.Path]::GetTempFileName()
+                        & gh api "gists/$savedGistId" 1>$null 2>$probeErrFile
+                        $probeRc = $LASTEXITCODE
+                        $probeErrText = (Get-Content $probeErrFile -Raw -ErrorAction SilentlyContinue) -as [string]
+                        Remove-Item $probeErrFile -Force -ErrorAction SilentlyContinue
+                        if ($probeRc -ne 0 -and $probeErrText -match '(?i)\b(404|not found)\b') {
+                            $preservedName = Get-Name 2>$null
+                            $savedRoom = ''
+                            if (Test-Path $savedRoomFile) {
+                                $savedRoom = (Get-Content $savedRoomFile -Raw -ErrorAction SilentlyContinue).Trim()
+                            }
+                            Write-Host ''
+                            Write-Host "  ! Saved room gist ($savedGistId) no longer on your gh -- room dissolved or rehosted."
+                            if ($savedRoom) {
+                                Write-Host "  Re-discovering #$savedRoom via fresh gist lookup..."
+                            } else {
+                                Write-Host '  Re-pairing via fresh discovery...'
+                            }
+                            Remove-Item -Force $CONFIG -ErrorAction SilentlyContinue
+                            Remove-Item -Force $savedGistFile -ErrorAction SilentlyContinue
+                            $reExecArgs = @('connect')
+                            if ($savedRoom) { $reExecArgs += @('--room', $savedRoom) }
+                            if ($preservedName) { $env:AIRC_NAME = $preservedName }
+                            & $PSCommandPath @reExecArgs
+                            exit $LASTEXITCODE
                         }
-                        Write-Host ''
-                        Write-Host "  ! Saved room gist ($savedGistId) no longer on your gh -- room dissolved or rehosted."
-                        if ($savedRoom) {
-                            Write-Host "  Re-discovering #$savedRoom via fresh gist lookup..."
-                        } else {
-                            Write-Host '  Re-pairing via fresh discovery...'
-                        }
-                        # Wipe stale joiner state (identity + peers persist).
-                        Remove-Item -Force $CONFIG -ErrorAction SilentlyContinue
-                        Remove-Item -Force $savedGistFile -ErrorAction SilentlyContinue
-                        $preservedName = Get-Name 2>$null
-                        $reExecArgs = @('connect')
-                        if ($savedRoom) { $reExecArgs += @('--room', $savedRoom) }
-                        if ($preservedName) { $env:AIRC_NAME = $preservedName }
-                        & $PSCommandPath @reExecArgs
-                        exit $LASTEXITCODE
                     }
                 }
             }
