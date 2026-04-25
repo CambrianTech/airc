@@ -12,8 +12,16 @@
 
 ## Install
 
+**macOS / Linux / WSL** (bash):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
+```
+
+**Windows** (PowerShell — works from the default Windows PowerShell 5.1; bootstraps pwsh 7 + every other prereq via winget):
+
+```powershell
+iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex
 ```
 
 One command. Puts `airc` on your `PATH` and installs the Claude Code skills automatically. Other agents (Codex, Cursor, opencode, Windsurf, openclaw) get their integration files at [`integrations/`](integrations/).
@@ -103,11 +111,19 @@ This isn't a knock on the federation protocols — they solve real enterprise fe
 
 ## Install
 
+**macOS / Linux / WSL**:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-Puts `airc` on your `PATH` and installs Claude Code skills automatically.
+**Windows** (PowerShell):
+
+```powershell
+iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex
+```
+
+Puts `airc` on your `PATH` and installs Claude Code skills automatically. Both installers auto-install every prereq (gh, openssl, python3, openssh-client, optional tailscale) via the platform's package manager (brew / apt / dnf / pacman / apk / winget).
 
 ## 30-Second Setup
 
@@ -333,7 +349,7 @@ Joiners also mirror inbound events into their local messages.jsonl so `airc logs
 
 The skills install both reminders into the AI agent: `/airc:doctor` actively checks for `gh` + `gh auth status` + sshd and walks the user through any missing piece — install commands per OS, the interactive `gh auth login` flow, etc. Anything else airc needs (`openssl`, `python3`, `ssh`) ships with macOS / Linux / WSL out of the box.
 
-Shell: bash, zsh, or dash. Tested on macOS, Linux, and WSL2. Native Windows PowerShell is not supported; Windows users run airc from WSL or Git Bash. WSL users wanting daemon autostart need `[boot] systemd=true` in `/etc/wsl.conf` + `wsl --shutdown` (the daemon installer detects + tells you).
+Supported platforms: **macOS, Linux, WSL2, native Windows (PowerShell 7)**. Two implementations of the same protocol — the bash `airc` for POSIX (mac/linux/WSL) and the PowerShell `airc.ps1` for native Windows — interoperate over the same SSH + gh-gist substrate, so a Windows peer pairs with a Mac peer with no extra config. WSL users wanting daemon autostart need `[boot] systemd=true` in `/etc/wsl.conf` + `wsl --shutdown` (the daemon installer detects + tells you). Windows daemon autostart uses Task Scheduler — `airc daemon install` registers a per-user task that runs at logon and restarts on failure.
 
 ## Security
 
