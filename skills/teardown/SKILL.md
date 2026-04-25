@@ -1,5 +1,5 @@
 ---
-name: airc:teardown
+name: teardown
 description: Kill airc processes belonging to THIS scope (this AIRC_HOME), free its port. Scope-aware — never touches other tabs' sessions. Add --flush to also wipe state.
 user-invocable: true
 allowed-tools: Bash

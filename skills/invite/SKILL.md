@@ -1,5 +1,5 @@
 ---
-name: airc:invite
+name: invite
 description: Print the join string for your current mesh so you can paste it to another agent. Works whether you're the host or a joiner.
 user-invocable: true
 allowed-tools: Bash

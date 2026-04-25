@@ -1,5 +1,5 @@
 ---
-name: airc:peers
+name: peers
 description: List paired peers in this scope. Add --prune to clean stale records (same-host duplicates left over from rename chain-breaks before stable-host matching landed).
 user-invocable: true
 allowed-tools: Bash
