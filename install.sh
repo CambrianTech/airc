@@ -354,6 +354,45 @@ if [ -d "$CLONE_DIR/skills" ]; then
   done
 fi
 
+# ── Tailscale login check ──────────────────────────────────────────────
+# Common state: Tailscale is installed but the user isn't signed in (just
+# rebooted, fresh install, auth expired). Without this check, the user's
+# first 'airc join' silently hangs trying to reach a Tailscale CGNAT IP
+# until the SSH timeout, then prints a confusing "daemon down" message.
+# Detect it here and trigger sign-in proactively.
+
+ts_post_check() {
+  local ts_bin=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_bin="tailscale"
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  fi
+  [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
+
+  local ts_out
+  ts_out=$("$ts_bin" status 2>&1) || true
+  case "$ts_out" in
+    *"Logged out"*|*"NeedsLogin"*)
+      echo ""
+      warn "Tailscale is installed but you're not signed in."
+      case "$(uname -s)" in
+        Darwin)
+          if [ -d /Applications/Tailscale.app ]; then
+            info "Opening Tailscale.app — sign in there before running 'airc join'."
+            open -a Tailscale 2>/dev/null || true
+          else
+            info "Sign in:  tailscale up"
+          fi ;;
+        *)
+          info "Sign in:  tailscale up   (follow the printed URL)" ;;
+      esac
+      ;;
+  esac
+}
+
+ts_post_check
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""

@@ -406,17 +406,29 @@ advise_tailscale_if_down() {
     *) return 0 ;;
   esac
 
-  # CLI present AND daemon up? fall through — if the SSH probe still
-  # fails it's a peer-offline problem, not a tailnet-down problem.
-  # resolve_tailscale_bin() handles Windows tailscale.exe + the macOS
-  # .app bundle path that PATH lookups miss.
+  # CLI present AND daemon up + logged in? fall through — if the SSH
+  # probe still fails it's a peer-offline problem, not a tailnet
+  # problem. resolve_tailscale_bin() handles Windows tailscale.exe +
+  # the macOS .app bundle path that PATH lookups miss.
   local ts_bin; ts_bin=$(resolve_tailscale_bin)
-  if [ -n "$ts_bin" ] && "$ts_bin" status >/dev/null 2>&1; then
-    return 0
+  local ts_status_out=""
+  local ts_status_rc=1
+  if [ -n "$ts_bin" ]; then
+    ts_status_out=$("$ts_bin" status 2>&1)
+    ts_status_rc=$?
+    if [ "$ts_status_rc" = "0" ]; then
+      # Status command succeeded — check whether we're actually
+      # connected. tailscale prints "Logged out." when the daemon is
+      # running but unauthenticated, with rc=0 on some versions.
+      case "$ts_status_out" in
+        *"Logged out"*|*"NeedsLogin"*) : ;;
+        *) return 0 ;;
+      esac
+    fi
   fi
 
   echo "" >&2
-  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale appears down on this machine." >&2
+  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale isn't ready on this machine." >&2
   echo "" >&2
   if [ -z "$ts_bin" ]; then
     echo "   Tailscale is not installed. airc needs it only for cross-machine mesh." >&2
@@ -429,9 +441,37 @@ advise_tailscale_if_down() {
     return 1
   fi
 
-  # CLI present, daemon down → platform-specific start instruction.
+  # CLI present. Distinguish daemon-down from logged-out — they need
+  # different fixes and used to print the same wrong message.
   local uname_s; uname_s=$(uname -s 2>/dev/null || echo "")
   local uname_r; uname_r=$(uname -r 2>/dev/null || echo "")
+
+  case "$ts_status_out" in
+    *"Logged out"*|*"NeedsLogin"*)
+      echo "   Tailscale is installed and running but you're not signed in." >&2
+      case "$uname_s" in
+        Darwin)
+          if [ -d /Applications/Tailscale.app ]; then
+            echo "   Opening Tailscale.app — sign in there, then re-run airc join." >&2
+            # Foreground the GUI app so the sign-in dialog is reachable.
+            # `open -a` is a no-op if the app is already up; harmless.
+            open -a Tailscale 2>/dev/null || true
+          else
+            echo "     tailscale up   # CLI prompts a sign-in URL" >&2
+          fi
+          ;;
+        Linux|MINGW*|MSYS*|CYGWIN*)
+          echo "     tailscale up   # follow the printed sign-in URL" >&2
+          ;;
+        *)
+          echo "     tailscale up" >&2
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+
+  # Status command failed AND output didn't say "logged out" → daemon down.
   echo "   Tailscale CLI is installed but the daemon is not running. Start it:" >&2
   case "$uname_s" in
     Darwin)
