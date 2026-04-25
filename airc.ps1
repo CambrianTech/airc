@@ -2023,6 +2023,19 @@ function Invoke-Connect {
 
         # Pair handshake via TCP (.NET native, no embedded Python)
         $peerHostOnly = ($sshTarget -split '@')[-1]
+
+        # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
+        # Resume path (line ~1877) already calls Advise-TailscaleIfDown, but
+        # that gate doesn't cover (a) cold-start `airc join <invite>` from a
+        # fresh scope or (b) the gist-discovery resolution that lands here
+        # with a tailnet host_target. Without this check, a logged-out
+        # Tailscale produces a silent unreachable-host + self-heal cascade
+        # (issue #78, Memento's case 2026-04-25). Same call shape as resume
+        # path: detect-and-instruct, do not auto-tailscale-up.
+        if (Advise-TailscaleIfDown -TargetHost $peerHostOnly) {
+            Die 'Re-run airc join after starting Tailscale.'
+        }
+
         Write-Host "  Connecting to ${peerHostOnly}:$peerPort ..."
         $mySshPub  = (Get-Content (Join-Path $IDENTITY_DIR 'ssh_key.pub') -Raw -ErrorAction SilentlyContinue).Trim()
         $mySignPub = (Get-Content (Join-Path $IDENTITY_DIR 'public.pem') -Raw -ErrorAction SilentlyContinue)
