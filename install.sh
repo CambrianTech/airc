@@ -127,9 +127,20 @@ install_with_pkgmgr() {
   esac
 }
 
+tailscale_present() {
+  # macOS GUI install puts Tailscale.app at /Applications without putting
+  # `tailscale` on PATH — `command -v tailscale` then lies about a missing
+  # install and we'd brew-cask over the user's working Tailscale (sudo
+  # prompt + kernel extension churn). Check the GUI bundle path too.
+  command -v tailscale >/dev/null 2>&1 && return 0
+  [ -d /Applications/Tailscale.app ] && return 0
+  [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && return 0
+  return 1
+}
+
 install_tailscale() {
   # Optional. macOS: brew cask. Linux: tailscale's official installer.
-  command -v tailscale >/dev/null 2>&1 && return 0
+  tailscale_present && return 0
   case "$(uname -s)" in
     Darwin)
       if command -v brew >/dev/null 2>&1; then
@@ -206,7 +217,7 @@ ensure_prereqs() {
 
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
-  if ! command -v tailscale >/dev/null 2>&1; then
+  if ! tailscale_present; then
     info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
     install_tailscale
   fi
