@@ -161,6 +161,50 @@ infer_default_room() {
   return 1
 }
 
+# Resolve the path to a working gh CLI binary across platforms.
+# Same shape as resolve_tailscale_bin (defined later) and same problem:
+# on Windows native + Git Bash, gh is installed via winget at
+# `C:\Program Files\GitHub CLI\gh.exe` but the path doesn't get
+# inherited into Git Bash's PATH. Without a fallback, airc skips its
+# gist substrate entirely, leaving the user stuck on legacy long-
+# invite-string flow with no auto-discovery. Issue #85.
+# Defined here (before script-init) so the PATH-fixup below can use it.
+resolve_gh_bin() {
+  if command -v gh >/dev/null 2>&1; then
+    echo "gh"
+    return 0
+  fi
+  if command -v gh.exe >/dev/null 2>&1; then
+    echo "gh.exe"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "/c/Program Files/GitHub CLI/gh.exe" \
+    "/mnt/c/Program Files/GitHub CLI/gh.exe" \
+    "/c/Program Files (x86)/GitHub CLI/gh.exe" \
+    "/usr/local/bin/gh" \
+    "/opt/homebrew/bin/gh"; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# gh PATH-fixup: if gh isn't on PATH but a fallback resolves it (e.g.
+# Git Bash on Windows where winget installed gh at a standard location
+# that PATH doesn't inherit), prepend its directory to PATH so every
+# subsequent `gh` invocation in this script finds it. Issue #85 — the
+# alternative was to wrap every gh callsite, which is ~20 places + ps1
+# parallel; PATH-prepend is a one-liner that fixes all of them.
+_gh_resolved=$(resolve_gh_bin 2>/dev/null || true)
+if [ -n "$_gh_resolved" ] && ! command -v gh >/dev/null 2>&1; then
+  export PATH="$(dirname "$_gh_resolved"):$PATH"
+fi
+unset _gh_resolved
+
 AIRC_WRITE_DIR="$(detect_scope)"
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"

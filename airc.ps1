@@ -85,6 +85,33 @@ function Get-AircScope {
     return (Join-Path (Resolve-Path .).Path '.airc')
 }
 
+# Resolve gh CLI binary path early. Same problem the bash script handles:
+# winget-installed gh sits at a standard location that doesn't always end
+# up on the running shell's PATH (Windows native shells especially).
+# Defined inline here so the PATH-fixup below can use it before the
+# main helpers section below runs. Issue #85.
+function _Resolve-GhBinEarly {
+    foreach ($name in @('gh', 'gh.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @(
+        'C:\Program Files\GitHub CLI\gh.exe',
+        'C:\Program Files (x86)\GitHub CLI\gh.exe'
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# gh PATH-fixup: if gh resolved via fallback rather than PATH, prepend its
+# directory to PATH so every later `gh` invocation transparently finds it.
+$_ghResolved = _Resolve-GhBinEarly
+if ($_ghResolved -and -not (Get-Command 'gh' -ErrorAction SilentlyContinue)) {
+    $env:PATH = (Split-Path $_ghResolved -Parent) + [IO.Path]::PathSeparator + $env:PATH
+}
+Remove-Variable _ghResolved -ErrorAction SilentlyContinue
+
 $AIRC_WRITE_DIR = Get-AircScope
 $CONFIG       = Join-Path $AIRC_WRITE_DIR 'config.json'
 $IDENTITY_DIR = Join-Path $AIRC_WRITE_DIR 'identity'
@@ -196,6 +223,25 @@ function Resolve-TailscaleBin {
     foreach ($p in @(
         'C:\Program Files\Tailscale\tailscale.exe',
         'C:\Program Files (x86)\Tailscale\tailscale.exe'
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+function Resolve-GhBin {
+    # Same shape as Resolve-TailscaleBin. Issue #85: on Windows native +
+    # Git Bash, gh is installed via winget at the standard location but
+    # the path doesn't get inherited into Git Bash's PATH. The bash side
+    # has the equivalent helper; ps1 keeps lockstep so gist substrate
+    # works without manual PATH edits.
+    foreach ($name in @('gh', 'gh.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @(
+        'C:\Program Files\GitHub CLI\gh.exe',
+        'C:\Program Files (x86)\GitHub CLI\gh.exe'
     )) {
         if (Test-Path $p) { return $p }
     }
