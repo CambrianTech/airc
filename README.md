@@ -61,7 +61,7 @@ The acronym was destiny. a**IRC**. If you ever ran IRC, you already know the sur
 | nick | `airc nick <new>` |
 | server | host (your laptop, your desktop, anyone's) |
 | ircd registry | GitHub gist namespace |
-| `/join #channel` | `airc join` (auto-joins `#general`) |
+| `/join #channel` | `airc join` ([auto-scopes](#auto-scope--the-default-room) to the current repo's org, e.g. `#my-org`; `#general` for non-git dirs) |
 | `/join #foo` | `airc join --room foo` |
 | `/list` | `airc list` |
 | `/part` | `airc part` |
