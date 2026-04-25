@@ -1804,20 +1804,34 @@ cmd_connect() {
       echo ""
       echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over..."
       echo "     (prior host's gist: $_resolved_gist_id)"
+
+      # Same race-loser detection as the SSH-failure self-heal path
+      # below. Two tabs concurrently deciding "host is stale" both
+      # delete + publish, end up with split-brain — caught only by
+      # running two tabs together.
+      local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
+      sleep "$_race_jitter_s"
+
       if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
         echo "  ✓ Stale gist removed."
       else
-        echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
-        echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+        echo "  ⚠  Stale gist already gone — another tab may have taken over first."
       fi
-      # Preserve identity name across re-exec — same reason as the
-      # SSH-failure self-heal: derive_name re-runs from cwd and can drift
-      # on case-aliasing, peers see a "new" peer.
+
+      local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
+        | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
+            '$2 ~ re && $1 != skip { print $1; exit }')
+
       local _preserved_name; _preserved_name=$(get_config_val name "")
-      # Wipe any half-written CONFIG (this path runs before we write,
-      # but be defensive in case a prior failed pair left state behind).
       rm -f "$CONFIG"
       rm -f "$AIRC_WRITE_DIR/room_name"
+
+      if [ -n "$_new_picked" ]; then
+        echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
+        echo ""
+        exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+      fi
+
       echo "  Re-execing into host mode for #${resolved_room_name}..."
       echo ""
       exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
@@ -1971,25 +1985,49 @@ print(data.decode().strip())
         echo ""
         echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
         echo "     (prior host's gist: $_resolved_gist_id)"
+
+        # Jittered backoff before takeover. Without this, two tabs that
+        # hit the same dead gist concurrently both delete + publish
+        # within the same gh API window and you end up with two
+        # competing gists for the same room name (split-brain race —
+        # caught only by running two tabs against a stale gist
+        # simultaneously, NOT by the integration test).
+        local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
+        sleep "$_race_jitter_s"
+
         if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
           echo "  ✓ Stale gist removed."
         else
-          echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
-          echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+          echo "  ⚠  Stale gist already gone — another tab may have taken over first."
         fi
-        # Preserve identity name across re-exec (same reason as the resume
-        # path's self-heal — without this, derive_name re-runs from cwd
-        # and can drift on case-aliasing, peers see a "new" peer).
+
+        # Race-loser detection: re-scan for any OTHER fresh gist with
+        # this room name. If a concurrent self-heal already published
+        # one, JOIN their fresh gist instead of publishing a duplicate.
+        local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
+          | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
+              '$2 ~ re && $1 != skip { print $1; exit }')
+
+        # Preserve identity name across re-exec (same reason as resume
+        # path: derive_name re-runs from cwd and can drift on case-
+        # aliasing, peers see a "new" peer).
         local _preserved_name; _preserved_name=$(get_config_val name "")
-        # Wipe the CONFIG we just wrote — it points at the dead host and
-        # would trigger 'resume joiner' on next airc connect, looping back
-        # into this same failure.
+        # Wipe the CONFIG we just wrote — it points at the dead host
+        # and would trigger 'resume joiner' on next airc connect.
         rm -f "$CONFIG"
         rm -f "$AIRC_WRITE_DIR/room_name"
+
+        if [ -n "$_new_picked" ]; then
+          echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
+          echo ""
+          # Re-exec as joiner pointing at the winner's gist.
+          exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+        fi
+
         echo "  Re-execing into host mode for #${resolved_room_name}..."
         echo ""
-        # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
-        # ensures the new instance doesn't try to re-discover the just-deleted gist
+        # exec replaces the current bash process. AIRC_NO_DISCOVERY=1
+        # prevents the new instance from re-finding the just-deleted gist
         # (gh's gist-list cache might still show it for a few seconds).
         exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
       fi
