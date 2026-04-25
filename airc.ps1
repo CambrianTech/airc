@@ -1263,7 +1263,7 @@ function Invoke-DoctorConnectPreflight {
         }
     }
 
-    # Required prereqs (mirror default doctor)
+    # Required prereqs (mirror default doctor — except gh chain, see below)
     Probe 'PowerShell 7+' {
         $PSVersionTable.PSVersion.Major -ge 7
     } 'winget install --id Microsoft.PowerShell  (then re-launch in pwsh)'
@@ -1274,14 +1274,6 @@ function Invoke-DoctorConnectPreflight {
         $r = Resolve-PythonBin
         $null -ne $r
     } 'winget install --id Python.Python.3.12'
-    Probe 'gh (GitHub CLI)' {
-        Get-Command gh -ErrorAction SilentlyContinue
-    } 'winget install --id GitHub.cli  (then: gh auth login -s gist)'
-    Probe 'gh authenticated (gist scope)' {
-        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
-        & gh auth status 2>$null | Out-Null
-        $LASTEXITCODE -eq 0
-    } 'gh auth login -s gist'
     Probe 'ssh (OpenSSH client)' {
         Get-Command ssh -ErrorAction SilentlyContinue
     } 'Settings -> Apps -> Optional Features -> Add -> OpenSSH Client'
@@ -1292,12 +1284,38 @@ function Invoke-DoctorConnectPreflight {
         $null -ne $script:OpenSSLBin
     } 'winget install --id Git.Git  (Git for Windows bundles openssl)'
 
-    # Connect-specific: github gists API reachable
-    Probe 'github gists API reachable' {
-        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
-        & gh api user 2>$null | Out-Null
-        $LASTEXITCODE -eq 0
-    } 'check internet, then re-run gh auth login -s gist'
+    # gh chain: installed -> authed -> gist scope -> gists API reachable.
+    # Single chain (early-return on first failure) so a missing gh isn't
+    # counted 3-4x. Gist scope is checked explicitly because gh auth
+    # status alone passes for a gist-scope-less token (Copilot #87 review).
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Host '  [MISSING] gh (GitHub CLI)'
+        Write-Host '         Fix: winget install --id GitHub.cli  (then: gh auth login -s gist)'
+        $script:DoctorIssues += 'gh-missing'
+    } else {
+        & gh auth status 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  [BLOCKED] gh authenticated'
+            Write-Host '         Fix: gh auth login -s gist'
+            $script:DoctorIssues += 'gh-auth'
+        } else {
+            $authStatus = & gh auth status 2>&1 | Out-String
+            if ($authStatus -notmatch '(?im)^\s*(?:Token scopes|scopes):.*\bgist\b') {
+                Write-Host "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)"
+                Write-Host '         Fix: gh auth refresh -s gist'
+                $script:DoctorIssues += 'gh-gist-scope'
+            } else {
+                & gh api 'gists?per_page=1' 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host '  [BLOCKED] gist API not reachable -- network outage or rate-limit'
+                    Write-Host "         Fix: check internet; if persistent, run 'gh auth refresh'"
+                    $script:DoctorIssues += 'gist-api'
+                } else {
+                    Write-Host '  [ok] gh authed with gist scope, gists API reachable'
+                }
+            }
+        }
+    }
 
     # Connect-specific: tailscale state when cached host_target is CGNAT
     $priorHostTarget = (Get-ConfigVal -Key 'host_target' -Default '')

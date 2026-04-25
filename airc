@@ -4087,22 +4087,32 @@ _doctor_connect_preflight() {
 
   # ── Required prereqs (same as default doctor) ──
   _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
-  _doctor_probe "gh"           "$mgr" "Gist substrate (room discovery)" || issues=$((issues+1))
-  _doctor_probe_gh_auth                                                  || issues=$((issues+1))
-  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"     || issues=$((issues+1))
-  _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
-  _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
-  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
+  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"    || issues=$((issues+1))
+  _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
+  _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
+  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
 
-  # ── Connect-specific: gist API reachable ──
-  if command -v gh >/dev/null 2>&1; then
-    if gh api user >/dev/null 2>&1; then
-      printf "  [ok] github gists API reachable\n"
-    else
-      printf "  [BLOCKED] github gists API not reachable -- network or token issue\n"
-      printf "         Fix: check internet, then re-run 'gh auth login -s gist'\n"
-      issues=$((issues+1))
-    fi
+  # ── gh chain: installed → authed → gist scope → gists API reachable.
+  # Single chain (early-return on first failure) so a missing gh isn't
+  # counted 3-4x as a separate issue per dependent probe. Gist scope is
+  # checked explicitly because `gh auth status` alone passes for a
+  # gist-scope-less token (Copilot caught this on #87 review).
+  if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
+    issues=$((issues+1))
+  elif ! gh auth status >/dev/null 2>&1; then
+    printf "  [BLOCKED] gh authenticated\n"
+    printf "         Fix: gh auth login -s gist\n"
+    issues=$((issues+1))
+  elif ! gh auth status 2>&1 | grep -qiE "(scopes:|token scopes:)[^\\n]*\\bgist\\b"; then
+    printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
+    printf "         Fix: gh auth refresh -s gist\n"
+    issues=$((issues+1))
+  elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
+    printf "  [BLOCKED] gist API not reachable -- network outage or rate-limit\n"
+    printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    issues=$((issues+1))
+  else
+    printf "  [ok] gh authed with gist scope, gists API reachable\n"
   fi
 
   # ── Connect-specific: tailscale state. The default doctor only marks
