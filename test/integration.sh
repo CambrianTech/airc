@@ -1342,6 +1342,15 @@ scenario_kick() {
     && pass "joiner can't kick (rejected with helpful error)" \
     || fail "joiner kick attempt should be refused (got: $out)"
 
+  # ── Capture joiner's SSH pubkey BEFORE kick so we can assert removal ──
+  local kj_ssh_pub
+  kj_ssh_pub=$(cat /tmp/airc-it-k-j/state/identity/ssh_key.pub 2>/dev/null | tr -d '\n' || true)
+  if [ -n "$kj_ssh_pub" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
+    grep -qF "$kj_ssh_pub" "$HOME/.ssh/authorized_keys" \
+      && pass "joiner's SSH key present in authorized_keys before kick" \
+      || fail "joiner's SSH key missing from authorized_keys before kick (handshake regression?)"
+  fi
+
   # ── Host kicks joiner ──
   out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" kick kjoiner "scenario test" 2>&1)
   echo "$out" | grep -q "Kicked kjoiner" && pass "kick prints confirmation" || fail "kick missing confirmation (got: $out)"
@@ -1351,11 +1360,31 @@ scenario_kick() {
     && pass "kicked peer's file removed" \
     || fail "peer file still present after kick"
 
+  # ── SSH key actually removed from authorized_keys ──
+  # Without this assertion, kick's pubkey-removal could silently regress
+  # — Copilot's #73 review caught a bug where kick was reading the wrong
+  # .pub file and leaving the SSH key in place.
+  if [ -n "$kj_ssh_pub" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
+    grep -qF "$kj_ssh_pub" "$HOME/.ssh/authorized_keys" \
+      && fail "kicked peer's SSH key still in authorized_keys (kick didn't actually revoke access)" \
+      || pass "kicked peer's SSH key removed from authorized_keys"
+  fi
+
   # ── airc whois on the now-kicked peer is graceful ──
   out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" whois kjoiner 2>&1 || true)
   echo "$out" | grep -q "no record for 'kjoiner'" \
     && pass "whois post-kick prints no-record" \
     || fail "whois post-kick should report missing"
+
+  # ── Reject path-traversal attempts in peer name ──
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" whois "../config" 2>&1 || true)
+  echo "$out" | grep -q "invalid peer name" \
+    && pass "whois rejects path-traversal in peer name" \
+    || fail "whois did NOT reject '../config' as a peer name (got: $out)"
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" kick "../config" 2>&1 || true)
+  echo "$out" | grep -q "invalid peer name" \
+    && pass "kick rejects path-traversal in peer name" \
+    || fail "kick did NOT reject '../config' as a peer name (got: $out)"
 
   cleanup_all
 }
