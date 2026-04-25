@@ -51,7 +51,16 @@ cleanup_procs() {
 cleanup_dirs() {
   # Use find not glob: zsh with nomatch errors when no match exists, and we
   # still want deterministic cleanup between runs. Find exits 0 on no match.
-  find /tmp -maxdepth 1 -name 'airc-it-*' -exec rm -rf {} + 2>/dev/null || true
+  #
+  # Resolve /tmp before walking — on macOS /tmp is a symlink to /private/tmp
+  # and `find /tmp -maxdepth 1` does NOT traverse it without `-L` or
+  # the canonical path. Without this the cleanup silently no-ops between
+  # runs and stale identity / config / pidfiles leak forward, causing
+  # spurious test failures (saw scenario_identity see "pronouns: they"
+  # left over from a prior invocation, 2026-04-25).
+  local tmpdir
+  tmpdir=$(cd /tmp && pwd -P)   # /private/tmp on macOS, /tmp on Linux
+  find "$tmpdir" -maxdepth 1 -name 'airc-it-*' -exec rm -rf {} + 2>/dev/null || true
 }
 
 cleanup_known_hosts() {
@@ -1137,6 +1146,272 @@ scenario_mnemonic() {
   rm -rf "$thome"
 }
 
+# ── Scenario: identity (issue #34, v1) ─────────────────────────────────
+# Identity layer = pronouns/role/bio/status/integrations stored on top of
+# the bootstrap name from derive_name. v1 surface: airc identity
+# show/set/link locally; airc whois on self prints the same. Cross-peer
+# WHOIS over SSH is the v2 cut.
+scenario_identity() {
+  section "identity: airc identity show/set/link + airc whois self"
+  cleanup_all
+  local home=/tmp/airc-it-id
+  local name=alpha-id
+  local port=7549
+  mkdir -p "$home"
+
+  # Spin up a host so config.json gets written (identity helpers
+  # require ensure_init).
+  ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME="$name" AIRC_PORT="$port" \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 1
+    grep -q 'Hosting as' "$home/out.log" 2>/dev/null && break
+  done
+  grep -q 'Hosting as' "$home/out.log" 2>/dev/null \
+    && pass "host spawned for identity scenario" \
+    || { fail "host did not start; aborting identity scenario"; cleanup_all; return; }
+
+  # Small settle pause: the "Hosting as" banner can fire fractionally
+  # before the python config-merge subprocess flushes config.json under
+  # heavy concurrent test load. Without this, identity show occasionally
+  # reads a half-written config and misses the (unset) defaults.
+  sleep 1
+
+  # ── show on empty identity ──
+  local out
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "name: *$name" \
+    && pass "identity show prints the derived name" \
+    || fail "identity show missing name (got: $out)"
+  echo "$out" | grep -q "pronouns: *(unset)" \
+    && pass "pronouns default to (unset) on fresh init" \
+    || fail "pronouns field missing or wrong default (got: $out)"
+  echo "$out" | grep -q "integrations: *(none)" \
+    && pass "integrations default to (none)" \
+    || fail "integrations field missing or wrong default (got: $out)"
+
+  # ── set ──
+  AIRC_HOME="$home/state" "$AIRC" identity set \
+    --pronouns they --role test-role --bio "test bio line" --status "running scenario_identity" >/dev/null 2>&1 \
+    && pass "identity set returned ok" \
+    || fail "identity set returned nonzero"
+
+  # ── show round-trip ──
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "pronouns: *they" && pass "pronouns=they round-trips" || fail "pronouns missing post-set"
+  echo "$out" | grep -q "role: *test-role" && pass "role=test-role round-trips" || fail "role missing post-set"
+  echo "$out" | grep -q "bio: *test bio line" && pass "bio round-trips" || fail "bio missing post-set"
+  echo "$out" | grep -q "status: *running scenario_identity" && pass "status round-trips" || fail "status missing post-set"
+
+  # ── partial set (only --status) ──
+  AIRC_HOME="$home/state" "$AIRC" identity set --status "second status" >/dev/null 2>&1
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "status: *second status" && pass "partial set updates only --status" || fail "partial set didn't update status"
+  echo "$out" | grep -q "pronouns: *they" && pass "partial set preserves untouched fields" || fail "partial set wiped other fields"
+
+  # ── link / unlink ──
+  AIRC_HOME="$home/state" "$AIRC" identity link continuum Earl >/dev/null 2>&1
+  AIRC_HOME="$home/state" "$AIRC" identity link slack U07ABC123 >/dev/null 2>&1
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "continuum: *Earl" && pass "link continuum=Earl recorded" || fail "continuum link missing"
+  echo "$out" | grep -q "slack: *U07ABC123" && pass "link slack recorded" || fail "slack link missing"
+
+  AIRC_HOME="$home/state" "$AIRC" identity link continuum >/dev/null 2>&1   # empty handle = unlink
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "continuum:" \
+    && fail "empty-handle link should unlink continuum" \
+    || pass "empty-handle link unlinks continuum"
+  echo "$out" | grep -q "slack: *U07ABC123" && pass "unlinking continuum preserves slack link" || fail "unlinking continuum nuked slack too"
+
+  # ── whois self ──
+  out=$(AIRC_HOME="$home/state" "$AIRC" whois "$name" 2>&1)
+  echo "$out" | grep -q "pronouns: *they" \
+    && pass "whois <self> prints identity blob" \
+    || fail "whois <self> missing identity"
+
+  # ── whois unknown peer ──
+  out=$(AIRC_HOME="$home/state" "$AIRC" whois ghost-zzzz 2>&1 || true)
+  echo "$out" | grep -q "no record for 'ghost-zzzz'" \
+    && pass "whois on unknown peer prints helpful error" \
+    || fail "whois on unknown peer didn't print expected error (got: $out)"
+
+  # ── persistence across teardown (no flush) + reread ──
+  AIRC_HOME="$home/state" "$AIRC" teardown >/dev/null 2>&1 || true
+  out=$(AIRC_HOME="$home/state" "$AIRC" identity show 2>&1)
+  echo "$out" | grep -q "pronouns: *they" \
+    && pass "identity survives airc teardown (no flush)" \
+    || fail "identity wiped after teardown — should only happen on --flush"
+
+  # ── airc nick post-sanitization can't produce a leading dash ──
+  # Input like ".foo" used to slip past the leading-dash check (the
+  # case check fires BEFORE sanitization, then `.` → `-` produces
+  # "-foo" which made the resulting nick unreachable to airc whois /
+  # airc kick). Now stripped post-sanitization. Verify by setting a
+  # nick that would have triggered the bug and asserting the stored
+  # name has no leading dash.
+  AIRC_HOME="$home/state" "$AIRC" nick ".dottyname" >/dev/null 2>&1 || true
+  local renamed; renamed=$(python3 -c "import json; print(json.load(open('$home/state/config.json')).get('name',''))" 2>/dev/null)
+  case "$renamed" in
+    -*) fail "airc nick produced leading-dash name '$renamed' — sanitization regression" ;;
+    "") fail "airc nick wrote empty name — sanitization regression" ;;
+    *)  pass "airc nick strips leading dash post-sanitization (got '$renamed')" ;;
+  esac
+
+  cleanup_all
+}
+
+# ── Scenario: whois (issue #34, v2) ────────────────────────────────────
+# Identity gets exchanged at pair-handshake time. Verify:
+#   - Joiner's identity lands in host's peer file
+#   - Host's identity lands in joiner's config under host_identity
+#   - airc whois <joiner-name> works on the host (local peer file)
+#   - airc whois <host-name> works on the joiner (cached host_identity)
+scenario_whois() {
+  section "whois: identity exchanged at handshake (host ↔ joiner)"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-w-h whost 7549 || { fail "whost failed to start"; return; }
+  # Set host identity BEFORE the joiner pairs so the handshake response
+  # carries it. (Re-spawn semantics: changing identity then airc connect
+  # again is the natural flow; for a test we set after spawn and assume
+  # the next handshake reads fresh — verified below.)
+  AIRC_HOME=/tmp/airc-it-w-h/state "$AIRC" identity set \
+    --pronouns they --role host-role --bio "the host bio" --status "host status" >/dev/null 2>&1
+
+  local join; join=$(read_join_string /tmp/airc-it-w-h)
+  spawn_joiner /tmp/airc-it-w-j wjoiner "$join" || { fail "wjoiner join failed"; return; }
+  sleep 1
+
+  # Joiner sets identity AFTER pairing — handshake-time identity is empty
+  # in this slot (matches the realistic flow: agent gets prompted to set
+  # identity post-pair). Host's stored peer.identity will be empty for
+  # this joiner; that's expected. Test the host→joiner direction here;
+  # full bidirectional sync at handshake-time is exercised by scenario_kick
+  # which sets joiner identity before pair.
+  AIRC_HOME=/tmp/airc-it-w-j/state "$AIRC" identity set \
+    --pronouns she --role joiner-role --bio "the joiner bio" >/dev/null 2>&1
+
+  # ── Joiner: airc whois <host-name> reads host_identity from config ──
+  local out
+  out=$(AIRC_HOME=/tmp/airc-it-w-j/state "$AIRC" whois whost 2>&1)
+  echo "$out" | grep -q "pronouns: *they" && pass "joiner can whois host (pronouns)" || fail "joiner whois host missing pronouns (got: $out)"
+  echo "$out" | grep -q "role: *host-role" && pass "joiner can whois host (role)" || fail "joiner whois host missing role"
+  echo "$out" | grep -q "bio: *the host bio" && pass "joiner can whois host (bio)" || fail "joiner whois host missing bio"
+
+  # ── Joiner whois on self still works (local) ──
+  out=$(AIRC_HOME=/tmp/airc-it-w-j/state "$AIRC" whois wjoiner 2>&1)
+  echo "$out" | grep -q "pronouns: *she" && pass "joiner whois self works post-pair" || fail "joiner whois self regressed"
+
+  # ── Joiner whois on unknown peer still graceful ──
+  out=$(AIRC_HOME=/tmp/airc-it-w-j/state "$AIRC" whois nobody 2>&1 || true)
+  echo "$out" | grep -q "no record for 'nobody'" && pass "whois on unknown still graceful" || fail "whois unknown error message regressed"
+
+  cleanup_all
+}
+
+# ── Scenario: kick (host-only peer eviction) ──────────────────────────
+# Joiner sets identity FIRST, then pairs — so the host's peer file gets
+# joiner.identity populated. Test:
+#   - Host can `airc whois <joiner>` and see the joiner's pronouns/role/bio
+#   - Host kicks the joiner
+#   - Peer file is gone; joiner's pubkey removed from authorized_keys
+#   - Joiner attempts kick → refuses (joiner role check)
+scenario_kick() {
+  section "kick: host removes paired peer + handshake identity exchange"
+  cleanup_all
+
+  # Joiner pre-sets identity in its OWN scope before pairing — but
+  # spawn_joiner runs airc connect as part of pairing, which also writes
+  # config.json fresh. So we initialize the joiner's identity by writing
+  # config.json directly under AIRC_HOME ahead of spawn. The simpler
+  # route: spawn host first, get the join string, use airc identity set
+  # in the joiner's home BEFORE running airc connect, but that requires
+  # ensure_init which needs an existing config. Workaround: spawn the
+  # joiner, set identity, then teardown+reconnect. Cleanest for a test.
+  spawn_host /tmp/airc-it-k-h khost 7549 || { fail "khost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-k-h)
+  spawn_joiner /tmp/airc-it-k-j kjoiner "$join" || { fail "kjoiner join failed"; return; }
+  sleep 1
+
+  # Joiner sets identity AFTER first pair — to land it in host's peer
+  # file we need a re-handshake. teardown (no flush) + reconnect.
+  AIRC_HOME=/tmp/airc-it-k-j/state "$AIRC" identity set \
+    --pronouns he --role joined-with-id --bio "kick test joiner" >/dev/null 2>&1
+  AIRC_HOME=/tmp/airc-it-k-j/state "$AIRC" teardown >/dev/null 2>&1 || true
+  ( cd /tmp/airc-it-k-j && AIRC_HOME=/tmp/airc-it-k-j/state AIRC_NAME=kjoiner \
+      AIRC_NO_DISCOVERY=1 "$AIRC" connect "$join" > /tmp/airc-it-k-j/out2.log 2>&1 & )
+  sleep 3
+
+  # ── Host: airc whois kjoiner pulls fields from peer file ──
+  local out
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" whois kjoiner 2>&1)
+  echo "$out" | grep -q "pronouns: *he" && pass "host can whois joiner (handshake exchange worked)" \
+                                        || fail "host whois joiner missing identity (got: $out)"
+  echo "$out" | grep -q "role: *joined-with-id" && pass "host whois joiner shows role" || fail "host whois joiner missing role"
+
+  # ── Joiner attempts kick → refused ──
+  out=$(AIRC_HOME=/tmp/airc-it-k-j/state "$AIRC" kick khost 2>&1 || true)
+  echo "$out" | grep -qi "only the room host can kick\|joiner of" \
+    && pass "joiner can't kick (rejected with helpful error)" \
+    || fail "joiner kick attempt should be refused (got: $out)"
+
+  # ── Capture joiner's SSH pubkey BEFORE kick so we can assert removal ──
+  # init_identity always generates ssh_key.pub and the pair handshake always
+  # appends to ~/.ssh/authorized_keys — if either is missing, that's itself
+  # a regression worth failing on (the kick-revocation check below would
+  # otherwise be silently skipped, defeating the whole assertion).
+  local kj_ssh_pub
+  kj_ssh_pub=$(cat /tmp/airc-it-k-j/state/identity/ssh_key.pub 2>/dev/null | tr -d '\n' || true)
+  [ -n "$kj_ssh_pub" ] \
+    && pass "joiner's ssh_key.pub generated by init_identity" \
+    || { fail "joiner's ssh_key.pub missing — init_identity regression"; cleanup_all; return; }
+  [ -f "$HOME/.ssh/authorized_keys" ] \
+    && pass "host's authorized_keys exists post-handshake" \
+    || { fail "host's authorized_keys missing post-handshake — pair regression"; cleanup_all; return; }
+  grep -qF "$kj_ssh_pub" "$HOME/.ssh/authorized_keys" \
+    && pass "joiner's SSH key present in authorized_keys before kick" \
+    || fail "joiner's SSH key missing from authorized_keys before kick (handshake regression?)"
+
+  # ── Host kicks joiner ──
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" kick kjoiner "scenario test" 2>&1)
+  echo "$out" | grep -q "Kicked kjoiner" && pass "kick prints confirmation" || fail "kick missing confirmation (got: $out)"
+
+  # ── Peer file gone ──
+  [ ! -f /tmp/airc-it-k-h/state/peers/kjoiner.json ] \
+    && pass "kicked peer's file removed" \
+    || fail "peer file still present after kick"
+
+  # ── SSH key actually removed from authorized_keys ──
+  # Without this assertion, kick's pubkey-removal could silently regress
+  # — Copilot's #73 review caught a bug where kick was reading the wrong
+  # .pub file and leaving the SSH key in place.
+  if [ -n "$kj_ssh_pub" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
+    grep -qF "$kj_ssh_pub" "$HOME/.ssh/authorized_keys" \
+      && fail "kicked peer's SSH key still in authorized_keys (kick didn't actually revoke access)" \
+      || pass "kicked peer's SSH key removed from authorized_keys"
+  fi
+
+  # ── airc whois on the now-kicked peer is graceful ──
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" whois kjoiner 2>&1 || true)
+  echo "$out" | grep -q "no record for 'kjoiner'" \
+    && pass "whois post-kick prints no-record" \
+    || fail "whois post-kick should report missing"
+
+  # ── Reject path-traversal attempts in peer name ──
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" whois "../config" 2>&1 || true)
+  echo "$out" | grep -q "invalid peer name" \
+    && pass "whois rejects path-traversal in peer name" \
+    || fail "whois did NOT reject '../config' as a peer name (got: $out)"
+  out=$(AIRC_HOME=/tmp/airc-it-k-h/state "$AIRC" kick "../config" 2>&1 || true)
+  echo "$out" | grep -q "invalid peer name" \
+    && pass "kick rejects path-traversal in peer name" \
+    || fail "kick did NOT reject '../config' as a peer name (got: $out)"
+
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -1151,8 +1426,11 @@ case "$MODE" in
   room)         scenario_room ;;
   events)       scenario_events ;;
   get_host)     scenario_get_host ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|all]"; exit 2 ;;
+  identity)     scenario_identity ;;
+  whois)        scenario_whois ;;
+  kick)         scenario_kick ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|all]"; exit 2 ;;
 esac
 
 echo

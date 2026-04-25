@@ -57,19 +57,28 @@ detect_scope() {
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
-# Format: <basename>-<4-char-hash>. Hash disambiguates same-basename
-# directories across different parent paths (two "src" dirs don't collide).
-# Users can override any time with `airc rename <new>`.
+# Format: <repo>-<4-char-hash> when in a git repo (basename of the git
+# top-level), or <dir-basename>-<4-char-hash> otherwise. Hash
+# disambiguates same-name directories across different parent paths
+# (two "src" dirs, two clones of the same repo, etc.).
+#
+# Within a room scoped to a single org (which is the auto-scope default
+# — see infer_repo_org), every peer is from that org by construction, so
+# adding the org as a name prefix is redundant and lengthens @-mentions.
+# Cap is 20 chars on the basename, comfortably fitting common repo names
+# (`authenticator-d1f4`, `merchant-browser-d1f4`) without truncation.
+# Users can override any time with `airc nick`.
 derive_name() {
   local dir="${1:-$(pwd -P)}"
-  # Prefer git root basename — more meaningful than a subdir basename when
-  # the user happens to be deep in a repo — but hash the actual cwd so
-  # subdirs still get unique names.
-  local base_dir git_root
+  local base_dir git_root base
   git_root=$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)
   base_dir="${git_root:-$dir}"
-  local base
-  base=$(basename "$base_dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-12)
+  base=$(basename "$base_dir" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g' \
+    | sed 's/--*/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-20 \
+    | sed 's/-*$//')
   [ -z "$base" ] && base="airc"
   local hash
   hash=$(printf '%s' "$dir" | shasum -a 256 2>/dev/null | cut -c1-4)
@@ -167,6 +176,20 @@ relay_list() { [ -d "$AIRC_WRITE_DIR/$1" ] && ls -1 "$AIRC_WRITE_DIR/$1" 2>/dev/
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Validate a peer name matches the allowed nick charset BEFORE using it in
+# filesystem paths or remote SSH commands. Same charset cmd_rename uses
+# (a-z 0-9 -) — anything else is unreachable as a real airc identity and
+# almost certainly a path-traversal / shell-injection attempt
+# (`../config`, `; rm -rf /`, etc.). Rejects empty as well.
+_validate_peer_name() {
+  local name="${1:-}"
+  case "$name" in
+    "")              die "peer name required" ;;
+    *[!a-z0-9-]*)    die "invalid peer name '$name' — must match [a-z0-9-]+ (use airc peers to list valid names)" ;;
+    -*)              die "invalid peer name '$name' — must not start with '-'" ;;
+  esac
+}
 
 ensure_init() {
   [ -f "$CONFIG" ] && return 0
@@ -1582,14 +1605,22 @@ cmd_connect() {
     my_name=$(resolve_name)
     init_identity "$my_name"
 
-    cat > "$CONFIG" << EOF
-{
-  "name": "$my_name",
-  "host": "$(get_host)",
-  "host_target": "$ssh_target",
-  "created": "$(timestamp)"
-}
-EOF
+    # Merge into existing config.json instead of clobbering — preserves
+    # the `identity` block (issue #34) across re-pairs so a teardown +
+    # rejoin keeps pronouns/role/bio/status without requiring users to
+    # re-run airc identity set every time.
+    MY_NAME="$my_name" MY_HOST="$(get_host)" SSH_TARGET="$ssh_target" CREATED="$(timestamp)" CONFIG="$CONFIG" python3 -c '
+import json, os
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+except Exception:
+    c = {}
+c["name"]        = os.environ["MY_NAME"]
+c["host"]        = os.environ["MY_HOST"]
+c["host_target"] = os.environ["SSH_TARGET"]
+c["created"]     = os.environ["CREATED"]
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+'
 
     # Remember which room we joined (issue #39). Lets `airc rooms` and
     # status/diagnostics report channel context, and gives the joiner
@@ -1622,16 +1653,29 @@ EOF
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
 
+    # Read own identity blob to send in handshake (issue #34 v2 — peers
+    # cache each other's identity at pair-time so airc whois works fast).
+    local my_identity_json; my_identity_json=$(CONFIG="$CONFIG" python3 -c '
+import json, os
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+    print(json.dumps(c.get("identity", {})))
+except Exception:
+    print("{}")
+' 2>/dev/null)
+    [ -z "$my_identity_json" ] && my_identity_json="{}"
+
     local response
     local _pair_ok=1
-    response=$(python3 -c "
-import socket, json, sys
+    response=$(MY_IDENTITY="$my_identity_json" python3 -c "
+import socket, json, sys, os
 payload = json.dumps({
     'name': '$my_name',
     'host': '$(whoami)@$(get_host)',
     'ssh_pub': '''$my_ssh_pub''',
     'sign_pub': '''$my_sign_pub''',
-    'airc_home': '$AIRC_WRITE_DIR'
+    'airc_home': '$AIRC_WRITE_DIR',
+    'identity': json.loads(os.environ.get('MY_IDENTITY', '{}'))
 })
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(30)
@@ -1758,14 +1802,25 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
 " 2>/dev/null || true
 
     # Persist host details in own config so `airc invite` can reconstruct
-    # the join string for onward sharing without a fresh handshake.
-    python3 -c "
-import json
+    # the join string for onward sharing without a fresh handshake. Also
+    # cache the host's identity blob from the handshake response so
+    # `airc whois <host-name>` works locally (issue #34 v2).
+    local host_identity_json; host_identity_json=$(echo "$response" | python3 -c '
+import sys, json
+try:
+    print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
+except Exception:
+    print("{}")
+' 2>/dev/null)
+    [ -z "$host_identity_json" ] && host_identity_json="{}"
+    HOST_IDENTITY="$host_identity_json" python3 -c "
+import json, os
 c = json.load(open('$CONFIG'))
 c['host_airc_home'] = '$host_airc_home'
 c['host_name']      = '$peer_name'
 c['host_port']      = ${peer_port:-7547}
 c['host_ssh_pub']   = '''$host_ssh_pub'''
+c['host_identity']  = json.loads(os.environ.get('HOST_IDENTITY', '{}'))
 json.dump(c, open('$CONFIG', 'w'), indent=2)
 " 2>/dev/null || true
 
@@ -1803,13 +1858,23 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 
     init_identity "$name"
 
-    cat > "$CONFIG" << EOF
-{
-  "name": "$name",
-  "host": "$(get_host)",
-  "created": "$(timestamp)"
-}
-EOF
+    # Merge into existing config.json (preserve identity across re-spawns
+    # — same rationale as the joiner branch above).
+    MY_NAME="$name" MY_HOST="$(get_host)" CREATED="$(timestamp)" CONFIG="$CONFIG" python3 -c '
+import json, os
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+except Exception:
+    c = {}
+c["name"]    = os.environ["MY_NAME"]
+c["host"]    = os.environ["MY_HOST"]
+c["created"] = os.environ["CREATED"]
+# Host mode: clear any leftover host_target/host_name from a prior
+# joiner run in this scope (avoid mis-reading ourselves as a joiner).
+for k in ("host_target", "host_name", "host_port", "host_airc_home", "host_ssh_pub", "host_identity"):
+    c.pop(k, None)
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+'
 
     local host; host=$(get_host)
     local user; user=$(whoami)
@@ -2056,19 +2121,37 @@ with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
         'name': jname,
         'host': joiner.get('host',''),
         'airc_home': joiner.get('airc_home', ''),
-        'paired': '$(timestamp)'
+        'paired': '$(timestamp)',
+        # Cache joiner's SSH pubkey so airc kick can remove it from
+        # authorized_keys later. Without this, kick has no way to find
+        # the right line in authorized_keys and the kicked peer keeps
+        # SSH access — Copilot caught this on PR #73 review.
+        'ssh_pub': joiner.get('ssh_pub', ''),
+        # Cache joiner's identity blob (issue #34 v2). Empty on legacy
+        # peers that don't send the field — airc whois prints the
+        # 'not exchanged yet' fallback gracefully.
+        'identity': joiner.get('identity', {})
     }, f, indent=2)
 if joiner.get('sign_pub'):
     with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
         f.write(joiner['sign_pub'])
 
-# Send back host's SSH pubkey and airc_home
+# Send back host's SSH pubkey + airc_home + own identity blob (issue #34
+# v2). Joiner caches under host_identity so 'airc whois <host-name>'
+# works locally without a round-trip.
 host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
+host_identity = {}
+try:
+    host_config = json.load(open('$CONFIG'))
+    host_identity = host_config.get('identity', {}) or {}
+except Exception:
+    pass
 response = json.dumps({
     'ssh_pub': host_pub,
     'name': '$name',
     'reminder': $reminder_interval,
-    'airc_home': '$AIRC_WRITE_DIR'
+    'airc_home': '$AIRC_WRITE_DIR',
+    'identity': host_identity
 })
 conn.sendall((response + '\n').encode())
 conn.close()
@@ -2134,7 +2217,19 @@ cmd_rename() {
   esac
   # Reject leading dash so no flag-shaped string can ever become an identity.
   case "$new_name" in -*) die "Name must not start with '-' (got '$new_name')" ;; esac
-  new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
+  # Sanitize: lowercase, replace non-[a-z0-9-] with '-', collapse runs of
+  # dashes, strip leading/trailing dashes, then cap. The post-sanitization
+  # leading-dash strip matters because input like `.foo` becomes `-foo`
+  # after the `[^a-z0-9-]` replacement and would slip past the case check
+  # above — making the resulting name unreachable by `airc whois` /
+  # `airc kick` (both reject leading-dash). Caught by Copilot review on
+  # PR #75 follow-up.
+  new_name=$(echo "$new_name" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g' \
+    | sed 's/--*/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-24 \
+    | sed 's/-*$//')
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
@@ -2159,6 +2254,431 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
   # still sits under an older name). host is immutable per machine+user.
   local my_host; my_host="$(whoami)@$(get_host)"
   cmd_send "[rename] old=$old_name new=$new_name host=$my_host" >/dev/null 2>&1 || true
+}
+
+# ── Identity (issue #34) ────────────────────────────────────────────────
+#
+# Structured agent persona, layered on top of the bootstrap name from
+# derive_name. Stored under config.json's `identity` key (single-file
+# scope: `name` already lives in config.json, identity fields sit
+# alongside). Five fields:
+#
+#   pronouns      — she/they/he/it; used by skill narrators for grammar
+#   role          — short hyphenated tag, e.g. "device-link-orchestrator"
+#   bio           — one-line free-form, IRC-realname analog
+#   status        — mutable "what I'm working on now" (Slack-like)
+#   integrations  — { platform: handle } mappings to other platforms
+#                   (continuum, slack, telegram) so airc identity can
+#                   adopt or be adopted by canonical persona elsewhere
+#
+# Skill-side bootstrap prompts the agent to fill these on first /join
+# (set AIRC_NO_IDENTITY_PROMPT=1 to skip — used by integration tests).
+# v1: airc identity show/set/link locally; airc whois on self.
+# v2 (deferred): peer WHOIS over SSH; live continuum/slack import/push.
+
+cmd_identity() {
+  ensure_init
+  local sub="${1:-show}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    show|"") _identity_show ;;
+    set)     _identity_set "$@" ;;
+    link)    _identity_link "$@" ;;
+    import)  _identity_import "$@" ;;
+    push)    _identity_push "$@" ;;
+    -h|--help|help)
+      echo "Usage:"
+      echo "  airc identity show                            Print own identity"
+      echo "  airc identity set [--pronouns X] [--role Y] [--bio \"…\"] [--status \"…\"]"
+      echo "  airc identity link <platform> [handle]        Map this identity to a platform persona (omit handle to unlink)"
+      echo "  airc identity import <platform>:<id>          Pull persona from platform (continuum)"
+      echo "  airc identity push <platform>                 Send local fields to platform (continuum)"
+      ;;
+    *) die "Unknown identity subcommand: $sub (try: show, set, link, import, push)" ;;
+  esac
+}
+
+_identity_show() {
+  CONFIG="$CONFIG" python3 -c '
+import json, os
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+except Exception:
+    print("  (no config — run airc connect)"); raise SystemExit(0)
+ident = c.get("identity", {}) or {}
+fields = [
+    ("name",     c.get("name", "?"),         ""),
+    ("pronouns", ident.get("pronouns", ""),  "(unset)"),
+    ("role",     ident.get("role", ""),      "(unset)"),
+    ("bio",      ident.get("bio", ""),       "(unset)"),
+    ("status",   ident.get("status", ""),    "(unset)"),
+]
+for k, v, fallback in fields:
+    label = k + ":"
+    value = v if v else fallback
+    print(f"  {label:<11} {value}")
+ints = ident.get("integrations", {}) or {}
+if ints:
+    print("  integrations:")
+    for k, v in ints.items():
+        print(f"    {k}: {v}")
+else:
+    print("  integrations: (none)")
+'
+}
+
+_identity_set() {
+  local pronouns="" role="" bio="" status=""
+  local set_pronouns=0 set_role=0 set_bio=0 set_status=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pronouns) pronouns="${2:-}"; set_pronouns=1; shift 2 ;;
+      --role)     role="${2:-}";     set_role=1;     shift 2 ;;
+      --bio)      bio="${2:-}";      set_bio=1;      shift 2 ;;
+      --status)   status="${2:-}";   set_status=1;   shift 2 ;;
+      *) die "Unknown flag: $1 (use --pronouns/--role/--bio/--status)" ;;
+    esac
+  done
+  if [ "$set_pronouns" = 0 ] && [ "$set_role" = 0 ] && [ "$set_bio" = 0 ] && [ "$set_status" = 0 ]; then
+    die "Pass at least one of --pronouns / --role / --bio / --status"
+  fi
+  CONFIG="$CONFIG" \
+    SET_PRONOUNS="$set_pronouns" PRONOUNS="$pronouns" \
+    SET_ROLE="$set_role"         ROLE="$role" \
+    SET_BIO="$set_bio"           BIO="$bio" \
+    SET_STATUS="$set_status"     STATUS="$status" \
+    python3 -c '
+import json, os
+c = json.load(open(os.environ["CONFIG"]))
+ident = c.setdefault("identity", {})
+for key, env_set, env_val in [
+    ("pronouns", "SET_PRONOUNS", "PRONOUNS"),
+    ("role",     "SET_ROLE",     "ROLE"),
+    ("bio",      "SET_BIO",      "BIO"),
+    ("status",   "SET_STATUS",   "STATUS"),
+]:
+    if os.environ.get(env_set) == "1":
+        v = os.environ.get(env_val, "").strip()
+        if v:
+            ident[key] = v
+        else:
+            ident.pop(key, None)
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+print("  identity updated.")
+'
+}
+
+_identity_link() {
+  local platform="${1:-}" handle="${2:-}"
+  [ -z "$platform" ] && die "Usage: airc identity link <platform> [handle] (omit/blank handle to unlink)"
+  CONFIG="$CONFIG" PLATFORM="$platform" HANDLE="$handle" python3 -c '
+import json, os
+c = json.load(open(os.environ["CONFIG"]))
+ints = c.setdefault("identity", {}).setdefault("integrations", {})
+platform = os.environ["PLATFORM"]
+handle = os.environ.get("HANDLE", "").strip()
+if handle:
+    ints[platform] = handle
+    print(f"  linked: {platform} -> {handle}")
+else:
+    ints.pop(platform, None)
+    print(f"  unlinked: {platform}")
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+'
+}
+
+# WHOIS: prints identity for self, host, paired peer, or other peer of
+# our host. Identity blobs are exchanged at pair-handshake time and
+# cached locally — no round-trip needed for self/host/local-peer. Cross-
+# peer (we're a joiner asking about another joiner of our host) falls
+# back to a single SSH read of the host's peer file.
+cmd_whois() {
+  ensure_init
+  local target="${1:-}"
+  local my_name; my_name=$(get_name)
+
+  # Self
+  if [ -z "$target" ] || [ "$target" = "$my_name" ]; then
+    _identity_show
+    return 0
+  fi
+
+  # Reject path-traversal / shell-injection in target before it touches
+  # filesystem paths (local PEERS_DIR/<target>.json) or remote SSH cmds
+  # (cat $host_airc_home/peers/<target>.json).
+  _validate_peer_name "$target"
+
+  # Host (we're a joiner, target is the host we paired with)
+  local host_name; host_name=$(get_config_val host_name "")
+  if [ -n "$host_name" ] && [ "$target" = "$host_name" ]; then
+    local host_id_blob; host_id_blob=$(CONFIG="$CONFIG" python3 -c '
+import json, os
+c = json.load(open(os.environ["CONFIG"]))
+print(json.dumps(c.get("host_identity", {}) or {}))
+' 2>/dev/null || echo "{}")
+    _whois_pretty "$target" "$host_id_blob" "$(get_config_val host_target '')"
+    return 0
+  fi
+
+  # Local peer file — flat layout: $PEERS_DIR/<peer>.json
+  local peer_file="$PEERS_DIR/$target.json"
+  if [ -f "$peer_file" ]; then
+    local blob; blob=$(python3 -c "
+import json
+p = json.load(open('$peer_file'))
+print(json.dumps(p.get('identity', {}) or {}))
+" 2>/dev/null)
+    local host; host=$(python3 -c "
+import json
+print(json.load(open('$peer_file')).get('host', ''))
+" 2>/dev/null)
+    _whois_pretty "$target" "$blob" "$host"
+    return 0
+  fi
+
+  # Cross-peer via host (we're a joiner; query host's peer file remotely)
+  local host_target; host_target=$(get_config_val host_target "")
+  local host_airc_home; host_airc_home=$(get_config_val host_airc_home "")
+  if [ -n "$host_target" ] && [ -n "$host_airc_home" ]; then
+    local remote_blob
+    remote_blob=$(relay_ssh "$host_target" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
+    if [ -n "$remote_blob" ]; then
+      local peer_id; peer_id=$(printf '%s' "$remote_blob" | python3 -c '
+import sys, json
+try:
+    print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
+except Exception:
+    print("{}")
+' 2>/dev/null)
+      local peer_host; peer_host=$(printf '%s' "$remote_blob" | python3 -c '
+import sys, json
+try:
+    print(json.load(sys.stdin).get("host", ""))
+except Exception:
+    print("")
+' 2>/dev/null)
+      _whois_pretty "$target" "$peer_id" "$peer_host"
+      return 0
+    fi
+  fi
+
+  echo "  whois: no record for '$target' (try airc peers to list paired peers)"
+  return 1
+}
+
+# Pretty-print an identity blob (JSON string) for a named peer.
+# Args: name, identity-json, host (any may be empty).
+_whois_pretty() {
+  local name="$1" blob="${2:-{\}}" host="${3:-}"
+  NAME="$name" BLOB="$blob" HOST="$host" python3 <<'PYEOF'
+import json, os
+name = os.environ["NAME"]
+host = os.environ.get("HOST", "")
+try:
+    ident = json.loads(os.environ.get("BLOB", "{}") or "{}")
+except Exception:
+    ident = {}
+print(f"  name:      {name}")
+fields = [("pronouns", ident.get("pronouns", "")),
+          ("role",     ident.get("role", "")),
+          ("bio",      ident.get("bio", "")),
+          ("status",   ident.get("status", ""))]
+for k, v in fields:
+    label = k + ":"
+    fallback = "(unset)"
+    print(f"  {label:<11} {v if v else fallback}")
+ints = ident.get("integrations", {}) or {}
+if ints:
+    print("  integrations:")
+    for k, v in ints.items():
+        print(f"    {k}: {v}")
+else:
+    print("  integrations: (none)")
+if host:
+    print(f"  host:      {host}")
+PYEOF
+}
+
+cmd_kick() {
+  # Host-only: forcibly remove a paired peer. IRC analog: /kick <user>.
+  # Steps: emit a system event, drop their SSH pubkey from authorized_keys,
+  # remove the peer file. The kicked peer's tail loop dies on the closed
+  # pipe AND any future auth attempts fail because their key is gone from
+  # authorized_keys — they can't silently keep operating after a kick.
+  # They can re-pair via airc connect (no ban yet) — for that, see future
+  # `airc ban`.
+  ensure_init
+  local target="${1:-}"
+  [ -z "$target" ] && die "Usage: airc kick <peer> [reason]"
+  _validate_peer_name "$target"
+  shift || true
+  local reason="${*:-no reason given}"
+
+  # Joiner role check — kicking only makes sense as host.
+  local host_target; host_target=$(get_config_val host_target "")
+  if [ -n "$host_target" ]; then
+    die "kick: only the room host can kick. You are a joiner of $host_target — talk to the host."
+  fi
+
+  local peer_file="$PEERS_DIR/$target.json"
+  if [ ! -f "$peer_file" ]; then
+    die "kick: '$target' not in peers list (try: airc peers)"
+  fi
+
+  # Read the joiner's SSH pubkey from the peer JSON record (the host
+  # handshake stores it there — `<peer>.pub` holds the SIGNING pubkey,
+  # not the SSH auth key, so we can't use that file). Without this,
+  # kick would leave the joiner's SSH key in authorized_keys and the
+  # peer could keep authenticating despite the "kick" — caught by
+  # Copilot review on PR #73.
+  local peer_ssh_pub
+  peer_ssh_pub=$(PEER_FILE="$peer_file" python3 -c '
+import json, os
+try:
+    p = json.load(open(os.environ["PEER_FILE"]))
+    print((p.get("ssh_pub") or "").strip())
+except Exception:
+    pass
+' 2>/dev/null || echo "")
+
+  if [ -n "$peer_ssh_pub" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
+    # grep -v returns 1 when every line matches (or the file is empty);
+    # both are fine outcomes here, so eat the exit code.
+    grep -vF "$peer_ssh_pub" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp" 2>/dev/null || true
+    [ -f "$HOME/.ssh/authorized_keys.tmp" ] && mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
+    chmod 600 "$HOME/.ssh/authorized_keys" 2>/dev/null || true
+  fi
+
+  # Remove peer files (rm -f is set-e-safe). The .pub here is the
+  # signing key file, separate from authorized_keys.
+  rm -f "$peer_file" "$PEERS_DIR/$target.pub"
+
+  # Emit a system event so the kicked peer (and others) see it in the
+  # tail stream. Reuse cmd_send's plumbing.
+  cmd_send "[kick] $target ($reason)" >/dev/null 2>&1 || true
+
+  if [ -n "$peer_ssh_pub" ]; then
+    echo "  Kicked $target ($reason). SSH key removed from authorized_keys; peer file gone."
+  else
+    echo "  Kicked $target ($reason). Peer file gone, but no SSH key recorded for this peer — they were paired before #34's handshake update; their authorized_keys entry survived. Run airc peers to confirm."
+  fi
+  echo "  They can re-pair via airc connect; for permanent ban, see future 'airc ban'."
+}
+
+# ── Identity import/push (issue #34 v2) ─────────────────────────────────
+#
+# Cross-platform persona linking. The basic shape: airc has an opt-in
+# tool wrapper for each known platform. If the platform's CLI is on PATH
+# AND a matching profile is found, pull/push fields. Otherwise: clear
+# error pointing at the manual `airc identity link <platform> <handle>`.
+#
+# v1 supports: continuum (the high-leverage internal case). slack/
+# telegram/discord are stubs that error with platform-install hints —
+# they're scaffolding for future PRs, not productionized integrations.
+
+_identity_import() {
+  local spec="${1:-}"
+  [ -z "$spec" ] && die "Usage: airc identity import <platform>:<id>"
+  local platform="${spec%%:*}"
+  local id="${spec#*:}"
+  if [ "$platform" = "$spec" ] || [ -z "$id" ]; then
+    die "Usage: airc identity import <platform>:<id> (got '$spec' — missing colon?)"
+  fi
+  case "$platform" in
+    continuum)
+      _identity_import_continuum "$id" ;;
+    slack|telegram|discord)
+      die "import from $platform not yet implemented. For now, run: airc identity link $platform <handle>"
+      ;;
+    *)
+      die "Unknown platform '$platform'. Supported: continuum (v1). slack/telegram/discord stubbed."
+      ;;
+  esac
+}
+
+_identity_push() {
+  local platform="${1:-}"
+  [ -z "$platform" ] && die "Usage: airc identity push <platform>"
+  case "$platform" in
+    continuum)
+      _identity_push_continuum ;;
+    slack|telegram|discord)
+      die "push to $platform not yet implemented. For now, run: airc identity link $platform <handle>"
+      ;;
+    *)
+      die "Unknown platform '$platform'. Supported: continuum (v1). slack/telegram/discord stubbed."
+      ;;
+  esac
+}
+
+# Continuum integration: shells out to a `continuum` binary if it's on
+# PATH. Expected interface (best-effort — we degrade gracefully if the
+# binary doesn't support these subcommands yet):
+#   continuum persona show <name>          → prints JSON {pronouns, role, bio, ...}
+#   continuum persona update <name> --bio ...  → updates the persona
+# If continuum isn't installed, link() the handle anyway so the mapping
+# is recorded for future syncs.
+_identity_import_continuum() {
+  local id="$1"
+  if ! command -v continuum >/dev/null 2>&1; then
+    echo "  continuum CLI not on PATH — recording link only."
+    echo "  Once you install continuum, re-run: airc identity import continuum:$id"
+    _identity_link continuum "$id"
+    return 0
+  fi
+  local blob; blob=$(continuum persona show "$id" 2>/dev/null || true)
+  if [ -z "$blob" ]; then
+    echo "  continuum persona '$id' not found — recording link only."
+    _identity_link continuum "$id"
+    return 0
+  fi
+  # Parse the JSON; merge into our identity. Empty fields skip; existing
+  # fields get overwritten (the user's intent: "I want to BE this persona").
+  BLOB="$blob" CONFIG="$CONFIG" python3 -c '
+import json, os
+try:
+    src = json.loads(os.environ["BLOB"])
+except Exception:
+    src = {}
+c = json.load(open(os.environ["CONFIG"]))
+ident = c.setdefault("identity", {})
+for k in ("pronouns", "role", "bio"):
+    v = src.get(k)
+    if v:
+        ident[k] = v
+ints = ident.setdefault("integrations", {})
+ints["continuum"] = src.get("name", "")
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+print(f"  imported continuum:{src.get(\"name\", \"?\")} → pronouns={src.get(\"pronouns\", \"\")} role={src.get(\"role\", \"\")} bio set={bool(src.get(\"bio\"))}")
+'
+}
+
+_identity_push_continuum() {
+  if ! command -v continuum >/dev/null 2>&1; then
+    die "continuum CLI not on PATH — install continuum before pushing."
+  fi
+  local handle; handle=$(CONFIG="$CONFIG" python3 -c '
+import json, os
+c = json.load(open(os.environ["CONFIG"]))
+print(c.get("identity", {}).get("integrations", {}).get("continuum", ""))
+' 2>/dev/null)
+  [ -z "$handle" ] && die "No continuum handle linked. Run: airc identity link continuum <name>"
+  CONFIG="$CONFIG" HANDLE="$handle" python3 -c '
+import json, os, subprocess
+c = json.load(open(os.environ["CONFIG"]))
+ident = c.get("identity", {})
+handle = os.environ["HANDLE"]
+args = ["continuum", "persona", "update", handle]
+for k in ("pronouns", "role", "bio"):
+    v = ident.get(k)
+    if v:
+        args += [f"--{k}", v]
+res = subprocess.run(args, capture_output=True, text=True)
+if res.returncode != 0:
+    print(f"  continuum push failed: {res.stderr.strip() or res.stdout.strip()}")
+    raise SystemExit(1)
+print(f"  pushed local identity to continuum:{handle}")
+'
 }
 
 cmd_send() {
@@ -3521,6 +4041,9 @@ case "${1:-help}" in
   send-file) shift; cmd_send_file "$@" ;;
   ping)      shift; cmd_ping "$@" ;;
   rename|nick) shift; cmd_rename "$@" ;;
+  identity|whoami) shift; cmd_identity "$@" ;;
+  whois)     shift; cmd_whois "$@" ;;
+  kick)      shift; cmd_kick "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
@@ -3554,6 +4077,13 @@ case "${1:-help}" in
     echo "  airc msg / send <text>          Broadcast to the current room"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc nick / rename <new>        Rename this session (notifies peers)"
+    echo "  airc identity show              Print own pronouns/role/bio/status/integrations"
+    echo "  airc identity set --pronouns X --role Y --bio \"…\" --status \"…\""
+    echo "  airc identity link <platform> <handle>   Map this airc identity to a platform persona"
+    echo "  airc identity import <platform>:<id>     Pull persona FROM platform (continuum)"
+    echo "  airc identity push <platform>            Push local fields TO platform (continuum)"
+    echo "  airc whois [<peer>]             Show identity of self / host / paired peer / cross-peer-via-host"
+    echo "  airc kick <peer> [reason]       Host-only: remove a paired peer (drop SSH key + peer file)"
     echo "  airc quit / disconnect          Leave the mesh (keep identity for next time)"
     echo "  airc peers                      List connected peers"
     echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong)"
