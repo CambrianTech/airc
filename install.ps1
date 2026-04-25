@@ -323,6 +323,28 @@ if (Test-Path $skillsSrc) {
     }
 }
 
+# -- Tailscale login check -----------------------------------------------
+# Tailscale-installed-but-logged-out is the most common 'tailscale down'
+# state in practice (post-reboot, fresh install, expired auth). Detect
+# proactively and tell the user to sign in before they hit a confusing
+# 'daemon down' error on their first 'airc join'. Mirrors install.sh
+# ts_post_check.
+$tsBin = $null
+if (Get-Command tailscale -ErrorAction SilentlyContinue) {
+    $tsBin = 'tailscale'
+} elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
+    $tsBin = 'C:\Program Files\Tailscale\tailscale.exe'
+}
+if ($tsBin) {
+    $tsOut = & $tsBin status 2>&1 | Out-String
+    if ($tsOut -match 'Logged out|NeedsLogin') {
+        Write-Host ''
+        Write-Warn2 "Tailscale is installed but you're not signed in."
+        Write-Host '    Click the Tailscale tray icon to sign in, or run:  tailscale up'
+        Write-Host '    Do this BEFORE airc join, or cross-machine joins will hang.'
+    }
+}
+
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'
@@ -330,7 +352,7 @@ Write-Host ''
 Write-Host '  Next:'
 Write-Host '    1. Open a NEW PowerShell window (so PATH refreshes)'
 Write-Host '    2. Authenticate gh once:    gh auth login -s gist'
-Write-Host "    3. Bring Tailscale up:      tailscale up    (or skip - LAN works without it)"
+Write-Host "    3. Sign in to Tailscale:    click tray icon, or 'tailscale up'  (or skip - LAN works without it)"
 Write-Host '    4. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'

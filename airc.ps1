@@ -307,13 +307,20 @@ function Advise-TailscaleIfDown {
     if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
 
     $ts = Resolve-TailscaleBin
+    $tsOut = ''
+    $tsRc  = 1
     if ($ts) {
-        & $ts status 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $false }   # daemon up, proceed
+        $tsOut = & $ts status 2>&1 | Out-String
+        $tsRc  = $LASTEXITCODE
+        # Status command rc=0 AND output doesn't say "Logged out" / "NeedsLogin"
+        # = daemon up + signed in, proceed.
+        if ($tsRc -eq 0 -and $tsOut -notmatch 'Logged out|NeedsLogin') {
+            return $false
+        }
     }
 
     Write-Host ''
-    Write-Host "X airc: can't reach Tailscale-routed host $TargetHost -- Tailscale appears down on this machine."
+    Write-Host "X airc: can't reach Tailscale-routed host $TargetHost -- Tailscale isn't ready on this machine."
     Write-Host ''
     if (-not $ts) {
         Write-Host '   Tailscale is not installed. airc needs it only for cross-machine mesh.'
@@ -324,6 +331,17 @@ function Advise-TailscaleIfDown {
         Write-Host '   After install, bring the tailnet up and re-run airc join.'
         return $true
     }
+
+    # Distinguish "logged out" from "daemon down" - they need different
+    # fixes and used to print the same wrong "start the daemon" message.
+    if ($tsOut -match 'Logged out|NeedsLogin') {
+        Write-Host '   Tailscale is installed and running but you''re not signed in.'
+        Write-Host '     Click the Tailscale tray icon to sign in,'
+        Write-Host '     or run:  tailscale up'
+        Write-Host ''
+        return $true
+    }
+
     Write-Host '   Tailscale CLI is installed but the daemon is not running. Start it:'
     Write-Host '     (Windows) Click the Tailscale tray icon to start the app.'
     Write-Host '               Or from an elevated PowerShell:  Start-Service Tailscale'
