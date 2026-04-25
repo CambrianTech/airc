@@ -1144,6 +1144,12 @@ cmd_connect() {
   # (sleep/crash/network), the joiner deletes the stale gist and re-execs
   # itself in host mode — first-agent-back-in becomes the new host.
   local _resolved_gist_id=""
+  # Heartbeat freshness vars - parsed by gist resolver in the room
+  # case-arm. Must be defaulted here so the JOIN MODE early-takeover
+  # check (which runs unconditionally if a target has '@') doesn't trip
+  # 'unbound variable' when target came in inline (no gist resolved).
+  local _resolved_heartbeat_stale=0
+  local _resolved_heartbeat_age=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1655,6 +1661,9 @@ cmd_connect() {
       # Try parse as airc JSON envelope first. If it parses + has airc
       # field, dispatch on `kind`. Otherwise, treat raw_content as the
       # legacy raw-invite-string format (backward compat).
+      # _resolved_heartbeat_stale + _resolved_heartbeat_age are declared
+      # at function-scope above so the JOIN MODE check sees them on the
+      # inline-invite path too (where this gist block doesn't run).
       local resolved=""
       if command -v jq >/dev/null 2>&1; then
         local airc_ver kind
@@ -1677,6 +1686,36 @@ cmd_connect() {
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.name // empty' 2>/dev/null)
+
+              # Heartbeat freshness check — the structural fix for
+              # orphan-gist class. Hosts update last_heartbeat every
+              # AIRC_HEARTBEAT_SEC (default 30s); if it's older than
+              # AIRC_HEARTBEAT_STALE (default 90s = 3 missed beats),
+              # the host is dead. We short-circuit the SSH attempt and
+              # take over directly — no minute-long timeout, no peer
+              # confusion about "is this thing on?". Pre-heartbeat
+              # gists (no field) are treated as fresh for backward
+              # compat; their hosts will get caught by the existing
+              # SSH-failure self-heal path at line ~1850.
+              local _hb_iso _hb_ts _now_ts _hb_stale_sec
+              _hb_iso=$(printf '%s' "$raw_content" | jq -r '.last_heartbeat // empty' 2>/dev/null)
+              _hb_stale_sec="${AIRC_HEARTBEAT_STALE:-90}"
+              if [ -n "$_hb_iso" ]; then
+                # Convert ISO-8601 UTC to epoch. GNU date and BSD date
+                # have incompatible flags; try GNU first (linux + git-bash),
+                # fall back to BSD (mac default). If both fail (busybox?),
+                # skip the check rather than mis-classify.
+                _hb_ts=$(date -u -d "$_hb_iso" +%s 2>/dev/null \
+                         || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$_hb_iso" +%s 2>/dev/null \
+                         || echo "")
+                if [ -n "$_hb_ts" ]; then
+                  _now_ts=$(date -u +%s)
+                  _resolved_heartbeat_age=$(( _now_ts - _hb_ts ))
+                  if [ "$_resolved_heartbeat_age" -gt "$_hb_stale_sec" ]; then
+                    _resolved_heartbeat_stale=1
+                  fi
+                fi
+              fi
               ;;
             "")
               die "Gist has airc envelope (v$airc_ver) but no 'kind' field — malformed."
@@ -1704,6 +1743,44 @@ cmd_connect() {
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
+
+    # Stale-heartbeat fast-path takeover. If the gist we resolved had a
+    # last_heartbeat older than AIRC_HEARTBEAT_STALE (parsed above), the
+    # host is dead. Skip the SSH attempt entirely — no minute-long TCP
+    # timeout, no peer wondering "is this thing on" — go straight to
+    # take-over. Same operations as the SSH-failure self-heal at the
+    # bottom of JOIN MODE (delete stale gist, re-exec as host with
+    # AIRC_NO_DISCOVERY=1) but triggered from positive evidence (stale
+    # presence signal) rather than negative evidence (TCP timeout).
+    #
+    # Backward compat: pre-heartbeat gists have no last_heartbeat field,
+    # _resolved_heartbeat_stale stays 0, this block is a no-op, and the
+    # SSH-failure self-heal still catches the dead host (slower, but
+    # correct).
+    if [ "$_resolved_heartbeat_stale" = "1" ] && [ -n "$resolved_room_name" ] \
+       && [ -n "$_resolved_gist_id" ] && command -v gh >/dev/null 2>&1; then
+      echo ""
+      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over..."
+      echo "     (prior host's gist: $_resolved_gist_id)"
+      if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
+        echo "  ✓ Stale gist removed."
+      else
+        echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
+        echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+      fi
+      # Preserve identity name across re-exec — same reason as the
+      # SSH-failure self-heal: derive_name re-runs from cwd and can drift
+      # on case-aliasing, peers see a "new" peer.
+      local _preserved_name; _preserved_name=$(get_config_val name "")
+      # Wipe any half-written CONFIG (this path runs before we write,
+      # but be defensive in case a prior failed pair left state behind).
+      rm -f "$CONFIG"
+      rm -f "$AIRC_WRITE_DIR/room_name"
+      echo "  Re-execing into host mode for #${resolved_room_name}..."
+      echo ""
+      exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
+    fi
+
     # Parse name@user@host[:port]#pubkey
     local host_ssh_pubkey_b64=""
     if echo "$target" | grep -q '#'; then
@@ -2111,6 +2188,14 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
           # gist lifecycle + envelope kind differ.
           _gist_kind="room"
           _gist_desc="airc room: ${room_name}"
+          # last_heartbeat field is the host's presence signal. Updated
+          # every AIRC_HEARTBEAT_SEC (default 30s) by a background loop
+          # spawned after gist create. Joiners check freshness on
+          # resolve — stale = host dead, take over deterministically.
+          # Without this, hosts that die ungracefully (machine sleep,
+          # kill -9, OOM, bash-bg-and-die) leave their gist pointing
+          # at a corpse forever — every today's mess was downstream of
+          # this. Issue: structural fix for #79 + #83.
           _gist_payload=$(cat <<JSON
 {
   "airc": 1,
@@ -2125,7 +2210,8 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     "port": $host_port
   },
   "created": "$_now",
-  "updated": "$_now"
+  "updated": "$_now",
+  "last_heartbeat": "$_now"
 }
 JSON
 )
@@ -2166,6 +2252,82 @@ JSON
           if [ "$_gist_kind" = "room" ]; then
             echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
             echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+
+            # Heartbeat loop: keep last_heartbeat fresh in the gist so
+            # joiners can deterministically detect a dead host. Without
+            # this, a host that dies ungracefully (sleep, kill -9, OOM,
+            # crashed bash) leaves a gist pointing at a corpse forever.
+            # Every messy state cascade today (memento, my own
+            # bash-bg-and-die orphan, the manual gist-delete I had to
+            # run by hand) traces to this missing presence signal.
+            #
+            # Loop runs every AIRC_HEARTBEAT_SEC (default 30s) and dies
+            # automatically when its parent (the host airc connect bash)
+            # exits — so kill -9 on the host stops heartbeats within one
+            # interval. Joiners treat last_heartbeat older than
+            # AIRC_HEARTBEAT_STALE (default 90s = 3 missed beats) as
+            # stale and self-heal as new host.
+            local _heartbeat_sec="${AIRC_HEARTBEAT_SEC:-30}"
+            local _hb_parent_pid=$$
+            local _hb_invite="$_invite_long"
+            local _hb_name="$name"
+            local _hb_user="$user"
+            local _hb_host="$host"
+            local _hb_port="$host_port"
+            local _hb_room="$room_name"
+            local _hb_created="$_now"
+            (
+              # Detach from job control so a parent SIGINT kills the
+              # whole tree but normal exit lets us race the trap to
+              # delete the gist first.
+              while sleep "$_heartbeat_sec"; do
+                # Parent died (PID gone) → exit. This is the kill -9
+                # / OOM / sleep recovery path.
+                if ! kill -0 "$_hb_parent_pid" 2>/dev/null; then
+                  exit 0
+                fi
+                local _hb_now; _hb_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                local _hb_payload; _hb_payload=$(cat <<JSON
+{
+  "airc": 1,
+  "kind": "room",
+  "name": "${_hb_room}",
+  "topic": "",
+  "invite": "${_hb_invite}",
+  "host": {
+    "name": "${_hb_name}",
+    "user": "${_hb_user}",
+    "address": "${_hb_host}",
+    "port": ${_hb_port}
+  },
+  "created": "${_hb_created}",
+  "updated": "${_hb_now}",
+  "last_heartbeat": "${_hb_now}"
+}
+JSON
+)
+                local _hb_tmp; _hb_tmp=$(mktemp -t airc-hb.XXXXXX)
+                printf '%s\n' "$_hb_payload" > "$_hb_tmp"
+                gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>&1 || true
+                rm -f "$_hb_tmp"
+              done
+            ) &
+            local _hb_pid=$!
+            # Track the heartbeat-loop PID so cmd_teardown can kill it
+            # cleanly. Also written to the airc.pid line so teardown's
+            # tree-walk picks it up.
+            echo "$_hb_pid" >> "$AIRC_WRITE_DIR/airc.pid"
+
+            # Graceful-exit trap: on EXIT/SIGINT/SIGTERM, kill the
+            # heartbeat + delete the gist. Doesn't help kill -9 (which
+            # is exactly what the heartbeat itself is the answer for),
+            # but covers Ctrl-C and normal teardown — gist gets cleaned
+            # up so peers don't even hit the stale window.
+            trap "
+              kill $_hb_pid 2>/dev/null
+              gh gist delete '$_gist_id' --yes >/dev/null 2>&1
+            " EXIT INT TERM
+
             echo "  Hosting #${room_name} (gh-account substrate)."
             echo "  Other agents on your gh account auto-join via:  airc connect"
             echo "  Cross-account share (rare):"

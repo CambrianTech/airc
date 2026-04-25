@@ -1,5 +1,5 @@
 ---
-name: airc:repair
+name: repair
 description: Full re-pair of a stale airc mesh — `teardown --flush` + reconnect using the saved invite string. Use when your sends silently fail or `resume` reports stale auth.
 user-invocable: true
 allowed-tools: Bash, Monitor

@@ -2276,12 +2276,37 @@ function Invoke-Connect {
                 Die "Failed to fetch gist '$gistId'. Check the ID, network, and (if private) 'gh auth login'."
             }
             $resolved = $null
+            $resolvedHeartbeatStale = $false
+            $resolvedHeartbeatAge = 0
             try {
                 $env = $rawContent | ConvertFrom-Json
                 if ($env.airc) {
                     switch ($env.kind) {
                         'invite' { $resolved = $env.invite }
-                        'room'   { $resolved = $env.invite; $resolvedRoomName = $env.name }
+                        'room'   {
+                            $resolved = $env.invite
+                            $resolvedRoomName = $env.name
+                            # Heartbeat freshness check - structural fix for
+                            # orphan-gist class. Hosts update last_heartbeat
+                            # every AIRC_HEARTBEAT_SEC; older than
+                            # AIRC_HEARTBEAT_STALE = host dead, take over.
+                            # Pre-heartbeat gists (no field) treated as fresh
+                            # for backward compat - SSH-failure self-heal
+                            # still catches them.
+                            $hbStaleSec = 90
+                            if ($env:AIRC_HEARTBEAT_STALE) {
+                                try { $hbStaleSec = [int]$env:AIRC_HEARTBEAT_STALE } catch {}
+                            }
+                            if ($env.last_heartbeat) {
+                                try {
+                                    $hbDt = [DateTime]::Parse($env.last_heartbeat, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+                                    $resolvedHeartbeatAge = [int]((Get-Date).ToUniversalTime() - $hbDt).TotalSeconds
+                                    if ($resolvedHeartbeatAge -gt $hbStaleSec) {
+                                        $resolvedHeartbeatStale = $true
+                                    }
+                                } catch {}
+                            }
+                        }
                         default  { Die "Gist uses unknown kind '$($env.kind)' - this airc may need 'airc update'." }
                     }
                 }
@@ -2300,6 +2325,29 @@ function Invoke-Connect {
 
     if ($target -and ($target -match '@')) {
         # -- JOIN MODE --
+
+        # Stale-heartbeat fast-path takeover. If the gist we resolved had a
+        # last_heartbeat older than AIRC_HEARTBEAT_STALE, the host is dead.
+        # Skip the SSH attempt entirely - go straight to take-over. Same
+        # operations as the SSH-failure self-heal path below, but triggered
+        # from positive evidence (stale presence signal) rather than
+        # negative evidence (TCP timeout).
+        if ($resolvedHeartbeatStale -and $resolvedRoomName -and $resolvedGistId -and (Test-GhAvailable)) {
+            Write-Host ''
+            Write-Host "  ! Host of #$resolvedRoomName is stale (last heartbeat ${resolvedHeartbeatAge}s ago) - taking over..."
+            Write-Host "     (prior host gist: $resolvedGistId)"
+            & gh gist delete $resolvedGistId --yes 2>$null | Out-Null
+            $preservedName = Get-ConfigVal -Key 'name' -Default ''
+            Remove-Item -Path $CONFIG -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path (Join-Path $AIRC_WRITE_DIR 'room_name') -Force -ErrorAction SilentlyContinue
+            Write-Host "  Re-launching into host mode for #$resolvedRoomName ..."
+            Write-Host ''
+            $env:AIRC_NO_DISCOVERY = '1'
+            if ($preservedName) { $env:AIRC_NAME = $preservedName }
+            Invoke-Connect -Argv @('--room', $resolvedRoomName)
+            return
+        }
+
         $hostSshPubkeyB64 = ''
         if ($target -match '#') {
             $hostSshPubkeyB64 = ($target -split '#')[-1]
@@ -2527,15 +2575,22 @@ function Invoke-Connect {
             } else {
                 $now = Get-Timestamp
                 if ($useRoom) {
+                    # last_heartbeat is the host's presence signal. Updated
+                    # every AIRC_HEARTBEAT_SEC (default 30s) by a background
+                    # job spawned after gist create. Joiners check freshness
+                    # on resolve - stale = host dead, take over deterministically.
+                    # Without this, hosts that die ungracefully (sleep, kill,
+                    # OOM) leave their gist pointing at a corpse forever.
                     $envelope = [ordered]@{
-                        airc    = 1
-                        kind    = 'room'
-                        name    = $roomName
-                        topic   = ''
-                        invite  = $inviteLong
-                        host    = [ordered]@{ name=$name; user=$user; address=$hostA; port=$hostPort }
-                        created = $now
-                        updated = $now
+                        airc           = 1
+                        kind           = 'room'
+                        name           = $roomName
+                        topic          = ''
+                        invite         = $inviteLong
+                        host           = [ordered]@{ name=$name; user=$user; address=$hostA; port=$hostPort }
+                        created        = $now
+                        updated        = $now
+                        last_heartbeat = $now
                     }
                     $gistDesc = "airc room: $roomName"
                 } else {
@@ -2558,6 +2613,70 @@ function Invoke-Connect {
                     $hh = Get-Humanhash -HexInput $gistId
                     if ($useRoom) {
                         Set-Content -Path (Join-Path $AIRC_WRITE_DIR 'room_gist_id') -Value $gistId -NoNewline
+
+                        # Heartbeat job: refresh last_heartbeat in the gist
+                        # every AIRC_HEARTBEAT_SEC seconds so joiners can
+                        # deterministically detect a dead host. Mirrors the
+                        # bash heartbeat loop. Start-ThreadJob runs in-process
+                        # so when this airc connect dies, the thread dies too.
+                        $heartbeatSec = 30
+                        if ($env:AIRC_HEARTBEAT_SEC) {
+                            try { $heartbeatSec = [int]$env:AIRC_HEARTBEAT_SEC } catch {}
+                        }
+                        $hbJob = Start-ThreadJob -ScriptBlock {
+                            param($GistId, $RoomName, $InviteLong, $Name, $User, $HostA, $HostPort, $Created, $IntervalSec)
+                            while ($true) {
+                                Start-Sleep -Seconds $IntervalSec
+                                $hbNow = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                                $hbEnvelope = [ordered]@{
+                                    airc           = 1
+                                    kind           = 'room'
+                                    name           = $RoomName
+                                    topic          = ''
+                                    invite         = $InviteLong
+                                    host           = [ordered]@{ name=$Name; user=$User; address=$HostA; port=$HostPort }
+                                    created        = $Created
+                                    updated        = $hbNow
+                                    last_heartbeat = $hbNow
+                                }
+                                $hbTmp = [System.IO.Path]::GetTempFileName()
+                                try {
+                                    ($hbEnvelope | ConvertTo-Json -Depth 10) | Set-Content -Path $hbTmp -NoNewline
+                                    & gh gist edit $GistId $hbTmp 2>$null | Out-Null
+                                } catch {
+                                    # Suppress only network/transient errors; surface them as job-output for diagnose.
+                                    Write-Output "heartbeat update failed: $_"
+                                } finally {
+                                    Remove-Item $hbTmp -Force -ErrorAction SilentlyContinue
+                                }
+                            }
+                        } -ArgumentList $gistId, $roomName, $inviteLong, $name, $user, $hostA, $hostPort, $now, $heartbeatSec
+
+                        # Track heartbeat job-id so cmd_part / teardown can
+                        # stop it cleanly. Job is also killed automatically
+                        # when this PowerShell process exits (Start-ThreadJob
+                        # is in-process), which is the kill -9 / OOM path.
+                        Add-Content -Path (Join-Path $AIRC_WRITE_DIR 'airc.pid') -Value $PID
+
+                        # Graceful-exit cleanup: on PowerShell.Exiting, stop
+                        # the heartbeat job + delete the room gist so peers
+                        # don't even hit the stale window. Doesn't help kill -9
+                        # (which is exactly what the heartbeat itself is the
+                        # answer for), but covers Ctrl-C and normal teardown.
+                        # Use globals (not $using:) - the engine event runspace
+                        # captures globals reliably whereas $using: scoping
+                        # in -Action blocks is version-dependent.
+                        $global:_AircCleanupGistId  = $gistId
+                        $global:_AircCleanupHbJobId = $hbJob.Id
+                        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+                            if ($global:_AircCleanupHbJobId) {
+                                try { Stop-Job -Id $global:_AircCleanupHbJobId -ErrorAction SilentlyContinue } catch {}
+                            }
+                            if ($global:_AircCleanupGistId) {
+                                try { & gh gist delete $global:_AircCleanupGistId --yes 2>$null | Out-Null } catch {}
+                            }
+                        } | Out-Null
+
                         Write-Host "  Hosting #$roomName (gh-account substrate)."
                         Write-Host "  Other agents on your gh account auto-join via:  airc connect"
                         Write-Host "  Cross-account share:"

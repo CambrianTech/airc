@@ -1,5 +1,5 @@
 ---
-name: airc:nick
+name: nick
 description: Rename this airc identity. Broadcasts the change so paired peers auto-update their records.
 user-invocable: true
 allowed-tools: Bash

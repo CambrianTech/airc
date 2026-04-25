@@ -1,5 +1,5 @@
 ---
-name: airc:doctor
+name: doctor
 description: Self-diagnose AIRC. AI checks environment health (gh, ssh, ports), runs the integration suite, and proactively fixes recoverable issues (install gh, etc.) instead of just reporting them.
 user-invocable: true
 allowed-tools: Bash

@@ -1,5 +1,5 @@
 ---
-name: airc:version
+name: version
 description: Print the currently-installed airc version (short git SHA, branch, commit subject, install dir). Use this to verify everyone in a mesh is on the same build.
 user-invocable: true
 allowed-tools: Bash

@@ -1412,6 +1412,149 @@ scenario_kick() {
   cleanup_all
 }
 
+# ── Scenario: heartbeat (orphan-gist self-heal, structural fix) ───────
+# When a host dies ungracefully, its room gist persists pointing at the
+# corpse. With heartbeat: host updates last_heartbeat every
+# AIRC_HEARTBEAT_SEC; joiners check freshness on resolve and take over
+# deterministically when stale. This test:
+#   1. Hosts a room (real gh, real gist)
+#   2. Verifies last_heartbeat appears in the gist
+#   3. Verifies last_heartbeat advances over time
+#   4. kill -9's the host — heartbeat thread dies with it, gist NOT cleaned
+#   5. Waits past AIRC_HEARTBEAT_STALE
+#   6. Spawns a joiner with discovery enabled
+#   7. Verifies joiner deleted stale gist + published fresh one
+#
+# Skips entirely if gh is unavailable or unauthed — this scenario can't
+# run in gh-less CI. AIRC_HEARTBEAT_SEC=2 / AIRC_HEARTBEAT_STALE=5 keep
+# wall-time short; cleanup deletes any gist this scenario published.
+scenario_heartbeat() {
+  section "heartbeat: orphan-gist self-heal via stale presence signal"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "  (skipped — gh CLI not installed)"
+    return
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed: 'gh auth login -s gist')"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "  (skipped — jq not installed)"
+    return
+  fi
+
+  cleanup_all
+
+  local rname="hb-test-$$"
+  local hb_sec=2 hb_stale=5
+
+  # ── Host alpha in room mode WITH gh discovery + gist push.
+  mkdir -p /tmp/airc-it-h
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 AIRC_HEARTBEAT_SEC=$hb_sec \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-h/out.log 2>&1 & )
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    [ -f /tmp/airc-it-h/state/room_gist_id ] && break
+  done
+
+  local gist_id
+  gist_id=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
+  [ -n "$gist_id" ] \
+    && pass "alpha published room gist ($gist_id)" \
+    || { fail "alpha did not publish a room gist within 10s"; cleanup_all; return; }
+
+  # Verify last_heartbeat field is present in the gist.
+  local hb1
+  hb1=$(gh api "gists/$gist_id" 2>/dev/null \
+        | jq -r '.files | to_entries[0].value.content' 2>/dev/null \
+        | jq -r '.last_heartbeat // empty' 2>/dev/null)
+  [ -n "$hb1" ] \
+    && pass "gist contains last_heartbeat field ($hb1)" \
+    || { fail "gist missing last_heartbeat field"; gh gist delete "$gist_id" --yes 2>/dev/null; cleanup_all; return; }
+
+  # Wait > 1 heartbeat interval, verify the field advanced.
+  sleep $((hb_sec + 2))
+  local hb2
+  hb2=$(gh api "gists/$gist_id" 2>/dev/null \
+        | jq -r '.files | to_entries[0].value.content' 2>/dev/null \
+        | jq -r '.last_heartbeat // empty' 2>/dev/null)
+  if [ -n "$hb2" ] && [ "$hb2" != "$hb1" ]; then
+    pass "last_heartbeat advanced after ${hb_sec}s ($hb2)"
+  else
+    fail "last_heartbeat did NOT advance ($hb1 → $hb2)"
+    gh gist delete "$gist_id" --yes 2>/dev/null
+    cleanup_all; return
+  fi
+
+  # ── kill -9 the host. Heartbeat thread dies with it; gist persists.
+  local host_pids
+  host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null)
+  [ -n "$host_pids" ] || { fail "no host pid recorded"; cleanup_all; return; }
+  kill -9 $host_pids 2>/dev/null || true
+  sleep 1
+  pass "host kill -9'd ($host_pids)"
+
+  # Wait past the stale window. Use the earlier hb2 timestamp as our
+  # "now-ish" anchor — sleep enough that whatever the next gist read
+  # sees has aged past hb_stale. Buffer = 2x stale to be deterministic.
+  sleep $((hb_stale + 3))
+
+  # Verify gist still exists (host died ungracefully, so EXIT trap didn't fire).
+  gh api "gists/$gist_id" >/dev/null 2>&1 \
+    && pass "stale gist still present (host kill -9 = no graceful cleanup)" \
+    || fail "gist already gone — kill -9 path didn't behave as expected"
+
+  # ── Spawn joiner beta with discovery ON. Joiner should:
+  #    - resolve the gist
+  #    - detect last_heartbeat is stale
+  #    - take over: delete stale gist, exec into host mode
+  mkdir -p /tmp/airc-it-j
+  ( cd /tmp/airc-it-j && AIRC_HOME=/tmp/airc-it-j/state AIRC_NAME=beta AIRC_PORT=7550 \
+      AIRC_HEARTBEAT_STALE=$hb_stale AIRC_HEARTBEAT_SEC=$hb_sec \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-j/out.log 2>&1 & )
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log 2>/dev/null && break
+  done
+
+  grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log \
+    && pass "beta detected stale heartbeat + initiated takeover" \
+    || { fail "beta did NOT detect stale heartbeat (log: $(tail -20 /tmp/airc-it-j/out.log))"; cleanup_all; return; }
+
+  # Wait for beta to publish a fresh gist as new host.
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    [ -f /tmp/airc-it-j/state/room_gist_id ] && break
+  done
+
+  local new_gist_id
+  new_gist_id=$(cat /tmp/airc-it-j/state/room_gist_id 2>/dev/null)
+  if [ -n "$new_gist_id" ] && [ "$new_gist_id" != "$gist_id" ]; then
+    pass "beta published fresh gist as new host ($new_gist_id, replaces $gist_id)"
+  else
+    fail "beta did not publish a fresh gist (got: '$new_gist_id', original: '$gist_id')"
+  fi
+
+  # Old gist must be gone (beta deleted it during takeover).
+  if gh api "gists/$gist_id" >/dev/null 2>&1; then
+    fail "stale gist $gist_id still exists after takeover"
+    gh gist delete "$gist_id" --yes 2>/dev/null
+  else
+    pass "stale gist $gist_id removed by takeover"
+  fi
+
+  # Cleanup: delete the new gist beta published.
+  if [ -n "$new_gist_id" ]; then
+    gh gist delete "$new_gist_id" --yes 2>/dev/null || true
+  fi
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -1429,8 +1572,9 @@ case "$MODE" in
   identity)     scenario_identity ;;
   whois)        scenario_whois ;;
   kick)         scenario_kick ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|all]"; exit 2 ;;
+  heartbeat)    scenario_heartbeat ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|all]"; exit 2 ;;
 esac
 
 echo

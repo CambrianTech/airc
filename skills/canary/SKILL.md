@@ -1,5 +1,5 @@
 ---
-name: airc:canary
+name: canary
 description: Switch this airc install to the canary channel — pre-merge features queued for the next main release. Use when Joel asks you to test something that hasn't landed on main yet, or when you want the bleeding edge.
 user-invocable: true
 allowed-tools: Bash

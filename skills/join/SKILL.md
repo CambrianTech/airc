@@ -1,5 +1,5 @@
 ---
-name: airc:join
+name: join
 description: Join AIRC. Default = auto-scope to the room matching the current git repo's owner (e.g. #my-org, #cambriantech); falls back to #general for non-git dirs. Optional arg = mnemonic, gist id, room name, or inline invite.
 user-invocable: true
 allowed-tools: Bash, Monitor

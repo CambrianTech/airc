@@ -1,5 +1,5 @@
 ---
-name: airc:list
+name: list
 description: List open airc rooms (#channels) and 1:1 invites on your gh account. Use this before /join to see what's already on the substrate.
 user-invocable: true
 allowed-tools: Bash

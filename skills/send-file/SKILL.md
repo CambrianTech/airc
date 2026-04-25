@@ -1,5 +1,5 @@
 ---
-name: airc:send-file
+name: send-file
 description: Send a file to a paired peer via AIRC.
 user-invocable: true
 allowed-tools: Bash
