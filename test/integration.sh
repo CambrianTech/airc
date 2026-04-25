@@ -1555,6 +1555,152 @@ scenario_heartbeat() {
   cleanup_all
 }
 
+# ── Scenario: bounce (teardown should not orphan the host's gist) ─────
+# host A → teardown → host A again. Each cycle must leave AT MOST ONE
+# gist for the room name on the gh account. Pre-fix, every bounce
+# accumulated an orphan because cmd_teardown's kill -9 skipped the
+# EXIT trap that would have deleted the gist (PR #110).
+# Skips if gh is unavailable.
+scenario_bounce() {
+  section "bounce: teardown deletes hosted gist (no orphan accumulation)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local rname="bounce-test-$$"
+  mkdir -p /tmp/airc-it-h
+
+  # Round 1: spawn host
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    [ -f /tmp/airc-it-h/state/room_gist_id ] && break
+  done
+
+  local gid1; gid1=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
+  [ -n "$gid1" ] && pass "round 1: alpha hosted, gist=$gid1" \
+                 || { fail "round 1: no gist published"; cleanup_all; return; }
+
+  # Teardown
+  AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
+  sleep 2
+
+  # Verify gist deleted
+  if gh api "gists/$gid1" >/dev/null 2>&1; then
+    fail "teardown LEFT gist $gid1 on gh account (orphan)"
+    gh gist delete "$gid1" --yes 2>/dev/null  # cleanup our mess
+  else
+    pass "teardown deleted gist $gid1 ✓"
+  fi
+
+  # Round 2: rehost same room, verify NO orphan from round 1.
+  # Teardown leaves room_gist_id behind (it only wipes airc.pid +
+  # host_gist_id), so we can't `[ -f room_gist_id ]` as a "round 2
+  # ready" signal — that file already exists from round 1. Wait for
+  # the round-2 banner instead.
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-h/out2.log 2>&1 & )
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    grep -qE "Hosting #${rname}|Waiting for peers" /tmp/airc-it-h/out2.log 2>/dev/null && break
+  done
+  sleep 1   # let host_gist_id finish writing
+
+  local gid2; gid2=$(cat /tmp/airc-it-h/state/host_gist_id 2>/dev/null)
+  [ -z "$gid2" ] && gid2=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
+  [ -n "$gid2" ] && [ "$gid2" != "$gid1" ] \
+    && pass "round 2: alpha re-hosted, fresh gist=$gid2" \
+    || fail "round 2: no fresh gist or same as orphan (gid1=$gid1 gid2=$gid2)"
+
+  local count
+  count=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v r="airc room: $rname" '$2==r' | wc -l | tr -d ' ')
+  [ "$count" = "1" ] \
+    && pass "exactly one #${rname} gist on account after bounce ✓" \
+    || fail "expected 1 gist, found $count (orphan accumulation)"
+
+  # Cleanup
+  AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
+  [ -n "$gid2" ] && gh gist delete "$gid2" --yes 2>/dev/null
+  cleanup_all
+}
+
+# ── Scenario: two-tab localhost (multi-address: same machine = 127.0.0.1) ───
+# Two airc processes on the same machine, same gh account, joining the
+# same room. Joiner must pick the host's localhost address via
+# machine_id match, not the host's LAN/Tailscale advertised address.
+# Validates host.addresses[] + host.machine_id propagation through the
+# gist envelope and peer_pick_address logic.
+scenario_two_tab_localhost() {
+  section "two_tab_localhost: same-machine join uses 127.0.0.1 (multi-address)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local rname="ttl-test-$$"
+  mkdir -p /tmp/airc-it-h /tmp/airc-it-j
+
+  # Host
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    [ -f /tmp/airc-it-h/state/room_gist_id ] && break
+  done
+
+  local gid; gid=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
+  [ -n "$gid" ] && pass "alpha hosted, gist=$gid" \
+                || { fail "alpha did not publish gist"; cleanup_all; return; }
+
+  # Verify the gist envelope carries machine_id + addresses[]
+  local env; env=$(gh api "gists/$gid" 2>/dev/null | jq -r '.files | to_entries[0].value.content' 2>/dev/null)
+  printf '%s' "$env" | jq -e '.host.machine_id' >/dev/null 2>&1 \
+    && pass "envelope has host.machine_id" \
+    || fail "envelope MISSING host.machine_id"
+  printf '%s' "$env" | jq -e '.host.addresses | length >= 1' >/dev/null 2>&1 \
+    && pass "envelope has host.addresses[]" \
+    || fail "envelope MISSING host.addresses[]"
+  printf '%s' "$env" | jq -e '.host.addresses[] | select(.scope=="localhost")' >/dev/null 2>&1 \
+    && pass "envelope addresses include localhost entry" \
+    || fail "envelope addresses MISSING localhost"
+
+  # Joiner via discovery (will find this gist via gh list)
+  ( cd /tmp/airc-it-j && AIRC_HOME=/tmp/airc-it-j/state AIRC_NAME=beta AIRC_PORT=7550 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-j/out.log 2>&1 & )
+
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    grep -qE 'Connected to|Multi-address pick|unreachable' /tmp/airc-it-j/out.log 2>/dev/null && break
+  done
+
+  grep -qE 'Multi-address pick: 127\.0\.0\.1' /tmp/airc-it-j/out.log \
+    && pass "beta picked 127.0.0.1 via machine_id match ✓" \
+    || fail "beta did NOT pick localhost (log: $(grep -E 'Multi-address|Connecting' /tmp/airc-it-j/out.log | head -2 | tr '\n' '|'))"
+
+  grep -q 'Connected to' /tmp/airc-it-j/out.log \
+    && pass "beta SSH-paired with alpha over localhost" \
+    || fail "beta did NOT successfully pair"
+
+  # Cleanup
+  for f in /tmp/airc-it-h/state/airc.pid /tmp/airc-it-j/state/airc.pid; do
+    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
+  done
+  sleep 1
+  gh gist delete "$gid" --yes 2>/dev/null
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -1573,8 +1719,10 @@ case "$MODE" in
   whois)        scenario_whois ;;
   kick)         scenario_kick ;;
   heartbeat)    scenario_heartbeat ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|all]"; exit 2 ;;
+  bounce)       scenario_bounce ;;
+  two_tab_localhost) scenario_two_tab_localhost ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|all]"; exit 2 ;;
 esac
 
 echo
