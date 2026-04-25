@@ -515,6 +515,171 @@ advise_tailscale_if_down() {
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# host_machine_id: stable per-machine identifier. Same machine, two
+# terminals: same value. Different machines: different. Used by the
+# multi-address gist envelope so a same-machine joiner knows to dial
+# 127.0.0.1 regardless of what Tailscale/LAN addresses the host
+# advertised. Cached after first call.
+host_machine_id() {
+  if [ -n "${_AIRC_MACHINE_ID_CACHE:-}" ]; then
+    printf '%s\n' "$_AIRC_MACHINE_ID_CACHE"
+    return 0
+  fi
+  local id=""
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      id=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+           | awk -F'"' '/IOPlatformUUID/{print $4; exit}')
+      ;;
+    Linux)
+      [ -r /etc/machine-id ] && id=$(cat /etc/machine-id 2>/dev/null)
+      [ -z "$id" ] && [ -r /var/lib/dbus/machine-id ] && id=$(cat /var/lib/dbus/machine-id 2>/dev/null)
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      id=$(reg query 'HKLM\SOFTWARE\Microsoft\Cryptography' /v MachineGuid 2>/dev/null \
+           | awk '/MachineGuid/{print $NF}')
+      ;;
+  esac
+  [ -z "$id" ] && id=$(hostname 2>/dev/null || echo "unknown-machine")
+  _AIRC_MACHINE_ID_CACHE="$id"
+  printf '%s\n' "$id"
+}
+
+# host_address_set: enumerate this host's currently-usable addresses,
+# in priority order: localhost first (always present), then any LAN
+# interface with a non-loopback IP, then Tailscale (only if the daemon
+# is up AND signed in — Logged out / NeedsLogin produces no entry).
+# Output: one line per address, "scope|addr|port|subnet" tab-or-pipe
+# separated. Caller assembles into JSON.
+# port arg is the listen port to advertise.
+host_address_set() {
+  local port="${1:-7547}"
+
+  # localhost — always
+  printf 'localhost|127.0.0.1|%s|\n' "$port"
+
+  # LAN: enumerate interfaces, pick non-loopback IPv4s. macOS + Linux
+  # converge on `ifconfig`; we use that and reject loopback + CGNAT.
+  local lan_ips
+  lan_ips=$(ifconfig 2>/dev/null \
+            | awk '/inet /{print $2}' \
+            | grep -vE '^(127\.|169\.254\.)' \
+            | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+  if [ -n "$lan_ips" ]; then
+    printf '%s\n' "$lan_ips" | while read -r ip; do
+      [ -z "$ip" ] && continue
+      # /24 subnet from the IP — good-enough heuristic for "same LAN"
+      local subnet="${ip%.*}.0/24"
+      printf 'lan|%s|%s|%s\n' "$ip" "$port" "$subnet"
+    done
+  fi
+
+  # Tailscale: only emit when the daemon reports signed-in. AIRC_NO_TAILSCALE=1
+  # forces empty.
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      local ts_out; ts_out=$("$ts_bin" status 2>&1)
+      case "$ts_out" in
+        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
+        *)
+          # Pull our own Tailscale IP from `tailscale ip -4`. If that
+          # fails (older versions, weird state), parse from status.
+          local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null | head -1 | tr -d '\r\n ')
+          if [ -z "$ts_ip" ]; then
+            ts_ip=$(printf '%s' "$ts_out" | awk 'NR==1 && /^100\./{print $1; exit}')
+          fi
+          [ -n "$ts_ip" ] && printf 'tailscale|%s|%s|\n' "$ts_ip" "$port"
+          ;;
+      esac
+    fi
+  fi
+}
+
+# host_addresses_json: assemble host_address_set output into a JSON
+# array suitable for the gist envelope's host.addresses field. Args:
+# port. Output: JSON array string.
+host_addresses_json() {
+  local port="${1:-7547}"
+  local first=1
+  local out="["
+  while IFS='|' read -r scope addr p subnet; do
+    [ -z "$scope" ] && continue
+    if [ "$first" = "1" ]; then first=0; else out="${out},"; fi
+    if [ -n "$subnet" ]; then
+      out="${out}{\"scope\":\"${scope}\",\"addr\":\"${addr}\",\"port\":${p},\"subnet\":\"${subnet}\"}"
+    else
+      out="${out}{\"scope\":\"${scope}\",\"addr\":\"${addr}\",\"port\":${p}}"
+    fi
+  done < <(host_address_set "$port")
+  out="${out}]"
+  printf '%s' "$out"
+}
+
+# peer_pick_address: given the host's published addresses (JSON array)
+# and the host's machine_id, pick the cheapest reachable address for
+# THIS peer to dial. Output: "addr|port" on stdout, or empty if no
+# addresses available.
+#
+# Priority:
+#   1. host.machine_id == my host_machine_id → localhost entry
+#   2. any host.lan entry whose subnet contains any of my LAN IPs
+#   3. first host.tailscale entry (if I have a usable tailscale myself)
+#   4. first localhost entry (last-resort; only useful for same-machine)
+#   5. first entry of any kind (gives the joiner SOMETHING to try)
+peer_pick_address() {
+  local addresses_json="${1:-}" host_machine="${2:-}"
+  [ -z "$addresses_json" ] || [ "$addresses_json" = "null" ] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # Same machine: use localhost.
+  local my_machine; my_machine=$(host_machine_id)
+  if [ -n "$host_machine" ] && [ "$host_machine" = "$my_machine" ]; then
+    local pick; pick=$(printf '%s' "$addresses_json" \
+      | jq -r '.[] | select(.scope=="localhost") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+    if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
+  fi
+
+  # Same LAN: find a host.lan whose subnet contains one of MY LAN IPs.
+  # Use my own host_address_set output to get my LAN IPs.
+  local my_lan_ips
+  my_lan_ips=$(host_address_set 0 | awk -F'|' '$1=="lan"{print $2}')
+  if [ -n "$my_lan_ips" ]; then
+    local lan_entries
+    lan_entries=$(printf '%s' "$addresses_json" \
+      | jq -c '.[] | select(.scope=="lan")' 2>/dev/null)
+    if [ -n "$lan_entries" ]; then
+      while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        local subnet; subnet=$(printf '%s' "$entry" | jq -r '.subnet // empty' 2>/dev/null)
+        local addr; addr=$(printf '%s' "$entry" | jq -r '.addr' 2>/dev/null)
+        local port; port=$(printf '%s' "$entry" | jq -r '.port' 2>/dev/null)
+        # subnet is like "192.168.1.0/24" — match the /24 prefix against my IPs.
+        if [ -n "$subnet" ]; then
+          local prefix="${subnet%/*}"   # 192.168.1.0
+          prefix="${prefix%.*}."          # 192.168.1.
+          if printf '%s' "$my_lan_ips" | grep -qF "$prefix"; then
+            printf '%s|%s' "$addr" "$port"; return 0
+          fi
+        fi
+      done <<< "$lan_entries"
+    fi
+  fi
+
+  # Tailscale path: only attempt if I have a working tailscale of my own.
+  local i_have_ts; i_have_ts=$(host_address_set 0 | awk -F'|' '$1=="tailscale"{print; exit}')
+  if [ -n "$i_have_ts" ]; then
+    local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
+      | jq -r '.[] | select(.scope=="tailscale") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+    if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
+  fi
+
+  # Fallback: first entry of any kind. Useful when neither side has a
+  # clearly matching scope and we just want to try something.
+  printf '%s' "$addresses_json" \
+    | jq -r '.[0] | "\(.addr)|\(.port)"' 2>/dev/null
+}
+
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
 # Compresses N bytes of input into 4 words via XOR-folding, then maps each
 # byte to a word in the standard zacharyvoase/humanhash 256-word dictionary.
@@ -1190,6 +1355,13 @@ cmd_connect() {
   # 'unbound variable' when target came in inline (no gist resolved).
   local _resolved_heartbeat_stale=0
   local _resolved_heartbeat_age=""
+  # Multi-address fields parsed from host.addresses[] in the room
+  # gist envelope. _resolved_addresses_json is the raw JSON array
+  # (or empty if the host published a legacy envelope with only
+  # host.address/host.port). _resolved_host_machine_id lets the
+  # joiner detect "we're on the same machine" and dial 127.0.0.1.
+  local _resolved_addresses_json=""
+  local _resolved_host_machine_id=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1728,6 +1900,13 @@ cmd_connect() {
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.name // empty' 2>/dev/null)
+              # Multi-address: capture host.addresses[] + host.machine_id
+              # for the joiner's address-picker (peer_pick_address). Empty
+              # if the host published a pre-multi-address envelope; in
+              # that case JOIN MODE falls back to the parsed-from-invite
+              # host:port (legacy single-address path).
+              _resolved_addresses_json=$(printf '%s' "$raw_content" | jq -c '.host.addresses // empty' 2>/dev/null)
+              _resolved_host_machine_id=$(printf '%s' "$raw_content" | jq -r '.host.machine_id // empty' 2>/dev/null)
 
               # Heartbeat freshness check — the structural fix for
               # orphan-gist class. Hosts update last_heartbeat every
@@ -1854,6 +2033,27 @@ cmd_connect() {
     fi
 
     [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc connect name@user@host"
+
+    # Multi-address override: if the gist envelope carried host.addresses[]
+    # and host.machine_id, use peer_pick_address to choose the cheapest
+    # reachable scope (same-machine localhost > same-LAN > tailscale).
+    # This is what makes Tailscale truly optional — same-machine and
+    # same-LAN peers connect via 127.0.0.1 / LAN IP regardless of the
+    # invite string's host:port (which historically advertised one IP).
+    if [ -n "$_resolved_addresses_json" ] && [ "$_resolved_addresses_json" != "null" ]; then
+      local _picked; _picked=$(peer_pick_address "$_resolved_addresses_json" "$_resolved_host_machine_id")
+      if [ -n "$_picked" ]; then
+        local _picked_addr="${_picked%|*}"
+        local _picked_port="${_picked#*|}"
+        # Reconstruct ssh_target with the user@addr form. Original
+        # ssh_target was user@invite-string-host; preserve the user.
+        local _ssh_user="${ssh_target%@*}"
+        if [ "$_ssh_user" = "$ssh_target" ]; then _ssh_user=""; fi
+        ssh_target="${_ssh_user:+${_ssh_user}@}${_picked_addr}"
+        peer_port="$_picked_port"
+        echo "  ✓ Multi-address pick: ${_picked_addr}:${_picked_port} (from host.addresses)"
+      fi
+    fi
 
     local my_name
     my_name=$(resolve_name)
@@ -2269,14 +2469,22 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
           # gist lifecycle + envelope kind differ.
           _gist_kind="room"
           _gist_desc="airc room: ${room_name}"
-          # last_heartbeat field is the host's presence signal. Updated
-          # every AIRC_HEARTBEAT_SEC (default 30s) by a background loop
-          # spawned after gist create. Joiners check freshness on
-          # resolve — stale = host dead, take over deterministically.
-          # Without this, hosts that die ungracefully (machine sleep,
-          # kill -9, OOM, bash-bg-and-die) leave their gist pointing
-          # at a corpse forever — every today's mess was downstream of
-          # this. Issue: structural fix for #79 + #83.
+          # last_heartbeat: host's presence signal, refreshed every
+          # AIRC_HEARTBEAT_SEC (default 30s) by the bg loop spawned
+          # below. Joiners detect stale → take over deterministically.
+          #
+          # machine_id + host.addresses[]: multi-address redundancy.
+          # Same machine, two tabs → joiner sees machine_id match,
+          # uses 127.0.0.1 regardless of network state. Same LAN →
+          # joiner picks the LAN entry. Tailscale → joiner picks
+          # tailscale ONLY when nothing closer works AND the host is
+          # actually signed in (host_address_set drops tailscale from
+          # the list when not authed). Tailscale becomes truly
+          # optional: if it's down or you're logged out, the gist's
+          # localhost+LAN entries still let same-machine and
+          # same-LAN peers connect.
+          local _addrs_json; _addrs_json=$(host_addresses_json "$host_port")
+          local _machine_id; _machine_id=$(host_machine_id)
           _gist_payload=$(cat <<JSON
 {
   "airc": 1,
@@ -2287,8 +2495,10 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
   "host": {
     "name": "$name",
     "user": "$user",
+    "machine_id": "${_machine_id}",
     "address": "$host",
-    "port": $host_port
+    "port": $host_port,
+    "addresses": ${_addrs_json}
   },
   "created": "$_now",
   "updated": "$_now",
@@ -2357,6 +2567,7 @@ JSON
             local _hb_port="$host_port"
             local _hb_room="$room_name"
             local _hb_created="$_now"
+            local _hb_machine_id="$_machine_id"
             (
               # Detach from job control so a parent SIGINT kills the
               # whole tree but normal exit lets us race the trap to
@@ -2368,6 +2579,13 @@ JSON
                   exit 0
                 fi
                 local _hb_now; _hb_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                # Refresh addresses each tick. Captures network changes
+                # mid-session: laptop moves to a different LAN, Tailscale
+                # comes up / goes down / re-auths, interface flapping.
+                # The next gist write reflects current reachability;
+                # joiners that lose connection re-discover and try the
+                # new address set.
+                local _hb_addrs; _hb_addrs=$(host_addresses_json "${_hb_port}")
                 local _hb_payload; _hb_payload=$(cat <<JSON
 {
   "airc": 1,
@@ -2378,8 +2596,10 @@ JSON
   "host": {
     "name": "${_hb_name}",
     "user": "${_hb_user}",
+    "machine_id": "${_hb_machine_id}",
     "address": "${_hb_host}",
-    "port": ${_hb_port}
+    "port": ${_hb_port},
+    "addresses": ${_hb_addrs}
   },
   "created": "${_hb_created}",
   "updated": "${_hb_now}",
