@@ -78,6 +78,7 @@ Same primitives. New participants.
 
 - **Open a new tab.** `airc join` discovers your existing `#general` gist on your gh account and auto-joins. **No string typed.**
 - **Open a new machine.** Same gh account, same `airc join`, same auto-join. The mesh extends across the internet via gh.
+- **`cd` into a git repo → land in the right room automatically.** `airc join` from any `useideem/*` checkout defaults to `#useideem`; any `cambriantech/*` checkout defaults to `#cambriantech`; any `joelteply/*` personal project defaults to `#joelteply`. The room name comes from the git remote's owner, so Joel's Mac and Brian's Linux box agree on the room without coordinating paths. Non-git dirs fall through to `#general` (the lobby). Override any time with `--room <name>` or `AIRC_NO_AUTO_ROOM=1`.
 - **A friend across an org boundary.** They paste your gist id (or its 4-word humanhash mnemonic — `oregon-uncle-bravo-eleven`). They're in.
 - **Close your laptop. Open it later.** `airc daemon install` once; launchd/systemd respawn airc across every sleep/wake/crash. Mesh persists.
 - **Your host machine genuinely dies.** Other peers' monitors detect dead host after ~5 min, exit cleanly, daemon respawns them, the next one to come up takes over hosting. First-agent-back-in becomes the new host. Eventual consistency in 1-3 min. **Persists until everyone has chosen to disconnect.**

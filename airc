@@ -77,6 +77,81 @@ derive_name() {
   echo "${base}-${hash}"
 }
 
+# Infer default room name from the git repo at $PWD. Maps mesh scope to
+# project scope: cd into any repo under a shared project group, default
+# to the same room. Works across machines without coordination because
+# the identifier is the upstream org, not a local path.
+#
+# Two signals, tried in order:
+#
+#   1. gh org from `origin` remote URL (the stable, cross-machine ID).
+#      useideem/vHSM on Joel's Mac + useideem/authenticator on Brian's
+#      Linux box both default to #useideem. No matter where on disk
+#      either of us keeps the checkout, the remote URL fingerprints it.
+#      Handles github / gitlab / bitbucket / self-hosted (just the
+#      owner segment between host and repo). Matches airc's "gh OAuth
+#      scope IS the trust boundary" philosophy — the org that owns the
+#      code is the room that discusses it.
+#
+#   2. Parent directory basename (fallback for local-only repos with no
+#      remote, or one-off clones outside a conventional workspace).
+#      Skipped when parent is $HOME / / / a generic workspace root
+#      (Development, work, src, projects, …) — sharing a room across
+#      every unrelated repo you own defeats the point.
+#
+# Returns empty (exit 1) when both signals refuse; caller falls back to
+# #general. Explicit `--room X` bypasses entirely; AIRC_NO_AUTO_ROOM=1
+# disables. Sanitization mirrors derive_name() so casing always agrees.
+infer_repo_org() {
+  local url
+  url=$(git remote get-url origin 2>/dev/null) || return 1
+  [ -z "$url" ] && return 1
+  # Normalize SSH + HTTPS + ssh:// forms to host/path, then strip.
+  local path=""
+  case "$url" in
+    git@*:*)      path="${url#git@*:}" ;;
+    ssh://*)      path="${url#ssh://*/}" ;;
+    http*://*/*)  path="${url#*://*/}" ;;
+    *)            return 1 ;;
+  esac
+  path="${path%.git}"
+  [ -z "$path" ] && return 1
+  local org="${path%%/*}"
+  [ -z "$org" ] || [ "$org" = "$path" ] && return 1
+  org=$(printf '%s' "$org" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-*//;s/-*$//')
+  [ -z "$org" ] && return 1
+  printf '%s\n' "$org"
+}
+
+infer_parent_room() {
+  local top
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -z "$top" ] && return 1
+  local parent_dir
+  parent_dir=$(dirname "$top")
+  [ "$parent_dir" = "$HOME" ] && return 1
+  [ "$parent_dir" = "/" ] && return 1
+  local parent
+  parent=$(basename "$parent_dir")
+  case "$parent" in
+    Development|development|Workspace|workspace|Work|work|Dev|dev|Code|code|Src|src|Source|source|Projects|projects|Repos|repos|GitHub|Github|github|Documents|documents|Desktop|desktop)
+      return 1 ;;
+  esac
+  parent=$(printf '%s' "$parent" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-*//;s/-*$//')
+  [ -z "$parent" ] && return 1
+  printf '%s\n' "$parent"
+}
+
+# Composed: org first (stable across machines), parent-dir second
+# (for local-only repos without a remote). Echoes "<name>|<source>"
+# so the caller can tell the user where the name came from.
+infer_default_room() {
+  local name
+  name=$(infer_repo_org 2>/dev/null) && [ -n "$name" ] && { printf '%s|org\n' "$name"; return 0; }
+  name=$(infer_parent_room 2>/dev/null) && [ -n "$name" ] && { printf '%s|parent\n' "$name"; return 0; }
+  return 1
+}
+
 AIRC_WRITE_DIR="$(detect_scope)"
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
@@ -979,6 +1054,7 @@ cmd_connect() {
   # First in hosts, rest auto-join. Matches IRC's "everyone's in the lobby."
   local use_gist=1   # default ON; runtime probe later checks gh availability
   local room_name="general"
+  local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
   # Declared at function scope so set -u doesn't bite when JOIN MODE runs
   # without a prior gist parser (inline-invite path skips the parser
@@ -996,12 +1072,29 @@ cmd_connect() {
     case "$1" in
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
-      --room|-room) room_name="${2:-general}"; use_room=1; shift 2 ;;
+      --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
       --no-general|-no-general|--no-room|-no-room) use_room=0; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+
+  # Auto-scope: when --room wasn't explicit, derive default from git
+  # remote org (cross-machine-stable) or parent dir (local fallback).
+  # See infer_default_room() for the rationale — zero-config project
+  # separation: cd into any useideem repo → #useideem, any cambriantech
+  # repo → #cambriantech, regardless of local path. Falls back to
+  # #general when neither signal fires. Opt out: AIRC_NO_AUTO_ROOM=1.
+  if [ "$use_room" = "1" ] && [ "$room_explicit" = "0" ] \
+     && [ "${AIRC_NO_AUTO_ROOM:-0}" != "1" ]; then
+    local _inferred
+    _inferred=$(infer_default_room 2>/dev/null || true)
+    if [ -n "$_inferred" ]; then
+      room_name="${_inferred%|*}"
+      local _source="${_inferred#*|}"
+      echo "  Auto-scoped: #${room_name} (from git ${_source}; override with --room or AIRC_NO_AUTO_ROOM=1)"
+    fi
+  fi
 
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
