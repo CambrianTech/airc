@@ -8,6 +8,26 @@
 
 set -euo pipefail
 
+# Cross-platform Python invocation. macOS / Linux / WSL all ship `python3`
+# on PATH; Git Bash on Windows typically has `python` only (the launcher
+# from python.org). Resolve once at startup; every `python3 ...` invocation
+# downstream goes through this wrapper. Hard fail if neither is present
+# (we genuinely need Python — the inline heredocs for monitor formatting
+# and pair handshake are not yet ported to pure shell).
+if ! command -v python3 >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1; then
+    # Define a wrapper function that callers see as `python3`.
+    python3() { command python "$@"; }
+    export -f python3 2>/dev/null || true
+  else
+    echo "ERROR: airc requires python3 (or python on Windows/Git Bash)." >&2
+    echo "  macOS:    brew install python3" >&2
+    echo "  Linux:    apt install python3 / dnf install python3" >&2
+    echo "  Windows:  install from python.org or Microsoft Store" >&2
+    exit 1
+  fi
+fi
+
 # One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
 # is on vanilla defaults, the old dir exists as a real dir (not a symlink we
 # already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
@@ -565,7 +585,7 @@ import sys, json, os, re, time, signal
 # the python exit; the bash probe is what decides whether the user
 # sees a notification.
 WATCHDOG_SEC = 150
-def _watchdog_exit(signum, frame):
+def _watchdog_exit(signum=None, frame=None):
     # Diagnostic to stderr only. The bash retry loop owns the
     # user-visible notification — it probes the host on fmt_exit=2
     # to decide whether silence means "healthy idle" (silent reset)
@@ -574,8 +594,28 @@ def _watchdog_exit(signum, frame):
     sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — exiting for probe\\n")
     sys.stderr.flush()
     os._exit(2)
-signal.signal(signal.SIGALRM, _watchdog_exit)
-signal.alarm(WATCHDOG_SEC)
+
+# Cross-platform watchdog. POSIX (mac/linux/WSL) gets signal.SIGALRM
+# which is cheaper (single-thread, kernel-armed). Windows Python has
+# no SIGALRM so we fall back to threading.Timer — same exit semantics,
+# slight overhead from the timer thread. Either way the fmt_exit=2
+# contract is preserved.
+try:
+    signal.signal(signal.SIGALRM, _watchdog_exit)
+    signal.alarm(WATCHDOG_SEC)
+    def _arm_watchdog():
+        signal.alarm(WATCHDOG_SEC)
+except (AttributeError, ValueError):
+    import threading
+    _wd_timer_holder = [None]
+    def _arm_watchdog():
+        if _wd_timer_holder[0] is not None:
+            _wd_timer_holder[0].cancel()
+        t = threading.Timer(WATCHDOG_SEC, _watchdog_exit)
+        t.daemon = True
+        t.start()
+        _wd_timer_holder[0] = t
+    _arm_watchdog()
 
 peers_dir = os.environ.get("PEERS_DIR", "")
 scope_dir = os.path.dirname(peers_dir)
@@ -677,8 +717,9 @@ except Exception:
 
 for line in sys.stdin:
     # Any inbound line — real message, heartbeat, whatever — means the
-    # channel is alive. Reset the watchdog.
-    signal.alarm(WATCHDOG_SEC)
+    # channel is alive. Reset the watchdog (POSIX: re-arms SIGALRM;
+    # Windows: cancels + restarts threading.Timer).
+    _arm_watchdog()
     line = line.strip()
     if not line: continue
     offset_counter += 1
@@ -748,27 +789,40 @@ for line in sys.stdin:
         # cmd_ping picks PONG up by tailing messages.jsonl directly.
         # Suppress to keep the chat surface clean.
         continue
-    # Compact one-liner per event. Every line starts with `airc:` so
-    # the source is unambiguous when other Monitor tasks (continuum,
-    # tests, etc.) are also firing notifications. Long messages
-    # truncate to PREVIEW_LEN; full content stays in messages.jsonl
-    # for `airc logs` audit.
-    PREVIEW_LEN = 100
-    msg_preview = msg.replace("\\n", " ").strip()
-    if len(msg_preview) > PREVIEW_LEN:
-        msg_preview = msg_preview[:PREVIEW_LEN] + "…"
-    if fr in ("airc", "sys"):
-        # System events (joins, parts, drain, auth, watchdog).
-        # Example:  airc: [#general] alice joined
-        print(f"airc: [#{room_name}] {msg_preview}", flush=True)
-    elif to and to not in ("all", ""):
-        # DM with addressed recipient.
-        # Example:  airc: [#general] bigmama → alice: quick question
-        print(f"airc: [#{room_name}] {fr} → {to}: {msg_preview}", flush=True)
-    else:
-        # Broadcast.
-        # Example:  airc: [#general] bigmama: hello everyone
-        print(f"airc: [#{room_name}] {fr}: {msg_preview}", flush=True)
+    # One-liner per event. Every line starts with `airc:` so the source
+    # is unambiguous when other Monitor tasks (continuum, tests, etc.)
+    # are also firing notifications.
+    #
+    # No length cap any more -- consumers (Claude Code Monitor, Codex,
+    # log tailers, etc.) decide their own display truncation. Truncating
+    # in the substrate forced everyone downstream to fall back to
+    # `airc logs` to see anything past the cap, which is exactly the
+    # polling-vs-substrate anti-pattern Joel called out 2026-04-24.
+    # Newlines collapsed to spaces so each emitted event is still a
+    # single line, but the full body always reaches the consumer.
+    msg_one_line = (msg or "").replace("\\n", " ").replace("\\r", " ").strip()
+    try:
+        if fr in ("airc", "sys"):
+            # System events (joins, parts, drain, auth, watchdog).
+            # Example:  airc: [#general] alice joined
+            print(f"airc: [#{room_name}] {msg_one_line}", flush=True)
+        elif to and to not in ("all", ""):
+            # DM with addressed recipient.
+            # Example:  airc: [#general] bigmama → alice: quick question
+            print(f"airc: [#{room_name}] {fr} → {to}: {msg_one_line}", flush=True)
+        else:
+            # Broadcast.
+            # Example:  airc: [#general] bigmama: hello everyone
+            print(f"airc: [#{room_name}] {fr}: {msg_one_line}", flush=True)
+    except Exception as e:
+        # Belt-and-suspenders -- one bad message must never take the
+        # whole monitor down. Surface to stderr (which the bash retry
+        # loop captures) and keep going.
+        try:
+            sys.stderr.write(f"[airc:formatter] skipped one line: {e}\\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 '
 }
 
@@ -3172,12 +3226,168 @@ cmd_daemon_log() {
 }
 
 cmd_doctor() {
-  # Self-diagnose: run the bundled integration test script.
-  # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
-  # when running from a git checkout.
+  # Two modes:
+  #   airc doctor           -- environment health check (default).
+  #                            Probes each prereq and prints the exact
+  #                            install command for whichever package
+  #                            manager this platform uses, so any AI
+  #                            reading the output can `proactively fix
+  #                            recoverable issues` (per /doctor SKILL.md).
+  #   airc doctor --tests   -- run the integration test suite (the
+  #   airc doctor tests        prior default behavior; aliased on the
+  #                            dispatch via `tests|test`).
+  case "${1:-}" in
+    --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
+  esac
+
+  echo ""
+  echo "  airc doctor -- environment health"
+  echo "  --------------------------------"
+  echo ""
+  local issues=0
+
+  # Detect the platform's package manager so we can emit concrete fix
+  # commands. Same shape as install.sh's ensure_prereqs.
+  local mgr; mgr=$(_doctor_detect_pkgmgr)
+
+  _doctor_probe "git"          "$mgr" "VCS for clone/update" || issues=$((issues+1))
+  _doctor_probe "gh"           "$mgr" "Gist substrate (room discovery)" || issues=$((issues+1))
+  _doctor_probe_gh_auth                                             || issues=$((issues+1))
+  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"     || issues=$((issues+1))
+  _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
+  _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
+  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
+  _doctor_probe_tailscale "$mgr"  # optional, never increments issues
+
+  echo ""
+  echo "  Scope:"
+  echo "    AIRC_HOME = $AIRC_WRITE_DIR"
+  if [ -f "$CONFIG" ]; then
+    local _name; _name=$(get_name)
+    local _ht;   _ht=$(get_config_val host_target "")
+    if [ -n "$_ht" ]; then
+      echo "    Identity: $_name (joiner of $_ht)"
+    else
+      echo "    Identity: $_name (host or unconnected)"
+    fi
+  else
+    echo "    Identity: not initialized (run 'airc join' to set up)"
+  fi
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "  All required prereqs present. Behavioral suite:  airc doctor --tests"
+  else
+    echo "  $issues prereq(s) missing -- see fix lines above."
+    echo "  Fastest path: re-run install.sh (auto-installs via brew/apt/dnf/pacman/apk):"
+    echo "    curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash"
+  fi
+  echo ""
+}
+
+_doctor_detect_pkgmgr() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      command -v brew >/dev/null 2>&1 && { echo "brew"; return; }
+      echo "brew-missing"; return ;;
+    Linux)
+      command -v apt-get >/dev/null 2>&1 && { echo "apt";    return; }
+      command -v dnf     >/dev/null 2>&1 && { echo "dnf";    return; }
+      command -v pacman  >/dev/null 2>&1 && { echo "pacman"; return; }
+      command -v apk     >/dev/null 2>&1 && { echo "apk";    return; }
+      ;;
+  esac
+  echo "unknown"
+}
+
+# Map a generic prereq to the install command for the detected pkgmgr.
+# Empty string = we don't have a one-liner to suggest; emits a generic
+# pointer instead. Mirrors install.sh:pkgname_for + install_with_pkgmgr.
+_doctor_install_cmd_for() {
+  local mgr="$1" prereq="$2"
+  local pkg
+  case "$prereq" in
+    ssh|ssh-keygen)
+      case "$mgr" in
+        brew)   pkg="openssh" ;;
+        apt)    pkg="openssh-client" ;;
+        dnf)    pkg="openssh-clients" ;;
+        pacman) pkg="openssh" ;;
+        apk)    pkg="openssh-client" ;;
+      esac ;;
+    python3)
+      case "$mgr" in
+        pacman) pkg="python" ;;
+        *)      pkg="python3" ;;
+      esac ;;
+    *) pkg="$prereq" ;;
+  esac
+  case "$mgr" in
+    brew)   echo "brew install $pkg" ;;
+    apt)    echo "sudo apt-get install -y $pkg" ;;
+    dnf)    echo "sudo dnf install -y $pkg" ;;
+    pacman) echo "sudo pacman -S --needed $pkg" ;;
+    apk)    echo "sudo apk add $pkg" ;;
+    brew-missing)
+      echo "Install Homebrew first: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\", then: brew install $pkg" ;;
+    *) echo "Install '$pkg' via your platform's package manager" ;;
+  esac
+}
+
+_doctor_probe() {
+  local cmd="$1" mgr="$2" purpose="$3"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    printf "  [ok] %s\n" "$cmd"
+    return 0
+  fi
+  local fix; fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
+  printf "  [MISSING] %s -- %s\n" "$cmd" "$purpose"
+  printf "         Fix: %s\n" "$fix"
+  return 1
+}
+
+_doctor_probe_gh_auth() {
+  if ! command -v gh >/dev/null 2>&1; then
+    return 0  # already reported missing by the gh probe
+  fi
+  if gh auth status >/dev/null 2>&1; then
+    printf "  [ok] gh authenticated\n"
+    return 0
+  fi
+  printf "  [MISSING] gh authenticated (gist scope)\n"
+  printf "         Fix: gh auth login -s gist\n"
+  return 1
+}
+
+_doctor_probe_tailscale() {
+  local mgr="$1"
+  if command -v tailscale >/dev/null 2>&1; then
+    if tailscale status >/dev/null 2>&1; then
+      printf "  [ok] tailscale (optional) -- daemon up\n"
+    else
+      printf "  [info] tailscale (optional) -- installed but daemon not up\n"
+      printf "         Bring up:  tailscale up    (or skip; LAN mesh works without it)\n"
+    fi
+    return 0
+  fi
+  # Optional -- print the install hint but don't count toward issues.
+  local fix
+  case "$mgr" in
+    brew)         fix="brew install --cask tailscale" ;;
+    apt|dnf|pacman|apk) fix="curl -fsSL https://tailscale.com/install.sh | sh" ;;
+    *)            fix="https://tailscale.com/download" ;;
+  esac
+  printf "  [info] tailscale (optional) -- not installed; only needed for cross-LAN mesh\n"
+  printf "         Install: %s\n" "$fix"
+  return 0
+}
+
+_doctor_run_tests() {
+  # Behavioral suite -- the prior cmd_doctor entry point. Kept reachable
+  # via `airc doctor --tests` (or the `tests`/`test` aliases in dispatch)
+  # so existing CI / muscle memory still works.
   local script="${AIRC_DIR:-$HOME/.airc-src}/test/integration.sh"
   if [ ! -x "$script" ]; then
-    # Try next to the binary itself (dev checkout case)
     local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
     local here; here="$(dirname "$self")"
     [ -x "$here/test/integration.sh" ] && script="$here/test/integration.sh"
@@ -3229,7 +3439,8 @@ case "${1:-help}" in
   canary) shift; cmd_update --channel canary "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
   status)    shift; cmd_status "$@" ;;
-  doctor|tests|test) shift; cmd_doctor "$@" ;;
+  doctor)            shift; cmd_doctor "$@" ;;
+  tests|test)        shift; _doctor_run_tests "$@" ;;
   daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   disconnect|quit|leave|unbind) cmd_disconnect ;;

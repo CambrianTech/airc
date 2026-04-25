@@ -10,41 +10,31 @@ argument-hint: "[scenario|all]"
 
 Run this yourself — don't ask the user. Goal: leave the user with a working airc, not a diagnosis they have to act on.
 
-## Step 1 — environment health check (do this BEFORE running tests)
+## Step 1 — environment health check
 
-The substrate is gh-rooted. Check the environment first; an absent / unauthed gh is the #1 cause of "airc feels broken." If you can fix it, fix it.
+The substrate is gh-rooted. An absent / unauthed gh is the #1 cause of "airc feels broken." Run the built-in probe first:
 
 ```bash
-# (a) gh installed?
-command -v gh >/dev/null 2>&1 && echo "gh: present" || echo "gh: MISSING"
-
-# (b) gh authenticated?
-gh auth status 2>&1 | head -3
-
-# (c) ssh remote login on this machine? (needed for tabs/scope tests + real pairing)
-# macOS:
-sudo systemsetup -getremotelogin 2>/dev/null || true
-# Linux: just check sshd is running
-systemctl is-active sshd 2>/dev/null || pgrep -f "sshd" >/dev/null && echo "sshd: active" || echo "sshd: NOT running"
-
-# (d) port 7549 (test-reserved) free?
-lsof -iTCP:7549 -sTCP:LISTEN 2>/dev/null | head -3 || echo "7549: free"
+airc doctor
 ```
+
+This emits one line per prereq with `[ok]`, `[MISSING]`, or `[info]` (optional/Tailscale). For every `[MISSING]` line, the next line is `Fix: <exact command>` for the platform's package manager (brew / apt / dnf / pacman / apk; or a manual hint when no manager is detected).
 
 **Act on findings, don't just print them:**
 
-- **`gh: MISSING`** → install gh. macOS: `brew install gh`. Linux Ubuntu/Debian: `sudo apt install gh` (or follow https://github.com/cli/cli#installation). Windows: `winget install GitHub.cli` or `choco install gh`. Then tell the user to `gh auth login` (needs interactive browser flow — they have to run this themselves).
-- **`gh auth: not logged in`** → `gh auth login` (must be interactive — instruct the user to type `! gh auth login` so it runs in the terminal session and the browser flow can complete).
-- **`sshd: NOT running`** (macOS) → `sudo systemsetup -setremotelogin on` (the user has to run this; needs sudo). Or System Settings → General → Sharing → Remote Login.
-- **`7549: <pid>`** → port held by something else; `lsof -tiTCP:7549 -sTCP:LISTEN | xargs kill` if the process is one you can identify and kill safely. Otherwise tell the user.
+- For each `[MISSING]` prereq with a `Fix:` line: run the fix. Most are unattended (`brew install gh`, `sudo apt-get install -y openssh-client`, etc.).
+- `gh authenticated (gist scope)` is interactive (browser flow) — instruct the user to type `! gh auth login -s gist` so it runs in their terminal session.
+- `tailscale (optional)` lines never block the user (LAN-only mesh works without it). Install only if they want cross-LAN reach, then `tailscale up` is also interactive.
 
-Why this comes BEFORE the tests: the integration suite is `gh`-free by design (uses inline invites + local SSH), so missing gh wouldn't fail the tests — but the user will still be unable to use the substrate (`airc join` zero-arg auto-discovery, `airc list`). Doctor should catch and fix that.
+If `airc doctor` says **"All required prereqs present"**, environment is good — proceed to Step 2.
 
 ## Step 2 — run the integration suite
 
 ```bash
-airc doctor $ARGUMENTS
+airc doctor --tests $ARGUMENTS
 ```
+
+(Aliases: `airc doctor tests`, `airc tests`, `airc test`.)
 
 Empty `$ARGUMENTS` (or `all`) runs every scenario. A scenario name (`tabs`, `scope`, `room`, `teardown`, `reminder`, `resilience`, `reconnect`, `queue`, `status`, `auth_failure`, `resume_stale_auth`) runs just that one. Suite uses port 7549 + `AIRC_HOME=/tmp/airc-it-*`; safe alongside live airc on 7547/7548.
 
@@ -55,7 +45,7 @@ Final line: `N passed, M failed`.
 ### Green (`0 failed`)
 
 - Environment OK + tests OK → tell the user "airc is healthy. Run `airc join` to join the substrate."
-- Make sure to mention what you fixed (if anything) in step 1.
+- Mention what you fixed in step 1 if anything.
 
 ### Red
 
@@ -76,7 +66,7 @@ If a failure isn't in the table:
 - Read the failure verbatim
 - Trace into `test/integration.sh` for that scenario name to understand what assertion fired
 - Read the relevant section of the airc binary
-- Form a hypothesis, fix it, re-run that scenario alone (`airc doctor <scenario>`)
+- Form a hypothesis, fix it, re-run that scenario alone (`airc doctor --tests <scenario>`)
 
 ## Step 4 — final report
 
@@ -93,4 +83,4 @@ One line: "Fixed X, Y. All tests green." OR "Fixed X. Tests N passed M failed; f
 
 - Scenarios are gh-free; the substrate ITSELF (`airc join` zero-arg, `airc list`) requires gh. That's a feature, not a bug — gh is the comm layer.
 - Suite runtime is ~2 minutes for `all`; individual scenarios are 10-30s.
-- This skill assumes you can run shell commands. The user should not have to type anything except the interactive `gh auth login` flow if you encounter it.
+- This skill assumes you can run shell commands. The user should not have to type anything except the interactive `gh auth login -s gist` flow if you encounter it.
