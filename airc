@@ -1162,20 +1162,22 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
-  # Auto-scope: when --room wasn't explicit, derive default from git
-  # remote org (cross-machine-stable) or parent dir (local fallback).
-  # See infer_default_room() for the rationale — zero-config project
-  # separation: cd into any useideem repo → #useideem, any cambriantech
-  # repo → #cambriantech, regardless of local path. Falls back to
-  # #general when neither signal fires. Opt out: AIRC_NO_AUTO_ROOM=1.
+  # `airc join` (no args) joins #general. Period. Auto-scope-by-git-remote
+  # was a previous default that silently put agents in different cwds into
+  # different rooms ('#cambriantech' from one repo, '#useideem' from another),
+  # so two agents on the same gh account couldn't see each other and each
+  # wound up alone in its own "channel" — the opposite of the IRC-substrate
+  # mental model. Per-project rooms are still available via explicit
+  # `--room <name>`. AIRC_AUTO_SCOPE_ROOM=1 restores the old behavior for
+  # anyone who actually wanted it.
   if [ "$use_room" = "1" ] && [ "$room_explicit" = "0" ] \
-     && [ "${AIRC_NO_AUTO_ROOM:-0}" != "1" ]; then
+     && [ "${AIRC_AUTO_SCOPE_ROOM:-0}" = "1" ]; then
     local _inferred
     _inferred=$(infer_default_room 2>/dev/null || true)
     if [ -n "$_inferred" ]; then
       room_name="${_inferred%|*}"
       local _source="${_inferred#*|}"
-      echo "  Auto-scoped: #${room_name} (from git ${_source}; override with --room or AIRC_NO_AUTO_ROOM=1)"
+      echo "  Auto-scoped: #${room_name} (AIRC_AUTO_SCOPE_ROOM=1, from git ${_source})"
     fi
   fi
 
@@ -2150,7 +2152,8 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     # substrate framing took effect — emit unconditionally for room mode.
     if [ "$use_room" = "1" ]; then
       echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
-      echo "  Hosting #${room_name} (gh-account substrate)."
+      echo "  No live #${room_name} found on your gh account — hosting fresh."
+      echo "  Other agents on your gh account who run 'airc join' will auto-join."
     fi
 
     # ── Gist transport (--gist flag, issue #37) ────────────────────
