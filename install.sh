@@ -45,7 +45,7 @@ detect_pkgmgr() {
       if command -v pacman  >/dev/null 2>&1; then echo "pacman"; return; fi
       if command -v apk     >/dev/null 2>&1; then echo "apk";    return; fi
       ;;
-    MINGW*|MSYS*|CYGWIN*|MINGW64*)
+    MINGW*|MSYS*|CYGWIN*)
       # Windows Git Bash / MSYS2 / Cygwin. winget is the standard
       # package manager on modern Windows and what install.ps1 uses;
       # it's reachable from Git Bash as winget.exe via PATH or as
@@ -165,19 +165,40 @@ ensure_prereqs() {
     return 0
   fi
 
-  local missing=() pkgs=()
+  local missing=() pkgs=() unmappable=()
   for cmd in git gh openssl ssh-keygen python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
-      pkgs+=("$(pkgname_for "$mgr" "$cmd")")
+      local pkg; pkg=$(pkgname_for "$mgr" "$cmd")
+      if [ -z "$pkg" ]; then
+        # Manager has no auto-install path for this prereq (e.g., winget
+        # treats ssh + openssl as bundled-with-Windows / Git-for-Windows
+        # but the user hits this case if those bundles are absent).
+        # Surface clearly instead of silently skipping (#92 Copilot).
+        unmappable+=("$cmd")
+      else
+        pkgs+=("$pkg")
+      fi
     fi
   done
   if [ ${#missing[@]} -gt 0 ]; then
-    info "Installing missing prereqs via $mgr: ${missing[*]}"
-    if install_with_pkgmgr "$mgr" "${pkgs[@]}"; then
-      ok "Prereqs installed"
+    if [ ${#pkgs[@]} -gt 0 ]; then
+      info "Installing missing prereqs via $mgr: ${pkgs[*]}"
+      if install_with_pkgmgr "$mgr" "${pkgs[@]}"; then
+        ok "Auto-installable prereqs installed"
+      else
+        warn "Package install reported failure; airc may not run until you fix: ${missing[*]}"
+      fi
     else
-      warn "Package install reported failure; airc may not run until you fix: ${missing[*]}"
+      warn "Missing prereqs not auto-installable on $mgr: ${missing[*]}"
+    fi
+    if [ ${#unmappable[@]} -gt 0 ]; then
+      warn "These prereqs need manual install on $mgr: ${unmappable[*]}"
+      case "$mgr" in
+        winget)
+          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client"
+          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' provides it" ;;
+      esac
     fi
   else
     ok "All required prereqs present"
