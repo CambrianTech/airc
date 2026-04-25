@@ -57,19 +57,28 @@ detect_scope() {
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
-# Format: <basename>-<4-char-hash>. Hash disambiguates same-basename
-# directories across different parent paths (two "src" dirs don't collide).
-# Users can override any time with `airc rename <new>`.
+# Format: <repo>-<4-char-hash> when in a git repo (basename of the git
+# top-level), or <dir-basename>-<4-char-hash> otherwise. Hash
+# disambiguates same-name directories across different parent paths
+# (two "src" dirs, two clones of the same repo, etc.).
+#
+# Within a room scoped to a single org (which is the auto-scope default
+# — see infer_repo_org), every peer is from that org by construction, so
+# adding the org as a name prefix is redundant and lengthens @-mentions.
+# Cap is 20 chars on the basename, comfortably fitting common repo names
+# (`authenticator-d1f4`, `merchant-browser-d1f4`) without truncation.
+# Users can override any time with `airc nick`.
 derive_name() {
   local dir="${1:-$(pwd -P)}"
-  # Prefer git root basename — more meaningful than a subdir basename when
-  # the user happens to be deep in a repo — but hash the actual cwd so
-  # subdirs still get unique names.
-  local base_dir git_root
+  local base_dir git_root base
   git_root=$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)
   base_dir="${git_root:-$dir}"
-  local base
-  base=$(basename "$base_dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-12)
+  base=$(basename "$base_dir" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g' \
+    | sed 's/--*/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-20 \
+    | sed 's/-*$//')
   [ -z "$base" ] && base="airc"
   local hash
   hash=$(printf '%s' "$dir" | shasum -a 256 2>/dev/null | cut -c1-4)
