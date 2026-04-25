@@ -1,5 +1,5 @@
 ---
-name: part
+name: airc:part
 description: Leave the current room without leaving the mesh. Host parts → room gist deleted, joiners reconnect into a new election. Joiner parts → host's gist stays open for others. Local identity preserved.
 user-invocable: true
 allowed-tools: Bash

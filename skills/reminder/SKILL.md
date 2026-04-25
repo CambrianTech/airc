@@ -1,5 +1,5 @@
 ---
-name: reminder
+name: airc:reminder
 description: Control the silence-reminder nudge. Fires once when no send happens within N seconds; resets on next send.
 user-invocable: true
 allowed-tools: Bash

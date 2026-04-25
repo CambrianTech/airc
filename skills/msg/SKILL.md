@@ -1,5 +1,5 @@
 ---
-name: msg
+name: airc:msg
 description: Send a message to the chat room. No target = everyone. Prefix @peer for a DM.
 user-invocable: true
 allowed-tools: Bash

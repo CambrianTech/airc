@@ -1,5 +1,5 @@
 ---
-name: resume
+name: airc:resume
 description: Resume a prior airc session in this scope. Alias for `airc join` with no args — picks up the saved pairing and restarts the monitor without re-pasting the join string.
 user-invocable: true
 allowed-tools: Bash, Monitor

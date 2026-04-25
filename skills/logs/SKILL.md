@@ -1,5 +1,5 @@
 ---
-name: logs
+name: airc:logs
 description: Show the last N messages in the mesh's shared log (default 20). Human-readable format — timestamp + sender + message.
 user-invocable: true
 allowed-tools: Bash

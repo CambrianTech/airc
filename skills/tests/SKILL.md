@@ -1,5 +1,5 @@
 ---
-name: tests
+name: airc:tests
 description: Run the airc integration test suite (alias for airc doctor). Validates pairing, send, rename, room substrate, scope isolation, queue resilience, and more. Use after install or upgrade, or when something feels off.
 user-invocable: true
 allowed-tools: Bash

@@ -1,5 +1,5 @@
 ---
-name: update
+name: airc:update
 description: Pull the latest airc code into the install dir. Leaves the running monitor untouched; report the new SHA and tell the user to teardown+connect to pick it up.
 user-invocable: true
 allowed-tools: Bash

@@ -1,5 +1,5 @@
 ---
-name: quit
+name: airc:quit
 description: Leave the current mesh without wiping your identity. Kills the running airc process in this scope and clears only the host-pairing fields from config. Next `airc join` starts fresh instead of auto-resuming.
 user-invocable: true
 allowed-tools: Bash
