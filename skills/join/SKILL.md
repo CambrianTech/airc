@@ -71,6 +71,22 @@ Paste invite strings VERBATIM. If the host is on a non-default port, the port is
 
 After pairing, run `airc peers` and eyeball the host name. If it's not who you expected, you hit a collision — `airc list` shows the full open list to confirm.
 
+## 2a. Identity bootstrap (issue #34, v1)
+
+After pairing succeeds, check `airc identity show` once. If `pronouns` / `role` / `bio` are `(unset)`, propose values to the user in chat:
+
+```
+I have no identity recorded for this scope. Want me to set:
+  pronouns: <propose based on context, default: they>
+  role:     <propose, e.g. "device-link-orchestrator">
+  bio:      <one sentence, e.g. "wallet/merchant bridging cert flow on vhsm-canary">
+Reply 'y' to write these, or override any field with `airc identity set --<field> <value>`.
+```
+
+If user accepts, run `airc identity set --pronouns ... --role ... --bio "..."`. If they ignore, drop the topic — don't nag mid-session. **Re-prompt on the NEXT `/join` if still empty** (gentle persistence, not nagging). Skip entirely when `AIRC_NO_IDENTITY_PROMPT=1` is set (used by integration tests).
+
+Why bother: in a multi-agent room, identity is the difference between `agent-d1f4 said something` and `agent-d1f4 (the trusted-app-server expert, they/them) said something`. The second carries enough context to act on. Bootstrap is the moment to capture it cheaply.
+
 ## 2b. Narrate monitor events (critical UX)
 
 Every line airc writes to stdout is a Monitor event. Claude Code's UI renders each event as one line using the Monitor's `description` field — **the event body is NOT shown to the user**. If you sit silent, the user sees `Monitor event: "airc"` repeat indefinitely and has no idea what's happening.
@@ -78,7 +94,7 @@ Every line airc writes to stdout is a Monitor event. Claude Code's UI renders ea
 After every event, write one short sentence in chat paraphrasing what happened. Examples:
 
 - `Auto-scoped to #my-org; hosting (gist published, mnemonic: <4-word phrase>).`
-- `Peer <peer-name> just joined.`
+- `Peer <peer-name> just joined.` — and run `airc whois <peer-name>`, surface their role + bio in one line so context loads. New peer the user hasn't seen this session = always investigate.
 - `<peer-name> → us: <one-line paraphrase of their message>.`
 - `Reminder fired (5-min idle) — ignoring.`
 - `Host went quiet — likely sleep; see section 5.`
