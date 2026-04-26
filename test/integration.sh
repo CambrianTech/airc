@@ -2154,6 +2154,69 @@ JSON
   cleanup_all
 }
 
+# ── Scenario: resume_prints_connected_banner ───────────────────────────
+# Pre-fix: a joiner that paired, teardown'd (no --flush), then ran
+# `airc connect` again printed "Resuming as joiner of '<peer>'..."
+# and then went silent — even on full success. The user couldn't
+# tell SSH-pair-OK from script-wedged. Fresh-pair printed
+# "Connected to '<peer>' (SSH verified, ...)" at line ~2469;
+# resume's success branch had no analogous banner.
+#
+# Per the "never swallow errors" rule (Joel, 2026-04-15):
+# silent-success is the same evidence-eating shape as silent-fail
+# because the user can't distinguish them. Caught 2026-04-26 by
+# vhsm-Claude observing through the substrate ("fresh-join printed
+# it; resume path didn't").
+#
+# Post-fix: resume's success branch prints
+#   "Resumed as joiner of '<peer>' in #<room> (SSH verified)"
+# (or without "in #<room>" for legacy 1:1 invites).
+scenario_resume_prints_connected_banner() {
+  section "resume_prints_connected_banner: resume success must announce itself (no silent-success)"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-rpcb-h alpha 7568 || { fail "alpha host failed to start"; cleanup_all; return; }
+  local join; join=$(read_join_string /tmp/airc-it-rpcb-h)
+  [ -n "$join" ] || { fail "no join string"; cleanup_all; return; }
+  spawn_joiner /tmp/airc-it-rpcb-j beta "$join" || { fail "beta join failed"; cleanup_all; return; }
+
+  # Teardown beta only (preserve state — that's what triggers the
+  # resume path on next connect). Identity, peer records, host_target
+  # all stay on disk.
+  AIRC_HOME=/tmp/airc-it-rpcb-j/state "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  # Re-run airc connect from beta's scope. With the existing config
+  # (host_target present), this enters the resume branch.
+  local resume_log=/tmp/airc-it-rpcb-j/resume.log
+  ( AIRC_HOME=/tmp/airc-it-rpcb-j/state AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect > "$resume_log" 2>&1 ) &
+  local pid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    grep -qE 'Resumed as joiner|Resume aborted|silent-broadcast' "$resume_log" 2>/dev/null && break
+    kill -0 $pid 2>/dev/null || break
+  done
+
+  grep -qE "Resuming as joiner of 'alpha'" "$resume_log" \
+    && pass "Resuming banner fires (entry into resume path is announced)" \
+    || fail "no 'Resuming as joiner' banner — resume path not entered (got: $(head -3 "$resume_log"))"
+
+  grep -qE "Resumed as joiner of 'alpha'.*SSH verified" "$resume_log" \
+    && pass "Resumed-as-joiner success banner fires (no silent-success)" \
+    || fail "MISSING resume-success banner — silent-success bug regressed (got: $(head -10 "$resume_log"))"
+
+  # Cleanup
+  kill -9 $pid 2>/dev/null
+  for f in /tmp/airc-it-rpcb-h/state/airc.pid /tmp/airc-it-rpcb-j/state/airc.pid; do
+    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
+  done
+  sleep 1
+  rm -f "$resume_log"
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2179,8 +2242,9 @@ case "$MODE" in
   stale_auth_room_selfheal) scenario_stale_auth_room_selfheal ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   resume_404_gist_no_silent_exit) scenario_resume_404_gist_no_silent_exit ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|all]"; exit 2 ;;
+  resume_prints_connected_banner) scenario_resume_prints_connected_banner ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|all]"; exit 2 ;;
 esac
 
 echo

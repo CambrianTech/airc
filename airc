@@ -1807,6 +1807,21 @@ cmd_connect() {
         fi
       else
         rm -f "$probe_err"
+        # Resume probe succeeded — confirm visibly that we're paired and
+        # entering the monitor loop. Without this the user sees only
+        # "Resuming as joiner of..." and then silence, which (per the
+        # "never swallow errors" rule) has the same evidence-eating
+        # shape as silent failure — they can't tell whether SSH worked
+        # or the script wedged. Fresh-pair prints "Connected to ..."
+        # at line ~2469; resume must too. Caught 2026-04-26 by
+        # vhsm-Claude observing through the substrate.
+        local _resume_room=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && _resume_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$_resume_room" ]; then
+          echo "  Resumed as joiner of '$prior_name' in #${_resume_room} (SSH verified)"
+        else
+          echo "  Resumed as joiner of '$prior_name' (SSH verified)"
+        fi
       fi
 
       echo $$ > "$AIRC_WRITE_DIR/airc.pid"
