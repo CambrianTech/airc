@@ -771,6 +771,150 @@ sign_message() {
   rm -f "$tmpfile"
 }
 
+# ── Platform adapters ───────────────────────────────────────────────────
+#
+# Single-purpose helpers that hide platform-specific differences in the
+# process / port / filesystem APIs. Every callsite that needs "find
+# children of PID X" or "find PIDs listening on port Y" goes through
+# these helpers, NOT inline pgrep/lsof. That way:
+#
+#   1. The platform-specific implementation lives in ONE place per
+#      capability — adding a Windows fallback for `lsof` (e.g. via
+#      `netstat -ano`) means editing one helper, not 4+ callsites.
+#   2. The business logic above the adapter line stays platform-
+#      agnostic. Refactor risk drops.
+#   3. We hold the line on Joel's "fixing one platform shouldn't
+#      degrade another" rule (2026-04-26): without adapters, a Mac
+#      AI's tweak to a pgrep callsite easily diverges from the Linux
+#      AI's tweak. With adapters, both AIs touch the same helper.
+#
+# Each adapter takes simple inputs and emits a one-thing-per-line
+# stream, suitable for `while IFS= read -r` consumption. Callers can
+# `tr '\n' ' '` if they want space-separated, but the canonical
+# representation is newline-delimited (POSIX-friendly).
+#
+# Conventions:
+#   - `proc_*` — process / PID introspection
+#   - `port_*` — TCP port introspection
+#   - `file_*` — filesystem metadata
+#   - `detect_*` — environment classification
+
+# Return PIDs of direct children of $1, one per line.
+# Implementations: pgrep -P (POSIX/macOS/Linux), ps fallback for
+# environments without pgrep (Git Bash for Windows ships only msys
+# coreutils — no pgrep by default; the fallback uses `ps -axo pid,ppid`
+# which msys2 ps DOES support). Empty output if no children or pid is
+# already gone.
+proc_children() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$pid" 2>/dev/null
+  else
+    # POSIX-portable fallback. Works on Git Bash (msys ps), Linux ps,
+    # macOS ps. Awk filters by ppid column.
+    ps -axo pid,ppid 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }'
+  fi
+}
+
+# Return parent PID of $1. Empty if $1 is gone.
+proc_parent() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
+}
+
+# Return the command line of $1 (full argv, space-joined). Empty if gone.
+proc_cmdline() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  ps -p "$pid" -o command= 2>/dev/null
+}
+
+# Find airc-related PIDs owned by the current user matching a pattern.
+# Used by `airc teardown --all` to nuke every airc process.
+# Pattern is a regex passed to pgrep -f or to awk's =~.
+proc_airc_pids_matching() {
+  local pattern="$1"
+  [ -z "$pattern" ] && return 0
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -u "$(id -u)" -f "$pattern" 2>/dev/null
+  else
+    # Fallback: ps + awk. Less precise than pgrep -f (no anchored regex)
+    # but covers the same shape. Filter by user since msys ps -u option
+    # may not match POSIX semantics.
+    local me; me=$(whoami 2>/dev/null)
+    ps -axo pid,user,command 2>/dev/null \
+      | awk -v u="$me" -v p="$pattern" 'NR>1 && $2 == u && $0 ~ p { print $1 }'
+  fi
+}
+
+# Return PIDs listening on TCP port $1 (LISTEN state), one per line.
+# Implementations:
+#   1. lsof -tiTCP:<port> -sTCP:LISTEN — macOS, most BSDs, modern Linux
+#      with lsof installed.
+#   2. ss -tlnp — modern Linux distros (iproute2 default since ~2017),
+#      replaces deprecated netstat. Output post-processing extracts pid.
+#   3. netstat -ano — Windows native (cmd / PowerShell), and also a
+#      fallback on minimal Linux containers without lsof or ss. Output
+#      shape differs per platform; awk parses the LISTENING column.
+# Empty output = nobody listening.
+port_listeners() {
+  local port="$1"
+  [ -z "$port" ] && return 0
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null
+  elif command -v ss >/dev/null 2>&1; then
+    # ss output: 'LISTEN 0 ... users:(("python",pid=12345,fd=4))'
+    # Awk extracts pid= number.
+    ss -tlnp "( sport = :$port )" 2>/dev/null \
+      | awk 'NR>1 { match($0, /pid=[0-9]+/); if (RSTART) print substr($0, RSTART+4, RLENGTH-4) }'
+  elif command -v netstat >/dev/null 2>&1; then
+    # netstat -ano output (Windows + some Linux):
+    #   TCP 0.0.0.0:7547 0.0.0.0:0 LISTENING 12345
+    # Trailing column is PID. Match $port at end of local-address column.
+    netstat -ano 2>/dev/null \
+      | awk -v p=":$port" '$2 ~ p"$" && /LISTEN/ { print $NF }'
+  fi
+}
+
+# Return file size in bytes. Empty / 0 on failure.
+# stat is not POSIX (different flags on BSD vs GNU); chain both with
+# fallback to wc -c which IS POSIX.
+file_size() {
+  local path="$1"
+  [ -f "$path" ] || { echo 0; return 0; }
+  stat -f%z "$path" 2>/dev/null \
+    || stat -c%s "$path" 2>/dev/null \
+    || wc -c < "$path" 2>/dev/null \
+    || echo 0
+}
+
+# Detect platform: emits one of macos, linux, wsl, windows-bash (Git Bash
+# on Windows native), unknown. Most callers don't need this — they
+# should use the proc_/port_/file_ adapters, which handle platform
+# differences internally. detect_platform is for the rare case where
+# a top-level decision genuinely depends on platform (e.g. Tailscale.app
+# launching on macOS).
+detect_platform() {
+  local s; s=$(uname -s 2>/dev/null)
+  case "$s" in
+    Darwin)               echo macos ;;
+    Linux)
+      # Detect WSL via /proc/version content (kernel string contains
+      # 'microsoft' or 'WSL'). Bare Linux otherwise.
+      if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        echo wsl
+      else
+        echo linux
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows-bash ;;
+    *)                    echo unknown ;;
+  esac
+}
+
+# ── End platform adapters ───────────────────────────────────────────────
+
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s
@@ -1658,7 +1802,7 @@ cmd_connect() {
       # that would abort this block *before* reaching the rm on line 442 that
       # self-heals the stale pidfile. Result: joiner wedged forever after a
       # parent crash / laptop sleep until someone manually rm'd the pidfile.
-      all_stale="$all_stale $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ' || true)"
+      all_stale="$all_stale $(proc_children "$p" | tr '\n' ' ' || true)"
     done
     # Quiet kill — don't warn unless there was actually a live process.
     if [ -n "$all_stale" ]; then
@@ -1930,7 +2074,7 @@ cmd_connect() {
       echo $$ > "$AIRC_WRITE_DIR/airc.pid"
       trap '
         rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
-        for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
+        for p in $(proc_children $$); do kill $p 2>/dev/null; done
       ' EXIT INT TERM
       spawn_general_sidecar_if_wanted
       monitor
@@ -2606,7 +2750,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
     # remote doesn't see an orphaned session and the port doesn't linger.
     trap '
       rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
-      for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
+      for p in $(proc_children $$); do kill $p 2>/dev/null; done
     ' EXIT INT TERM
 
     spawn_general_sidecar_if_wanted
@@ -2647,7 +2791,7 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     local host_port="${AIRC_PORT:-7547}"
     local original_port="$host_port"
     local tried=0
-    while lsof -iTCP:"$host_port" -sTCP:LISTEN >/dev/null 2>&1; do
+    while [ -n "$(port_listeners "$host_port")" ]; do
       host_port=$((host_port + 1))
       tried=$((tried + 1))
       if [ "$tried" -ge 20 ]; then
@@ -3103,7 +3247,7 @@ except Exception:
         gh gist delete "$_exit_gist_id" --yes >/dev/null 2>&1
       fi
       rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR/heartbeat.pid" "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null
-      for p in $PAIR_PID $(pgrep -P $PAIR_PID 2>/dev/null) $(pgrep -P $$ 2>/dev/null); do
+      for p in $PAIR_PID $(proc_children $PAIR_PID) $(proc_children $$); do
         kill $p 2>/dev/null
       done
     ' EXIT INT TERM
@@ -4121,7 +4265,7 @@ cmd_send_file() {
     die "Failed to transfer $filename: $scp_out"
   fi
 
-  local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
+  local filesize; filesize=$(file_size "$filepath")
   cmd_send "$peer_name" "Sent file: $filename ($filesize bytes)"
   echo "Sent $filename ($filesize bytes)"
 }
@@ -4315,7 +4459,7 @@ cmd_teardown() {
     # Bash airc-connect processes (any path that ends in /airc connect or
     # the /tmp/airc-prefix bootstrap variant the curl|bash installer uses).
     local bash_pids
-    bash_pids=$(pgrep -u "$(id -u)" -f '(airc|airc-prefix)[[:space:]]+connect' 2>/dev/null || true)
+    bash_pids=$(proc_airc_pids_matching '(airc|airc-prefix)[[:space:]]+connect' || true)
     if [ -n "$bash_pids" ]; then
       echo "  --all: killing airc bash processes: $(echo $bash_pids | tr '\n' ' ')"
       kill -9 $bash_pids 2>/dev/null || true
@@ -4326,10 +4470,10 @@ cmd_teardown() {
     local port
     for port in 7547 7548 7549 7550 7551 7552 7553 7554 7555 7556 7557 7558 7559; do
       local lpids
-      lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+      lpids=$(port_listeners "$port" || true)
       for lpid in $lpids; do
         local cmd
-        cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
+        cmd=$(proc_cmdline "$lpid" || true)
         if echo "$cmd" | grep -q "socket.SOCK_STREAM\|socket.AF_INET"; then
           echo "  --all: freeing port $port (python pid $lpid)"
           kill -9 "$lpid" 2>/dev/null || true
@@ -4340,7 +4484,7 @@ cmd_teardown() {
     # Stale tail/ssh subprocesses that look like airc message tails
     # (ssh ... tail -F .../.airc/messages.jsonl).
     local tail_pids
-    tail_pids=$(pgrep -u "$(id -u)" -f '\.airc/messages\.jsonl' 2>/dev/null || true)
+    tail_pids=$(proc_airc_pids_matching '\.airc/messages\.jsonl' || true)
     if [ -n "$tail_pids" ]; then
       echo "  --all: killing stale airc message tails: $(echo $tail_pids | tr '\n' ' ')"
       kill -9 $tail_pids 2>/dev/null || true
@@ -4402,7 +4546,7 @@ cmd_teardown() {
       if [ -n "$_sc_pids" ]; then
         local _all_sc="$_sc_pids"
         for _p in $_sc_pids; do
-          local _kids; _kids=$(pgrep -P "$_p" 2>/dev/null | tr '\n' ' ' || true)
+          local _kids; _kids=$(proc_children "$_p" | tr '\n' ' ' || true)
           [ -n "$_kids" ] && _all_sc="$_all_sc $_kids"
         done
         _all_sc=$(echo "$_all_sc" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
@@ -4433,7 +4577,7 @@ cmd_teardown() {
       local all_pids="$main_pids"
       for pid in $main_pids; do
         local kids
-        kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ' || true)
+        kids=$(proc_children "$pid" | tr '\n' ' ' || true)
         [ -n "$kids" ] && all_pids="$all_pids $kids"
       done
       all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
@@ -4449,7 +4593,7 @@ cmd_teardown() {
           local _sc_pids; _sc_pids=$(cat "$_sc_pidfile" 2>/dev/null | tr '\n' ' ')
           for _scp in $_sc_pids; do
             _exclude_pids="$_exclude_pids $_scp"
-            local _scp_kids; _scp_kids=$(pgrep -P "$_scp" 2>/dev/null | tr '\n' ' ' || true)
+            local _scp_kids; _scp_kids=$(proc_children "$_scp" | tr '\n' ' ' || true)
             [ -n "$_scp_kids" ] && _exclude_pids="$_exclude_pids $_scp_kids"
           done
         fi
@@ -4484,14 +4628,14 @@ cmd_teardown() {
   [ "$ports" != "7547" ] && ports="$ports 7547"
   for port in $ports; do
     local lpids
-    lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    lpids=$(port_listeners "$port" || true)
     for lpid in $lpids; do
       # `|| true` on both — $lpid came from lsof a moment ago; if the process
       # exited in the interim, `ps -p` returns 1 and pipefail/errexit would
       # abort the port-reap loop mid-scan, leaving later ports unchecked.
       # Empty parent/cmd → the `if` below falls through, which is correct.
-      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
+      local parent; parent=$(proc_parent "$lpid" || true)
+      local cmd; cmd=$(proc_cmdline "$lpid" || true)
       # Reap if orphaned AND is a python socket listener.
       if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
         echo "  freeing orphaned port $port (pid $lpid)"
@@ -5338,12 +5482,10 @@ _doctor_connect_preflight() {
 
   # ── Connect-specific: AIRC_PORT free or auto-shift available ──
   local target_port="${AIRC_PORT:-7547}"
-  if command -v lsof >/dev/null 2>&1; then
-    if lsof -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
-      printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
-    else
-      printf "  [ok] port %s available for hosting\n" "$target_port"
-    fi
+  if [ -n "$(port_listeners "$target_port")" ]; then
+    printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
+  else
+    printf "  [ok] port %s available for hosting\n" "$target_port"
   fi
 
   # ── Connect-specific: cached host_target reachable (resume scenario) ──
