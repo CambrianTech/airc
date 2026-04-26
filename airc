@@ -1792,9 +1792,10 @@ cmd_connect() {
         # fall through to gist resolver below — kind:room → invite handshake
       else
         echo "  No #${room_name} found on your gh account → becoming the host."
-        # fall through to host mode below; cmd_connect's host path will
-        # publish a kind:room gist instead of kind:invite (see use_room
-        # check at gist push).
+        # Race against a concurrent host attempt is handled POST-publish
+        # (see "race-loser detection" near host_gist_id write below).
+        # Pre-publish recheck doesn't help — neither tab's gist is
+        # globally visible yet at this point.
       fi
     fi
 
@@ -2686,6 +2687,39 @@ JSON
             # state files and cleans everything up in one place.
             echo "$_hb_pid"  >  "$AIRC_WRITE_DIR/heartbeat.pid"
             echo "$_gist_id" >  "$AIRC_WRITE_DIR/host_gist_id"
+
+            # Post-publish race-loser detection. Two tabs that ran
+            # `airc join --room X` simultaneously can BOTH see empty
+            # gist list (gh propagation lag) and BOTH publish — pre-
+            # publish recheck doesn't help because neither's gist is
+            # globally visible yet. Solution: after publishing, look
+            # for OTHER gists with the same room name. Deterministic
+            # tiebreaker (lowest gist id alphabetically) picks the
+            # winner; loser deletes its gist + re-execs as joiner
+            # targeting the winner. Light jitter spreads the listing
+            # so we both see the same set.
+            local _race_jit; _race_jit=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.5 + (r%1000)/1000}')
+            sleep "$_race_jit"
+            local _peer_rooms; _peer_rooms=$(gh gist list --limit 50 2>/dev/null \
+              | awk -F'\t' -v re="airc room: ${room_name}\$" '$2 ~ re {print $1}' \
+              | sort)
+            local _peer_count; _peer_count=$(printf '%s\n' "$_peer_rooms" | grep -c . || true)
+            if [ "$_peer_count" -gt 1 ]; then
+              local _winner_id; _winner_id=$(printf '%s\n' "$_peer_rooms" | head -1)
+              if [ "$_winner_id" != "$_gist_id" ]; then
+                echo ""
+                echo "  ⚠  Concurrent host detected for #${room_name} — yielding to winner ($_winner_id)."
+                # Stop our heartbeat, delete our gist, clear state, re-exec as joiner.
+                kill "$_hb_pid" 2>/dev/null || true
+                gh gist delete "$_gist_id" --yes >/dev/null 2>&1 || true
+                rm -f "$AIRC_WRITE_DIR/heartbeat.pid" \
+                      "$AIRC_WRITE_DIR/host_gist_id" \
+                      "$AIRC_WRITE_DIR/room_gist_id" \
+                      "$AIRC_WRITE_DIR/room_name"
+                local _preserved_name; _preserved_name=$(get_config_val name "")
+                exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_winner_id"
+              fi
+            fi
 
             echo "  Hosting #${room_name} (gh-account substrate)."
             echo "  Other agents on your gh account auto-join via:  airc connect"
