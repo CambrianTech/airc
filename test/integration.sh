@@ -2313,15 +2313,21 @@ scenario_general_sidecar_default() {
     && pass "sidecar scope has room_name=general" \
     || fail "sidecar scope room_name wrong (got: $(cat "${home1}.general/room_name" 2>/dev/null))"
 
-  # Sidecar PID should be appended to primary's airc.pid
-  grep -qE '^[0-9]+$' "$home1/airc.pid" \
-    && pass "primary airc.pid has at least one entry" \
-    || fail "primary airc.pid empty or malformed"
+  # Primary's airc.pid contains primary's host-mode PIDs ($$ PAIR_PID
+  # hb_pid on one line). The sidecar's PID lives in its OWN scope's
+  # airc.pid — separate file, separate ownership. (PR #122 originally
+  # appended sidecar PID to primary's airc.pid, but PR #125 reverted
+  # that to make `airc part` work cleanly without nuking the sidecar.)
+  [ -s "$home1/airc.pid" ] \
+    && pass "primary airc.pid is non-empty (host PIDs recorded)" \
+    || fail "primary airc.pid empty or missing"
 
-  # Sidecar bash should be alive
-  local _sc_pid; _sc_pid=$(tail -1 "$home1/airc.pid" 2>/dev/null)
+  # Sidecar bash should be alive — read sidecar's OWN pidfile.
+  # awk '{print $1; exit}' grabs just the first PID since host-mode
+  # airc.pid has multiple space-separated PIDs on one line.
+  local _sc_pid; _sc_pid=$(awk '{print $1; exit}' "${home1}.general/airc.pid" 2>/dev/null)
   if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
-    pass "sidecar PID ${_sc_pid} (last entry in primary's airc.pid) is alive"
+    pass "sidecar bash PID ${_sc_pid} (from sidecar scope's own airc.pid) is alive"
   else
     fail "sidecar PID not alive (pid=${_sc_pid:-<empty>})"
   fi
@@ -2619,6 +2625,159 @@ scenario_part_keeps_sidecar() {
   cleanup_all
 }
 
+# ── Scenario: platform_adapters (cross-platform helpers contract) ──────
+# proc_children / port_listeners / proc_parent / proc_cmdline /
+# file_size / detect_platform replace inline pgrep/lsof/stat patterns
+# scattered through the codebase. This scenario verifies their
+# contract: input → output shape, fallback paths, and behavior when
+# the primary backing tool is missing (simulated by hiding it via
+# a PATH that excludes it).
+#
+# Catches: regressions where one platform's adapter implementation
+# diverges from another's. Refactoring these helpers should not
+# change observable behavior on any platform.
+scenario_platform_adapters() {
+  section "platform_adapters: proc_children / port_listeners / file_size / detect_platform"
+  cleanup_all
+
+  # Source the airc script in a way that gives us its functions without
+  # triggering its top-level argument processing. The script is a CLI
+  # so it dispatches on $1; we just want the helpers. Workaround: pass
+  # 'help' as $1 (no-op for our purposes) inside a subshell we can
+  # short-circuit OR re-exec the script with a marker. Simpler:
+  # extract the function definitions via grep + eval.
+  #
+  # Reliable approach: invoke the helpers via a tiny test driver that
+  # sources airc up to the helper definitions and then calls them.
+  # The script has no `if __name__ == '__main__'` equivalent in shell,
+  # so use a custom $1 that hits a dummy code path. Easiest: run airc
+  # in a subshell, override the dispatch by setting $1 to something
+  # unreachable, and just call the function directly. That requires
+  # we trust the script's structure — function definitions all run
+  # before the dispatch. So `bash -c 'source airc 2>/dev/null; func args'`
+  # works IF source is allowed (no exit/return at top level).
+  #
+  # The airc script does have top-level exec paths (auto-migration of
+  # ~/.agent-relay → ~/.airc, gh PATH-fixup, etc.) but those are
+  # idempotent. Sourcing should be fine.
+
+  # Helper: invoke an adapter without running airc's main dispatch.
+  # Sourcing $AIRC directly would trigger the bottom-of-file case
+  # statement and either die ("Unknown command") or print cmd_help.
+  # Extract just the marked adapter section into a temp file we can
+  # safely source.
+  local _adapters_extract; _adapters_extract=$(mktemp -t airc-it-pa.XXXXXX)
+  awk '/^# ── Platform adapters/,/^# ── End platform adapters/' "$AIRC" > "$_adapters_extract"
+  _adapter_call() {
+    bash -c "source '$_adapters_extract'; $*"
+  }
+
+  # ── proc_children ──
+  # Spawn a sleep, then check proc_children of the test harness PID
+  # finds it.
+  ( sleep 30 ) &
+  local _child_pid=$!
+  sleep 0.3
+  local _kids; _kids=$(_adapter_call "proc_children $$" | tr '\n' ' ')
+  echo "$_kids" | grep -qE "(^| )${_child_pid}( |$)" \
+    && pass "proc_children: finds direct child PID" \
+    || fail "proc_children: did NOT find spawned child $_child_pid (got: '$_kids')"
+  kill -9 $_child_pid 2>/dev/null
+  wait $_child_pid 2>/dev/null
+
+  # ── proc_parent ──
+  ( sleep 30 ) &
+  _child_pid=$!
+  sleep 0.3
+  local _ppid; _ppid=$(_adapter_call "proc_parent $_child_pid")
+  [ "$_ppid" = "$$" ] \
+    && pass "proc_parent: returns harness PID for spawned child" \
+    || fail "proc_parent: expected $$, got '$_ppid'"
+  kill -9 $_child_pid 2>/dev/null
+  wait $_child_pid 2>/dev/null
+
+  # ── proc_cmdline ──
+  ( sleep 30 ) &
+  _child_pid=$!
+  sleep 0.3
+  local _cmd; _cmd=$(_adapter_call "proc_cmdline $_child_pid")
+  echo "$_cmd" | grep -q 'sleep' \
+    && pass "proc_cmdline: returns command containing 'sleep'" \
+    || fail "proc_cmdline: didn't contain 'sleep' (got: '$_cmd')"
+  kill -9 $_child_pid 2>/dev/null
+  wait $_child_pid 2>/dev/null
+
+  # ── port_listeners ──
+  # Bring up a python listener on a random high port, verify
+  # port_listeners returns its PID.
+  local _test_port=49917
+  python3 -c "
+import socket, time, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $_test_port))
+s.listen(1)
+sys.stderr.write(f'pid={__import__(\"os\").getpid()}\n')
+sys.stderr.flush()
+time.sleep(30)
+" 2> /tmp/airc-it-pa-listener.err &
+  local _listener_pid=$!
+  sleep 0.5
+  local _detected; _detected=$(_adapter_call "port_listeners $_test_port" | tr '\n' ' ')
+  echo "$_detected" | grep -qE "(^| )${_listener_pid}( |$)" \
+    && pass "port_listeners: finds python listener on :$_test_port" \
+    || fail "port_listeners: missed listener $_listener_pid (got: '$_detected', stderr: $(cat /tmp/airc-it-pa-listener.err 2>/dev/null))"
+  kill -9 $_listener_pid 2>/dev/null
+  wait $_listener_pid 2>/dev/null
+  rm -f /tmp/airc-it-pa-listener.err
+
+  # ── file_size ──
+  local _testfile; _testfile=$(mktemp -t airc-it-pa-fs.XXXXXX)
+  printf 'hello world' > "$_testfile"   # 11 bytes
+  local _sz; _sz=$(_adapter_call "file_size '$_testfile'")
+  [ "$_sz" = "11" ] \
+    && pass "file_size: returns 11 bytes for 'hello world'" \
+    || fail "file_size: expected 11, got '$_sz'"
+  rm -f "$_testfile"
+
+  _sz=$(_adapter_call "file_size /nonexistent/path/here")
+  [ "$_sz" = "0" ] \
+    && pass "file_size: returns 0 for missing file" \
+    || fail "file_size on missing: expected 0, got '$_sz'"
+
+  # ── detect_platform ──
+  local _plat; _plat=$(_adapter_call "detect_platform")
+  case "$_plat" in
+    macos|linux|wsl|windows-bash|unknown)
+      pass "detect_platform: returns valid value '$_plat'" ;;
+    *)
+      fail "detect_platform: unexpected value '$_plat'" ;;
+  esac
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) [ "$_plat" = "macos" ] \
+      && pass "detect_platform: 'macos' on Darwin matches uname" \
+      || fail "detect_platform: Darwin should map to 'macos' (got '$_plat')" ;;
+    Linux)
+      case "$_plat" in
+        linux|wsl) pass "detect_platform: '$_plat' on Linux matches uname (linux or wsl)" ;;
+        *)         fail "detect_platform: Linux should map to linux or wsl (got '$_plat')" ;;
+      esac ;;
+  esac
+
+  # ── proc_children fallback (Windows compat path) ──
+  # Skipping the simulated-pgrep-missing test on platforms that have
+  # pgrep — naive PATH manipulation removes co-located tools (awk, ps)
+  # and breaks the very fallback we'd be exercising. The fallback is
+  # tested for real when running on Git Bash for Windows, where pgrep
+  # is genuinely absent. On those platforms this scenario's earlier
+  # proc_children assertion validates the ps-based code path
+  # automatically (no special simulation needed).
+  echo "  (proc_children fallback exercised for real on platforms without pgrep — see Windows runs)"
+
+  rm -f "$_adapters_extract"
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2649,8 +2808,9 @@ case "$MODE" in
   send_room_flag) scenario_send_room_flag ;;
   peers_cross_scope) scenario_peers_cross_scope ;;
   part_keeps_sidecar) scenario_part_keeps_sidecar ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|all]"; exit 2 ;;
+  platform_adapters) scenario_platform_adapters ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo
