@@ -414,8 +414,14 @@ advise_tailscale_if_down() {
   local ts_status_out=""
   local ts_status_rc=1
   if [ -n "$ts_bin" ]; then
-    ts_status_out=$("$ts_bin" status 2>&1)
-    ts_status_rc=$?
+    # `set -e` aborts on `out=$(...)` if the command exits non-zero.
+    # Logged-out tailscale exits 1 — exactly what we need to inspect.
+    # Wrap in if/else so set -e doesn't abort and rc is preserved.
+    if ts_status_out=$("$ts_bin" status 2>&1); then
+      ts_status_rc=0
+    else
+      ts_status_rc=$?
+    fi
     if [ "$ts_status_rc" = "0" ]; then
       # Status command succeeded — check whether we're actually
       # connected. tailscale prints "Logged out." when the daemon is
@@ -531,7 +537,10 @@ tailscale_login_check_or_prompt() {
   [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
   local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
   [ -z "$ts_bin" ] && return 0   # not installed; no nag (Tailscale truly optional)
-  local out; out=$("$ts_bin" status 2>&1)
+  # `set -e` at the top of airc aborts on a failed $() assignment.
+  # `tailscale status` exits 1 when logged out — exactly the case we
+  # WANT to detect. Trail with `|| true` so the rc doesn't kill us.
+  local out; out=$("$ts_bin" status 2>&1) || true
   case "$out" in
     *"Logged out"*|*"NeedsLogin"*) ;;
     *) return 0 ;;
@@ -619,7 +628,9 @@ host_address_set() {
   if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
     local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
     if [ -n "$ts_bin" ]; then
-      local ts_out; ts_out=$("$ts_bin" status 2>&1)
+      # set -e + non-zero exit on `tailscale status` (logged out) would
+      # abort. `|| true` is fine here — we only use the output.
+      local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
       case "$ts_out" in
         *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
         *)
