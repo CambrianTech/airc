@@ -361,11 +361,14 @@ function Test-TailscaleLoginOrPrompt {
     $out = & $ts status 2>&1 | Out-String
     if ($out -notmatch 'Logged out|NeedsLogin') { return }
     Write-Host ''
-    Write-Host "  ! Tailscale is installed but you're not signed in."
-    Write-Host '     Same-machine and same-LAN peers reach you fine; remote peers'
-    Write-Host "     (other machines on your gh account) can't until you sign in."
-    Write-Host '     Click the Tailscale tray icon to sign in, or run:  tailscale up'
-    Write-Host '     (To opt out of this nag: set AIRC_NO_TAILSCALE=1)'
+    Write-Host "  ! Tailscale is logged out. Running 'tailscale up' to start the auth flow -"
+    Write-Host '     click the URL it prints to authorize this device.'
+    Write-Host '     (Opt out anytime: airc join --no-tailscale)'
+    Write-Host ''
+    # Synchronously run `tailscale up` so the URL flows straight to the
+    # user's terminal. Same shape as bash. If the user cancels, we
+    # continue without Tailscale - same-machine + same-LAN paths work.
+    try { & $ts up } catch { }
     Write-Host ''
 }
 

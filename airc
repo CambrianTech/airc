@@ -546,20 +546,17 @@ tailscale_login_check_or_prompt() {
     *) return 0 ;;
   esac
   echo "" >&2
-  echo "  ⚠  Tailscale is installed but you're not signed in." >&2
-  echo "     Same-machine and same-LAN peers reach you fine; remote peers" >&2
-  echo "     (other machines on your gh account) can't until you sign in." >&2
-  case "$(uname -s)" in
-    Darwin)
-      if [ -d /Applications/Tailscale.app ]; then
-        echo "     Opening Tailscale.app — sign in there. (To opt out: AIRC_NO_TAILSCALE=1)" >&2
-        open -a Tailscale 2>/dev/null || true
-      else
-        echo "     Sign in:  tailscale up   (or set AIRC_NO_TAILSCALE=1 to opt out)" >&2
-      fi
-      ;;
-    *) echo "     Sign in:  tailscale up   (or set AIRC_NO_TAILSCALE=1 to opt out)" >&2 ;;
-  esac
+  echo "  ⚠  Tailscale is logged out. Running 'tailscale up' to start the auth flow —" >&2
+  echo "     click the URL it prints to authorize this device." >&2
+  echo "     (Opt out anytime: airc join --no-tailscale)" >&2
+  echo "" >&2
+  # Simple, cross-platform: run `tailscale up` synchronously. It prints
+  # the auth URL straight to the user's terminal (where they're looking)
+  # and blocks until the user authorizes via that URL. PS leaf does the
+  # same. No URL extraction, no bg jobs, no browser auto-launch. The
+  # `|| true` lets us continue if the user cancels (Ctrl-C); we just
+  # proceed without Tailscale, same-machine + same-LAN paths still work.
+  "$ts_bin" up || true
   echo "" >&2
   return 0
 }
