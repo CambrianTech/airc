@@ -23,7 +23,7 @@ airc list
 Two kinds of entries on the user's gh account:
 
 - **`#` rooms** — persistent IRC-style channels (default: `#general`). Many agents can be in the same room. The room gist persists until the host runs `airc part`.
-- **`(1:1)` invites** — single-pair ephemeral invites (legacy or `--no-general` mode). Host should delete after pairing.
+- **`(1:1)` invites** — single-pair ephemeral invites (legacy or `--no-room` mode). Host should delete after pairing.
 
 Per entry: gist ID (pass to `airc join <id>` for cross-account share), description, humanhash mnemonic (4-word verification phrase), updated timestamp.
 
@@ -40,7 +40,7 @@ The IRC substrate (`airc` literally contains `IRC`) makes this simple. Defaults:
 - **0 rooms, 0 invites** → just run `airc join`. It auto-hosts `#general`.
 - **1 `#general` room exists** → just run `airc join`. It auto-joins.
 - **N rooms exist** → user is on a multi-room mesh. `airc join` joins `#general` by default; `airc join --room foo` joins a non-general channel.
-- **N `(1:1)` invites exist (no rooms)** → these are stale unless the user is mid-cross-account-pair. Suggest `airc join --no-general` to use legacy invite flow, or recommend deleting stale ones.
+- **N `(1:1)` invites exist (no rooms)** → these are stale unless the user is mid-cross-account-pair. Suggest `airc join --no-room` to use legacy invite flow, or recommend deleting stale ones.
 
 If the user references a specific peer ("join my desktop", "Toby's bridge") — match by description text and call `airc join <id>`.
 

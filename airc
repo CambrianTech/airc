@@ -161,6 +161,50 @@ infer_default_room() {
   return 1
 }
 
+# Resolve the path to a working gh CLI binary across platforms.
+# Same shape as resolve_tailscale_bin (defined later) and same problem:
+# on Windows native + Git Bash, gh is installed via winget at
+# `C:\Program Files\GitHub CLI\gh.exe` but the path doesn't get
+# inherited into Git Bash's PATH. Without a fallback, airc skips its
+# gist substrate entirely, leaving the user stuck on legacy long-
+# invite-string flow with no auto-discovery. Issue #85.
+# Defined here (before script-init) so the PATH-fixup below can use it.
+resolve_gh_bin() {
+  if command -v gh >/dev/null 2>&1; then
+    echo "gh"
+    return 0
+  fi
+  if command -v gh.exe >/dev/null 2>&1; then
+    echo "gh.exe"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "/c/Program Files/GitHub CLI/gh.exe" \
+    "/mnt/c/Program Files/GitHub CLI/gh.exe" \
+    "/c/Program Files (x86)/GitHub CLI/gh.exe" \
+    "/usr/local/bin/gh" \
+    "/opt/homebrew/bin/gh"; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# gh PATH-fixup: if gh isn't on PATH but a fallback resolves it (e.g.
+# Git Bash on Windows where winget installed gh at a standard location
+# that PATH doesn't inherit), prepend its directory to PATH so every
+# subsequent `gh` invocation in this script finds it. Issue #85 — the
+# alternative was to wrap every gh callsite, which is ~20 places + ps1
+# parallel; PATH-prepend is a one-liner that fixes all of them.
+_gh_resolved=$(resolve_gh_bin 2>/dev/null || true)
+if [ -n "$_gh_resolved" ] && ! command -v gh >/dev/null 2>&1; then
+  export PATH="$(dirname "$_gh_resolved"):$PATH"
+fi
+unset _gh_resolved
+
 AIRC_WRITE_DIR="$(detect_scope)"
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
@@ -310,6 +354,12 @@ is_peer_offline_in_tailnet() {
   # user's time blocking on a predictable failure.
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 1
+  # Strip leading user@ if present — host_target is stored as `user@host`
+  # in config.json, but the CGNAT match below only recognizes strings
+  # starting with 100.x. Without this strip, every call from a resume
+  # path silently bypassed the CGNAT gate (issue #78 root cause, caught
+  # in PR #84 Copilot review).
+  target_host="${target_host##*@}"
   # CGNAT range only. LAN / DNS targets fall through to the normal path.
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
@@ -347,22 +397,44 @@ advise_tailscale_if_down() {
   [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 0
+  # Strip leading user@ if present — host_target from config.json is
+  # `user@host` form. Without this strip, every resume-path call
+  # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+  target_host="${target_host##*@}"
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
     *) return 0 ;;
   esac
 
-  # CLI present AND daemon up? fall through — if the SSH probe still
-  # fails it's a peer-offline problem, not a tailnet-down problem.
-  # resolve_tailscale_bin() handles Windows tailscale.exe + the macOS
-  # .app bundle path that PATH lookups miss.
+  # CLI present AND daemon up + logged in? fall through — if the SSH
+  # probe still fails it's a peer-offline problem, not a tailnet
+  # problem. resolve_tailscale_bin() handles Windows tailscale.exe +
+  # the macOS .app bundle path that PATH lookups miss.
   local ts_bin; ts_bin=$(resolve_tailscale_bin)
-  if [ -n "$ts_bin" ] && "$ts_bin" status >/dev/null 2>&1; then
-    return 0
+  local ts_status_out=""
+  local ts_status_rc=1
+  if [ -n "$ts_bin" ]; then
+    # `set -e` aborts on `out=$(...)` if the command exits non-zero.
+    # Logged-out tailscale exits 1 — exactly what we need to inspect.
+    # Wrap in if/else so set -e doesn't abort and rc is preserved.
+    if ts_status_out=$("$ts_bin" status 2>&1); then
+      ts_status_rc=0
+    else
+      ts_status_rc=$?
+    fi
+    if [ "$ts_status_rc" = "0" ]; then
+      # Status command succeeded — check whether we're actually
+      # connected. tailscale prints "Logged out." when the daemon is
+      # running but unauthenticated, with rc=0 on some versions.
+      case "$ts_status_out" in
+        *"Logged out"*|*"NeedsLogin"*) : ;;
+        *) return 0 ;;
+      esac
+    fi
   fi
 
   echo "" >&2
-  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale appears down on this machine." >&2
+  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale isn't ready on this machine." >&2
   echo "" >&2
   if [ -z "$ts_bin" ]; then
     echo "   Tailscale is not installed. airc needs it only for cross-machine mesh." >&2
@@ -375,9 +447,37 @@ advise_tailscale_if_down() {
     return 1
   fi
 
-  # CLI present, daemon down → platform-specific start instruction.
+  # CLI present. Distinguish daemon-down from logged-out — they need
+  # different fixes and used to print the same wrong message.
   local uname_s; uname_s=$(uname -s 2>/dev/null || echo "")
   local uname_r; uname_r=$(uname -r 2>/dev/null || echo "")
+
+  case "$ts_status_out" in
+    *"Logged out"*|*"NeedsLogin"*)
+      echo "   Tailscale is installed and running but you're not signed in." >&2
+      case "$uname_s" in
+        Darwin)
+          if [ -d /Applications/Tailscale.app ]; then
+            echo "   Opening Tailscale.app — sign in there, then re-run airc join." >&2
+            # Foreground the GUI app so the sign-in dialog is reachable.
+            # `open -a` is a no-op if the app is already up; harmless.
+            open -a Tailscale 2>/dev/null || true
+          else
+            echo "     tailscale up   # CLI prompts a sign-in URL" >&2
+          fi
+          ;;
+        Linux|MINGW*|MSYS*|CYGWIN*)
+          echo "     tailscale up   # follow the printed sign-in URL" >&2
+          ;;
+        *)
+          echo "     tailscale up" >&2
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+
+  # Status command failed AND output didn't say "logged out" → daemon down.
   echo "   Tailscale CLI is installed but the daemon is not running. Start it:" >&2
   case "$uname_s" in
     Darwin)
@@ -420,6 +520,213 @@ advise_tailscale_if_down() {
 }
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# tailscale_login_check_or_prompt: at the top of every cmd_connect, if
+# Tailscale is installed but the daemon reports Logged out / NeedsLogin,
+# tell the user + open the GUI sign-in (mac) / print 'tailscale up'
+# (linux/win). Non-fatal: returns 0 always. Same-machine + same-LAN
+# substrate paths still work without Tailscale; this prompt is for
+# the host-goal-is-mesh case Joel pointed at: "if you got it use it".
+#
+# Opt-out: AIRC_NO_TAILSCALE=1 (env var) — explicit user preference
+# for "I'm intentionally running without Tailscale; stop nagging."
+# Distinct from advise_tailscale_if_down which fires only on a
+# CGNAT-targeted SSH attempt; this one is the unconditional startup
+# nudge for both host and joiner roles.
+tailscale_login_check_or_prompt() {
+  [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
+  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  [ -z "$ts_bin" ] && return 0   # not installed; no nag (Tailscale truly optional)
+  # `set -e` at the top of airc aborts on a failed $() assignment.
+  # `tailscale status` exits 1 when logged out — exactly the case we
+  # WANT to detect. Trail with `|| true` so the rc doesn't kill us.
+  local out; out=$("$ts_bin" status 2>&1) || true
+  case "$out" in
+    *"Logged out"*|*"NeedsLogin"*) ;;
+    *) return 0 ;;
+  esac
+  echo "" >&2
+  echo "  ⚠  Tailscale is logged out. Running 'tailscale up' to start the auth flow —" >&2
+  echo "     click the URL it prints to authorize this device." >&2
+  echo "     (Opt out anytime: airc join --no-tailscale)" >&2
+  echo "" >&2
+  # Simple, cross-platform: run `tailscale up` synchronously. It prints
+  # the auth URL straight to the user's terminal (where they're looking)
+  # and blocks until the user authorizes via that URL. PS leaf does the
+  # same. No URL extraction, no bg jobs, no browser auto-launch. The
+  # `|| true` lets us continue if the user cancels (Ctrl-C); we just
+  # proceed without Tailscale, same-machine + same-LAN paths still work.
+  "$ts_bin" up || true
+  echo "" >&2
+  return 0
+}
+
+# host_machine_id: stable per-machine identifier. Same machine, two
+# terminals: same value. Different machines: different. Used by the
+# multi-address gist envelope so a same-machine joiner knows to dial
+# 127.0.0.1 regardless of what Tailscale/LAN addresses the host
+# advertised. Cached after first call.
+host_machine_id() {
+  if [ -n "${_AIRC_MACHINE_ID_CACHE:-}" ]; then
+    printf '%s\n' "$_AIRC_MACHINE_ID_CACHE"
+    return 0
+  fi
+  local id=""
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      id=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+           | awk -F'"' '/IOPlatformUUID/{print $4; exit}')
+      ;;
+    Linux)
+      [ -r /etc/machine-id ] && id=$(cat /etc/machine-id 2>/dev/null)
+      [ -z "$id" ] && [ -r /var/lib/dbus/machine-id ] && id=$(cat /var/lib/dbus/machine-id 2>/dev/null)
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      id=$(reg query 'HKLM\SOFTWARE\Microsoft\Cryptography' /v MachineGuid 2>/dev/null \
+           | awk '/MachineGuid/{print $NF}')
+      ;;
+  esac
+  [ -z "$id" ] && id=$(hostname 2>/dev/null || echo "unknown-machine")
+  _AIRC_MACHINE_ID_CACHE="$id"
+  printf '%s\n' "$id"
+}
+
+# host_address_set: enumerate this host's currently-usable addresses,
+# in priority order: localhost first (always present), then any LAN
+# interface with a non-loopback IP, then Tailscale (only if the daemon
+# is up AND signed in — Logged out / NeedsLogin produces no entry).
+# Output: one line per address, "scope|addr|port|subnet" tab-or-pipe
+# separated. Caller assembles into JSON.
+# port arg is the listen port to advertise.
+host_address_set() {
+  local port="${1:-7547}"
+
+  # localhost — always
+  printf 'localhost|127.0.0.1|%s|\n' "$port"
+
+  # LAN: enumerate interfaces, pick non-loopback IPv4s. macOS + Linux
+  # converge on `ifconfig`; we use that and reject loopback + CGNAT.
+  local lan_ips
+  lan_ips=$(ifconfig 2>/dev/null \
+            | awk '/inet /{print $2}' \
+            | grep -vE '^(127\.|169\.254\.)' \
+            | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+  if [ -n "$lan_ips" ]; then
+    printf '%s\n' "$lan_ips" | while read -r ip; do
+      [ -z "$ip" ] && continue
+      # /24 subnet from the IP — good-enough heuristic for "same LAN"
+      local subnet="${ip%.*}.0/24"
+      printf 'lan|%s|%s|%s\n' "$ip" "$port" "$subnet"
+    done
+  fi
+
+  # Tailscale: only emit when the daemon reports signed-in. AIRC_NO_TAILSCALE=1
+  # forces empty.
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      # set -e + non-zero exit on `tailscale status` (logged out) would
+      # abort. `|| true` is fine here — we only use the output.
+      local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
+      case "$ts_out" in
+        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
+        *)
+          # Pull our own Tailscale IP from `tailscale ip -4`. If that
+          # fails (older versions, weird state), parse from status.
+          local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null | head -1 | tr -d '\r\n ')
+          if [ -z "$ts_ip" ]; then
+            ts_ip=$(printf '%s' "$ts_out" | awk 'NR==1 && /^100\./{print $1; exit}')
+          fi
+          [ -n "$ts_ip" ] && printf 'tailscale|%s|%s|\n' "$ts_ip" "$port"
+          ;;
+      esac
+    fi
+  fi
+}
+
+# host_addresses_json: assemble host_address_set output into a JSON
+# array suitable for the gist envelope's host.addresses field. Args:
+# port. Output: JSON array string.
+host_addresses_json() {
+  local port="${1:-7547}"
+  local first=1
+  local out="["
+  while IFS='|' read -r scope addr p subnet; do
+    [ -z "$scope" ] && continue
+    if [ "$first" = "1" ]; then first=0; else out="${out},"; fi
+    if [ -n "$subnet" ]; then
+      out="${out}{\"scope\":\"${scope}\",\"addr\":\"${addr}\",\"port\":${p},\"subnet\":\"${subnet}\"}"
+    else
+      out="${out}{\"scope\":\"${scope}\",\"addr\":\"${addr}\",\"port\":${p}}"
+    fi
+  done < <(host_address_set "$port")
+  out="${out}]"
+  printf '%s' "$out"
+}
+
+# peer_pick_address: given the host's published addresses (JSON array)
+# and the host's machine_id, pick the cheapest reachable address for
+# THIS peer to dial. Output: "addr|port" on stdout, or empty if no
+# addresses available.
+#
+# Priority:
+#   1. host.machine_id == my host_machine_id → localhost entry
+#   2. any host.lan entry whose subnet contains any of my LAN IPs
+#   3. first host.tailscale entry (if I have a usable tailscale myself)
+#   4. first localhost entry (last-resort; only useful for same-machine)
+#   5. first entry of any kind (gives the joiner SOMETHING to try)
+peer_pick_address() {
+  local addresses_json="${1:-}" host_machine="${2:-}"
+  [ -z "$addresses_json" ] || [ "$addresses_json" = "null" ] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # Same machine: use localhost.
+  local my_machine; my_machine=$(host_machine_id)
+  if [ -n "$host_machine" ] && [ "$host_machine" = "$my_machine" ]; then
+    local pick; pick=$(printf '%s' "$addresses_json" \
+      | jq -r '.[] | select(.scope=="localhost") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+    if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
+  fi
+
+  # Same LAN: find a host.lan whose subnet contains one of MY LAN IPs.
+  # Use my own host_address_set output to get my LAN IPs.
+  local my_lan_ips
+  my_lan_ips=$(host_address_set 0 | awk -F'|' '$1=="lan"{print $2}')
+  if [ -n "$my_lan_ips" ]; then
+    local lan_entries
+    lan_entries=$(printf '%s' "$addresses_json" \
+      | jq -c '.[] | select(.scope=="lan")' 2>/dev/null)
+    if [ -n "$lan_entries" ]; then
+      while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        local subnet; subnet=$(printf '%s' "$entry" | jq -r '.subnet // empty' 2>/dev/null)
+        local addr; addr=$(printf '%s' "$entry" | jq -r '.addr' 2>/dev/null)
+        local port; port=$(printf '%s' "$entry" | jq -r '.port' 2>/dev/null)
+        # subnet is like "192.168.1.0/24" — match the /24 prefix against my IPs.
+        if [ -n "$subnet" ]; then
+          local prefix="${subnet%/*}"   # 192.168.1.0
+          prefix="${prefix%.*}."          # 192.168.1.
+          if printf '%s' "$my_lan_ips" | grep -qF "$prefix"; then
+            printf '%s|%s' "$addr" "$port"; return 0
+          fi
+        fi
+      done <<< "$lan_entries"
+    fi
+  fi
+
+  # Tailscale path: only attempt if I have a working tailscale of my own.
+  local i_have_ts; i_have_ts=$(host_address_set 0 | awk -F'|' '$1=="tailscale"{print; exit}')
+  if [ -n "$i_have_ts" ]; then
+    local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
+      | jq -r '.[] | select(.scope=="tailscale") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+    if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
+  fi
+
+  # Fallback: first entry of any kind. Useful when neither side has a
+  # clearly matching scope and we just want to try something.
+  printf '%s' "$addresses_json" \
+    | jq -r '.[0] | "\(.addr)|\(.port)"' 2>/dev/null
+}
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
 # Compresses N bytes of input into 4 words via XOR-folding, then maps each
@@ -484,6 +791,76 @@ remote_home() {
   h=$(get_config_val host_airc_home "")
   [ -z "$h" ] && h='$HOME/.airc'
   echo "$h"
+}
+
+# Spawn the #general sidecar (issue #121) — a parallel `airc connect`
+# in a sibling scope (.general suffix) so the primary tab is in BOTH
+# its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
+# ssh_key + peer records are per-scope. Each subscription gets its own
+# wire (the python formatter prefixes events with the scope's room_name,
+# so the user sees `[#useideem] X` and `[#general] Y` interleaved).
+#
+# Reads from cmd_connect's locals via bash's dynamic scoping:
+#   general_sidecar     1 = spawn, 0 = don't (--no-general / --room-only /
+#                       AIRC_GENERAL_SIDECAR=1 recursion guard already set it)
+#   room_name           skip if we ARE #general (avoid self-recursion)
+#   use_room            skip if legacy 1:1 invite mode (no substrate at all)
+#   AIRC_WRITE_DIR      primary scope dir; sidecar lives at ${this}.general
+#
+# Side effect: appends sidecar bash PID to primary's airc.pid so
+# cmd_teardown's process-tree walker reaps it. cmd_teardown also has
+# explicit sidecar-scope cleanup (gist + sidecar's own pidfile).
+spawn_general_sidecar_if_wanted() {
+  [ "$general_sidecar" = "1" ] || return 0
+  [ "$room_name" = "general" ] && return 0
+  [ "$use_room" = "1" ] || return 0
+
+  local _primary_scope="$AIRC_WRITE_DIR"
+  local _primary_name; _primary_name=$(get_name 2>/dev/null || echo "")
+  local _sidecar_scope="${_primary_scope}.general"
+
+  echo "  Sidecar: also subscribing to #general (--no-general to opt out)"
+
+  mkdir -p "$_sidecar_scope"
+
+  # Background subprocess. Inherits stdout from primary so its monitor
+  # events stream alongside primary's, naturally distinguished by the
+  # formatter's `[#room]` prefix. AIRC_GENERAL_SIDECAR=1 is the recursion
+  # guard the sidecar reads at the top of cmd_connect to avoid spawning
+  # ITS OWN sidecar (turtles all the way down).
+  # Explicit `--room general` is critical: without it, auto-scope from
+  # cwd's git remote would resolve to the SAME project room as primary
+  # (cwd is shared across the spawn), and we'd end up double-subscribed
+  # to one room instead of subscribed to two. AIRC_NO_AUTO_ROOM=1 is
+  # belt-and-suspenders — auto-scope is gated by --room not being
+  # explicit; --room general makes it explicit, but the env var
+  # documents intent.
+  #
+  # `env` invocation (not bash assignment-prefixes): bash parameter
+  # expansion `${foo:+VAR=val}` doesn't get treated as an assignment
+  # prefix because it's expanded after tokenization — bash sees
+  # `AIRC_NAME=alpha` as a command in that position, not an env var,
+  # and dies with "command not found". `env` always treats its args
+  # as VAR=val pairs. Caught the hard way by the first run of this
+  # helper on 2026-04-26.
+  local _env_args=(AIRC_HOME="$_sidecar_scope" AIRC_GENERAL_SIDECAR=1 AIRC_NO_AUTO_ROOM=1)
+  [ -n "$_primary_name" ] && _env_args+=("AIRC_NAME=$_primary_name")
+  # Unset primary's AIRC_PORT so sidecar doesn't fight for the same port —
+  # primary has it bound already, sidecar's auto-bump-loop would land on
+  # +1, but better to start the sidecar from the canonical default and
+  # let it find its own free port without the conflict-detect dance.
+  ( env -u AIRC_PORT "${_env_args[@]}" "$0" connect --room general ) &
+  local _sidecar_pid=$!
+
+  # Sidecar's own scope writes its own airc.pid for its bash + descendants.
+  # cmd_teardown walks $AIRC_WRITE_DIR.general/airc.pid explicitly to kill
+  # the sidecar tree, so we DON'T append the sidecar bash PID to the
+  # primary's airc.pid. Earlier (PR #122) we did — but that broke
+  # cmd_part, which walks the same primary pidfile and ends up killing
+  # the sidecar too even though IRC semantics say `/part` should leave
+  # only the current channel and keep others (e.g. #general) alive.
+  # Pidfiles per scope; cmd_teardown is the only path that walks both.
+  :
 }
 
 # Resolve this session's peer name.
@@ -1068,17 +1445,37 @@ cmd_connect() {
   # falls through to long-invite-only when gh is missing or unauthed, so
   # the host command never fails just because GitHub isn't reachable.
   #
-  # Issue #39 — IRC-style rooms (aIRC, get it):
-  #   --room <name>       : join (or host) a named room (default: 'general')
-  #   --no-general        : skip the auto-#general default (host an unnamed
-  #                         single-pair invite, today's invite-only flow)
-  #   --no-room           : alias for --no-general (kept for symmetry)
-  # Default behavior: every `airc connect` joins '#general' on the gh account.
-  # First in hosts, rest auto-join. Matches IRC's "everyone's in the lobby."
+  # Room flags (issue #39 + #121):
+  #   --room <name>       : join (or host) a named room (default: auto-scope
+  #                         from git org, falling back to 'general')
+  #   --no-room           : disable the substrate entirely; legacy 1:1
+  #                         invite-string flow (use_room=0). Inherits #38
+  #                         single-pair behavior. Aliased --no-general was
+  #                         removed for this — those have different meanings.
+  #   --no-general        : keep the project room, but DON'T also subscribe
+  #                         to the #general lobby. Project-only focus mode.
+  #                         (NEW; previously this was an alias for --no-room.)
+  #   --room-only <name>  : explicit project room + no general sidecar.
+  #                         Equivalent to `--room <name> --no-general`.
+  #
+  # Default behavior (issue #121): every `airc join` lands in BOTH the
+  # auto-scoped project room AND #general. The general sidecar runs in a
+  # sibling scope (.general suffix) under the same visible identity, so
+  # AIs cross-pollinate between projects via the lobby while keeping
+  # focused work in their project room. Set AIRC_GENERAL_SIDECAR=1 to
+  # signal "this IS the sidecar, don't recurse" — internal-only.
   local use_gist=1   # default ON; runtime probe later checks gh availability
   local room_name="general"
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
+  local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
+  # Recursion guard: when WE are the sidecar (spawned by another airc
+  # connect), don't spawn our own sidecar. Otherwise: turtles all the way.
+  [ "${AIRC_GENERAL_SIDECAR:-0}" = "1" ] && general_sidecar=0
+  # User-facing env opt-out, equivalent to --no-general flag. Useful
+  # for test harnesses that don't care about sidecar behavior, and
+  # for one-off scoped scripts that want to set it once and forget.
+  [ "${AIRC_NO_GENERAL:-0}" = "1" ] && general_sidecar=0
   # Declared at function scope so set -u doesn't bite when JOIN MODE runs
   # without a prior gist parser (inline-invite path skips the parser
   # entirely; resolved_room_name only gets a value when we resolved a
@@ -1090,24 +1487,79 @@ cmd_connect() {
   # (sleep/crash/network), the joiner deletes the stale gist and re-execs
   # itself in host mode — first-agent-back-in becomes the new host.
   local _resolved_gist_id=""
+  # Heartbeat freshness vars - parsed by gist resolver in the room
+  # case-arm. Must be defaulted here so the JOIN MODE early-takeover
+  # check (which runs unconditionally if a target has '@') doesn't trip
+  # 'unbound variable' when target came in inline (no gist resolved).
+  local _resolved_heartbeat_stale=0
+  local _resolved_heartbeat_age=""
+  # Multi-address fields parsed from host.addresses[] in the room
+  # gist envelope. _resolved_addresses_json is the raw JSON array
+  # (or empty if the host published a legacy envelope with only
+  # host.address/host.port). _resolved_host_machine_id lets the
+  # joiner detect "we're on the same machine" and dial 127.0.0.1.
+  local _resolved_addresses_json=""
+  local _resolved_host_machine_id=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
       --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
-      --no-general|-no-general|--no-room|-no-room) use_room=0; shift ;;
+      --no-room|-no-room) use_room=0; shift ;;
+      --no-general|-no-general)
+        # NEW semantic (issue #121): keep the project room substrate,
+        # just don't ALSO subscribe to the #general lobby sidecar. This
+        # used to alias --no-room (disable substrate entirely); the
+        # behaviors are now distinct because dual-room presence is
+        # default and users need a way to opt out of just the lobby
+        # part without dropping back to legacy 1:1 invites.
+        general_sidecar=0; shift ;;
+      --room-only|-room-only)
+        # Combo: explicit project room + skip general sidecar. For
+        # focused work where lobby noise would distract.
+        room_name="${2:-general}"; use_room=1; room_explicit=1; general_sidecar=0
+        shift 2 ;;
+      --no-tailscale|-no-tailscale)
+        # Opt out of Tailscale entirely: skips the login prompt AND
+        # drops the tailscale entry from host_address_set so the
+        # gist envelope advertises only localhost+LAN. The flag is
+        # the primary user-facing API; AIRC_NO_TAILSCALE=1 stays as
+        # an internal toggle for code that already reads it.
+        export AIRC_NO_TAILSCALE=1
+        shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
-  # Auto-scope: when --room wasn't explicit, derive default from git
-  # remote org (cross-machine-stable) or parent dir (local fallback).
-  # See infer_default_room() for the rationale — zero-config project
-  # separation: cd into any useideem repo → #useideem, any cambriantech
-  # repo → #cambriantech, regardless of local path. Falls back to
-  # #general when neither signal fires. Opt out: AIRC_NO_AUTO_ROOM=1.
+  # Tailscale-installed-but-logged-out nudge. Runs AFTER flag parsing
+  # so --no-tailscale takes effect. Default behavior: if Tailscale is
+  # installed, "just works" — prompt the user to sign in (Mac: opens
+  # Tailscale.app). The 90% case is "I have it and want it on";
+  # --no-tailscale is the explicit opt-out for the few who don't.
+  tailscale_login_check_or_prompt
+
+  # `airc join` (no args) auto-scopes to the room matching the current cwd.
+  # Resolution: git remote org first ('useideem/authenticator' → #useideem),
+  # parent-dir basename second (local-only repos). Falls back to #general
+  # only when neither signal fires (non-git dir, no remote). The skill
+  # /join contract documents this as the default.
+  #
+  # The trade-off: two tabs in DIFFERENT projects on the same gh account
+  # land in different rooms (a #cambriantech tab can't see a #useideem
+  # tab). That's intentional — project work shouldn't mix with unrelated
+  # project chatter. Cross-project agents who need a shared lobby:
+  # `AIRC_NO_AUTO_ROOM=1 airc join` or `airc join --room general`.
+  #
+  # Two tabs in the SAME project converge automatically: both useideem
+  # tabs auto-scope to #useideem, both find each other. That's the case
+  # this default optimizes for.
+  #
+  # History: this was rolled back in PR #104 over the cross-project
+  # concern, then re-enabled here after dogfooding showed the converse
+  # bug (two same-project tabs both defaulting to #general and never
+  # converging on the project room) was the more painful failure mode.
   if [ "$use_room" = "1" ] && [ "$room_explicit" = "0" ] \
      && [ "${AIRC_NO_AUTO_ROOM:-0}" != "1" ]; then
     local _inferred
@@ -1228,6 +1680,28 @@ cmd_connect() {
   if [ -z "$target" ] && [ -f "$CONFIG" ]; then
     local prior_host_target; prior_host_target=$(get_config_val host_target "")
     if [ -n "$prior_host_target" ]; then
+      # Explicit --room with a different saved room must not silently resume
+      # the saved pairing. Symptom (pre-fix): user runs `airc join --room foo`
+      # after having paired into #bar; resume blindly reconnects to #bar's
+      # host and the --room flag is ignored without a peep. The user has to
+      # `airc teardown --flush` before the explicit flag takes effect, which
+      # is a hidden footgun.
+      #
+      # Fix: when --room is explicit AND a saved room_name file says we were
+      # in a different room, skip resume and fall through to discovery for
+      # the requested room. Identity persists, no flush needed.
+      if [ "$room_explicit" = "1" ]; then
+        local _saved_room_check=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_check=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$_saved_room_check" ] && [ "$_saved_room_check" != "$room_name" ]; then
+          echo "  Saved pairing was for #${_saved_room_check}; --room #${room_name} requested → discarding stale pairing."
+          rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
+          # Skip the resume block entirely and let discovery run below.
+          prior_host_target=""
+        fi
+      fi
+    fi
+    if [ -n "$prior_host_target" ]; then
       local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
       echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
 
@@ -1240,6 +1714,83 @@ cmd_connect() {
       # and re-run. No install, no sudo, no prompt — just instruct + exit.
       if ! advise_tailscale_if_down "$prior_host_target"; then
         die "Re-run airc join after starting Tailscale."
+      fi
+
+      # Stale-pairing detect (#83): if we resolved into the room via a
+      # gist (joiner-side gist_id was cached at pair time) and that gist
+      # is now gone or replaced, the room dissolved or got rehosted —
+      # the cached host_target is stale even if TCP would still answer.
+      # Catch this BEFORE SSH probe so we self-heal cleanly instead of
+      # silently re-pairing against a dead-but-reachable host or
+      # accidentally landing in a different room.
+      #
+      # Two safety guards (Copilot caught both on PR #92 review):
+      # (a) Confirm gh is healthy first. Auth issues, missing scope,
+      #     rate limits, transient network all return non-zero from
+      #     `gh api gists/<id>` — treating those as "gist deleted"
+      #     would spuriously wipe joiner state on every flaky network
+      #     blip. Only act when we got an authoritative 404.
+      # (b) Capture the preserved name BEFORE deleting CONFIG; otherwise
+      #     get_name reads the now-deleted file and falls back to
+      #     "unknown", changing peer identity on re-exec.
+      local _saved_gist_id=""
+      [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _saved_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
+      local _saved_room_resume=""
+      [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_resume=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+      if [ -n "$_saved_gist_id" ] && command -v gh >/dev/null 2>&1; then
+        # Two-step gh-health gate. Both required before treating any 404
+        # as authoritative gist-deletion (else a scope-less token's auth
+        # error gets mis-classified):
+        #   (a) gh auth status passes (token is valid)
+        #   (b) gh has gist scope (matching the doctor --connect chain)
+        # Without (b), gist API calls return 401/403/404 depending on
+        # token state — could spuriously trigger teardown.
+        local _gh_healthy=0
+        if gh auth status >/dev/null 2>&1 \
+           && gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+          _gh_healthy=1
+        fi
+        if [ "$_gh_healthy" = "1" ]; then
+          # Capture stderr for 404-vs-other classification. stdout is
+          # redirected to /dev/null so gh's normal output doesn't pollute
+          # our terminal regardless of outcome.
+          #
+          # CRITICAL: pre-declare _gist_probe_rc and use `|| _gist_probe_rc=$?`
+          # so `set -euo pipefail` does NOT abort the script when gh api
+          # returns non-zero. A 404 is the EXPECTED signal that the host
+          # teardown'd and deleted the gist — the whole reason this block
+          # exists. Without the `|| ...` guard, set -e fires on the very
+          # signal we're trying to detect, exiting silently before the
+          # classification logic below can run. Spent a session of "vhsm
+          # tab silently exits 1 on resume after host re-host" on
+          # 2026-04-26 chasing this. (Issue #118.)
+          local _gist_probe_err; _gist_probe_err=$(mktemp -t airc-gist-probe.XXXXXX)
+          local _gist_probe_rc=0
+          gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err" || _gist_probe_rc=$?
+          local _gist_probe_stderr; _gist_probe_stderr=$(cat "$_gist_probe_err" 2>/dev/null)
+          rm -f "$_gist_probe_err"
+          # 404 (gist gone) shows as "Not Found" or "404" in gh's stderr.
+          # Other failures (rate limit "API rate limit", auth "401",
+          # network "could not resolve") are explicitly NOT treated as
+          # gist-deleted.
+          if [ "$_gist_probe_rc" -ne 0 ] && echo "$_gist_probe_stderr" | grep -qiE '404|not found'; then
+            local _preserved_name; _preserved_name=$(get_name 2>/dev/null || echo "")
+            echo ""
+            echo "  ⚠  Saved room gist ($_saved_gist_id) no longer on your gh — room dissolved or rehosted."
+            if [ -n "$_saved_room_resume" ]; then
+              echo "  Re-discovering #${_saved_room_resume} via fresh gist lookup..."
+            else
+              echo "  Re-pairing via fresh discovery..."
+            fi
+            # Wipe stale joiner state. Identity + peer records persist.
+            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_gist_id"
+            if [ -n "$_saved_room_resume" ]; then
+              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$_saved_room_resume"
+            else
+              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect
+            fi
+          fi
+        fi
       fi
 
       # Auth probe BEFORE committing to the monitor loop. Prior behavior
@@ -1261,6 +1812,41 @@ cmd_connect() {
         # Auth failure → re-pair needed. Network failure → fall through,
         # monitor's retry loop handles transient outages correctly.
         if echo "$probe_stderr" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
+          # Stale auth = saved pairing is dead from our side (host wiped
+          # our key, host machine reinstalled, or host_keys rotated). For
+          # room-mode pairings this is the same end-state as the host
+          # going unreachable: the saved pair is junk. If we have a
+          # saved room_name AND gh is available, fall through to fresh
+          # discovery — the room may have been re-hosted by another
+          # peer, or we'll become the new host. Identity persists, so
+          # re-pair is automatic.
+          #
+          # Without this self-heal the user had to manually run
+          # `airc teardown --flush` and paste an invite — exactly the
+          # toil airc's auto-discovery is supposed to eliminate. Hit
+          # twice in one session on 2026-04-26 (vhsm-2c84 dead host +
+          # regenerated key), which is what motivated this change.
+          local _saved_auth_room=""
+          [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_auth_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+          if [ -n "$_saved_auth_room" ] && command -v gh >/dev/null 2>&1; then
+            echo ""
+            echo "  ⚠  SSH auth to host FAILED on resume — saved pairing for #${_saved_auth_room} is stale." >&2
+            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — host rotated keys or reinstalled)" >&2
+            echo "  Self-healing: discarding stale pairing and re-discovering #${_saved_auth_room}..."
+            local _preserved_name_a; _preserved_name_a=$(get_config_val name "")
+            # Wipe joiner state but leave identity (ssh_key) and peer
+            # records intact — they'll be re-validated by the fresh
+            # handshake. room_name is wiped here and re-set after
+            # discovery succeeds, just like the non-auth self-heal does.
+            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
+            echo ""
+            exec env ${_preserved_name_a:+AIRC_NAME="$_preserved_name_a"} "$0" connect --room "$_saved_auth_room"
+          fi
+          # No saved room (legacy 1:1 invite scope) OR no gh: keep the
+          # explicit-die behavior. There's nothing to fall through to —
+          # discovery requires gh, and a 1:1 invite has no room to
+          # rejoin. The user genuinely needs to re-pair via the invite
+          # string.
           echo "  SSH auth to host FAILED on resume. Saved pairing is stale." >&2
           echo "  SSH stderr: ${probe_stderr}" >&2
           echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
@@ -1324,6 +1910,21 @@ cmd_connect() {
         fi
       else
         rm -f "$probe_err"
+        # Resume probe succeeded — confirm visibly that we're paired and
+        # entering the monitor loop. Without this the user sees only
+        # "Resuming as joiner of..." and then silence, which (per the
+        # "never swallow errors" rule) has the same evidence-eating
+        # shape as silent failure — they can't tell whether SSH worked
+        # or the script wedged. Fresh-pair prints "Connected to ..."
+        # at line ~2469; resume must too. Caught 2026-04-26 by
+        # vhsm-Claude observing through the substrate.
+        local _resume_room=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && _resume_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$_resume_room" ]; then
+          echo "  Resumed as joiner of '$prior_name' in #${_resume_room} (SSH verified)"
+        else
+          echo "  Resumed as joiner of '$prior_name' (SSH verified)"
+        fi
       fi
 
       echo $$ > "$AIRC_WRITE_DIR/airc.pid"
@@ -1331,6 +1932,7 @@ cmd_connect() {
         rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
         for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
       ' EXIT INT TERM
+      spawn_general_sidecar_if_wanted
       monitor
       return
     fi
@@ -1388,9 +1990,10 @@ cmd_connect() {
         # fall through to gist resolver below — kind:room → invite handshake
       else
         echo "  No #${room_name} found on your gh account → becoming the host."
-        # fall through to host mode below; cmd_connect's host path will
-        # publish a kind:room gist instead of kind:invite (see use_room
-        # check at gist push).
+        # Race against a concurrent host attempt is handled POST-publish
+        # (see "race-loser detection" near host_gist_id write below).
+        # Pre-publish recheck doesn't help — neither tab's gist is
+        # globally visible yet at this point.
       fi
     fi
 
@@ -1534,6 +2137,9 @@ cmd_connect() {
       # Try parse as airc JSON envelope first. If it parses + has airc
       # field, dispatch on `kind`. Otherwise, treat raw_content as the
       # legacy raw-invite-string format (backward compat).
+      # _resolved_heartbeat_stale + _resolved_heartbeat_age are declared
+      # at function-scope above so the JOIN MODE check sees them on the
+      # inline-invite path too (where this gist block doesn't run).
       local resolved=""
       if command -v jq >/dev/null 2>&1; then
         local airc_ver kind
@@ -1556,6 +2162,43 @@ cmd_connect() {
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.name // empty' 2>/dev/null)
+              # Multi-address: capture host.addresses[] + host.machine_id
+              # for the joiner's address-picker (peer_pick_address). Empty
+              # if the host published a pre-multi-address envelope; in
+              # that case JOIN MODE falls back to the parsed-from-invite
+              # host:port (legacy single-address path).
+              _resolved_addresses_json=$(printf '%s' "$raw_content" | jq -c '.host.addresses // empty' 2>/dev/null)
+              _resolved_host_machine_id=$(printf '%s' "$raw_content" | jq -r '.host.machine_id // empty' 2>/dev/null)
+
+              # Heartbeat freshness check — the structural fix for
+              # orphan-gist class. Hosts update last_heartbeat every
+              # AIRC_HEARTBEAT_SEC (default 30s); if it's older than
+              # AIRC_HEARTBEAT_STALE (default 90s = 3 missed beats),
+              # the host is dead. We short-circuit the SSH attempt and
+              # take over directly — no minute-long timeout, no peer
+              # confusion about "is this thing on?". Pre-heartbeat
+              # gists (no field) are treated as fresh for backward
+              # compat; their hosts will get caught by the existing
+              # SSH-failure self-heal path at line ~1850.
+              local _hb_iso _hb_ts _now_ts _hb_stale_sec
+              _hb_iso=$(printf '%s' "$raw_content" | jq -r '.last_heartbeat // empty' 2>/dev/null)
+              _hb_stale_sec="${AIRC_HEARTBEAT_STALE:-90}"
+              if [ -n "$_hb_iso" ]; then
+                # Convert ISO-8601 UTC to epoch. GNU date and BSD date
+                # have incompatible flags; try GNU first (linux + git-bash),
+                # fall back to BSD (mac default). If both fail (busybox?),
+                # skip the check rather than mis-classify.
+                _hb_ts=$(date -u -d "$_hb_iso" +%s 2>/dev/null \
+                         || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$_hb_iso" +%s 2>/dev/null \
+                         || echo "")
+                if [ -n "$_hb_ts" ]; then
+                  _now_ts=$(date -u +%s)
+                  _resolved_heartbeat_age=$(( _now_ts - _hb_ts ))
+                  if [ "$_resolved_heartbeat_age" -gt "$_hb_stale_sec" ]; then
+                    _resolved_heartbeat_stale=1
+                  fi
+                fi
+              fi
               ;;
             "")
               die "Gist has airc envelope (v$airc_ver) but no 'kind' field — malformed."
@@ -1583,6 +2226,58 @@ cmd_connect() {
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
+
+    # Stale-heartbeat fast-path takeover. If the gist we resolved had a
+    # last_heartbeat older than AIRC_HEARTBEAT_STALE (parsed above), the
+    # host is dead. Skip the SSH attempt entirely — no minute-long TCP
+    # timeout, no peer wondering "is this thing on" — go straight to
+    # take-over. Same operations as the SSH-failure self-heal at the
+    # bottom of JOIN MODE (delete stale gist, re-exec as host with
+    # AIRC_NO_DISCOVERY=1) but triggered from positive evidence (stale
+    # presence signal) rather than negative evidence (TCP timeout).
+    #
+    # Backward compat: pre-heartbeat gists have no last_heartbeat field,
+    # _resolved_heartbeat_stale stays 0, this block is a no-op, and the
+    # SSH-failure self-heal still catches the dead host (slower, but
+    # correct).
+    if [ "$_resolved_heartbeat_stale" = "1" ] && [ -n "$resolved_room_name" ] \
+       && [ -n "$_resolved_gist_id" ] && command -v gh >/dev/null 2>&1; then
+      echo ""
+      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over..."
+      echo "     (prior host's gist: $_resolved_gist_id)"
+
+      # Same race-loser detection as the SSH-failure self-heal path
+      # below. Two tabs concurrently deciding "host is stale" both
+      # delete + publish, end up with split-brain — caught only by
+      # running two tabs together.
+      local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
+      sleep "$_race_jitter_s"
+
+      if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
+        echo "  ✓ Stale gist removed."
+      else
+        echo "  ⚠  Stale gist already gone — another tab may have taken over first."
+      fi
+
+      local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
+        | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
+            '$2 ~ re && $1 != skip { print $1; exit }')
+
+      local _preserved_name; _preserved_name=$(get_config_val name "")
+      rm -f "$CONFIG"
+      rm -f "$AIRC_WRITE_DIR/room_name"
+
+      if [ -n "$_new_picked" ]; then
+        echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
+        echo ""
+        exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+      fi
+
+      echo "  Re-execing into host mode for #${resolved_room_name}..."
+      echo ""
+      exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
+    fi
+
     # Parse name@user@host[:port]#pubkey
     local host_ssh_pubkey_b64=""
     if echo "$target" | grep -q '#'; then
@@ -1600,6 +2295,27 @@ cmd_connect() {
     fi
 
     [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc connect name@user@host"
+
+    # Multi-address override: if the gist envelope carried host.addresses[]
+    # and host.machine_id, use peer_pick_address to choose the cheapest
+    # reachable scope (same-machine localhost > same-LAN > tailscale).
+    # This is what makes Tailscale truly optional — same-machine and
+    # same-LAN peers connect via 127.0.0.1 / LAN IP regardless of the
+    # invite string's host:port (which historically advertised one IP).
+    if [ -n "$_resolved_addresses_json" ] && [ "$_resolved_addresses_json" != "null" ]; then
+      local _picked; _picked=$(peer_pick_address "$_resolved_addresses_json" "$_resolved_host_machine_id")
+      if [ -n "$_picked" ]; then
+        local _picked_addr="${_picked%|*}"
+        local _picked_port="${_picked#*|}"
+        # Reconstruct ssh_target with the user@addr form. Original
+        # ssh_target was user@invite-string-host; preserve the user.
+        local _ssh_user="${ssh_target%@*}"
+        if [ "$_ssh_user" = "$ssh_target" ]; then _ssh_user=""; fi
+        ssh_target="${_ssh_user:+${_ssh_user}@}${_picked_addr}"
+        peer_port="$_picked_port"
+        echo "  ✓ Multi-address pick: ${_picked_addr}:${_picked_port} (from host.addresses)"
+      fi
+    fi
 
     local my_name
     my_name=$(resolve_name)
@@ -1648,6 +2364,19 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 
     # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
+
+    # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
+    # Resume path (line ~1241) already calls advise_tailscale_if_down, but
+    # that gate doesn't cover (a) cold-start `airc join <invite>` from a
+    # fresh scope or (b) the gist-discovery resolution that lands here
+    # with a tailnet host_target. Without this check, a logged-out
+    # Tailscale produced a silent unreachable-host + self-heal cascade
+    # (issue #78, Memento's case 2026-04-25). Same call site shape as the
+    # resume path: detect-and-instruct, do not auto-tailscale-up.
+    if ! advise_tailscale_if_down "$peer_host_only"; then
+      die "Re-run airc join after starting Tailscale."
+    fi
+
     echo "  Connecting to $peer_host_only:$peer_port..."
     local my_ssh_pub my_sign_pub
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
@@ -1718,25 +2447,49 @@ print(data.decode().strip())
         echo ""
         echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
         echo "     (prior host's gist: $_resolved_gist_id)"
+
+        # Jittered backoff before takeover. Without this, two tabs that
+        # hit the same dead gist concurrently both delete + publish
+        # within the same gh API window and you end up with two
+        # competing gists for the same room name (split-brain race —
+        # caught only by running two tabs against a stale gist
+        # simultaneously, NOT by the integration test).
+        local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
+        sleep "$_race_jitter_s"
+
         if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
           echo "  ✓ Stale gist removed."
         else
-          echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
-          echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+          echo "  ⚠  Stale gist already gone — another tab may have taken over first."
         fi
-        # Preserve identity name across re-exec (same reason as the resume
-        # path's self-heal — without this, derive_name re-runs from cwd
-        # and can drift on case-aliasing, peers see a "new" peer).
+
+        # Race-loser detection: re-scan for any OTHER fresh gist with
+        # this room name. If a concurrent self-heal already published
+        # one, JOIN their fresh gist instead of publishing a duplicate.
+        local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
+          | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
+              '$2 ~ re && $1 != skip { print $1; exit }')
+
+        # Preserve identity name across re-exec (same reason as resume
+        # path: derive_name re-runs from cwd and can drift on case-
+        # aliasing, peers see a "new" peer).
         local _preserved_name; _preserved_name=$(get_config_val name "")
-        # Wipe the CONFIG we just wrote — it points at the dead host and
-        # would trigger 'resume joiner' on next airc connect, looping back
-        # into this same failure.
+        # Wipe the CONFIG we just wrote — it points at the dead host
+        # and would trigger 'resume joiner' on next airc connect.
         rm -f "$CONFIG"
         rm -f "$AIRC_WRITE_DIR/room_name"
+
+        if [ -n "$_new_picked" ]; then
+          echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
+          echo ""
+          # Re-exec as joiner pointing at the winner's gist.
+          exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+        fi
+
         echo "  Re-execing into host mode for #${resolved_room_name}..."
         echo ""
-        # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
-        # ensures the new instance doesn't try to re-discover the just-deleted gist
+        # exec replaces the current bash process. AIRC_NO_DISCOVERY=1
+        # prevents the new instance from re-finding the just-deleted gist
         # (gh's gist-list cache might still show it for a few seconds).
         exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
       fi
@@ -1801,6 +2554,14 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
 
+    # If we resolved this pair via gist discovery (vs. inline-invite),
+    # persist the gist id so resume-time freshness checks can detect a
+    # gist-deletion / replacement before re-pairing against a stale host
+    # (issue #83). Cleared by cmd_part on graceful leave.
+    if [ -n "$_resolved_gist_id" ]; then
+      echo "$_resolved_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+    fi
+
     # Persist host details in own config so `airc invite` can reconstruct
     # the join string for onward sharing without a fresh handshake. Also
     # cache the host's identity blob from the handshake response so
@@ -1848,6 +2609,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
       for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
     ' EXIT INT TERM
 
+    spawn_general_sidecar_if_wanted
     echo "  Monitoring for messages..."
     monitor
 
@@ -1931,7 +2693,8 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     # substrate framing took effect — emit unconditionally for room mode.
     if [ "$use_room" = "1" ]; then
       echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
-      echo "  Hosting #${room_name} (gh-account substrate)."
+      echo "  Hosting #${room_name} — no existing room on your gh account, fresh start."
+      echo "  Other agents on your gh account who run 'airc join' will auto-join."
     fi
 
     # ── Gist transport (--gist flag, issue #37) ────────────────────
@@ -1969,6 +2732,22 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
           # gist lifecycle + envelope kind differ.
           _gist_kind="room"
           _gist_desc="airc room: ${room_name}"
+          # last_heartbeat: host's presence signal, refreshed every
+          # AIRC_HEARTBEAT_SEC (default 30s) by the bg loop spawned
+          # below. Joiners detect stale → take over deterministically.
+          #
+          # machine_id + host.addresses[]: multi-address redundancy.
+          # Same machine, two tabs → joiner sees machine_id match,
+          # uses 127.0.0.1 regardless of network state. Same LAN →
+          # joiner picks the LAN entry. Tailscale → joiner picks
+          # tailscale ONLY when nothing closer works AND the host is
+          # actually signed in (host_address_set drops tailscale from
+          # the list when not authed). Tailscale becomes truly
+          # optional: if it's down or you're logged out, the gist's
+          # localhost+LAN entries still let same-machine and
+          # same-LAN peers connect.
+          local _addrs_json; _addrs_json=$(host_addresses_json "$host_port")
+          local _machine_id; _machine_id=$(host_machine_id)
           _gist_payload=$(cat <<JSON
 {
   "airc": 1,
@@ -1979,11 +2758,14 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
   "host": {
     "name": "$name",
     "user": "$user",
+    "machine_id": "${_machine_id}",
     "address": "$host",
-    "port": $host_port
+    "port": $host_port,
+    "addresses": ${_addrs_json}
   },
   "created": "$_now",
-  "updated": "$_now"
+  "updated": "$_now",
+  "last_heartbeat": "$_now"
 }
 JSON
 )
@@ -2024,6 +2806,120 @@ JSON
           if [ "$_gist_kind" = "room" ]; then
             echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
             echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+
+            # Heartbeat loop: keep last_heartbeat fresh in the gist so
+            # joiners can deterministically detect a dead host. Without
+            # this, a host that dies ungracefully (sleep, kill -9, OOM,
+            # crashed bash) leaves a gist pointing at a corpse forever.
+            # Every messy state cascade today (memento, my own
+            # bash-bg-and-die orphan, the manual gist-delete I had to
+            # run by hand) traces to this missing presence signal.
+            #
+            # Loop runs every AIRC_HEARTBEAT_SEC (default 30s) and dies
+            # automatically when its parent (the host airc connect bash)
+            # exits — so kill -9 on the host stops heartbeats within one
+            # interval. Joiners treat last_heartbeat older than
+            # AIRC_HEARTBEAT_STALE (default 90s = 3 missed beats) as
+            # stale and self-heal as new host.
+            local _heartbeat_sec="${AIRC_HEARTBEAT_SEC:-30}"
+            local _hb_parent_pid=$$
+            local _hb_invite="$_invite_long"
+            local _hb_name="$name"
+            local _hb_user="$user"
+            local _hb_host="$host"
+            local _hb_port="$host_port"
+            local _hb_room="$room_name"
+            local _hb_created="$_now"
+            local _hb_machine_id="$_machine_id"
+            (
+              # Detach from job control so a parent SIGINT kills the
+              # whole tree but normal exit lets us race the trap to
+              # delete the gist first.
+              while sleep "$_heartbeat_sec"; do
+                # Parent died (PID gone) → exit. This is the kill -9
+                # / OOM / sleep recovery path.
+                if ! kill -0 "$_hb_parent_pid" 2>/dev/null; then
+                  exit 0
+                fi
+                local _hb_now; _hb_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                # Refresh addresses each tick. Captures network changes
+                # mid-session: laptop moves to a different LAN, Tailscale
+                # comes up / goes down / re-auths, interface flapping.
+                # The next gist write reflects current reachability;
+                # joiners that lose connection re-discover and try the
+                # new address set.
+                local _hb_addrs; _hb_addrs=$(host_addresses_json "${_hb_port}")
+                local _hb_payload; _hb_payload=$(cat <<JSON
+{
+  "airc": 1,
+  "kind": "room",
+  "name": "${_hb_room}",
+  "topic": "",
+  "invite": "${_hb_invite}",
+  "host": {
+    "name": "${_hb_name}",
+    "user": "${_hb_user}",
+    "machine_id": "${_hb_machine_id}",
+    "address": "${_hb_host}",
+    "port": ${_hb_port},
+    "addresses": ${_hb_addrs}
+  },
+  "created": "${_hb_created}",
+  "updated": "${_hb_now}",
+  "last_heartbeat": "${_hb_now}"
+}
+JSON
+)
+                local _hb_tmp; _hb_tmp=$(mktemp -t airc-hb.XXXXXX)
+                printf '%s\n' "$_hb_payload" > "$_hb_tmp"
+                gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>&1 || true
+                rm -f "$_hb_tmp"
+              done
+            ) &
+            local _hb_pid=$!
+            # Stash heartbeat-loop PID + gist-id in scope-local files so
+            # the canonical exit-trap (set later in cmd_connect, around
+            # line 2498) can reap them. We don't set our own EXIT trap
+            # here because bash traps are last-set-wins per shell — the
+            # later trap would clobber us, leaving the gist orphaned on
+            # graceful Ctrl-C. Instead, the canonical trap reads these
+            # state files and cleans everything up in one place.
+            echo "$_hb_pid"  >  "$AIRC_WRITE_DIR/heartbeat.pid"
+            echo "$_gist_id" >  "$AIRC_WRITE_DIR/host_gist_id"
+
+            # Post-publish race-loser detection. Two tabs that ran
+            # `airc join --room X` simultaneously can BOTH see empty
+            # gist list (gh propagation lag) and BOTH publish — pre-
+            # publish recheck doesn't help because neither's gist is
+            # globally visible yet. Solution: after publishing, look
+            # for OTHER gists with the same room name. Deterministic
+            # tiebreaker (lowest gist id alphabetically) picks the
+            # winner; loser deletes its gist + re-execs as joiner
+            # targeting the winner. Light jitter spreads the listing
+            # so we both see the same set.
+            local _race_jit; _race_jit=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.5 + (r%1000)/1000}')
+            sleep "$_race_jit"
+            local _peer_rooms; _peer_rooms=$(gh gist list --limit 50 2>/dev/null \
+              | awk -F'\t' -v re="airc room: ${room_name}\$" '$2 ~ re {print $1}' \
+              | sort)
+            local _peer_count; _peer_count=$(printf '%s\n' "$_peer_rooms" | grep -c . || true)
+            if [ "$_peer_count" -gt 1 ]; then
+              local _winner_id; _winner_id=$(printf '%s\n' "$_peer_rooms" | head -1)
+              if [ "$_winner_id" != "$_gist_id" ]; then
+                echo ""
+                echo "  ⚠  Concurrent host detected for #${room_name} — yielding to winner ($_winner_id)."
+                # Stop our heartbeat, delete our gist, clear state, re-exec as joiner.
+                kill "$_hb_pid" 2>/dev/null || true
+                gh gist delete "$_gist_id" --yes >/dev/null 2>&1 || true
+                rm -f "$AIRC_WRITE_DIR/heartbeat.pid" \
+                      "$AIRC_WRITE_DIR/host_gist_id" \
+                      "$AIRC_WRITE_DIR/room_gist_id" \
+                      "$AIRC_WRITE_DIR/room_name"
+                local _preserved_name; _preserved_name=$(get_config_val name "")
+                exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_winner_id"
+              fi
+            fi
+
             echo "  Hosting #${room_name} (gh-account substrate)."
             echo "  Other agents on your gh account auto-join via:  airc connect"
             echo "  Cross-account share (rare):"
@@ -2184,20 +3080,35 @@ except Exception:
     done &
     PAIR_PID=$!
 
-    # Write PID file so `airc teardown` can find us later. Record both us and
-    # the PAIR_PID (the backgrounded TCP-accept loop) so teardown can reap both.
-    echo "$$ $PAIR_PID" > "$AIRC_WRITE_DIR/airc.pid"
+    # Write PID file so `airc teardown` can find us later. Record us, the
+    # PAIR_PID (TCP-accept loop), and the heartbeat-loop PID (if hosting a
+    # room with a gist) so teardown can reap all three.
+    _hb_pid_persisted=""
+    [ -f "$AIRC_WRITE_DIR/heartbeat.pid" ] && _hb_pid_persisted=$(cat "$AIRC_WRITE_DIR/heartbeat.pid" 2>/dev/null)
+    echo "$$ $PAIR_PID $_hb_pid_persisted" > "$AIRC_WRITE_DIR/airc.pid"
     # Clean exit on tab close (SIGTERM/SIGINT from Claude Code's Monitor tool
     # going away, or any other signal): reap the accept loop, its python
-    # listener, and any active ssh tail — don't leave orphans holding the
-    # port or the SSH session.
+    # listener, the heartbeat loop, AND delete our hosted gist if any —
+    # don't leave orphans holding the port, the SSH session, or a stale
+    # gist pointing at a corpse. Single canonical trap (was previously
+    # split between this site + the gist-publish site, but bash traps are
+    # last-set-wins per shell so the split lost the gist-cleanup half).
     trap '
-      rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+      _exit_hb_pid=""
+      _exit_gist_id=""
+      [ -f "$AIRC_WRITE_DIR/heartbeat.pid" ] && _exit_hb_pid=$(cat "$AIRC_WRITE_DIR/heartbeat.pid" 2>/dev/null)
+      [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && _exit_gist_id=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
+      [ -n "$_exit_hb_pid" ] && kill $_exit_hb_pid 2>/dev/null
+      if [ -n "$_exit_gist_id" ] && command -v gh >/dev/null 2>&1; then
+        gh gist delete "$_exit_gist_id" --yes >/dev/null 2>&1
+      fi
+      rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR/heartbeat.pid" "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null
       for p in $PAIR_PID $(pgrep -P $PAIR_PID 2>/dev/null) $(pgrep -P $$ 2>/dev/null); do
         kill $p 2>/dev/null
       done
     ' EXIT INT TERM
 
+    spawn_general_sidecar_if_wanted
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null
@@ -2682,10 +3593,98 @@ print(f"  pushed local identity to continuum:{handle}")
 }
 
 cmd_send() {
-  # Chat-room semantics. Default: broadcast to everyone on the host.
-  # Prefix the first arg with '@' to DM a specific peer.
-  #   airc send "hello everyone"        → broadcast (to=all)
-  #   airc send @alice "hey"            → DM to alice
+  # Chat-room semantics. Default: broadcast to everyone in the current
+  # scope's room. Prefix the first arg with '@' to DM a specific peer.
+  #   airc send "hello everyone"           → broadcast to current room
+  #   airc send @alice "hey"               → DM alice in current room
+  #   airc send --room general "hi lobby"  → broadcast to a SIBLING room
+  #   airc send --room general @alice "..."→ DM alice via the sibling room
+  #
+  # --room <name> route (issue #122 follow-up): the multi-room sidecar
+  # model means a tab is in #project-room AND #general simultaneously,
+  # but each room has its own scope. Without --room support here, sending
+  # to a non-current room required `AIRC_HOME=$cwd/.airc.<room> airc msg`,
+  # which is nonobvious (vhsm-Claude attempted `airc msg --room general`
+  # on 2026-04-26, the unrecognized flag silently became part of the
+  # message body — exactly the evidence-eating shape the project rejects).
+  #
+  # Implementation: parse --room here. If it names a sibling sidecar scope
+  # (e.g. ${AIRC_WRITE_DIR}.<name>), re-exec ourselves with AIRC_HOME
+  # pointed at that scope so the rest of the function runs there. Errors
+  # loudly when the requested room isn't in the user's subscription set
+  # — never silently broadcasts to the wrong place.
+  local target_room=""
+  local positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --room|-room)
+        target_room="${2:-}"
+        [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
+        shift 2 ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  set -- "${positional[@]+"${positional[@]}"}"
+
+  if [ -n "$target_room" ]; then
+    # Resolve target_room to a scope dir. Two cases:
+    #   1. We ARE in target_room already (current scope's room_name file
+    #      matches) → just continue here, no re-exec.
+    #   2. A sibling scope `${primary_scope}.${target_room}` exists →
+    #      re-exec with AIRC_HOME there. Recursion guard via
+    #      AIRC_SEND_REROUTED=1 — without it, a misconfigured sibling
+    #      scope could loop.
+    #
+    # Determining "primary scope" is the awkward bit because we may
+    # ALREADY be in a sidecar scope (AIRC_WRITE_DIR ends in `.X`). Strip
+    # any trailing `.<word>` to find the project scope, then append
+    # `.<target_room>` for the requested sibling. If target_room IS the
+    # project room name (read from primary's room_name file), point at
+    # the project scope itself, not a sibling.
+    local _here_room=""
+    [ -f "$AIRC_WRITE_DIR/room_name" ] && _here_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+    if [ "$_here_room" = "$target_room" ]; then
+      : # already in the right scope, fall through to normal send
+    else
+      [ "${AIRC_SEND_REROUTED:-0}" = "1" ] \
+        && die "send: --room re-route loop detected (scope $AIRC_WRITE_DIR room=$_here_room target=$target_room)"
+      # Strip any sibling suffix from current scope to get the project
+      # scope path. e.g. /path/.airc.general → /path/.airc
+      local _project_scope="$AIRC_WRITE_DIR"
+      case "$_project_scope" in
+        *.airc.*)
+          _project_scope="${_project_scope%.*}" ;;
+      esac
+      # Read the project scope's room_name to compare with target.
+      local _project_room=""
+      [ -f "$_project_scope/room_name" ] && _project_room=$(cat "$_project_scope/room_name" 2>/dev/null)
+      local _target_scope=""
+      if [ "$_project_room" = "$target_room" ]; then
+        _target_scope="$_project_scope"
+      else
+        # Sibling sidecar scope under the project scope's parent.
+        # Convention: primary scope is `<base>/.airc`, sidecar scope is
+        # `<base>/.airc.<roomname>` (e.g. `.airc.general`).
+        _target_scope="${_project_scope}.${target_room}"
+      fi
+      if [ ! -d "$_target_scope" ] || [ ! -f "$_target_scope/room_name" ]; then
+        echo "  send --room #${target_room}: not subscribed in this scope." >&2
+        echo "    looked at: $_target_scope" >&2
+        echo "    rooms you ARE in:" >&2
+        for _d in "$_project_scope" "$_project_scope".*; do
+          [ -f "$_d/room_name" ] && echo "      - #$(cat "$_d/room_name" 2>/dev/null) (scope: $_d)" >&2
+        done
+        echo "  Fix: 'airc join --room ${target_room}' (in a separate scope), or drop the --room flag." >&2
+        die "send: not subscribed to #${target_room}"
+      fi
+      # Re-exec with AIRC_HOME pointed at the target scope. Pass the
+      # remaining positional args (peer/message) through. The recursion
+      # guard prevents infinite re-routing if the target scope is itself
+      # misconfigured.
+      exec env AIRC_HOME="$_target_scope" AIRC_SEND_REROUTED=1 "$0" send "$@"
+    fi
+  fi
+
   local first="${1:-}"
   [ -z "$first" ] && die "Usage: airc send <message>  or  airc send @peer <message>"
 
@@ -2798,6 +3797,47 @@ cmd_send() {
       rm -f "$err"
     fi
   else
+    # Host path: append to OUR messages.jsonl. Joiners' SSH tails will
+    # pick it up and route to their monitors. BUT — if our monitor isn't
+    # actually running, no joiner is connected (the SSH tail rides on the
+    # monitor process tree), and this append goes to a log nobody reads.
+    # The send returns 0 and the user thinks it succeeded.
+    #
+    # That's exactly how Joel hit "I see no communication going on" on
+    # 2026-04-26: shell auto-cd'd into a different scope mid-session, that
+    # scope's monitor was dead, every `airc msg` returned 0 with zero
+    # delivery, and the peer in the actual room waited forever for a
+    # reply that never landed.
+    #
+    # Detect: pidfile exists AND every PID in it is alive. Anything else
+    # = monitor dead = broadcasting into a void. Die loudly so the user
+    # immediately knows their cwd / scope / monitor state is wrong.
+    local _pidfile="$AIRC_WRITE_DIR/airc.pid"
+    local _monitor_alive=0
+    if [ -f "$_pidfile" ]; then
+      local _pids; _pids=$(cat "$_pidfile" 2>/dev/null)
+      if [ -n "$_pids" ]; then
+        local _all_alive=1 _p
+        for _p in $_pids; do
+          kill -0 "$_p" 2>/dev/null || { _all_alive=0; break; }
+        done
+        [ "$_all_alive" = "1" ] && _monitor_alive=1
+      fi
+    fi
+    if [ "$_monitor_alive" = "0" ]; then
+      echo "  Send NOT delivered — this scope's monitor isn't running." >&2
+      echo "    scope:    $AIRC_WRITE_DIR" >&2
+      echo "    identity: $my_name (host)" >&2
+      if [ -f "$_pidfile" ]; then
+        echo "    pidfile:  $_pidfile (stale — process not alive)" >&2
+      else
+        echo "    pidfile:  absent (monitor never started in this scope)" >&2
+      fi
+      echo "  Joiners ride on the monitor's SSH tail; with the monitor down, your message reaches no one." >&2
+      echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
+      echo "       OR cd into the scope you actually meant to send from." >&2
+      die "monitor down — refusing to silently broadcast into a void"
+    fi
     echo "$full_msg" >> "$MESSAGES"
   fi
 
@@ -2904,10 +3944,14 @@ cmd_rooms() {
   # Match BOTH the persistent IRC-style rooms (#39, prefix `airc room:`)
   # and the legacy single-pair invites (#37/#38, prefix `airc invite for`).
   # Show kind explicitly so the AI / human can tell them apart.
+  # gh gist list columns: id  description  files  visibility  updated_at
+  # Use $5 (timestamp) for the updated field — pre-#82 we were using
+  # $4 (visibility, "secret") under the "updated:" label, which is a
+  # display bug fixed here on the way to adding stale markers.
   local raw; raw=$(gh gist list --limit 50 2>/dev/null \
     | awk -F'\t' '
-        /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $4 }
-        /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $4 }
+        /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $5 }
+        /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $5 }
       ')
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
@@ -2926,12 +3970,62 @@ cmd_rooms() {
       room)   marker="#" ;;     # persistent channel
       invite) marker="(1:1)" ;; # ephemeral pairing
     esac
-    printf '    %s %s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
-      "$marker" "$desc" "$id" "$hh" "$updated"
+    local age_str; age_str=$(_format_relative_time "$updated")
+    local stale_marker=""
+    if _is_stale "$updated"; then
+      stale_marker="  (stale)"
+    fi
+    printf '    %s %s%s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
+      "$marker" "$desc" "$stale_marker" "$id" "$hh" "$age_str"
   done
   echo "  Join (auto-resolves on same gh account): airc connect"
   echo "  Join by id (cross-account share):        airc connect <id>"
   echo ""
+}
+
+# Convert an ISO 8601 timestamp into a relative-time string ("12m ago",
+# "3h ago", "2d ago"). Handles both macOS BSD date and GNU/Linux date
+# syntax differences. Falls back to the raw timestamp on parse failure.
+# Used by cmd_rooms to display gist activity (#82).
+_format_relative_time() {
+  local ts="${1:-}"
+  [ -z "$ts" ] && { echo "(unknown)"; return; }
+  local epoch
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    : # BSD/macOS
+  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    : # GNU/Linux/WSL
+  else
+    echo "$ts"
+    return
+  fi
+  local now; now=$(date -u +%s)
+  local diff=$((now - epoch))
+  if [ "$diff" -lt 0 ]; then echo "$ts"; return; fi
+  if [ "$diff" -lt 60 ]; then       echo "${diff}s ago"
+  elif [ "$diff" -lt 3600 ]; then   echo "$((diff / 60))m ago"
+  elif [ "$diff" -lt 86400 ]; then  echo "$((diff / 3600))h ago"
+  else                              echo "$((diff / 86400))d ago"
+  fi
+}
+
+# Return 0 if the given ISO timestamp is older than AIRC_STALE_HOURS
+# (default 24h). Used to mark abandoned rooms in cmd_rooms output (#82).
+_is_stale() {
+  local ts="${1:-}"
+  local threshold_hours="${AIRC_STALE_HOURS:-24}"
+  [ -z "$ts" ] && return 1
+  local epoch
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    :
+  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  local now; now=$(date -u +%s)
+  local diff=$((now - epoch))
+  [ "$diff" -gt $((threshold_hours * 3600)) ]
 }
 
 # ── cmd_part: leave the current room ──────────────────────────────────
@@ -2980,9 +4074,20 @@ cmd_part() {
   else
     # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
-    rm -f "$room_name_file"
+    # Clear our cached gist_id too, matching the comment on the joiner-
+    # side cache write site (PR #92 Copilot feedback). Without this, a
+    # parted joiner that later reconnects via the same scope would
+    # incorrectly trigger the stale-pairing-detect path on the next
+    # resume even though they parted intentionally.
+    rm -f "$room_name_file" "$gist_id_file"
   fi
 
+  # IRC `/part` semantics — leave THIS room only; the #general sidecar
+  # (or any other sibling subscription) keeps running. cmd_teardown
+  # respects AIRC_TEARDOWN_PART_ONLY=1 by skipping its sidecar block,
+  # so the kill is scope-local. cmd_teardown without this guard remains
+  # the "kill everything in this scope tree" command.
+  local AIRC_TEARDOWN_PART_ONLY=1
   cmd_teardown
 }
 
@@ -3100,24 +4205,81 @@ else:
     return
   fi
 
-  local found=false
-  local entry
-  for entry in $(relay_list peers); do
-    case "$entry" in *.json) ;; *) continue ;; esac
-    local f; f=$(relay_path "peers/$entry")
-    [ -f "$f" ] || continue
-    found=true
-    local name host
-    # `|| true` — a malformed peer record shouldn't abort the whole peers list
-    # under `set -euo pipefail`. Empty name/host gets printed and the user can
-    # tell the record is broken; the rest of the list still enumerates.
-    name=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null || true)
-    host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null || true)
-    echo "  $name → $host"
-  done
-  if [ "$found" = false ]; then
-    echo "  No peers yet."
-  fi
+  # Walk scopes that count as "subscribed rooms" for this tab: primary
+  # (current AIRC_WRITE_DIR) plus any sibling sidecar scopes (.airc.<room>
+  # pattern under the project scope's parent). For each, read peers/
+  # records and annotate with the scope's room_name. Same peer in both
+  # scopes folds into one line with both room tags.
+  #
+  # Intent (issue #121 follow-up): multi-room presence shouldn't fragment
+  # the operator's view of "who am I connected to" into separate per-scope
+  # listings. From the user's perspective they're in N rooms; airc peers
+  # should reflect that as one unified roster with room context per peer.
+  python3 -c "
+import json, os, sys, re
+
+primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
+parent = os.path.dirname(primary_scope)
+self_basename = os.path.basename(primary_scope)
+
+# Prefix detection: a sidecar scope is named like \`<prefix>.<room>\`
+# (e.g. .airc.general). Strip a trailing .<word> to recover the
+# primary scope's basename. Works for both production layout
+# (.airc / .airc.general) and test ad-hoc paths (state / state.general)
+# without baking in the .airc literal.
+prefix_match = re.match(r'(.+?)\.[a-z0-9-]+\$', self_basename)
+prefix = prefix_match.group(1) if prefix_match else self_basename
+
+# Collect: the primary scope itself, plus every sibling whose name is
+# <prefix>.<something>. We additionally require room_name + peers/ on
+# each candidate so unrelated dirs in the same parent (e.g. .airc-old,
+# .airc.bak) don't pollute the listing.
+candidates = []
+if os.path.isdir(parent):
+    for entry in sorted(os.listdir(parent)):
+        if entry == prefix or entry.startswith(prefix + '.'):
+            candidates.append(os.path.join(parent, entry))
+scopes = [s for s in candidates
+          if os.path.isfile(os.path.join(s, 'room_name'))
+          and os.path.isdir(os.path.join(s, 'peers'))]
+# Always include primary even if it doesn't have room_name yet — that's
+# the legacy 1:1 invite mode case (use_room=0).
+if primary_scope not in scopes and os.path.isdir(os.path.join(primary_scope, 'peers')):
+    scopes.insert(0, primary_scope)
+
+# Build {(name, host): [room1, room2, ...]} by walking each scope's peers/.
+peers_by_id = {}
+for scope in scopes:
+    peers_dir = os.path.join(scope, 'peers')
+    if not os.path.isdir(peers_dir):
+        continue
+    rn_file = os.path.join(scope, 'room_name')
+    room = '(?)'
+    if os.path.isfile(rn_file):
+        try: room = open(rn_file).read().strip()
+        except Exception: pass
+    for f in sorted(os.listdir(peers_dir)):
+        if not f.endswith('.json'): continue
+        try:
+            d = json.load(open(os.path.join(peers_dir, f)))
+        except Exception:
+            continue
+        key = (d.get('name', f[:-5]), d.get('host', ''))
+        peers_by_id.setdefault(key, []).append(room)
+
+if not peers_by_id:
+    print('  No peers yet.')
+    sys.exit(0)
+
+# Render. Each peer once, with room annotations sorted + deduped.
+for (name, host), rooms in sorted(peers_by_id.items()):
+    seen = set(); ordered = []
+    for r in rooms:
+        if r not in seen:
+            ordered.append(r); seen.add(r)
+    tags = ', '.join('#' + r for r in ordered)
+    print(f'  {name} → {host}   [{tags}]')
+"
 }
 
 cmd_teardown() {
@@ -3191,6 +4353,72 @@ cmd_teardown() {
 
 
   local killed=0
+  # Hosted gist cleanup BEFORE process kill. The cmd_connect EXIT trap
+  # would normally delete our hosted gist on graceful shutdown, but the
+  # kill -9 below skips traps entirely. Without this explicit step,
+  # every `airc teardown` of a host left an orphan gist on the gh
+  # account that joiners couldn't tell apart from a live host until
+  # heartbeat went stale (~90s later). Caught by Joel's other tab
+  # bouncing repeatedly and accumulating fresh #general gists each
+  # cycle.
+  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+    local _td_gist; _td_gist=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
+    if [ -n "$_td_gist" ]; then
+      if gh gist delete "$_td_gist" --yes >/dev/null 2>&1; then
+        echo "  deleted hosted gist: $_td_gist"
+      fi
+      rm -f "$AIRC_WRITE_DIR/host_gist_id"
+    fi
+  fi
+
+  # Sidecar scope cleanup (issue #121 — multi-room presence).
+  # When the primary tab spawned a #general sidecar, that sidecar runs
+  # in a sibling .general scope with its own pidfile + (if hosting)
+  # its own host_gist_id. Mirror the primary's gist cleanup + pidfile
+  # kill there. Without this, killing the primary leaves an orphan
+  # #general gist on the gh account AND an orphan sidecar process that
+  # the primary's pidfile descendant-walk wouldn't catch (sidecar's
+  # bash isn't a child of cmd_teardown — it was forked detached).
+  #
+  # Guard: AIRC_TEARDOWN_PART_ONLY=1 (set by cmd_part) skips the sidecar
+  # block. IRC `/part` should leave only the current channel; the
+  # sidecar (#general lobby) should keep running. cmd_teardown without
+  # this flag is the "kill everything in this scope tree" semantic.
+  local _sidecar_scope="${AIRC_WRITE_DIR}.general"
+  if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" = "1" ]; then
+    : # cmd_part path — skip sidecar
+  elif [ -d "$_sidecar_scope" ]; then
+    if [ -f "$_sidecar_scope/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+      local _td_sc_gist; _td_sc_gist=$(cat "$_sidecar_scope/host_gist_id" 2>/dev/null)
+      if [ -n "$_td_sc_gist" ]; then
+        if gh gist delete "$_td_sc_gist" --yes >/dev/null 2>&1; then
+          echo "  deleted sidecar #general gist: $_td_sc_gist"
+        fi
+        rm -f "$_sidecar_scope/host_gist_id"
+      fi
+    fi
+    if [ -f "$_sidecar_scope/airc.pid" ]; then
+      local _sc_pids; _sc_pids=$(cat "$_sidecar_scope/airc.pid" 2>/dev/null | tr '\n' ' ')
+      if [ -n "$_sc_pids" ]; then
+        local _all_sc="$_sc_pids"
+        for _p in $_sc_pids; do
+          local _kids; _kids=$(pgrep -P "$_p" 2>/dev/null | tr '\n' ' ' || true)
+          [ -n "$_kids" ] && _all_sc="$_all_sc $_kids"
+        done
+        _all_sc=$(echo "$_all_sc" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+        if [ -n "$_all_sc" ]; then
+          echo "  killing sidecar scope $_sidecar_scope: $(echo $_all_sc | tr '\n' ' ')"
+          kill -9 $_all_sc 2>/dev/null || true
+          killed=1
+        fi
+      fi
+      rm -f "$_sidecar_scope/airc.pid"
+    fi
+    if [ "$flush" = "1" ]; then
+      rm -rf "$_sidecar_scope"
+    fi
+  fi
+
   # Scope-aware via PID file: cmd_connect wrote its PID(s) to $AIRC_WRITE_DIR/airc.pid.
   # We kill ONLY those PIDs + their descendants. Never touches other scopes.
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
@@ -3209,6 +4437,34 @@ cmd_teardown() {
         [ -n "$kids" ] && all_pids="$all_pids $kids"
       done
       all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+      # Part-only path: exclude the sidecar's bash + its descendants so
+      # `airc part` doesn't sweep them via the primary's child-tree.
+      # The sidecar's bash is forked from primary, so pgrep -P picks it
+      # up here; without exclusion we'd kill the sidecar in violation
+      # of IRC /part semantics (leave one channel, keep others alive).
+      if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" = "1" ] && [ -n "$all_pids" ]; then
+        local _exclude_pids=""
+        local _sc_pidfile="${AIRC_WRITE_DIR}.general/airc.pid"
+        if [ -f "$_sc_pidfile" ]; then
+          local _sc_pids; _sc_pids=$(cat "$_sc_pidfile" 2>/dev/null | tr '\n' ' ')
+          for _scp in $_sc_pids; do
+            _exclude_pids="$_exclude_pids $_scp"
+            local _scp_kids; _scp_kids=$(pgrep -P "$_scp" 2>/dev/null | tr '\n' ' ' || true)
+            [ -n "$_scp_kids" ] && _exclude_pids="$_exclude_pids $_scp_kids"
+          done
+        fi
+        if [ -n "$_exclude_pids" ]; then
+          local _filtered=""
+          for _p in $all_pids; do
+            local _skip=0
+            for _ex in $_exclude_pids; do
+              [ "$_p" = "$_ex" ] && { _skip=1; break; }
+            done
+            [ "$_skip" = "0" ] && _filtered="$_filtered $_p"
+          done
+          all_pids=$(echo "$_filtered" | tr ' ' '\n' | grep -v '^$' || true)
+        fi
+      fi
       if [ -n "$all_pids" ]; then
         echo "  killing scope $AIRC_WRITE_DIR: $(echo $all_pids | tr '\n' ' ')"
         kill -9 $all_pids 2>/dev/null || true
@@ -3839,18 +5095,25 @@ cmd_daemon_log() {
 }
 
 cmd_doctor() {
-  # Two modes:
+  # Three modes:
   #   airc doctor           -- environment health check (default).
   #                            Probes each prereq and prints the exact
   #                            install command for whichever package
   #                            manager this platform uses, so any AI
   #                            reading the output can `proactively fix
   #                            recoverable issues` (per /doctor SKILL.md).
+  #   airc doctor --connect -- pre-flight before `airc connect`. Runs
+  #                            the default health probes PLUS connect-
+  #                            specific checks (tailscale UP not just
+  #                            installed, gist API reachable, port free,
+  #                            cached host_target reachable). Issue #80.
+  #                            Use case: airc doctor --connect && airc connect
   #   airc doctor --tests   -- run the integration test suite (the
   #   airc doctor tests        prior default behavior; aliased on the
   #                            dispatch via `tests|test`).
   case "${1:-}" in
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
+    --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
   esac
 
   echo ""
@@ -3993,6 +5256,120 @@ _doctor_probe_tailscale() {
   printf "  [info] tailscale (optional) -- not installed; only needed for cross-LAN mesh\n"
   printf "         Install: %s\n" "$fix"
   return 0
+}
+
+_doctor_connect_preflight() {
+  # Pre-flight check before `airc connect`. Issue #80. Runs the default
+  # prereq probes PLUS connect-specific checks. Output is a checklist
+  # with fix commands; exit non-zero if any blocking issue. Use case:
+  #
+  #   airc doctor --connect && airc connect
+  #
+  # Catches the silent-fail classes that produced #78 / #85 / #79
+  # cascades for first-time users and surfaced as detective-work bugs.
+  echo ""
+  echo "  airc doctor --connect -- pre-flight checks"
+  echo "  ------------------------------------------"
+  echo ""
+  local issues=0
+  local mgr; mgr=$(_doctor_detect_pkgmgr)
+
+  # ── Required prereqs (same as default doctor) ──
+  _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
+  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"    || issues=$((issues+1))
+  _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
+  _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
+  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
+
+  # ── gh chain: installed → authed → gist scope → gists API reachable.
+  # Single chain (early-return on first failure) so a missing gh isn't
+  # counted 3-4x as a separate issue per dependent probe. Gist scope is
+  # checked explicitly because `gh auth status` alone passes for a
+  # gist-scope-less token (Copilot caught this on #87 review).
+  if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
+    issues=$((issues+1))
+  elif ! gh auth status >/dev/null 2>&1; then
+    printf "  [BLOCKED] gh authenticated\n"
+    printf "         Fix: gh auth login -s gist\n"
+    issues=$((issues+1))
+  elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+    printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
+    printf "         Fix: gh auth refresh -s gist\n"
+    issues=$((issues+1))
+  elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
+    printf "  [BLOCKED] gist API not reachable -- network outage or rate-limit\n"
+    printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    issues=$((issues+1))
+  else
+    printf "  [ok] gh authed with gist scope, gists API reachable\n"
+  fi
+
+  # ── Connect-specific: tailscale state. The default doctor only marks
+  # tailscale as "info" since it's optional for LAN-only mesh. In
+  # --connect mode, if there's a saved host_target in tailnet CGNAT
+  # range, Tailscale being UP is a HARD requirement.
+  local prior_host_target=""
+  [ -f "$CONFIG" ] && prior_host_target=$(get_config_val host_target "")
+  local prior_host_only="${prior_host_target##*@}"
+  local target_is_cgnat=0
+  case "$prior_host_only" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) target_is_cgnat=1 ;;
+  esac
+  if [ "$target_is_cgnat" = "1" ]; then
+    # Use resolve_tailscale_bin so the .app-bundle / Program Files paths
+    # are checked, not just PATH (consistency with the rest of airc).
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      if "$ts_bin" status >/dev/null 2>&1; then
+        printf "  [ok] tailscale UP (cached host_target is tailnet CGNAT)\n"
+      else
+        printf "  [BLOCKED] tailscale CLI installed but DOWN -- cached host is tailnet, can't reach\n"
+        printf "         Fix: tailscale up\n"
+        issues=$((issues+1))
+      fi
+    else
+      printf "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach\n"
+      printf "         Fix: install tailscale (https://tailscale.com/download), then 'tailscale up'\n"
+      issues=$((issues+1))
+    fi
+  else
+    _doctor_probe_tailscale "$mgr"  # optional, info-only
+  fi
+
+  # ── Connect-specific: AIRC_PORT free or auto-shift available ──
+  local target_port="${AIRC_PORT:-7547}"
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
+      printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
+    else
+      printf "  [ok] port %s available for hosting\n" "$target_port"
+    fi
+  fi
+
+  # ── Connect-specific: cached host_target reachable (resume scenario) ──
+  if [ -n "$prior_host_target" ]; then
+    local probe_key="$IDENTITY_DIR/ssh_key"
+    if [ -f "$probe_key" ]; then
+      if ssh -i "$probe_key" -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=3 -o BatchMode=yes \
+              "$prior_host_target" "echo __PROBE_OK__" 2>/dev/null | grep -q __PROBE_OK__; then
+        printf "  [ok] cached host %s reachable + auth works\n" "$prior_host_target"
+      else
+        printf "  [warn] cached host %s not reachable -- may need re-pair\n" "$prior_host_target"
+        printf "         Fix: airc teardown --flush && airc join (fresh pairing)\n"
+        # Not blocking — fresh-pair flow handles this
+      fi
+    fi
+  fi
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "  ✓ READY -- airc connect should work."
+    return 0
+  else
+    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc connect'."
+    return 1
+  fi
 }
 
 _doctor_run_tests() {

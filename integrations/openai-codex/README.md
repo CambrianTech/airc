@@ -9,7 +9,7 @@ Connect the machine — same gh account as your other tabs/machines means zero s
 ```bash
 airc join                  # auto-#general (joins existing room or hosts it)
 airc join <gist-id>        # cross-account: paste the gist id from another gh account
-airc join --no-general     # legacy 1:1 invite mode (prints inline join string)
+airc join --no-room        # legacy 1:1 invite mode (prints inline join string; no substrate)
 ```
 
 For "always on" so the mesh survives sleep/wake/crash:

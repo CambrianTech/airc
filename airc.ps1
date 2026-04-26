@@ -85,6 +85,33 @@ function Get-AircScope {
     return (Join-Path (Resolve-Path .).Path '.airc')
 }
 
+# Resolve gh CLI binary path early. Same problem the bash script handles:
+# winget-installed gh sits at a standard location that doesn't always end
+# up on the running shell's PATH (Windows native shells especially).
+# Defined inline here so the PATH-fixup below can use it before the
+# main helpers section below runs. Issue #85.
+function _Resolve-GhBinEarly {
+    foreach ($name in @('gh', 'gh.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @(
+        'C:\Program Files\GitHub CLI\gh.exe',
+        'C:\Program Files (x86)\GitHub CLI\gh.exe'
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# gh PATH-fixup: if gh resolved via fallback rather than PATH, prepend its
+# directory to PATH so every later `gh` invocation transparently finds it.
+$_ghResolved = _Resolve-GhBinEarly
+if ($_ghResolved -and -not (Get-Command 'gh' -ErrorAction SilentlyContinue)) {
+    $env:PATH = (Split-Path $_ghResolved -Parent) + [IO.Path]::PathSeparator + $env:PATH
+}
+Remove-Variable _ghResolved -ErrorAction SilentlyContinue
+
 $AIRC_WRITE_DIR = Get-AircScope
 $CONFIG       = Join-Path $AIRC_WRITE_DIR 'config.json'
 $IDENTITY_DIR = Join-Path $AIRC_WRITE_DIR 'identity'
@@ -202,6 +229,25 @@ function Resolve-TailscaleBin {
     return $null
 }
 
+function Resolve-GhBin {
+    # Same shape as Resolve-TailscaleBin. Issue #85: on Windows native +
+    # Git Bash, gh is installed via winget at the standard location but
+    # the path doesn't get inherited into Git Bash's PATH. The bash side
+    # has the equivalent helper; ps1 keeps lockstep so gist substrate
+    # works without manual PATH edits.
+    foreach ($name in @('gh', 'gh.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @(
+        'C:\Program Files\GitHub CLI\gh.exe',
+        'C:\Program Files (x86)\GitHub CLI\gh.exe'
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
 function Test-CgnatIp {
     # Tailscale CGNAT range 100.64.0.0/10 = 100.64.0.0 .. 100.127.255.255
     param([string]$Ip)
@@ -221,6 +267,10 @@ function Test-PeerOfflineInTailnet {
     # is_peer_offline_in_tailnet (commit 64b604d).
     param([string]$TargetHost)
     if (-not $TargetHost) { return $false }
+    # Strip leading user@ if present — host_target from config.json is
+    # `user@host` form. Without this strip, every resume-path call
+    # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+    if ($TargetHost -match '@') { $TargetHost = ($TargetHost -split '@')[-1] }
     if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
     $ts = Resolve-TailscaleBin
     if (-not $ts) { return $false }
@@ -250,16 +300,27 @@ function Advise-TailscaleIfDown {
     param([string]$TargetHost)
     if ($env:AIRC_NO_TAILSCALE -eq '1') { return $false }
     if (-not $TargetHost) { return $false }
+    # Strip leading user@ if present — host_target from config.json is
+    # `user@host` form. Without this strip, every resume-path call
+    # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+    if ($TargetHost -match '@') { $TargetHost = ($TargetHost -split '@')[-1] }
     if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
 
     $ts = Resolve-TailscaleBin
+    $tsOut = ''
+    $tsRc  = 1
     if ($ts) {
-        & $ts status 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $false }   # daemon up, proceed
+        $tsOut = & $ts status 2>&1 | Out-String
+        $tsRc  = $LASTEXITCODE
+        # Status command rc=0 AND output doesn't say "Logged out" / "NeedsLogin"
+        # = daemon up + signed in, proceed.
+        if ($tsRc -eq 0 -and $tsOut -notmatch 'Logged out|NeedsLogin') {
+            return $false
+        }
     }
 
     Write-Host ''
-    Write-Host "X airc: can't reach Tailscale-routed host $TargetHost -- Tailscale appears down on this machine."
+    Write-Host "X airc: can't reach Tailscale-routed host $TargetHost -- Tailscale isn't ready on this machine."
     Write-Host ''
     if (-not $ts) {
         Write-Host '   Tailscale is not installed. airc needs it only for cross-machine mesh.'
@@ -270,11 +331,45 @@ function Advise-TailscaleIfDown {
         Write-Host '   After install, bring the tailnet up and re-run airc join.'
         return $true
     }
+
+    # Distinguish "logged out" from "daemon down" - they need different
+    # fixes and used to print the same wrong "start the daemon" message.
+    if ($tsOut -match 'Logged out|NeedsLogin') {
+        Write-Host '   Tailscale is installed and running but you''re not signed in.'
+        Write-Host '     Click the Tailscale tray icon to sign in,'
+        Write-Host '     or run:  tailscale up'
+        Write-Host ''
+        return $true
+    }
+
     Write-Host '   Tailscale CLI is installed but the daemon is not running. Start it:'
     Write-Host '     (Windows) Click the Tailscale tray icon to start the app.'
     Write-Host '               Or from an elevated PowerShell:  Start-Service Tailscale'
     Write-Host ''
     return $true
+}
+
+# Test-TailscaleLoginOrPrompt: PS parity for bash tailscale_login_check_or_prompt.
+# Called at the top of Invoke-Connect. If Tailscale is installed but the
+# daemon reports Logged out / NeedsLogin, surface a non-fatal warning.
+# Same-machine + same-LAN substrate paths still work without Tailscale.
+# AIRC_NO_TAILSCALE=1 opts out (explicit "I'm running without it").
+function Test-TailscaleLoginOrPrompt {
+    if ($env:AIRC_NO_TAILSCALE -eq '1') { return }
+    $ts = Resolve-TailscaleBin
+    if (-not $ts) { return }   # not installed; no nag
+    $out = & $ts status 2>&1 | Out-String
+    if ($out -notmatch 'Logged out|NeedsLogin') { return }
+    Write-Host ''
+    Write-Host "  ! Tailscale is logged out. Running 'tailscale up' to start the auth flow -"
+    Write-Host '     click the URL it prints to authorize this device.'
+    Write-Host '     (Opt out anytime: airc join --no-tailscale)'
+    Write-Host ''
+    # Synchronously run `tailscale up` so the URL flows straight to the
+    # user's terminal. Same shape as bash. If the user cancels, we
+    # continue without Tailscale - same-machine + same-LAN paths work.
+    try { & $ts up } catch { }
+    Write-Host ''
 }
 
 # -- get_host: tailscale IP > LAN IP > hostname -------------------------
@@ -554,7 +649,10 @@ function Test-GhAvailable {
 function Get-GhGistList {
     param([int]$Limit = 50)
     if (-not (Test-GhAvailable)) { return @() }
-    # `gh gist list --limit N` outputs TAB-separated: id, description, files, visibility, updated
+    # `gh gist list --limit N` outputs TAB-separated: id, description, files, visibility, updated_at
+    # Pre-#82 we read $cols[3] (visibility) into Updated -- a display bug
+    # where rooms list showed "updated: secret" instead of an actual time.
+    # Fixed here on the way to adding stale-marker logic.
     $raw = & gh gist list --limit $Limit 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $raw) { return @() }
     $rows = @()
@@ -565,10 +663,44 @@ function Get-GhGistList {
         $rows += [pscustomobject]@{
             Id          = $cols[0]
             Description = $cols[1]
-            Updated     = if ($cols.Count -gt 3) { $cols[3] } else { '' }
+            Updated     = if ($cols.Count -gt 4) { $cols[4] } else { '' }
         }
     }
     return $rows
+}
+
+# Convert ISO 8601 timestamp into relative-time string ("12m ago",
+# "3h ago", "2d ago"). Falls back to raw timestamp on parse failure.
+# #82 — used by Invoke-Rooms to display gist activity.
+function _FormatRelativeTime {
+    param([string]$Ts)
+    if (-not $Ts) { return '(unknown)' }
+    try {
+        $dt = [datetime]::Parse($Ts).ToUniversalTime()
+    } catch {
+        return $Ts
+    }
+    $diff = ([datetime]::UtcNow - $dt).TotalSeconds
+    if ($diff -lt 0)      { return $Ts }
+    if ($diff -lt 60)     { return "$([int]$diff)s ago" }
+    if ($diff -lt 3600)   { return "$([int]($diff / 60))m ago" }
+    if ($diff -lt 86400)  { return "$([int]($diff / 3600))h ago" }
+    return "$([int]($diff / 86400))d ago"
+}
+
+# Return $true if ISO timestamp is older than AIRC_STALE_HOURS
+# (default 24h). #82 — used to mark abandoned rooms.
+function _IsStale {
+    param([string]$Ts)
+    if (-not $Ts) { return $false }
+    $thresholdHours = if ($env:AIRC_STALE_HOURS) { [int]$env:AIRC_STALE_HOURS } else { 24 }
+    try {
+        $dt = [datetime]::Parse($Ts).ToUniversalTime()
+    } catch {
+        return $false
+    }
+    $diffSec = ([datetime]::UtcNow - $dt).TotalSeconds
+    return ($diffSec -gt ($thresholdHours * 3600))
 }
 
 # Fetch the content of the first file in a gist by ID. Uses `gh api` over
@@ -1086,7 +1218,24 @@ Identity resolution (highest priority first):
 # -- cmd_doctor ---------------------------------------------------------
 # User-emphasized: "if they dont have gh for example doctor would say
 # hey get that". Concrete winget commands so the user can copy-paste.
+# Three modes (mirrors bash):
+#   airc doctor              -- environment health (default)
+#   airc doctor --connect    -- pre-flight before airc connect (#80)
+#   airc doctor --tests      -- run integration suite
 function Invoke-Doctor {
+    param([string[]]$Argv = @())
+    if ($Argv -and $Argv.Count -gt 0) {
+        switch ($Argv[0]) {
+            { $_ -in @('--tests','-t','tests','test','run','suite') } {
+                Invoke-Tests
+                return
+            }
+            { $_ -in @('--connect','-c','connect') } {
+                Invoke-DoctorConnectPreflight
+                return
+            }
+        }
+    }
     Write-Host ''
     Write-Host '  airc doctor - environment health'
     Write-Host '  --------------------------------'
@@ -1170,6 +1319,144 @@ function Invoke-Doctor {
     Write-Host ''
 }
 
+# -- airc doctor --connect ---------------------------------------------
+# Issue #80: pre-flight check before airc connect. Runs default prereq
+# probes PLUS connect-specific checks (gh gist API reachable, tailscale
+# UP if cached host is CGNAT, port available, cached host reachable).
+# Use case: airc doctor --connect; if exit 0, airc connect.
+function Invoke-DoctorConnectPreflight {
+    Write-Host ''
+    Write-Host '  airc doctor --connect -- pre-flight checks'
+    Write-Host '  ------------------------------------------'
+    Write-Host ''
+    $script:DoctorIssues = @()
+
+    function Probe($Name, $TestBlock, $FixHint) {
+        if (& $TestBlock) {
+            Write-Host "  [ok] $Name"
+        } else {
+            Write-Host "  [MISSING] $Name"
+            Write-Host "         Fix: $FixHint"
+            $script:DoctorIssues += $Name
+        }
+    }
+
+    # Required prereqs (mirror default doctor — except gh chain, see below)
+    Probe 'PowerShell 7+' {
+        $PSVersionTable.PSVersion.Major -ge 7
+    } 'winget install --id Microsoft.PowerShell  (then re-launch in pwsh)'
+    Probe 'git' {
+        Get-Command git -ErrorAction SilentlyContinue
+    } 'winget install --id Git.Git'
+    Probe 'python' {
+        $r = Resolve-PythonBin
+        $null -ne $r
+    } 'winget install --id Python.Python.3.12'
+    Probe 'ssh (OpenSSH client)' {
+        Get-Command ssh -ErrorAction SilentlyContinue
+    } 'Settings -> Apps -> Optional Features -> Add -> OpenSSH Client'
+    Probe 'ssh-keygen' {
+        Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    } 'Comes with OpenSSH Client (see above)'
+    Probe 'openssl' {
+        $null -ne $script:OpenSSLBin
+    } 'winget install --id Git.Git  (Git for Windows bundles openssl)'
+
+    # gh chain: installed -> authed -> gist scope -> gists API reachable.
+    # Single chain (early-return on first failure) so a missing gh isn't
+    # counted 3-4x. Gist scope is checked explicitly because gh auth
+    # status alone passes for a gist-scope-less token (Copilot #87 review).
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Host '  [MISSING] gh (GitHub CLI)'
+        Write-Host '         Fix: winget install --id GitHub.cli  (then: gh auth login -s gist)'
+        $script:DoctorIssues += 'gh-missing'
+    } else {
+        & gh auth status 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  [BLOCKED] gh authenticated'
+            Write-Host '         Fix: gh auth login -s gist'
+            $script:DoctorIssues += 'gh-auth'
+        } else {
+            $authStatus = & gh auth status 2>&1 | Out-String
+            if ($authStatus -notmatch '(?i)(?:Token scopes|scopes):.*\bgist\b') {
+                Write-Host "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)"
+                Write-Host '         Fix: gh auth refresh -s gist'
+                $script:DoctorIssues += 'gh-gist-scope'
+            } else {
+                & gh api 'gists?per_page=1' 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host '  [BLOCKED] gist API not reachable -- network outage or rate-limit'
+                    Write-Host "         Fix: check internet; if persistent, run 'gh auth refresh'"
+                    $script:DoctorIssues += 'gist-api'
+                } else {
+                    Write-Host '  [ok] gh authed with gist scope, gists API reachable'
+                }
+            }
+        }
+    }
+
+    # Connect-specific: tailscale state when cached host_target is CGNAT
+    $priorHostTarget = (Get-ConfigVal -Key 'host_target' -Default '')
+    $priorHostOnly = if ($priorHostTarget -match '@') { ($priorHostTarget -split '@')[-1] } else { $priorHostTarget }
+    if ($priorHostOnly -and (Test-CgnatIp -Ip $priorHostOnly)) {
+        $tsBin = Resolve-TailscaleBin
+        if ($tsBin) {
+            & $tsBin status 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  [ok] tailscale UP (cached host_target is tailnet CGNAT)'
+            } else {
+                Write-Host "  [BLOCKED] tailscale CLI installed but DOWN -- cached host is tailnet, can't reach"
+                Write-Host '         Fix: tailscale up'
+                $script:DoctorIssues += 'tailscale-down'
+            }
+        } else {
+            Write-Host "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach"
+            Write-Host '         Fix: winget install --id tailscale.tailscale  (then: tailscale up)'
+            $script:DoctorIssues += 'tailscale-missing'
+        }
+    } else {
+        Probe 'tailscale (optional)' {
+            $null -ne (Resolve-TailscaleBin)
+        } 'winget install --id tailscale.tailscale  (LAN-only mode works without it)'
+    }
+
+    # Connect-specific: AIRC_PORT free
+    $targetPort = if ($env:AIRC_PORT) { [int]$env:AIRC_PORT } else { 7547 }
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $targetPort)
+        $listener.Start()
+        $listener.Stop()
+        Write-Host "  [ok] port $targetPort available for hosting"
+    } catch {
+        Write-Host "  [info] port $targetPort busy -- airc will auto-shift to next free port"
+    }
+
+    # Connect-specific: cached host_target reachable (resume scenario)
+    if ($priorHostTarget) {
+        $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
+        if (Test-Path $sshKey) {
+            $probeOut = & ssh -i $sshKey -o StrictHostKeyChecking=accept-new `
+                              -o ConnectTimeout=3 -o BatchMode=yes `
+                              $priorHostTarget 'echo __PROBE_OK__' 2>$null
+            if ($probeOut -match '__PROBE_OK__') {
+                Write-Host "  [ok] cached host $priorHostTarget reachable + auth works"
+            } else {
+                Write-Host "  [warn] cached host $priorHostTarget not reachable -- may need re-pair"
+                Write-Host '         Fix: airc teardown --flush; airc join (fresh pairing)'
+            }
+        }
+    }
+
+    Write-Host ''
+    if ($script:DoctorIssues.Count -eq 0) {
+        Write-Host '  [READY] -- airc connect should work.'
+    } else {
+        Write-Host "  [BLOCKED] on $($script:DoctorIssues.Count) issue(s) -- fix the items above before 'airc connect'."
+        exit 1
+    }
+    Write-Host ''
+}
+
 # -- cmd_peers ----------------------------------------------------------
 function Invoke-Peers {
     Ensure-Init
@@ -1244,10 +1531,12 @@ function Invoke-Rooms {
     foreach ($m in $matches) {
         $marker = if ($m.Kind -eq 'room') { '#' } else { '(1:1)' }
         $hh = Get-Humanhash -HexInput $m.Id
-        Write-Host "    $marker $($m.Description)"
+        $ageStr = _FormatRelativeTime -Ts $m.Updated
+        $stale = if (_IsStale -Ts $m.Updated) { '  (stale)' } else { '' }
+        Write-Host "    $marker $($m.Description)$stale"
         Write-Host "      id:       $($m.Id)"
         Write-Host "      mnemonic: $hh"
-        Write-Host "      updated:  $($m.Updated)"
+        Write-Host "      updated:  $ageStr"
         Write-Host ''
     }
     Write-Host '  Join (auto on same gh account): airc connect'
@@ -1281,7 +1570,11 @@ function Invoke-Part {
         Remove-Item $gistIdFile, $roomFile -Force -ErrorAction SilentlyContinue
     } else {
         Write-Host "  Joiner of #$roomName parting - host gist stays open for others."
-        Remove-Item $roomFile -Force -ErrorAction SilentlyContinue
+        # Clear cached gist_id too, matching #83's joiner-side cache
+        # write-site comment (Copilot caught this on PR #92 review).
+        # Without this, a parted joiner reconnecting in the same scope
+        # would spuriously trigger stale-pairing detect on next resume.
+        Remove-Item $roomFile, $gistIdFile -Force -ErrorAction SilentlyContinue
     }
     Invoke-Teardown
 }
@@ -1842,9 +2135,16 @@ function Invoke-Connect {
             '^(--no-gist|-no-gist)$' { $useGist = $false }
             '^(--room|-room)$' { $roomName = $Argv[$i + 1]; $useRoom = $true; $i++ }
             '^(--no-general|-no-general|--no-room|-no-room)$' { $useRoom = $false }
+            '^(--no-tailscale|-no-tailscale)$' { $env:AIRC_NO_TAILSCALE = '1' }
             default { $positional += $Argv[$i] }
         }
     }
+
+    # Tailscale-installed-but-logged-out nudge. AFTER flag parsing so
+    # --no-tailscale takes effect. Default: prompt to sign in if it's
+    # installed but logged out (90% case is "I want it on, just got
+    # logged out"). --no-tailscale is the explicit opt-out.
+    Test-TailscaleLoginOrPrompt
     $target = if ($positional.Count -gt 0) { $positional[0] } else { '' }
     $reminderInterval = if ($env:AIRC_REMINDER) { [int]$env:AIRC_REMINDER }
                        elseif ($positional.Count -gt 1) { [int]$positional[1] }
@@ -1877,6 +2177,71 @@ function Invoke-Connect {
             if (Advise-TailscaleIfDown -TargetHost $priorHost) {
                 Die 'Re-run airc join after starting Tailscale.'
             }
+
+            # Stale-pairing detect (#83): if we resolved into the room
+            # via gist discovery (joiner-side gist_id was cached at pair
+            # time) and that gist is now gone or replaced, the room
+            # dissolved or got rehosted. Catch BEFORE SSH probe so we
+            # self-heal cleanly instead of silently re-pairing against
+            # a dead-but-reachable host or the wrong room.
+            #
+            # Two safety guards (Copilot caught both on PR #92 review):
+            # (a) Only trigger on authoritative 404. Auth/scope/rate-
+            #     limit/network issues all return non-zero from
+            #     `gh api gists/<id>` -- misreading those as "gist
+            #     deleted" would spuriously wipe joiner state on every
+            #     flaky network blip.
+            # (b) Capture preservedName BEFORE removing CONFIG; otherwise
+            #     Get-Name reads the deleted file and falls back to
+            #     "unknown", changing peer identity on re-exec.
+            $savedGistFile = Join-Path $AIRC_WRITE_DIR 'room_gist_id'
+            $savedRoomFile = Join-Path $AIRC_WRITE_DIR 'room_name'
+            if ((Test-Path $savedGistFile) -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+                $savedGistId = (Get-Content $savedGistFile -Raw -ErrorAction SilentlyContinue).Trim()
+                if ($savedGistId) {
+                    # Two-step gh-health gate (matching bash + doctor --connect):
+                    # auth must pass AND gist scope must be present. Without
+                    # both, gh api errors get mis-classified.
+                    $ghHealthy = $false
+                    & gh auth status 2>$null | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        $authStatus = & gh auth status 2>&1 | Out-String
+                        if ($authStatus -match '(?i)(?:Token scopes|scopes):.*\bgist\b') {
+                            $ghHealthy = $true
+                        }
+                    }
+                    if ($ghHealthy) {
+                        # Capture stderr to distinguish 404 from other failures.
+                        $probeErrFile = [System.IO.Path]::GetTempFileName()
+                        & gh api "gists/$savedGistId" 1>$null 2>$probeErrFile
+                        $probeRc = $LASTEXITCODE
+                        $probeErrText = (Get-Content $probeErrFile -Raw -ErrorAction SilentlyContinue) -as [string]
+                        Remove-Item $probeErrFile -Force -ErrorAction SilentlyContinue
+                        if ($probeRc -ne 0 -and $probeErrText -match '(?i)\b(404|not found)\b') {
+                            $preservedName = Get-Name 2>$null
+                            $savedRoom = ''
+                            if (Test-Path $savedRoomFile) {
+                                $savedRoom = (Get-Content $savedRoomFile -Raw -ErrorAction SilentlyContinue).Trim()
+                            }
+                            Write-Host ''
+                            Write-Host "  ! Saved room gist ($savedGistId) no longer on your gh -- room dissolved or rehosted."
+                            if ($savedRoom) {
+                                Write-Host "  Re-discovering #$savedRoom via fresh gist lookup..."
+                            } else {
+                                Write-Host '  Re-pairing via fresh discovery...'
+                            }
+                            Remove-Item -Force $CONFIG -ErrorAction SilentlyContinue
+                            Remove-Item -Force $savedGistFile -ErrorAction SilentlyContinue
+                            $reExecArgs = @('connect')
+                            if ($savedRoom) { $reExecArgs += @('--room', $savedRoom) }
+                            if ($preservedName) { $env:AIRC_NAME = $preservedName }
+                            & $PSCommandPath @reExecArgs
+                            exit $LASTEXITCODE
+                        }
+                    }
+                }
+            }
+
             # Auth probe before committing to monitor loop
             $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
             $probeErr = [System.IO.Path]::GetTempFileName()
@@ -1959,12 +2324,37 @@ function Invoke-Connect {
                 Die "Failed to fetch gist '$gistId'. Check the ID, network, and (if private) 'gh auth login'."
             }
             $resolved = $null
+            $resolvedHeartbeatStale = $false
+            $resolvedHeartbeatAge = 0
             try {
                 $env = $rawContent | ConvertFrom-Json
                 if ($env.airc) {
                     switch ($env.kind) {
                         'invite' { $resolved = $env.invite }
-                        'room'   { $resolved = $env.invite; $resolvedRoomName = $env.name }
+                        'room'   {
+                            $resolved = $env.invite
+                            $resolvedRoomName = $env.name
+                            # Heartbeat freshness check - structural fix for
+                            # orphan-gist class. Hosts update last_heartbeat
+                            # every AIRC_HEARTBEAT_SEC; older than
+                            # AIRC_HEARTBEAT_STALE = host dead, take over.
+                            # Pre-heartbeat gists (no field) treated as fresh
+                            # for backward compat - SSH-failure self-heal
+                            # still catches them.
+                            $hbStaleSec = 90
+                            if ($env:AIRC_HEARTBEAT_STALE) {
+                                try { $hbStaleSec = [int]$env:AIRC_HEARTBEAT_STALE } catch {}
+                            }
+                            if ($env.last_heartbeat) {
+                                try {
+                                    $hbDt = [DateTime]::Parse($env.last_heartbeat, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+                                    $resolvedHeartbeatAge = [int]((Get-Date).ToUniversalTime() - $hbDt).TotalSeconds
+                                    if ($resolvedHeartbeatAge -gt $hbStaleSec) {
+                                        $resolvedHeartbeatStale = $true
+                                    }
+                                } catch {}
+                            }
+                        }
                         default  { Die "Gist uses unknown kind '$($env.kind)' - this airc may need 'airc update'." }
                     }
                 }
@@ -1983,6 +2373,29 @@ function Invoke-Connect {
 
     if ($target -and ($target -match '@')) {
         # -- JOIN MODE --
+
+        # Stale-heartbeat fast-path takeover. If the gist we resolved had a
+        # last_heartbeat older than AIRC_HEARTBEAT_STALE, the host is dead.
+        # Skip the SSH attempt entirely - go straight to take-over. Same
+        # operations as the SSH-failure self-heal path below, but triggered
+        # from positive evidence (stale presence signal) rather than
+        # negative evidence (TCP timeout).
+        if ($resolvedHeartbeatStale -and $resolvedRoomName -and $resolvedGistId -and (Test-GhAvailable)) {
+            Write-Host ''
+            Write-Host "  ! Host of #$resolvedRoomName is stale (last heartbeat ${resolvedHeartbeatAge}s ago) - taking over..."
+            Write-Host "     (prior host gist: $resolvedGistId)"
+            & gh gist delete $resolvedGistId --yes 2>$null | Out-Null
+            $preservedName = Get-ConfigVal -Key 'name' -Default ''
+            Remove-Item -Path $CONFIG -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path (Join-Path $AIRC_WRITE_DIR 'room_name') -Force -ErrorAction SilentlyContinue
+            Write-Host "  Re-launching into host mode for #$resolvedRoomName ..."
+            Write-Host ''
+            $env:AIRC_NO_DISCOVERY = '1'
+            if ($preservedName) { $env:AIRC_NAME = $preservedName }
+            Invoke-Connect -Argv @('--room', $resolvedRoomName)
+            return
+        }
+
         $hostSshPubkeyB64 = ''
         if ($target -match '#') {
             $hostSshPubkeyB64 = ($target -split '#')[-1]
@@ -2023,6 +2436,19 @@ function Invoke-Connect {
 
         # Pair handshake via TCP (.NET native, no embedded Python)
         $peerHostOnly = ($sshTarget -split '@')[-1]
+
+        # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
+        # Resume path (line ~1877) already calls Advise-TailscaleIfDown, but
+        # that gate doesn't cover (a) cold-start `airc join <invite>` from a
+        # fresh scope or (b) the gist-discovery resolution that lands here
+        # with a tailnet host_target. Without this check, a logged-out
+        # Tailscale produces a silent unreachable-host + self-heal cascade
+        # (issue #78, Memento's case 2026-04-25). Same call shape as resume
+        # path: detect-and-instruct, do not auto-tailscale-up.
+        if (Advise-TailscaleIfDown -TargetHost $peerHostOnly) {
+            Die 'Re-run airc join after starting Tailscale.'
+        }
+
         Write-Host "  Connecting to ${peerHostOnly}:$peerPort ..."
         $mySshPub  = (Get-Content (Join-Path $IDENTITY_DIR 'ssh_key.pub') -Raw -ErrorAction SilentlyContinue).Trim()
         $mySignPub = (Get-Content (Join-Path $IDENTITY_DIR 'public.pem') -Raw -ErrorAction SilentlyContinue)
@@ -2117,6 +2543,14 @@ function Invoke-Connect {
             host_ssh_pub   = $resp.ssh_pub
         }
 
+        # If we resolved this pair via gist discovery (vs. inline-invite),
+        # persist the gist id so resume-time freshness checks (#83) can
+        # detect a gist-deletion / replacement before re-pairing against
+        # a stale host. Cleared by Invoke-Part on graceful leave.
+        if ($resolvedGistId) {
+            Set-Content -Path (Join-Path $AIRC_WRITE_DIR 'room_gist_id') -Value $resolvedGistId -NoNewline
+        }
+
         # Reminder from host
         $hostReminder = if ($resp.reminder) { [int]$resp.reminder } else { 300 }
         if ($hostReminder -gt 0) {
@@ -2189,15 +2623,22 @@ function Invoke-Connect {
             } else {
                 $now = Get-Timestamp
                 if ($useRoom) {
+                    # last_heartbeat is the host's presence signal. Updated
+                    # every AIRC_HEARTBEAT_SEC (default 30s) by a background
+                    # job spawned after gist create. Joiners check freshness
+                    # on resolve - stale = host dead, take over deterministically.
+                    # Without this, hosts that die ungracefully (sleep, kill,
+                    # OOM) leave their gist pointing at a corpse forever.
                     $envelope = [ordered]@{
-                        airc    = 1
-                        kind    = 'room'
-                        name    = $roomName
-                        topic   = ''
-                        invite  = $inviteLong
-                        host    = [ordered]@{ name=$name; user=$user; address=$hostA; port=$hostPort }
-                        created = $now
-                        updated = $now
+                        airc           = 1
+                        kind           = 'room'
+                        name           = $roomName
+                        topic          = ''
+                        invite         = $inviteLong
+                        host           = [ordered]@{ name=$name; user=$user; address=$hostA; port=$hostPort }
+                        created        = $now
+                        updated        = $now
+                        last_heartbeat = $now
                     }
                     $gistDesc = "airc room: $roomName"
                 } else {
@@ -2220,6 +2661,70 @@ function Invoke-Connect {
                     $hh = Get-Humanhash -HexInput $gistId
                     if ($useRoom) {
                         Set-Content -Path (Join-Path $AIRC_WRITE_DIR 'room_gist_id') -Value $gistId -NoNewline
+
+                        # Heartbeat job: refresh last_heartbeat in the gist
+                        # every AIRC_HEARTBEAT_SEC seconds so joiners can
+                        # deterministically detect a dead host. Mirrors the
+                        # bash heartbeat loop. Start-ThreadJob runs in-process
+                        # so when this airc connect dies, the thread dies too.
+                        $heartbeatSec = 30
+                        if ($env:AIRC_HEARTBEAT_SEC) {
+                            try { $heartbeatSec = [int]$env:AIRC_HEARTBEAT_SEC } catch {}
+                        }
+                        $hbJob = Start-ThreadJob -ScriptBlock {
+                            param($GistId, $RoomName, $InviteLong, $Name, $User, $HostA, $HostPort, $Created, $IntervalSec)
+                            while ($true) {
+                                Start-Sleep -Seconds $IntervalSec
+                                $hbNow = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                                $hbEnvelope = [ordered]@{
+                                    airc           = 1
+                                    kind           = 'room'
+                                    name           = $RoomName
+                                    topic          = ''
+                                    invite         = $InviteLong
+                                    host           = [ordered]@{ name=$Name; user=$User; address=$HostA; port=$HostPort }
+                                    created        = $Created
+                                    updated        = $hbNow
+                                    last_heartbeat = $hbNow
+                                }
+                                $hbTmp = [System.IO.Path]::GetTempFileName()
+                                try {
+                                    ($hbEnvelope | ConvertTo-Json -Depth 10) | Set-Content -Path $hbTmp -NoNewline
+                                    & gh gist edit $GistId $hbTmp 2>$null | Out-Null
+                                } catch {
+                                    # Suppress only network/transient errors; surface them as job-output for diagnose.
+                                    Write-Output "heartbeat update failed: $_"
+                                } finally {
+                                    Remove-Item $hbTmp -Force -ErrorAction SilentlyContinue
+                                }
+                            }
+                        } -ArgumentList $gistId, $roomName, $inviteLong, $name, $user, $hostA, $hostPort, $now, $heartbeatSec
+
+                        # Track heartbeat job-id so cmd_part / teardown can
+                        # stop it cleanly. Job is also killed automatically
+                        # when this PowerShell process exits (Start-ThreadJob
+                        # is in-process), which is the kill -9 / OOM path.
+                        Add-Content -Path (Join-Path $AIRC_WRITE_DIR 'airc.pid') -Value $PID
+
+                        # Graceful-exit cleanup: on PowerShell.Exiting, stop
+                        # the heartbeat job + delete the room gist so peers
+                        # don't even hit the stale window. Doesn't help kill -9
+                        # (which is exactly what the heartbeat itself is the
+                        # answer for), but covers Ctrl-C and normal teardown.
+                        # Use globals (not $using:) - the engine event runspace
+                        # captures globals reliably whereas $using: scoping
+                        # in -Action blocks is version-dependent.
+                        $global:_AircCleanupGistId  = $gistId
+                        $global:_AircCleanupHbJobId = $hbJob.Id
+                        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+                            if ($global:_AircCleanupHbJobId) {
+                                try { Stop-Job -Id $global:_AircCleanupHbJobId -ErrorAction SilentlyContinue } catch {}
+                            }
+                            if ($global:_AircCleanupGistId) {
+                                try { & gh gist delete $global:_AircCleanupGistId --yes 2>$null | Out-Null } catch {}
+                            }
+                        } | Out-Null
+
                         Write-Host "  Hosting #$roomName (gh-account substrate)."
                         Write-Host "  Other agents on your gh account auto-join via:  airc connect"
                         Write-Host "  Cross-account share:"
@@ -2380,7 +2885,7 @@ try {
         # Info
         { $_ -in @('version','--version','-v') }      { Invoke-Version; break }
         { $_ -in @('help','--help','-h') }            { Invoke-Help; break }
-        'doctor'                                       { Invoke-Doctor; break }
+        'doctor'                                       { Invoke-Doctor -Argv $rest; break }
         { $_ -in @('tests','test') }                   { Invoke-Tests; break }
 
         # Connection lifecycle

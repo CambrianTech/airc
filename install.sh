@@ -45,6 +45,19 @@ detect_pkgmgr() {
       if command -v pacman  >/dev/null 2>&1; then echo "pacman"; return; fi
       if command -v apk     >/dev/null 2>&1; then echo "apk";    return; fi
       ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash / MSYS2 / Cygwin. winget is the standard
+      # package manager on modern Windows and what install.ps1 uses;
+      # it's reachable from Git Bash as winget.exe via PATH or as
+      # `cmd /c winget`. If winget isn't there (older Win10), fall
+      # through to the unknown branch which emits the manual prereq
+      # list. Issue #83 follow-up: pre-fix, install.sh on Git Bash
+      # said "Unknown package manager (uname=MINGW64_NT-10.0-26200)"
+      # and skipped prereq install entirely.
+      if command -v winget.exe >/dev/null 2>&1 || command -v winget >/dev/null 2>&1; then
+        echo "winget"; return
+      fi
+      ;;
   esac
   echo "unknown"
 }
@@ -61,11 +74,28 @@ pkgname_for() {
         dnf)    echo "openssh-clients" ;;
         pacman) echo "openssh" ;;
         apk)    echo "openssh-client" ;;
+        winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
+      esac ;;
+    openssl)
+      case "$mgr" in
+        winget) echo "" ;;  # bundled with Git for Windows; if Git is installed, openssl is there
+        *)      echo "openssl" ;;
       esac ;;
     python3)
       case "$mgr" in
         pacman) echo "python" ;;
+        winget) echo "Python.Python.3.12" ;;
         *)      echo "python3" ;;
+      esac ;;
+    git)
+      case "$mgr" in
+        winget) echo "Git.Git" ;;
+        *)      echo "git" ;;
+      esac ;;
+    gh)
+      case "$mgr" in
+        winget) echo "GitHub.cli" ;;
+        *)      echo "gh" ;;
       esac ;;
     *) echo "$prereq" ;;
   esac
@@ -81,13 +111,36 @@ install_with_pkgmgr() {
     dnf)    sudo dnf install -y "${pkgs[@]}" ;;
     pacman) sudo pacman -S --noconfirm --needed "${pkgs[@]}" ;;
     apk)    sudo apk add --no-cache "${pkgs[@]}" ;;
+    winget)
+      # winget on Git Bash: install one ID at a time, --accept-* flags so
+      # it doesn't prompt during the script. winget.exe is the binary;
+      # plain `winget` works if PATHEXT is honored.
+      local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+      [ -z "$wbin" ] && return 1
+      local pkg
+      for pkg in "${pkgs[@]}"; do
+        [ -z "$pkg" ] && continue
+        "$wbin" install --id "$pkg" --silent --accept-source-agreements --accept-package-agreements 2>&1 \
+          || warn "winget install $pkg returned non-zero (may already be installed; continuing)"
+      done ;;
     *)      return 1 ;;
   esac
 }
 
+tailscale_present() {
+  # macOS GUI install puts Tailscale.app at /Applications without putting
+  # `tailscale` on PATH — `command -v tailscale` then lies about a missing
+  # install and we'd brew-cask over the user's working Tailscale (sudo
+  # prompt + kernel extension churn). Check the GUI bundle path too.
+  command -v tailscale >/dev/null 2>&1 && return 0
+  [ -d /Applications/Tailscale.app ] && return 0
+  [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && return 0
+  return 1
+}
+
 install_tailscale() {
   # Optional. macOS: brew cask. Linux: tailscale's official installer.
-  command -v tailscale >/dev/null 2>&1 && return 0
+  tailscale_present && return 0
   case "$(uname -s)" in
     Darwin)
       if command -v brew >/dev/null 2>&1; then
@@ -123,19 +176,40 @@ ensure_prereqs() {
     return 0
   fi
 
-  local missing=() pkgs=()
+  local missing=() pkgs=() unmappable=()
   for cmd in git gh openssl ssh-keygen python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
-      pkgs+=("$(pkgname_for "$mgr" "$cmd")")
+      local pkg; pkg=$(pkgname_for "$mgr" "$cmd")
+      if [ -z "$pkg" ]; then
+        # Manager has no auto-install path for this prereq (e.g., winget
+        # treats ssh + openssl as bundled-with-Windows / Git-for-Windows
+        # but the user hits this case if those bundles are absent).
+        # Surface clearly instead of silently skipping (#92 Copilot).
+        unmappable+=("$cmd")
+      else
+        pkgs+=("$pkg")
+      fi
     fi
   done
   if [ ${#missing[@]} -gt 0 ]; then
-    info "Installing missing prereqs via $mgr: ${missing[*]}"
-    if install_with_pkgmgr "$mgr" "${pkgs[@]}"; then
-      ok "Prereqs installed"
+    if [ ${#pkgs[@]} -gt 0 ]; then
+      info "Installing missing prereqs via $mgr: ${pkgs[*]}"
+      if install_with_pkgmgr "$mgr" "${pkgs[@]}"; then
+        ok "Auto-installable prereqs installed"
+      else
+        warn "Package install reported failure; airc may not run until you fix: ${missing[*]}"
+      fi
     else
-      warn "Package install reported failure; airc may not run until you fix: ${missing[*]}"
+      warn "Missing prereqs not auto-installable on $mgr: ${missing[*]}"
+    fi
+    if [ ${#unmappable[@]} -gt 0 ]; then
+      warn "These prereqs need manual install on $mgr: ${unmappable[*]}"
+      case "$mgr" in
+        winget)
+          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client"
+          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' provides it" ;;
+      esac
     fi
   else
     ok "All required prereqs present"
@@ -143,7 +217,7 @@ ensure_prereqs() {
 
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
-  if ! command -v tailscale >/dev/null 2>&1; then
+  if ! tailscale_present; then
     info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
     install_tailscale
   fi
@@ -279,6 +353,45 @@ if [ -d "$CLONE_DIR/skills" ]; then
     ok "Skill: /$skill_name"
   done
 fi
+
+# ── Tailscale login check ──────────────────────────────────────────────
+# Common state: Tailscale is installed but the user isn't signed in (just
+# rebooted, fresh install, auth expired). Without this check, the user's
+# first 'airc join' silently hangs trying to reach a Tailscale CGNAT IP
+# until the SSH timeout, then prints a confusing "daemon down" message.
+# Detect it here and trigger sign-in proactively.
+
+ts_post_check() {
+  local ts_bin=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_bin="tailscale"
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  fi
+  [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
+
+  local ts_out
+  ts_out=$("$ts_bin" status 2>&1) || true
+  case "$ts_out" in
+    *"Logged out"*|*"NeedsLogin"*)
+      echo ""
+      warn "Tailscale is installed but you're not signed in."
+      case "$(uname -s)" in
+        Darwin)
+          if [ -d /Applications/Tailscale.app ]; then
+            info "Opening Tailscale.app — sign in there before running 'airc join'."
+            open -a Tailscale 2>/dev/null || true
+          else
+            info "Sign in:  tailscale up"
+          fi ;;
+        *)
+          info "Sign in:  tailscale up   (follow the printed URL)" ;;
+      esac
+      ;;
+  esac
+}
+
+ts_post_check
 
 # ── Done ────────────────────────────────────────────────────────────────
 
