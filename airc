@@ -1437,22 +1437,34 @@ cmd_connect() {
   # --no-tailscale is the explicit opt-out for the few who don't.
   tailscale_login_check_or_prompt
 
-  # `airc join` (no args) joins #general. Period. Auto-scope-by-git-remote
-  # was a previous default that silently put agents in different cwds into
-  # different rooms ('#cambriantech' from one repo, '#useideem' from another),
-  # so two agents on the same gh account couldn't see each other and each
-  # wound up alone in its own "channel" — the opposite of the IRC-substrate
-  # mental model. Per-project rooms are still available via explicit
-  # `--room <name>`. AIRC_AUTO_SCOPE_ROOM=1 restores the old behavior for
-  # anyone who actually wanted it.
+  # `airc join` (no args) auto-scopes to the room matching the current cwd.
+  # Resolution: git remote org first ('useideem/authenticator' → #useideem),
+  # parent-dir basename second (local-only repos). Falls back to #general
+  # only when neither signal fires (non-git dir, no remote). The skill
+  # /join contract documents this as the default.
+  #
+  # The trade-off: two tabs in DIFFERENT projects on the same gh account
+  # land in different rooms (a #cambriantech tab can't see a #useideem
+  # tab). That's intentional — project work shouldn't mix with unrelated
+  # project chatter. Cross-project agents who need a shared lobby:
+  # `AIRC_NO_AUTO_ROOM=1 airc join` or `airc join --room general`.
+  #
+  # Two tabs in the SAME project converge automatically: both useideem
+  # tabs auto-scope to #useideem, both find each other. That's the case
+  # this default optimizes for.
+  #
+  # History: this was rolled back in PR #104 over the cross-project
+  # concern, then re-enabled here after dogfooding showed the converse
+  # bug (two same-project tabs both defaulting to #general and never
+  # converging on the project room) was the more painful failure mode.
   if [ "$use_room" = "1" ] && [ "$room_explicit" = "0" ] \
-     && [ "${AIRC_AUTO_SCOPE_ROOM:-0}" = "1" ]; then
+     && [ "${AIRC_NO_AUTO_ROOM:-0}" != "1" ]; then
     local _inferred
     _inferred=$(infer_default_room 2>/dev/null || true)
     if [ -n "$_inferred" ]; then
       room_name="${_inferred%|*}"
       local _source="${_inferred#*|}"
-      echo "  Auto-scoped: #${room_name} (AIRC_AUTO_SCOPE_ROOM=1, from git ${_source})"
+      echo "  Auto-scoped: #${room_name} (from git ${_source}; override with --room or AIRC_NO_AUTO_ROOM=1)"
     fi
   fi
 
@@ -1565,6 +1577,28 @@ cmd_connect() {
   if [ -z "$target" ] && [ -f "$CONFIG" ]; then
     local prior_host_target; prior_host_target=$(get_config_val host_target "")
     if [ -n "$prior_host_target" ]; then
+      # Explicit --room with a different saved room must not silently resume
+      # the saved pairing. Symptom (pre-fix): user runs `airc join --room foo`
+      # after having paired into #bar; resume blindly reconnects to #bar's
+      # host and the --room flag is ignored without a peep. The user has to
+      # `airc teardown --flush` before the explicit flag takes effect, which
+      # is a hidden footgun.
+      #
+      # Fix: when --room is explicit AND a saved room_name file says we were
+      # in a different room, skip resume and fall through to discovery for
+      # the requested room. Identity persists, no flush needed.
+      if [ "$room_explicit" = "1" ]; then
+        local _saved_room_check=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_check=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$_saved_room_check" ] && [ "$_saved_room_check" != "$room_name" ]; then
+          echo "  Saved pairing was for #${_saved_room_check}; --room #${room_name} requested → discarding stale pairing."
+          rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
+          # Skip the resume block entirely and let discovery run below.
+          prior_host_target=""
+        fi
+      fi
+    fi
+    if [ -n "$prior_host_target" ]; then
       local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
       echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
 
@@ -1665,6 +1699,41 @@ cmd_connect() {
         # Auth failure → re-pair needed. Network failure → fall through,
         # monitor's retry loop handles transient outages correctly.
         if echo "$probe_stderr" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
+          # Stale auth = saved pairing is dead from our side (host wiped
+          # our key, host machine reinstalled, or host_keys rotated). For
+          # room-mode pairings this is the same end-state as the host
+          # going unreachable: the saved pair is junk. If we have a
+          # saved room_name AND gh is available, fall through to fresh
+          # discovery — the room may have been re-hosted by another
+          # peer, or we'll become the new host. Identity persists, so
+          # re-pair is automatic.
+          #
+          # Without this self-heal the user had to manually run
+          # `airc teardown --flush` and paste an invite — exactly the
+          # toil airc's auto-discovery is supposed to eliminate. Hit
+          # twice in one session on 2026-04-26 (vhsm-2c84 dead host +
+          # regenerated key), which is what motivated this change.
+          local _saved_auth_room=""
+          [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_auth_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+          if [ -n "$_saved_auth_room" ] && command -v gh >/dev/null 2>&1; then
+            echo ""
+            echo "  ⚠  SSH auth to host FAILED on resume — saved pairing for #${_saved_auth_room} is stale." >&2
+            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — host rotated keys or reinstalled)" >&2
+            echo "  Self-healing: discarding stale pairing and re-discovering #${_saved_auth_room}..."
+            local _preserved_name_a; _preserved_name_a=$(get_config_val name "")
+            # Wipe joiner state but leave identity (ssh_key) and peer
+            # records intact — they'll be re-validated by the fresh
+            # handshake. room_name is wiped here and re-set after
+            # discovery succeeds, just like the non-auth self-heal does.
+            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
+            echo ""
+            exec env ${_preserved_name_a:+AIRC_NAME="$_preserved_name_a"} "$0" connect --room "$_saved_auth_room"
+          fi
+          # No saved room (legacy 1:1 invite scope) OR no gh: keep the
+          # explicit-die behavior. There's nothing to fall through to —
+          # discovery requires gh, and a 1:1 invite has no room to
+          # rejoin. The user genuinely needs to re-pair via the invite
+          # string.
           echo "  SSH auth to host FAILED on resume. Saved pairing is stale." >&2
           echo "  SSH stderr: ${probe_stderr}" >&2
           echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
