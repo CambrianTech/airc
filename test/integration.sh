@@ -1959,6 +1959,91 @@ scenario_stale_auth_room_selfheal() {
   cleanup_all
 }
 
+# ── Scenario: send_dead_monitor_dies (no silent void-broadcasts) ─────────
+# Pre-fix: `airc msg "hello"` from a host scope whose monitor is dead
+# returned exit 0 with the message appended to messages.jsonl that
+# nobody was tailing. The user's send "succeeded" but reached zero
+# peers. This is exactly how Joel hit "i see no communication going
+# on" on 2026-04-26 — shell auto-cd'd into a different scope mid-
+# session, that scope was a host with a stale pidfile, every send
+# returned 0 with zero delivery, and the actual paired tab waited
+# forever for a reply that vanished into a void.
+#
+# Post-fix: cmd_send detects host-with-dead-monitor and dies with a
+# clear diagnostic naming the scope, the stale pidfile path, and the
+# remediation. Joiner sends are unchanged (they go via SSH; monitor
+# liveness on the joiner side is irrelevant to delivery).
+scenario_send_dead_monitor_dies() {
+  section "send_dead_monitor_dies: host scope with dead monitor refuses to silent-succeed"
+  cleanup_all
+
+  # Synthesize a host scope (no host_target in config, identity present,
+  # stale pidfile pointing at a dead PID). No actual host process —
+  # we're testing cmd_send's pre-flight liveness check, not the wire.
+  local home=/tmp/airc-it-sdmd/state
+  mkdir -p "$home/identity" "$home/peers"
+  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'airc-test-sdmd' 2>/dev/null
+  cat > "$home/config.json" <<'JSON'
+{ "name": "ghost-host" }
+JSON
+  # Stale pidfile pointing at a definitely-dead PID. Pick 99999 — outside
+  # most systems' active range, plus we kill -0 to verify before asserting.
+  if kill -0 99999 2>/dev/null; then
+    fail "PID 99999 unexpectedly alive on this system — pick a different stale PID"
+    cleanup_all; return
+  fi
+  echo "99999" > "$home/airc.pid"
+
+  local out err
+  out=$(mktemp -t airc-sdmd-out.XXXXXX)
+  err=$(mktemp -t airc-sdmd-err.XXXXXX)
+  AIRC_HOME="$home" "$AIRC" msg "send into the void" >"$out" 2>"$err"
+  local rc=$?
+
+  [ "$rc" -ne 0 ] \
+    && pass "exits non-zero ($rc) when monitor is dead" \
+    || fail "exited 0 despite dead monitor (silent void-broadcast bug)"
+
+  grep -qE 'Send NOT delivered|monitor down|broadcast into a void' "$err" \
+    && pass "stderr names the failure (not silent)" \
+    || fail "stderr missing the diagnostic (got: $(cat "$err"))"
+
+  grep -qE 'pidfile.*stale|pidfile.*absent' "$err" \
+    && pass "stderr identifies pidfile state (stale or absent)" \
+    || fail "stderr doesn't mention pidfile state"
+
+  grep -qE "scope:.*$home" "$err" \
+    && pass "stderr names the offending scope dir" \
+    || fail "stderr doesn't surface scope path (user can't tell where their cwd resolved)"
+
+  # Also test the absent-pidfile path (monitor never started in this scope).
+  rm -f "$home/airc.pid"
+  AIRC_HOME="$home" "$AIRC" msg "still void" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" -ne 0 ] \
+    && pass "exits non-zero when pidfile is absent (monitor never started)" \
+    || fail "exited 0 with absent pidfile"
+  grep -qE 'pidfile:.*absent' "$err" \
+    && pass "stderr correctly distinguishes absent vs stale pidfile" \
+    || fail "stderr doesn't say 'absent' for missing pidfile"
+
+  # Negative control: with a live PID in the pidfile, send should NOT die
+  # on this check. Use $$ — the test harness's own PID, definitely alive.
+  echo $$ > "$home/airc.pid"
+  AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" = "0" ] \
+    && pass "live-pid scope: send returns 0 (no false positive on liveness check)" \
+    || fail "live-pid scope incorrectly rejected (rc=$rc, stderr=$(cat "$err"))"
+  grep -q 'live monitor probe ascii' "$home/messages.jsonl" \
+    && pass "live-pid scope: message appended to local log as expected" \
+    || fail "live-pid scope: message NOT in log despite rc=0 (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+
+  rm -f "$out" "$err"
+  rm -rf /tmp/airc-it-sdmd
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -1982,8 +2067,9 @@ case "$MODE" in
   auto_scope)   scenario_auto_scope ;;
   room_overrides_resume) scenario_room_overrides_resume ;;
   stale_auth_room_selfheal) scenario_stale_auth_room_selfheal ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|all]"; exit 2 ;;
+  send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|all]"; exit 2 ;;
 esac
 
 echo

@@ -3578,6 +3578,47 @@ cmd_send() {
       rm -f "$err"
     fi
   else
+    # Host path: append to OUR messages.jsonl. Joiners' SSH tails will
+    # pick it up and route to their monitors. BUT — if our monitor isn't
+    # actually running, no joiner is connected (the SSH tail rides on the
+    # monitor process tree), and this append goes to a log nobody reads.
+    # The send returns 0 and the user thinks it succeeded.
+    #
+    # That's exactly how Joel hit "I see no communication going on" on
+    # 2026-04-26: shell auto-cd'd into a different scope mid-session, that
+    # scope's monitor was dead, every `airc msg` returned 0 with zero
+    # delivery, and the peer in the actual room waited forever for a
+    # reply that never landed.
+    #
+    # Detect: pidfile exists AND every PID in it is alive. Anything else
+    # = monitor dead = broadcasting into a void. Die loudly so the user
+    # immediately knows their cwd / scope / monitor state is wrong.
+    local _pidfile="$AIRC_WRITE_DIR/airc.pid"
+    local _monitor_alive=0
+    if [ -f "$_pidfile" ]; then
+      local _pids; _pids=$(cat "$_pidfile" 2>/dev/null)
+      if [ -n "$_pids" ]; then
+        local _all_alive=1 _p
+        for _p in $_pids; do
+          kill -0 "$_p" 2>/dev/null || { _all_alive=0; break; }
+        done
+        [ "$_all_alive" = "1" ] && _monitor_alive=1
+      fi
+    fi
+    if [ "$_monitor_alive" = "0" ]; then
+      echo "  Send NOT delivered — this scope's monitor isn't running." >&2
+      echo "    scope:    $AIRC_WRITE_DIR" >&2
+      echo "    identity: $my_name (host)" >&2
+      if [ -f "$_pidfile" ]; then
+        echo "    pidfile:  $_pidfile (stale — process not alive)" >&2
+      else
+        echo "    pidfile:  absent (monitor never started in this scope)" >&2
+      fi
+      echo "  Joiners ride on the monitor's SSH tail; with the monitor down, your message reaches no one." >&2
+      echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
+      echo "       OR cd into the scope you actually meant to send from." >&2
+      die "monitor down — refusing to silently broadcast into a void"
+    fi
     echo "$full_msg" >> "$MESSAGES"
   fi
 
