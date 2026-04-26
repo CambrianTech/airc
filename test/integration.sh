@@ -2358,6 +2358,86 @@ scenario_general_sidecar_default() {
   rm -rf /tmp/airc-it-sc3
 }
 
+# ── Scenario: send_room_flag (cross-room broadcast from one tab) ────────
+# `airc msg --room <name>` should re-route the send to a subscribed
+# sibling scope (e.g. .airc.general). Pre-fix: --room was unknown to
+# cmd_send's argparse, fell through as message body — silent mis-routing.
+#
+# Post-fix: --room <name> consumes both args, looks up the sibling scope
+# via the .airc.<name> convention, and either re-execs with the right
+# AIRC_HOME or errors loudly listing rooms the tab IS in.
+scenario_send_room_flag() {
+  section "send_room_flag: airc send --room <name> routes to sibling scope or errors"
+  cleanup_all
+
+  # Synthesize a primary scope (#myproject) and a sibling sidecar
+  # scope (#general) so the cross-room reroute can find a target.
+  local primary=/tmp/airc-it-srf/state
+  local sidecar=/tmp/airc-it-srf/state.general
+  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
+  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'srf-primary' 2>/dev/null
+  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'srf-sidecar' 2>/dev/null
+  cat > "$primary/config.json" <<'JSON'
+{ "name": "alpha" }
+JSON
+  cat > "$sidecar/config.json" <<'JSON'
+{ "name": "alpha" }
+JSON
+  echo "myproject" > "$primary/room_name"
+  echo "general" > "$sidecar/room_name"
+  echo $$ > "$primary/airc.pid"
+  echo $$ > "$sidecar/airc.pid"
+
+  # ── Test 1: --room <current room> is a no-op route ────────────────────
+  AIRC_HOME="$primary" "$AIRC" send --room myproject "in-room test" >/dev/null 2>&1
+  grep -q 'in-room test' "$primary/messages.jsonl" \
+    && pass "--room <current>: lands in current scope's log (no-op route)" \
+    || fail "--room <current>: didn't land where expected"
+
+  # ── Test 2: --room general re-routes to sibling .general scope ────────
+  AIRC_HOME="$primary" "$AIRC" send --room general "lobby ping from alpha" >/dev/null 2>&1
+  grep -q 'lobby ping from alpha' "$sidecar/messages.jsonl" \
+    && pass "--room general: re-routed append to sibling .general scope" \
+    || fail "--room general: NOT in sidecar log (got primary=$(grep 'lobby ping' "$primary/messages.jsonl" | wc -l) sidecar=$(grep 'lobby ping' "$sidecar/messages.jsonl" 2>/dev/null | wc -l))"
+
+  # The lobby ping should NOT have leaked into the primary scope.
+  ! grep -q 'lobby ping from alpha' "$primary/messages.jsonl" \
+    && pass "--room general: did NOT also land in primary (no double-write)" \
+    || fail "--room general: leaked into primary scope (silent dual-write bug)"
+
+  # ── Test 3: --room <unsubscribed> fails loudly with diagnostic ────────
+  local err
+  err=$(mktemp -t airc-srf-err.XXXXXX)
+  AIRC_HOME="$primary" "$AIRC" send --room unsubscribed "should fail" >/dev/null 2>"$err"
+  local rc=$?
+
+  [ "$rc" -ne 0 ] \
+    && pass "--room <unsubscribed>: exits non-zero (no silent fallthrough)" \
+    || fail "--room <unsubscribed>: exited 0 despite no such room"
+
+  grep -q 'not subscribed in this scope' "$err" \
+    && pass "stderr says 'not subscribed in this scope'" \
+    || fail "stderr missing the structured 'not subscribed' line"
+
+  grep -qE 'rooms you ARE in:' "$err" \
+    && pass "stderr lists the rooms the tab IS in (helps user fix)" \
+    || fail "stderr doesn't list available rooms"
+
+  grep -qE '#myproject|#general' "$err" \
+    && pass "stderr names at least one subscribed room by name" \
+    || fail "stderr empty of room names"
+
+  # ── Test 4: --room with @peer DM also re-routes ──────────────────────
+  AIRC_HOME="$primary" "$AIRC" send --room general @somepeer "private to lobby peer" >/dev/null 2>&1
+  grep -q 'private to lobby peer' "$sidecar/messages.jsonl" \
+    && pass "--room general @peer DM: re-routed to sibling scope" \
+    || fail "--room <r> @peer DM: didn't re-route"
+
+  rm -f "$err"
+  cleanup_all
+  rm -rf /tmp/airc-it-srf
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2385,8 +2465,9 @@ case "$MODE" in
   resume_404_gist_no_silent_exit) scenario_resume_404_gist_no_silent_exit ;;
   resume_prints_connected_banner) scenario_resume_prints_connected_banner ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|all]"; exit 2 ;;
+  send_room_flag) scenario_send_room_flag ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|all]"; exit 2 ;;
 esac
 
 echo
