@@ -1651,9 +1651,19 @@ cmd_connect() {
           # Capture stderr for 404-vs-other classification. stdout is
           # redirected to /dev/null so gh's normal output doesn't pollute
           # our terminal regardless of outcome.
+          #
+          # CRITICAL: pre-declare _gist_probe_rc and use `|| _gist_probe_rc=$?`
+          # so `set -euo pipefail` does NOT abort the script when gh api
+          # returns non-zero. A 404 is the EXPECTED signal that the host
+          # teardown'd and deleted the gist — the whole reason this block
+          # exists. Without the `|| ...` guard, set -e fires on the very
+          # signal we're trying to detect, exiting silently before the
+          # classification logic below can run. Spent a session of "vhsm
+          # tab silently exits 1 on resume after host re-host" on
+          # 2026-04-26 chasing this. (Issue #118.)
           local _gist_probe_err; _gist_probe_err=$(mktemp -t airc-gist-probe.XXXXXX)
-          gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err"
-          local _gist_probe_rc=$?
+          local _gist_probe_rc=0
+          gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err" || _gist_probe_rc=$?
           local _gist_probe_stderr; _gist_probe_stderr=$(cat "$_gist_probe_err" 2>/dev/null)
           rm -f "$_gist_probe_err"
           # 404 (gist gone) shows as "Not Found" or "404" in gh's stderr.

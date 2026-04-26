@@ -2044,6 +2044,116 @@ JSON
   cleanup_all
 }
 
+# ── Scenario: resume_404_gist_no_silent_exit (issue #118) ───────────────
+# Pre-fix: when the saved room_gist_id refers to a gist that's been
+# deleted (host teardown'd), the gist-probe in the resume path runs
+# `gh api gists/<id>` under `set -euo pipefail` with no `|| ...`
+# guard. The 404 (which is the EXPECTED signal that the gist is gone)
+# trips set -e, the script exits 1 silently — BEFORE the 404
+# classification + self-heal logic below it can run. Vhsm-Claude hit
+# this on 2026-04-26: tab A teardown'd #useideem (deleted the gist),
+# tab B's resume tried to look up the now-deleted gist and silent-
+# died. The user had to `airc teardown --flush` manually, defeating
+# the whole point of saved-state self-heal.
+#
+# Post-fix: pre-declare _gist_probe_rc=0 + use `|| _gist_probe_rc=$?`
+# so set -e doesn't fire on the expected 404. The classification
+# block proceeds and self-heals into fresh discovery.
+#
+# Test: synthesize a joiner CONFIG with a known-bogus gist_id +
+# saved room_name. Run `airc connect`. Expect EITHER a self-heal
+# banner OR a structured stderr — NOT silent exit 1.
+scenario_resume_404_gist_no_silent_exit() {
+  section "resume_404_gist_no_silent_exit: deleted-gist resume self-heals (issue #118)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed; gist probe is the trigger we need)"
+    return
+  fi
+
+  # Confirm gh has gist scope — the gh-health gate requires it before the
+  # probe runs. Without it, the bug doesn't trigger and the test would
+  # pass for the wrong reason.
+  if ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+    echo "  (skipped — gh missing 'gist' scope; gh-health gate would short-circuit before the bug fires)"
+    return
+  fi
+
+  cleanup_all
+  local home=/tmp/airc-it-r404/state
+  mkdir -p "$home/identity" "$home/peers"
+  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'airc-test-r404' 2>/dev/null
+
+  # Synthesize a joiner with: host_target (so resume path fires),
+  # saved room_name (so self-heal can re-exec --room), and a bogus
+  # room_gist_id (so the 404 path is exercised). The host_target
+  # points at a dead port so the SSH probe down the line fails fast
+  # — but we want the BUG (silent exit before any of that runs) to
+  # be the question.
+  cat > "$home/config.json" <<'JSON'
+{
+  "name": "ghost-joiner",
+  "host_target": "deadhost@127.0.0.1",
+  "host_name": "deadhost",
+  "host_port": 9999,
+  "host_ssh_pub": "ssh-ed25519 AAAAignored"
+}
+JSON
+  echo "useideem-test-$$" > "$home/room_name"
+  # 32-char hex id that's vanishingly unlikely to exist on any gh
+  # account. gh api will return 404 for this.
+  echo "deadbeef00000000000000000000000d" > "$home/room_gist_id"
+
+  local out err
+  out=$(mktemp -t airc-r404-out.XXXXXX)
+  err=$(mktemp -t airc-r404-err.XXXXXX)
+
+  # Run resume with a hard timeout — pre-fix the silent-exit happens
+  # immediately, post-fix the self-heal re-execs into discovery (which
+  # may try to host on a port and block; that's fine, we kill below).
+  ( AIRC_HOME="$home" AIRC_PORT=7567 AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist >"$out" 2>"$err" ) &
+  local pid=$!
+  local i exited=0
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if grep -qE 'no longer on your gh|Re-discovering|Re-pairing|Hosting|Resume aborted|Self-healing' "$out" "$err" 2>/dev/null; then
+      break
+    fi
+    kill -0 $pid 2>/dev/null || { exited=1; break; }
+  done
+
+  # Assertion 1: must NOT silent-exit. Either still running (self-heal
+  # re-execed and is doing something) OR exited with structured stderr.
+  if [ "$exited" = "1" ]; then
+    # It exited. Did it leave a diagnostic?
+    if [ ! -s "$err" ] && ! grep -qE '⚠|Saved room gist|Re-discovering|Re-pairing|Self-healing|Resume aborted' "$out" 2>/dev/null; then
+      fail "silent exit-1 reproduced (issue #118 NOT fixed): out=$(head -3 "$out") err=$(cat "$err")"
+    else
+      pass "exit was NOT silent — stderr/stdout has a diagnostic"
+    fi
+  else
+    pass "process didn't silent-exit on 404 gist (still running or self-healing)"
+  fi
+
+  # Assertion 2: the 404 self-heal banner should be visible OR another
+  # honest failure (e.g. "Re-discovering" if room_name is set, or
+  # "Saved room gist no longer on your gh"). Pre-fix produces neither.
+  grep -qE 'no longer on your gh|Re-discovering|Re-pairing' "$out" "$err" 2>/dev/null \
+    && pass "404 self-heal banner fired (gist-deleted path classified correctly)" \
+    || fail "no self-heal banner — 404 classification didn't run (got out=$(head -3 "$out") err=$(head -3 "$err"))"
+
+  # Cleanup
+  kill -9 $pid 2>/dev/null
+  for f in "$home/airc.pid"; do
+    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
+  done
+  sleep 1
+  rm -f "$out" "$err"
+  rm -rf /tmp/airc-it-r404
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2068,8 +2178,9 @@ case "$MODE" in
   room_overrides_resume) scenario_room_overrides_resume ;;
   stale_auth_room_selfheal) scenario_stale_auth_room_selfheal ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|all]"; exit 2 ;;
+  resume_404_gist_no_silent_exit) scenario_resume_404_gist_no_silent_exit ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|all]"; exit 2 ;;
 esac
 
 echo
