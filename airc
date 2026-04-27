@@ -2218,6 +2218,16 @@ cmd_connect() {
     if echo "$gist_id" | grep -qE '^[a-zA-Z0-9]{6,40}$'; then
       echo "  Resolving gist $gist_id ..."
       local raw_content=""
+      # Each path's `raw_content=$(cmd | filter)` is protected with
+      # `|| true` so a non-zero exit on the upstream command does NOT
+      # abort the script via `set -euo pipefail`. Pre-fix: when gh
+      # rate-limited (HTTP 403), `gh api ...` exited non-zero, pipefail
+      # propagated it, set -e aborted the whole script BEFORE the next
+      # fallback ran. Net: rate-limit hit = total resolution failure
+      # with no diagnostic. Joel 2026-04-27: "this limit will kill
+      # people." Fix: per-path `|| true` makes each path advisory; the
+      # `[ -z "$raw_content" ]` gates control fallthrough explicitly.
+      #
       # Prefer `gh api` over `gh gist view --raw` — the latter prepends
       # the gist description as a header line ("airc room: general\n\n{...}")
       # which breaks JSON parse downstream. `gh api` returns the file
@@ -2227,18 +2237,43 @@ cmd_connect() {
       # handshake failed on garbage host info, and self-heal didn't fire
       # because resolved_room_name was never extracted via the jq path.
       if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        raw_content=$(gh api "gists/$gist_id" 2>/dev/null \
-                      | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null)
+        raw_content=$( (gh api "gists/$gist_id" 2>/dev/null \
+                        | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null) || true )
       fi
       # Fallback path 1: gh without jq → degraded gh gist view --raw, with
       # a description-strip in the consumer below.
       if [ -z "$raw_content" ] && command -v gh >/dev/null 2>&1; then
-        raw_content=$(gh gist view "$gist_id" --raw 2>/dev/null)
+        raw_content=$(gh gist view "$gist_id" --raw 2>/dev/null || true)
       fi
-      # Fallback path 2: anonymous curl + jq for environments without gh.
+      # Fallback path 2: git clone the gist's git remote. CRITICAL — this
+      # is the rate-limit-bypass path. The REST API has a tight gist
+      # sub-bucket (~60 reads/hr); a busy session blows through it
+      # quickly and EVERY `gh api gists/<id>` and `gh gist view <id>`
+      # call HTTP 403's. Git transport at gist.github.com uses git HTTP
+      # over the same auth but on a separate quota — it keeps working
+      # when REST is throttled. The git-clone fallback adds ~1s on the
+      # slow path but unblocks discovery completely.
+      if [ -z "$raw_content" ] && command -v git >/dev/null 2>&1; then
+        local _gist_tmp; _gist_tmp=$(mktemp -d -t airc-gist-resolve.XXXXXX 2>/dev/null || echo "")
+        if [ -n "$_gist_tmp" ] && git clone --depth 1 --quiet "https://gist.github.com/$gist_id.git" "$_gist_tmp" 2>/dev/null; then
+          # Gists typically contain ONE file (airc envelopes always do).
+          # Take the first non-dotfile, non-.git entry. If a future gist
+          # shape ships multiple files we'll add an explicit airc-envelope
+          # filename convention; for now the single-file assumption is
+          # sound across every gist airc has ever published.
+          local _gist_file
+          _gist_file=$(find "$_gist_tmp" -maxdepth 1 -type f ! -name '.git*' 2>/dev/null | head -1 || true)
+          if [ -n "$_gist_file" ] && [ -f "$_gist_file" ]; then
+            raw_content=$(cat "$_gist_file" 2>/dev/null || true)
+          fi
+        fi
+        [ -n "$_gist_tmp" ] && rm -rf "$_gist_tmp"
+      fi
+      # Fallback path 3: anonymous curl + jq for environments without gh
+      # OR git. Last resort.
       if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        raw_content=$(curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
-                      | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null)
+        raw_content=$( (curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
+                        | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null) || true )
       fi
       # Last-resort cleanup: if raw_content still has the description-header
       # leak from a degraded gh-view path, strip lines before the first '{'
