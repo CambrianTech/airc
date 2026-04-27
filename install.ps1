@@ -155,6 +155,47 @@ function Install-OpenSSHClient {
 # only. Post-fix (Joel 2026-04-27 "this needs to be in the install dude"):
 # install.ps1 now installs+starts the server too, with auto-start on
 # boot so the mesh survives reboots without manual intervention.
+# Workaround for Windows HNS (Host Network Service) randomly reserving
+# port 22 at boot. HNS dynamically reserves port ranges to support
+# Hyper-V / WSL2 / Docker Desktop networking; the reservations rotate
+# per-boot and are NOT visible in `netsh int ipv4 show excludedportrange`
+# (that command shows static admin reservations only). When port 22
+# happens to fall inside a dynamic HNS range, sshd bind() returns EPERM
+# even with admin. Diagnosis credit: continuum-b69f via cross-Mac/Windows
+# coord gist 2026-04-27. Two-step persistent fix:
+#
+#   1. Disable HNS auto-exclusion via registry — survives reboots.
+#   2. Explicitly reserve port 22 in the static excluded-port-range so
+#      HNS can't grab it on subsequent boots.
+#
+# References:
+#   keasigmadelta.com/blog/how-to-solve-cannot-bind-to-port-due-to-permission-denied-on-windows
+#   github.com/docker/for-win/issues/3171
+function Set-HnsPortFreedomFor22 {
+    # Idempotent — both checks before writing so re-runs of install
+    # don't double-write or noisy on a healthy system.
+    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
+    $regName = 'EnableExcludedPortRange'
+    $needRegWrite = $true
+    try {
+        $cur = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
+        if ($cur -eq 0) { $needRegWrite = $false }
+    } catch { }
+    if ($needRegWrite) {
+        Write-Host '    Disabling HNS auto-exclusion (HKLM\...\hns\State EnableExcludedPortRange = 0) ...'
+        & reg add 'HKLM\SYSTEM\CurrentControlSet\Services\hns\State' /v 'EnableExcludedPortRange' /d 0 /f 2>$null | Out-Null
+    }
+
+    # Check if port 22 is already in the static excluded-port-range.
+    $existing = & netsh int ipv4 show excludedportrange protocol=tcp 2>$null | Out-String
+    if ($existing -match '(?m)^\s*22\s+22\b') {
+        # Already reserved.
+        return
+    }
+    Write-Host '    Reserving port 22 in static excluded-port-range (netsh) ...'
+    & netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 2>$null | Out-Null
+}
+
 function Install-OpenSSHServer {
     $svc = Get-Service sshd -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -eq 'Running') {
@@ -163,13 +204,25 @@ function Install-OpenSSHServer {
     }
     Write-Step 'Installing + starting OpenSSH Server (admin required) ...'
     try {
-        # Install capability if not already installed.
+        # 1. Capability install (if not already).
         $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
         if ($cap.State -ne 'Installed') {
             Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
             Write-Host '    OpenSSH.Server capability installed.'
         }
-        # Start the service.
+        # 2. HNS port-22 reservation (Hyper-V quirk — see Set-HnsPortFreedomFor22).
+        Set-HnsPortFreedomFor22
+        # 3. Firewall rule for inbound TCP/22. The capability install
+        # usually creates 'OpenSSH-Server-In-TCP' but it may be disabled
+        # or missing on some systems. Idempotent.
+        if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+            Write-Host '    Creating firewall rule for inbound SSH (TCP/22) ...'
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+                                -DisplayName 'OpenSSH Server (sshd)' `
+                                -Enabled True -Direction Inbound -Protocol TCP `
+                                -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
+        }
+        # 4. Start + persist.
         Start-Service sshd -ErrorAction Stop
         Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
         Write-Ok 'OpenSSH server installed + started + auto-start on boot'
@@ -177,8 +230,11 @@ function Install-OpenSSHServer {
         Write-Warn2 "Could not auto-install OpenSSH Server (run install.ps1 in admin PowerShell): $_"
         Write-Host '    Manual fix (admin PowerShell):'
         Write-Host '      Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
+        Write-Host '      reg add HKLM\SYSTEM\CurrentControlSet\Services\hns\State /v EnableExcludedPortRange /d 0 /f'
+        Write-Host '      netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1'
         Write-Host '      Start-Service sshd'
         Write-Host '      Set-Service -Name sshd -StartupType Automatic'
+        Write-Host '    (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot.)'
     }
 }
 

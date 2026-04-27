@@ -204,31 +204,59 @@ _ensure_sshd_running() {
     MINGW*|MSYS*|CYGWIN*)
       # Windows Git Bash: probe via powershell.exe; install via UAC-elevated
       # PowerShell (Start-Process -Verb RunAs).
+      #
+      # HNS port-22 reservation: Windows HNS (Host Network Service)
+      # randomly reserves dynamic port ranges per boot to support
+      # Hyper-V/WSL2/Docker. When port 22 falls inside an HNS range,
+      # sshd bind() returns EPERM even with admin. Persistent fix:
+      # (a) reg-disable HNS auto-exclusion + (b) reserve port 22 in the
+      # static excluded-port-range. Both run inside the elevated payload
+      # so user clicks UAC once for the whole sshd setup.
+      # Diagnosis: continuum-b69f via cross-Mac/Windows coord gist
+      # 2026-04-27. Refs:
+      #   keasigmadelta.com/blog/how-to-solve-cannot-bind-to-port-...
+      #   github.com/docker/for-win/issues/3171
       if ! command -v powershell.exe >/dev/null 2>&1; then
         warn "powershell.exe not on PATH; can't auto-configure sshd."
         return 0
       fi
       local _state
       _state=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
+      # Single elevated payload: capability + HNS workaround + firewall
+      # rule + start + persist. Idempotent — the inner commands check
+      # state before writing, so re-running install on a healthy box
+      # doesn't re-prompt or duplicate state.
+      local _elevated_payload='
+$ErrorActionPreference = "Stop";
+try {
+  $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
+  if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+  $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
+  if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null }
+  $excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
+  if ($excl -notmatch "(?m)^\s*22\s+22\b") { netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null }
+  if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+  }
+  Start-Service sshd;
+  Set-Service -Name sshd -StartupType Automatic;
+  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start)";
+} catch { Write-Host "airc-elevated-error: $_" }
+'
       case "$_state" in
         Running)
           ok "sshd running (Windows OpenSSH.Server)"
           return 0
           ;;
-        Stopped|StopPending|StartPending|Paused)
-          info "sshd installed but not running — starting it (UAC prompt incoming)."
-          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command Start-Service sshd; Set-Service sshd -StartupType Automatic'" 2>&1 \
-            && ok "sshd started + auto-start configured." \
-            || warn "Self-elevation failed. Run in admin PowerShell: Start-Service sshd; Set-Service sshd -StartupType Automatic"
-          ;;
-        "")
-          info "Installing OpenSSH.Server (UAC prompt incoming) — needed for hosting airc rooms."
-          # Self-elevate, install capability, start service, set automatic.
-          # All in one elevated process so the user clicks UAC once.
-          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Start-Service sshd; Set-Service -Name sshd -StartupType Automatic'" 2>&1 \
-            && ok "OpenSSH.Server installed + started + auto-start configured." \
+        Stopped|StopPending|StartPending|Paused|"")
+          info "Configuring OpenSSH.Server + HNS port-22 reservation (UAC prompt incoming)."
+          info "  airc joiners need this to ssh-tail your messages.jsonl when you host."
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"$_elevated_payload\"'" 2>&1 \
+            && ok "OpenSSH.Server installed + started + HNS port-22 reserved + auto-start." \
             || warn "Self-elevation failed. Run in admin PowerShell:
     Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+    reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\hns\\State /v EnableExcludedPortRange /d 0 /f
+    netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1
     Start-Service sshd
     Set-Service -Name sshd -StartupType Automatic"
           ;;

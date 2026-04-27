@@ -5593,10 +5593,14 @@ _doctor_probe_sshd() {
           ;;
         "")
           printf "  [MISSING] sshd -- needed when you HOST a room\n"
-          printf "         Fix (admin PowerShell):\n"
+          printf "         Fix (admin PowerShell — five lines, run all together):\n"
           printf "           Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0\n"
+          printf "           reg add HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\hns\\\\State /v EnableExcludedPortRange /d 0 /f\n"
+          printf "           netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1\n"
           printf "           Start-Service sshd\n"
           printf "           Set-Service -Name sshd -StartupType Automatic\n"
+          printf "         (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot —\n"
+          printf "          continuum-b69f's diagnosis 2026-04-27. Without them, sshd bind returns EPERM.)\n"
           return 1
           ;;
         *)
