@@ -2760,17 +2760,19 @@ scenario_platform_adapters() {
   # statement and either die ("Unknown command") or print cmd_help.
   # Extract just the marked adapter section into a temp file we can
   # safely source.
-  local _adapters_extract; _adapters_extract=$(mktemp -t airc-it-pa.XXXXXX)
-  awk '/^# ── Platform adapters/,/^# ── End platform adapters/' "$AIRC" > "$_adapters_extract"
-  # iso_to_epoch (post-PR #152 Phase 0a) calls into airc_core.datetime
-  # via "$AIRC_PYTHON" -m. The extracted-adapter test bash needs both
-  # vars set + lib/ on PYTHONPATH so the module resolves. Pre-Phase-0a
-  # this wasn't required (the bash adapter had inline date fallbacks).
+  # Phase 3 (#152): adapters live in lib/airc_bash/platform_adapters.sh,
+  # sourced by airc at startup. The test bash directly sources that file
+  # — no awk extraction needed any more.
   local _airc_lib_dir; _airc_lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+  local _adapters_file="$_airc_lib_dir/airc_bash/platform_adapters.sh"
+  if [ ! -f "$_adapters_file" ]; then
+    fail "platform_adapters.sh not found at $_adapters_file"
+    return
+  fi
   _adapter_call() {
     AIRC_PYTHON="${AIRC_PYTHON:-python3}" \
     PYTHONPATH="${_airc_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-    bash -c "source '$_adapters_extract'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
+    bash -c "source '$_adapters_file'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
   }
 
   # ── proc_children ──
@@ -2902,7 +2904,9 @@ time.sleep(30)
     && pass "iso_to_epoch: garbage input → empty (no false-positive epoch)" \
     || fail "iso_to_epoch: garbage parsed to '$_epoch_bad' (should be empty)"
 
-  rm -f "$_adapters_extract"
+  # _adapters_extract no longer used post-Phase-3 (the file is sourced
+  # from its real location in lib/airc_bash/); nothing to clean up.
+  :
   cleanup_all
 }
 
