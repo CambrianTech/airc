@@ -33,13 +33,18 @@ import sys
 
 
 def get(config_path: str, key: str, default: str = "") -> str:
-    """Read a key from config.json. Returns default on any failure."""
+    """Read a key from config.json. Returns default on any failure.
+    Nested objects (dicts/lists) round-trip as JSON-encoded strings so
+    callers can re-parse if needed (matches handshake.get_field shape).
+    """
     try:
         with open(config_path) as f:
             c = json.load(f)
         v = c.get(key)
-        if v is None:
+        if v is None or v == "":
             return default
+        if isinstance(v, (dict, list)):
+            return json.dumps(v)
         return str(v)
     except (OSError, ValueError, KeyError):
         return default

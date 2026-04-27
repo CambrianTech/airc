@@ -316,6 +316,14 @@ get_config_val() {
   CONFIG="$CONFIG" "$AIRC_PYTHON" -m airc_core.config get "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
 }
 
+# Same as get_config_val but reads from an arbitrary config.json path.
+# Used by _whois_in_scope (#134 cross-scope walk) and other places
+# that need to read sibling-scope state without changing $CONFIG.
+get_config_val_in() {
+  local cfg="$1" key="$2" default="${3:-}"
+  CONFIG="$cfg" "$AIRC_PYTHON" -m airc_core.config get "$key" "$default" 2>/dev/null || echo "$default"
+}
+
 get_host() {
   # Address-resolution priority for the host endpoint baked into the room
   # gist (and inline join strings):
@@ -1225,7 +1233,7 @@ resolve_name() {
   if [ -n "${AIRC_NAME:-}" ]; then
     name="$AIRC_NAME"
   elif [ -f "$CONFIG" ]; then
-    name=$("$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+    name=$(get_config_val name "")
   fi
   # Reject flag-shaped names that may have leaked in from a buggy prior rename.
   case "$name" in -*) name="" ;; esac
@@ -3365,8 +3373,7 @@ cmd_rename() {
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
-  local old_name
-  old_name=$("$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  local old_name; old_name=$(get_config_val name "")
   if [ "$old_name" = "$new_name" ]; then
     echo "  Already named '$new_name'."
     return
@@ -3603,43 +3610,27 @@ _whois_in_scope() {
   local scope_peers="$scope/peers"
   [ -f "$scope_config" ] || return 1
 
+  # All scope-local config + peer file reads route through
+  # get_config_val_in / airc_core.config (#152 Phase 1). Pre-migration
+  # this function had six inline python heredocs reading individual
+  # JSON fields — each a silent-fail vector with bash-substituted
+  # SCOPE_CONFIG / PEER_FILE env vars. Now: one CLI per read.
+  #
   # Host of this scope (we're a joiner, target is the host we paired with).
-  local host_name
-  host_name=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_name", "") or "")
-except Exception: pass
-' 2>/dev/null || echo "")
+  local host_name; host_name=$(get_config_val_in "$scope_config" host_name "")
   if [ -n "$host_name" ] && [ "$target" = "$host_name" ]; then
-    local host_id_blob host_target_addr
-    host_id_blob=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.dumps(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_identity", {}) or {}))
-except Exception: print("{}")
-' 2>/dev/null || echo "{}")
-    host_target_addr=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
-except Exception: pass
-' 2>/dev/null || echo "")
+    local host_id_blob; host_id_blob=$(get_config_val_in "$scope_config" host_identity "{}")
+    local host_target_addr; host_target_addr=$(get_config_val_in "$scope_config" host_target "")
     _whois_pretty "$target" "$host_id_blob" "$host_target_addr"
     return 0
   fi
 
-  # Local peer file under this scope.
+  # Local peer file under this scope. Same get_config_val_in shape —
+  # peer files are JSON-shaped just like config.json.
   local peer_file="$scope_peers/$target.json"
   if [ -f "$peer_file" ]; then
-    local blob host
-    blob=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.dumps(json.load(open(os.environ["PEER_FILE"])).get("identity", {}) or {}))
-except Exception: print("{}")
-' 2>/dev/null)
-    host=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.load(open(os.environ["PEER_FILE"])).get("host", "") or "")
-except Exception: pass
-' 2>/dev/null)
+    local blob; blob=$(get_config_val_in "$peer_file" identity "{}")
+    local host; host=$(get_config_val_in "$peer_file" host "")
     _whois_pretty "$target" "$blob" "$host"
     return 0
   fi
@@ -3649,32 +3640,14 @@ except Exception: pass
   # host_target). The SSH key for this scope is at $scope/identity/ssh_key
   # — relay_ssh picks up IDENTITY_DIR from the env, so we set it for the
   # subprocess.
-  local host_target_addr host_airc_home
-  host_target_addr=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
-except Exception: pass
-' 2>/dev/null || echo "")
-  host_airc_home=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
-import json, os
-try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_airc_home", "") or "")
-except Exception: pass
-' 2>/dev/null || echo "")
+  local host_target_addr; host_target_addr=$(get_config_val_in "$scope_config" host_target "")
+  local host_airc_home; host_airc_home=$(get_config_val_in "$scope_config" host_airc_home "")
   if [ -n "$host_target_addr" ] && [ -n "$host_airc_home" ]; then
     local remote_blob
     remote_blob=$(IDENTITY_DIR="$scope/identity" relay_ssh "$host_target_addr" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
     if [ -n "$remote_blob" ]; then
-      local peer_id peer_host
-      peer_id=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -c '
-import sys, json
-try: print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
-except Exception: print("{}")
-' 2>/dev/null)
-      peer_host=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -c '
-import sys, json
-try: print(json.load(sys.stdin).get("host", "") or "")
-except Exception: pass
-' 2>/dev/null)
+      local peer_id; peer_id=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -m airc_core.handshake get_field identity "{}" 2>/dev/null || echo "{}")
+      local peer_host; peer_host=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -m airc_core.handshake get_field host "" 2>/dev/null || echo "")
       _whois_pretty "$target" "$peer_id" "$peer_host"
       return 0
     fi
