@@ -67,6 +67,16 @@ export AIRC_PYTHON
 # invocation inherits the same translation policy.
 export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:-/Users/;/home/;/root/}"
 
+# Force UTF-8 for stdin/stdout/stderr in every airc_core invocation.
+# Windows Python defaults to the local code page (cp1252 on most US/EU
+# installs) which can't encode common Unicode chars like → or em-dashes;
+# write attempts raise UnicodeEncodeError, the formatter's per-line
+# error handler catches it, and the message gets silently dropped from
+# the user's view. PYTHONIOENCODING=utf-8 is the standard remedy —
+# applies to every Python subprocess airc spawns. Honors user override.
+# continuum-b69f's catch + verify 2026-04-27.
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
 # Resolve the airc install dir's lib/ path and prepend to PYTHONPATH so
 # Python heredocs + module invocations can import airc_core (the
 # Python truth-layer #152). Three resolution paths, first hit wins:
