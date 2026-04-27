@@ -1152,11 +1152,32 @@ spawn_general_sidecar_if_wanted() {
   # helper on 2026-04-26.
   local _env_args=(AIRC_HOME="$_sidecar_scope" AIRC_GENERAL_SIDECAR=1 AIRC_NO_AUTO_ROOM=1)
   [ -n "$_primary_name" ] && _env_args+=("AIRC_NAME=$_primary_name")
+  # Inherit primary's --no-gist flag so test fixtures don't leak a real
+  # #general gist into the live joelteply gh namespace via the sidecar.
+  # Bug found by continuum-b69f 2026-04-27 across the cross-Mac/Windows
+  # substrate-bypass channel: scenario_part_persists et al spawn the
+  # primary with `--no-gist --no-discovery`, but those flags do not
+  # propagate to the sidecar's spawn here. The sidecar then publishes
+  # an `airc room: general` gist with the test fixture's host info
+  # (e.g. host=alpha, port=7556). Test exits via cleanup_all's `kill -9`
+  # which bypasses the on-exit gist-delete trap, leaving the gist
+  # orphaned. Real users (continuum-b69f's Windows tab) discover it,
+  # try to TCP-connect, get RST. Two layers of test isolation hole;
+  # this fix patches the upstream half. (The downstream half — kill -9
+  # bypassing the trap — is harder to fix; tracked separately.)
+  #
+  # AIRC_NO_DISCOVERY=1 propagates automatically via the subshell env;
+  # only --no-gist needs explicit forwarding because it's a flag, not
+  # an env var.
+  local _sidecar_args=(connect --room general)
+  if [ "${use_gist:-1}" = "0" ]; then
+    _sidecar_args+=(--no-gist)
+  fi
   # Unset primary's AIRC_PORT so sidecar doesn't fight for the same port —
   # primary has it bound already, sidecar's auto-bump-loop would land on
   # +1, but better to start the sidecar from the canonical default and
   # let it find its own free port without the conflict-detect dance.
-  ( env -u AIRC_PORT "${_env_args[@]}" "$0" connect --room general ) &
+  ( env -u AIRC_PORT "${_env_args[@]}" "$0" "${_sidecar_args[@]}" ) &
   local _sidecar_pid=$!
 
   # Sidecar's own scope writes its own airc.pid for its bash + descendants.
