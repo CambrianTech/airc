@@ -12,7 +12,7 @@ a real .py file with no `'\\''` shell-escape gymnastics.
 
 CLI:
 
-    PEERS_DIR=<peers-dir> python -u -m airc_core.monitor_formatter <my_name>
+    python -u -m airc_core.monitor_formatter --peers-dir <path> --my-name <name>
 """
 
 from __future__ import annotations
@@ -147,9 +147,8 @@ def _handle_rename(peers_dir: str, msg: str) -> bool:
     return False
 
 
-def run(my_name: str) -> int:
+def run(my_name: str, peers_dir: str) -> int:
     """Stream the formatter loop. Returns process exit code."""
-    peers_dir = os.environ.get("PEERS_DIR", "")
     scope_dir = os.path.dirname(peers_dir)
     config_path = os.path.join(scope_dir, "config.json")
     local_log = os.path.join(scope_dir, "messages.jsonl")
@@ -303,8 +302,12 @@ def run(my_name: str) -> int:
 
 
 def _cli() -> int:
-    my_name = sys.argv[1] if len(sys.argv) > 1 else ""
-    return run(my_name)
+    import argparse
+    p = argparse.ArgumentParser(prog="airc_core.monitor_formatter")
+    p.add_argument("--peers-dir", required=True)
+    p.add_argument("--my-name", required=True)
+    args = p.parse_args()
+    return run(args.my_name, args.peers_dir)
 
 
 if __name__ == "__main__":

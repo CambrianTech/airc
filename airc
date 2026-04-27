@@ -302,18 +302,15 @@ ensure_init() {
   die "Not initialized ($AIRC_WRITE_DIR). Run: airc connect"
 }
 
-# config CRUD migrated to airc_core.config (#152 Phase 1). Pre-
-# migration these were inline python heredocs with bash variable
-# substitution INTO the python source — every callsite (45+) was a
-# silent-fail vector if the substituted value broke python parsing.
-# Post-migration: CONFIG comes from env var; key + default come from
-# argv. Python source is fixed bytes; bash never touches it.
+# config CRUD via airc_core.config — proper argparse --flags so paths
+# are per-arg-predictable across MSYS path-translation. Each call passes
+# `--config <path>` explicitly.
 get_name() {
-  CONFIG="$CONFIG" "$AIRC_PYTHON" -m airc_core.config get_name 2>/dev/null || echo "unknown"
+  "$AIRC_PYTHON" -m airc_core.config get_name --config "$CONFIG" 2>/dev/null || echo "unknown"
 }
 
 get_config_val() {
-  CONFIG="$CONFIG" "$AIRC_PYTHON" -m airc_core.config get "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
+  "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
 }
 
 # Same as get_config_val but reads from an arbitrary config.json path.
@@ -321,7 +318,7 @@ get_config_val() {
 # that need to read sibling-scope state without changing $CONFIG.
 get_config_val_in() {
   local cfg="$1" key="$2" default="${3:-}"
-  CONFIG="$cfg" "$AIRC_PYTHON" -m airc_core.config get "$key" "$default" 2>/dev/null || echo "$default"
+  "$AIRC_PYTHON" -m airc_core.config get --config "$cfg" "$key" "$default" 2>/dev/null || echo "$default"
 }
 
 get_host() {
@@ -1259,7 +1256,7 @@ monitor() {
 # same env vars (PEERS_DIR) and argv (my_name).
 monitor_formatter() {
   local my_name="$1"
-  PEERS_DIR="$PEERS_DIR" "$AIRC_PYTHON" -u -m airc_core.monitor_formatter "$my_name"
+  "$AIRC_PYTHON" -u -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
 }
 
 # Drain pending.jsonl when the host is reachable again. Runs in background
@@ -2201,18 +2198,20 @@ except Exception:
 
     local response
     local _pair_ok=1
-    # Migrated to airc_core.handshake send (#152 Phase 1). Pre-migration
-    # this was an inline `python -c "..."` heredoc with five bash-
-    # variable substitutions INTO the python source — any special
-    # character in any field would silently break python parsing. Now:
-    # env vars + argv. Python source is fixed bytes.
-    response=$(MY_NAME="$my_name" \
-               MY_HOST="$(whoami)@$(get_host)" \
-               MY_SSH_PUB="$my_ssh_pub" \
-               MY_SIGN_PUB="$my_sign_pub" \
-               MY_AIRC_HOME="$AIRC_WRITE_DIR" \
-               MY_IDENTITY="$my_identity_json" \
-               "$AIRC_PYTHON" -m airc_core.handshake send "$peer_host_only" "$peer_port" 2>&1) || _pair_ok=0
+    # Migrated to airc_core.handshake send with proper --flags (not env
+    # vars). MSYS path-translation on Git Bash silently mangles env-var
+    # values that look like Unix paths (/Users/... → C:/Program
+    # Files/Git/Users/...) when they cross to a Windows-binary subprocess.
+    # argparse --flags are per-arg-predictable (callers can //-prefix
+    # or set MSYS2_ARG_CONV_EXCL targeted-ly). Continuum-b69f 2026-04-27
+    # traced the env-var path-mangling class.
+    response=$("$AIRC_PYTHON" -m airc_core.handshake send "$peer_host_only" "$peer_port" \
+                  --my-name "$my_name" \
+                  --my-host "$(whoami)@$(get_host)" \
+                  --my-ssh-pub "$my_ssh_pub" \
+                  --my-sign-pub "$my_sign_pub" \
+                  --my-airc-home "$AIRC_WRITE_DIR" \
+                  --my-identity-json "$my_identity_json" 2>&1) || _pair_ok=0
 
     if [ "$_pair_ok" = "0" ]; then
       # ── Self-heal: stale-host takeover ─────────────────────────────
@@ -2768,15 +2767,15 @@ JSON
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
     while true; do
-      HOST_PORT="$host_port" \
-      PEERS_DIR="$PEERS_DIR" \
-      IDENTITY_DIR="$IDENTITY_DIR" \
-      CONFIG="$CONFIG" \
-      HOST_NAME="$name" \
-      REMINDER_INTERVAL="$reminder_interval" \
-      AIRC_WRITE_DIR="$AIRC_WRITE_DIR" \
-      MESSAGES="$MESSAGES" \
-      "$AIRC_PYTHON" -m airc_core.handshake accept_one 2>/dev/null || true
+      "$AIRC_PYTHON" -m airc_core.handshake accept_one \
+        --host-port "$host_port" \
+        --peers-dir "$PEERS_DIR" \
+        --identity-dir "$IDENTITY_DIR" \
+        --config "$CONFIG" \
+        --host-name "$name" \
+        --reminder-interval "$reminder_interval" \
+        --airc-home "$AIRC_WRITE_DIR" \
+        --messages "$MESSAGES" 2>/dev/null || true
     done &
     PAIR_PID=$!
 
