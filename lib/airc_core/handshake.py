@@ -36,6 +36,47 @@ def parse_response(response_json: str) -> dict:
         return {}
 
 
+def send(host: str, port: int) -> str:
+    """Joiner-side: build payload from env vars, connect to host:port,
+    send, read response, return as string. Caller checks for empty
+    string on failure.
+
+    Env vars:
+        MY_NAME, MY_HOST, MY_SSH_PUB, MY_SIGN_PUB, MY_AIRC_HOME,
+        MY_IDENTITY (JSON string of identity dict)
+
+    Pre-migration this was an inline `python -c "..."` heredoc with
+    five bash-variable substitutions INTO the python source. Any
+    special character in any field (apostrophe in bio, embedded
+    newline in ssh_pub) silently broke parsing. Now: env vars + argv.
+    """
+    import os
+    import socket as sock_mod
+
+    payload = json.dumps({
+        "name": os.environ.get("MY_NAME", ""),
+        "host": os.environ.get("MY_HOST", ""),
+        "ssh_pub": os.environ.get("MY_SSH_PUB", ""),
+        "sign_pub": os.environ.get("MY_SIGN_PUB", ""),
+        "airc_home": os.environ.get("MY_AIRC_HOME", ""),
+        "identity": json.loads(os.environ.get("MY_IDENTITY", "{}") or "{}"),
+    })
+
+    s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect((host, int(port)))
+    s.sendall((payload + "\n").encode())
+    s.shutdown(sock_mod.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return data.decode().strip()
+
+
 def _cli() -> int:
     if len(sys.argv) < 2:
         return 2
@@ -60,6 +101,20 @@ def _cli() -> int:
         else:
             print(v if v != "" else default)
         return 0
+    if cmd == "send":
+        if len(sys.argv) < 4:
+            return 2
+        host = sys.argv[2]
+        port = sys.argv[3]
+        try:
+            print(send(host, port))
+            return 0
+        except Exception as e:
+            # Stderr surfaces; bash's `2>&1` capture lets cmd_connect's
+            # die() print the actual error per the never-swallow-errors
+            # rule.
+            print(f"airc-handshake-send-error: {e}", file=sys.stderr)
+            return 1
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
     return 2
 

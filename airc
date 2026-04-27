@@ -2601,29 +2601,18 @@ except Exception:
 
     local response
     local _pair_ok=1
-    response=$(MY_IDENTITY="$my_identity_json" "$AIRC_PYTHON" -c "
-import socket, json, sys, os
-payload = json.dumps({
-    'name': '$my_name',
-    'host': '$(whoami)@$(get_host)',
-    'ssh_pub': '''$my_ssh_pub''',
-    'sign_pub': '''$my_sign_pub''',
-    'airc_home': '$AIRC_WRITE_DIR',
-    'identity': json.loads(os.environ.get('MY_IDENTITY', '{}'))
-})
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.settimeout(30)
-sock.connect(('$peer_host_only', $peer_port))
-sock.sendall((payload + '\n').encode())
-sock.shutdown(socket.SHUT_WR)
-data = b''
-while True:
-    chunk = sock.recv(4096)
-    if not chunk: break
-    data += chunk
-sock.close()
-print(data.decode().strip())
-" 2>&1) || _pair_ok=0
+    # Migrated to airc_core.handshake send (#152 Phase 1). Pre-migration
+    # this was an inline `python -c "..."` heredoc with five bash-
+    # variable substitutions INTO the python source — any special
+    # character in any field would silently break python parsing. Now:
+    # env vars + argv. Python source is fixed bytes.
+    response=$(MY_NAME="$my_name" \
+               MY_HOST="$(whoami)@$(get_host)" \
+               MY_SSH_PUB="$my_ssh_pub" \
+               MY_SIGN_PUB="$my_sign_pub" \
+               MY_AIRC_HOME="$AIRC_WRITE_DIR" \
+               MY_IDENTITY="$my_identity_json" \
+               "$AIRC_PYTHON" -m airc_core.handshake send "$peer_host_only" "$peer_port" 2>&1) || _pair_ok=0
 
     if [ "$_pair_ok" = "0" ]; then
       # ── Self-heal: stale-host takeover ─────────────────────────────
