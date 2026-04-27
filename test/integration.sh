@@ -2868,6 +2868,33 @@ time.sleep(30)
   # automatically (no special simulation needed).
   echo "  (proc_children fallback exercised for real on platforms without pgrep — see Windows runs)"
 
+  # ── iso_to_epoch ──
+  # Single adapter replacing the BSD/GNU date split that used to live at
+  # 3 callsites (heartbeat parse, _format_relative_time, _is_stale).
+  # Same fixed timestamp + arithmetic check on the result keeps the
+  # assertion deterministic regardless of which date flavor wins.
+  # 2026-01-15T12:34:56Z = 1768480496 (UTC epoch seconds; computed via
+  # python3 -c "import datetime; print(int(datetime.datetime(2026,1,15,12,34,56,tzinfo=datetime.timezone.utc).timestamp()))").
+  local _epoch_known
+  _epoch_known=$(_adapter_call "iso_to_epoch '2026-01-15T12:34:56Z'" 2>/dev/null)
+  [ "$_epoch_known" = "1768480496" ] \
+    && pass "iso_to_epoch: known timestamp parses to expected epoch" \
+    || fail "iso_to_epoch: parse mismatch (expected 1768480496, got '$_epoch_known')"
+
+  # Empty input → empty output (callers test for empty to skip stale check)
+  local _epoch_empty
+  _epoch_empty=$(_adapter_call "iso_to_epoch ''" 2>/dev/null)
+  [ -z "$_epoch_empty" ] \
+    && pass "iso_to_epoch: empty input → empty output (graceful)" \
+    || fail "iso_to_epoch: empty input returned '$_epoch_empty' (should be empty)"
+
+  # Garbage input → empty output (no crash, no false epoch)
+  local _epoch_bad
+  _epoch_bad=$(_adapter_call "iso_to_epoch 'not-a-timestamp'" 2>/dev/null)
+  [ -z "$_epoch_bad" ] \
+    && pass "iso_to_epoch: garbage input → empty (no false-positive epoch)" \
+    || fail "iso_to_epoch: garbage parsed to '$_epoch_bad' (should be empty)"
+
   rm -f "$_adapters_extract"
   cleanup_all
 }

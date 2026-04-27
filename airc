@@ -913,6 +913,46 @@ detect_platform() {
   esac
 }
 
+# Convert an ISO 8601 UTC timestamp (e.g. "2026-04-27T03:25:54Z") to a
+# Unix epoch (seconds since 1970). Echoes the epoch on success, empty
+# on failure. Tries in order:
+#   - BSD/macOS:    date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s
+#   - GNU/Linux:    date -u -d "$ts" +%s     (also works in Git Bash on
+#                                             Windows via MSYS coreutils)
+#   - python3:      datetime.strptime fallback for any environment where
+#                   neither `date` flavor parses (rare but real on some
+#                   minimal Cygwin/MSYS installs without coreutils).
+#
+# Why an adapter: the BSD-vs-GNU date split was inlined at 3 callsites
+# pre-canary. Each had its own `date -j -u -f ... || date -u -d ...`
+# fallback chain — so when WSL's date semantics drifted (it's GNU but
+# old enough to reject some flag combos) the fix had to land at every
+# site. Single adapter = single fix. Mac integration tests still cover
+# both branches because Mac's `date -j` succeeds first; the python
+# fallback is only reachable on hosts where both `date` flavors fail.
+iso_to_epoch() {
+  local ts="${1:-}"
+  [ -z "$ts" ] && return 0
+  local epoch=""
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    echo "$epoch"; return 0
+  fi
+  if epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    echo "$epoch"; return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import datetime, sys
+try:
+    dt = datetime.datetime.strptime('$ts', '%Y-%m-%dT%H:%M:%SZ')
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+    print(int(dt.timestamp()))
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+  fi
+}
+
 # ── End platform adapters ───────────────────────────────────────────────
 
 relay_ssh() {
@@ -2220,13 +2260,11 @@ cmd_connect() {
               _hb_iso=$(printf '%s' "$raw_content" | jq -r '.last_heartbeat // empty' 2>/dev/null)
               _hb_stale_sec="${AIRC_HEARTBEAT_STALE:-90}"
               if [ -n "$_hb_iso" ]; then
-                # Convert ISO-8601 UTC to epoch. GNU date and BSD date
-                # have incompatible flags; try GNU first (linux + git-bash),
-                # fall back to BSD (mac default). If both fail (busybox?),
-                # skip the check rather than mis-classify.
-                _hb_ts=$(date -u -d "$_hb_iso" +%s 2>/dev/null \
-                         || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$_hb_iso" +%s 2>/dev/null \
-                         || echo "")
+                # Cross-platform ISO→epoch via the iso_to_epoch adapter.
+                # Pre-adapter this site had its own BSD/GNU date fallback
+                # chain (one of three duplicates that drifted indepen-
+                # dently — see commit history before the dedupe).
+                _hb_ts=$(iso_to_epoch "$_hb_iso")
                 if [ -n "$_hb_ts" ]; then
                   _now_ts=$(date -u +%s)
                   _resolved_heartbeat_age=$(( _now_ts - _hb_ts ))
@@ -4105,21 +4143,14 @@ cmd_rooms() {
 }
 
 # Convert an ISO 8601 timestamp into a relative-time string ("12m ago",
-# "3h ago", "2d ago"). Handles both macOS BSD date and GNU/Linux date
-# syntax differences. Falls back to the raw timestamp on parse failure.
-# Used by cmd_rooms to display gist activity (#82).
+# "3h ago", "2d ago"). Falls back to the raw timestamp on parse failure.
+# Used by cmd_rooms to display gist activity (#82). Date parsing goes
+# through iso_to_epoch so the BSD/GNU/python fallback chain is shared.
 _format_relative_time() {
   local ts="${1:-}"
   [ -z "$ts" ] && { echo "(unknown)"; return; }
-  local epoch
-  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
-    : # BSD/macOS
-  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
-    : # GNU/Linux/WSL
-  else
-    echo "$ts"
-    return
-  fi
+  local epoch; epoch=$(iso_to_epoch "$ts")
+  if [ -z "$epoch" ]; then echo "$ts"; return; fi
   local now; now=$(date -u +%s)
   local diff=$((now - epoch))
   if [ "$diff" -lt 0 ]; then echo "$ts"; return; fi
@@ -4132,18 +4163,14 @@ _format_relative_time() {
 
 # Return 0 if the given ISO timestamp is older than AIRC_STALE_HOURS
 # (default 24h). Used to mark abandoned rooms in cmd_rooms output (#82).
+# Shares iso_to_epoch with _format_relative_time so a future date-parse
+# fix lands once.
 _is_stale() {
   local ts="${1:-}"
   local threshold_hours="${AIRC_STALE_HOURS:-24}"
   [ -z "$ts" ] && return 1
-  local epoch
-  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
-    :
-  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
-    :
-  else
-    return 1
-  fi
+  local epoch; epoch=$(iso_to_epoch "$ts")
+  [ -z "$epoch" ] && return 1
   local now; now=$(date -u +%s)
   local diff=$((now - epoch))
   [ "$diff" -gt $((threshold_hours * 3600)) ]
