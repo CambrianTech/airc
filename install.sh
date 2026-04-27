@@ -222,6 +222,55 @@ ensure_prereqs() {
     ok "All required prereqs present"
   fi
 
+  # sshd: airc joiners ssh into the host's airc_home to tail messages.
+  # Every airc user who'll host a room (which is most users — first to
+  # discover becomes the host) needs sshd RUNNING on their box. Pre-fix
+  # 2026-04-27: install printed "All required prereqs present" against
+  # systems with no sshd, then airc connect's first cross-machine pair
+  # silently failed at the ssh-tail step. Now we detect + provide the
+  # platform-specific fix.
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      # macOS: sshd is launchd-managed via Remote Login.
+      if ! launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd" \
+         && ! systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
+        warn "sshd not running (Remote Login OFF) — needed when you HOST a room."
+        warn "  Enable: System Settings -> General -> Sharing -> Remote Login"
+        warn "  Or:     sudo systemsetup -setremotelogin on"
+      fi
+      ;;
+    Linux)
+      if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
+        warn "sshd not running — needed when you HOST a room."
+        warn "  Debian/Ubuntu: sudo apt-get install openssh-server && sudo systemctl enable --now ssh"
+        warn "  RHEL/Fedora:   sudo dnf install openssh-server && sudo systemctl enable --now sshd"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash: probe via powershell.exe.
+      if command -v powershell.exe >/dev/null 2>&1; then
+        _SSHD_STATE=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
+        case "$_SSHD_STATE" in
+          Running) ok "sshd running (OpenSSH.Server service)" ;;
+          Stopped|StopPending|StartPending|Paused)
+            warn "sshd installed but not running (state: $_SSHD_STATE) — needed when you HOST."
+            warn "  Run in admin PowerShell:"
+            warn "    Start-Service sshd"
+            warn "    Set-Service sshd -StartupType Automatic"
+            ;;
+          "")
+            warn "sshd NOT installed — needed when you HOST a room."
+            warn "  Run in admin PowerShell (one-time):"
+            warn "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
+            warn "    Start-Service sshd"
+            warn "    Set-Service -Name sshd -StartupType Automatic"
+            warn "  Then re-run install.sh."
+            ;;
+        esac
+      fi
+      ;;
+  esac
+
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
   if ! tailscale_present; then
