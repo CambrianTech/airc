@@ -5614,8 +5614,16 @@ _doctor_probe_sshd() {
 
 _doctor_probe_tailscale() {
   local mgr="$1"
-  if command -v tailscale >/dev/null 2>&1; then
-    if tailscale status >/dev/null 2>&1; then
+  # Use resolve_tailscale_bin so we find macOS GUI-installed Tailscale.app
+  # (the binary lives at /Applications/Tailscale.app/Contents/MacOS/Tailscale,
+  # not on PATH by default). Bare `command -v tailscale` false-negatives
+  # on every Mac that installed via the App Store / dmg — caught live
+  # 2026-04-27 when Mac doctor said "tailscale not installed" while
+  # airc was actively publishing a Tailscale IP from the running app.
+  local _ts_bin
+  _ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  if [ -n "$_ts_bin" ]; then
+    if "$_ts_bin" status >/dev/null 2>&1; then
       printf "  [ok] tailscale (optional) -- daemon up\n"
     else
       printf "  [info] tailscale (optional) -- installed but daemon not up\n"
