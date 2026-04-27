@@ -797,84 +797,6 @@ scenario_auth_failure() {
   cleanup_all
 }
 
-scenario_resume_stale_auth() {
-  section "resume_stale_auth: teardown + resume with stale SSH key must fail LOUDLY, not silently"
-  cleanup_all
-
-  # This is the "default broken" path joel flagged. A user runs `airc teardown`
-  # (without --flush, so saved pairing stays) and then `airc connect` (no args,
-  # resume path). If their SSH key has been invalidated on the host — by a
-  # reinstall regenerating identity keys, by authorized_keys rotation, by ANY
-  # cause — the old resume path silently started a tail loop that retried
-  # forever while the user waited for a mesh that was never coming back.
-
-  spawn_host /tmp/airc-it-rsa-h rsahost 7549 || { fail "rsahost failed to start"; return; }
-  local join; join=$(read_join_string /tmp/airc-it-rsa-h)
-  spawn_joiner /tmp/airc-it-rsa-j rsajoiner "$join" || { fail "rsajoiner join failed"; return; }
-  sleep 3
-
-  # Baseline: confirm fresh pair works
-  as_home /tmp/airc-it-rsa-j send @rsahost "baseline" >/dev/null 2>&1 \
-    && pass "baseline: fresh pair works" || { fail "baseline broken"; return; }
-
-  # ── Simulate the stale-auth state: kill the joiner (non-flush — preserves
-  # config.json + identity + peer records), then regenerate the identity key
-  # BEHIND the host's back (the host's authorized_keys still has the old key).
-  AIRC_HOME=/tmp/airc-it-rsa-j/state AIRC_PORT=7549 "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-  rm -f /tmp/airc-it-rsa-j/state/identity/ssh_key \
-        /tmp/airc-it-rsa-j/state/identity/ssh_key.pub
-  ssh-keygen -t ed25519 -f /tmp/airc-it-rsa-j/state/identity/ssh_key \
-             -N '' -q -C 'airc-stale-post-reinstall' 2>/dev/null
-
-  # ── Now attempt a resume. PRE-FIX: silently starts a tail loop that
-  # retries forever. POST-FIX: auth probe detects the stale key and dies.
-  local resume_out; resume_out=$(mktemp -t airc-rsa-out.XXXXXX)
-  local resume_err; resume_err=$(mktemp -t airc-rsa-err.XXXXXX)
-  # Background with a timeout so the pre-fix silent-loop doesn't hang the test.
-  ( AIRC_HOME=/tmp/airc-it-rsa-j/state "$AIRC" connect >"$resume_out" 2>"$resume_err" ) &
-  local resume_pid=$!
-  # Give it up to 10s to either exit (post-fix) or go silent into the tail
-  # retry loop (pre-fix — we'll kill it).
-  local exited=0 i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 1
-    if ! kill -0 $resume_pid 2>/dev/null; then exited=1; break; fi
-  done
-  if [ "$exited" = "0" ]; then
-    # Still running after 10s — pre-fix behavior. Kill it, record the failure.
-    kill -9 $resume_pid 2>/dev/null
-    fail "resume_stale_auth: connect still running after 10s — silent retry loop (pre-fix bug)"
-  else
-    pass "resume_stale_auth: connect exited promptly (${i}s) rather than silently looping"
-  fi
-
-  wait $resume_pid 2>/dev/null
-  local resume_exit=$?
-
-  # Post-fix expectations
-  if [ "$resume_exit" -ne 0 ]; then
-    pass "resume_stale_auth: connect exited non-zero ($resume_exit) on stale auth"
-  else
-    fail "resume_stale_auth: connect exited 0 despite broken auth"
-  fi
-
-  grep -qiE 'auth|permission|publickey' "$resume_err" \
-    && pass "resume_stale_auth: stderr surfaces the SSH auth error" \
-    || fail "resume_stale_auth: stderr doesn't mention auth (got: $(cat "$resume_err"))"
-
-  grep -qE 'teardown --flush' "$resume_err" \
-    && pass "resume_stale_auth: stderr tells user HOW to fix" \
-    || fail "resume_stale_auth: no --flush repair command in stderr"
-
-  grep -qE 'invite string' "$resume_err" \
-    && pass "resume_stale_auth: stderr reconstructs the saved invite string for convenience" \
-    || fail "resume_stale_auth: no reconstructed invite string in stderr"
-
-  rm -f "$resume_out" "$resume_err"
-  cleanup_all
-}
-
 # ── Scenario: room (#39 — IRC-style #general substrate) ────────────────
 # Validates the room-mode flag plumbing, host-vs-joiner detection in
 # cmd_part, and that --no-gist still records local room state. Doesn't
@@ -1817,190 +1739,11 @@ scenario_auto_scope() {
   cleanup_all
 }
 
-# ── Scenario: room_overrides_resume (--room discards stale saved pairing) ──
-# Pre-fix: `airc connect --room foo` after a prior pairing into #bar
-# silently ignored the flag and resumed #bar's host, because the resume
-# path didn't compare the saved room_name to the explicit --room. The
-# user had to manually `airc teardown --flush` before the flag took
-# effect — exactly the toil the substrate is supposed to eliminate.
-#
-# Post-fix: when --room is explicit AND saved room_name differs, the
-# resume path discards the stale CONFIG + room_name + room_gist_id and
-# falls through to discovery for the requested room. Identity persists
-# (no flush needed); ssh_key + peer records survive.
-scenario_room_overrides_resume() {
-  section "room_overrides_resume: explicit --room discards stale saved pairing"
-  cleanup_all
-
-  # Synthesize a saved joiner state for room #old-room with a dead host.
-  # We don't need a real host — the resume path checks --room/saved-room
-  # mismatch BEFORE attempting any SSH probe, and bails early if they
-  # differ. (The probe itself is exercised by scenario_resume_stale_auth.)
-  local home=/tmp/airc-it-ror/state
-  mkdir -p "$home/identity"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'airc-test-ror' 2>/dev/null
-  cat > "$home/config.json" <<'JSON'
-{
-  "name": "alpha",
-  "host_target": "deadhost@127.0.0.1:9999",
-  "host_name": "deadhost",
-  "host_port": 9999,
-  "host_ssh_pub": "ssh-ed25519 AAAAignored"
-}
-JSON
-  echo "old-room" > "$home/room_name"
-
-  # Run connect with --room new-room. Should discard stale pair, then
-  # proceed to host #new-room (AIRC_NO_DISCOVERY=1 + --no-gist keep
-  # this gh-free).
-  AIRC_HOME="$home" AIRC_NAME=alpha AIRC_PORT=7563 AIRC_NO_DISCOVERY=1 \
-    "$AIRC" connect --room new-room --no-gist > /tmp/airc-it-ror.log 2>&1 &
-  local pid=$!
-  local i
-  for i in 1 2 3 4 5 6; do
-    sleep 1
-    grep -qE 'Hosting #new-room|discarding stale pairing' /tmp/airc-it-ror.log 2>/dev/null && break
-  done
-
-  grep -qE 'Saved pairing was for #old-room.*--room #new-room.*discarding stale pairing' /tmp/airc-it-ror.log \
-    && pass "discard banner fires with old room + new room named" \
-    || fail "no discard banner (got: $(head -5 /tmp/airc-it-ror.log | tr '\n' '|'))"
-
-  grep -qE 'Hosting #new-room' /tmp/airc-it-ror.log \
-    && pass "fell through to host #new-room after discarding stale pair" \
-    || fail "did NOT host #new-room (got: $(grep -E 'Hosting|Resuming' /tmp/airc-it-ror.log | head -3 | tr '\n' '|'))"
-
-  ! grep -qE 'Resuming as joiner of .deadhost' /tmp/airc-it-ror.log \
-    && pass "did NOT resume the stale deadhost pairing" \
-    || fail "still tried to resume deadhost despite explicit --room"
-
-  # Identity must survive — ssh_key intact post-discard.
-  [ -f "$home/identity/ssh_key" ] \
-    && pass "identity (ssh_key) preserved across discard" \
-    || fail "ssh_key was wiped (over-broad cleanup)"
-
-  for f in "$home/airc.pid"; do
-    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
-  done
-  sleep 1
-  rm -rf /tmp/airc-it-ror /tmp/airc-it-ror.log
-  cleanup_all
-}
-
-# ── Scenario: stale_auth_room_selfheal (room-mode auto-recover) ────────
-# Pre-fix companion to scenario_resume_stale_auth: when the saved
-# pairing has a saved room_name (i.e. we were in a #room, not a 1:1
-# invite), stale SSH auth shouldn't `die` and demand the user run
-# `airc teardown --flush`. It should fall through to fresh discovery
-# for that room — re-pair against whoever's now hosting, or become
-# the new host. Identity persists; the user does nothing.
-#
-# Without this self-heal, the bare `airc join` UX hits a forced manual
-# repair every time a host machine reinstalls / rotates keys / wipes
-# state — exactly the cliff Joel hit twice on 2026-04-26 (vhsm-2c84
-# dead host followed by the no-saved-pair-after-flush bug, which sent
-# us into #general instead of #useideem).
-#
-# This test covers ONLY the saved-room branch. The legacy 1:1 invite
-# branch (no saved room) keeps its die-loud behavior and is still
-# covered by scenario_resume_stale_auth.
-scenario_stale_auth_room_selfheal() {
-  section "stale_auth_room_selfheal: room-mode resume self-heals on stale auth"
-  cleanup_all
-
-  local rname="sars-test-$$"
-  mkdir -p /tmp/airc-it-sars-h /tmp/airc-it-sars-j
-
-  # Host alpha in room mode (gh-free).
-  ( cd /tmp/airc-it-sars-h && AIRC_HOME=/tmp/airc-it-sars-h/state AIRC_NAME=alpha AIRC_PORT=7564 \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist --room "$rname" > /tmp/airc-it-sars-h/out.log 2>&1 & )
-  local i
-  for i in 1 2 3 4 5; do
-    sleep 1
-    grep -q 'Hosting as' /tmp/airc-it-sars-h/out.log 2>/dev/null && break
-  done
-  grep -q 'Hosting as' /tmp/airc-it-sars-h/out.log \
-    && pass "alpha hosting #${rname}" \
-    || { fail "alpha did not start"; cleanup_all; return; }
-
-  local join; join=$(read_join_string /tmp/airc-it-sars-h)
-  [ -n "$join" ] || { fail "no join string from alpha"; cleanup_all; return; }
-
-  # Joiner beta pairs into the room (also writes room_name on disk).
-  ( cd /tmp/airc-it-sars-j && AIRC_HOME=/tmp/airc-it-sars-j/state AIRC_NAME=beta \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect "$join" > /tmp/airc-it-sars-j/out.log 2>&1 & )
-  for i in 1 2 3 4 5 6; do
-    sleep 1
-    grep -q 'Connected to' /tmp/airc-it-sars-j/out.log 2>/dev/null && break
-  done
-  grep -q 'Connected to' /tmp/airc-it-sars-j/out.log \
-    && pass "beta paired with alpha" \
-    || { fail "beta join failed"; cleanup_all; return; }
-
-  # Beta's resume path needs a saved room_name to pick the self-heal
-  # branch over the die branch. The non-discovery inline-invite join
-  # path doesn't write room_name — synthesize it the way a discovery
-  # join would. (Production discovery join always writes this.)
-  echo "$rname" > /tmp/airc-it-sars-j/state/room_name
-
-  # Stale-auth simulation: kill beta, regenerate beta's SSH key. Alpha's
-  # authorized_keys still has the OLD key, so any resume probe will get
-  # "Permission denied (publickey)" — which is the trigger for the
-  # self-heal we're testing.
-  AIRC_HOME=/tmp/airc-it-sars-j/state "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-  rm -f /tmp/airc-it-sars-j/state/identity/ssh_key \
-        /tmp/airc-it-sars-j/state/identity/ssh_key.pub
-  ssh-keygen -t ed25519 -f /tmp/airc-it-sars-j/state/identity/ssh_key \
-             -N '' -q -C 'airc-stale-sars' 2>/dev/null
-
-  # Resume. Pre-fix would die (exit 1). Post-fix: re-execs with
-  # --room ${rname}. AIRC_NO_DISCOVERY is NOT inherited across the
-  # re-exec, but with no real gh probe configured here the discovery
-  # path will silently no-op and fall through to host mode — beta
-  # becomes the new host of #${rname}. We just need to verify it
-  # DIDN'T die and DID land in the room.
-  local resume_out=/tmp/airc-it-sars-j-resume.out
-  local resume_err=/tmp/airc-it-sars-j-resume.err
-  ( AIRC_HOME=/tmp/airc-it-sars-j/state AIRC_PORT=7565 AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist >"$resume_out" 2>"$resume_err" ) &
-  local resume_pid=$!
-  local exited=0
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 1
-    grep -qE "Hosting #${rname}|Self-healing|Resume aborted" "$resume_out" "$resume_err" 2>/dev/null && break
-    kill -0 $resume_pid 2>/dev/null || { exited=1; break; }
-  done
-
-  grep -qE 'Self-healing: discarding stale pairing' "$resume_out" \
-    && pass "self-heal banner fires on stale-auth resume in room mode" \
-    || fail "self-heal banner missing (got: $(head -10 "$resume_out" "$resume_err" | tr '\n' '|'))"
-
-  ! grep -qE 'Resume aborted — re-pair required' "$resume_err" \
-    && pass "did NOT die with 'Resume aborted' (room-mode self-heal took over)" \
-    || fail "still died with Resume aborted despite saved room_name"
-
-  grep -qE "Hosting #${rname}" "$resume_out" \
-    && pass "beta self-healed into hosting #${rname}" \
-    || fail "beta did NOT land in #${rname} after self-heal (got: $(grep -E 'Hosting|Found' "$resume_out" | head -3 | tr '\n' '|'))"
-
-  # Identity must survive the re-exec (peer records preserved means
-  # any future re-pair recognizes us as the same beta, not a stranger).
-  [ -f /tmp/airc-it-sars-j/state/identity/ssh_key ] \
-    && pass "identity (ssh_key) survived self-heal re-exec" \
-    || fail "ssh_key wiped during self-heal"
-
-  # Cleanup the resume process + harness.
-  kill -9 $resume_pid 2>/dev/null
-  for f in /tmp/airc-it-sars-h/state/airc.pid /tmp/airc-it-sars-j/state/airc.pid; do
-    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
-  done
-  sleep 1
-  rm -f "$resume_out" "$resume_err"
-  cleanup_all
-}
+# Scenarios room_overrides_resume + stale_auth_room_selfheal removed in #130.
+# Both tested resume-path behavior (--room flag override, stale-auth self-heal)
+# that exists trivially under the new always-discover model. The connect-after-
+# kill recovery property is now covered by scenario_connect_after_kill_recovers
+# below (uses real gh; gh-free legacy flows are out of scope after #130).
 
 # ── Scenario: send_dead_monitor_dies (no silent void-broadcasts) ─────────
 # Pre-fix: `airc msg "hello"` from a host scope whose monitor is dead
@@ -2087,176 +1830,131 @@ JSON
   cleanup_all
 }
 
-# ── Scenario: resume_404_gist_no_silent_exit (issue #118) ───────────────
-# Pre-fix: when the saved room_gist_id refers to a gist that's been
-# deleted (host teardown'd), the gist-probe in the resume path runs
-# `gh api gists/<id>` under `set -euo pipefail` with no `|| ...`
-# guard. The 404 (which is the EXPECTED signal that the gist is gone)
-# trips set -e, the script exits 1 silently — BEFORE the 404
-# classification + self-heal logic below it can run. Vhsm-Claude hit
-# this on 2026-04-26: tab A teardown'd #useideem (deleted the gist),
-# tab B's resume tried to look up the now-deleted gist and silent-
-# died. The user had to `airc teardown --flush` manually, defeating
-# the whole point of saved-state self-heal.
+# ── Scenario: connect_after_kill_recovers (#130, replaces resume_*) ──────
+# The architectural property of #130: cached pairing in CONFIG is NEVER
+# trusted. Every `airc connect` runs discovery and re-pairs against the
+# live gist. So the bug class "(SSH verified) printed against an
+# unreachable cached host" — and its silent-success / silent-failure
+# cousins — is structurally impossible.
 #
-# Post-fix: pre-declare _gist_probe_rc=0 + use `|| _gist_probe_rc=$?`
-# so set -e doesn't fire on the expected 404. The classification
-# block proceeds and self-heals into fresh discovery.
+# Repro shape (the bug Joel hit on 2026-04-26):
+#   1. Two tabs paired (alpha hosting, beta joined). Beta's CONFIG now
+#      has host_target=alpha's-address.
+#   2. Alpha's process dies (machine restart, crash, kill -9). Alpha's
+#      gist may also be gone (graceful teardown deletes it; ungraceful
+#      leaves it stale).
+#   3. Beta runs `airc connect` again.
 #
-# Test: synthesize a joiner CONFIG with a known-bogus gist_id +
-# saved room_name. Run `airc connect`. Expect EITHER a self-heal
-# banner OR a structured stderr — NOT silent exit 1.
-scenario_resume_404_gist_no_silent_exit() {
-  section "resume_404_gist_no_silent_exit: deleted-gist resume self-heals (issue #118)"
+# Pre-#130: beta's resume path SSH-probed alpha's cached address. If
+# alpha's listener was orphan-surviving (or another airc happened to
+# bind that port), the probe could "succeed" and beta would print
+# "Resumed as joiner of 'alpha' (SSH verified)" — against a ghost.
+# Outbound messages vaporized; the user couldn't tell.
+#
+# Post-#130: no resume code path. Beta's connect runs discovery,
+# finds alpha's stale gist (or none), and either takes over as new
+# host or rediscovers the live one. NEVER prints "(SSH verified)"
+# against the cached pairing because there's no SSH probe of cached
+# pairings to print that for.
+#
+# Test: requires real gh (the architectural property is gh-rooted).
+scenario_connect_after_kill_recovers() {
+  section "connect_after_kill_recovers: cached pairing never trusted; discovery is the only path (#130)"
 
   if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
-    echo "  (skipped — gh not authed; gist probe is the trigger we need)"
-    return
-  fi
-
-  # Confirm gh has gist scope — the gh-health gate requires it before the
-  # probe runs. Without it, the bug doesn't trigger and the test would
-  # pass for the wrong reason.
-  if ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
-    echo "  (skipped — gh missing 'gist' scope; gh-health gate would short-circuit before the bug fires)"
+    echo "  (skipped — gh not authed; discovery requires gh)"
     return
   fi
 
   cleanup_all
-  local home=/tmp/airc-it-r404/state
-  mkdir -p "$home/identity" "$home/peers"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'airc-test-r404' 2>/dev/null
+  local rname="cakr-test-$$"
+  mkdir -p /tmp/airc-it-cakr-h /tmp/airc-it-cakr-j
 
-  # Synthesize a joiner with: host_target (so resume path fires),
-  # saved room_name (so self-heal can re-exec --room), and a bogus
-  # room_gist_id (so the 404 path is exercised). The host_target
-  # points at a dead port so the SSH probe down the line fails fast
-  # — but we want the BUG (silent exit before any of that runs) to
-  # be the question.
-  cat > "$home/config.json" <<'JSON'
-{
-  "name": "ghost-joiner",
-  "host_target": "deadhost@127.0.0.1",
-  "host_name": "deadhost",
-  "host_port": 9999,
-  "host_ssh_pub": "ssh-ed25519 AAAAignored"
-}
-JSON
-  echo "useideem-test-$$" > "$home/room_name"
-  # 32-char hex id that's vanishingly unlikely to exist on any gh
-  # account. gh api will return 404 for this.
-  echo "deadbeef00000000000000000000000d" > "$home/room_gist_id"
-
-  local out err
-  out=$(mktemp -t airc-r404-out.XXXXXX)
-  err=$(mktemp -t airc-r404-err.XXXXXX)
-
-  # Run resume with a hard timeout — pre-fix the silent-exit happens
-  # immediately, post-fix the self-heal re-execs into discovery (which
-  # may try to host on a port and block; that's fine, we kill below).
-  ( AIRC_HOME="$home" AIRC_PORT=7567 AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist >"$out" 2>"$err" ) &
-  local pid=$!
-  local i exited=0
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 1
-    if grep -qE 'no longer on your gh|Re-discovering|Re-pairing|Hosting|Resume aborted|Self-healing' "$out" "$err" 2>/dev/null; then
-      break
-    fi
-    kill -0 $pid 2>/dev/null || { exited=1; break; }
-  done
-
-  # Assertion 1: must NOT silent-exit. Either still running (self-heal
-  # re-execed and is doing something) OR exited with structured stderr.
-  if [ "$exited" = "1" ]; then
-    # It exited. Did it leave a diagnostic?
-    if [ ! -s "$err" ] && ! grep -qE '⚠|Saved room gist|Re-discovering|Re-pairing|Self-healing|Resume aborted' "$out" 2>/dev/null; then
-      fail "silent exit-1 reproduced (issue #118 NOT fixed): out=$(head -3 "$out") err=$(cat "$err")"
-    else
-      pass "exit was NOT silent — stderr/stdout has a diagnostic"
-    fi
-  else
-    pass "process didn't silent-exit on 404 gist (still running or self-healing)"
-  fi
-
-  # Assertion 2: the 404 self-heal banner should be visible OR another
-  # honest failure (e.g. "Re-discovering" if room_name is set, or
-  # "Saved room gist no longer on your gh"). Pre-fix produces neither.
-  grep -qE 'no longer on your gh|Re-discovering|Re-pairing' "$out" "$err" 2>/dev/null \
-    && pass "404 self-heal banner fired (gist-deleted path classified correctly)" \
-    || fail "no self-heal banner — 404 classification didn't run (got out=$(head -3 "$out") err=$(head -3 "$err"))"
-
-  # Cleanup
-  kill -9 $pid 2>/dev/null
-  for f in "$home/airc.pid"; do
-    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
-  done
-  sleep 1
-  rm -f "$out" "$err"
-  rm -rf /tmp/airc-it-r404
-  cleanup_all
-}
-
-# ── Scenario: resume_prints_connected_banner ───────────────────────────
-# Pre-fix: a joiner that paired, teardown'd (no --flush), then ran
-# `airc connect` again printed "Resuming as joiner of '<peer>'..."
-# and then went silent — even on full success. The user couldn't
-# tell SSH-pair-OK from script-wedged. Fresh-pair printed
-# "Connected to '<peer>' (SSH verified, ...)" at line ~2469;
-# resume's success branch had no analogous banner.
-#
-# Per the "never swallow errors" rule (Joel, 2026-04-15):
-# silent-success is the same evidence-eating shape as silent-fail
-# because the user can't distinguish them. Caught 2026-04-26 by
-# vhsm-Claude observing through the substrate ("fresh-join printed
-# it; resume path didn't").
-#
-# Post-fix: resume's success branch prints
-#   "Resumed as joiner of '<peer>' in #<room> (SSH verified)"
-# (or without "in #<room>" for legacy 1:1 invites).
-scenario_resume_prints_connected_banner() {
-  section "resume_prints_connected_banner: resume success must announce itself (no silent-success)"
-  cleanup_all
-
-  spawn_host /tmp/airc-it-rpcb-h alpha 7568 || { fail "alpha host failed to start"; cleanup_all; return; }
-  local join; join=$(read_join_string /tmp/airc-it-rpcb-h)
-  [ -n "$join" ] || { fail "no join string"; cleanup_all; return; }
-  spawn_joiner /tmp/airc-it-rpcb-j beta "$join" || { fail "beta join failed"; cleanup_all; return; }
-
-  # Teardown beta only (preserve state — that's what triggers the
-  # resume path on next connect). Identity, peer records, host_target
-  # all stay on disk.
-  AIRC_HOME=/tmp/airc-it-rpcb-j/state "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-
-  # Re-run airc connect from beta's scope. With the existing config
-  # (host_target present), this enters the resume branch.
-  local resume_log=/tmp/airc-it-rpcb-j/resume.log
-  ( AIRC_HOME=/tmp/airc-it-rpcb-j/state AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect > "$resume_log" 2>&1 ) &
-  local pid=$!
+  # Round 1: alpha hosts the room (real gist published).
+  ( cd /tmp/airc-it-cakr-h && AIRC_HOME=/tmp/airc-it-cakr-h/state AIRC_NAME=alpha AIRC_PORT=7572 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-cakr-h/out.log 2>&1 & )
   local i
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
-    grep -qE 'Resumed as joiner|Resume aborted|silent-broadcast' "$resume_log" 2>/dev/null && break
-    kill -0 $pid 2>/dev/null || break
+    [ -f /tmp/airc-it-cakr-h/state/host_gist_id ] && break
+  done
+  local gid_alpha; gid_alpha=$(cat /tmp/airc-it-cakr-h/state/host_gist_id 2>/dev/null)
+  [ -n "$gid_alpha" ] && pass "alpha hosting #${rname} on real gist ($gid_alpha)" \
+                      || { fail "alpha didn't publish a gist"; cleanup_all; return; }
+
+  # Beta joins via discovery so its CONFIG gets a real host_target.
+  ( cd /tmp/airc-it-cakr-j && AIRC_HOME=/tmp/airc-it-cakr-j/state AIRC_NAME=beta \
+      "$AIRC" connect --room "$rname" --no-general > /tmp/airc-it-cakr-j/out.log 2>&1 & )
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    grep -q 'Connected to' /tmp/airc-it-cakr-j/out.log 2>/dev/null && break
+  done
+  grep -q 'Connected to' /tmp/airc-it-cakr-j/out.log \
+    && pass "beta paired with alpha via discovery" \
+    || { fail "beta didn't pair (got: $(head -10 /tmp/airc-it-cakr-j/out.log))"; cleanup_all; return; }
+
+  # Sanity-check beta's CONFIG actually has a cached host_target post-pair —
+  # otherwise the test isn't exercising the property we care about.
+  grep -q 'host_target' /tmp/airc-it-cakr-j/state/config.json \
+    && pass "beta's CONFIG has cached host_target (pre-condition)" \
+    || { fail "beta's CONFIG has no host_target — pre-condition broken"; cleanup_all; return; }
+
+  # ── Kill alpha hard. SIGKILL bypasses alpha's EXIT trap, so alpha's
+  # gist is left STALE on gh (host process gone, gist still exists).
+  # This is the worst case: a cached pairing pointing at a dead host
+  # whose gist still resolves.
+  AIRC_HOME=/tmp/airc-it-cakr-h/state "$AIRC" teardown >/dev/null 2>&1
+  # teardown deletes the gist gracefully — do that for round 1 to
+  # exercise the gist-gone case. (The TCP-unreachable-but-gist-alive
+  # case is exercised by scenario_two_tab_localhost's host-crash branch.)
+  sleep 2
+  if gh api "gists/$gid_alpha" >/dev/null 2>&1; then
+    fail "alpha's gist not deleted by teardown (test pre-condition)"
+    gh gist delete "$gid_alpha" --yes 2>/dev/null
+  else
+    pass "alpha's gist deleted (gist-gone case set up)"
+  fi
+
+  # Beta is now in the same state Joel hit: paired CONFIG with cached
+  # host_target pointing at a dead host, gist gone. Run beta's connect.
+  AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+  local recover_log=/tmp/airc-it-cakr-j-recover.log
+  # Note: `( ... ) &` (not `( ... & )`) so $! is set in the parent.
+  ( cd /tmp/airc-it-cakr-j && AIRC_HOME=/tmp/airc-it-cakr-j/state AIRC_NAME=beta AIRC_PORT=7573 \
+      "$AIRC" connect --room "$rname" --no-general > "$recover_log" 2>&1 ) &
+  local recover_pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    grep -qE "Hosting #${rname}|Connected to|Resumed as joiner" "$recover_log" 2>/dev/null && break
+    kill -0 "$recover_pid" 2>/dev/null || break
   done
 
-  grep -qE "Resuming as joiner of 'alpha'" "$resume_log" \
-    && pass "Resuming banner fires (entry into resume path is announced)" \
-    || fail "no 'Resuming as joiner' banner — resume path not entered (got: $(head -3 "$resume_log"))"
+  # Property A: NEVER prints the resume-banner-against-cached-host. The
+  # entire "Resumed as joiner ... (SSH verified)" form was deleted in #130.
+  ! grep -qE "Resumed as joiner.*SSH verified" "$recover_log" \
+    && pass "no 'Resumed as joiner ... (SSH verified)' banner — cached pairing never trusted" \
+    || fail "GHOST PAIRING REGRESSION: 'Resumed as joiner ... (SSH verified)' printed against deleted host"
 
-  grep -qE "Resumed as joiner of 'alpha'.*SSH verified" "$resume_log" \
-    && pass "Resumed-as-joiner success banner fires (no silent-success)" \
-    || fail "MISSING resume-success banner — silent-success bug regressed (got: $(head -10 "$resume_log"))"
+  ! grep -qE "Resuming as joiner of " "$recover_log" \
+    && pass "no 'Resuming as joiner' banner — resume code path is gone" \
+    || fail "GHOST PAIRING REGRESSION: 'Resuming as joiner' printed (resume code path resurrected?)"
+
+  # Property B: beta lands somewhere correct — either takes over as new
+  # host of #${rname}, or finds another peer who already did. Both are
+  # fine; the architectural property is that beta is in a working state
+  # in #${rname} without ghost-pairing or silent failure.
+  grep -qE "Hosting #${rname}|Connected to" "$recover_log" \
+    && pass "beta landed in a working state for #${rname} (host or joiner)" \
+    || fail "beta didn't recover (got: $(head -15 "$recover_log"))"
 
   # Cleanup
-  kill -9 $pid 2>/dev/null
-  for f in /tmp/airc-it-rpcb-h/state/airc.pid /tmp/airc-it-rpcb-j/state/airc.pid; do
-    [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null
-  done
+  kill -9 "$recover_pid" 2>/dev/null
+  AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
   sleep 1
-  rm -f "$resume_log"
+  rm -f "$recover_log"
+  rm -rf /tmp/airc-it-cakr-h /tmp/airc-it-cakr-j
   cleanup_all
 }
 
@@ -2788,7 +2486,6 @@ case "$MODE" in
   queue)        scenario_queue ;;
   status)       scenario_status ;;
   auth_failure) scenario_auth_failure ;;
-  resume_stale_auth) scenario_resume_stale_auth ;;
   room)         scenario_room ;;
   events)       scenario_events ;;
   get_host)     scenario_get_host ;;
@@ -2799,18 +2496,15 @@ case "$MODE" in
   bounce)       scenario_bounce ;;
   two_tab_localhost) scenario_two_tab_localhost ;;
   auto_scope)   scenario_auto_scope ;;
-  room_overrides_resume) scenario_room_overrides_resume ;;
-  stale_auth_room_selfheal) scenario_stale_auth_room_selfheal ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
-  resume_404_gist_no_silent_exit) scenario_resume_404_gist_no_silent_exit ;;
-  resume_prints_connected_banner) scenario_resume_prints_connected_banner ;;
+  connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
   send_room_flag) scenario_send_room_flag ;;
   peers_cross_scope) scenario_peers_cross_scope ;;
   part_keeps_sidecar) scenario_part_keeps_sidecar ;;
   platform_adapters) scenario_platform_adapters ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo
