@@ -5535,7 +5535,15 @@ _doctor_probe_sshd() {
   local plat; plat=$(detect_platform)
   case "$plat" in
     macos)
-      if launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd"; then
+      # macOS Remote Login = launchd-managed sshd. Detect WITHOUT sudo:
+      #   - `launchctl list` (user scope) does NOT show system services
+      #     like com.openssh.sshd, so the user-scope probe always misses.
+      #   - `launchctl print system` DOES list system services and works
+      #     without sudo. Look for `com.openssh.sshd` (the service id).
+      #   - `systemsetup -getremotelogin` requires admin to read state
+      #     (returns "You need administrator access..." otherwise) — keep
+      #     it as the second-attempt fallback in case sudo is cached.
+      if launchctl print system 2>/dev/null | grep -qE 'com\.openssh\.sshd($|[[:space:]])'; then
         printf "  [ok] sshd (Remote Login enabled)\n"
         return 0
       fi

@@ -132,18 +132,39 @@ install_with_pkgmgr() {
 _ensure_sshd_running() {
   case "$(uname -s 2>/dev/null)" in
     Darwin)
-      # macOS: sshd is launchd-managed; "Remote Login" toggle drives it.
-      if launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd" \
+      # macOS: sshd is launchd-managed via "Remote Login". Detection
+      # without sudo: `launchctl print system` shows system services
+      # including com.openssh.sshd when Remote Login is on. Bare
+      # `launchctl list` is user-scope and never shows it.
+      if launchctl print system 2>/dev/null | grep -qE 'com\.openssh\.sshd($|[[:space:]])' \
          || systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
         ok "sshd running (Remote Login enabled)"
         return 0
       fi
-      info "Enabling Remote Login (sshd) — sudo prompt incoming."
+      info "Enabling Remote Login (sshd) — admin password prompt incoming."
       info "  airc joiners need this to ssh-tail your messages.jsonl when you host."
-      if sudo systemsetup -setremotelogin on 2>&1; then
-        ok "Remote Login enabled."
+      # Two paths: terminal sudo (if a TTY is attached) or osascript GUI
+      # admin prompt (when called from non-terminal context — e.g. a
+      # Monitor-spawned shell, or via curl|bash piping). The osascript
+      # path uses macOS native admin dialog with a branded prompt
+      # explaining what airc is doing — Joel 2026-04-27 (continuum
+      # relay): "if we can prompt the user, we do NOT have them do
+      # annoying setup shit we automate into install."
+      if [ -t 0 ] && [ -t 1 ]; then
+        # Interactive shell — sudo can read the password.
+        if sudo systemsetup -setremotelogin on 2>&1; then
+          ok "Remote Login enabled."
+        else
+          warn "systemsetup failed. Manual: System Settings -> General -> Sharing -> Remote Login."
+        fi
       else
-        warn "systemsetup failed. Manual fallback: System Settings -> General -> Sharing -> Remote Login (toggle on)."
+        # Non-interactive (Monitor/pipe/script) — use osascript GUI prompt.
+        if osascript -e 'do shell script "systemsetup -setremotelogin on" with administrator privileges with prompt "AIRC needs admin to enable Remote Login (sshd) — one-time setup so peers can ssh-tail your messages when you host an airc room."' 2>&1; then
+          ok "Remote Login enabled."
+        else
+          warn "osascript admin dialog cancelled or failed."
+          warn "  Manual: System Settings -> General -> Sharing -> Remote Login."
+        fi
       fi
       ;;
     Linux)
