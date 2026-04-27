@@ -15,37 +15,44 @@ set -euo pipefail
 # (we genuinely need Python — the inline heredocs for monitor formatting
 # and pair handshake are not yet ported to pure shell).
 #
-# DETECTION: invoke `python3 --version` rather than `command -v python3`.
-# Modern Windows ships a Microsoft Store ALIAS at
-# %LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe that satisfies
-# `command -v` (the file exists, is on PATH) but is just a "click here
-# to install Python from the Store" stub. Invoking it exits 49 with a
-# Store-redirect message on stderr and produces no real interpreter.
-# Continuum-b69f caught this on 2026-04-27 — every later `python3 -c "..."`
-# in the script silently failed because the shim never installed; the
-# pair-handshake's captured stderr then got discarded by the generic
-# "Can't reach $host" die() (fix below). Strict --version probe makes
-# the Store stub fail-fast, falling through to `python` (real install)
-# or the install-instructions die.
-if ! python3 --version >/dev/null 2>&1; then
-  if command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
-    # Define a wrapper function that callers see as `python3`.
-    python3() { command python "$@"; }
-    export -f python3 2>/dev/null || true
-  else
-    echo "ERROR: airc requires a working python3 (or python on Windows/Git Bash)." >&2
-    echo "  macOS:    brew install python3" >&2
-    echo "  Linux:    apt install python3 / dnf install python3" >&2
-    echo "  Windows:  install from https://www.python.org/downloads/" >&2
-    echo "" >&2
-    echo "  Note for Windows: a 'python3.exe' Store-installer alias on PATH" >&2
-    echo "  is NOT a real Python — disable it under" >&2
-    echo "  Settings → Apps → Advanced app settings → App execution aliases" >&2
-    echo "  (toggle off python.exe and python3.exe), or PATH-prepend your real" >&2
-    echo "  install (e.g. C:\\Users\\<you>\\AppData\\Local\\Programs\\Python\\Python312\\)." >&2
-    exit 1
-  fi
+# AIRC_PYTHON: resolve real Python interpreter once, propagate via env
+# var. Pre-fix (PR #153) used a bash function shim named python3
+# exported via export -f. On Git Bash MINGW, export -f succeeds
+# silently but the function does NOT reliably inherit into command-
+# substitution subshells (the captured-via-dollar-paren pattern).
+# Result: every site that captured python3 -c output through a
+# subshell (45+ callsites) bypassed the shim, hit the Microsoft
+# Store stub, exited 49 with empty stdout. The pipe-to-echo-empty
+# fallbacks on those sites then silently set config values to empty
+# strings — host_target, host_airc_home, name all became empty.
+# cmd_send then took the HOST path (no host_target) and mirrored
+# locally without ever attempting the SSH push. Net: every Win→Mac
+# broadcast silently no-op'd while pretending success. Caught by
+# continuum-b69f via cross-Mac/Windows substrate-bypass gist
+# 2026-04-27.
+#
+# Fix: env-var holds the resolved interpreter path. Bash variables
+# propagate to subshells unconditionally — no function-export quirks.
+# Every callsite now invokes "$AIRC_PYTHON" -c instead of the
+# function-shim name; sed replace across the file did the conversion.
+if python3 --version >/dev/null 2>&1; then
+  AIRC_PYTHON=python3
+elif command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
+  AIRC_PYTHON=python
+else
+  echo "ERROR: airc requires a working python3 (or python on Windows/Git Bash)." >&2
+  echo "  macOS:    brew install python3" >&2
+  echo "  Linux:    apt install python3 / dnf install python3" >&2
+  echo "  Windows:  install from https://www.python.org/downloads/" >&2
+  echo "" >&2
+  echo "  Note for Windows: a 'python3.exe' Store-installer alias on PATH" >&2
+  echo "  is NOT a real Python — disable it under" >&2
+  echo "  Settings → Apps → Advanced app settings → App execution aliases" >&2
+  echo "  (toggle off python.exe and python3.exe), or PATH-prepend your real" >&2
+  echo "  install (e.g. C:\\Users\\<you>\\AppData\\Local\\Programs\\Python\\Python312\\)." >&2
+  exit 1
 fi
+export AIRC_PYTHON
 
 # One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
 # is on vanilla defaults, the old dir exists as a real dir (not a symlink we
@@ -260,11 +267,11 @@ ensure_init() {
 }
 
 get_name() {
-  python3 -c "import json; print(json.load(open('$CONFIG'))['name'])" 2>/dev/null || echo "unknown"
+  "$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG'))['name'])" 2>/dev/null || echo "unknown"
 }
 
 get_config_val() {
-  python3 -c "import json; print(json.load(open('$CONFIG')).get('$1','$2'))" 2>/dev/null || echo "$2"
+  "$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('$1','$2'))" 2>/dev/null || echo "$2"
 }
 
 get_host() {
@@ -296,9 +303,9 @@ get_host() {
   # Returns one of 192.168.*, 10.*, 172.16-31.* on a typical home/office
   # LAN. Returns 127.0.0.1 if no internet route is available — which we
   # treat as "no LAN" and fall through to hostname.
-  if command -v python3 >/dev/null 2>&1; then
+  if [ -n "${AIRC_PYTHON:-}" ]; then
     local lan_ip
-    lan_ip=$(python3 -c "
+    lan_ip=$("$AIRC_PYTHON" -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -959,8 +966,8 @@ iso_to_epoch() {
   if epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
     echo "$epoch"; return 0
   fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c "
+  if [ -n "${AIRC_PYTHON:-}" ]; then
+    "$AIRC_PYTHON" -c "
 import datetime, sys
 try:
     dt = datetime.datetime.strptime('$ts', '%Y-%m-%dT%H:%M:%SZ')
@@ -1031,7 +1038,7 @@ _read_parted_rooms() {
   local primary="$1"
   local cfg="$primary/config.json"
   [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" python3 -c '
+  CONFIG="$cfg" "$AIRC_PYTHON" -c '
 import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
@@ -1049,7 +1056,7 @@ _record_parted_room() {
   local primary="$1" room="$2"
   local cfg="$primary/config.json"
   [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" ROOM="$room" python3 -c '
+  CONFIG="$cfg" ROOM="$room" "$AIRC_PYTHON" -c '
 import json, os, sys
 cfg = os.environ["CONFIG"]
 room = os.environ["ROOM"]
@@ -1074,7 +1081,7 @@ _clear_parted_room() {
   local primary="$1" room="$2"
   local cfg="$primary/config.json"
   [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" ROOM="$room" python3 -c '
+  CONFIG="$cfg" ROOM="$room" "$AIRC_PYTHON" -c '
 import json, os, sys
 cfg = os.environ["CONFIG"]
 room = os.environ["ROOM"]
@@ -1200,7 +1207,7 @@ resolve_name() {
   if [ -n "${AIRC_NAME:-}" ]; then
     name="$AIRC_NAME"
   elif [ -f "$CONFIG" ]; then
-    name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+    name=$("$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
   fi
   # Reject flag-shaped names that may have leaked in from a buggy prior rename.
   case "$name" in -*) name="" ;; esac
@@ -2497,7 +2504,7 @@ cmd_connect() {
     # the `identity` block (issue #34) across re-pairs so a teardown +
     # rejoin keeps pronouns/role/bio/status without requiring users to
     # re-run airc identity set every time.
-    MY_NAME="$my_name" MY_HOST="$(get_host)" SSH_TARGET="$ssh_target" CREATED="$(timestamp)" CONFIG="$CONFIG" python3 -c '
+    MY_NAME="$my_name" MY_HOST="$(get_host)" SSH_TARGET="$ssh_target" CREATED="$(timestamp)" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
@@ -2556,7 +2563,7 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).
-    local my_identity_json; my_identity_json=$(CONFIG="$CONFIG" python3 -c '
+    local my_identity_json; my_identity_json=$(CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
@@ -2568,7 +2575,7 @@ except Exception:
 
     local response
     local _pair_ok=1
-    response=$(MY_IDENTITY="$my_identity_json" python3 -c "
+    response=$(MY_IDENTITY="$my_identity_json" "$AIRC_PYTHON" -c "
 import socket, json, sys, os
 payload = json.dumps({
     'name': '$my_name',
@@ -2688,7 +2695,7 @@ print(data.decode().strip())
     # targeted ssh-keygen -R when a PRIOR real-sshd host key in known_hosts
     # is known stale (e.g. the server rotated sshd host keys).
     local host_ssh_pub
-    host_ssh_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null || true)
+    host_ssh_pub=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null || true)
     if [ -n "$host_ssh_pub" ]; then
       mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
       grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
@@ -2707,8 +2714,8 @@ print(data.decode().strip())
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
     local host_airc_home
-    host_airc_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
-    python3 -c "
+    host_airc_home=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
+    "$AIRC_PYTHON" -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
@@ -2750,7 +2757,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # the join string for onward sharing without a fresh handshake. Also
     # cache the host's identity blob from the handshake response so
     # `airc whois <host-name>` works locally (issue #34 v2).
-    local host_identity_json; host_identity_json=$(echo "$response" | python3 -c '
+    local host_identity_json; host_identity_json=$(echo "$response" | "$AIRC_PYTHON" -c '
 import sys, json
 try:
     print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
@@ -2758,7 +2765,7 @@ except Exception:
     print("{}")
 ' 2>/dev/null)
     [ -z "$host_identity_json" ] && host_identity_json="{}"
-    HOST_IDENTITY="$host_identity_json" python3 -c "
+    HOST_IDENTITY="$host_identity_json" "$AIRC_PYTHON" -c "
 import json, os
 c = json.load(open('$CONFIG'))
 c['host_airc_home'] = '$host_airc_home'
@@ -2771,7 +2778,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 
     # Pick up reminder setting from host
     local host_reminder
-    host_reminder=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
+    host_reminder=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
     if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
       echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
       date +%s > "$AIRC_WRITE_DIR/last_sent"
@@ -2806,7 +2813,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 
     # Merge into existing config.json (preserve identity across re-spawns
     # — same rationale as the joiner branch above).
-    MY_NAME="$name" MY_HOST="$(get_host)" CREATED="$(timestamp)" CONFIG="$CONFIG" python3 -c '
+    MY_NAME="$name" MY_HOST="$(get_host)" CREATED="$(timestamp)" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
@@ -3134,7 +3141,7 @@ JSON
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
     while true; do
-      python3 -c "
+      "$AIRC_PYTHON" -c "
 import socket, json, sys, os
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3329,13 +3336,13 @@ cmd_rename() {
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
   local old_name
-  old_name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  old_name=$("$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
   if [ "$old_name" = "$new_name" ]; then
     echo "  Already named '$new_name'."
     return
   fi
 
-  python3 -c "
+  "$AIRC_PYTHON" -c "
 import json
 c = json.load(open('$CONFIG'))
 c['name'] = '$new_name'
@@ -3410,7 +3417,7 @@ cmd_identity() {
 }
 
 _identity_show() {
-  CONFIG="$CONFIG" python3 -c '
+  CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
@@ -3461,7 +3468,7 @@ _identity_set() {
     SET_ROLE="$set_role"         ROLE="$role" \
     SET_BIO="$set_bio"           BIO="$bio" \
     SET_STATUS="$set_status"     STATUS="$status" \
-    python3 -c '
+    "$AIRC_PYTHON" -c '
 import json, os
 c = json.load(open(os.environ["CONFIG"]))
 ident = c.setdefault("identity", {})
@@ -3485,7 +3492,7 @@ print("  identity updated.")
 _identity_link() {
   local platform="${1:-}" handle="${2:-}"
   [ -z "$platform" ] && die "Usage: airc identity link <platform> [handle] (omit/blank handle to unlink)"
-  CONFIG="$CONFIG" PLATFORM="$platform" HANDLE="$handle" python3 -c '
+  CONFIG="$CONFIG" PLATFORM="$platform" HANDLE="$handle" "$AIRC_PYTHON" -c '
 import json, os
 c = json.load(open(os.environ["CONFIG"]))
 ints = c.setdefault("identity", {}).setdefault("integrations", {})
@@ -3568,19 +3575,19 @@ _whois_in_scope() {
 
   # Host of this scope (we're a joiner, target is the host we paired with).
   local host_name
-  host_name=$(SCOPE_CONFIG="$scope_config" python3 -c '
+  host_name=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_name", "") or "")
 except Exception: pass
 ' 2>/dev/null || echo "")
   if [ -n "$host_name" ] && [ "$target" = "$host_name" ]; then
     local host_id_blob host_target_addr
-    host_id_blob=$(SCOPE_CONFIG="$scope_config" python3 -c '
+    host_id_blob=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.dumps(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_identity", {}) or {}))
 except Exception: print("{}")
 ' 2>/dev/null || echo "{}")
-    host_target_addr=$(SCOPE_CONFIG="$scope_config" python3 -c '
+    host_target_addr=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
 except Exception: pass
@@ -3593,12 +3600,12 @@ except Exception: pass
   local peer_file="$scope_peers/$target.json"
   if [ -f "$peer_file" ]; then
     local blob host
-    blob=$(PEER_FILE="$peer_file" python3 -c '
+    blob=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.dumps(json.load(open(os.environ["PEER_FILE"])).get("identity", {}) or {}))
 except Exception: print("{}")
 ' 2>/dev/null)
-    host=$(PEER_FILE="$peer_file" python3 -c '
+    host=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.load(open(os.environ["PEER_FILE"])).get("host", "") or "")
 except Exception: pass
@@ -3613,12 +3620,12 @@ except Exception: pass
   # — relay_ssh picks up IDENTITY_DIR from the env, so we set it for the
   # subprocess.
   local host_target_addr host_airc_home
-  host_target_addr=$(SCOPE_CONFIG="$scope_config" python3 -c '
+  host_target_addr=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
 except Exception: pass
 ' 2>/dev/null || echo "")
-  host_airc_home=$(SCOPE_CONFIG="$scope_config" python3 -c '
+  host_airc_home=$(SCOPE_CONFIG="$scope_config" "$AIRC_PYTHON" -c '
 import json, os
 try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_airc_home", "") or "")
 except Exception: pass
@@ -3628,12 +3635,12 @@ except Exception: pass
     remote_blob=$(IDENTITY_DIR="$scope/identity" relay_ssh "$host_target_addr" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
     if [ -n "$remote_blob" ]; then
       local peer_id peer_host
-      peer_id=$(printf '%s' "$remote_blob" | python3 -c '
+      peer_id=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -c '
 import sys, json
 try: print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
 except Exception: print("{}")
 ' 2>/dev/null)
-      peer_host=$(printf '%s' "$remote_blob" | python3 -c '
+      peer_host=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -c '
 import sys, json
 try: print(json.load(sys.stdin).get("host", "") or "")
 except Exception: pass
@@ -3712,7 +3719,7 @@ cmd_kick() {
   # peer could keep authenticating despite the "kick" — caught by
   # Copilot review on PR #73.
   local peer_ssh_pub
-  peer_ssh_pub=$(PEER_FILE="$peer_file" python3 -c '
+  peer_ssh_pub=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
 import json, os
 try:
     p = json.load(open(os.environ["PEER_FILE"]))
@@ -3814,7 +3821,7 @@ _identity_import_continuum() {
   fi
   # Parse the JSON; merge into our identity. Empty fields skip; existing
   # fields get overwritten (the user's intent: "I want to BE this persona").
-  BLOB="$blob" CONFIG="$CONFIG" python3 -c '
+  BLOB="$blob" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 try:
     src = json.loads(os.environ["BLOB"])
@@ -3837,13 +3844,13 @@ _identity_push_continuum() {
   if ! command -v continuum >/dev/null 2>&1; then
     die "continuum CLI not on PATH — install continuum before pushing."
   fi
-  local handle; handle=$(CONFIG="$CONFIG" python3 -c '
+  local handle; handle=$(CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
 c = json.load(open(os.environ["CONFIG"]))
 print(c.get("identity", {}).get("integrations", {}).get("continuum", ""))
 ' 2>/dev/null)
   [ -z "$handle" ] && die "No continuum handle linked. Run: airc identity link continuum <name>"
-  CONFIG="$CONFIG" HANDLE="$handle" python3 -c '
+  CONFIG="$CONFIG" HANDLE="$handle" "$AIRC_PYTHON" -c '
 import json, os, subprocess
 c = json.load(open(os.environ["CONFIG"]))
 ident = c.get("identity", {})
@@ -3977,7 +3984,7 @@ cmd_send() {
   ts_val=$(timestamp)
 
   local escaped_msg
-  escaped_msg=$(printf '%s' "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  escaped_msg=$(printf '%s' "$msg" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
 
   local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"msg\":\"$escaped_msg\"}"
   local sig; sig=$(sign_message "$payload")
@@ -4158,7 +4165,7 @@ cmd_ping() {
 
   # uuid from python for format consistency with the regex in monitor_formatter.
   local ping_id
-  ping_id=$(python3 -c "import uuid; print(uuid.uuid4())")
+  ping_id=$("$AIRC_PYTHON" -c "import uuid; print(uuid.uuid4())")
 
   local start_time
   start_time=$(date +%s)
@@ -4437,7 +4444,7 @@ cmd_peers() {
   # newer record (cruft left from rename chain-breaks before the stable-host
   # matching logic landed).
   if [ "${1:-}" = "--prune" ]; then
-    python3 -c "
+    "$AIRC_PYTHON" -c "
 import json, os, sys
 peers_dir = os.path.expanduser('$PEERS_DIR')
 if not os.path.isdir(peers_dir):
@@ -4484,7 +4491,7 @@ else:
   # the operator's view of "who am I connected to" into separate per-scope
   # listings. From the user's perspective they're in N rooms; airc peers
   # should reflect that as one unified roster with room context per peer.
-  python3 -c "
+  "$AIRC_PYTHON" -c "
 import json, os, sys, re
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
@@ -4791,7 +4798,7 @@ cmd_disconnect() {
   # keep your agent identity stable.
   cmd_teardown >/dev/null 2>&1 || true
   if [ -f "$CONFIG" ]; then
-    python3 -c "
+    "$AIRC_PYTHON" -c "
 import json
 try:
     c = json.load(open('$CONFIG'))
@@ -5013,7 +5020,7 @@ cmd_status() {
 
   if [ -s "$MESSAGES" ]; then
     local last_rx_ts
-    last_rx_ts=$(PEERS_DIR="$PEERS_DIR" MY_NAME="$my_name" python3 -c "
+    last_rx_ts=$(PEERS_DIR="$PEERS_DIR" MY_NAME="$my_name" "$AIRC_PYTHON" -c "
 import sys, json, os, calendar, time
 name = os.environ.get('MY_NAME', '')
 last_ts = None
@@ -5812,7 +5819,7 @@ cmd_logs() {
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
-  echo "$raw" | python3 -c "
+  echo "$raw" | "$AIRC_PYTHON" -c "
 import sys, json
 for line in sys.stdin:
     try:
