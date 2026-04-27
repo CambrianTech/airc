@@ -1369,7 +1369,7 @@ monitor() {
 # Handles [rename] protocol by updating peer records on disk.
 monitor_formatter() {
   local my_name="$1"
-  PEERS_DIR="$PEERS_DIR" python3 -u -c '
+  PEERS_DIR="$PEERS_DIR" "$AIRC_PYTHON" -u -c '
 import sys, json, os, re, time, signal
 
 # Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
@@ -2765,16 +2765,34 @@ except Exception:
     print("{}")
 ' 2>/dev/null)
     [ -z "$host_identity_json" ] && host_identity_json="{}"
-    HOST_IDENTITY="$host_identity_json" "$AIRC_PYTHON" -c "
+    # Pass values as env vars instead of bash-substituted into the
+    # python heredoc body. continuum-b69f's PR #164 retest 2026-04-27
+    # found host_airc_home / host_name / host_port / host_ssh_pub /
+    # host_identity all silently unwritten on Win→Mac join: if ANY of
+    # the bash substitutions broke the python source (newline in
+    # host_ssh_pub, weird char in host_airc_home, peer_port empty/
+    # non-numeric, etc.), the whole heredoc errored out via
+    # `2>/dev/null || true` and zero fields landed in config. Switch
+    # to env-var pass — python reads from os.environ; bash never
+    # touches the python source. Also emit stderr to surface failures
+    # for the future debugger (not /dev/null).
+    HOST_AIRC_HOME="$host_airc_home" \
+    HOST_NAME="$peer_name" \
+    HOST_PORT="${peer_port:-7547}" \
+    HOST_SSH_PUB="$host_ssh_pub" \
+    HOST_IDENTITY="$host_identity_json" \
+    CONFIG="$CONFIG" \
+    "$AIRC_PYTHON" -c '
 import json, os
-c = json.load(open('$CONFIG'))
-c['host_airc_home'] = '$host_airc_home'
-c['host_name']      = '$peer_name'
-c['host_port']      = ${peer_port:-7547}
-c['host_ssh_pub']   = '''$host_ssh_pub'''
-c['host_identity']  = json.loads(os.environ.get('HOST_IDENTITY', '{}'))
-json.dump(c, open('$CONFIG', 'w'), indent=2)
-" 2>/dev/null || true
+c = json.load(open(os.environ["CONFIG"]))
+c["host_airc_home"] = os.environ.get("HOST_AIRC_HOME", "")
+c["host_name"]      = os.environ.get("HOST_NAME", "")
+try:    c["host_port"] = int(os.environ.get("HOST_PORT", "7547"))
+except: c["host_port"] = 7547
+c["host_ssh_pub"]   = os.environ.get("HOST_SSH_PUB", "")
+c["host_identity"]  = json.loads(os.environ.get("HOST_IDENTITY", "{}"))
+json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
+' || echo "  ⚠  config write failed (host_airc_home/host_name/host_port/host_ssh_pub may be unset). airc may still work if subsequent retries refresh." >&2
 
     # Pick up reminder setting from host
     local host_reminder
