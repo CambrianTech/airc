@@ -3265,7 +3265,10 @@ fields = [
     ("pronouns", ident.get("pronouns", ""),  "(unset)"),
     ("role",     ident.get("role", ""),      "(unset)"),
     ("bio",      ident.get("bio", ""),       "(unset)"),
-    ("status",   ident.get("status", ""),    "(unset)"),
+    # status field is the IRC /away analog. Surface the airc away
+    # command in the unset case so QA users (continuum-b741 2026-04-27)
+    # do not see a half-baked empty field with no obvious setter.
+    ("status",   ident.get("status", ""),    "(unset; airc away <msg> to set)"),
 ]
 for k, v, fallback in fields:
     label = k + ":"
