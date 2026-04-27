@@ -3210,77 +3210,143 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 # cached locally — no round-trip needed for self/host/local-peer. Cross-
 # peer (we're a joiner asking about another joiner of our host) falls
 # back to a single SSH read of the host's peer file.
+#
+# Cross-scope (issue #134): walks sibling scopes (.airc + .airc.<room>)
+# so a project-tab whois can find a peer who's only in the #general
+# sidecar's host. Without this, JOIN events in the sidecar room emit
+# names that whois can't resolve, breaking the IRC mental model where
+# every room member is reachable.
 cmd_whois() {
   ensure_init
   local target="${1:-}"
   local my_name; my_name=$(get_name)
 
-  # Self
+  # Self — same identity across all scopes, no walk needed.
   if [ -z "$target" ] || [ "$target" = "$my_name" ]; then
     _identity_show
     return 0
   fi
 
   # Reject path-traversal / shell-injection in target before it touches
-  # filesystem paths (local PEERS_DIR/<target>.json) or remote SSH cmds
-  # (cat $host_airc_home/peers/<target>.json).
+  # filesystem paths (local <scope>/peers/<target>.json) or remote SSH
+  # cmds (cat $host_airc_home/peers/<target>.json) in any scope.
   _validate_peer_name "$target"
 
-  # Host (we're a joiner, target is the host we paired with)
-  local host_name; host_name=$(get_config_val host_name "")
-  if [ -n "$host_name" ] && [ "$target" = "$host_name" ]; then
-    local host_id_blob; host_id_blob=$(CONFIG="$CONFIG" python3 -c '
-import json, os
-c = json.load(open(os.environ["CONFIG"]))
-print(json.dumps(c.get("host_identity", {}) or {}))
-' 2>/dev/null || echo "{}")
-    _whois_pretty "$target" "$host_id_blob" "$(get_config_val host_target '')"
+  # Try primary scope first, then walk sibling sidecar scopes. First
+  # hit wins. The order matters: primary scope's host/peer-file lookups
+  # are local-only (cheap); sibling scopes may add an SSH round-trip
+  # per scope for the cross-peer-via-host path.
+  if _whois_in_scope "$AIRC_WRITE_DIR" "$target"; then
     return 0
   fi
 
-  # Local peer file — flat layout: $PEERS_DIR/<peer>.json
-  local peer_file="$PEERS_DIR/$target.json"
+  local parent self_base prefix sibling
+  parent=$(dirname "$AIRC_WRITE_DIR")
+  self_base=$(basename "$AIRC_WRITE_DIR")
+  # Strip a trailing .<word> to recover the primary prefix. Mirrors the
+  # detection in cmd_peers (#124) so .airc / .airc.general both resolve
+  # to .airc as the prefix; in tests we see state / state.general → state.
+  prefix=$(printf '%s' "$self_base" | sed -E 's/\.[a-z0-9-]+$//')
+  if [ -d "$parent" ]; then
+    for sibling in "$parent/$prefix" "$parent/$prefix".*; do
+      [ -d "$sibling" ] || continue
+      [ "$sibling" = "$AIRC_WRITE_DIR" ] && continue
+      [ -f "$sibling/config.json" ] || continue
+      if _whois_in_scope "$sibling" "$target"; then
+        return 0
+      fi
+    done
+  fi
+
+  echo "  whois: no record for '$target' (try airc peers to list paired peers)"
+  return 1
+}
+
+# Per-scope whois lookup. Returns 0 + prints if found; non-zero if not.
+# Args: scope-dir, target-name. Caller has already validated target.
+_whois_in_scope() {
+  local scope="$1" target="$2"
+  local scope_config="$scope/config.json"
+  local scope_peers="$scope/peers"
+  [ -f "$scope_config" ] || return 1
+
+  # Host of this scope (we're a joiner, target is the host we paired with).
+  local host_name
+  host_name=$(SCOPE_CONFIG="$scope_config" python3 -c '
+import json, os
+try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_name", "") or "")
+except Exception: pass
+' 2>/dev/null || echo "")
+  if [ -n "$host_name" ] && [ "$target" = "$host_name" ]; then
+    local host_id_blob host_target_addr
+    host_id_blob=$(SCOPE_CONFIG="$scope_config" python3 -c '
+import json, os
+try: print(json.dumps(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_identity", {}) or {}))
+except Exception: print("{}")
+' 2>/dev/null || echo "{}")
+    host_target_addr=$(SCOPE_CONFIG="$scope_config" python3 -c '
+import json, os
+try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
+except Exception: pass
+' 2>/dev/null || echo "")
+    _whois_pretty "$target" "$host_id_blob" "$host_target_addr"
+    return 0
+  fi
+
+  # Local peer file under this scope.
+  local peer_file="$scope_peers/$target.json"
   if [ -f "$peer_file" ]; then
-    local blob; blob=$(python3 -c "
-import json
-p = json.load(open('$peer_file'))
-print(json.dumps(p.get('identity', {}) or {}))
-" 2>/dev/null)
-    local host; host=$(python3 -c "
-import json
-print(json.load(open('$peer_file')).get('host', ''))
-" 2>/dev/null)
+    local blob host
+    blob=$(PEER_FILE="$peer_file" python3 -c '
+import json, os
+try: print(json.dumps(json.load(open(os.environ["PEER_FILE"])).get("identity", {}) or {}))
+except Exception: print("{}")
+' 2>/dev/null)
+    host=$(PEER_FILE="$peer_file" python3 -c '
+import json, os
+try: print(json.load(open(os.environ["PEER_FILE"])).get("host", "") or "")
+except Exception: pass
+' 2>/dev/null)
     _whois_pretty "$target" "$blob" "$host"
     return 0
   fi
 
-  # Cross-peer via host (we're a joiner; query host's peer file remotely)
-  local host_target; host_target=$(get_config_val host_target "")
-  local host_airc_home; host_airc_home=$(get_config_val host_airc_home "")
-  if [ -n "$host_target" ] && [ -n "$host_airc_home" ]; then
+  # Cross-peer via this scope's host (we're a joiner; query host's peer
+  # file remotely). Skipped when we're the host of this scope (no
+  # host_target). The SSH key for this scope is at $scope/identity/ssh_key
+  # — relay_ssh picks up IDENTITY_DIR from the env, so we set it for the
+  # subprocess.
+  local host_target_addr host_airc_home
+  host_target_addr=$(SCOPE_CONFIG="$scope_config" python3 -c '
+import json, os
+try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_target", "") or "")
+except Exception: pass
+' 2>/dev/null || echo "")
+  host_airc_home=$(SCOPE_CONFIG="$scope_config" python3 -c '
+import json, os
+try: print(json.load(open(os.environ["SCOPE_CONFIG"])).get("host_airc_home", "") or "")
+except Exception: pass
+' 2>/dev/null || echo "")
+  if [ -n "$host_target_addr" ] && [ -n "$host_airc_home" ]; then
     local remote_blob
-    remote_blob=$(relay_ssh "$host_target" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
+    remote_blob=$(IDENTITY_DIR="$scope/identity" relay_ssh "$host_target_addr" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
     if [ -n "$remote_blob" ]; then
-      local peer_id; peer_id=$(printf '%s' "$remote_blob" | python3 -c '
+      local peer_id peer_host
+      peer_id=$(printf '%s' "$remote_blob" | python3 -c '
 import sys, json
-try:
-    print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
-except Exception:
-    print("{}")
+try: print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
+except Exception: print("{}")
 ' 2>/dev/null)
-      local peer_host; peer_host=$(printf '%s' "$remote_blob" | python3 -c '
+      peer_host=$(printf '%s' "$remote_blob" | python3 -c '
 import sys, json
-try:
-    print(json.load(sys.stdin).get("host", ""))
-except Exception:
-    print("")
+try: print(json.load(sys.stdin).get("host", "") or "")
+except Exception: pass
 ' 2>/dev/null)
       _whois_pretty "$target" "$peer_id" "$peer_host"
       return 0
     fi
   fi
 
-  echo "  whois: no record for '$target' (try airc peers to list paired peers)"
   return 1
 }
 

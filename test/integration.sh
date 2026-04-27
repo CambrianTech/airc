@@ -2249,6 +2249,97 @@ JSON
   cleanup_all
 }
 
+# ── Scenario: whois_cross_scope (issue #134) ───────────────────────────
+# Pre-fix: cmd_whois only consulted the primary scope. A peer who
+# was paired in the #general sidecar but not in the primary project
+# room returned "no record" — even though airc peers (post-#124)
+# already showed them. JOIN events in the sidecar emitted names
+# whois couldn't resolve.
+#
+# Post-fix: cmd_whois walks sibling scopes (.airc + .airc.<room>)
+# and tries each scope's host / local-peer / cross-peer-via-host
+# lookups. First hit wins; "no record" only after exhausting all.
+#
+# Test exercises the local-peer path in sibling scope (the SSH-based
+# cross-peer path is symmetric in code and covered by scenario_whois
+# at the primary scope). Also verifies sibling-scope HOST lookup
+# works — whois on the sidecar's host name should pull host_identity
+# out of the sidecar's config.json rather than 404.
+scenario_whois_cross_scope() {
+  section "whois_cross_scope: airc whois walks sibling scopes (issue #134)"
+  cleanup_all
+
+  local primary=/tmp/airc-it-wcs/state
+  local sidecar=/tmp/airc-it-wcs/state.general
+  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
+  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'wcs-primary' 2>/dev/null
+  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'wcs-sidecar' 2>/dev/null
+  # Primary scope: paired with phost in #myproject. No fellow joiners.
+  cat > "$primary/config.json" <<'JSON'
+{
+  "name": "alpha",
+  "host_name": "phost",
+  "host_target": "joel@10.0.0.1",
+  "host_identity": {"pronouns":"they","role":"primary-host","bio":"primary host bio"}
+}
+JSON
+  echo "myproject" > "$primary/room_name"
+  # Sidecar scope: paired with shost in #general. Fellow joiner 'lobbymate'.
+  cat > "$sidecar/config.json" <<'JSON'
+{
+  "name": "alpha",
+  "host_name": "shost",
+  "host_target": "joel@10.0.0.2",
+  "host_identity": {"pronouns":"she","role":"general-host","bio":"general host bio"}
+}
+JSON
+  echo "general" > "$sidecar/room_name"
+  cat > "$sidecar/peers/lobbymate.json" <<'JSON'
+{"name":"lobbymate","host":"joel@10.0.0.99","ssh_pub":"ssh-ed25519 AAAA",
+ "identity":{"pronouns":"they","role":"fellow-joiner","bio":"in general only"}}
+JSON
+
+  local out
+  # ── from primary scope: sidecar peer should resolve ────────────────
+  out=$(AIRC_HOME="$primary" "$AIRC" whois lobbymate 2>&1)
+  echo "$out" | grep -q "role: *fellow-joiner" \
+    && pass "primary scope finds sidecar-only peer (role)" \
+    || fail "primary scope didn't find sidecar peer (got: $out)"
+  echo "$out" | grep -q "bio: *in general only" \
+    && pass "primary scope finds sidecar-only peer (bio)" \
+    || fail "primary scope sidecar peer missing bio (got: $out)"
+
+  # ── from primary scope: sidecar HOST should resolve ────────────────
+  # shost is the host of the sidecar's #general — primary scope's
+  # host_name is phost, so the lookup must walk into sidecar's config
+  # and read host_identity from there.
+  out=$(AIRC_HOME="$primary" "$AIRC" whois shost 2>&1)
+  echo "$out" | grep -q "role: *general-host" \
+    && pass "primary scope finds sidecar host via cross-scope walk" \
+    || fail "primary scope didn't resolve sidecar host (got: $out)"
+
+  # ── from primary scope: primary host still resolves (no regression)
+  out=$(AIRC_HOME="$primary" "$AIRC" whois phost 2>&1)
+  echo "$out" | grep -q "role: *primary-host" \
+    && pass "primary scope still resolves primary host (no regression)" \
+    || fail "primary host lookup regressed (got: $out)"
+
+  # ── from primary scope: unknown peer still graceful ────────────────
+  out=$(AIRC_HOME="$primary" "$AIRC" whois ghost-zzz 2>&1 || true)
+  echo "$out" | grep -q "no record for 'ghost-zzz'" \
+    && pass "unknown peer still 404s after walking all scopes" \
+    || fail "unknown peer error message regressed (got: $out)"
+
+  # ── from sidecar scope: same merged view (operator perspective) ────
+  out=$(AIRC_HOME="$sidecar" "$AIRC" whois phost 2>&1)
+  echo "$out" | grep -q "role: *primary-host" \
+    && pass "sidecar scope finds primary host (symmetric walk)" \
+    || fail "sidecar scope didn't resolve primary host (got: $out)"
+
+  rm -rf /tmp/airc-it-wcs
+  cleanup_all
+}
+
 # ── Scenario: part_keeps_sidecar (IRC /part semantics) ──────────────────
 # Pre-fix: `airc part` from the primary scope called cmd_teardown which
 # (post-#122) cleaned both primary AND sidecar scopes — so leaving
@@ -2501,10 +2592,11 @@ case "$MODE" in
   general_sidecar_default) scenario_general_sidecar_default ;;
   send_room_flag) scenario_send_room_flag ;;
   peers_cross_scope) scenario_peers_cross_scope ;;
+  whois_cross_scope) scenario_whois_cross_scope ;;
   part_keeps_sidecar) scenario_part_keeps_sidecar ;;
   platform_adapters) scenario_platform_adapters ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo
