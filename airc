@@ -302,12 +302,18 @@ ensure_init() {
   die "Not initialized ($AIRC_WRITE_DIR). Run: airc connect"
 }
 
+# config CRUD migrated to airc_core.config (#152 Phase 1). Pre-
+# migration these were inline python heredocs with bash variable
+# substitution INTO the python source — every callsite (45+) was a
+# silent-fail vector if the substituted value broke python parsing.
+# Post-migration: CONFIG comes from env var; key + default come from
+# argv. Python source is fixed bytes; bash never touches it.
 get_name() {
-  "$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG'))['name'])" 2>/dev/null || echo "unknown"
+  CONFIG="$CONFIG" "$AIRC_PYTHON" -m airc_core.config get_name 2>/dev/null || echo "unknown"
 }
 
 get_config_val() {
-  "$AIRC_PYTHON" -c "import json; print(json.load(open('$CONFIG')).get('$1','$2'))" 2>/dev/null || echo "$2"
+  CONFIG="$CONFIG" "$AIRC_PYTHON" -m airc_core.config get "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
 }
 
 get_host() {
