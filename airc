@@ -2713,7 +2713,7 @@ print(data.decode().strip())
     # targeted ssh-keygen -R when a PRIOR real-sshd host key in known_hosts
     # is known stale (e.g. the server rotated sshd host keys).
     local host_ssh_pub
-    host_ssh_pub=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null || true)
+    host_ssh_pub=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field ssh_pub "" 2>/dev/null || true)
     if [ -n "$host_ssh_pub" ]; then
       mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
       grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
@@ -2732,7 +2732,7 @@ print(data.decode().strip())
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
     local host_airc_home
-    host_airc_home=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
+    host_airc_home=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field airc_home "" 2>/dev/null || true)
     "$AIRC_PYTHON" -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
@@ -2775,13 +2775,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # the join string for onward sharing without a fresh handshake. Also
     # cache the host's identity blob from the handshake response so
     # `airc whois <host-name>` works locally (issue #34 v2).
-    local host_identity_json; host_identity_json=$(echo "$response" | "$AIRC_PYTHON" -c '
-import sys, json
-try:
-    print(json.dumps(json.load(sys.stdin).get("identity", {}) or {}))
-except Exception:
-    print("{}")
-' 2>/dev/null)
+    local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field identity "{}" 2>/dev/null || echo "{}")
     [ -z "$host_identity_json" ] && host_identity_json="{}"
     # Pass values as env vars instead of bash-substituted into the
     # python heredoc body. continuum-b69f's PR #164 retest 2026-04-27
@@ -2814,7 +2808,7 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 
     # Pick up reminder setting from host
     local host_reminder
-    host_reminder=$(echo "$response" | "$AIRC_PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
+    host_reminder=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field reminder 300 2>/dev/null || echo "300")
     if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
       echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
       date +%s > "$AIRC_WRITE_DIR/last_sent"
