@@ -5379,6 +5379,7 @@ cmd_doctor() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
+  _doctor_probe_sshd                                                    || issues=$((issues+1))
   _doctor_probe_tailscale "$mgr"  # optional, never increments issues
 
   echo ""
@@ -5458,18 +5459,28 @@ _doctor_install_cmd_for() {
 
 _doctor_probe() {
   local cmd="$1" mgr="$2" purpose="$3"
-  # Strict probe: command must exist on PATH AND respond to --version with
-  # exit 0. The bare `command -v` form is fooled by Windows's Microsoft
-  # Store python3.exe alias (continuum-b69f, 2026-04-27) — the file
-  # exists, satisfies command -v, but exits 49 with a Store-redirect
-  # message on stderr when actually invoked. Same story for Windows
-  # python.exe alias. Strict-probe version catches this fail-fast at
-  # doctor time instead of letting every later python3 -c "..."
-  # call die silently in cmd_connect.
-  if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version >/dev/null 2>&1; then
-    printf "  [ok] %s\n" "$cmd"
-    return 0
-  fi
+  # Strict-probe ONLY the binaries that have known shadow-aliases on
+  # Windows. PR #153's blanket strict-probe broke on macOS BSD utilities
+  # — `ssh-keygen --version` exits 1 ("illegal option") because BSD
+  # doesn't accept --version, and there's no portable single-flag that
+  # discriminates "real ssh-keygen" from "stub" anyway. Only the
+  # Microsoft Store {python.exe, python3.exe} aliases need defense
+  # against; everything else is uniquely shipped by the user's package
+  # manager (no shadowing ambiguity), so bare `command -v` is correct.
+  case "$cmd" in
+    python|python3)
+      if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version >/dev/null 2>&1; then
+        printf "  [ok] %s\n" "$cmd"
+        return 0
+      fi
+      ;;
+    *)
+      if command -v "$cmd" >/dev/null 2>&1; then
+        printf "  [ok] %s\n" "$cmd"
+        return 0
+      fi
+      ;;
+  esac
   # Distinguish "absent" from "stub on PATH" so the fix hint is correct.
   local fix
   if command -v "$cmd" >/dev/null 2>&1; then
@@ -5500,6 +5511,97 @@ _doctor_probe_gh_auth() {
   printf "  [MISSING] gh authenticated (gist scope)\n"
   printf "         Fix: gh auth login -s gist\n"
   return 1
+}
+
+# Probe sshd (SSH server). airc joiners ssh into the host's airc_home
+# to `tail -F messages.jsonl`. So every airc user who'll host a room
+# (which is most users — first to discover a room becomes its host)
+# needs sshd running on their box. Pre-fix: airc doctor probed for the
+# ssh CLIENT but not the SERVER. Joel + continuum-b69f hit this on
+# 2026-04-27 mid-cross-machine bringup: TCP handshake worked, but
+# message stream silently failed because Windows ships OpenSSH client
+# but NOT the server enabled by default.
+#
+# Per-platform probes:
+#   macOS         — launchctl + systemsetup (Remote Login)
+#   linux / wsl   — systemctl is-active on ssh OR sshd unit names
+#                   (Debian/Ubuntu unit is 'ssh', RHEL/Fedora is 'sshd')
+#   windows-bash  — powershell.exe Get-Service sshd, distinguish
+#                   Running / Stopped / Missing-capability
+#
+# Returns 0 on ok, 1 on missing/broken, 0 on platforms we can't probe
+# (don't penalize if we can't tell).
+_doctor_probe_sshd() {
+  local plat; plat=$(detect_platform)
+  case "$plat" in
+    macos)
+      if launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd"; then
+        printf "  [ok] sshd (Remote Login enabled)\n"
+        return 0
+      fi
+      if systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
+        printf "  [ok] sshd (Remote Login enabled)\n"
+        return 0
+      fi
+      printf "  [MISSING] sshd -- needed when you HOST a room\n"
+      printf "         Fix: System Settings -> General -> Sharing -> Remote Login (toggle on)\n"
+      printf "         Or:  sudo systemsetup -setremotelogin on\n"
+      return 1
+      ;;
+    linux|wsl)
+      # Debian/Ubuntu uses 'ssh', RHEL/Fedora/Arch uses 'sshd'.
+      if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+        printf "  [ok] sshd (systemd active)\n"
+        return 0
+      fi
+      printf "  [MISSING] sshd -- needed when you HOST a room\n"
+      printf "         Fix (Debian/Ubuntu): sudo apt-get install openssh-server && sudo systemctl enable --now ssh\n"
+      printf "         Fix (RHEL/Fedora):    sudo dnf install openssh-server && sudo systemctl enable --now sshd\n"
+      return 1
+      ;;
+    windows-bash)
+      # powershell.exe is the canonical PS launcher in Git Bash. Some
+      # boxes also ship pwsh.exe (PS Core); prefer powershell.exe for
+      # broadest reach since OpenSSH service control works in both.
+      local _ps=""
+      if command -v powershell.exe >/dev/null 2>&1; then _ps="powershell.exe"
+      elif command -v pwsh.exe >/dev/null 2>&1; then _ps="pwsh.exe"
+      fi
+      if [ -z "$_ps" ]; then
+        printf "  [info] sshd probe skipped (powershell.exe not on PATH)\n"
+        return 0
+      fi
+      local _state
+      _state=$("$_ps" -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
+      case "$_state" in
+        Running)
+          printf "  [ok] sshd (Windows OpenSSH.Server running)\n"
+          return 0
+          ;;
+        Stopped|StopPending|StartPending|Paused)
+          printf "  [BROKEN] sshd -- installed but not running (state: %s)\n" "$_state"
+          printf "         Fix (admin PowerShell):  Start-Service sshd; Set-Service sshd -StartupType Automatic\n"
+          return 1
+          ;;
+        "")
+          printf "  [MISSING] sshd -- needed when you HOST a room\n"
+          printf "         Fix (admin PowerShell):\n"
+          printf "           Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0\n"
+          printf "           Start-Service sshd\n"
+          printf "           Set-Service -Name sshd -StartupType Automatic\n"
+          return 1
+          ;;
+        *)
+          printf "  [info] sshd state unknown (Get-Service returned: '%s')\n" "$_state"
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      printf "  [info] sshd probe unsupported on platform '%s'\n" "$plat"
+      return 0
+      ;;
+  esac
 }
 
 _doctor_probe_tailscale() {
@@ -5547,6 +5649,7 @@ _doctor_connect_preflight() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
+  _doctor_probe_sshd                                                   || issues=$((issues+1))
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.
   # Single chain (early-return on first failure) so a missing gh isn't
