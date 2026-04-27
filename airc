@@ -2384,23 +2384,14 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # to env-var pass — python reads from os.environ; bash never
     # touches the python source. Also emit stderr to surface failures
     # for the future debugger (not /dev/null).
-    HOST_AIRC_HOME="$host_airc_home" \
-    HOST_NAME="$peer_name" \
-    HOST_PORT="${peer_port:-7547}" \
-    HOST_SSH_PUB="$host_ssh_pub" \
-    HOST_IDENTITY="$host_identity_json" \
-    CONFIG="$CONFIG" \
-    "$AIRC_PYTHON" -c '
-import json, os
-c = json.load(open(os.environ["CONFIG"]))
-c["host_airc_home"] = os.environ.get("HOST_AIRC_HOME", "")
-c["host_name"]      = os.environ.get("HOST_NAME", "")
-try:    c["host_port"] = int(os.environ.get("HOST_PORT", "7547"))
-except: c["host_port"] = 7547
-c["host_ssh_pub"]   = os.environ.get("HOST_SSH_PUB", "")
-c["host_identity"]  = json.loads(os.environ.get("HOST_IDENTITY", "{}"))
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-' || echo "  ⚠  config write failed (host_airc_home/host_name/host_port/host_ssh_pub may be unset). airc may still work if subsequent retries refresh." >&2
+    "$AIRC_PYTHON" -m airc_core.config set_host_block \
+        --config "$CONFIG" \
+        --host-airc-home "$host_airc_home" \
+        --host-name "$peer_name" \
+        --host-port "${peer_port:-7547}" \
+        --host-ssh-pub "$host_ssh_pub" \
+        --host-identity-json "$host_identity_json" \
+        || echo "  ⚠  config write failed (host_airc_home/host_name/host_port/host_ssh_pub may be unset). airc may still work if subsequent retries refresh." >&2
 
     # Pick up reminder setting from host
     local host_reminder
