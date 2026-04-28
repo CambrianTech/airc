@@ -276,19 +276,25 @@ def run(my_name: str, peers_dir: str) -> int:
         # Newlines collapsed to spaces so each emitted event is still a
         # single line, but the full body always reaches the consumer.
         msg_one_line = (msg or "").replace("\n", " ").replace("\r", " ").strip()
+        # Phase 2: prefer the envelope's `channel` field over the scope-
+        # level `room_name`. The envelope field is per-message, so a
+        # single scope can display a multi-channel stream with correct
+        # per-line prefixing. Falls back to the scope's `room_name` for
+        # pre-Phase-2 messages that don't carry the envelope field.
+        line_channel = m.get("channel") or room_name
         try:
             if fr in ("airc", "sys"):
                 # System events (joins, parts, drain, auth, watchdog).
                 # Example:  airc: [#general] alice joined
-                print(f"airc: [#{room_name}] {msg_one_line}", flush=True)
+                print(f"airc: [#{line_channel}] {msg_one_line}", flush=True)
             elif to and to not in ("all", ""):
                 # DM with addressed recipient.
                 # Example:  airc: [#general] bigmama → alice: quick question
-                print(f"airc: [#{room_name}] {fr} → {to}: {msg_one_line}", flush=True)
+                print(f"airc: [#{line_channel}] {fr} → {to}: {msg_one_line}", flush=True)
             else:
                 # Broadcast.
                 # Example:  airc: [#general] bigmama: hello everyone
-                print(f"airc: [#{room_name}] {fr}: {msg_one_line}", flush=True)
+                print(f"airc: [#{line_channel}] {fr}: {msg_one_line}", flush=True)
         except Exception as e:
             # Belt-and-suspenders — one bad message must never take the
             # whole monitor down. Surface to stderr (which the bash retry

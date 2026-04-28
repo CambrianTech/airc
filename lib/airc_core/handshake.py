@@ -245,6 +245,7 @@ def cmd_accept_one(args) -> int:
             "ts": timestamp,
             "from": "airc",
             "to": "all",
+            "channel": room_name,
             "msg": f"{jname} joined #{room_name}",
         }
         with open(args.messages, "a") as f:
