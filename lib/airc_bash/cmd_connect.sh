@@ -747,6 +747,12 @@ cmd_connect() {
     # the gist lifecycle — but we save the room name for display.
     if [ -n "$resolved_room_name" ]; then
       echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
+      # Phase 2B.2: also write to subscribed_channels[0] so cmd_send picks
+      # this as the default channel without needing the legacy room_name
+      # file. --first promotes to index 0 in case a prior subscription
+      # already added other channels.
+      "$AIRC_PYTHON" -m airc_core.config subscribe \
+        --config "$CONFIG" --channel "$resolved_room_name" --first 2>/dev/null || true
       echo "  Joined #${resolved_room_name}"
     fi
 
@@ -1055,6 +1061,10 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # substrate framing took effect — emit unconditionally for room mode.
     if [ "$use_room" = "1" ]; then
       echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+      # Phase 2B.2: also seed subscribed_channels with our hosted channel
+      # so cmd_send + future config-driven consumers see it.
+      "$AIRC_PYTHON" -m airc_core.config subscribe \
+        --config "$CONFIG" --channel "$room_name" --first 2>/dev/null || true
       echo "  Hosting #${room_name} — no existing room on your gh account, fresh start."
       echo "  Other agents on your gh account who run 'airc join' will auto-join."
     fi
