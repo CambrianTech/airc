@@ -159,18 +159,20 @@ iso_to_epoch() {
 # Both directions exposed so callers don't have to remember which sed
 # regex inverts the other.
 _to_win_path() {
-  if command -v cygpath >/dev/null 2>&1; then
-    cygpath -w "$1" 2>/dev/null
-  else
-    printf '%s' "$1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g'
-  fi
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1" 2>/dev/null; return; fi
+  # Pure-bash fallback (BSD sed lacks GNU \U/\L). /c/Users/foo → C:\Users\foo
+  case "$1" in
+    /[a-zA-Z]/*) printf '%s' "${1:1:1}" | tr 'a-z' 'A-Z'; printf ':\\%s\n' "${1:3}" | tr '/' '\\';;
+    *)           printf '%s\n' "$1" | tr '/' '\\' ;;
+  esac
 }
 _to_bash_path() {
-  if command -v cygpath >/dev/null 2>&1; then
-    cygpath -u "$1" 2>/dev/null
-  else
-    printf '%s' "$1" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|'
-  fi
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1" 2>/dev/null; return; fi
+  # Inverse of _to_win_path. C:\Users\foo → /c/Users/foo
+  case "$1" in
+    [a-zA-Z]:*) printf '/'; printf '%s' "${1:0:1}" | tr 'A-Z' 'a-z'; printf '%s\n' "${1:2}" | tr '\\' '/';;
+    *)          printf '%s\n' "$1" | tr '\\' '/' ;;
+  esac
 }
 
 # ── End platform adapters ───────────────────────────────────────────────
