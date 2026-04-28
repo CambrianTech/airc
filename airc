@@ -380,9 +380,9 @@ get_name() {
   "$AIRC_PYTHON" -m airc_core.config get_name --config "$CONFIG" 2>/dev/null || echo "unknown"
 }
 
-get_config_val() {
-  "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
-}
+get_config_val()   { "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"; }
+set_config_val()   { "$AIRC_PYTHON" -m airc_core.config set --config "$CONFIG" --key "$1" --value "$2"; }
+unset_config_keys() { "$AIRC_PYTHON" -m airc_core.config unset_keys --config "$CONFIG" "$@"; }
 
 # Same as get_config_val but reads from an arbitrary config.json path.
 # Used by _whois_in_scope (#134 cross-scope walk) and other places
@@ -1027,70 +1027,11 @@ _primary_scope_for() {
   fi
 }
 
-# Read the parted_rooms list (issue #136) from a primary scope's
-# config.json. Echoes one room per line (empty if unset). Caller can
-# pipe to grep -Fxq "<room>" to test membership without subshell.
-_read_parted_rooms() {
-  local primary="$1"
-  local cfg="$primary/config.json"
-  [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-    for r in c.get("parted_rooms", []) or []:
-        print(r)
-except Exception:
-    pass
-' 2>/dev/null
-}
-
-# Mark a room as parted in the primary scope's config (issue #136).
-# Idempotent — re-parting the same room does not create duplicates.
-# Persists across teardown/reboot so /part is sticky, not session-only.
-_record_parted_room() {
-  local primary="$1" room="$2"
-  local cfg="$primary/config.json"
-  [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" ROOM="$room" "$AIRC_PYTHON" -c '
-import json, os, sys
-cfg = os.environ["CONFIG"]
-room = os.environ["ROOM"]
-try:
-    c = json.load(open(cfg))
-except Exception:
-    # Better to no-op than corrupt config; the missing persist surfaces
-    # as auto-resubscribe on next bootstrap, not silent state corruption.
-    sys.exit(0)
-parted = list(c.get("parted_rooms", []) or [])
-if room not in parted:
-    parted.append(room)
-    c["parted_rooms"] = parted
-    json.dump(c, open(cfg, "w"), indent=2)
-' 2>/dev/null || true
-}
-
-# Remove a room from the primary scope's parted_rooms (issue #136).
-# Used by `airc join --general` (and similar explicit re-opt-in flows)
-# to undo a prior /part.
-_clear_parted_room() {
-  local primary="$1" room="$2"
-  local cfg="$primary/config.json"
-  [ -f "$cfg" ] || return 0
-  CONFIG="$cfg" ROOM="$room" "$AIRC_PYTHON" -c '
-import json, os, sys
-cfg = os.environ["CONFIG"]
-room = os.environ["ROOM"]
-try:
-    c = json.load(open(cfg))
-except Exception:
-    sys.exit(0)
-parted = [r for r in (c.get("parted_rooms", []) or []) if r != room]
-if parted != (c.get("parted_rooms", []) or []):
-    c["parted_rooms"] = parted
-    json.dump(c, open(cfg, "w"), indent=2)
-' 2>/dev/null || true
-}
+# parted_rooms helpers (#136 sticky /part) — thin wrappers; mutation
+# logic lives in airc_core.config (#205 target 6).
+_read_parted_rooms()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config read_parted --config "$1/config.json" 2>/dev/null; }
+_record_parted_room() { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config record_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
+_clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config clear_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
 
 # Spawn the #general sidecar (issue #121) — a parallel `airc connect`
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
@@ -2255,18 +2196,10 @@ cmd_connect() {
     # the `identity` block (issue #34) across re-pairs so a teardown +
     # rejoin keeps pronouns/role/bio/status without requiring users to
     # re-run airc identity set every time.
-    MY_NAME="$my_name" MY_HOST="$(get_host)" SSH_TARGET="$ssh_target" CREATED="$(timestamp)" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-except Exception:
-    c = {}
-c["name"]        = os.environ["MY_NAME"]
-c["host"]        = os.environ["MY_HOST"]
-c["host_target"] = os.environ["SSH_TARGET"]
-c["created"]     = os.environ["CREATED"]
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-'
+    set_config_val name        "$my_name"
+    set_config_val host        "$(get_host)"
+    set_config_val host_target "$ssh_target"
+    set_config_val created     "$(timestamp)"
 
     # Remember which room we joined (issue #39). Lets `airc rooms` and
     # status/diagnostics report channel context, and gives the joiner
@@ -2521,21 +2454,12 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
 
     # Merge into existing config.json (preserve identity across re-spawns
     # — same rationale as the joiner branch above).
-    MY_NAME="$name" MY_HOST="$(get_host)" CREATED="$(timestamp)" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-except Exception:
-    c = {}
-c["name"]    = os.environ["MY_NAME"]
-c["host"]    = os.environ["MY_HOST"]
-c["created"] = os.environ["CREATED"]
-# Host mode: clear any leftover host_target/host_name from a prior
-# joiner run in this scope (avoid mis-reading ourselves as a joiner).
-for k in ("host_target", "host_name", "host_port", "host_airc_home", "host_ssh_pub", "host_identity"):
-    c.pop(k, None)
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-'
+    set_config_val name    "$name"
+    set_config_val host    "$(get_host)"
+    set_config_val created "$(timestamp)"
+    # Host mode: clear leftover host_* from any prior joiner run in
+    # this scope so we don't mis-read ourselves as a joiner.
+    unset_config_keys host_target host_name host_port host_airc_home host_ssh_pub host_identity
 
     local host; host=$(get_host)
     local user; user=$(whoami)

@@ -70,6 +70,47 @@ def cmd_set_name(args) -> int:
         return 1
 
 
+def _load(path):
+    try: return json.load(open(path))
+    except (OSError, ValueError): return {}
+
+
+def _save(path, c):
+    try: json.dump(c, open(path, "w"), indent=2); return 0
+    except OSError as e:
+        print(f"airc-config-set-error: {e}", file=sys.stderr); return 1
+
+
+def cmd_set(args) -> int:
+    c = _load(args.config); c[args.key] = args.value; return _save(args.config, c)
+
+
+def cmd_unset_keys(args) -> int:
+    c = _load(args.config)
+    for k in args.keys: c.pop(k, None)
+    return _save(args.config, c)
+
+
+def cmd_read_parted(args) -> int:
+    for r in _load(args.config).get("parted_rooms", []) or []: print(r)
+    return 0
+
+
+def cmd_record_parted(args) -> int:
+    c = _load(args.config); p = list(c.get("parted_rooms", []) or [])
+    if args.room not in p:
+        p.append(args.room); c["parted_rooms"] = p; return _save(args.config, c)
+    return 0
+
+
+def cmd_clear_parted(args) -> int:
+    c = _load(args.config); cur = c.get("parted_rooms", []) or []
+    new = [r for r in cur if r != args.room]
+    if new != cur:
+        c["parted_rooms"] = new; return _save(args.config, c)
+    return 0
+
+
 def cmd_set_host_block(args) -> int:
     """Atomically write the post-handshake host_* fields into config.
 
@@ -123,6 +164,31 @@ def _build_parser() -> argparse.ArgumentParser:
     sn.add_argument("--config", required=True)
     sn.add_argument("--name", required=True)
     sn.set_defaults(func=cmd_set_name)
+
+    ss = sub.add_parser("set")
+    ss.add_argument("--config", required=True)
+    ss.add_argument("--key", required=True)
+    ss.add_argument("--value", required=True)
+    ss.set_defaults(func=cmd_set)
+
+    us = sub.add_parser("unset_keys")
+    us.add_argument("--config", required=True)
+    us.add_argument("keys", nargs="+")
+    us.set_defaults(func=cmd_unset_keys)
+
+    rp = sub.add_parser("read_parted")
+    rp.add_argument("--config", required=True)
+    rp.set_defaults(func=cmd_read_parted)
+
+    rcp = sub.add_parser("record_parted")
+    rcp.add_argument("--config", required=True)
+    rcp.add_argument("--room", required=True)
+    rcp.set_defaults(func=cmd_record_parted)
+
+    cp = sub.add_parser("clear_parted")
+    cp.add_argument("--config", required=True)
+    cp.add_argument("--room", required=True)
+    cp.set_defaults(func=cmd_clear_parted)
 
     s = sub.add_parser("set_host_block")
     s.add_argument("--config", required=True)
