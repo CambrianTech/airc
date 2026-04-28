@@ -65,12 +65,20 @@ cmd_rooms() {
   # rolled over yet, plus single-pair invites (`airc invite for`) for
   # cross-account ad-hoc pairing.
   # gh gist list columns: id  description  files  visibility  updated_at
-  local raw; raw=$(gh gist list --limit 50 2>/dev/null \
+  #
+  # CI fix: airc has \`set -euo pipefail\` at the top. \`gh gist list\` exits
+  # 4 when not authed; under pipefail that propagates and -e aborts the
+  # script with rc=4. The integration suite's scenario_list saw
+  # 'airc list crashed (rc=4)'. Tolerate gh's nonzero exit explicitly:
+  # capture stderr to /dev/null, OR-true the pipeline so an unauthed
+  # gh produces empty raw (which the count=0 branch handles cleanly).
+  local raw=""
+  raw=$( { gh gist list --limit 50 2>/dev/null || true; } \
     | awk -F'\t' '
         /airc mesh/         { print "mesh\t"   $1 "\t" $2 "\t" $5 }
         /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $5 }
         /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $5 }
-      ')
+      ' || true)
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
     echo "  No open airc rooms or invites on your gh account."
