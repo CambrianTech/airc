@@ -231,6 +231,11 @@ _ensure_sshd_running() {
       # rule + start + persist. Idempotent — the inner commands check
       # state before writing, so re-running install on a healthy box
       # doesn't re-prompt or duplicate state.
+      # DefaultShell = Git for Windows bash (#98). Without this, every
+      # Windows airc HOST silently fails inbound `airc msg` from peers
+      # because the OpenSSH default shell is cmd.exe, which lacks `cat`,
+      # `>>`, and the rest of the POSIX vocabulary airc remote commands
+      # rely on. Locate bash.exe; idempotent registry write.
       local _elevated_payload='
 $ErrorActionPreference = "Stop";
 try {
@@ -245,7 +250,18 @@ try {
   }
   Start-Service sshd;
   Set-Service -Name sshd -StartupType Automatic;
-  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start)";
+  $bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
+  $bashPath = $null;
+  foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
+  if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
+  if ($bashPath) {
+    $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
+    if ($cur -ne $bashPath) {
+      if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
+      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
+    }
+  }
+  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start + DefaultShell=bash)";
 } catch { Write-Host "airc-elevated-error: $_" }
 '
       case "$_state" in
@@ -281,14 +297,19 @@ tailscale_present() {
   # `tailscale` on PATH — `command -v tailscale` then lies about a missing
   # install and we'd brew-cask over the user's working Tailscale (sudo
   # prompt + kernel extension churn). Check the GUI bundle path too.
+  # Windows Git Bash: winget installs to Program Files; PATH may not
+  # include it in the current shell yet. Same trap.
   command -v tailscale >/dev/null 2>&1 && return 0
   [ -d /Applications/Tailscale.app ] && return 0
   [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && return 0
+  [ -x "/c/Program Files/Tailscale/tailscale.exe" ] && return 0
+  [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ] && return 0
   return 1
 }
 
 install_tailscale() {
   # Optional. macOS: brew cask. Linux: tailscale's official installer.
+  # Windows Git Bash: winget (case-sensitive id, see #94).
   tailscale_present && return 0
   case "$(uname -s)" in
     Darwin)
@@ -303,6 +324,17 @@ install_tailscale() {
           || warn "Tailscale installer script failed; install manually: https://tailscale.com/download/linux"
       else
         warn "curl missing; install Tailscale manually: https://tailscale.com/download/linux"
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash: winget. Package id is case-sensitive (#94 —
+      # 'tailscale.tailscale' lowercase silently fails; 'Tailscale.Tailscale'
+      # is the actual id). Mirrors install.ps1's Install-IfMissing line.
+      local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+      if [ -n "$wbin" ]; then
+        "$wbin" install --id Tailscale.Tailscale --silent --accept-source-agreements --accept-package-agreements 2>&1 \
+          || warn "Tailscale install via winget failed; install manually: https://tailscale.com/download/windows"
+      else
+        warn "winget not present; install Tailscale manually: https://tailscale.com/download/windows"
       fi ;;
     *)
       warn "Don't know how to install Tailscale on $(uname -s); see https://tailscale.com/download" ;;
@@ -493,8 +525,25 @@ EOF
     exit 1
   fi
 else
-  info "Installing AIRC"
-  git clone --quiet "$REPO_URL" "$CLONE_DIR"
+  # First install. Honor AIRC_CHANNEL if set so users can land on canary
+  # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
+  # `airc canary && airc update` dance. Default to main (the release
+  # branch) when AIRC_CHANNEL is unset. Caught by vhsm-d1f4 2026-04-28
+  # during the #191 release-gate fresh-install verification: env var was
+  # silently ignored, install landed on main.
+  CHANNEL_TARGET="${AIRC_CHANNEL:-main}"
+  case "$CHANNEL_TARGET" in
+    main|canary) ;;
+    *)
+      warn "AIRC_CHANNEL='$CHANNEL_TARGET' is not a known channel (main, canary). Defaulting to main."
+      CHANNEL_TARGET="main"
+      ;;
+  esac
+  info "Installing AIRC (channel: $CHANNEL_TARGET)"
+  git clone --quiet --branch "$CHANNEL_TARGET" "$REPO_URL" "$CLONE_DIR"
+  # Persist the channel choice so future `airc update` follows the same
+  # branch. Mirrors what `airc canary` / `airc main` write.
+  echo "$CHANNEL_TARGET" > "$CLONE_DIR/.channel"
 fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
@@ -559,6 +608,13 @@ ts_post_check() {
     ts_bin="tailscale"
   elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
     ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  elif [ -x "/c/Program Files/Tailscale/tailscale.exe" ]; then
+    # Windows Git Bash: winget installs Tailscale to Program Files;
+    # PATH may not yet include it in the current shell. Mirror
+    # airc.ps1's resolve_tailscale_bin candidates.
+    ts_bin="/c/Program Files/Tailscale/tailscale.exe"
+  elif [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ]; then
+    ts_bin="/c/Program Files (x86)/Tailscale/tailscale.exe"
   fi
   [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
 
@@ -576,9 +632,15 @@ ts_post_check() {
           else
             info "Sign in:  tailscale up"
           fi ;;
+        MINGW*|MSYS*|CYGWIN*)
+          info "Click the Tailscale tray icon to sign in, or run:  tailscale up"
+          info "Do this BEFORE 'airc join', or cross-machine joins will hang." ;;
         *)
           info "Sign in:  tailscale up   (follow the printed URL)" ;;
       esac
+      ;;
+    *)
+      # Logged in / running normally — silent (good UX, nothing to nag).
       ;;
   esac
 }
@@ -590,10 +652,20 @@ ts_post_check
 echo ""
 ok "Installed."
 echo ""
-echo "  Cross-LAN mesh? Tailscale is optional but recommended:"
-echo "    https://tailscale.com    (then: tailscale up)"
-echo "  Same-LAN mesh works without it; gist orchestration handles either."
-echo ""
+# Tailscale post-install message — be honest about installed state. The
+# pre-fix text always read "Tailscale is optional but recommended:
+# https://tailscale.com" even when winget had just installed it 30s ago,
+# which (per Joel 2026-04-28) reads as a fail. ts_post_check above
+# already nudges sign-in if installed-but-logged-out, so here we only
+# print the "go install it" line when tailscale really isn't present.
+if tailscale_present; then
+  :  # ts_post_check handled the messaging if relevant
+else
+  echo "  Cross-LAN mesh? Tailscale is optional (not installed):"
+  echo "    https://tailscale.com    (then: tailscale up)"
+  echo "  Same-LAN mesh works without it; gist orchestration handles either."
+  echo ""
+fi
 echo "  Next:"
 echo "    1. gh auth login -s gist          # one-time, browser flow"
 echo "    2. airc join                      # auto-#general (joins existing or hosts)"
