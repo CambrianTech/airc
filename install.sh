@@ -340,6 +340,32 @@ if (-not (Test-Path $sshKeygen)) {
   }
 }
 
+Write-Host "==> SSH directory ACLs (C:\ProgramData\ssh + logs/)";
+# Per Microsoft KB on Error 1067 / Event 7034 (Oct 2024 Windows update
+# regression that became permanent in newer builds):
+#   "This issue occurs if the C:\ProgramData\ssh and C:\ProgramData\ssh\logs
+#    folders have incorrect permissions. The permissions might be too limited
+#    or too open. For example, the SYSTEM account or the Administrators group
+#    might not have write permissions. For a second example, regular users
+#    might have write or full control permissions."
+# https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/error-1053-1067-7034-after-update-openssh-doesnt-start
+#
+# Required ACL on each folder:
+#   SYSTEM              : Full Control
+#   Administrators      : Full Control
+#   Authenticated Users : Read & execute (read-only, no write)
+# Owner: SYSTEM (not the user who created the folder).
+$sshDir = 'C:\ProgramData\ssh'
+$logsDir = Join-Path $sshDir 'logs'
+foreach ($d in @($sshDir, $logsDir)) {
+  if (-not (Test-Path $d)) { New-Item -Path $d -ItemType Directory -Force | Out-Null }
+  icacls $d /setowner 'NT AUTHORITY\SYSTEM' 2>&1 | Out-Null
+  icacls $d /inheritance:r 2>&1 | Out-Null
+  icacls $d /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)' 'BUILTIN\Administrators:(OI)(CI)(F)' 'NT AUTHORITY\Authenticated Users:(OI)(CI)(RX)' 2>&1 | Out-Null
+  Write-Host "  $d :"
+  icacls $d 2>&1 | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" }
+}
+
 Write-Host "==> sshd dry-run (config + key load test)";
 # Run sshd -t from elevated context to surface the *real* reason sshd
 # is failing -- Start-Service sshd hides the underlying error behind a
