@@ -1067,88 +1067,31 @@ _clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.c
 # cmd_teardown's process-tree walker reaps it. cmd_teardown also has
 # explicit sidecar-scope cleanup (gist + sidecar's own pidfile).
 spawn_general_sidecar_if_wanted() {
+  # Phase 2B.3: the sidecar process is GONE. With Phase 1's mesh-singleton
+  # substrate (one gist + one host per gh account), a separate `airc
+  # connect` process for #general would discover the same mesh and yield
+  # to the same host — pure overhead. Instead we just add "general" to
+  # this scope's subscribed_channels list. cmd_send default-channel logic
+  # (Phase 2B.1) and the monitor formatter's per-envelope channel display
+  # (Phase 2A) handle the rest in one process.
+  #
+  # The function name + callsites stay so cmd_connect's flow doesn't
+  # need rewiring; only the body changed.
   [ "$general_sidecar" = "1" ] || return 0
   [ "$room_name" = "general" ] && return 0
   [ "$use_room" = "1" ] || return 0
 
-  local _primary_scope="$AIRC_WRITE_DIR"
-  local _primary_name; _primary_name=$(get_name 2>/dev/null || echo "")
-  local _sidecar_scope="${_primary_scope}.general"
-
-  # Issue #136: honor a prior /part. If "general" is in the primary
-  # scope's parted_rooms list, the user explicitly left the lobby —
-  # don't auto-resubscribe on bootstrap. Override with `airc join
-  # --general` (cmd_connect calls _clear_parted_room) or by editing
-  # config.json. Env/flag opt-outs are session-only and do NOT touch
-  # parted_rooms; only an explicit /part persists.
-  if _read_parted_rooms "$_primary_scope" | grep -Fxq "general"; then
-    echo "  Sidecar #general skipped — previously parted (airc join --general to rejoin)."
+  # Honor a prior /part: if "general" is in parted_rooms, don't
+  # auto-resubscribe. Override with `airc join --general` (which
+  # already calls _clear_parted_room) or by editing config.json.
+  if _read_parted_rooms "$AIRC_WRITE_DIR" | grep -Fxq "general"; then
+    echo "  #general subscription skipped — previously parted (airc join --general to rejoin)."
     return 0
   fi
 
-  echo "  Sidecar: also subscribing to #general (--no-general to opt out)"
-
-  mkdir -p "$_sidecar_scope"
-
-  # Background subprocess. Inherits stdout from primary so its monitor
-  # events stream alongside primary's, naturally distinguished by the
-  # formatter's `[#room]` prefix. AIRC_GENERAL_SIDECAR=1 is the recursion
-  # guard the sidecar reads at the top of cmd_connect to avoid spawning
-  # ITS OWN sidecar (turtles all the way down).
-  # Explicit `--room general` is critical: without it, auto-scope from
-  # cwd's git remote would resolve to the SAME project room as primary
-  # (cwd is shared across the spawn), and we'd end up double-subscribed
-  # to one room instead of subscribed to two. AIRC_NO_AUTO_ROOM=1 is
-  # belt-and-suspenders — auto-scope is gated by --room not being
-  # explicit; --room general makes it explicit, but the env var
-  # documents intent.
-  #
-  # `env` invocation (not bash assignment-prefixes): bash parameter
-  # expansion `${foo:+VAR=val}` doesn't get treated as an assignment
-  # prefix because it's expanded after tokenization — bash sees
-  # `AIRC_NAME=alpha` as a command in that position, not an env var,
-  # and dies with "command not found". `env` always treats its args
-  # as VAR=val pairs. Caught the hard way by the first run of this
-  # helper on 2026-04-26.
-  local _env_args=(AIRC_HOME="$_sidecar_scope" AIRC_GENERAL_SIDECAR=1 AIRC_NO_AUTO_ROOM=1)
-  [ -n "$_primary_name" ] && _env_args+=("AIRC_NAME=$_primary_name")
-  # Inherit primary's --no-gist flag so test fixtures don't leak a real
-  # #general gist into the live joelteply gh namespace via the sidecar.
-  # Bug found by continuum-b69f 2026-04-27 across the cross-Mac/Windows
-  # substrate-bypass channel: scenario_part_persists et al spawn the
-  # primary with `--no-gist --no-discovery`, but those flags do not
-  # propagate to the sidecar's spawn here. The sidecar then publishes
-  # an `airc room: general` gist with the test fixture's host info
-  # (e.g. host=alpha, port=7556). Test exits via cleanup_all's `kill -9`
-  # which bypasses the on-exit gist-delete trap, leaving the gist
-  # orphaned. Real users (continuum-b69f's Windows tab) discover it,
-  # try to TCP-connect, get RST. Two layers of test isolation hole;
-  # this fix patches the upstream half. (The downstream half — kill -9
-  # bypassing the trap — is harder to fix; tracked separately.)
-  #
-  # AIRC_NO_DISCOVERY=1 propagates automatically via the subshell env;
-  # only --no-gist needs explicit forwarding because it's a flag, not
-  # an env var.
-  local _sidecar_args=(connect --room general)
-  if [ "${use_gist:-1}" = "0" ]; then
-    _sidecar_args+=(--no-gist)
-  fi
-  # Unset primary's AIRC_PORT so sidecar doesn't fight for the same port —
-  # primary has it bound already, sidecar's auto-bump-loop would land on
-  # +1, but better to start the sidecar from the canonical default and
-  # let it find its own free port without the conflict-detect dance.
-  ( env -u AIRC_PORT "${_env_args[@]}" "$0" "${_sidecar_args[@]}" ) &
-  local _sidecar_pid=$!
-
-  # Sidecar's own scope writes its own airc.pid for its bash + descendants.
-  # cmd_teardown walks $AIRC_WRITE_DIR.general/airc.pid explicitly to kill
-  # the sidecar tree, so we DON'T append the sidecar bash PID to the
-  # primary's airc.pid. Earlier (PR #122) we did — but that broke
-  # cmd_part, which walks the same primary pidfile and ends up killing
-  # the sidecar too even though IRC semantics say `/part` should leave
-  # only the current channel and keep others (e.g. #general) alive.
-  # Pidfiles per scope; cmd_teardown is the only path that walks both.
-  :
+  echo "  Also subscribing to #general (--no-general to opt out)"
+  "$AIRC_PYTHON" -m airc_core.config subscribe \
+    --config "$CONFIG" --channel general 2>/dev/null || true
 }
 
 # Resolve this session's peer name.
