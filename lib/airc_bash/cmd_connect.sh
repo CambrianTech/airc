@@ -746,14 +746,34 @@ cmd_connect() {
     # need the gist_id for cmd_part on joiner side — only the host owns
     # the gist lifecycle — but we save the room name for display.
     if [ -n "$resolved_room_name" ]; then
-      echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
-      # Phase 2B.2: also write to subscribed_channels[0] so cmd_send picks
-      # this as the default channel without needing the legacy room_name
-      # file. --first promotes to index 0 in case a prior subscription
-      # already added other channels.
-      "$AIRC_PYTHON" -m airc_core.config subscribe \
-        --config "$CONFIG" --channel "$resolved_room_name" --first 2>/dev/null || true
-      echo "  Joined #${resolved_room_name}"
+      # Phase 2B.2.1 (continuum-b741's WART 1): joiner's cwd-derived or
+      # explicit --room intent must NOT be overwritten by the host's
+      # advertised channel. If the user wanted #cambriantech (cwd) and
+      # the mesh host happens to advertise #useideem, the joiner is
+      # subscribed to BOTH — cmd_send default = user's intent; the
+      # host's channel is tagged on too so their traffic still displays
+      # via [#useideem] prefix.
+      #
+      # The legacy room_name file gets the user's intent when it differs
+      # (so cmd_send's third-priority fallback also picks the right
+      # default for users still on Phase 1 code).
+      local _intent="$room_name"
+      if [ -z "$_intent" ] || [ "$_intent" = "$resolved_room_name" ]; then
+        echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
+        "$AIRC_PYTHON" -m airc_core.config subscribe \
+          --config "$CONFIG" --channel "$resolved_room_name" --first 2>/dev/null || true
+        echo "  Joined #${resolved_room_name}"
+      else
+        # Diverged: user wanted X, host advertises Y. Subscribe to both,
+        # X first (default for cmd_send), Y appended (display shows
+        # host's channel traffic too).
+        echo "$_intent" > "$AIRC_WRITE_DIR/room_name"
+        "$AIRC_PYTHON" -m airc_core.config subscribe \
+          --config "$CONFIG" --channel "$_intent" --first 2>/dev/null || true
+        "$AIRC_PYTHON" -m airc_core.config subscribe \
+          --config "$CONFIG" --channel "$resolved_room_name" 2>/dev/null || true
+        echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
+      fi
     fi
 
     # Exchange keys with host via TCP (port 7547) — public keys only
