@@ -231,6 +231,11 @@ _ensure_sshd_running() {
       # rule + start + persist. Idempotent — the inner commands check
       # state before writing, so re-running install on a healthy box
       # doesn't re-prompt or duplicate state.
+      # DefaultShell = Git for Windows bash (#98). Without this, every
+      # Windows airc HOST silently fails inbound `airc msg` from peers
+      # because the OpenSSH default shell is cmd.exe, which lacks `cat`,
+      # `>>`, and the rest of the POSIX vocabulary airc remote commands
+      # rely on. Locate bash.exe; idempotent registry write.
       local _elevated_payload='
 $ErrorActionPreference = "Stop";
 try {
@@ -245,7 +250,18 @@ try {
   }
   Start-Service sshd;
   Set-Service -Name sshd -StartupType Automatic;
-  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start)";
+  $bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
+  $bashPath = $null;
+  foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
+  if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
+  if ($bashPath) {
+    $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
+    if ($cur -ne $bashPath) {
+      if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
+      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
+    }
+  }
+  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start + DefaultShell=bash)";
 } catch { Write-Host "airc-elevated-error: $_" }
 '
       case "$_state" in
@@ -289,6 +305,7 @@ tailscale_present() {
 
 install_tailscale() {
   # Optional. macOS: brew cask. Linux: tailscale's official installer.
+  # Windows Git Bash: winget (case-sensitive id, see #94).
   tailscale_present && return 0
   case "$(uname -s)" in
     Darwin)
@@ -303,6 +320,17 @@ install_tailscale() {
           || warn "Tailscale installer script failed; install manually: https://tailscale.com/download/linux"
       else
         warn "curl missing; install Tailscale manually: https://tailscale.com/download/linux"
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash: winget. Package id is case-sensitive (#94 —
+      # 'tailscale.tailscale' lowercase silently fails; 'Tailscale.Tailscale'
+      # is the actual id). Mirrors install.ps1's Install-IfMissing line.
+      local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+      if [ -n "$wbin" ]; then
+        "$wbin" install --id Tailscale.Tailscale --silent --accept-source-agreements --accept-package-agreements 2>&1 \
+          || warn "Tailscale install via winget failed; install manually: https://tailscale.com/download/windows"
+      else
+        warn "winget not present; install Tailscale manually: https://tailscale.com/download/windows"
       fi ;;
     *)
       warn "Don't know how to install Tailscale on $(uname -s); see https://tailscale.com/download" ;;
