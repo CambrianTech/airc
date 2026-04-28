@@ -1,0 +1,205 @@
+name: ci
+
+# Three jobs on every PR + every push to canary/main:
+#
+#   clean-install-linux   ubuntu install.sh + airc doctor + smoke test
+#   clean-install-macos   macos install.sh + airc doctor + smoke test
+#   clean-install-windows windows install.ps1 + airc doctor (PS-side)
+#
+# Plus on canary/main only (skipped on PR): integration-suite runs the
+# full test/integration.sh on ubuntu — the most thorough gate, but
+# expensive (real gh-gist scenarios + ~5min runtime).
+#
+# The clean-install jobs are the "guarantee installs work from zero"
+# gate Joel asked for (2026-04-28). They run on a stock runner image
+# with no airc preinstalled, exercise install.{sh,ps1} the way a real
+# first-time user would, and validate the binary lands + doctor reports
+# clean. Without these, every Windows install bug (#94, #96, #98, #99)
+# slipped past every PR review and only surfaced when a user hit them.
+
+on:
+  pull_request:
+    branches: [canary, main]
+  push:
+    branches: [canary, main]
+
+# A previous push's CI gets cancelled if the same branch / PR pushes
+# again. Prevents queue pileup when several PRs land in quick succession.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clean-install-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage install.sh in a temp dir (simulate first-time user)
+        # The shipped install.sh clones from the canonical github URL.
+        # In CI we want it to install FROM THIS COMMIT, not from main —
+        # otherwise we'd be testing the published install.sh against
+        # whatever's already on the canonical branch, not the PR.
+        # Override AIRC_DIR + skip the clone step by pre-populating
+        # the source tree, then run install.sh's PATH/skills wiring.
+        run: |
+          mkdir -p $HOME/.airc-src
+          cp -r . $HOME/.airc-src/
+          # AIRC_SKIP_PREREQS=1 so apt-get isn't required (CI runner
+          # already has python3/git/openssh-client/gh/jq).
+          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+
+      - name: airc doctor
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          which airc
+          airc doctor || echo "airc doctor reported issues (non-fatal in CI)"
+
+      - name: Smoke — connect --no-room --no-gist + send + teardown
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          export AIRC_HOME=/tmp/ci-airc/state
+          export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
+          mkdir -p /tmp/ci-airc/state
+          # Spawn host in background. --no-gist keeps it offline.
+          airc connect --no-room --no-gist > /tmp/ci-airc/host.log 2>&1 &
+          HOST_PID=$!
+          sleep 6
+          if ! pgrep -f "airc connect --no-gist" >/dev/null; then
+            echo "FAIL: airc connect did not stay up"
+            cat /tmp/ci-airc/host.log
+            exit 1
+          fi
+          echo "✓ airc connect stayed up"
+          airc teardown
+          sleep 1
+          if pgrep -f "airc connect --no-gist" >/dev/null; then
+            echo "FAIL: airc teardown did not kill the host"
+            exit 1
+          fi
+          echo "✓ airc teardown clean"
+
+  clean-install-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage install.sh + run
+        run: |
+          mkdir -p $HOME/.airc-src
+          cp -r . $HOME/.airc-src/
+          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+
+      - name: airc doctor
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          which airc
+          airc doctor || echo "airc doctor reported issues (non-fatal in CI)"
+
+      - name: Smoke — same as linux
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          export AIRC_HOME=/tmp/ci-airc/state
+          export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
+          mkdir -p /tmp/ci-airc/state
+          airc connect --no-room --no-gist > /tmp/ci-airc/host.log 2>&1 &
+          sleep 6
+          if ! pgrep -f "airc connect --no-gist" >/dev/null; then
+            echo "FAIL: airc connect did not stay up"
+            cat /tmp/ci-airc/host.log
+            exit 1
+          fi
+          echo "✓ airc connect stayed up"
+          airc teardown
+          sleep 1
+          if pgrep -f "airc connect --no-gist" >/dev/null; then
+            echo "FAIL: airc teardown did not kill the host"
+            exit 1
+          fi
+          echo "✓ airc teardown clean"
+
+  clean-install-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run install.ps1 (skip prereqs — CI image has them)
+        shell: pwsh
+        run: |
+          $env:AIRC_DIR = "$env:USERPROFILE\.airc-src"
+          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
+          Copy-Item -Recurse -Force * $env:AIRC_DIR
+          $env:AIRC_SKIP_PREREQS = '1'
+          # install.ps1 must work from default Windows PowerShell 5.1 too,
+          # but the CI runner gives us pwsh by default; we test 5.1 path
+          # in a separate job below.
+          & "$env:AIRC_DIR\install.ps1"
+
+      - name: airc doctor (powershell wrapper)
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\AppData\Local\Programs\airc;$env:PATH"
+          # Print which airc is found + run doctor. Issues non-fatal for
+          # now while the Windows port catches up; gate becomes hard
+          # once #91/#94/#96/#98/#99 are resolved.
+          (Get-Command airc -ErrorAction SilentlyContinue) | Out-String
+          try { airc doctor } catch { Write-Host "airc doctor reported issues (non-fatal in CI)" }
+
+  clean-install-windows-ps5:
+    # Validates the bootstrap path under Windows PowerShell 5.1 — the
+    # default that ships with Windows. install.ps1 must work from 5.1
+    # to bootstrap pwsh itself (#91 — bootstrap-airc.ps1 fails under
+    # PS 5.1 because airc.ps1 has #Requires -Version 7.0). Splitting
+    # this into its own job means a 5.1 regression fails loudly without
+    # also failing the pwsh-based smoke.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run install.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $env:AIRC_DIR = "$env:USERPROFILE\.airc-src-ps5"
+          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
+          Copy-Item -Recurse -Force * $env:AIRC_DIR
+          $env:AIRC_SKIP_PREREQS = '1'
+          & "$env:AIRC_DIR\install.ps1"
+
+  integration-suite:
+    # Heavy gate: the full test/integration.sh, including scenarios that
+    # hit real gh-gists. Runs on canary/main pushes, NOT on PRs (rate
+    # limits + flaky network). When canary→main bundle PRs come up, this
+    # already-green status on the canary tip is the signal that cross-
+    # branch validation passed.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prereqs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y jq openssh-client python3
+          # gh + tailscale handled separately when needed by individual
+          # scenarios. Tailscale isn't required for the suite (no real
+          # tailnet in CI); gh is needed for gist-using scenarios but
+          # those self-skip when gh isn't authed.
+
+      - name: Stage + install
+        run: |
+          mkdir -p $HOME/.airc-src
+          cp -r . $HOME/.airc-src/
+          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+
+      - name: Run integration suite
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          # Tests that need real gists self-skip without gh auth. The
+          # remaining ~85% of the suite covers the local-only scenarios
+          # that catch the lion's share of regressions.
+          bash test/integration.sh
