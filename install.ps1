@@ -150,7 +150,7 @@ function Install-OpenSSHClient {
 }
 
 # -- OpenSSH server (Windows Optional Feature) ---------------------------
-# Required when this Windows host serves airc rooms — joiners ssh-tail
+# Required when this Windows host serves airc rooms -- joiners ssh-tail
 # the host's messages.jsonl. Pre-fix the installer covered the CLIENT
 # only. Post-fix (Joel 2026-04-27 "this needs to be in the install dude"):
 # install.ps1 now installs+starts the server too, with auto-start on
@@ -164,7 +164,7 @@ function Install-OpenSSHClient {
 # even with admin. Diagnosis credit: continuum-b69f via cross-Mac/Windows
 # coord gist 2026-04-27. Two-step persistent fix:
 #
-#   1. Disable HNS auto-exclusion via registry — survives reboots.
+#   1. Disable HNS auto-exclusion via registry -- survives reboots.
 #   2. Explicitly reserve port 22 in the static excluded-port-range so
 #      HNS can't grab it on subsequent boots.
 #
@@ -172,7 +172,7 @@ function Install-OpenSSHClient {
 #   keasigmadelta.com/blog/how-to-solve-cannot-bind-to-port-due-to-permission-denied-on-windows
 #   github.com/docker/for-win/issues/3171
 function Set-HnsPortFreedomFor22 {
-    # Idempotent — both checks before writing so re-runs of install
+    # Idempotent -- both checks before writing so re-runs of install
     # don't double-write or noisy on a healthy system.
     $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
     $regName = 'EnableExcludedPortRange'
@@ -196,12 +196,12 @@ function Set-HnsPortFreedomFor22 {
     & netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 2>$null | Out-Null
 }
 
-# -- DefaultShell — bash, not cmd.exe (#98) ----------------------------
+# -- DefaultShell -- bash, not cmd.exe (#98) ----------------------------
 # Windows OpenSSH defaults DefaultShell to cmd.exe, which lacks `cat`,
 # heredoc redirection, the rest of the POSIX shell vocabulary that airc
 # remote commands rely on (`cat >> $rhome/messages.jsonl`, etc.). Result
 # without this fix: every Windows airc HOST fails the moment a peer
-# tries to send a message — the remote `cat` command is "not recognized
+# tries to send a message -- the remote `cat` command is "not recognized
 # as an internal or external command", airc records [QUEUED] forever,
 # and the user sees no errors locally.
 #
@@ -213,7 +213,7 @@ function Set-OpenSSHDefaultShellBash {
     $regPath = 'HKLM:\SOFTWARE\OpenSSH'
     # Locate Git for Windows bash.exe. Standard install paths first,
     # fall through to PATH lookup. Without bash.exe we can't set it,
-    # so warn loudly — every airc host on this machine will break
+    # so warn loudly -- every airc host on this machine will break
     # silently otherwise.
     $bashCandidates = @(
         'C:\Program Files\Git\bin\bash.exe',
@@ -229,12 +229,12 @@ function Set-OpenSSHDefaultShellBash {
         if ($cmd) { $bashPath = $cmd.Source }
     }
     if (-not $bashPath) {
-        Write-Warn2 "Could not locate Git for Windows bash.exe — leaving OpenSSH DefaultShell at OS default (cmd.exe)."
-        Write-Host '    Without bash, this Windows machine cannot HOST an airc room — joiners will see [QUEUED] forever.'
+        Write-Warn2 "Could not locate Git for Windows bash.exe -- leaving OpenSSH DefaultShell at OS default (cmd.exe)."
+        Write-Host '    Without bash, this Windows machine cannot HOST an airc room -- joiners will see [QUEUED] forever.'
         Write-Host '    Fix: install Git for Windows, then re-run install.ps1.'
         return
     }
-    # Idempotent — read current, only write if different.
+    # Idempotent -- read current, only write if different.
     try {
         $cur = (Get-ItemProperty -Path $regPath -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
     } catch { $cur = $null }
@@ -269,7 +269,7 @@ function Install-OpenSSHServer {
             Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
             Write-Host '    OpenSSH.Server capability installed.'
         }
-        # 2. HNS port-22 reservation (Hyper-V quirk — see Set-HnsPortFreedomFor22).
+        # 2. HNS port-22 reservation (Hyper-V quirk -- see Set-HnsPortFreedomFor22).
         Set-HnsPortFreedomFor22
         # 3. Firewall rule for inbound TCP/22. The capability install
         # usually creates 'OpenSSH-Server-In-TCP' but it may be disabled
@@ -511,7 +511,7 @@ Write-Host ''
 
 # Explicit successful exit. Earlier external probes (winget, tailscale
 # status, etc.) leak their $LASTEXITCODE through to the script's
-# natural-end exit — most notably `tailscale status` returns non-zero
+# natural-end exit -- most notably `tailscale status` returns non-zero
 # when the user hasn't logged in yet (a perfectly normal post-install
 # state we already report via Write-Warn2 above). Without this, every
 # fresh install on a runner / VM with not-yet-signed-in tailscale exits
