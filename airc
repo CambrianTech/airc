@@ -3800,6 +3800,26 @@ cmd_ping() {
 # conversation context to pick. The CLI itself stays orthogonal — it
 # emits the menu, doesn't decide.
 cmd_rooms() {
+  # Parse flags (#142). Default hides items already marked stale (older
+  # than the threshold in _is_stale) so an active user with several
+  # rooms + several days of test runs doesn't have stale-invite count
+  # dominating the active-rooms count. --all / --include-stale shows
+  # everything (the pre-#142 behavior); --prune deletes stale gists.
+  local include_stale=0
+  local prune=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all|--include-stale) include_stale=1; shift ;;
+      --prune) prune=1; include_stale=1; shift ;;
+      -h|--help)
+        echo "Usage: airc list [--all|--include-stale] [--prune]"
+        echo "  --all / --include-stale  show stale items (default: hidden)"
+        echo "  --prune                  delete stale gists from your gh account"
+        return 0 ;;
+      *) echo "  Unknown flag: $1 (try: airc list --help)" >&2; return 1 ;;
+    esac
+  done
+
   if ! command -v gh >/dev/null 2>&1; then
     echo "  airc rooms requires the 'gh' CLI: https://cli.github.com" >&2
     echo "  airc IS aIRC — github gist is the coordination layer; gh is mandatory." >&2
@@ -3824,10 +3844,46 @@ cmd_rooms() {
     echo "  Host a named room:      airc connect --room <name>"
     return 0
   fi
+  # First pass: count how many are stale vs fresh, so we can show an
+  # accurate header AND a hint about --all when items got hidden.
+  local stale_count=0 fresh_count=0
+  while IFS=$'\t' read -r _kind _id _desc updated; do
+    [ -z "$_kind" ] && continue
+    if _is_stale "$updated"; then
+      stale_count=$((stale_count + 1))
+    else
+      fresh_count=$((fresh_count + 1))
+    fi
+  done <<< "$raw"
+
   echo ""
-  echo "  $count open on your gh account:"
+  if [ "$include_stale" = "1" ]; then
+    echo "  $count open on your gh account ($fresh_count active, $stale_count stale):"
+  elif [ "$stale_count" -gt 0 ]; then
+    echo "  $fresh_count active on your gh account ($stale_count stale hidden — see 'airc list --all')"
+  else
+    echo "  $count open on your gh account:"
+  fi
   echo ""
-  printf '%s\n' "$raw" | while IFS=$'\t' read -r kind id desc updated; do
+
+  local pruned=0
+  while IFS=$'\t' read -r kind id desc updated; do
+    [ -z "$kind" ] && continue
+    local is_stale=0
+    _is_stale "$updated" && is_stale=1
+    # Default: skip stale entries. --all/--include-stale shows all.
+    if [ "$is_stale" = "1" ] && [ "$include_stale" = "0" ]; then
+      continue
+    fi
+    if [ "$prune" = "1" ] && [ "$is_stale" = "1" ]; then
+      if gh gist delete "$id" --yes >/dev/null 2>&1; then
+        echo "    pruned: $desc (id: $id)"
+        pruned=$((pruned + 1))
+      else
+        echo "    prune FAILED for $desc (id: $id)" >&2
+      fi
+      continue
+    fi
     local hh; hh=$(humanhash "$id" 2>/dev/null)
     local marker
     case "$kind" in
@@ -3836,12 +3892,15 @@ cmd_rooms() {
     esac
     local age_str; age_str=$(_format_relative_time "$updated")
     local stale_marker=""
-    if _is_stale "$updated"; then
-      stale_marker="  (stale)"
-    fi
+    [ "$is_stale" = "1" ] && stale_marker="  (stale)"
     printf '    %s %s%s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
       "$marker" "$desc" "$stale_marker" "$id" "$hh" "$age_str"
-  done
+  done <<< "$raw"
+
+  if [ "$prune" = "1" ]; then
+    echo "  pruned $pruned stale gist(s)."
+    return 0
+  fi
   echo "  Join (auto-resolves on same gh account): airc connect"
   echo "  Join by id (cross-account share):        airc connect <id>"
   echo ""
