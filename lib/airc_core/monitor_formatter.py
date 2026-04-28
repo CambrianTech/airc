@@ -278,6 +278,21 @@ def run(my_name: str, peers_dir: str) -> int:
                     f.write(line + "\n")
             except Exception:
                 pass
+            # Rotate every ~100 mirrored lines (cheap no-op when under
+            # threshold). Without this, joiner local logs grow forever —
+            # Joel's audit 2026-04-28. Host's log is rotated by the
+            # heartbeat loop on the host side; this is the joiner-side
+            # equivalent.
+            if (offset_counter % 100) == 0:
+                try:
+                    from airc_core.log import rotate_if_needed
+                    rotate_if_needed(
+                        local_log,
+                        int(os.environ.get("AIRC_LOG_MAX_LINES", "5000")),
+                        int(os.environ.get("AIRC_LOG_KEEP_LINES", "2500")),
+                    )
+                except Exception:
+                    pass
         if _handle_rename(peers_dir, msg):
             continue
         # Ping/pong monitor-liveness probe. Prefix marker on a normal
