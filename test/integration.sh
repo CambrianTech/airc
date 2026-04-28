@@ -2764,7 +2764,23 @@ case "$MODE" in
   list) scenario_list ;;
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|part_persists|away|list|quit|platform_adapters|all]"; exit 2 ;;
+  ""|all)
+    # Default = run everything. The peers_cross_scope + whois_cross_scope
+    # scenarios were removed in PR #239 (sidecar walk semantics deleted
+    # in Phase 2B.3); their lines in this all-list and case-dispatch
+    # got swept along, which left this whole \`all)\` branch missing —
+    # CI no-arg invocation hit *) and exit 2.
+    scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown
+    scenario_resilience; scenario_reconnect; scenario_queue; scenario_status
+    scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
+    scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
+    scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
+    scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
+    scenario_general_sidecar_default; scenario_send_room_flag
+    scenario_part_keeps_sidecar; scenario_part_persists; scenario_away
+    scenario_list; scenario_quit; scenario_platform_adapters
+    ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|part_keeps_sidecar|part_persists|away|list|quit|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo
