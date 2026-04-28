@@ -111,6 +111,62 @@ def cmd_clear_parted(args) -> int:
     return 0
 
 
+# ── subscribed_channels (Phase 2B) ──────────────────────────────────────
+#
+# Replaces the per-scope `room_name` file + sidecar scopes. A single
+# `airc connect` process now subscribes to N channels in one mesh; the
+# config field is the source of truth for "which channels do I display?".
+#
+# The first element is the DEFAULT channel — the one cmd_send stamps on
+# outbound messages when --channel isn't passed. Order matters.
+#
+# Migration: a one-shot bootstrap reads the legacy `room_name` file (if
+# present) and writes it as the single-element subscribed_channels list,
+# preserving behavior for users mid-rollover. After that the room_name
+# file is no longer authoritative — config wins.
+
+def cmd_read_channels(args) -> int:
+    """Print subscribed channels, one per line. Empty output if none."""
+    for ch in _load(args.config).get("subscribed_channels", []) or []:
+        print(ch)
+    return 0
+
+
+def cmd_default_channel(args) -> int:
+    """Print the default (first) subscribed channel. Empty if none."""
+    chans = _load(args.config).get("subscribed_channels", []) or []
+    if chans:
+        print(chans[0])
+    return 0
+
+
+def cmd_subscribe(args) -> int:
+    """Add args.channel to subscribed_channels (idempotent).
+    --first promotes the channel to subscribed_channels[0] (becomes the
+    default for outbound). Without --first, appended at the end.
+    """
+    c = _load(args.config); cur = list(c.get("subscribed_channels", []) or [])
+    new = [ch for ch in cur if ch != args.channel]
+    if args.first:
+        new = [args.channel] + new
+    else:
+        new = new + [args.channel]
+    if new != cur:
+        c["subscribed_channels"] = new
+        return _save(args.config, c)
+    return 0
+
+
+def cmd_unsubscribe(args) -> int:
+    """Remove args.channel from subscribed_channels."""
+    c = _load(args.config); cur = c.get("subscribed_channels", []) or []
+    new = [ch for ch in cur if ch != args.channel]
+    if new != cur:
+        c["subscribed_channels"] = new
+        return _save(args.config, c)
+    return 0
+
+
 def cmd_set_host_block(args) -> int:
     """Atomically write the post-handshake host_* fields into config.
 
@@ -189,6 +245,26 @@ def _build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--config", required=True)
     cp.add_argument("--room", required=True)
     cp.set_defaults(func=cmd_clear_parted)
+
+    rc = sub.add_parser("read_channels")
+    rc.add_argument("--config", required=True)
+    rc.set_defaults(func=cmd_read_channels)
+
+    dc = sub.add_parser("default_channel")
+    dc.add_argument("--config", required=True)
+    dc.set_defaults(func=cmd_default_channel)
+
+    su = sub.add_parser("subscribe")
+    su.add_argument("--config", required=True)
+    su.add_argument("--channel", required=True)
+    su.add_argument("--first", action="store_true",
+                    help="promote channel to subscribed_channels[0] (becomes default)")
+    su.set_defaults(func=cmd_subscribe)
+
+    un = sub.add_parser("unsubscribe")
+    un.add_argument("--config", required=True)
+    un.add_argument("--channel", required=True)
+    un.set_defaults(func=cmd_unsubscribe)
 
     s = sub.add_parser("set_host_block")
     s.add_argument("--config", required=True)

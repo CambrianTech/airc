@@ -42,6 +42,12 @@ cmd_send() {
   # loudly when the requested room isn't in the user's subscription set
   # — never silently broadcasts to the wrong place.
   local target_room=""
+  # --channel <name> (Phase 2B): post-substrate flag that ONLY stamps
+  # the envelope's channel field; no scope re-exec. Same scope, same
+  # SSH wire, different channel tag. Coexists with --room for now;
+  # Phase 2B.3 deletes --room's re-exec path and makes --room an
+  # alias for --channel.
+  local channel_override=""
   # --internal: best-effort send for internal informational broadcasts
   # ([rename], etc.) where the monitor-down guard is the wrong UX. Append
   # to the local log + return 0 even when the monitor isn't running.
@@ -56,6 +62,10 @@ cmd_send() {
       --room|-room)
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
+        shift 2 ;;
+      --channel|-c)
+        channel_override="${2:-}"
+        [ -z "$channel_override" ] && die "Usage: airc send --channel <name> <message>"
         shift 2 ;;
       --internal)
         internal=1
@@ -151,12 +161,22 @@ cmd_send() {
 
   # Channel: stamp every outbound envelope with the active channel so the
   # monitor display can route by channel uniformly (Phase 2 mesh
-  # substrate). Resolved from the scope's room_name file; falls back to
-  # "general" if no scope room is set. Once Phase 2B lands the joiner
-  # subscribed_channels concept, --channel <name> on cmd_send will
-  # override this default.
-  local active_channel="general"
-  [ -f "$AIRC_WRITE_DIR/room_name" ] && active_channel=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || echo general)
+  # substrate). Resolution priority (Phase 2B.1):
+  #   1. --channel / -c flag (explicit per-call override)
+  #   2. config.json subscribed_channels[0]
+  #      (Phase 2B substrate — replaces sidecar scopes)
+  #   3. legacy room_name file (back-compat for users mid-rollover)
+  #   4. literal "general" fallback
+  local active_channel=""
+  if [ -n "$channel_override" ]; then
+    active_channel="$channel_override"
+  fi
+  if [ -z "$active_channel" ]; then
+    active_channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  fi
+  if [ -z "$active_channel" ] && [ -f "$AIRC_WRITE_DIR/room_name" ]; then
+    active_channel=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || true)
+  fi
   [ -z "$active_channel" ] && active_channel="general"
 
   local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\"}"
