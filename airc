@@ -309,6 +309,36 @@ _reexec_into() {
     exec env ${_name:+AIRC_NAME="$_name"} "$0" connect "$@"
   fi
 }
+
+# Stale-host self-heal + race-loser detection. Args: $1=stale gist id,
+# $2=room name. Random jitter, delete stale, re-list to see if another
+# tab self-healed first; if yes rejoin theirs, else take over as host.
+# Always exec's via _reexec_into; does not return. Wipes $CONFIG +
+# room_name first since both pointed at the dead host. Replaces 2
+# duplicated 22-line blocks in cmd_connect (#205 target 4).
+_self_heal_stale_host() {
+  local stale_id="$1" room_name="$2"
+  local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
+  sleep "$jitter"
+  if gh gist delete "$stale_id" --yes 2>/dev/null; then
+    echo "  ✓ Stale gist removed."
+  else
+    echo "  ⚠  Stale gist already gone — another tab may have taken over first."
+  fi
+  local picked
+  picked=$(gh gist list --limit 50 2>/dev/null \
+    | awk -F'\t' -v re="airc room: ${room_name}\$" -v skip="$stale_id" \
+        '$2 ~ re && $1 != skip { print $1; exit }')
+  rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
+  if [ -n "$picked" ]; then
+    echo "  ✓ Another tab beat us to it — joining their fresh gist ($picked)"
+    echo ""
+    _reexec_into rejoin "$picked"
+  fi
+  echo "  Re-execing into host mode for #${room_name}..."
+  echo ""
+  _reexec_into host --room "$room_name"
+}
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
 PEERS_DIR="$AIRC_WRITE_DIR/peers"
@@ -2175,30 +2205,7 @@ cmd_connect() {
       # below. Two tabs concurrently deciding "host is stale" both
       # delete + publish, end up with split-brain — caught only by
       # running two tabs together.
-      local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
-      sleep "$_race_jitter_s"
-
-      if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
-        echo "  ✓ Stale gist removed."
-      else
-        echo "  ⚠  Stale gist already gone — another tab may have taken over first."
-      fi
-
-      local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
-        | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
-            '$2 ~ re && $1 != skip { print $1; exit }')
-
-      rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
-
-      if [ -n "$_new_picked" ]; then
-        echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
-        echo ""
-        _reexec_into rejoin "$_new_picked"
-      fi
-
-      echo "  Re-execing into host mode for #${resolved_room_name}..."
-      echo ""
-      _reexec_into host --room "$resolved_room_name"
+      _self_heal_stale_host "$_resolved_gist_id" "$resolved_room_name"
     fi
 
     # Parse name@user@host[:port]#pubkey
@@ -2368,35 +2375,7 @@ except Exception:
         # competing gists for the same room name (split-brain race —
         # caught only by running two tabs against a stale gist
         # simultaneously, NOT by the integration test).
-        local _race_jitter_s; _race_jitter_s=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
-        sleep "$_race_jitter_s"
-
-        if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
-          echo "  ✓ Stale gist removed."
-        else
-          echo "  ⚠  Stale gist already gone — another tab may have taken over first."
-        fi
-
-        # Race-loser detection: re-scan for any OTHER fresh gist with
-        # this room name. If a concurrent self-heal already published
-        # one, JOIN their fresh gist instead of publishing a duplicate.
-        local _new_picked; _new_picked=$(gh gist list --limit 50 2>/dev/null \
-          | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
-              '$2 ~ re && $1 != skip { print $1; exit }')
-
-        # Wipe the CONFIG we just wrote — it points at the dead host
-        # and would trigger 'resume joiner' on next airc connect.
-        rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
-
-        if [ -n "$_new_picked" ]; then
-          echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
-          echo ""
-          _reexec_into rejoin "$_new_picked"
-        fi
-
-        echo "  Re-execing into host mode for #${resolved_room_name}..."
-        echo ""
-        _reexec_into host --room "$resolved_room_name"
+        _self_heal_stale_host "$_resolved_gist_id" "$resolved_room_name"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
