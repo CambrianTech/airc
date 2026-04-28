@@ -386,15 +386,33 @@ if (Test-Path $sshdExe) {
 
 Write-Host "==> HNS port-22 reservation";
 $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
+$regChanged = $false
 if ($reg -ne 0) {
   reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null;
   Write-Host "  HNS auto-exclusion disabled"
+  $regChanged = $true
 } else { Write-Host "  HNS auto-exclusion already off" }
 $excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
 if ($excl -notmatch "(?m)^\s*22\s+22\b") {
   netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null;
   Write-Host "  port 22 reserved in static excluded-port-range"
 } else { Write-Host "  port 22 already reserved" }
+
+# Verify port 22 is actually claimable. If HNS has it reserved at a
+# layer below netsh-visible (Hyper-V/WSL2/Docker share dynamic port
+# ranges via HNS), a restart of the HNS service is the only way to
+# re-evaluate the reservation. Without this, netsh shows port 22
+# excluded but sshd-as-LocalSystem still gets EACCES on bind:
+#   sshd: error: Bind to port 22 on 0.0.0.0 failed: Permission denied.
+#   sshd: fatal: Cannot bind any address.
+# Verified on continuum-b69f 2026-04-28 in OpenSSH/Admin event log.
+$hns = Get-Service hns -ErrorAction SilentlyContinue
+if ($hns -and $hns.Status -eq 'Running') {
+  Write-Host "  restarting HNS service so port-22 reservation takes effect"
+  Restart-Service hns -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 2
+  Write-Host "  HNS state: $((Get-Service hns).Status)"
+}
 
 Write-Host "==> Firewall rule (TCP/22 inbound)";
 if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
