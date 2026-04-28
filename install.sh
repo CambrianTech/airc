@@ -442,13 +442,23 @@ ensure_prereqs() {
   # On Git Bash, jq is winget-installable as 'jqlang.jq'.
   for cmd in git gh jq openssl ssh-keygen python3; do
     # Strict probe: presence on PATH AND a successful --version invocation.
-    # The bare `command -v` form is fooled by Windows's Microsoft Store
-    # python3.exe alias (continuum-b69f, 2026-04-27) — the file exists,
-    # satisfies command -v, but exits 49 with a Store-redirect message
-    # when actually run. Pre-fix: install printed "All required prereqs
-    # present" and airc later silent-fail-cascaded at every python3 -c
-    # invocation. Strict probe catches this at install time.
-    if ! command -v "$cmd" >/dev/null 2>&1 || ! "$cmd" --version >/dev/null 2>&1; then
+    # Used selectively: python3 needs the strict variant because Windows
+    # Store's python3.exe alias is on PATH but exits 49 with a Store-
+    # redirect (continuum-b69f, 2026-04-27). git/gh/jq/openssl all
+    # support --version cleanly. ssh-keygen does NOT have a version
+    # flag at all (different from `ssh -V`); calling `ssh-keygen
+    # --version` exits non-zero on every install, so the strict probe
+    # produces false positives — Joel 2026-04-28 saw "ssh-keygen needs
+    # manual install on winget" on a perfectly good Git for Windows
+    # install. Skip the strict variant for ssh-keygen; presence-on-PATH
+    # is sufficient since Git for Windows bundles a working binary.
+    local _missing=0
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      _missing=1
+    elif [ "$cmd" != "ssh-keygen" ] && ! "$cmd" --version >/dev/null 2>&1; then
+      _missing=1
+    fi
+    if [ "$_missing" = "1" ]; then
       missing+=("$cmd")
       local pkg; pkg=$(pkgname_for "$mgr" "$cmd")
       if [ -z "$pkg" ]; then
