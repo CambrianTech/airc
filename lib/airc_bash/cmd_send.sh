@@ -59,6 +59,14 @@ cmd_send() {
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      -h|--help)
+        echo "Usage:"
+        echo "  airc send <message>                broadcast to default channel"
+        echo "  airc send @peer <message>          DM peer"
+        echo "  airc send --channel <name> <msg>   stamp channel field"
+        echo "  airc send --room <name> <msg>      same as --channel (Phase 2B alias)"
+        echo "  airc send --internal <msg>         system event (skips monitor-down guard)"
+        return 0 ;;
       --room|-room)
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"

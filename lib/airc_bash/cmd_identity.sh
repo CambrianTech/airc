@@ -190,6 +190,17 @@ cmd_whois() {
   local target="${1:-}"
   local my_name; my_name=$(get_name)
 
+  # Help-flag intercept — without this, --help flowed into target and
+  # got rejected by _validate_peer_name with the unhelpful "must not
+  # start with '-'" error.
+  case "$target" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc whois                         show own identity"
+      echo "  airc whois <peer>                  show peer's identity (paired or via host)"
+      return 0 ;;
+  esac
+
   # Self — same identity across all scopes, no walk needed.
   if [ -z "$target" ] || [ "$target" = "$my_name" ]; then
     _identity_show

@@ -25,7 +25,13 @@ cmd_kick() {
   # `airc ban`.
   ensure_init
   local target="${1:-}"
-  [ -z "$target" ] && die "Usage: airc kick <peer> [reason]"
+  case "$target" in
+    -h|--help|"")
+      echo "Usage: airc kick <peer> [reason]"
+      echo "  Host-only. Removes peer's SSH pubkey + peer file."
+      [ -z "$target" ] && return 1
+      return 0 ;;
+  esac
   _validate_peer_name "$target"
   shift || true
   local reason="${*:-no reason given}"
