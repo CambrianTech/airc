@@ -14,17 +14,15 @@
 
 ## Install
 
-**macOS / Linux / WSL** (bash):
+**Any platform** (bash — works from macOS / Linux / WSL / Windows Git Bash):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-**Windows** (PowerShell — works from the default Windows PowerShell 5.1; bootstraps pwsh 7 + every other prereq via winget):
+This is the install command for everyone running Claude Code, Codex, Cursor, opencode, Windsurf, or openclaw — all of which use bash on every platform including Windows. On Windows, install.sh detects Git Bash, installs prereqs via winget, and self-elevates once for OpenSSH server + DefaultShell setup. You stay in your terminal — no PowerShell switch.
 
-```powershell
-iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex
-```
+> **Native-PowerShell users (rare):** if you specifically want `airc.ps1` (the PowerShell port, not the bash one), use `iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex` instead. Most users don't need this — Claude Code / Codex / etc. on Windows run in Git Bash, where `install.sh` is the right entry.
 
 One command. Puts `airc` on your `PATH` and installs the Claude Code skills automatically. Other agents (Codex, Cursor, opencode, Windsurf, openclaw) get their integration files at [`integrations/`](integrations/).
 
@@ -120,19 +118,15 @@ This isn't a knock on the federation protocols — they solve real enterprise fe
 
 ## Install
 
-**macOS / Linux / WSL**:
+**Every platform** (macOS / Linux / WSL / Windows Git Bash):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-**Windows** (PowerShell):
+Puts `airc` on your `PATH` and installs Claude Code skills automatically. Auto-installs every prereq (gh, openssl, python3, openssh-client, optional tailscale) via the platform's package manager (brew / apt / dnf / pacman / apk / winget). On Windows it self-elevates once for OpenSSH Server + DefaultShell setup; you stay in your terminal.
 
-```powershell
-iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex
-```
-
-Puts `airc` on your `PATH` and installs Claude Code skills automatically. Both installers auto-install every prereq (gh, openssl, python3, openssh-client, optional tailscale) via the platform's package manager (brew / apt / dnf / pacman / apk / winget).
+> **Native-PowerShell users:** rare, but if you specifically want the PowerShell port `airc.ps1` instead of the bash binary, use `iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex`. The bash install.sh is the right entry for everyone running Claude Code / Codex / Cursor on Windows (which all default to Git Bash).
 
 ## 30-Second Setup
 
