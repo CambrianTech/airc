@@ -97,19 +97,41 @@ cmd_send() {
   local first="${1:-}"
   [ -z "$first" ] && die "Usage: airc send <message>  or  airc send @peer <message>"
 
-  local peer_name msg
-  case "$first" in
-    @*)
-      peer_name="${first#@}"
-      shift
-      msg="$*"
-      [ -z "$msg" ] && die "Usage: airc send @peer <message>"
-      ;;
-    *)
-      peer_name="all"
-      msg="$*"
-      ;;
-  esac
+  # Multi-target DM: collect leading @-tokens (whitespace-separated)
+  # and/or comma-separated peers within a single @-token. All forms
+  # collapse to a comma-joined CSV in peer_name. The mesh substrate
+  # has every peer tailing the same host's messages.jsonl, so one
+  # envelope with `to: "alice,bob,carol"` is visible to all three;
+  # display shows the CSV recipient list. Receivers can split on
+  # comma to detect "is this addressed to me?".
+  #
+  # IRC norm: /msg user1,user2 message
+  # Also supported: airc msg @user1 @user2 message (whitespace)
+  # Mixed:          airc msg @user1,user2 @user3 message
+  local peer_name="" msg=""
+  local _peer_csv=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      @*)
+        local _p="${1#@}"
+        if [ -z "$_peer_csv" ]; then
+          _peer_csv="$_p"
+        else
+          _peer_csv="${_peer_csv},${_p}"
+        fi
+        shift
+        ;;
+      *) break ;;
+    esac
+  done
+  if [ -n "$_peer_csv" ]; then
+    peer_name="$_peer_csv"
+    msg="$*"
+    [ -z "$msg" ] && die "Usage: airc send @peer [@peer2 ...] <message>"
+  else
+    peer_name="all"
+    msg="$*"
+  fi
   ensure_init
 
   local my_name ts_val
