@@ -27,11 +27,16 @@ cmd_kick() {
   local target="${1:-}"
   case "$target" in
     -h|--help|"")
-      echo "Usage: airc kick <peer> [reason]"
+      echo "Usage: airc kick <peer> [reason]   (or: airc kick @peer)"
       echo "  Host-only. Removes peer's SSH pubkey + peer file."
       [ -z "$target" ] && return 1
       return 0 ;;
   esac
+  # Accept @-prefix for parity with `airc msg @peer`. QA pass found
+  # the @-rejection inconsistent — users who write @ for DM naturally
+  # write @ for kick. Strip BEFORE validation; the rest of the function
+  # uses $target (not $1).
+  target="${target#@}"
   _validate_peer_name "$target"
   shift || true
   local reason="${*:-no reason given}"
