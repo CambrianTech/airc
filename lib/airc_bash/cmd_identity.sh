@@ -174,12 +174,21 @@ c = json.load(open(os.environ["CONFIG"]))
 ints = c.setdefault("identity", {}).setdefault("integrations", {})
 platform = os.environ["PLATFORM"]
 handle = os.environ.get("HANDLE", "").strip()
+prev = ints.get(platform)
 if handle:
     ints[platform] = handle
-    print(f"  linked: {platform} -> {handle}")
-else:
+    if prev and prev != handle:
+        print(f"  linked: {platform} -> {handle} (was: {prev})")
+    else:
+        print(f"  linked: {platform} -> {handle}")
+elif prev:
+    # QA-pass clarification 2026-04-28: be explicit about "you said
+    # link but I unlinked" — happens when user omits the handle.
     ints.pop(platform, None)
-    print(f"  unlinked: {platform}")
+    print(f"  unlinked: {platform} (was: {prev}; pass a handle to (re)link)")
+else:
+    # Nothing was linked. Be explicit instead of saying "unlinked" for a no-op.
+    print(f"  no {platform} integration to unlink. Pass a handle to link: airc identity link {platform} <handle>")
 json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
 '
 }
