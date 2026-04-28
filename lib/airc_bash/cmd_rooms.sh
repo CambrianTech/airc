@@ -240,6 +240,15 @@ cmd_part() {
     echo "  /part persisted — #${room_name} won't auto-resubscribe. Rejoin with: airc join --${room_name}"
   fi
 
+  # Phase 2B.2: also remove the parted channel from this scope's
+  # subscribed_channels list. cmd_send won't pick it as default
+  # anymore, the monitor display drops the channel prefix from
+  # outbound, and a future cmd_join --room <name> re-adds it.
+  if [ "$room_name" != "(unnamed)" ]; then
+    "$AIRC_PYTHON" -m airc_core.config unsubscribe \
+      --config "$CONFIG" --channel "$room_name" 2>/dev/null || true
+  fi
+
   # IRC `/part` semantics — leave THIS room only; the #general sidecar
   # (or any other sibling subscription) keeps running. cmd_teardown
   # respects AIRC_TEARDOWN_PART_ONLY=1 by skipping its sidecar block,
