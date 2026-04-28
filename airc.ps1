@@ -534,7 +534,22 @@ function Invoke-AircSsh {
 function Get-RemoteHome {
     $h = Get-ConfigVal -Key 'host_airc_home' -Default ''
     if (-not $h) { $h = '$HOME/.airc' }
-    return $h
+    # Windows host paths come from Get-AircHome as backslash form
+    # (e.g. 'C:\Users\Administrator\Documents\Cambrian\.airc'). When
+    # this gets interpolated into an SSH remote command and the remote
+    # DefaultShell is bash (Git for Windows — what install.ps1 sets),
+    # bash interprets the backslashes as escape characters and strips
+    # them, producing 'C:UsersAdministratorDocumentsCambrian.airc'.
+    # The redirect target then becomes garbage and `airc msg` silently
+    # fails (#99 — RebelTechPro 2026-04-25).
+    #
+    # Forward-slash form ('C:/Users/.../.airc') is interpreted correctly
+    # by bash as an absolute path, by Git for Windows' POSIX layer, and
+    # by the airc bash runtime on the receiving end. Windows itself
+    # accepts forward slashes in file paths everywhere it accepts
+    # backslashes (kernel32 normalizes), so this is a one-way safe
+    # conversion.
+    return ($h -replace '\\','/')
 }
 
 # -- Identity init: Ed25519 sign keypair + SSH keypair ------------------
