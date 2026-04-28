@@ -190,6 +190,21 @@ _is_stale() {
 # a legitimate host case (`--no-gist`, or gh push failed) — falling back
 # to "you're a joiner" would be wrong.
 cmd_part() {
+  # Help-flag intercept BEFORE ensure_init / state mutation. Without
+  # this, `airc part --help` (and `-h`) fell through and ACTUALLY
+  # PARTED the user's current room — found the hard way 2026-04-28
+  # by airc-96dd while exercising the --help-intercept follow-up
+  # work from #231. Same anti-pattern as the cmd_send/kick/whois
+  # bugs that #231 already fixed; cmd_part was missed.
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc part                      leave the current channel (host's gist deleted if you're host)"
+      echo "                                 (joiner: just local teardown; host's gist stays for others)"
+      echo "  airc part --no-teardown        clear room state but don't kill the airc process"
+      return 0 ;;
+  esac
+
   ensure_init
 
   local gist_id_file="$AIRC_WRITE_DIR/room_gist_id"
