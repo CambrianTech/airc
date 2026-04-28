@@ -62,18 +62,45 @@ def _watchdog_exit(signum=None, frame=None):
 # no SIGALRM so we fall back to threading.Timer — same exit semantics,
 # slight overhead from the timer thread. Either way the fmt_exit=2
 # contract is preserved.
+#
+# QA-pass 2026-04-28 caught a real bug: the watchdog runs on HOSTS too,
+# but for hosts there's no remote SSH-tail to die silently — the host's
+# own messages.jsonl is local. Idle hosts watchdog-exit every 150s,
+# leaving brief dead windows where [PING:] arrivals don't get auto-
+# pong'd (peer ping reports timeout despite host being alive). Fixed
+# below: `run()` disables the watchdog when is_joiner=False.
+_watchdog_active = True
+
+def _disable_watchdog():
+    """Called by run() when we detect host mode. Cancels any pending
+    alarm/timer + flips the flag so future _arm_watchdog calls no-op."""
+    global _watchdog_active
+    _watchdog_active = False
+    try:
+        signal.alarm(0)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        if "_wd_timer_holder" in globals() and _wd_timer_holder[0] is not None:
+            _wd_timer_holder[0].cancel()
+    except Exception:
+        pass
+
 try:
     signal.signal(signal.SIGALRM, _watchdog_exit)
     signal.alarm(WATCHDOG_SEC)
 
     def _arm_watchdog():
-        signal.alarm(WATCHDOG_SEC)
+        if _watchdog_active:
+            signal.alarm(WATCHDOG_SEC)
 except (AttributeError, ValueError):
     import threading
 
     _wd_timer_holder = [None]
 
     def _arm_watchdog():
+        if not _watchdog_active:
+            return
         if _wd_timer_holder[0] is not None:
             _wd_timer_holder[0].cancel()
         t = threading.Timer(WATCHDOG_SEC, _watchdog_exit)
@@ -162,6 +189,16 @@ def run(my_name: str, peers_dir: str) -> int:
         is_joiner = bool(json.load(open(config_path)).get("host_target", ""))
     except Exception:
         pass
+
+    # Host mode: disable the inactivity watchdog. The watchdog was
+    # designed to detect a silently-dead SSH tail on the joiner side
+    # (no SIGPIPE, no exit, just no inbound). Hosts read their own
+    # local messages.jsonl — there's no remote pipe to die silently;
+    # idle just means the channel is quiet. Without this disable, the
+    # host formatter cycles every 150s and leaves a 1s+ dead window
+    # where [PING:] arrivals don't get auto-pong'd.
+    if not is_joiner:
+        _disable_watchdog()
 
     # Room name for the chat-line prefix. Read once at startup; a rename
     # of the room would require a fresh airc connect to pick up. Default
