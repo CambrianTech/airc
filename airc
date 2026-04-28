@@ -1451,38 +1451,15 @@ reminder_timer_loop() {
   done
 }
 
-cmd_reminder() {
-  ensure_init
-  local arg="${1:-status}"
-  local reminder_file="$AIRC_WRITE_DIR/reminder"
-
-  case "$arg" in
-    off|0)
-      rm -f "$reminder_file"
-      echo "  Reminders off."
-      ;;
-    pause)
-      echo "0" > "$reminder_file"
-      echo "  Reminders paused. 'airc reminder <seconds>' to resume."
-      ;;
-    status)
-      if [ -f "$reminder_file" ]; then
-        local val; val=$(cat "$reminder_file")
-        if [ "$val" = "0" ]; then
-          echo "  Reminders paused."
-        else
-          echo "  Reminder every ${val}s."
-        fi
-      else
-        echo "  Reminders off."
-      fi
-      ;;
-    *)
-      echo "$arg" > "$reminder_file"
-      echo "  Reminder every ${arg}s if no messages."
-      ;;
-  esac
-}
+# cmd_reminder extracted to lib/airc_bash/cmd_reminder.sh
+# (#152 Phase 3 file split — final structural sweep).
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_reminder.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_reminder.sh
+  source "$_airc_lib_dir/airc_bash/cmd_reminder.sh"
+else
+  echo "ERROR: airc_bash/cmd_reminder.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
 
 # ── Commands ────────────────────────────────────────────────────────────
 
@@ -1501,107 +1478,15 @@ else
   exit 1
 fi
 
-cmd_rename() {
-  # Parse flags. --no-propagate is the recursion guard for sibling-scope
-  # propagation (#179): when cmd_rename recurses into `airc rename` for
-  # each sibling scope, it passes --no-propagate so the sub-call does
-  # its own scope's work without re-recursing into us.
-  local no_propagate=0
-  local new_name=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --no-propagate) no_propagate=1; shift ;;
-      -h|--help|"")
-        echo "Usage: airc rename <new-name>"
-        echo "  Renames this identity and broadcasts [rename] to paired peers."
-        echo "  --no-propagate    skip sibling-scope propagation (internal — used during recursion)"
-        [ -z "${1:-}" ] && exit 1 || exit 0 ;;
-      -*) die "Unknown flag: $1 (try: airc rename --help)" ;;
-      *)
-        [ -n "$new_name" ] && die "rename takes one name (got '$new_name' and '$1')"
-        new_name="$1"; shift ;;
-    esac
-  done
-  [ -z "$new_name" ] && { echo "Usage: airc rename <new-name>"; exit 1; }
-  # Sanitize: lowercase, replace non-[a-z0-9-] with '-', collapse runs of
-  # dashes, strip leading/trailing dashes, then cap. The post-sanitization
-  # leading-dash strip matters because input like `.foo` becomes `-foo`
-  # after the `[^a-z0-9-]` replacement and would slip past the case check
-  # above — making the resulting name unreachable by `airc whois` /
-  # `airc kick` (both reject leading-dash). Caught by Copilot review on
-  # PR #75 follow-up.
-  new_name=$(echo "$new_name" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed 's/[^a-z0-9-]/-/g' \
-    | sed 's/--*/-/g; s/^-*//; s/-*$//' \
-    | cut -c1-24 \
-    | sed 's/-*$//')
-  [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
-  [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
-
-  local old_name; old_name=$(get_config_val name "")
-  if [ "$old_name" = "$new_name" ]; then
-    echo "  Already named '$new_name'."
-    return
-  fi
-
-  # Phase 1: write the new name into THIS scope's config (the truth-
-  # layer effect for this scope). Goes through airc_core.config rather
-  # than an inline-python heredoc — the heredoc was quoting-fragile
-  # (would have broken on a name containing a single quote — currently
-  # safe because the sanitizer keeps names in [a-z0-9-], but a sharp
-  # edge in code that's about to recurse).
-  "$AIRC_PYTHON" -m airc_core.config set_name --config "$CONFIG" --name "$new_name"
-  echo "  Renamed: $old_name → $new_name"
-
-  # Phase 2: propagate the config write to sibling scopes BEFORE
-  # broadcasting (#179 — vhsm-d1f4 + ideem-local-4bef caught 2026-04-28
-  # that nick rename only updated the current scope's config, leaving
-  # any sidecar to broadcast under the OLD name).
-  #
-  # Order matters: configs first, broadcast last. cmd_send calls die()
-  # if the scope's monitor is down, and die() is `exit 1` (kills the
-  # whole shell, ignoring our `|| true`). Doing configs first means a
-  # broadcast failure after this point cannot prevent propagation.
-  #
-  # --no-propagate prevents the sub-call from recursing back into us.
-  # Each sibling scope writes its own config AND broadcasts in its own
-  # room's host_target.
-  if [ "$no_propagate" != "1" ]; then
-    local _primary _parent _primary_base _sibling
-    _primary=$(_primary_scope_for "$AIRC_WRITE_DIR")
-    _parent=$(dirname "$_primary")
-    _primary_base=$(basename "$_primary")
-    # Glob all sibling sidecars (named <primary>.<room>) — does NOT
-    # match the primary itself (which has no trailing `.<room>`).
-    for _sibling in "$_parent/$_primary_base".*; do
-      [ -d "$_sibling" ] || continue
-      [ -f "$_sibling/config.json" ] || continue
-      [ "$_sibling" = "$AIRC_WRITE_DIR" ] && continue
-      AIRC_HOME="$_sibling" "$0" rename --no-propagate "$new_name" \
-        || echo "  warn: rename propagation to $_sibling failed (exit $?)" >&2
-    done
-    # If WE are a sidecar (current scope != primary), also rename the
-    # primary scope.
-    if [ "$AIRC_WRITE_DIR" != "$_primary" ] && [ -f "$_primary/config.json" ]; then
-      AIRC_HOME="$_primary" "$0" rename --no-propagate "$new_name" \
-        || echo "  warn: rename propagation to primary $_primary failed (exit $?)" >&2
-    fi
-  fi
-
-  # Phase 3: best-effort broadcast in this scope. Include a stable
-  # `host` field so receivers can find THIS peer's record even if their
-  # name-keyed lookup would miss (a prior rename marker got dropped;
-  # their peer file for us still sits under an older name). host is
-  # immutable per machine+user.
-  #
-  # --internal tells cmd_send to append-and-return rather than die()
-  # when this scope's monitor is down. [rename] is informational;
-  # receivers heal via monitor_formatter's host-fallback on next
-  # traffic regardless of whether they saw this specific event.
-  local my_host; my_host="$(whoami)@$(get_host)"
-  cmd_send --internal "[rename] old=$old_name new=$new_name host=$my_host" >/dev/null || true
-}
+# cmd_rename extracted to lib/airc_bash/cmd_rename.sh
+# (#152 Phase 3 file split — final structural sweep).
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_rename.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_rename.sh
+  source "$_airc_lib_dir/airc_bash/cmd_rename.sh"
+else
+  echo "ERROR: airc_bash/cmd_rename.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
 
 # Identity bundle (cmd_away + cmd_identity + cmd_whois + _identity_*
 # helpers) extracted to lib/airc_bash/cmd_identity.sh (#152 Phase 3 file
@@ -1648,136 +1533,16 @@ else
   exit 1
 fi
 
-cmd_update() {
-  # Refresh install dir AND re-run install.sh so new skills get symlinked
-  # into ~/.claude/skills/ and old ones get cleaned up. install.sh is
-  # idempotent — it handles the pull, the binary symlink, and the skill
-  # directory refresh in one pass. Does NOT teardown or reconnect.
-  #
-  # Channels (#40 followup): airc supports release channels for opt-in
-  # pre-merge testing. main = stable; canary = features-not-yet-promoted.
-  # The chosen channel persists in $AIRC_DIR/.channel so subsequent
-  # `airc update` (no args) keeps the user on their chosen track.
-  #   airc update                    # stay on current channel (default: main)
-  #   airc update --channel canary   # switch to canary + update
-  #   airc update --channel main     # switch back to main + update
-  #   airc channel                   # show current channel without updating
-  local dir="${AIRC_DIR:-$HOME/.airc-src}"
-  local channel_file="$dir/.channel"
-  local requested_channel=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --channel|-c)
-        requested_channel="${2:-}"
-        [ -z "$requested_channel" ] && die "Usage: airc update --channel <name>"
-        shift 2
-        ;;
-      --canary) requested_channel="canary"; shift ;;
-      --main)   requested_channel="main";   shift ;;
-      *) shift ;;
-    esac
-  done
-
-  if [ ! -d "$dir/.git" ]; then
-    die "No git checkout at $dir. Reinstall: curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash"
-  fi
-
-  # Determine target channel: explicit request > saved preference > main.
-  local channel
-  if [ -n "$requested_channel" ]; then
-    channel="$requested_channel"
-  elif [ -f "$channel_file" ]; then
-    channel=$(cat "$channel_file" 2>/dev/null | tr -d '[:space:]')
-    [ -z "$channel" ] && channel="main"
-  else
-    channel="main"
-  fi
-
-  # Switch to the target branch BEFORE pulling. install.sh will then ff-pull
-  # whatever branch is checked out. Fail loud if the channel doesn't exist
-  # on origin — silently falling back to main would defeat the opt-in test
-  # purpose.
-  local before; before=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
-  local current_branch; current_branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  if [ "$current_branch" != "$channel" ]; then
-    git -C "$dir" fetch --quiet origin "$channel" 2>/dev/null \
-      || die "Channel '$channel' not found on origin. Try: airc channel (to see options)."
-    git -C "$dir" checkout -q "$channel" 2>/dev/null \
-      || git -C "$dir" checkout -q -B "$channel" "origin/$channel" 2>/dev/null \
-      || die "Failed to checkout '$channel'. Resolve manually in $dir."
-  fi
-
-  if [ ! -x "$dir/install.sh" ]; then
-    die "install.sh missing at $dir. Reinstall via curl|bash."
-  fi
-  AIRC_DIR="$dir" bash "$dir/install.sh" || die "install.sh failed."
-
-  # Persist channel choice AFTER successful update so a failed switch
-  # doesn't leave a dangling preference for a broken state.
-  echo "$channel" > "$channel_file"
-
-  local after; after=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
-  if [ "$before" = "$after" ]; then
-    echo "  Already at ${after} on channel '${channel}'. Skills refreshed."
-  else
-    echo "  Updated: ${before} -> ${after} on channel '${channel}'. Skills refreshed."
-    echo "  Running monitor still uses the old code. To pick up:  airc teardown && airc connect"
-  fi
-}
-
-# ── cmd_channel: show or set the release channel without pulling ──────
-# `airc channel`           → print current channel + how to switch
-# `airc channel canary`    → set preferred channel; doesn't pull (use
-#                            `airc update` after to actually switch)
-# Allows the AI / human to inspect + decide before the heavier update.
-cmd_channel() {
-  local dir="${AIRC_DIR:-$HOME/.airc-src}"
-  local channel_file="$dir/.channel"
-  local current="main"
-  [ -f "$channel_file" ] && current=$(cat "$channel_file" 2>/dev/null | tr -d '[:space:]')
-  [ -z "$current" ] && current="main"
-
-  local target="${1:-}"
-  if [ -z "$target" ]; then
-    echo "  Channel: $current"
-    echo "  Available channels (any branch on origin can be a channel):"
-    echo "    main      — stable, what most users run"
-    echo "    canary    — features queued for the next main merge; opt-in testing"
-    echo "  Switch:"
-    echo "    airc channel <name>           # set preference (run 'airc update' after)"
-    echo "    airc update --channel <name>  # set + pull in one step"
-    return 0
-  fi
-
-  echo "$target" > "$channel_file"
-  echo "  Channel preference set: '$target'. Run 'airc update' to actually switch + pull."
-}
-
-cmd_version() {
-  # Report git state for whichever airc actually ran. Prefer the binary's
-  # own directory so a dev-checkout run doesn't lie about AIRC_DIR.
-  local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
-  local here; here="$(dirname "$self")"
-  local dir=""
-  if [ -d "$here/.git" ]; then
-    dir="$here"
-  elif [ -d "${AIRC_DIR:-$HOME/.airc-src}/.git" ]; then
-    dir="${AIRC_DIR:-$HOME/.airc-src}"
-  fi
-  if [ -z "$dir" ]; then
-    echo "  unknown (no git metadata found)"
-    return
-  fi
-  local sha subject branch dirty
-  sha=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
-  subject=$(git -C "$dir" log -1 --format=%s 2>/dev/null)
-  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  dirty=""
-  [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty=" (dirty)"
-  echo "  airc ${sha}${dirty} on ${branch}"
-  [ -n "$subject" ] && echo "  ${subject}"
-  echo "  install: $dir"
-}
+# Release-info cluster (cmd_update + cmd_channel + cmd_version)
+# extracted to lib/airc_bash/cmd_update.sh (#152 Phase 3 file split —
+# final structural sweep).
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_update.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_update.sh
+  source "$_airc_lib_dir/airc_bash/cmd_update.sh"
+else
+  echo "ERROR: airc_bash/cmd_update.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
 
 # cmd_status + cmd_logs extracted to lib/airc_bash/cmd_status.sh
 # (#152 Phase 3 file split). cmd_logs lived ~30 lines below the cmd_doctor
