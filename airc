@@ -292,20 +292,22 @@ unset _gh_resolved
 
 AIRC_WRITE_DIR="$(detect_scope)"
 
-# Write a sentinel marker before any intentional `exec env ... "$0" ...`
-# call, so the Windows daemon launcher .bat can distinguish "intentional
-# re-exec into different mode" from "actual crash" (#203). On Linux/Mac
-# `exec` is a true execve — the parent bash's PID becomes the new
-# program, so the launcher script never observes an exit and the marker
-# is harmless. On Windows MSYS-bash, exec is emulated as spawn-and-exit:
-# the original bash exits + a new airc bash takes over. The launcher
-# .bat sees the original bash exit, would normally treat it as a crash,
-# and respawn — racing the new airc that just took over (Joel/continuum-
-# b69f's #203 crashloop). Marker contents: "PID:UNIX_TIMESTAMP". Caller
-# is responsible for invoking this immediately before exec.
-_write_reexec_marker() {
-  local marker="$AIRC_WRITE_DIR/airc.reexec-marker"
-  printf '%d:%d\n' "$$" "$(date +%s)" > "$marker" 2>/dev/null || true
+# Re-exec airc connect into a different mode (rejoin into another tab's
+# gist or take over as host). Centralizes (a) the sentinel marker for
+# the Windows daemon launcher (#203/#204 — distinguishes intentional
+# re-exec from "actual crash"), (b) AIRC_NAME preservation across the
+# exec, and (c) AIRC_NO_DISCOVERY=1 for host-takeover so the new
+# instance won't re-find the just-deleted gist via gh's list-cache.
+# Replaces 5 duplicated 3-line call sites in cmd_connect (#205 target 1).
+_reexec_into() {
+  local mode="$1"; shift  # "rejoin" or "host"
+  printf '%d:%d\n' "$$" "$(date +%s)" > "$AIRC_WRITE_DIR/airc.reexec-marker" 2>/dev/null || true
+  local _name; _name=$(get_config_val name "")
+  if [ "$mode" = "host" ]; then
+    exec env AIRC_NO_DISCOVERY=1 ${_name:+AIRC_NAME="$_name"} "$0" connect "$@"
+  else
+    exec env ${_name:+AIRC_NAME="$_name"} "$0" connect "$@"
+  fi
 }
 CONFIG="$AIRC_WRITE_DIR/config.json"
 IDENTITY_DIR="$AIRC_WRITE_DIR/identity"
@@ -2191,21 +2193,17 @@ cmd_connect() {
         | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
             '$2 ~ re && $1 != skip { print $1; exit }')
 
-      local _preserved_name; _preserved_name=$(get_config_val name "")
-      rm -f "$CONFIG"
-      rm -f "$AIRC_WRITE_DIR/room_name"
+      rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
 
       if [ -n "$_new_picked" ]; then
         echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
         echo ""
-        _write_reexec_marker
-        exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+        _reexec_into rejoin "$_new_picked"
       fi
 
       echo "  Re-execing into host mode for #${resolved_room_name}..."
       echo ""
-      _write_reexec_marker
-      exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
+      _reexec_into host --room "$resolved_room_name"
     fi
 
     # Parse name@user@host[:port]#pubkey
@@ -2391,30 +2389,19 @@ except Exception:
           | awk -F'\t' -v re="airc room: ${resolved_room_name}\$" -v skip="$_resolved_gist_id" \
               '$2 ~ re && $1 != skip { print $1; exit }')
 
-        # Preserve identity name across re-exec (same reason as resume
-        # path: derive_name re-runs from cwd and can drift on case-
-        # aliasing, peers see a "new" peer).
-        local _preserved_name; _preserved_name=$(get_config_val name "")
         # Wipe the CONFIG we just wrote — it points at the dead host
         # and would trigger 'resume joiner' on next airc connect.
-        rm -f "$CONFIG"
-        rm -f "$AIRC_WRITE_DIR/room_name"
+        rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
 
         if [ -n "$_new_picked" ]; then
           echo "  ✓ Another tab beat us to it — joining their fresh gist ($_new_picked)"
           echo ""
-          # Re-exec as joiner pointing at the winner's gist.
-          _write_reexec_marker
-          exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_new_picked"
+          _reexec_into rejoin "$_new_picked"
         fi
 
         echo "  Re-execing into host mode for #${resolved_room_name}..."
         echo ""
-        # exec replaces the current bash process. AIRC_NO_DISCOVERY=1
-        # prevents the new instance from re-finding the just-deleted gist
-        # (gh's gist-list cache might still show it for a few seconds).
-        _write_reexec_marker
-        exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
+        _reexec_into host --room "$resolved_room_name"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
@@ -2853,9 +2840,7 @@ JSON
                       "$AIRC_WRITE_DIR/host_gist_id" \
                       "$AIRC_WRITE_DIR/room_gist_id" \
                       "$AIRC_WRITE_DIR/room_name"
-                local _preserved_name; _preserved_name=$(get_config_val name "")
-                _write_reexec_marker
-                exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect "$_winner_id"
+                _reexec_into rejoin "$_winner_id"
               fi
             fi
 
@@ -5067,14 +5052,8 @@ _daemon_install_schtasks() {
     cwd_win=$(printf '%s' "$(pwd -P)" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
     airc_bin_unix="$airc_bin"
   fi
-  # Marker path the daemon-launcher polls between iterations to
-  # distinguish "intentional re-exec into different mode" from "actual
-  # crash" (#203). airc itself writes this file via _write_reexec_marker
-  # right before any `exec env ... "$0" connect ...` call. On Windows
-  # MSYS-bash, exec is emulated as spawn-and-exit (not a true execve),
-  # so the launcher .bat sees the original bash exit while the new
-  # airc takes over — the marker tells the .bat to step aside instead
-  # of racing-respawn the new airc with another instance.
+  # Marker path the .bat polls to distinguish intentional re-exec
+  # (written by _reexec_into) from "actual crash" (#203/#204).
   local marker_win
   if command -v cygpath >/dev/null 2>&1; then
     marker_win=$(cygpath -w "$scope/airc.reexec-marker")
