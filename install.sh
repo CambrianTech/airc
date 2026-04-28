@@ -388,7 +388,16 @@ ensure_prereqs() {
   # AIRC_SKIP_SSHD=1 short-circuits the whole block — for headless CI
   # boxes that genuinely don't host, or environments that manage sshd
   # via their own config-management (Ansible, Chef).
-  if [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
+  #
+  # Auto-detect: GitHub Actions sets CI=true; so does almost every CI
+  # system (Travis, CircleCI, GitLab, BuildKite, Jenkins). On macOS
+  # specifically, the osascript admin-prompt path hangs forever in CI
+  # because there's no Touch ID / password input — the runner job
+  # silently runs for the full 6-hour timeout. Skip when CI=true so
+  # the install completes cleanly and CI tests the rest of the path.
+  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+    info "CI=true — skipping sshd setup (no host-capability test in CI)"
+  elif [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
     _ensure_sshd_running
   fi
 
