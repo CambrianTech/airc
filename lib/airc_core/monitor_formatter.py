@@ -210,6 +210,22 @@ def run(my_name: str, peers_dir: str) -> int:
     except Exception:
         room_name = "1:1"
 
+    def subscribed_channels():
+        """Read subscribed_channels fresh each call so a join/part during
+        the session takes effect immediately for the display filter.
+        Returns None if the field is absent (means "show everything";
+        opt-in semantics — users on pre-Phase-2B configs see no
+        behavior change). Empty list is treated as None to avoid the
+        "subscribed to nothing → display nothing" footgun on a brand-
+        new scope before cmd_join writes anything."""
+        try:
+            v = json.load(open(config_path)).get("subscribed_channels")
+            if isinstance(v, list) and v:
+                return set(v)
+        except Exception:
+            pass
+        return None
+
     def current_name():
         """Read identity name fresh from config.json each time so a rename
         during the session immediately takes effect for own-send filtering.
@@ -319,6 +335,21 @@ def run(my_name: str, peers_dir: str) -> int:
         # per-line prefixing. Falls back to the scope's `room_name` for
         # pre-Phase-2 messages that don't carry the envelope field.
         line_channel = m.get("channel") or room_name
+
+        # Phase 2C+ (continuum-b741's #9 from QA pass 2026-04-28):
+        # filter display by subscribed_channels. If the user is
+        # subscribed to specific channels and this message is on a
+        # different channel, skip display. DMs addressed to us bypass
+        # the filter (a peer reaching out across channels still
+        # surfaces). System events ('airc'/'sys' from-field) also
+        # bypass — joins/parts/[HOST EVICTED] are operational, not
+        # channel-scoped. Wire-level all peers still see all messages
+        # in messages.jsonl; this is display-only.
+        subs = subscribed_channels()
+        if subs is not None and fr not in ("airc", "sys"):
+            addressed_to_me = bool(to) and to not in ("", "all") and current_name() in to.split(",")
+            if line_channel and line_channel not in subs and not addressed_to_me:
+                continue
         try:
             if fr in ("airc", "sys"):
                 # System events (joins, parts, drain, auth, watchdog).
