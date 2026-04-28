@@ -125,18 +125,32 @@ cmd_send() {
     esac
   done
   if [ -n "$_peer_csv" ]; then
-    peer_name="$_peer_csv"
-    msg="$*"
-    if [ -z "$msg" ]; then
-      # #147: empty body after leading @-tokens. Common cause is a user
-      # wanting an in-channel @-mention rather than a DM (#141). Two
-      # explicit recovery paths instead of just the bare usage line.
-      echo "Usage:" >&2
-      echo "  airc msg @peer <message>           DM that peer" >&2
-      echo "  airc msg @peer1 @peer2 <message>   DM multiple peers" >&2
-      echo "  airc msg \"hi @peer, fyi\"           in-channel @-mention (quote so @ stays in body)" >&2
-      die "got @-targets but no message body. If you wanted an @-mention in the channel, quote the whole message."
-    fi
+    # #141: if the parsed @-target contains whitespace, it's not a peer
+    # name (peer names are [a-z0-9-]); user clearly wanted an in-channel
+    # @-mention via something like `airc msg "@bob looks good"`. Treat
+    # as broadcast and put the @-prefix back in the message body.
+    case "$_peer_csv" in
+      *[[:space:]]*)
+        msg="@${_peer_csv}"
+        if [ -n "$*" ]; then
+          msg="${msg} $*"
+        fi
+        peer_name="all"
+        ;;
+      *)
+        peer_name="$_peer_csv"
+        msg="$*"
+        if [ -z "$msg" ]; then
+          # #147: empty body after leading @-tokens.
+          echo "Usage:" >&2
+          echo "  airc msg @peer <message>           DM that peer" >&2
+          echo "  airc msg @peer1 @peer2 <message>   DM multiple peers" >&2
+          echo "  airc msg \"@peer looks good\"        in-channel @-mention" >&2
+          echo "                                      (whitespace in @-token = broadcast intent)" >&2
+          die "got @-targets but no message body. To @-mention in the channel, include text after the @name in the same quoted string."
+        fi
+        ;;
+    esac
   else
     peer_name="all"
     msg="$*"
