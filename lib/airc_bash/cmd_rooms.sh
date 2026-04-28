@@ -341,7 +341,18 @@ cmd_invite() {
     join_string="${my_name}@${user}@${host}${port_suffix}#${pubkey_b64}"
   fi
 
-  echo "$join_string"
+  # QA pass 2026-04-28: bare invite-string output was confusing — fresh
+  # user sees a 200-char base64 blob with no context and has no idea
+  # what to do with it. Wrap it with a one-line label + a usage hint
+  # for the receiver. Same gh-account-based discovery still works (gist
+  # mnemonic is the friendlier path), but the long invite is the
+  # cross-account fallback so it gets the explicit framing.
+  echo "  Cross-account share invite (one-time pairing string):"
+  echo ""
+  echo "    $join_string"
+  echo ""
+  echo "  Receiver runs:  airc connect <paste-the-above>"
+  echo "  Same-account peers can use:  airc rooms (then 'airc connect' auto-resolves the mesh gist)."
 }
 
 cmd_peers() {
