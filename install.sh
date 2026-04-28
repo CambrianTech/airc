@@ -317,9 +317,14 @@ if (-not (Test-Path $sshKeygen)) {
   # 2026-04-28: with regenerate alone, sshd kept failing with error 13
   # (ACL secure_permission_check); with this strip, the ACL is just
   # SYSTEM + Administrators and sshd accepts it.
+  # ssh-keygen -A leaves the file owner as the user who ran it
+  # (BIGMAMA\green even when running elevated). OpenSSH's
+  # secure_permission_check requires owner in {SYSTEM, Administrators,
+  # running sshd user}. Setting owner to SYSTEM is the safe default.
   $me = (whoami).Trim()
   $newKeys = Get-ChildItem (Join-Path $sshDir 'ssh_host_*_key') -ErrorAction SilentlyContinue
   foreach ($k in $newKeys) {
+    icacls $k.FullName /setowner 'NT AUTHORITY\SYSTEM' 2>&1 | Out-Null
     icacls $k.FullName /inheritance:r 2>&1 | Out-Null
     icacls $k.FullName /grant 'NT AUTHORITY\SYSTEM:(F)' 'BUILTIN\Administrators:(F)' 2>&1 | Out-Null
     icacls $k.FullName /remove:g $me 2>&1 | Out-Null
