@@ -309,12 +309,26 @@ if (-not (Test-Path $sshKeygen)) {
     $existing | Remove-Item -Force -ErrorAction SilentlyContinue
   }
   & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  ssh-keygen: $_" }
-  # Dump the post-regen ACL state for one of the keys so we can see in
-  # the transcript whether the ACL is what sshd expects -- saves a UAC
-  # round-trip if it's wrong.
+  # ssh-keygen -A on Windows leaves an ACE for the user who ran it
+  # (e.g. BIGMAMA\green:(M) for an admin elevation), even though that
+  # user is just the file creator. OpenSSH's secure_permission_check
+  # rejects any ACE that isn't owner / SYSTEM / Administrators -- so
+  # we strip the creator's ACE explicitly. Verified on continuum-b69f
+  # 2026-04-28: with regenerate alone, sshd kept failing with error 13
+  # (ACL secure_permission_check); with this strip, the ACL is just
+  # SYSTEM + Administrators and sshd accepts it.
+  $me = (whoami).Trim()
+  $newKeys = Get-ChildItem (Join-Path $sshDir 'ssh_host_*_key') -ErrorAction SilentlyContinue
+  foreach ($k in $newKeys) {
+    icacls $k.FullName /inheritance:r 2>&1 | Out-Null
+    icacls $k.FullName /grant 'NT AUTHORITY\SYSTEM:(F)' 'BUILTIN\Administrators:(F)' 2>&1 | Out-Null
+    icacls $k.FullName /remove:g $me 2>&1 | Out-Null
+  }
+  # Dump the post-fix ACL on the rsa key so we can see in the transcript
+  # whether the result matches what sshd expects (only SYSTEM + Admins).
   $rsa = Join-Path $sshDir 'ssh_host_rsa_key'
   if (Test-Path $rsa) {
-    Write-Host "  post-regen ACL on ssh_host_rsa_key:"
+    Write-Host "  post-fix ACL on ssh_host_rsa_key:"
     icacls $rsa 2>&1 | ForEach-Object { Write-Host "    $_" }
   }
 }
