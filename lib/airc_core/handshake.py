@@ -95,10 +95,53 @@ def cmd_send(args) -> int:
 # ── host: accept_one ────────────────────────────────────────────────────
 
 
+def _start_parent_watch(watch_pid: int):
+    """Daemon thread that os._exit()s the moment the watched PID dies (#132).
+
+    The accept_one process is a grandchild of the airc parent bash:
+        airc bash → accept-loop subshell → python accept_one
+    If the airc parent bash dies (terminal closed, kill, Monitor tool
+    teardown), the accept-loop subshell reparents to init but stays
+    alive (running its `while kill -0 PARENT` loop until the next
+    iteration). During python's in-flight accept() / recv() we'd miss
+    that — getppid() points at the accept-loop subshell, which is
+    still alive — so any joiner that connects during this window gets
+    a real-looking pair handshake against a ghost host (keys land in
+    authorized_keys, peer record gets written, no relay behind it).
+
+    Watching the airc bash PID directly (passed in via --watch-pid)
+    fixes this. `os.kill(pid, 0)` is the probe: it sends no signal,
+    just raises OSError if the PID is gone. Poll once a second; the
+    moment the airc bash disappears, os._exit(0) breaks out of any
+    blocking syscall and dies cleanly.
+
+    Daemon thread so it doesn't block clean shutdown when the parent
+    IS alive and accept_one returns normally.
+    """
+    import os
+    import threading
+    import time
+
+    def _watch():
+        while True:
+            try:
+                os.kill(watch_pid, 0)
+            except (OSError, ProcessLookupError):
+                # airc bash gone — break out of any blocking syscall.
+                os._exit(0)
+            time.sleep(1)
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
+
 def cmd_accept_one(args) -> int:
     import datetime
     import os
     import socket
+
+    if args.watch_pid:
+        _start_parent_watch(args.watch_pid)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -246,6 +289,10 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("--reminder-interval", type=int, default=300)
     a.add_argument("--airc-home", required=True)
     a.add_argument("--messages", required=True)
+    # --watch-pid: airc parent bash PID. The listener spawns a daemon
+    # thread that os._exit()s the moment this PID disappears (#132).
+    # 0 disables the watch (legacy callers / direct invocations).
+    a.add_argument("--watch-pid", type=int, default=0)
     a.set_defaults(func=cmd_accept_one)
 
     return p

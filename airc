@@ -2779,18 +2779,41 @@ JSON
     fi
     echo ""
     echo "  Waiting for peers on port $host_port..."
-    # Background: accept peer registrations via TCP (public keys only)
-    while true; do
-      "$AIRC_PYTHON" -m airc_core.handshake accept_one \
-        --host-port "$host_port" \
-        --peers-dir "$PEERS_DIR" \
-        --identity-dir "$IDENTITY_DIR" \
-        --config "$CONFIG" \
-        --host-name "$name" \
-        --reminder-interval "$reminder_interval" \
-        --airc-home "$AIRC_WRITE_DIR" \
-        --messages "$MESSAGES" 2>/dev/null || true
-    done &
+    # Background: accept peer registrations via TCP (public keys only).
+    #
+    # Parent-watch (#132): the loop exits when its own parent disappears
+    # (PPID=1 = reparented to init = airc parent bash died). Without
+    # this, the loop survives terminal close / Monitor tool teardown /
+    # kill of the parent, keeps spawning fresh python listeners, and
+    # every joiner that hits the cached port gets a real-looking pair
+    # handshake against a ghost host. Pair-listener Python has its own
+    # 1s parent-watch thread (see airc_core.handshake._start_parent_watch)
+    # to catch the in-flight-handshake case; this loop check covers the
+    # between-iterations case before the next python is spawned.
+    _orphan_parent_pid=$$
+    (
+      # Loop while the airc parent bash is still alive. kill -0 is the
+      # cheapest "is PID still running" probe (no signal sent, just an
+      # error if the process is gone). When the parent dies, this exits
+      # before the next iteration so no fresh python is spawned.
+      #
+      # --watch-pid hands the same PID to the python listener, which
+      # spawns a 1s polling thread that os._exit()s mid-accept the
+      # moment the parent dies — covering the in-flight handshake
+      # case that the bash between-iterations check can't see.
+      while kill -0 "$_orphan_parent_pid" 2>/dev/null; do
+        "$AIRC_PYTHON" -m airc_core.handshake accept_one \
+          --host-port "$host_port" \
+          --peers-dir "$PEERS_DIR" \
+          --identity-dir "$IDENTITY_DIR" \
+          --config "$CONFIG" \
+          --host-name "$name" \
+          --reminder-interval "$reminder_interval" \
+          --airc-home "$AIRC_WRITE_DIR" \
+          --messages "$MESSAGES" \
+          --watch-pid "$_orphan_parent_pid" 2>/dev/null || true
+      done
+    ) &
     PAIR_PID=$!
 
     # Write PID file so `airc teardown` can find us later. Record us, the
