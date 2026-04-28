@@ -140,9 +140,16 @@ def _rename_files(peers_dir: str, old: str, new: str) -> bool:
 
 
 def _find_peer_by_host(peers_dir: str, host: str):
-    """Return current name of the peer record whose host matches, or None."""
+    """Return current name of the peer record whose host matches, or None.
+
+    #180 fix: only return a name when the host is UNAMBIGUOUS (exactly
+    one peer record matches). Same-machine peers share the host field
+    (e.g. multiple Claudes on Joel's box all have host=joel@127.0.0.1),
+    so picking one arbitrarily corrupts an unrelated peer's record.
+    Ambiguous-host → return None → chain-repair skips, no phantom."""
     if not host or not os.path.isdir(peers_dir):
         return None
+    matches = []
     for entry in os.listdir(peers_dir):
         if not entry.endswith(".json"):
             continue
@@ -151,7 +158,13 @@ def _find_peer_by_host(peers_dir: str, host: str):
         except Exception:
             continue
         if d.get("host") == host:
-            return d.get("name") or entry[:-5]
+            matches.append(d.get("name") or entry[:-5])
+    if len(matches) == 1:
+        return matches[0]
+    # 0 matches → no record to chain-repair against (probably the rename
+    # is for someone we never paired with — fine to skip silently).
+    # 2+ matches → ambiguous host (same-machine peers); skipping prevents
+    # the phantom-record corruption that Joel hit 2026-04-28.
     return None
 
 
