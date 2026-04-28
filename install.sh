@@ -243,18 +243,44 @@ _ensure_sshd_running() {
        # blinks for a half second so i have no idea"). Log lives at
        # $env:TEMP\airc-install-elevated.log; bash side surfaces it
        # below regardless of success/failure.
-      local _elevated_payload='
+      # Stage payload as a .ps1 file in $CLONE_DIR (Joel + continuum-b69f
+      # 2026-04-28). Pre-fix: payload was inlined as
+      #   ... -ArgumentList '-NoProfile -Command "$_elevated_payload"'
+      # but the payload itself contains many "" (PowerShell strings) and
+      # \\ (registry paths). Four layers of escaping (bash-double, ps1-
+      # outer-Command, Start-Process-ArgumentList-single, inner-Command-
+      # double) silently mangled the payload — PowerShell never parsed it,
+      # the elevated window opened, ran nothing, exited silently, no
+      # transcript ever written. continuum verified the .ps1 file approach
+      # writes a clean transcript every time.
+      local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
+      mkdir -p "$CLONE_DIR"
+      cat > "$_elevated_ps1" <<'PSPAYLOAD'
 $ErrorActionPreference = "Stop";
-# Use [System.IO.Path]::GetTempPath() not $env:TEMP — when called from
-# Git Bash, the inherited TEMP env var can be the bash-side /tmp, not
-# the Windows user temp directory. GetTempPath() asks the OS directly
-# (resolves to %LOCALAPPDATA%\Temp on Windows) regardless of the env.
+# [System.IO.Path]::GetTempPath() asks the OS directly (no env-var
+# inheritance surprises). On a UAC-elevated process this resolves to
+# the user's %LOCALAPPDATA%\Temp.
 $logPath = Join-Path ([System.IO.Path]::GetTempPath()) "airc-install-elevated.log";
 Start-Transcript -Path $logPath -Force | Out-Null;
 try {
   Write-Host "==> OpenSSH.Server capability";
   $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
   if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null; Write-Host "  installed: $($cap.Name)" } else { Write-Host "  already installed" }
+  Write-Host "==> SSH host keys + ACLs (ssh-keygen -A)";
+  # continuum-b69f 2026-04-28: every fresh Windows OpenSSH install has
+  # a documented bug where sshd refuses to start with "no hostkeys
+  # available" because the host key files exist but have overly-
+  # permissive ACLs (Authenticated Users / BUILTIN\Users / Everyone).
+  # ssh-keygen -A is idempotent: generates missing host keys AND
+  # restores correct ACLs on existing ones (SYSTEM + Administrators
+  # only). Without this, Start-Service sshd fails with WIN32_EXIT_CODE
+  # 1067 (terminated unexpectedly) on every fresh-install machine.
+  $sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
+  if (Test-Path $sshKeygen) {
+    & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  $_" };
+  } else {
+    Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen — sshd may fail to start";
+  }
   Write-Host "==> HNS port-22 reservation";
   $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
   if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null; Write-Host "  HNS auto-exclusion disabled" } else { Write-Host "  HNS auto-exclusion already off" }
@@ -295,7 +321,16 @@ try {
   Stop-Transcript | Out-Null;
 }
 exit $global:LASTEXITCODE;
-'
+PSPAYLOAD
+
+      # Translate the .ps1 path to Windows form for Start-Process -File.
+      local _elevated_ps1_win
+      if command -v cygpath >/dev/null 2>&1; then
+        _elevated_ps1_win=$(cygpath -w "$_elevated_ps1" 2>/dev/null)
+      else
+        # Fallback: /c/Users/foo/.airc-src/install-elevated.ps1 → C:\Users\foo\.airc-src\install-elevated.ps1
+        _elevated_ps1_win=$(printf '%s' "$_elevated_ps1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
+      fi
       case "$_state" in
         Running)
           ok "sshd running (Windows OpenSSH.Server)"
@@ -320,12 +355,14 @@ exit $global:LASTEXITCODE;
             # MSYS-style sed translation: 'C:\Users\...' → '/c/Users/...'
             _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
           fi
-          info "  elevated log: $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
-          # Run the elevated payload. Start-Process exits 0 if it could
-          # launch the elevated process; the payload's own exit code is
-          # what we care about (it explicitly `exit $LASTEXITCODE`s based
-          # on try/catch).
-          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"$_elevated_payload\"'" 2>&1 \
+          info "  elevated payload: $_elevated_ps1_win"
+          info "  elevated log:     $_ps_log_win"
+          info "  (bash log path:   $_ps_log_bash)"
+          # Run the elevated payload via -File (no quoting hell). Start-
+          # Process -Wait propagates the elevated process's exit code.
+          # -ExecutionPolicy Bypass so the elevated PS doesn't refuse
+          # the unsigned .ps1.
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$_elevated_ps1_win')" 2>&1 \
             || _elev_rc=$?
           # Always dump the transcript — success or failure, the user
           # sees what happened. If transcript file is missing, the
@@ -347,10 +384,22 @@ exit $global:LASTEXITCODE;
           else
             warn "  Elevated transcript not written — UAC denied, or Start-Process failed."
           fi
-          if [ "$_elev_rc" = "0" ]; then
-            ok "OpenSSH.Server installed + started + HNS port-22 reserved + auto-start + DefaultShell=bash."
+          # Belt-and-suspenders: re-query sshd state from non-elevated PS
+          # (continuum-b69f 2026-04-28). If the elevated payload claimed
+          # exit 0 but sshd isn't actually Running, surface that — the
+          # silent-success-while-broken path was the worst version of
+          # this bug. The Get-Service call is cheap; doing it always
+          # is fine.
+          local _post_state
+          _post_state=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r ')
+          if [ "$_elev_rc" = "0" ] && [ "$_post_state" = "Running" ]; then
+            ok "OpenSSH.Server installed + sshd Running + HNS port-22 reserved + auto-start + DefaultShell=bash."
+          elif [ "$_elev_rc" = "0" ]; then
+            warn "Elevated payload exit 0 but sshd state is '$_post_state' — partial install."
+            warn "  Re-run install or check elevated log: $_ps_log_win"
+            _elev_rc=1
           else
-            warn "Elevated payload failed (exit $_elev_rc). See log above."
+            warn "Elevated payload failed (exit $_elev_rc, sshd state '$_post_state'). See log above."
             warn "Manual fix (admin PowerShell):"
             warn "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
             warn "    reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\hns\\State /v EnableExcludedPortRange /d 0 /f"
