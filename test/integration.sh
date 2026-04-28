@@ -250,12 +250,12 @@ scenario_tabs() {
   python3 -c "
 import json
 c = json.load(open('$fake_home/state/config.json'))
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 c['host_airc_home'] = '/tmp/nowhere'
 json.dump(c, open('$fake_home/state/config.json', 'w'))
 "
   # Write a fake peer so resolution doesn't fail
-  echo '{"name":"ghost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
+  echo '{"name":"ghost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
   AIRC_HOME=$fake_home/state "$AIRC" send @ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
   # Exit should be non-zero (we die()), but local must have both the attempt AND the failure marker
   grep -q '"this-should-fail-but-still-mirror"' "$fake_home/state/messages.jsonl" 2>/dev/null && \
@@ -619,11 +619,11 @@ scenario_queue() {
 import json
 p = '/tmp/airc-it-q-j/state/config.json'
 c = json.load(open(p))
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 json.dump(c, open(p, 'w'))
 "
   # Also fake the peer record so resolution doesn't fail on @qhost
-  echo '{"name":"qhost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' \
+  echo '{"name":"qhost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' \
     > /tmp/airc-it-q-j/state/peers/qhost.json
   pass "joiner: host_target flipped to unreachable (outage simulation)"
 
@@ -714,10 +714,10 @@ import json
 p = '/tmp/airc-it-s-j/state/config.json'
 c = json.load(open(p))
 c['_real_host_target'] = c['host_target']
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 json.dump(c, open(p, 'w'))
 "
-  echo '{"name":"shost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
+  echo '{"name":"shost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
   AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" send @shost "status-queue-probe" >/dev/null 2>&1 || true
   local j_out3; j_out3=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
   echo "$j_out3" | grep -Eq 'queue:\s+[1-9][0-9]* pending' \
