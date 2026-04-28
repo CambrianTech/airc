@@ -1596,10 +1596,10 @@ case "${1:-help}" in
   kick)      shift; cmd_kick "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
-  invite|share|join-string) cmd_invite ;;
+  invite|share|join-string) shift; cmd_invite "$@" ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
-  version|--version|-v) cmd_version ;;
+  version|--version|-v) shift; cmd_version "$@" ;;
   update|upgrade|pull) shift; cmd_update "$@" ;;
   channel) shift; cmd_channel "$@" ;;
   canary) shift; cmd_update --channel canary "$@" ;;
@@ -1609,7 +1609,7 @@ case "${1:-help}" in
   tests|test)        shift; _doctor_run_tests "$@" ;;
   daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
-  disconnect|quit|leave|unbind) cmd_disconnect ;;
+  disconnect|quit|leave|unbind) shift; cmd_disconnect "$@" ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;

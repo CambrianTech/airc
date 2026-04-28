@@ -309,6 +309,13 @@ cmd_send_file() {
 }
 
 cmd_invite() {
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc invite             print cross-account share invite (one-time pairing string)"
+      echo "  airc share / join-string  aliases"
+      return 0 ;;
+  esac
   ensure_init
   local host_target pubkey_b64 join_string
   host_target=$(get_config_val host_target "")
@@ -356,6 +363,13 @@ cmd_invite() {
 }
 
 cmd_peers() {
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc peers              list paired peers in primary scope"
+      echo "  airc peers --prune      remove stale dup records (same host, older paired)"
+      return 0 ;;
+  esac
   ensure_init
   # `airc peers --prune` — remove stale records that share a host with a
   # newer record (cruft left from rename chain-breaks before the stable-host

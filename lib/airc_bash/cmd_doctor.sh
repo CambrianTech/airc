@@ -437,6 +437,14 @@ _doctor_run_tests() {
   # Behavioral suite -- the prior cmd_doctor entry point. Kept reachable
   # via `airc doctor --tests` (or the `tests`/`test` aliases in dispatch)
   # so existing CI / muscle memory still works.
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc tests              run the full integration suite"
+      echo "  airc tests <scenario>   run one scenario (see test/integration.sh)"
+      echo "  airc doctor --tests     same as 'airc tests'"
+      return 0 ;;
+  esac
   local script="${AIRC_DIR:-$HOME/.airc-src}/test/integration.sh"
   if [ ! -x "$script" ]; then
     local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"

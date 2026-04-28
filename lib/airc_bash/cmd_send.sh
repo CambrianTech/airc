@@ -354,6 +354,13 @@ cmd_send() {
 #   airc ping @peer 30        # 30s timeout
 cmd_ping() {
   local first="${1:-}"
+  case "$first" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc ping @peer                liveness probe (default 10s timeout)"
+      echo "  airc ping @peer <timeout>      override timeout (positive integer seconds)"
+      return 0 ;;
+  esac
   [ -z "$first" ] && die "Usage: airc ping @peer [timeout_secs]"
   case "$first" in
     @*) ;;

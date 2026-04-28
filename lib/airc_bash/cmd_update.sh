@@ -199,6 +199,13 @@ cmd_channel() {
 }
 
 cmd_version() {
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc version            print git rev + branch + install path"
+      echo "  airc -v / --version     aliases"
+      return 0 ;;
+  esac
   # Report git state for whichever airc actually ran. Prefer the binary's
   # own directory so a dev-checkout run doesn't lie about AIRC_DIR.
   local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"

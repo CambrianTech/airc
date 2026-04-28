@@ -262,6 +262,13 @@ cmd_disconnect() {
   # args) starts fresh host mode instead of auto-resuming the prior pairing.
   # Use when you want to switch to a different mesh or host a new one, but
   # keep your agent identity stable.
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc disconnect / quit    leave the mesh: kill processes + clear host pairing"
+      echo "                            (identity, peers, message history preserved)"
+      return 0 ;;
+  esac
   cmd_teardown >/dev/null 2>&1 || true
   if [ -f "$CONFIG" ]; then
     "$AIRC_PYTHON" -c "
