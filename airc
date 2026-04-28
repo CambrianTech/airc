@@ -4903,6 +4903,19 @@ cmd_daemon_install() {
   esac
 }
 
+# Print the common "daemon installed; here's where to look" footer.
+# Three platform installers used to duplicate this 5-line block; now
+# they call this helper. Pass the platform-specific lead line as $1 and
+# any optional trailing note as $2 (heredoc-style multi-line OK).
+_daemon_install_done() {
+  local lead="$1" scope="$2" note="${3:-}"
+  echo "  ✓ $lead"
+  echo "  airc will now auto-start at login + restart on exit."
+  echo "  Logs:   $scope/daemon.log"
+  echo "  Status: airc daemon status"
+  if [ -n "$note" ]; then echo ""; printf '  %s\n' "$note"; fi
+}
+
 _daemon_install_launchd() {
   local airc_bin="$1" scope="$2"
   local plist_dir="$HOME/Library/LaunchAgents"
@@ -4952,35 +4965,18 @@ PLIST
   launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 \
     || die "launchctl bootstrap failed. Plist written but not loaded; check Console.app for errors."
   launchctl enable "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
-  echo "  ✓ Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)"
-  echo "  airc will now auto-start at login + restart on crash + survive sleep/wake."
-  echo "  Logs:   $scope/daemon.log"
-  echo "  Status: airc daemon status"
-  echo ""
-  echo "  Note: gh keychain access — if 'airc canary' / gist push fails under"
-  echo "        launchd, the gh keychain may not be unlocked at boot. Workaround:"
-  echo "        run 'gh auth status' once after login to unlock, then airc daemon"
-  echo "        will pick up gh credentials on next restart."
+  _daemon_install_done "Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)" "$scope" \
+    "Note: if 'airc canary' / gist push fails under launchd, the gh keychain may not be unlocked at boot. Workaround: 'gh auth status' once after login to unlock; airc daemon picks it up on next restart."
 }
 
 _daemon_install_schtasks() {
-  # Windows daemon via HKCU Run key (no admin). Mirrors launchd /
-  # systemd: per-user autostart at logon, restarts airc connect on
-  # exit, logs to $scope/daemon.log. Joel 2026-04-28: "fix the monitor
-  # man / i cant go to bed till this is fixed" — Windows had no daemon
-  # path, `nohup airc connect &` doesn't survive the launching shell
-  # on MINGW64 (Git Bash kills the child when the parent bash exits).
-  #
-  # Why Run-key instead of Task Scheduler: schtasks //SC ONLOGON
-  # requires admin even for per-user tasks (UAC prompt + "Access is
-  # denied" without). HKCU\...\Run writes to user-scope hive, no admin,
-  # works identically (fires at user logon). Path-of-least-friction
-  # per Joel: "i just want whatever is least hassle and also robust".
+  # Windows daemon via HKCU Run-key (no admin; HKCU\...\Run is user-
+  # scope, so per-user autostart at logon without UAC). PRs #200/#202
+  # for the why; this function for the how.
   local airc_bin="$1" scope="$2"
   local entry_name="airc-monitor"
 
-  # Find Git Bash. The launcher .bat bridges from cmd.exe (Run key
-  # context) into bash (where airc actually runs).
+  # Find Git Bash — the launcher .bat needs it to exec airc.
   local bash_exe=""
   for c in 'C:\Program Files\Git\bin\bash.exe' 'C:\Program Files (x86)\Git\bin\bash.exe' "$HOME/AppData/Local/Programs/Git/bin/bash.exe"; do
     local check_path; check_path=$(echo "$c" | sed 's|\\|/|g; s|^C:|/c|')
@@ -4992,25 +4988,11 @@ _daemon_install_schtasks() {
   local airc_bin_win; airc_bin_win=$(_to_win_path "$airc_bin")
   local scope_win; scope_win=$(_to_win_path "$scope")
 
-  # Stage a launcher .bat in $scope. Loops with 5s pause for airc-crash
-  # auto-restart (matches launchd KeepAlive=true / systemd Restart=always).
-  #
-  # Why we cd into the project dir + don't set AIRC_HOME: airc's
-  # detect_scope() uses cwd to find <cwd>/.airc. Setting AIRC_HOME
-  # to a Windows-form path (C:\Users\green\continuum\.airc) makes
-  # later bash code that touches AIRC_HOME hit "no such file" on
-  # Git Bash's mixed POSIX/Windows fs view. cd'ing first + letting
-  # detect_scope work its normal way is cleaner. Joel 2026-04-28
-  # caught the daemon crashlooping every 4s in the prior shape.
-  #
-  # bash -c (not -lc): skip login profile. Login shells re-export
-  # PATH and other vars from /etc/profile.d/* on Git Bash, which can
-  # override the env we just set in cmd. Non-login bash keeps the
-  # cmd-set env clean.
-  #
-  # Absolute Unix-form path to airc: bash with -c doesn't read
-  # ~/.bashrc, so PATH may not include ~/.local/bin. Hard-coding
-  # the resolved unix path makes the invocation independent of PATH.
+  # Launcher .bat: cd to cwd (so airc's detect_scope finds <cwd>/.airc),
+  # bash -c (not -lc, to keep cmd-set env), absolute unix airc path
+  # (bash -c doesn't read .bashrc so PATH won't have ~/.local/bin).
+  # Loop with 5s restart matches launchd KeepAlive / systemd Restart=always.
+  # See PR #202 for the bug history that necessitated each of those choices.
   local cwd_win; cwd_win=$(_to_win_path "$(pwd -P)")
   local airc_bin_unix; airc_bin_unix=$(_to_bash_path "$airc_bin")
   [ -z "$airc_bin_unix" ] && airc_bin_unix="$airc_bin"
@@ -5049,33 +5031,16 @@ goto loop
 EOF
   local launcher_win; launcher_win=$(_to_win_path "$launcher_bash")
 
-  # The Run-key value is what cmd.exe runs at user logon. We wrap with
-  # `cmd /c start "" /MIN ... ` so the daemon launches detached + with
-  # a minimized console window (still visible in taskbar but out of
-  # the way). Without /MIN the user gets a raw cmd window every login.
-  # The empty "" is the title slot for `start` (otherwise `start "path
-  # to bat"` interprets the path as the title).
+  # `cmd /c start "" /MIN <bat>` launches detached + minimized; empty ""
+  # is start's title slot. reg add /f is idempotent (overwrites prior).
   local run_cmd="cmd /c start \"\" /MIN \"$launcher_win\""
-
-  # HKCU\Software\Microsoft\Windows\CurrentVersion\Run is the canonical
-  # per-user autostart hive on Windows. reg add overwrites any prior
-  # entry with /f (no prompt). Fully idempotent.
   reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v "$entry_name" //t REG_SZ //d "$run_cmd" //f >/dev/null 2>&1 \
     || die "reg add failed for HKCU Run\\$entry_name"
-
-  # Start it now (detached) so the user doesn't have to logout/login.
-  # cmd /c start fires-and-forgets — returns immediately; the spawned
-  # bat keeps running independent of this shell.
+  # Start now (no logout/login needed). Fires-and-forgets.
   cmd //c start "" //MIN "$launcher_win" >/dev/null 2>&1 || true
 
-  echo "  ✓ Registered HKCU Run entry '$entry_name' (runs at every Windows logon)"
   echo "  ✓ Started monitor in detached cmd window (minimized)"
-  echo "  airc will now auto-start at login + restart on exit."
-  echo "  Logs:     $scope/daemon.log    (airc's own --background log)"
-  echo "  Errors:   $scope/daemon.err    (restart events, etc.)"
-  echo "  Launcher: $scope/airc-daemon.bat"
-  echo "  Status:   airc daemon status"
-  echo "  Stop:     airc daemon uninstall"
+  _daemon_install_done "Registered HKCU Run entry '$entry_name' (runs at every Windows logon)" "$scope"
 }
 
 _daemon_install_systemd() {
@@ -5144,14 +5109,8 @@ UNIT
   systemctl --user daemon-reload || die "systemctl --user daemon-reload failed."
   systemctl --user enable --now airc.service \
     || die "systemctl --user enable --now airc.service failed."
-  echo "  ✓ Loaded into systemd-user (airc.service)"
-  echo "  airc will now auto-start at login + restart on crash."
-  echo "  Logs:   $scope/daemon.log  (or: journalctl --user -u airc -f)"
-  echo "  Status: airc daemon status"
-  echo ""
-  echo "  Note: systemd-user units stop at logout unless lingering is enabled."
-  echo "        For 'always on across logout' (typical for an always-up mesh):"
-  echo "          sudo loginctl enable-linger \$USER"
+  _daemon_install_done "Loaded into systemd-user (airc.service)" "$scope" \
+    "Note: systemd-user units stop at logout unless lingering is enabled. For always-on across logout: sudo loginctl enable-linger \$USER"
 }
 
 cmd_daemon_uninstall() {
