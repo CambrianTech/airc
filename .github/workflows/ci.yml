@@ -46,15 +46,15 @@ jobs:
         run: |
           mkdir -p $HOME/.airc-src
           cp -r . $HOME/.airc-src/
-          # AIRC_SKIP_PREREQS=1 so apt-get isn't required (CI runner
-          # already has python3/git/openssh-client/gh/jq).
-          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+          # Real install — no AIRC_SKIP_PREREQS. install.sh must
+          # detect the package manager and install everything missing.
+          AIRC_DIR=$HOME/.airc-src bash install.sh
 
-      - name: airc doctor
+      - name: airc doctor (must report environment-clean)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           which airc
-          airc doctor || echo "airc doctor reported issues (non-fatal in CI)"
+          airc doctor
 
       - name: Smoke — connect --no-room --no-gist + teardown
         run: |
@@ -103,17 +103,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Stage install.sh + run
+      - name: Stage install.sh + run (no skip-prereqs — real install path)
         run: |
           mkdir -p $HOME/.airc-src
           cp -r . $HOME/.airc-src/
-          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_DIR=$HOME/.airc-src bash install.sh
 
-      - name: airc doctor
+      - name: airc doctor (must report environment-clean)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           which airc
-          airc doctor || echo "airc doctor reported issues (non-fatal in CI)"
+          airc doctor
 
       - name: Smoke — same as linux (airc.pid based)
         run: |
@@ -153,35 +153,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run install.ps1 (skip prereqs — CI image has them)
+      - name: Run install.ps1 (no skip — real install path via winget)
         shell: pwsh
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc-src"
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
-          $env:AIRC_SKIP_PREREQS = '1'
-          # install.ps1 must work from default Windows PowerShell 5.1 too,
-          # but the CI runner gives us pwsh by default; we test 5.1 path
-          # in a separate job below.
+          # install.ps1 must work from default Windows PowerShell 5.1
+          # too; we test 5.1 path in a separate job below.
           & "$env:AIRC_DIR\install.ps1"
 
-      - name: airc doctor (powershell wrapper)
+      - name: airc doctor (must report environment-clean)
         shell: pwsh
         run: |
           $env:PATH = "$env:USERPROFILE\AppData\Local\Programs\airc;$env:PATH"
-          # Print which airc is found + run doctor. Issues non-fatal for
-          # now while the Windows port catches up; gate becomes hard
-          # once #91/#94/#96/#98/#99 are resolved. PowerShell try/catch
-          # doesn't trap native exit codes — invoke and explicitly clear
-          # $LASTEXITCODE so the step succeeds regardless of doctor's
-          # exit. We still SEE the failures in the log for triage.
           (Get-Command airc -ErrorAction SilentlyContinue) | Out-String
           airc doctor
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "airc doctor reported issues (non-fatal in CI — see log)"
+            Write-Error "airc doctor failed with exit $LASTEXITCODE"
+            exit $LASTEXITCODE
           }
-          $global:LASTEXITCODE = 0
-          exit 0
 
   clean-install-windows-ps5:
     # Validates the bootstrap path under Windows PowerShell 5.1 — the
@@ -195,13 +186,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run install.ps1 under Windows PowerShell 5.1
+      - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc-src-ps5"
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
-          $env:AIRC_SKIP_PREREQS = '1'
           & "$env:AIRC_DIR\install.ps1"
 
   integration-suite:
@@ -216,20 +206,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install prereqs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y jq openssh-client python3
-          # gh + tailscale handled separately when needed by individual
-          # scenarios. Tailscale isn't required for the suite (no real
-          # tailnet in CI); gh is needed for gist-using scenarios but
-          # those self-skip when gh isn't authed.
-
-      - name: Stage + install
+      - name: Stage + install (real install path)
         run: |
           mkdir -p $HOME/.airc-src
           cp -r . $HOME/.airc-src/
-          AIRC_SKIP_PREREQS=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_DIR=$HOME/.airc-src bash install.sh
 
       - name: Run integration suite
         run: |

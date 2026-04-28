@@ -388,13 +388,28 @@ ensure_prereqs() {
   # AIRC_SKIP_SSHD=1 short-circuits the whole block — for headless CI
   # boxes that genuinely don't host, or environments that manage sshd
   # via their own config-management (Ansible, Chef).
-  if [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
+  #
+  # Auto-detect: GitHub Actions sets CI=true; so does almost every CI
+  # system (Travis, CircleCI, GitLab, BuildKite, Jenkins). On macOS
+  # specifically, the osascript admin-prompt path hangs forever in CI
+  # because there's no Touch ID / password input — the runner job
+  # silently runs for the full 6-hour timeout. Skip when CI=true so
+  # the install completes cleanly and CI tests the rest of the path.
+  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+    info "CI=true — skipping sshd setup (no host-capability test in CI)"
+  elif [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
     _ensure_sshd_running
   fi
 
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
-  if ! tailscale_present; then
+  # Skip in CI: brew install --cask tailscale on macOS runners is slow
+  # (multi-minute download + GUI app install) and there's no tailnet
+  # behind the runner anyway. The install itself is what we're gating
+  # on — Tailscale-as-optional is documented; CI doesn't need it.
+  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+    info "CI=true — skipping Tailscale install (optional, no tailnet in CI)"
+  elif ! tailscale_present; then
     info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
     install_tailscale
   fi

@@ -1,1 +1,3 @@
 .airc/
+__pycache__/
+*.pyc

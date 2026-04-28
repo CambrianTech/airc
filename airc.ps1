@@ -325,7 +325,7 @@ function Advise-TailscaleIfDown {
     if (-not $ts) {
         Write-Host '   Tailscale is not installed. airc needs it only for cross-machine mesh.'
         Write-Host '   Install:'
-        Write-Host '     winget install --id tailscale.tailscale'
+        Write-Host '     winget install --id Tailscale.Tailscale'
         Write-Host '     (or https://tailscale.com/download/windows)'
         Write-Host ''
         Write-Host '   After install, bring the tailnet up and re-run airc join.'
@@ -534,7 +534,22 @@ function Invoke-AircSsh {
 function Get-RemoteHome {
     $h = Get-ConfigVal -Key 'host_airc_home' -Default ''
     if (-not $h) { $h = '$HOME/.airc' }
-    return $h
+    # Windows host paths come from Get-AircHome as backslash form
+    # (e.g. 'C:\Users\Administrator\Documents\Cambrian\.airc'). When
+    # this gets interpolated into an SSH remote command and the remote
+    # DefaultShell is bash (Git for Windows — what install.ps1 sets),
+    # bash interprets the backslashes as escape characters and strips
+    # them, producing 'C:UsersAdministratorDocumentsCambrian.airc'.
+    # The redirect target then becomes garbage and `airc msg` silently
+    # fails (#99 — RebelTechPro 2026-04-25).
+    #
+    # Forward-slash form ('C:/Users/.../.airc') is interpreted correctly
+    # by bash as an absolute path, by Git for Windows' POSIX layer, and
+    # by the airc bash runtime on the receiving end. Windows itself
+    # accepts forward slashes in file paths everywhere it accepts
+    # backslashes (kernel32 normalizes), so this is a one-way safe
+    # conversion.
+    return ($h -replace '\\','/')
 }
 
 # -- Identity init: Ed25519 sign keypair + SSH keypair ------------------
@@ -1290,7 +1305,7 @@ function Invoke-Doctor {
 
     Probe 'tailscale (optional)' {
         Get-Command tailscale -ErrorAction SilentlyContinue
-    } 'winget install --id tailscale.tailscale  (then: tailscale up)  - LAN-only mode works without it'
+    } 'winget install --id Tailscale.Tailscale  (then: tailscale up)  - LAN-only mode works without it'
 
     # State-dir + identity
     Write-Host ''
@@ -1317,6 +1332,15 @@ function Invoke-Doctor {
         Write-Host '    iwr https://raw.githubusercontent.com/CambrianTech/airc/canary/install.ps1 | iex'
     }
     Write-Host ''
+    # Always exit 0 from the default `airc doctor` — informational, like
+    # `git status`. Probes use `& gh auth status` etc which leak
+    # $LASTEXITCODE; without an explicit reset the script's natural-end
+    # exit picks up whatever the last external returned (typically
+    # gh-not-authed → 1 in CI / fresh installs). Match the bash doctor's
+    # behavior (cmd_doctor.sh — issues counter, no exit). For hard-fail
+    # semantics the user should run `airc doctor --connect`, which is
+    # the documented preflight gate that does exit non-zero on issues.
+    $global:LASTEXITCODE = 0
 }
 
 # -- airc doctor --connect ---------------------------------------------
@@ -1411,13 +1435,13 @@ function Invoke-DoctorConnectPreflight {
             }
         } else {
             Write-Host "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach"
-            Write-Host '         Fix: winget install --id tailscale.tailscale  (then: tailscale up)'
+            Write-Host '         Fix: winget install --id Tailscale.Tailscale  (then: tailscale up)'
             $script:DoctorIssues += 'tailscale-missing'
         }
     } else {
         Probe 'tailscale (optional)' {
             $null -ne (Resolve-TailscaleBin)
-        } 'winget install --id tailscale.tailscale  (LAN-only mode works without it)'
+        } 'winget install --id Tailscale.Tailscale  (LAN-only mode works without it)'
     }
 
     # Connect-specific: AIRC_PORT free
