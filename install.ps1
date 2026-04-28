@@ -67,18 +67,47 @@ function Update-SessionPath {
 # stripped App Installer, we can't auto-install -- flag it loud with the
 # exact Microsoft Store / GitHub Releases URL to recover.
 function Test-WingetAvailable {
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Fail 'winget not found. winget is the Windows package manager that ships with App Installer (Microsoft Store).'
+    if (Get-Command winget -ErrorAction SilentlyContinue) { return }
+
+    # Issue #95: detect Windows Server — Microsoft Store path is a
+    # dead-end there (no Store, no App Installer). Surface chocolatey
+    # / scoop fallbacks instead.
+    $isServer = $false
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        # ProductType: 1=Workstation, 2=Domain Controller, 3=Server
+        if ($os -and ($os.ProductType -eq 2 -or $os.ProductType -eq 3)) {
+            $isServer = $true
+        }
+    } catch { }
+
+    Write-Fail 'winget not found.'
+    Write-Host ''
+    if ($isServer) {
+        Write-Host '  This is Windows Server. The Microsoft Store path does not apply here.'
+        Write-Host '  Use chocolatey OR scoop, then re-run this installer:'
         Write-Host ''
-        Write-Host '  Install it manually then re-run this script:'
+        Write-Host '    # chocolatey (recommended for Server):'
+        Write-Host '    Set-ExecutionPolicy Bypass -Scope Process -Force'
+        Write-Host "    iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+        Write-Host '    choco install -y python git gh openssh'
+        Write-Host ''
+        Write-Host '    # OR scoop (user-scope, no admin needed):'
+        Write-Host "    iwr -useb https://get.scoop.sh | iex"
+        Write-Host '    scoop install python git gh openssh'
+        Write-Host ''
+        Write-Host '  After installing python, git, gh, openssh manually, re-run this script;'
+        Write-Host '  it will detect them and skip winget.'
+    } else {
+        Write-Host '  winget ships with App Installer (Microsoft Store). Install or update it:'
         Write-Host '    1. Open the Microsoft Store, search "App Installer", click Install/Update'
         Write-Host '       (or: https://www.microsoft.com/store/productId/9NBLGGH4NNS1)'
         Write-Host '    2. Reopen PowerShell and run this installer again.'
         Write-Host ''
-        Write-Host '  If you cannot use the Microsoft Store, install manually from'
+        Write-Host '  If the Store is unavailable, install manually from'
         Write-Host '  https://github.com/microsoft/winget-cli/releases (latest .msixbundle).'
-        exit 1
     }
+    exit 1
 }
 
 # -- Install one winget package, idempotent ------------------------------
