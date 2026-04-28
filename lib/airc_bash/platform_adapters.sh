@@ -160,4 +160,25 @@ iso_to_epoch() {
   "$AIRC_PYTHON" -m airc_core.datetime iso_to_epoch "$ts" 2>/dev/null
 }
 
+# MSYS / Git Bash path conversion. Six callsites in airc + three in
+# install.sh used the same `if command -v cygpath ... else sed ...`
+# block; #205 Target #3 collapsed them. cygpath when present (MSYS2,
+# modern Git Bash); sed fallback for stripped-down environments.
+# Both directions exposed so callers don't have to remember which sed
+# regex inverts the other.
+_to_win_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1" 2>/dev/null
+  else
+    printf '%s' "$1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g'
+  fi
+}
+_to_bash_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1" 2>/dev/null
+  else
+    printf '%s' "$1" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|'
+  fi
+}
+
 # ── End platform adapters ───────────────────────────────────────────────

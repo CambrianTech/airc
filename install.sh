@@ -23,6 +23,26 @@ info()  { printf '  \033[1;34m->\033[0m %s\n' "$*"; }
 ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
 
+# MSYS / Git Bash path conversion. Three callsites in this file used the
+# same `if command -v cygpath ... else sed ...` block; #205 Target #3
+# collapsed them. Mirrors lib/airc_bash/platform_adapters.sh's helpers
+# (defined twice on purpose: install.sh runs pre-clone so it can't
+# source from $CLONE_DIR, and the helper bodies are tiny).
+_to_win_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1" 2>/dev/null
+  else
+    printf '%s' "$1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g'
+  fi
+}
+_to_bash_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1" 2>/dev/null
+  else
+    printf '%s' "$1" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|'
+  fi
+}
+
 # ── Prereq auto-install ─────────────────────────────────────────────────
 # Mirrors the Windows install.ps1 winget path: detect what's missing,
 # install via the platform's package manager, then verify. Designed for
@@ -461,13 +481,7 @@ PSPAYLOAD
 
       # Translate the .ps1 path to Windows form for Start-Process -File
       # and the parse-check below.
-      local _elevated_ps1_win
-      if command -v cygpath >/dev/null 2>&1; then
-        _elevated_ps1_win=$(cygpath -w "$_elevated_ps1" 2>/dev/null)
-      else
-        # Fallback: /c/Users/foo/.airc-src/install-elevated.ps1 → C:\Users\foo\.airc-src\install-elevated.ps1
-        _elevated_ps1_win=$(printf '%s' "$_elevated_ps1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-      fi
+      local _elevated_ps1_win; _elevated_ps1_win=$(_to_win_path "$_elevated_ps1")
 
       # Pre-flight parse-check: catch syntax errors in the staged .ps1
       # BEFORE we trigger UAC. Without this, a parser error means the
@@ -507,12 +521,7 @@ PSPAYLOAD
           # C:\\Users\\green\\AppData\\Local\\Temp\\airc-install-elevated.log).
           local _ps_log_win _ps_log_bash _elev_rc=0
           _ps_log_win=$(powershell.exe -NoProfile -Command "Join-Path ([System.IO.Path]::GetTempPath()) 'airc-install-elevated.log'" 2>/dev/null | tr -d '\r')
-          if command -v cygpath >/dev/null 2>&1; then
-            _ps_log_bash=$(cygpath -u "$_ps_log_win" 2>/dev/null || echo "")
-          else
-            # MSYS-style sed translation: 'C:\Users\...' → '/c/Users/...'
-            _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
-          fi
+          _ps_log_bash=$(_to_bash_path "$_ps_log_win")
           info "  elevated payload: $_elevated_ps1_win"
           info "  elevated log:     $_ps_log_win"
           info "  (bash log path:   $_ps_log_bash)"
@@ -943,13 +952,7 @@ ts_post_check() {
     # the returned Windows path to MSYS form for [ -x ].
     local _wherewin
     _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
-    if [ -n "$_wherewin" ]; then
-      if command -v cygpath >/dev/null 2>&1; then
-        ts_bin=$(cygpath -u "$_wherewin" 2>/dev/null || echo "")
-      else
-        ts_bin=$(printf '%s' "$_wherewin" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
-      fi
-    fi
+    [ -n "$_wherewin" ] && ts_bin=$(_to_bash_path "$_wherewin")
   fi
   [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
 

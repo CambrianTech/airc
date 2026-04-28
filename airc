@@ -467,13 +467,8 @@ resolve_tailscale_bin() {
     local _wherewin
     _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
     if [ -n "$_wherewin" ]; then
-      if command -v cygpath >/dev/null 2>&1; then
-        local _bash; _bash=$(cygpath -u "$_wherewin" 2>/dev/null || echo "")
-        [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
-      else
-        local _bash; _bash=$(printf '%s' "$_wherewin" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
-        [ -f "$_bash" ] && { echo "$_bash"; return 0; }
-      fi
+      local _bash; _bash=$(_to_bash_path "$_wherewin")
+      [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
     fi
   fi
   return 1
@@ -5015,14 +5010,8 @@ _daemon_install_schtasks() {
   [ -z "$bash_exe" ] && die "bash.exe not found at any standard Git for Windows path. Install Git for Windows + re-run."
 
   # Convert paths to Windows form; cmd.exe can't read /c/Users/... .
-  local airc_bin_win scope_win
-  if command -v cygpath >/dev/null 2>&1; then
-    airc_bin_win=$(cygpath -w "$airc_bin")
-    scope_win=$(cygpath -w "$scope")
-  else
-    airc_bin_win=$(printf '%s' "$airc_bin" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-    scope_win=$(printf '%s' "$scope" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-  fi
+  local airc_bin_win; airc_bin_win=$(_to_win_path "$airc_bin")
+  local scope_win; scope_win=$(_to_win_path "$scope")
 
   # Stage a launcher .bat in $scope. Loops with 5s pause for airc-crash
   # auto-restart (matches launchd KeepAlive=true / systemd Restart=always).
@@ -5043,23 +5032,12 @@ _daemon_install_schtasks() {
   # Absolute Unix-form path to airc: bash with -c doesn't read
   # ~/.bashrc, so PATH may not include ~/.local/bin. Hard-coding
   # the resolved unix path makes the invocation independent of PATH.
-  local cwd_win airc_bin_unix
-  if command -v cygpath >/dev/null 2>&1; then
-    cwd_win=$(cygpath -w "$(pwd -P)")
-    airc_bin_unix=$(cygpath -u "$airc_bin" 2>/dev/null)
-    [ -z "$airc_bin_unix" ] && airc_bin_unix="$airc_bin"
-  else
-    cwd_win=$(printf '%s' "$(pwd -P)" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-    airc_bin_unix="$airc_bin"
-  fi
+  local cwd_win; cwd_win=$(_to_win_path "$(pwd -P)")
+  local airc_bin_unix; airc_bin_unix=$(_to_bash_path "$airc_bin")
+  [ -z "$airc_bin_unix" ] && airc_bin_unix="$airc_bin"
   # Marker path the .bat polls to distinguish intentional re-exec
   # (written by _reexec_into) from "actual crash" (#203/#204).
-  local marker_win
-  if command -v cygpath >/dev/null 2>&1; then
-    marker_win=$(cygpath -w "$scope/airc.reexec-marker")
-  else
-    marker_win=$(printf '%s' "$scope/airc.reexec-marker" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-  fi
+  local marker_win; marker_win=$(_to_win_path "$scope/airc.reexec-marker")
   local launcher_bash="$scope/airc-daemon.bat"
   cat > "$launcher_bash" <<EOF
 @echo off
@@ -5090,12 +5068,7 @@ echo [%date% %time%] airc connect exited. Restarting in 5s. >> daemon.err
 timeout /t 5 /nobreak >nul
 goto loop
 EOF
-  local launcher_win
-  if command -v cygpath >/dev/null 2>&1; then
-    launcher_win=$(cygpath -w "$launcher_bash")
-  else
-    launcher_win=$(printf '%s' "$launcher_bash" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
-  fi
+  local launcher_win; launcher_win=$(_to_win_path "$launcher_bash")
 
   # The Run-key value is what cmd.exe runs at user logon. We wrap with
   # `cmd /c start "" /MIN ... ` so the daemon launches detached + with
