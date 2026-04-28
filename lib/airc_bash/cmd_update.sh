@@ -41,6 +41,7 @@ cmd_update() {
         echo "  airc update --channel <name>       switch channel + pull"
         echo "  airc update --canary               shortcut for --channel canary"
         echo "  airc update --main                 shortcut for --channel main"
+        echo "  airc update --force / -f           auto-stash local mods + pull"
         return 0 ;;
       --channel|-c)
         requested_channel="${2:-}"
@@ -66,6 +67,31 @@ cmd_update() {
     [ -z "$channel" ] && channel="main"
   else
     channel="main"
+  fi
+
+  # Detect dirty tree BEFORE attempting branch switch / pull. Without this,
+  # a stray local edit (or partial change from a previous failed update)
+  # surfaced a hostile install.sh failure with no recovery path. Either
+  # auto-stash with --force, OR print a single-line copy-pasteable
+  # recovery suggestion. Defaults to safety (refuse without consent).
+  local force=0
+  for _arg in "$@"; do
+    case "$_arg" in --force|-f) force=1 ;; esac
+  done
+  if ! git -C "$dir" diff --quiet 2>/dev/null || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    if [ "$force" = "1" ]; then
+      echo "  ⚠  Local mods detected in $dir; --force passed → auto-stash."
+      git -C "$dir" stash push -u -m "airc-update-autostash-$(date +%s)" >/dev/null 2>&1 || die "Auto-stash failed in $dir."
+    else
+      echo "  ⚠  Local mods in install dir ($dir):" >&2
+      git -C "$dir" status --short 2>&1 | head -10 >&2
+      echo "" >&2
+      echo "  Recover with one of:" >&2
+      echo "    airc update --force                    # auto-stash, pull, leave stash for you" >&2
+      echo "    git -C $dir stash && airc update       # manual stash + retry" >&2
+      echo "    git -C $dir reset --hard origin/$channel  # discard mods + retry update" >&2
+      die "refusing to update over local mods (use --force to auto-stash)"
+    fi
   fi
 
   # Switch to the target branch BEFORE pulling. install.sh will then ff-pull
