@@ -149,9 +149,19 @@ cmd_send() {
   local escaped_msg
   escaped_msg=$(printf '%s' "$msg" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
 
-  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"msg\":\"$escaped_msg\"}"
+  # Channel: stamp every outbound envelope with the active channel so the
+  # monitor display can route by channel uniformly (Phase 2 mesh
+  # substrate). Resolved from the scope's room_name file; falls back to
+  # "general" if no scope room is set. Once Phase 2B lands the joiner
+  # subscribed_channels concept, --channel <name> on cmd_send will
+  # override this default.
+  local active_channel="general"
+  [ -f "$AIRC_WRITE_DIR/room_name" ] && active_channel=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || echo general)
+  [ -z "$active_channel" ] && active_channel="general"
+
+  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\"}"
   local sig; sig=$(sign_message "$payload")
-  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
   local host_target
   host_target=$(get_config_val host_target "")
@@ -173,8 +183,8 @@ cmd_send() {
     # tailscale CLI is unavailable (falls through to normal ssh attempt).
     if is_peer_offline_in_tailnet "$host_target"; then
       echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — peer offline in tailnet, auto-delivers on wake]"}' \
-        "$(timestamp)" "$peer_name")
+      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — peer offline in tailnet, auto-delivers on wake]"}' \
+        "$(timestamp)" "$active_channel" "$peer_name")
       echo "$queue_marker" >> "$MESSAGES"
       date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
       rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
@@ -214,8 +224,8 @@ cmd_send() {
       fi
 
       if [ "$is_auth_fail" = "1" ]; then
-        local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
-          "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
+        local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
+          "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
         echo "$fail_marker" >> "$MESSAGES"
         echo "  SSH auth to host FAILED. Message NOT queued — every retry would fail identically." >&2
         echo "  SSH stderr: ${stderr}" >&2
@@ -225,8 +235,8 @@ cmd_send() {
 
       # Network-class wire failure: legitimately transient, queue for retry.
       echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
-        "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
+      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
+        "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
       echo "$queue_marker" >> "$MESSAGES"
       echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
       # Surface the actual stderr so the user understands WHY — the old

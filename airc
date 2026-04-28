@@ -1434,9 +1434,12 @@ flush_pending_loop() {
 
     # Announce success in the local log so `airc logs` shows the drain event.
     if [ "$delivered" -gt 0 ]; then
+      local _drain_chan="general"
+      [ -f "$AIRC_WRITE_DIR/room_name" ] && _drain_chan=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || echo general)
+      [ -z "$_drain_chan" ] && _drain_chan="general"
       local drain_marker
-      drain_marker=$(printf '{"from":"airc","ts":"%s","msg":"[DRAINED %d queued message(s) to host]"}' \
-        "$(timestamp)" "$delivered")
+      drain_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[DRAINED %d queued message(s) to host]"}' \
+        "$(timestamp)" "$_drain_chan" "$delivered")
       echo "$drain_marker" >> "$MESSAGES"
     fi
 
