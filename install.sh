@@ -329,12 +329,32 @@ if (-not (Test-Path $sshKeygen)) {
     icacls $k.FullName /grant 'NT AUTHORITY\SYSTEM:(F)' 'BUILTIN\Administrators:(F)' 2>&1 | Out-Null
     icacls $k.FullName /remove:g $me 2>&1 | Out-Null
   }
-  # Dump the post-fix ACL on the rsa key so we can see in the transcript
-  # whether the result matches what sshd expects (only SYSTEM + Admins).
+  # Dump the post-fix ACL + OWNER on the rsa key so we can see in the
+  # transcript whether the result matches what sshd expects: owner must
+  # be SYSTEM or Administrators, ACEs must be only owner + SYSTEM + Admins.
   $rsa = Join-Path $sshDir 'ssh_host_rsa_key'
   if (Test-Path $rsa) {
     Write-Host "  post-fix ACL on ssh_host_rsa_key:"
     icacls $rsa 2>&1 | ForEach-Object { Write-Host "    $_" }
+    Write-Host "  post-fix OWNER on ssh_host_rsa_key: $((Get-Acl $rsa).Owner)"
+  }
+}
+
+Write-Host "==> sshd dry-run (config + key load test)";
+# Run sshd -t from elevated context to surface the *real* reason sshd
+# is failing -- Start-Service sshd hides the underlying error behind a
+# generic "Failed to start service" message. -t exits non-zero with a
+# specific error message ("no hostkeys available", config syntax,
+# privilege separation user missing, etc.). Captures stderr too.
+$sshdExe = Join-Path $env:WINDIR "System32\OpenSSH\sshd.exe"
+if (Test-Path $sshdExe) {
+  $sshdTest = & $sshdExe -t 2>&1
+  $sshdTestExit = $LASTEXITCODE
+  if ($sshdTestExit -eq 0) {
+    Write-Host "  sshd -t: OK (exit 0)"
+  } else {
+    Write-Host "  sshd -t: FAILED (exit $sshdTestExit)";
+    $sshdTest | ForEach-Object { Write-Host "    $_" }
   }
 }
 
