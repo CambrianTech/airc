@@ -89,7 +89,25 @@ cmd_update() {
     echo "  Already at ${after} on channel '${channel}'. Skills refreshed."
   else
     echo "  Updated: ${before} -> ${after} on channel '${channel}'. Skills refreshed."
-    echo "  Running monitor still uses the old code. To pick up:  airc teardown && airc connect"
+  fi
+
+  # Stale-running-monitor detection (vhsm-d1f4's gotcha 2026-04-28):
+  # bash sources its functions in-memory at process start; an airc
+  # connect that's been running since BEFORE this update is still
+  # executing the old version. We can't auto-restart safely (would
+  # interrupt active SSH sessions), so we print a loud, action-shaped
+  # warning ONLY when a monitor is actually running in the current
+  # scope. Silent when nothing is running.
+  if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
+    local _pid; _pid=$(awk '{print $1; exit}' "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      echo ""
+      echo "  ⚠  A running airc monitor (PID ${_pid}) is still on the OLD code."
+      echo "     Restart to pick up ${after}:"
+      echo ""
+      echo "       airc teardown && airc connect"
+      echo ""
+    fi
   fi
 }
 
