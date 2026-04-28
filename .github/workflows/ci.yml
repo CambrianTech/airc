@@ -115,24 +115,34 @@ jobs:
           which airc
           airc doctor || echo "airc doctor reported issues (non-fatal in CI)"
 
-      - name: Smoke — same as linux
+      - name: Smoke — same as linux (airc.pid based)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           export AIRC_HOME=/tmp/ci-airc/state
           export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
           mkdir -p /tmp/ci-airc/state
           airc connect --no-room --no-gist > /tmp/ci-airc/host.log 2>&1 &
-          sleep 6
-          if ! pgrep -f "airc connect --no-gist" >/dev/null; then
-            echo "FAIL: airc connect did not stay up"
-            cat /tmp/ci-airc/host.log
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ -f /tmp/ci-airc/state/airc.pid ] && break
+            sleep 1
+          done
+          if [ ! -f /tmp/ci-airc/state/airc.pid ]; then
+            echo "FAIL: airc.pid never appeared — connect didn't reach host loop"
+            cat /tmp/ci-airc/host.log || true
             exit 1
           fi
-          echo "✓ airc connect stayed up"
+          for p in $(cat /tmp/ci-airc/state/airc.pid); do
+            if ! kill -0 "$p" 2>/dev/null; then
+              echo "FAIL: PID $p in airc.pid is not alive"
+              cat /tmp/ci-airc/host.log || true
+              exit 1
+            fi
+          done
+          echo "✓ airc connect stayed up (pids: $(cat /tmp/ci-airc/state/airc.pid))"
           airc teardown
           sleep 1
-          if pgrep -f "airc connect --no-gist" >/dev/null; then
-            echo "FAIL: airc teardown did not kill the host"
+          if [ -f /tmp/ci-airc/state/airc.pid ]; then
+            echo "FAIL: airc teardown left airc.pid behind"
             exit 1
           fi
           echo "✓ airc teardown clean"
