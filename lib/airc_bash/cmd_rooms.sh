@@ -387,47 +387,23 @@ else:
     return
   fi
 
-  # Walk scopes that count as "subscribed rooms" for this tab: primary
-  # (current AIRC_WRITE_DIR) plus any sibling sidecar scopes (.airc.<room>
-  # pattern under the project scope's parent). For each, read peers/
-  # records and annotate with the scope's room_name. Same peer in both
-  # scopes folds into one line with both room tags.
+  # Phase 2B.3 onward: walk ONLY the primary scope. Sibling sidecar
+  # scopes (.airc.<room>) are no longer spawned; any leftover dirs are
+  # detritus from pre-2B.3 runs and contain stale peer records (e.g.
+  # the integration-test 'tr' peer from /tmp/airc-trace2 surfacing
+  # months later). Walking them was useful when sidecars were live;
+  # post-2B.3 it just resurfaces ghosts.
   #
-  # Intent (issue #121 follow-up): multi-room presence shouldn't fragment
-  # the operator's view of "who am I connected to" into separate per-scope
-  # listings. From the user's perspective they're in N rooms; airc peers
-  # should reflect that as one unified roster with room context per peer.
+  # The unified-roster intent from issue #121 still holds, but in the
+  # singleton-mesh world EVERY peer is in the primary scope's peers/.
+  # Multi-channel context comes from envelope.channel (Phase 2A) +
+  # subscribed_channels (Phase 2B), not from sibling scopes.
   "$AIRC_PYTHON" -c "
 import json, os, sys, re
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
-parent = os.path.dirname(primary_scope)
-self_basename = os.path.basename(primary_scope)
-
-# Prefix detection: a sidecar scope is named like \`<prefix>.<room>\`
-# (e.g. .airc.general). Strip a trailing .<word> to recover the
-# primary scope's basename. Works for both production layout
-# (.airc / .airc.general) and test ad-hoc paths (state / state.general)
-# without baking in the .airc literal.
-prefix_match = re.match(r'(.+?)\.[a-z0-9-]+\$', self_basename)
-prefix = prefix_match.group(1) if prefix_match else self_basename
-
-# Collect: the primary scope itself, plus every sibling whose name is
-# <prefix>.<something>. We additionally require room_name + peers/ on
-# each candidate so unrelated dirs in the same parent (e.g. .airc-old,
-# .airc.bak) don't pollute the listing.
-candidates = []
-if os.path.isdir(parent):
-    for entry in sorted(os.listdir(parent)):
-        if entry == prefix or entry.startswith(prefix + '.'):
-            candidates.append(os.path.join(parent, entry))
-scopes = [s for s in candidates
-          if os.path.isfile(os.path.join(s, 'room_name'))
-          and os.path.isdir(os.path.join(s, 'peers'))]
-# Always include primary even if it doesn't have room_name yet — that's
-# the legacy 1:1 invite mode case (use_room=0).
-if primary_scope not in scopes and os.path.isdir(os.path.join(primary_scope, 'peers')):
-    scopes.insert(0, primary_scope)
+# Phase 2B.3: only walk the primary scope. Sidecar scopes are gone.
+scopes = [primary_scope] if os.path.isdir(os.path.join(primary_scope, 'peers')) else []
 
 # Build {(name, host): [room1, room2, ...]} by walking each scope's peers/.
 peers_by_id = {}

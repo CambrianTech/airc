@@ -222,30 +222,18 @@ cmd_whois() {
   # cmds (cat $host_airc_home/peers/<target>.json) in any scope.
   _validate_peer_name "$target"
 
-  # Try primary scope first, then walk sibling sidecar scopes. First
-  # hit wins. The order matters: primary scope's host/peer-file lookups
-  # are local-only (cheap); sibling scopes may add an SSH round-trip
-  # per scope for the cross-peer-via-host path.
+  # Phase 2B.3 onward: only the primary scope. Sibling sidecar scopes
+  # are no longer spawned; any leftover .airc.<word> dirs have stale
+  # peer records that would resurface as ghosts (e.g. integration-test
+  # fixtures from /tmp/airc-trace2 surviving for days).
+  #
+  # Phase 2C+ TODO: cross-mesh whois resolution (ask the host for a
+  # peer record we don't have locally). Without that, indirect peers
+  # in the singleton mesh — peers paired with the host but not with
+  # us directly — return "no record". Tracked as the wart that
+  # ideem-local-4bef + continuum-b741 surfaced 2026-04-28.
   if _whois_in_scope "$AIRC_WRITE_DIR" "$target"; then
     return 0
-  fi
-
-  local parent self_base prefix sibling
-  parent=$(dirname "$AIRC_WRITE_DIR")
-  self_base=$(basename "$AIRC_WRITE_DIR")
-  # Strip a trailing .<word> to recover the primary prefix. Mirrors the
-  # detection in cmd_peers (#124) so .airc / .airc.general both resolve
-  # to .airc as the prefix; in tests we see state / state.general → state.
-  prefix=$(printf '%s' "$self_base" | sed -E 's/\.[a-z0-9-]+$//')
-  if [ -d "$parent" ]; then
-    for sibling in "$parent/$prefix" "$parent/$prefix".*; do
-      [ -d "$sibling" ] || continue
-      [ "$sibling" = "$AIRC_WRITE_DIR" ] && continue
-      [ -f "$sibling/config.json" ] || continue
-      if _whois_in_scope "$sibling" "$target"; then
-        return 0
-      fi
-    done
   fi
 
   echo "  whois: no record for '$target' (try airc peers to list paired peers)"
