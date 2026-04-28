@@ -805,6 +805,11 @@ cmd_connect() {
           --config "$CONFIG" --channel "$resolved_room_name" 2>/dev/null || true
         echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
       fi
+      # Identity bootstrap nudge (#146). Skill /join SKILL.md prompts
+      # AIs to set pronouns/role/bio at first join, but users running
+      # airc directly (no skill) never get the prompt and end up with
+      # all-(unset) whois forever. Code-level one-time nudge here.
+      _identity_bootstrap_nudge_if_unset || true
     fi
 
     # Exchange keys with host via TCP (port 7547) — public keys only

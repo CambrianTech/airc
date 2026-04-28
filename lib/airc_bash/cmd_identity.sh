@@ -92,6 +92,39 @@ cmd_identity() {
   esac
 }
 
+# Identity bootstrap nudge (#146). Called once after a successful
+# `airc connect` join. If pronouns/role/bio are all (unset), print a
+# one-time prompt encouraging the user to set them. Idempotent: the
+# nudge file under $AIRC_WRITE_DIR/.identity_nudged_v1 records that
+# we've nudged, so we don't nag every reconnect. The skill /join can
+# still drive interactive bootstrap; this is the binary-side fallback
+# for users running airc directly.
+_identity_bootstrap_nudge_if_unset() {
+  local nudge_file="$AIRC_WRITE_DIR/.identity_nudged_v1"
+  [ -f "$nudge_file" ] && return 0
+  CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
+import json, os, sys
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+except Exception:
+    sys.exit(0)
+ident = c.get("identity", {}) or {}
+unset = [k for k in ("pronouns", "role", "bio") if not ident.get(k)]
+if len(unset) == 3:
+    sys.exit(2)  # all three unset → nudge
+sys.exit(0)
+' || {
+    if [ "$?" = "2" ]; then
+      echo ""
+      echo "  Tip: set your identity so peers know who they are talking to. One-line example:"
+      echo "    airc identity set --pronouns they --role 'your role' --bio 'one-sentence bio'"
+      echo "  Done? Suppress this nudge: touch $nudge_file"
+      echo ""
+    fi
+  }
+  : > "$nudge_file" 2>/dev/null || true
+}
+
 _identity_show() {
   CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
 import json, os
