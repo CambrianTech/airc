@@ -311,6 +311,20 @@ cmd_send() {
   # Reset reminder — you sent something, clock restarts
   date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
   rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+
+  # Surface a one-line confirmation. QA pass 2026-04-28: silent success
+  # was indistinguishable from "command did nothing" — users hit
+  # `airc msg ...`, see no output, and have no idea whether the message
+  # is in flight, queued, or eaten. --internal callers (cmd_rename's
+  # propagation, etc.) stay silent on purpose; the user-invoked surface
+  # gets the confirmation.
+  if [ "$internal" != "1" ]; then
+    if [ "$peer_name" = "all" ]; then
+      echo "  → #${active_channel} (broadcast)"
+    else
+      echo "  → @${peer_name} on #${active_channel}"
+    fi
+  fi
 }
 
 # Ping a peer to verify their monitor is alive AND processing traffic.
