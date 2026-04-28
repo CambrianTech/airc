@@ -403,7 +403,13 @@ ensure_prereqs() {
 
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
-  if ! tailscale_present; then
+  # Skip in CI: brew install --cask tailscale on macOS runners is slow
+  # (multi-minute download + GUI app install) and there's no tailnet
+  # behind the runner anyway. The install itself is what we're gating
+  # on — Tailscale-as-optional is documented; CI doesn't need it.
+  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+    info "CI=true — skipping Tailscale install (optional, no tailnet in CI)"
+  elif ! tailscale_present; then
     info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
     install_tailscale
   fi
