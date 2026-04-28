@@ -134,13 +134,19 @@ cmd_channel() {
 
   local target="${1:-}"
   # Help-flag intercept BEFORE we'd write target to channel_file.
-  # vhsm-d1f4 + continuum-b741 + ideem-local-4bef caught this 2026-04-28:
-  # `airc channel --help` was writing "--help" as the channel preference,
-  # which would brick the next `airc update` (no such branch on origin).
+  # First version (#237) just fell through to the no-args path which
+  # prints the current channel info — continuum-b69f's #244 Windows
+  # e2e flagged that as inconsistent with the other --help intercepts
+  # (no "Usage:" header). Now prints a proper Usage block.
   case "$target" in
     -h|--help)
-      target=""  # fall through to the no-arg path which prints usage
-      ;;
+      echo "Usage:"
+      echo "  airc channel             show current channel + how to switch"
+      echo "  airc channel <name>      set preference (run 'airc update' to pull)"
+      echo "  airc channel canary      shortcut to set canary preference"
+      echo "  airc channel main        shortcut to set main preference"
+      echo "  airc update --channel <name>   set + pull in one step"
+      return 0 ;;
   esac
   # Reject any flag-shaped value as a channel name (channels are git
   # branches; they can't start with '-'). Defensive against the same
