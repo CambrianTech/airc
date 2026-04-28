@@ -245,7 +245,11 @@ _ensure_sshd_running() {
        # below regardless of success/failure.
       local _elevated_payload='
 $ErrorActionPreference = "Stop";
-$logPath = Join-Path $env:TEMP "airc-install-elevated.log";
+# Use [System.IO.Path]::GetTempPath() not $env:TEMP — when called from
+# Git Bash, the inherited TEMP env var can be the bash-side /tmp, not
+# the Windows user temp directory. GetTempPath() asks the OS directly
+# (resolves to %LOCALAPPDATA%\Temp on Windows) regardless of the env.
+$logPath = Join-Path ([System.IO.Path]::GetTempPath()) "airc-install-elevated.log";
 Start-Transcript -Path $logPath -Force | Out-Null;
 try {
   Write-Host "==> OpenSSH.Server capability";
@@ -300,13 +304,20 @@ exit $global:LASTEXITCODE;
         Stopped|StopPending|StartPending|Paused|"")
           info "Configuring OpenSSH.Server + HNS port-22 reservation (UAC prompt incoming)."
           info "  airc joiners need this to ssh-tail your messages.jsonl when you host."
-          # Log path lives at %TEMP%\airc-install-elevated.log on Windows.
-          # Compute its bash-form so we can dump it below.
+          # Log path lives at %LOCALAPPDATA%\Temp\airc-install-elevated.log
+          # on Windows. Use [System.IO.Path]::GetTempPath() not $env:TEMP
+          # — Git Bash's inherited TEMP=/tmp leaks into powershell.exe and
+          # would resolve to /tmp instead of the real Windows user temp,
+          # making us look for the log at the wrong path (Joel 2026-04-28
+          # — \"Elevated transcript not written\" but the log was written;
+          # we just looked at /tmp/airc-install-elevated.log instead of
+          # C:\\Users\\green\\AppData\\Local\\Temp\\airc-install-elevated.log).
           local _ps_log_win _ps_log_bash _elev_rc=0
-          _ps_log_win=$(powershell.exe -NoProfile -Command "Join-Path \$env:TEMP 'airc-install-elevated.log'" 2>/dev/null | tr -d '\r')
+          _ps_log_win=$(powershell.exe -NoProfile -Command "Join-Path ([System.IO.Path]::GetTempPath()) 'airc-install-elevated.log'" 2>/dev/null | tr -d '\r')
           if command -v cygpath >/dev/null 2>&1; then
             _ps_log_bash=$(cygpath -u "$_ps_log_win" 2>/dev/null || echo "")
           else
+            # MSYS-style sed translation: 'C:\Users\...' → '/c/Users/...'
             _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
           fi
           info "  elevated log: $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
@@ -693,6 +704,8 @@ ts_post_check() {
   local ts_bin=""
   if command -v tailscale >/dev/null 2>&1; then
     ts_bin="tailscale"
+  elif command -v tailscale.exe >/dev/null 2>&1; then
+    ts_bin="tailscale.exe"
   elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
     ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
   elif [ -x "/c/Program Files/Tailscale/tailscale.exe" ]; then
@@ -702,6 +715,19 @@ ts_post_check() {
     ts_bin="/c/Program Files/Tailscale/tailscale.exe"
   elif [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ]; then
     ts_bin="/c/Program Files (x86)/Tailscale/tailscale.exe"
+  elif command -v where.exe >/dev/null 2>&1; then
+    # Last resort: where.exe searches every PATH+PATHEXT location.
+    # Catches winget user-scope installs (%LOCALAPPDATA%\...). Translate
+    # the returned Windows path to MSYS form for [ -x ].
+    local _wherewin
+    _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
+    if [ -n "$_wherewin" ]; then
+      if command -v cygpath >/dev/null 2>&1; then
+        ts_bin=$(cygpath -u "$_wherewin" 2>/dev/null || echo "")
+      else
+        ts_bin=$(printf '%s' "$_wherewin" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
+      fi
+    fi
   fi
   [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
 

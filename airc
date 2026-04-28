@@ -423,17 +423,41 @@ resolve_tailscale_bin() {
     return 0
   fi
   # Known-path fallbacks. Both common Windows install locations + the
-  # macOS .app bundle. Order matters: try the cheap PATH cases first.
+  # macOS .app bundle. Use [ -f ] not [ -x ] for the Windows .exe paths
+  # — Git Bash MSYS doesn't always reflect the executable bit on NTFS
+  # for files Windows considers runnable-by-extension. -f catches the
+  # file's existence; .exe is implicitly executable on Windows.
   local candidate
   for candidate in \
     "/c/Program Files/Tailscale/tailscale.exe" \
-    "/mnt/c/Program Files/Tailscale/tailscale.exe" \
-    "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; do
-    if [ -x "$candidate" ]; then
+    "/c/Program Files (x86)/Tailscale/tailscale.exe" \
+    "/mnt/c/Program Files/Tailscale/tailscale.exe"; do
+    if [ -f "$candidate" ]; then
       echo "$candidate"
       return 0
     fi
   done
+  if [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    return 0
+  fi
+  # Last resort: where.exe searches every PATH+PATHEXT location, catches
+  # winget user-scope installs (%LOCALAPPDATA%\...) that aren't in any
+  # of the hard-coded paths above (Joel 2026-04-28: install.sh's
+  # tailscale_present had the same blind spot).
+  if command -v where.exe >/dev/null 2>&1; then
+    local _wherewin
+    _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
+    if [ -n "$_wherewin" ]; then
+      if command -v cygpath >/dev/null 2>&1; then
+        local _bash; _bash=$(cygpath -u "$_wherewin" 2>/dev/null || echo "")
+        [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
+      else
+        local _bash; _bash=$(printf '%s' "$_wherewin" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
+        [ -f "$_bash" ] && { echo "$_bash"; return 0; }
+      fi
+    fi
+  fi
   return 1
 }
 
@@ -652,7 +676,32 @@ tailscale_login_check_or_prompt() {
   # same. No URL extraction, no bg jobs, no browser auto-launch. The
   # `|| true` lets us continue if the user cancels (Ctrl-C); we just
   # proceed without Tailscale, same-machine + same-LAN paths still work.
-  "$ts_bin" up || true
+  "$ts_bin" up || _ts_up_rc=$?
+  # On Windows, `tailscale up` from non-admin Git Bash can exit silently
+  # if the user's shell isn't allowed to talk to the daemon's named
+  # pipe. Detect that case and fall back to launching the GUI (tailscale-
+  # ipn.exe lives next to tailscale.exe) so the user can click "Log in"
+  # from the tray. Without this fallback, the user sees nothing, has
+  # no obvious next step, and we silently proceed with logged-out
+  # Tailscale (Joel 2026-04-28).
+  if [ "${_ts_up_rc:-0}" != "0" ]; then
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*)
+        echo "" >&2
+        echo "  ⚠  'tailscale up' didn't complete (non-admin shell limitation on Windows)." >&2
+        local _ts_dir _ts_ipn
+        _ts_dir=$(dirname "$ts_bin")
+        _ts_ipn="$_ts_dir/tailscale-ipn.exe"
+        if [ -f "$_ts_ipn" ]; then
+          echo "  Opening Tailscale GUI — click the tray icon → Log in to authorize." >&2
+          "$_ts_ipn" >/dev/null 2>&1 &
+        else
+          echo "  Click the Tailscale tray icon (system tray) → Log in to authorize." >&2
+        fi
+        echo "" >&2
+        ;;
+    esac
+  fi
   echo "" >&2
   return 0
 }
