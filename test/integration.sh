@@ -1958,26 +1958,22 @@ scenario_connect_after_kill_recovers() {
   cleanup_all
 }
 
-# ── Scenario: general_sidecar_default (issue #121) ─────────────────────
-# Default-on multi-room presence: bare `airc join` from a project repo
-# should subscribe the tab to BOTH the auto-scoped project room AND
-# #general. The sidecar runs in a sibling .general scope; its bash PID
-# is appended to the primary's airc.pid so cmd_teardown reaps both.
+# ── Scenario: general_sidecar_default (Phase 2B.3 — sidecar deletion) ──
+# Phase 2B.3 collapses the multi-scope sidecar into a single scope with
+# subscribed_channels=["<project-room>", "general"]. Default-on multi-
+# room presence is preserved, but as ONE process subscribing to both
+# channels — not a separate `.general` sidecar process.
 #
 # Tests:
-#   1. Default behavior: primary spawns a #general sidecar.
-#   2. --no-general flag: project-only, no sidecar.
-#   3. cmd_teardown cleans BOTH primary scope + sidecar scope (.general).
-#
-# Test bypasses gh by using AIRC_NO_DISCOVERY=1 + --no-gist on both
-# primary and (transitively) sidecar — both fall into host mode in
-# their respective rooms with no gist publish. The point isn't wire
-# behavior; it's process spawn + scope creation + teardown reaping.
+#   1. Default behavior: bare `airc join` adds "general" to
+#      subscribed_channels (no separate scope/process).
+#   2. --no-general flag: project-only, no general subscription.
+#   3. --room-only is equivalent to --room + --no-general.
 scenario_general_sidecar_default() {
-  section "general_sidecar_default: bare join spawns #general sidecar (issue #121)"
+  section "general_sidecar_default: subscribed_channels (Phase 2B.3)"
   cleanup_all
 
-  # ── Test 1: default-on sidecar ────────────────────────────────────────
+  # ── Test 1: default-on subscription, no separate process ─────────────
   # The harness exports AIRC_NO_GENERAL=1 globally to suppress sidecar
   # in other tests; here we explicitly unset it for the scope of this
   # scenario.
@@ -1990,57 +1986,46 @@ scenario_general_sidecar_default() {
   local i
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
-    grep -qE 'Sidecar:.*also subscribing' "$home1/out.log" 2>/dev/null && break
+    grep -qE 'Also subscribing to #general' "$home1/out.log" 2>/dev/null && break
   done
 
-  grep -qE 'Sidecar:.*also subscribing to #general' "$home1/out.log" \
-    && pass "primary printed sidecar-spawn banner" \
-    || fail "no sidecar-spawn banner (got: $(head -10 "$home1/out.log" | tr '\n' '|'))"
+  grep -qE 'Also subscribing to #general' "$home1/out.log" \
+    && pass "primary printed subscribe-to-general banner" \
+    || fail "no subscribe banner (got: $(head -15 "$home1/out.log" | tr '\n' '|'))"
 
-  # Wait for sidecar scope to exist + be populated
+  # NEW: subscribed_channels in primary's config.json should include "general"
+  # (and the project room). No separate .general scope dir.
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
-    [ -f "${home1}.general/airc.pid" ] && [ -f "${home1}.general/room_name" ] && break
+    [ -f "$home1/config.json" ] && grep -q 'subscribed_channels' "$home1/config.json" && break
   done
 
-  [ -d "${home1}.general" ] \
-    && pass "sidecar scope dir created at \${home}.general" \
-    || fail "sidecar scope dir absent"
+  if [ -f "$home1/config.json" ] && python3 -c "
+import json,sys
+c=json.load(open('$home1/config.json'))
+chans=c.get('subscribed_channels',[])
+sys.exit(0 if 'general' in chans else 1)
+" 2>/dev/null; then
+    pass "subscribed_channels includes 'general'"
+  else
+    fail "subscribed_channels missing 'general' (config: $(cat "$home1/config.json" 2>/dev/null))"
+  fi
 
-  [ -f "${home1}.general/room_name" ] && [ "$(cat "${home1}.general/room_name")" = "general" ] \
-    && pass "sidecar scope has room_name=general" \
-    || fail "sidecar scope room_name wrong (got: $(cat "${home1}.general/room_name" 2>/dev/null))"
+  [ ! -d "${home1}.general" ] \
+    && pass "no .general sidecar scope created (Phase 2B.3)" \
+    || fail ".general sidecar scope STILL created — sidecar deletion not effective"
 
-  # Primary's airc.pid contains primary's host-mode PIDs ($$ PAIR_PID
-  # hb_pid on one line). The sidecar's PID lives in its OWN scope's
-  # airc.pid — separate file, separate ownership. (PR #122 originally
-  # appended sidecar PID to primary's airc.pid, but PR #125 reverted
-  # that to make `airc part` work cleanly without nuking the sidecar.)
   [ -s "$home1/airc.pid" ] \
     && pass "primary airc.pid is non-empty (host PIDs recorded)" \
     || fail "primary airc.pid empty or missing"
 
-  # Sidecar bash should be alive — read sidecar's OWN pidfile.
-  # awk '{print $1; exit}' grabs just the first PID since host-mode
-  # airc.pid has multiple space-separated PIDs on one line.
-  local _sc_pid; _sc_pid=$(awk '{print $1; exit}' "${home1}.general/airc.pid" 2>/dev/null)
-  if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
-    pass "sidecar bash PID ${_sc_pid} (from sidecar scope's own airc.pid) is alive"
-  else
-    fail "sidecar PID not alive (pid=${_sc_pid:-<empty>})"
-  fi
-
-  # ── Test 2: cmd_teardown reaps both ──────────────────────────────────
+  # ── Test 2: cmd_teardown reaps the single scope ──────────────────────
   AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
   sleep 1
 
-  ! kill -0 "$_sc_pid" 2>/dev/null \
-    && pass "teardown killed sidecar bash (PID ${_sc_pid})" \
-    || fail "sidecar still alive after teardown"
-
-  [ ! -f "${home1}.general/airc.pid" ] \
-    && pass "teardown cleared sidecar pidfile" \
-    || fail "sidecar pidfile still present after teardown"
+  [ ! -f "$home1/airc.pid" ] \
+    && pass "teardown cleared primary pidfile" \
+    || fail "primary pidfile still present after teardown"
 
   cleanup_all
   rm -rf /tmp/airc-it-sc1

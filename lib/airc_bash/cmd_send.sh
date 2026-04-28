@@ -76,61 +76,13 @@ cmd_send() {
   set -- "${positional[@]+"${positional[@]}"}"
 
   if [ -n "$target_room" ]; then
-    # Resolve target_room to a scope dir. Two cases:
-    #   1. We ARE in target_room already (current scope's room_name file
-    #      matches) → just continue here, no re-exec.
-    #   2. A sibling scope `${primary_scope}.${target_room}` exists →
-    #      re-exec with AIRC_HOME there. Recursion guard via
-    #      AIRC_SEND_REROUTED=1 — without it, a misconfigured sibling
-    #      scope could loop.
-    #
-    # Determining "primary scope" is the awkward bit because we may
-    # ALREADY be in a sidecar scope (AIRC_WRITE_DIR ends in `.X`). Strip
-    # any trailing `.<word>` to find the project scope, then append
-    # `.<target_room>` for the requested sibling. If target_room IS the
-    # project room name (read from primary's room_name file), point at
-    # the project scope itself, not a sibling.
-    local _here_room=""
-    [ -f "$AIRC_WRITE_DIR/room_name" ] && _here_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-    if [ "$_here_room" = "$target_room" ]; then
-      : # already in the right scope, fall through to normal send
-    else
-      [ "${AIRC_SEND_REROUTED:-0}" = "1" ] \
-        && die "send: --room re-route loop detected (scope $AIRC_WRITE_DIR room=$_here_room target=$target_room)"
-      # Strip any sibling suffix from current scope to get the project
-      # scope path. e.g. /path/.airc.general → /path/.airc
-      local _project_scope="$AIRC_WRITE_DIR"
-      case "$_project_scope" in
-        *.airc.*)
-          _project_scope="${_project_scope%.*}" ;;
-      esac
-      # Read the project scope's room_name to compare with target.
-      local _project_room=""
-      [ -f "$_project_scope/room_name" ] && _project_room=$(cat "$_project_scope/room_name" 2>/dev/null)
-      local _target_scope=""
-      if [ "$_project_room" = "$target_room" ]; then
-        _target_scope="$_project_scope"
-      else
-        # Sibling sidecar scope under the project scope's parent.
-        # Convention: primary scope is `<base>/.airc`, sidecar scope is
-        # `<base>/.airc.<roomname>` (e.g. `.airc.general`).
-        _target_scope="${_project_scope}.${target_room}"
-      fi
-      if [ ! -d "$_target_scope" ] || [ ! -f "$_target_scope/room_name" ]; then
-        echo "  send --room #${target_room}: not subscribed in this scope." >&2
-        echo "    looked at: $_target_scope" >&2
-        echo "    rooms you ARE in:" >&2
-        for _d in "$_project_scope" "$_project_scope".*; do
-          [ -f "$_d/room_name" ] && echo "      - #$(cat "$_d/room_name" 2>/dev/null) (scope: $_d)" >&2
-        done
-        echo "  Fix: 'airc join --room ${target_room}' (in a separate scope), or drop the --room flag." >&2
-        die "send: not subscribed to #${target_room}"
-      fi
-      # Re-exec with AIRC_HOME pointed at the target scope. Pass the
-      # remaining positional args (peer/message) through. The recursion
-      # guard prevents infinite re-routing if the target scope is itself
-      # misconfigured.
-      exec env AIRC_HOME="$_target_scope" AIRC_SEND_REROUTED=1 "$0" send "$@"
+    # Phase 2B.3: --room becomes equivalent to --channel. The pre-mesh
+    # sidecar model required re-exec'ing into a sibling scope because
+    # each room had its OWN host process; in the post-mesh world there
+    # is ONE host per gh account, so all channels share the same wire.
+    # Just stamp the channel field and continue.
+    if [ -z "$channel_override" ]; then
+      channel_override="$target_room"
     fi
   fi
 
