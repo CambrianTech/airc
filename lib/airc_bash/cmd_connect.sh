@@ -185,7 +185,12 @@ cmd_connect() {
     [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
     if [ -n "$_saved_room" ]; then
       room_name="$_saved_room"
-      echo "  Resuming saved room: #${room_name} (override with --room or 'airc part' first)"
+      # Phase 2C clarity (continuum-b741's report): the mesh substrate
+      # may steer us to a different host channel than our saved
+      # preference. State the preference as INTENT, not promise — the
+      # post-discovery banner is the authoritative "what you actually
+      # joined" signal.
+      echo "  Saved channel preference: #${room_name} (mesh may resolve a different host channel; 'airc part' to clear)"
     else
       local _inferred
       _inferred=$(infer_default_room 2>/dev/null || true)
@@ -735,6 +740,16 @@ cmd_connect() {
     # the `identity` block (issue #34) across re-pairs so a teardown +
     # rejoin keeps pronouns/role/bio/status without requiring users to
     # re-run airc identity set every time.
+    # Detect host change: if our saved host_target differs from the new
+    # one, the per-host offset (.airc/monitor_offset) is meaningless —
+    # line N of host A's log isn't line N of host B's log. Drop the
+    # offset so the next monitor cycle starts at -n 0 (current EOF) of
+    # the new host's log instead of replaying random history.
+    local _prev_host_target; _prev_host_target=$(get_config_val host_target "")
+    if [ -n "$_prev_host_target" ] && [ "$_prev_host_target" != "$ssh_target" ]; then
+      rm -f "$AIRC_WRITE_DIR/monitor_offset" 2>/dev/null || true
+    fi
+
     set_config_val name        "$my_name"
     set_config_val host        "$(get_host)"
     set_config_val host_target "$ssh_target"
