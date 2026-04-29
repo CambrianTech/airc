@@ -324,6 +324,7 @@ airc kick <peer> [reason]        # host-only: remove peer record + broadcast [ki
 # Lifecycle
 airc quit                         # leave mesh, keep identity
 airc teardown [--flush] [--all]   # kill processes (--flush wipes state)
+airc uninstall [--yes] [--purge]  # fully remove airc from this machine
 airc daemon install               # autostart via launchd (mac) / systemd-user (linux)
 airc daemon status / log / uninstall
 
@@ -361,6 +362,7 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 | [resume](skills/resume/) | `/resume` | Explicit resume (alias for `/join` with no args) |
 | [reminder](skills/reminder/) | `/reminder <seconds\|off\|pause>` | Control silence-nudge |
 | [teardown](skills/teardown/) | `/teardown [--flush]` | Kill scope's processes |
+| [uninstall](skills/uninstall/) | `/uninstall [--yes] [--purge]` | Fully remove airc (clone, symlinks, daemon, processes); leaves per-project state unless `--purge` |
 | [repair](skills/repair/) | `/repair [invite]` | Full re-pair (teardown --flush + reconnect) |
 | [update](skills/update/) | `/update` | Pull latest on current channel + refresh skills |
 | [canary](skills/canary/) | `/canary` | Switch to canary channel + pull (opt-in pre-merge testing) |

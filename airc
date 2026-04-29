@@ -1456,6 +1456,18 @@ case "${1:-help}" in
   tests|test)        shift; _doctor_run_tests "$@" ;;
   daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
+  uninstall|self-uninstall)
+    # Dispatch to the canonical uninstall.sh in the clone root. _airc_lib_dir
+    # resolves to <clone>/lib, so the clone root is one dir up. exec so
+    # uninstall.sh runs in this process — once it rm -rf's the clone, the
+    # bash script body is already in memory and finishes cleanly.
+    shift
+    if [ -n "${_airc_lib_dir:-}" ] && [ -f "${_airc_lib_dir%/lib}/uninstall.sh" ]; then
+      exec bash "${_airc_lib_dir%/lib}/uninstall.sh" "$@"
+    else
+      die "Could not locate uninstall.sh (lib_dir=${_airc_lib_dir:-<unresolved>}). Run manually:  bash \$AIRC_DIR/uninstall.sh"
+    fi
+    ;;
   disconnect|quit|leave|unbind) shift; cmd_disconnect "$@" ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
@@ -1503,6 +1515,7 @@ case "${1:-help}" in
     echo "  airc status [--probe]           Liveness snapshot (--probe for SSH check)"
     echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state)"
+    echo "  airc uninstall [--yes] [--purge] Fully remove airc (clone, symlinks, daemon, processes)"
     echo ""
     echo "Identity resolution (highest priority first):"
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
