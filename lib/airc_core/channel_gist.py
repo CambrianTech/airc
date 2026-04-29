@@ -185,17 +185,24 @@ def find_existing(channel: str) -> Optional[str]:
     """Look for an existing gist on this gh account hosting `channel`.
     Returns the gist id, or None if no match.
 
-    Two-pass to fix #290 (substrate split): canonical single-channel
-    gists (channels=[<channel>] exactly, description "airc room: #<x>")
-    take priority over legacy multi-channel mesh gists (channels=[a,b,c]).
-    Without this priority, peers resolved different gists when both
-    shapes coexisted on the same gh account, splitting the substrate
-    silently.
+    Convergence rule: when multiple gists match (duplicates from
+    repeated host-takeovers / race-loser collisions / orphaned
+    re-creates), return the OLDEST by created_at. Deterministic
+    across ALL peers on the gh account → all peers converge on the
+    same gist → substrate is unified.
 
-    Pass 1: any gist with channels=[<exact channel>] — the post-3c
-            create_new shape; deterministic match.
-    Pass 2: legacy multi-channel match — channels list CONTAINS the
-            target. Returned only if no single-channel canonical exists.
+    Pre-2026-04-29 bug: order was whatever gh's list-response yielded
+    first (recency-ordered, may differ across calls). Two peers
+    polling the listing at slightly different times could pick
+    DIFFERENT duplicates, splitting the substrate. authenticator-448f
+    + continuum-b741 saw this on #general — peers thought they were
+    in the same room but were writing to different gists. Sends
+    looked successful, peers heard nothing.
+
+    Two-pass to fix #290 (canonical-vs-legacy split): single-channel
+    gists (channels=[<channel>] exactly) take priority over multi-
+    channel mesh gists (channels=[a,b,c]). Within each pass, oldest
+    wins for convergence.
 
     Each pass first checks the cheap listing-response content, then
     falls back to a full GET when the listing didn't inline content.
@@ -207,13 +214,26 @@ def find_existing(channel: str) -> Optional[str]:
         if desc.startswith("airc mesh") or desc.startswith("airc room:"):
             candidates.append(g)
 
+    def _oldest(matches: list[dict]) -> Optional[str]:
+        """Return the gist id of the oldest match by created_at, or None."""
+        if not matches:
+            return None
+        # gh's created_at is ISO-8601 ('2026-04-29T07:11:00Z') so
+        # lexicographic sort matches chronological. Empty/missing
+        # values sort first (treated as oldest), which is the safe
+        # bias when in doubt.
+        matches.sort(key=lambda g: g.get("created_at", ""))
+        return matches[0].get("id")
+
     # Pass 1: canonical single-channel match (cheap, listing-response).
-    for g in candidates:
-        if _is_single_channel_match(g, channel):
-            return g.get("id")
+    canonical_matches = [g for g in candidates if _is_single_channel_match(g, channel)]
+    chosen = _oldest(canonical_matches)
+    if chosen:
+        return chosen
 
     # Pass 1 (deep): full GET for each candidate whose listing-content
     # was truncated. Same single-channel criterion.
+    deep_canonical: list[dict] = []
     for g in candidates:
         gid = g.get("id")
         if not gid:
@@ -222,12 +242,20 @@ def find_existing(channel: str) -> Optional[str]:
         if full is None:
             continue
         if _is_single_channel_match(full, channel):
-            return gid
+            # Carry created_at from the listing so _oldest can sort.
+            full.setdefault("created_at", g.get("created_at", ""))
+            deep_canonical.append(full)
+    chosen = _oldest(deep_canonical)
+    if chosen:
+        return chosen
 
     # Pass 2: legacy multi-channel fallback. Only if no canonical exists.
-    for g in candidates:
-        if _gist_describes_channel(g, channel):
-            return g.get("id")
+    legacy_matches = [g for g in candidates if _gist_describes_channel(g, channel)]
+    chosen = _oldest(legacy_matches)
+    if chosen:
+        return chosen
+
+    deep_legacy: list[dict] = []
     for g in candidates:
         gid = g.get("id")
         if not gid:
@@ -236,9 +264,9 @@ def find_existing(channel: str) -> Optional[str]:
         if full is None:
             continue
         if _gist_describes_channel(full, channel):
-            return gid
-
-    return None
+            full.setdefault("created_at", g.get("created_at", ""))
+            deep_legacy.append(full)
+    return _oldest(deep_legacy)
 
 
 def create_new(channel: str) -> Optional[str]:
