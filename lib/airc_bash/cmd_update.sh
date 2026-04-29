@@ -111,11 +111,25 @@ cmd_update() {
   if [ ! -x "$dir/install.sh" ]; then
     die "install.sh missing at $dir. Reinstall via curl|bash."
   fi
-  AIRC_DIR="$dir" bash "$dir/install.sh" || die "install.sh failed."
 
-  # Persist channel choice AFTER successful update so a failed switch
-  # doesn't leave a dangling preference for a broken state.
+  # #264: write the channel preference BEFORE running install.sh.
+  # install.sh has an auto-recovery block (install.sh:797-809) that
+  # reads .channel + the install dir's current branch and "fixes"
+  # disagreement by reverting the branch. If we write .channel AFTER
+  # install.sh runs, install.sh sees the stale value and switches our
+  # just-completed branch back to the old channel. Net effect: airc
+  # version reports the old branch, airc channel reports the new
+  # channel — the disagreement continuum-b741 hit during regression.
+  #
+  # Write order now: (a) cmd_update checks out the requested branch,
+  # (b) write .channel = requested, (c) install.sh ff-pulls + sees
+  # consistent state. If install.sh fails, the .channel write is
+  # already done — but the branch was successfully switched too, so
+  # the state is at least consistent (just on the new branch's tip
+  # instead of a fresh-pulled tip).
   echo "$channel" > "$channel_file"
+
+  AIRC_DIR="$dir" bash "$dir/install.sh" || die "install.sh failed."
 
   local after; after=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
   if [ "$before" = "$after" ]; then
