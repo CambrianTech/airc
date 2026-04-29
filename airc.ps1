@@ -48,12 +48,28 @@ function Resolve-BashExe {
     return $null
 }
 
-# Locate the bash `airc` script next to this file.
-$aircDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$bashAirc = Join-Path $aircDir 'airc'
-if (-not (Test-Path -LiteralPath $bashAirc)) {
-    Write-Error "airc.ps1: cannot find sibling 'airc' bash script at $bashAirc. Reinstall via install.ps1."
-    exit 1
+# Locate the bash `airc` script.
+#
+# install.ps1 copies airc.ps1 + airc.cmd into $BIN_TARGET (on PATH) but
+# leaves the bash `airc` and its sibling `lib/` tree in $CLONE_DIR (the
+# git checkout). Linux/Mac sidesteps this with a symlink at $BIN_DIR/airc;
+# Windows can't symlink reliably, so we resolve via env var instead. The
+# convention matches the bash side: $env:AIRC_DIR overrides, default is
+# $HOME\.airc-src.
+#
+# Fallback: if airc.ps1 is invoked directly from a source checkout (rare,
+# usually devs), prefer a sibling `airc` script — that's the dev workflow.
+$psDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$siblingAirc = Join-Path $psDir 'airc'
+if (Test-Path -LiteralPath $siblingAirc) {
+    $bashAirc = $siblingAirc
+} else {
+    $aircDir = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { Join-Path $env:USERPROFILE '.airc-src' }
+    $bashAirc = Join-Path $aircDir 'airc'
+    if (-not (Test-Path -LiteralPath $bashAirc)) {
+        Write-Error "airc.ps1: cannot find bash 'airc' script at $bashAirc (set `$env:AIRC_DIR or reinstall via install.ps1)."
+        exit 1
+    }
 }
 
 $bashExe = Resolve-BashExe
