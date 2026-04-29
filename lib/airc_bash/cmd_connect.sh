@@ -1257,6 +1257,43 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         echo "     Install: https://cli.github.com  (or: brew install gh)"
         echo "     Skipping gist push; long invite above is the only handoff."
       else
+        # Convergence-first (#321 follow-up): before bootstrapping a NEW
+        # gist for this channel, consult channel_gist.find_existing.
+        # If a canonical gist for this room name already exists on the
+        # gh account, USE IT — don't create yet another duplicate. This
+        # was the pre-fix bug that produced multiple #general gists on
+        # the same account: every --as-host bootstrap created its own
+        # gist regardless of what was already there. With find-first,
+        # all hosts on the gh account converge on the oldest canonical.
+        local _existing_room_gid=""
+        if [ "$use_room" = "1" ]; then
+          _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+                               --channel "$room_name" 2>/dev/null || true)
+        fi
+        if [ -n "$_existing_room_gid" ]; then
+          echo "  ✓ Found canonical gist for #${room_name} on this gh account → using existing ($_existing_room_gid)"
+          local _gist_id="$_existing_room_gid"
+          local _gist_url="https://gist.github.com/$_gist_id"
+          local _gist_kind="room"
+          # Persist the canonical mapping. Heartbeat + sends route here
+          # automatically; first send creates messages.jsonl in the
+          # existing gist.
+          echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+          echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
+          # Skip the new-gist creation block below since we have one.
+          # Continue to the heartbeat + monitor setup as if we'd just
+          # created it — the gist exists, we own/share it, write to it.
+          : >"$AIRC_WRITE_DIR/.using_existing_room_gist"
+        fi
+
+        # Skip create-new entirely if we already adopted an existing
+        # canonical gist above (find-first convergence path).
+        if [ -n "${_existing_room_gid:-}" ]; then
+          true  # No-op; downstream heartbeat + monitor setup uses
+                # _gist_id / _gist_url already set above.
+        else
         # Bootstrap basename + description match channel_gist.create_new's
         # canonical shape (airc-room-<channel>.json + "airc room: #X").
         # Pre-fix the host path used a random mktemp basename
@@ -1350,6 +1387,7 @@ JSON
         # gists should be deleted by the host after the first joiner.
         local _gist_url; _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
         rm -rf "$_gist_tmpdir"
+        fi  # close: skip create-new when adopted existing canonical
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)

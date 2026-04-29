@@ -272,6 +272,91 @@ scenario_idle_then_recv() {
 # `airc part` from the host should delete the room gist on gh.
 # Joiners parting just teardown locally (host's gist persists).
 # ─────────────────────────────────────────────────────────────────────
+scenario_status_agrees_with_send() {
+  # Today's bug Joel called out: 'airc status' said monitor: not running
+  # while 'airc msg' worked + landed in gist. The two diagnostics
+  # disagreed, which is exactly the silent-broken class CLAUDE.md
+  # forbids. If sends work, status MUST report monitor running.
+  section "status_agrees_with_send: if msg lands in gist, status must say running"
+  require_gh || return
+
+  local rname="smoke-statusagree-$$"
+  local A_HOME
+  A_HOME=$(mktemp -d -t airc-statusagree.XXXXXX)
+  trap "cleanup_homes '$A_HOME'" RETURN
+
+  spawn_real "$A_HOME" "smoke-sa-$$" 7607 --room "$rname" --as-host \
+    || { fail "host failed to start"; return; }
+  sleep 2
+
+  local marker="status-agree-$(date +%s%N)"
+  AIRC_HOME="$A_HOME/state" "$AIRC" msg --room "$rname" "$marker" >/dev/null 2>&1
+  sleep 3
+
+  local gid; gid=$(python3 -c "import json;print(json.load(open('$A_HOME/state/config.json')).get('channel_gists',{}).get('$rname',''))")
+  local landed=0
+  gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null | grep -qF "$marker" && landed=1
+  [ "$landed" = "1" ] || { fail "msg didn't land in gist — substrate broken, can't test status"; return; }
+
+  local status_out; status_out=$(AIRC_HOME="$A_HOME/state" "$AIRC" status 2>&1)
+  if printf '%s' "$status_out" | grep -qE "monitor: *running"; then
+    pass "msg landed AND status says monitor running (diagnostics agree)"
+  else
+    fail "msg LANDED but status reports monitor not running — diagnostics lie"
+    printf '%s' "$status_out" | sed 's/^/    /'
+  fi
+}
+
+scenario_stale_config_auto_resyncs() {
+  # Pre-seed channel_gists with a bogus gist id (simulates a peer
+  # who paired with a non-canonical dup pre-#321). After bounce,
+  # the host's subscription must self-heal to the actual gist on
+  # disk. Pre-fix peers stuck on stale mappings forever.
+  section "stale_config_auto_resyncs: bogus channel_gists is replaced on bounce"
+  require_gh || return
+
+  local rname="smoke-resync-$$"
+  local A_HOME
+  A_HOME=$(mktemp -d -t airc-resync.XXXXXX)
+  trap "cleanup_homes '$A_HOME'" RETURN
+
+  spawn_real "$A_HOME" "smoke-rs-$$" 7608 --room "$rname" --as-host \
+    || { fail "first spawn failed"; return; }
+  local good_gid; good_gid=$(python3 -c "import json;print(json.load(open('$A_HOME/state/config.json')).get('channel_gists',{}).get('$rname',''))")
+  [ -n "$good_gid" ] || { fail "first spawn didn't write channel_gists"; return; }
+  pass "first spawn: channel_gists['$rname']=$good_gid"
+
+  AIRC_HOME="$A_HOME/state" "$AIRC" teardown >/dev/null 2>&1
+
+  # Poison: replace channel_gists[$rname] with a bogus id
+  python3 -c "
+import json
+p = '$A_HOME/state/config.json'
+c = json.load(open(p))
+c['channel_gists'] = {'$rname': 'deadbeefcafebabe000000000000beef'}
+json.dump(c, open(p,'w'), indent=2)
+"
+
+  ( cd "$A_HOME" && AIRC_HOME="$A_HOME/state" AIRC_NAME="smoke-rs-$$" AIRC_PORT=7609 \
+      AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1 \
+      "$AIRC" connect --room "$rname" > "$A_HOME/out2.log" 2>&1 & )
+  local i
+  for i in $(seq 1 15); do
+    sleep 1
+    grep -qE "Hosting as|Connected to|Joined" "$A_HOME/out2.log" 2>/dev/null && break
+  done
+  sleep 3
+
+  local final_gid; final_gid=$(python3 -c "import json;print(json.load(open('$A_HOME/state/config.json')).get('channel_gists',{}).get('$rname',''))")
+  if [ "$final_gid" = "$good_gid" ]; then
+    pass "auto-resync replaced bogus 'deadbeef...' with the canonical gist"
+  elif [ "$final_gid" = "deadbeefcafebabe000000000000beef" ]; then
+    fail "STILL bogus after bounce — channel_gists was trusted blindly, no auto-resync"
+  else
+    fail "channel_gists['$rname']='$final_gid' (neither canonical nor bogus — created a 3rd duplicate?)"
+  fi
+}
+
 scenario_part_deletes_host_gist() {
   section "part: host's airc part deletes the gist; joiner's part doesn't"
   require_gh || return
@@ -311,19 +396,23 @@ scenario_part_deletes_host_gist() {
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────
 case "${1:-all}" in
-  passive_recv)         scenario_passive_recv ;;
-  round_trip)           scenario_round_trip ;;
-  idle_then_recv)       scenario_idle_then_recv ;;
-  part_deletes_host_gist) scenario_part_deletes_host_gist ;;
+  passive_recv)              scenario_passive_recv ;;
+  round_trip)                scenario_round_trip ;;
+  idle_then_recv)            scenario_idle_then_recv ;;
+  part_deletes_host_gist)    scenario_part_deletes_host_gist ;;
+  status_agrees_with_send)   scenario_status_agrees_with_send ;;
+  stale_config_auto_resyncs) scenario_stale_config_auto_resyncs ;;
   all)
     scenario_passive_recv
     scenario_round_trip
+    scenario_status_agrees_with_send
+    scenario_stale_config_auto_resyncs
     scenario_part_deletes_host_gist
-    # idle_then_recv last — it's the slow one (45s+ idle wait)
+    # idle_then_recv last — slow (45s+ idle wait)
     scenario_idle_then_recv
     ;;
   *)
-    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|all]"
+    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|status_agrees_with_send|stale_config_auto_resyncs|all]"
     exit 2
     ;;
 esac
