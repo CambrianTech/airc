@@ -72,25 +72,34 @@ _mesh_find() {
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.
 # Caller writes the JSON envelope to a tempfile and passes the path.
+# Per CLAUDE.md "never swallow errors": gh's stderr (auth lapsed, rate
+# limited, etc) reaches the terminal so failures are diagnosable
+# instead of "create returned empty, no idea why."
 _mesh_publish() {
   local payload_path="${1:-}"
   [ -f "$payload_path" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
   local desc; desc=$(_mesh_desc)
-  local url; url=$(gh gist create -d "$desc" "$payload_path" 2>/dev/null | tail -1)
+  local url; url=$(gh gist create -d "$desc" "$payload_path" | tail -1)
   [ -z "$url" ] && return 1
   printf '%s\n' "${url##*/}"
 }
 
 # Update an existing mesh gist with a new payload. Used by the heartbeat
 # loop. Returns 0 on success, non-zero if the gist is gone or auth lapsed.
-# Caller passes the gist_id and a path to the new JSON envelope.
+# Caller passes the gist_id and a path to the new JSON envelope. The
+# basename of payload_path MUST match the canonical in-gist filename
+# (e.g. airc-room-<channel>.json) — gh disambiguates targets by
+# basename, and a mismatched basename on a multi-file gist surfaces
+# as "unsure what file to edit" with non-zero exit. Per CLAUDE.md
+# "never swallow errors", stderr propagates to the terminal so the
+# next debugger sees the actual failure.
 _mesh_update() {
   local gist_id="${1:-}" payload_path="${2:-}"
   [ -n "$gist_id" ] || return 1
   [ -f "$payload_path" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
-  gh gist edit "$gist_id" "$payload_path" >/dev/null 2>&1
+  gh gist edit "$gist_id" "$payload_path" >/dev/null
 }
 
 # Echo the seconds since last_heartbeat in the given mesh gist. Empty
