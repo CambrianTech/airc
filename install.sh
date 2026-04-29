@@ -751,13 +751,31 @@ ensure_prereqs() {
   # them via opt-in flag, but the default install no longer invokes them.
   : "Phase 3c: skipping sshd + Tailscale (gh-as-bearer is the cross-network path)"
 
-  # gh auth: required for the gist substrate (#general room discovery).
-  # We can't auto-login (browser flow), but we surface the exact command
-  # so the user runs it once before `airc join`.
+  # gh auth: required for the gist substrate. We CAN drive the login
+  # interactively when stdin is a TTY (Joel 2026-04-29: 'thought that'd
+  # be in setup or at least doctor (then claude could always do it for
+  # them)'). The browser/device-code flow needs a real user to click
+  # but doesn't need them to remember the command. Falls back to the
+  # warning path for non-interactive installs (curl|bash piped without
+  # a TTY, CI, etc).
   if command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
-      warn "gh CLI is not authenticated. Run once before 'airc join':"
-      warn "    gh auth login -s gist"
+      if [ -t 0 ] && [ -t 1 ]; then
+        info "gh is not authenticated — launching 'gh auth login -s gist' now."
+        info "  (Browser will open; sign in to GitHub. The 'gist' scope is required for the substrate.)"
+        if gh auth login -h github.com -s gist; then
+          ok "gh auth complete"
+          # Re-run setup-git so the just-acquired token gets wired.
+          gh auth setup-git 2>/dev/null && info "  gh token wired into git credential helper" || true
+        else
+          warn "gh auth login did not complete — re-run when ready:"
+          warn "    gh auth login -h github.com -s gist"
+        fi
+      else
+        warn "gh CLI is not authenticated. Run once before 'airc join':"
+        warn "    gh auth login -h github.com -s gist"
+        warn "  (interactive; can't run from a non-TTY install)"
+      fi
     else
       # Wire gh's token into git's credential helper. Without this,
       # every git-over-HTTPS op (gist fetch/push -- airc's substrate
