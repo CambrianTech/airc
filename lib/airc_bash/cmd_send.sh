@@ -237,11 +237,16 @@ cmd_send() {
     #   4. Branches on the structured SendOutcome.kind
     # Adding a new transport doesn't touch this file — only the
     # resolver registers it. (Phases 1-3 of bearer rewrite; #269 #270.)
-    # Phase 3c: pass room_gist_id so GhBearer can serve cross-machine peers.
-    # LocalBearer.can_serve still wins for loopback host_target + writable
-    # remote_home (same-machine 2-tab case). SshBearer is gone.
+    # Phase 3c+ (#283): route by channel. The active_channel's gist
+    # comes from channel_gists in config (populated at subscribe time).
+    # If the channel has no mapping, fall back to the scope's primary
+    # room_gist_id so single-room scopes keep working unchanged.
     local room_gist_id=""
-    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    if [ -z "$room_gist_id" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+      room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    fi
 
     local outcome
     outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
@@ -386,8 +391,14 @@ cmd_send() {
         --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
     fi
 
+    # Route by channel via channel_gists (post-#283); fall back to the
+    # scope's primary room_gist_id so single-room hosts keep working.
     local _host_room_gist_id=""
-    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    _host_room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    if [ -z "$_host_room_gist_id" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+      _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    fi
 
     if [ -n "$_host_room_gist_id" ]; then
       local _host_outcome

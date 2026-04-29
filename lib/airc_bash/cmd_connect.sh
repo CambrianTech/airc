@@ -1001,6 +1001,12 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # (issue #83). Cleared by cmd_part on graceful leave.
     if [ -n "$_resolved_gist_id" ]; then
       echo "$_resolved_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+      # #283: also map this channel→gist in channel_gists so the
+      # multi-channel monitor polls it and cmd_send routes by channel.
+      if [ -n "$resolved_room_name" ]; then
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+      fi
     fi
 
     # Persist host details in own config so `airc invite` can reconstruct
@@ -1249,6 +1255,11 @@ JSON
           if [ "$_gist_kind" = "mesh" ] || [ "$_gist_kind" = "room" ]; then
             echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
             echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+            # #283: also map this channel→gist in channel_gists so
+            # the multi-channel monitor polls it and cmd_send routes
+            # by channel.
+            "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+              --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
 
             # Heartbeat loop: keep last_heartbeat fresh in the gist so
             # joiners can deterministically detect a dead host. Without

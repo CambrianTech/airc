@@ -773,31 +773,49 @@ _clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.c
 # cmd_teardown's process-tree walker reaps it. cmd_teardown also has
 # explicit sidecar-scope cleanup (gist + sidecar's own pidfile).
 spawn_general_sidecar_if_wanted() {
-  # Phase 2B.3: the sidecar process is GONE. With Phase 1's mesh-singleton
-  # substrate (one gist + one host per gh account), a separate `airc
-  # connect` process for #general would discover the same mesh and yield
-  # to the same host — pure overhead. Instead we just add "general" to
-  # this scope's subscribed_channels list. cmd_send default-channel logic
-  # (Phase 2B.1) and the monitor formatter's per-envelope channel display
-  # (Phase 2A) handle the rest in one process.
+  # Subscribe this scope to #general by:
+  #   1. Adding "general" to subscribed_channels in primary config
+  #   2. Finding-or-creating the canonical #general gist on the gh
+  #      account, persisting its id under channel_gists.general so the
+  #      monitor (multi-gist poll) and cmd_send (route-by-channel) can
+  #      reach it.
   #
-  # The function name + callsites stay so cmd_connect's flow doesn't
-  # need rewiring; only the body changed.
+  # ONE monitor process per scope — it polls ALL subscribed channels'
+  # gists. No separate sidecar process. Per Joel 2026-04-29: "you can
+  # still have one monitor doesn't need to load one for every room,
+  # just always itself monitor each room."
   [ "$general_sidecar" = "1" ] || return 0
   [ "$room_name" = "general" ] && return 0
   [ "$use_room" = "1" ] || return 0
 
   # Honor a prior /part: if "general" is in parted_rooms, don't
-  # auto-resubscribe. Override with `airc join --general` (which
-  # already calls _clear_parted_room) or by editing config.json.
+  # auto-resubscribe. Override with `airc join --general`.
   if _read_parted_rooms "$AIRC_WRITE_DIR" | grep -Fxq "general"; then
     echo "  #general subscription skipped — previously parted (airc join --general to rejoin)."
     return 0
   fi
 
   echo "  Also subscribing to #general (--no-general to opt out)"
+
+  # 1. Subscribe in config.
   "$AIRC_PYTHON" -m airc_core.config subscribe \
     --config "$CONFIG" --channel general 2>/dev/null || true
+
+  # 2. Resolve the canonical #general gist on this gh account
+  #    (find existing or create new). Reuses the same find-or-create
+  #    discovery that the primary room bootstrap goes through.
+  local _general_gid
+  _general_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+    --channel general --create-if-missing 2>/dev/null || true)
+
+  if [ -n "$_general_gid" ]; then
+    # 3. Persist channel→gist mapping so cmd_send + monitor can route.
+    "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+      --config "$CONFIG" --channel general --gist-id "$_general_gid" 2>/dev/null || true
+    echo "    #general gist: $_general_gid"
+  else
+    echo "  ⚠ Could not resolve #general gist (no gh auth?). #general subscription is config-only; cross-room messaging won't work until resolved." >&2
+  fi
 }
 
 # Resolve this session's peer name.
@@ -844,28 +862,97 @@ init_identity() {
   touch "$MESSAGES"
 }
 
-monitor() {
-  local my_name host_target room_gist_id
-  my_name=$(get_name)
-  host_target=$(get_config_val host_target "")
-  room_gist_id=""
-  [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+_monitor_multi_channel() {
+  # Poll N channels' gists in parallel; merge events into one
+  # monitor_formatter pipe. Each channel has its own offset file +
+  # bearer_state file so resume + observability are per-channel.
+  #
+  # PIPE_BUF safety: each bearer_cli recv emits one JSONL line per
+  # event, well under POSIX's 4KB atomic-write threshold; concurrent
+  # writes to the parent's stdout interleave at line boundaries.
+  #
+  # Args: my_name, TAB-separated "channel<TAB>gist_id" lines (one per
+  # subscribed channel, from airc_core.config list_channel_gists).
+  local my_name="$1"
+  local channel_map="$2"
 
-  # Background reminder timer + pending-flush loops (unchanged from
-  # pre-Phase-3c). Trap and parent-PID handling are owned by cmd_connect.
+  local consecutive_timeouts=0
+  local ESCALATE_AFTER=4
+  while true; do
+    {
+      while IFS=$'\t' read -r ch gid; do
+        [ -z "$ch" ] && continue
+        [ -z "$gid" ] && continue
+        # Fire-and-forget: each bearer_cli recv runs as a child of this
+        # subshell; `wait` (after the loop) holds the subshell open
+        # until all of them exit, which they only do on close (broken
+        # pipe / SIGTERM). When the formatter on the other side of the
+        # pipe exits (e.g. watchdog 2), the broken pipe terminates the
+        # bearer_cli children, the wait completes, the subshell exits,
+        # the surrounding while-loop reconnects.
+        "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+          --room-gist-id "$gid" \
+          --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
+          --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
+          2>/dev/null &
+      done <<< "$channel_map"
+      wait
+    } | monitor_formatter "$my_name" || true
+    local fmt_exit="${PIPESTATUS[1]:-0}"
+
+    if [ "$fmt_exit" = "2" ]; then
+      echo "airc: watchdog tripped — restarting multi-channel poll" >&2
+      consecutive_timeouts=$((consecutive_timeouts + 1))
+    else
+      consecutive_timeouts=0
+    fi
+    if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
+      local _daemon_present=0
+      if _daemon_installed >/dev/null 2>&1; then _daemon_present=1; fi
+      echo ""
+      if [ "$_daemon_present" = "1" ]; then
+        echo "airc: mesh disconnected ($consecutive_timeouts cycles); daemon restart will self-heal"
+      else
+        echo "airc: mesh disconnected ($consecutive_timeouts cycles); NO DAEMON installed, restart with: airc join"
+        echo "airc:   (for auto-recovery: airc daemon install)"
+      fi
+      exit 99
+    fi
+    sleep 3
+  done
+}
+
+monitor() {
+  local my_name; my_name=$(get_name)
+
+  # Background reminder timer + pending-flush loops.
   ( reminder_timer_loop ) &
   ( flush_pending_loop ) &
+
+  # Resolution priority:
+  #   1. channel_gists map non-empty → multi-channel mode (post-#283:
+  #      one monitor polls all subscribed channels' gists in parallel)
+  #   2. legacy room_gist_id only → single-gist mode (older scopes
+  #      that haven't been re-bootstrapped to populate channel_gists)
+  #   3. neither → local-tail mode (standalone tests, --no-room --no-gist)
+  local channel_map
+  channel_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+    --config "$CONFIG" 2>/dev/null || true)
+
+  if [ -n "$channel_map" ]; then
+    _monitor_multi_channel "$my_name" "$channel_map"
+    return
+  fi
+
+  local room_gist_id=""
+  [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
 
   local offset_file="$AIRC_WRITE_DIR/monitor_offset"
 
   if [ -n "$room_gist_id" ]; then
-    # Phase 3c: gh-bearer mode. Poll the shared room gist for inbound
-    # messages. The bearer (lib/airc_core/bearer_gh.py) handles polling
-    # cadence (15s default), rate-limit recovery, and offset resume.
-    # This loop owns watchdog/escalation (formatter exit 2 = no inbound
-    # for WATCHDOG_SEC).
+    # Single-gist mode (legacy fallback).
     local consecutive_timeouts=0
-    local ESCALATE_AFTER=4   # ~10min total dead-room detection (4 × 150s)
+    local ESCALATE_AFTER=4
     while true; do
       "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
         --room-gist-id "$room_gist_id" \

@@ -2886,6 +2886,116 @@ scenario_host_msg_publishes_to_gist() {
   cleanup_all
 }
 
+scenario_general_has_shared_gist() {
+  # TDD for #283: when a peer subscribes to #general (sidecar default
+  # on `airc join`), there must be a per-channel gist for #general
+  # that's findable/creatable on the gh account, and broadcasts to
+  # #general must land in THAT gist (not the project room's gist).
+  #
+  # Architecture (per Joel 2026-04-29): "one general, one continuum
+  # room, one ideem room etc — that's the whole point of rooms."
+  # Same gh account = ONE gist per channel name. All my tabs that
+  # subscribe to #general read+write the same #general gist.
+  #
+  # Pre-fix bug: spawn_general_sidecar_if_wanted only updates
+  # subscribed_channels in config.json. Nothing creates the canonical
+  # #general gist or routes traffic to it. Broadcasts on #general
+  # stamp the channel field but write to the project room's gist —
+  # other peers in different project rooms never see them.
+  section "general channel: shared gist resolved + traffic routed (#283)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local rname="tdd-general-$$"
+  mkdir -p /tmp/airc-it-tdd283-h /tmp/airc-it-tdd283-h/state
+
+  ( cd /tmp/airc-it-tdd283-h && AIRC_HOME=/tmp/airc-it-tdd283-h/state AIRC_NAME=tdd-h-283 AIRC_PORT=7561 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" --general > /tmp/airc-it-tdd283-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    [ -f /tmp/airc-it-tdd283-h/state/room_gist_id ] && break
+  done
+  local proj_gid; proj_gid=$(cat /tmp/airc-it-tdd283-h/state/room_gist_id 2>/dev/null)
+  if [ -z "$proj_gid" ]; then
+    fail "host did not publish project room gist (room_gist_id absent)"
+    cleanup_all; return
+  fi
+  pass "host published project room gist: $proj_gid (for #$rname)"
+
+  trap "gh gist delete '$proj_gid' --yes 2>/dev/null || true; \
+        general_gid=\$(python3 -c \"import json; c=json.load(open('/tmp/airc-it-tdd283-h/state/config.json')); print(c.get('channel_gists',{}).get('general',''))\" 2>/dev/null); \
+        [ -n \"\$general_gid\" ] && [ \"\$general_gid\" != \"$proj_gid\" ] && gh gist delete \"\$general_gid\" --yes 2>/dev/null || true" EXIT
+
+  # Sleep a moment so the sidecar code has had a chance to also resolve
+  # the #general gist (network call to gh).
+  sleep 3
+
+  # Critical assertion 1: config.json must have a channel_gists map
+  # with "general" pointing at a gist id distinct from the project room.
+  local general_gid
+  general_gid=$(python3 -c "
+import json, sys
+try:
+    c = json.load(open('/tmp/airc-it-tdd283-h/state/config.json'))
+    print(c.get('channel_gists', {}).get('general', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+
+  if [ -n "$general_gid" ]; then
+    pass "config.channel_gists['general'] resolved to: $general_gid"
+  else
+    fail "config.json missing channel_gists['general'] — #general sidecar didn't resolve a shared gist"
+    cleanup_all; return
+  fi
+
+  if [ "$general_gid" != "$proj_gid" ]; then
+    pass "#general gist is distinct from project room gist (no conflation)"
+  else
+    fail "channel_gists['general'] equals project room gist id — #general was not resolved as a separate room"
+  fi
+
+  # Critical assertion 2: the resolved #general gist must actually exist.
+  if gh api gists/$general_gid --jq '.id' >/dev/null 2>&1; then
+    pass "the resolved #general gist exists on gh"
+  else
+    fail "channel_gists['general'] points at a gist that doesn't exist on gh"
+  fi
+
+  # Critical assertion 3: airc msg --room general writes to the #general
+  # gist's messages.jsonl, not the project room's gist.
+  local marker="tdd283-general-marker-$(date +%s%N)"
+  AIRC_HOME=/tmp/airc-it-tdd283-h/state "$AIRC" msg --room general "$marker" >/dev/null 2>&1 || true
+  sleep 2
+
+  local general_content; general_content=$(gh api "gists/$general_gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$general_content" | grep -q "$marker"; then
+    pass "airc msg --room general landed in #general gist's messages.jsonl"
+  else
+    fail "BUG: marker NOT in #general gist (content len ${#general_content}); broadcast to #general routed wrong"
+  fi
+
+  # And it must NOT have landed in the project gist (would mean cross-channel pollution).
+  local proj_content; proj_content=$(gh api "gists/$proj_gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$proj_content" | grep -q "$marker"; then
+    fail "channel pollution: #general broadcast also landed in project room gist (channel routing wrong)"
+  else
+    pass "no channel pollution: project room gist did not receive the #general broadcast"
+  fi
+
+  trap - EXIT
+  gh gist delete "$proj_gid" --yes 2>/dev/null || true
+  [ -n "$general_gid" ] && [ "$general_gid" != "$proj_gid" ] && gh gist delete "$general_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_bearer_local() {
   # Phase 3a: LocalBearer serves same-machine peers via direct
   # filesystem reads/writes — no SSH, no subprocess. This scenario
@@ -3413,6 +3523,7 @@ case "$MODE" in
   bearer_gh) scenario_bearer_gh ;;
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
+  general_has_shared_gist) scenario_general_has_shared_gist ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted

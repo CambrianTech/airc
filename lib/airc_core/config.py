@@ -167,6 +167,53 @@ def cmd_unsubscribe(args) -> int:
     return 0
 
 
+# ── channel_gists (Phase 2B+ multi-room routing) ────────────────────────
+# Per-channel gist mapping. After Phase 3c (#283), each subscribed
+# channel has its own gist on the user's gh account. This map persists
+# the channel-name → gist-id resolution so cmd_send + monitor can route
+# without re-doing gh-account discovery on every send.
+#
+# Format in config.json:
+#   "channel_gists": {"general": "<id>", "useideem": "<id>", ...}
+#
+# Single source of truth for "given a channel name, what gist?" — bash
+# never reads config.json directly for this; it goes through these
+# accessors.
+
+def cmd_get_channel_gist(args) -> int:
+    """Print the gist id for args.channel (or empty stdout if not set)."""
+    gists = _load(args.config).get("channel_gists", {}) or {}
+    gid = gists.get(args.channel, "")
+    if gid:
+        print(gid)
+    return 0
+
+
+def cmd_set_channel_gist(args) -> int:
+    """Set channel → gist_id mapping. Idempotent. Empty gist_id removes
+    the mapping (treat as 'unsubscribe from this channel's wire')."""
+    c = _load(args.config)
+    gists = dict(c.get("channel_gists", {}) or {})
+    if args.gist_id:
+        gists[args.channel] = args.gist_id
+    else:
+        gists.pop(args.channel, None)
+    c["channel_gists"] = gists
+    return _save(args.config, c)
+
+
+def cmd_list_channel_gists(args) -> int:
+    """Print TAB-separated 'channel\\tgist_id' lines for every mapped
+    channel. Used by the monitor to know which gists to poll. Empty
+    output = no channels configured (host hasn't bootstrapped, or no
+    sidecar subscriptions)."""
+    gists = _load(args.config).get("channel_gists", {}) or {}
+    for ch, gid in gists.items():
+        if ch and gid:
+            print(f"{ch}\t{gid}")
+    return 0
+
+
 def cmd_set_host_block(args) -> int:
     """Atomically write the post-handshake host_* fields into config.
 
@@ -265,6 +312,22 @@ def _build_parser() -> argparse.ArgumentParser:
     un.add_argument("--config", required=True)
     un.add_argument("--channel", required=True)
     un.set_defaults(func=cmd_unsubscribe)
+
+    # channel_gists accessors — single source of truth for channel→gist routing.
+    gcg = sub.add_parser("get_channel_gist")
+    gcg.add_argument("--config", required=True)
+    gcg.add_argument("--channel", required=True)
+    gcg.set_defaults(func=cmd_get_channel_gist)
+
+    scg = sub.add_parser("set_channel_gist")
+    scg.add_argument("--config", required=True)
+    scg.add_argument("--channel", required=True)
+    scg.add_argument("--gist-id", default="")
+    scg.set_defaults(func=cmd_set_channel_gist)
+
+    lcg = sub.add_parser("list_channel_gists")
+    lcg.add_argument("--config", required=True)
+    lcg.set_defaults(func=cmd_list_channel_gists)
 
     s = sub.add_parser("set_host_block")
     s.add_argument("--config", required=True)
