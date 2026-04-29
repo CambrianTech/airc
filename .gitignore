@@ -1,3 +1,4 @@
 .airc/
 __pycache__/
 *.pyc
+.venv-dev
