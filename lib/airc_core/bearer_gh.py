@@ -412,14 +412,17 @@ class GhBearer(Bearer):
                 detail="payload is not utf-8; gh-bearer requires text envelopes",
             )
 
-        # Concurrency strategy: verify-after-write. GitHub's gists PATCH
-        # doesn't support If-Match (returns 400), so optimistic
-        # concurrency must be detected POST-write by re-reading and
-        # checking that our framed line is present. If it isn't, another
-        # peer's write clobbered ours between our read and our PATCH —
-        # retry with fresh content. Cost: 1 extra GET per send. Benefit:
-        # no silent loss on concurrent traffic.
-        RETRIES = 4
+        # Concurrency strategy: retry on BOTH explicit 409 conflicts
+        # AND silent-clobber detected via verify-after-write. continuum-
+        # b741 caught HTTP 409 "Gist cannot be updated" 4/5 times on a
+        # 5-way concurrent burst (#299) — gh's PATCH endpoint returns
+        # 409 when a parallel update commits between our GET and our
+        # PATCH. Pre-fix code returned transient_failure on first 409
+        # without retry, hence the 80% loss rate. Now: 409 → loop. Also
+        # keep verify-after-write as a second-line defense for the rarer
+        # silent-clobber path (PATCH returns 200 but our line isn't in
+        # the post-write content).
+        RETRIES = 8
         last_detail = ""
         for attempt in range(RETRIES):
             gist = _gh_api_get(gist_id)
@@ -435,32 +438,30 @@ class GhBearer(Bearer):
             if not ok:
                 last_detail = detail
                 lower = detail.lower()
+                # 409 = concurrent-update conflict. Retry with fresh
+                # content (the racer's line is now visible to our next
+                # GET and the merge keeps both).
+                if "409" in detail or "cannot be updated" in lower:
+                    _time.sleep(0.05 * (attempt + 1))
+                    continue
                 if "permission" in lower or "401" in lower or "not found" in lower or "404" in lower:
                     return SendOutcome(kind="auth_failure", detail=detail)
                 return SendOutcome(kind="transient_failure", detail=detail)
 
-            # Verify our line landed. If a concurrent writer's PATCH
-            # arrived after our GET but before ours, our PATCH replaced
-            # the whole file with content that doesn't include their
-            # line — and on read-back we'd see THEIR line missing too,
-            # but we only check OUR line because we don't know what
-            # else was in flight. Worst case the racer also retries
-            # and sees us; bounded by RETRIES.
+            # PATCH said OK — verify-after-write to catch silent clobbers
+            # (rare; gh sometimes accepts our PATCH even when it
+            # overwrote a racer's commit).
             verify = _gh_api_get(gist_id)
             if verify is None:
-                # Verify GET failed but PATCH succeeded — assume delivered;
-                # next send will re-read fresh state. Don't retry blindly.
                 return SendOutcome(kind="delivered", detail="")
             if framed_str.rstrip("\n") in _read_messages_content(verify):
                 return SendOutcome(kind="delivered", detail="")
-            # Our line isn't there → got clobbered. Retry with fresh
-            # state. Tiny backoff so concurrent retriers don't lockstep.
-            last_detail = "verify-after-write: line not in gist post-PATCH (concurrent clobber)"
+            last_detail = "verify-after-write: line not in gist post-PATCH (silent clobber)"
             _time.sleep(0.05 * (attempt + 1))
 
         return SendOutcome(
             kind="transient_failure",
-            detail=f"clobbered by concurrent writers after {RETRIES} retries; last: {last_detail}",
+            detail=f"concurrent-write conflict after {RETRIES} retries; last: {last_detail}",
         )
 
     def recv_stream(self) -> Iterator[ReceivedMessage]:
