@@ -2721,6 +2721,122 @@ sys.exit(1)
   cleanup_all
 }
 
+scenario_bearer_local() {
+  # Phase 3a: LocalBearer serves same-machine peers via direct
+  # filesystem reads/writes — no SSH, no subprocess. This scenario
+  # builds a hand-crafted peer_meta (loopback host_target + writable
+  # local dir), exercises send + recv + liveness via the bearer
+  # interface directly, and asserts the resolver picks LocalBearer
+  # over SshBearer.
+  #
+  # No spawn_host/spawn_joiner here — LocalBearer's whole point is to
+  # bypass the pair handshake. Lab-style direct construction is the
+  # cleaner test for this layer.
+  section "bearer (local): same-machine send/recv via direct filesystem"
+  cleanup_all
+
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local fake_home; fake_home=$(mktemp -d -t airc-it-bl-home.XXXXXX)
+  local off_file; off_file="$fake_home/monitor_offset"
+
+  # Round-trip a payload via the bearer's send + verify it lands.
+  local marker="local-bearer-send-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local send_out
+  send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys, json
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({
+    'host_target': 'user@127.0.0.1',
+    'remote_home': '$fake_home',
+})
+print(f'KIND={bearer.KIND}')
+bearer.open('alpha')
+out = bearer.send('alpha', 'general', b'$probe')
+print(f'SEND_KIND={out.kind}')
+bearer.close()
+" 2>&1)
+
+  if echo "$send_out" | grep -q '^KIND=local$'; then
+    pass "resolver picks LocalBearer for loopback host_target"
+  else
+    fail "resolver did NOT pick LocalBearer (got: $send_out)"
+    rm -rf "$fake_home"
+    return
+  fi
+  if echo "$send_out" | grep -q '^SEND_KIND=delivered$'; then
+    pass "LocalBearer.send returns delivered"
+  else
+    fail "LocalBearer.send did not deliver (got: $send_out)"
+  fi
+  if grep -q "$marker" "$fake_home/messages.jsonl" 2>/dev/null; then
+    pass "payload landed in $fake_home/messages.jsonl"
+  else
+    fail "payload NOT visible in messages.jsonl (contents: $(cat "$fake_home/messages.jsonl" 2>/dev/null))"
+  fi
+
+  # Now exercise recv: append a second probe and verify recv_stream picks it up.
+  local marker2="local-bearer-recv-marker-$(date +%s%N)"
+  local probe2='{"from":"beta","to":"all","ts":"2026-04-29T00:00:01Z","channel":"general","msg":"'"$marker2"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-bl-recv.XXXXXX)
+
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time, json
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({
+    'host_target': '127.0.0.1',
+    'remote_home': '$fake_home',
+})
+bearer.open('alpha')
+
+signal.alarm(10)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker2':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 10
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>&1 &
+  local recv_pid=$!
+
+  sleep 1
+  echo "$probe2" >> "$fake_home/messages.jsonl"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait "$recv_pid" 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "LocalBearer.recv_stream picked up the appended marker"
+  else
+    fail "LocalBearer.recv_stream did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "LocalBearer.liveness reports fresh ts after recv event"
+  else
+    fail "LocalBearer.liveness not fresh (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+
+  rm -rf "$fake_home" "$recv_out"
+  cleanup_all
+}
+
 scenario_bearer_observability() {
   # Phase 2c (#270): the bearer-attested liveness surface must replace
   # the messages.jsonl-mirror-derived "last recv" lie. After a real
@@ -2856,6 +2972,7 @@ case "$MODE" in
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
   bearer_cli_recv) scenario_bearer_cli_recv ;;
   bearer_observability) scenario_bearer_observability ;;
+  bearer_local) scenario_bearer_local ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2872,7 +2989,7 @@ case "$MODE" in
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
-    scenario_bearer_observability
+    scenario_bearer_observability; scenario_bearer_local
     ;;
   *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac

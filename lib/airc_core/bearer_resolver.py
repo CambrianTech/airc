@@ -10,10 +10,14 @@ Adding a transport: import its class, add to _REGISTRY at the right
 preference position. Done. Removing a transport: delete the import and
 the registry entry. Done. No other file moves.
 
-Phase 1 (this file's current state): registry contains only SshBearer,
-preserving today's behavior. Phase 2 adds GhBearer behind it. Phase 3
-flips the order (or replaces SshBearer with LocalBearer + GhBearer
-exclusively).
+Phase 3a (current state): registry has LocalBearer + SshBearer.
+LocalBearer comes first because same-machine peers (loopback host_target
++ local host_airc_home) get direct filesystem access — no SSH crypto
+overhead, no subprocess. SshBearer serves everyone else.
+
+Phase 3b adds GhBearer between LocalBearer and SshBearer (gh-as-bearer
+for cross-network peers when SSH/Tailscale aren't available). Phase 3c
+removes SshBearer + Tailscale entirely.
 """
 
 from __future__ import annotations
@@ -21,11 +25,16 @@ from __future__ import annotations
 from typing import List, Type
 
 from .bearer import Bearer, PeerUnreachable
+from .bearer_local import LocalBearer
 from .bearer_ssh import SshBearer
 
 # Preference order. Earlier = preferred. The resolver tries each in turn
 # via can_serve() and falls through on PeerUnreachable from open().
+# LocalBearer first: same-machine peers skip the SSH layer entirely.
+# SshBearer last: the universal-fallback that serves anything reachable
+# over the network.
 _REGISTRY: List[Type[Bearer]] = [
+    LocalBearer,
     SshBearer,
 ]
 
