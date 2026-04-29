@@ -137,10 +137,19 @@ def _read_messages_content(gist_data: dict) -> str:
 
 
 def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
-    """Write `content` as the messages.jsonl file in `gist_id` via
-    `gh gist edit`. Returns (ok, detail). Creates the file if absent
-    (gh gist edit -a) or replaces if present (default behavior with
-    matching basename).
+    """Write `content` as the messages.jsonl file in `gist_id`.
+
+    Critical detail caught in production (#285): `gh gist edit GIST_ID
+    file` (no flag) returns exit 0 BUT silently no-ops when the target
+    filename doesn't already exist in the gist. Bug surface: bearer
+    reports 'delivered', gh CLI reports success, gist is unchanged.
+
+    Fix: read the gist's file list FIRST, then choose the correct
+    subcommand:
+      - file already in gist  → `gh gist edit GIST file`        (replace)
+      - file NOT in gist      → `gh gist edit GIST -a file`     (add)
+    The flag is required for new files. Trying plain edit first
+    silently succeeds without writing — that's the trap.
 
     gh gist edit uses the local file's basename as the in-gist filename.
     We write to a temp file literally named messages.jsonl in a unique
@@ -149,43 +158,51 @@ def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
         gh = _resolve_gh_bin()
     except GhBearerError as e:
         return (False, str(e))
+
+    # Detect whether messages.jsonl exists in the gist BEFORE choosing
+    # subcommand. Single extra GET, but eliminates the silent-no-op
+    # trap. If the GET fails, default to -a (add) since that path
+    # surfaces real errors when the file already exists (gh complains
+    # about duplicate filename), whereas plain edit silently no-ops.
+    existing = _gh_api_get(gist_id)
+    file_exists_in_gist = (
+        existing is not None
+        and isinstance(existing.get("files"), dict)
+        and _MESSAGES_FILE in existing["files"]
+    )
+
     tmpdir = tempfile.mkdtemp(prefix="airc-ghbearer-")
     try:
         path = os.path.join(tmpdir, _MESSAGES_FILE)
         with open(path, "w") as f:
             f.write(content)
-        # `gh gist edit` updates an existing file by name; the -a flag
-        # adds a NEW file. We need both behaviors to converge. Strategy:
-        # try -a first; if the file already exists gh exits non-zero
-        # with a recognizable message; fall back to plain edit (replace).
-        # Simpler in practice: just try plain edit; gh creates the file
-        # if absent in newer releases, and if not, we retry with -a.
+        if file_exists_in_gist:
+            argv = [gh, "gist", "edit", gist_id, path]          # replace
+        else:
+            argv = [gh, "gist", "edit", gist_id, "-a", path]    # add new
         try:
             r = subprocess.run(
-                [gh, "gist", "edit", gist_id, path],
-                capture_output=True,
-                text=True,
-                timeout=_GH_API_TIMEOUT,
+                argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return (False, f"gh gist edit failed: {e}")
         if r.returncode == 0:
             return (True, "")
-        # Fallback: try with -a (add file). If THAT fails too, return
-        # the more informative error.
+        # Defense: if our existence check disagreed with reality (race —
+        # another peer added the file between our GET and our edit),
+        # try the OTHER subcommand once before giving up.
+        alt_argv = (
+            [gh, "gist", "edit", gist_id, path] if not file_exists_in_gist
+            else [gh, "gist", "edit", gist_id, "-a", path]
+        )
         try:
             r2 = subprocess.run(
-                [gh, "gist", "edit", gist_id, "-a", path],
-                capture_output=True,
-                text=True,
-                timeout=_GH_API_TIMEOUT,
+                alt_argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
-            return (False, f"gh gist edit -a failed: {e}")
+            return (False, f"gh gist edit retry failed: {e}")
         if r2.returncode == 0:
             return (True, "")
-        # Both failed — surface the FIRST error (the one caller saw
-        # via the natural-first-attempt path).
         err = (r.stderr or r.stdout or "gh gist edit failed").strip()
         return (False, err)
     finally:

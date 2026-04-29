@@ -2721,6 +2721,171 @@ sys.exit(1)
   cleanup_all
 }
 
+scenario_gh_send_creates_messages_jsonl() {
+  # TDD test for the "host broadcast disappears" bug Joel hit during the
+  # post-3c QA pass. Repro shape:
+  #   1. A gist exists with a non-messages.jsonl file (e.g. airc-invite
+  #      seed — what `airc join` actually creates as the room gist's
+  #      first file).
+  #   2. GhBearer.send is invoked to publish a message.
+  #   3. The send must CREATE messages.jsonl in the gist (the file
+  #      doesn't exist yet — first ever send to this room).
+  #   4. The gist after the send must contain messages.jsonl with the
+  #      sent envelope.
+  #
+  # The pre-fix bug: `gh gist edit GIST_ID file` (no -a flag) returns
+  # exit 0 but silently does nothing when the target file doesn't already
+  # exist in the gist. GhBearer's _gh_gist_write_file tried that first,
+  # got a false-success returncode 0, never invoked the -a fallback.
+  # Net: gh CLI no-op + GhBearer reports "delivered" + nothing on the
+  # wire. Worst silent-loss class.
+  #
+  # scenario_bearer_gh masked this bug because IT seeds the gist with
+  # messages.jsonl already present, so the first send is a replace, not
+  # a create. Production (`airc join`) seeds with airc-invite — first
+  # send is a create. The seed shape was the difference.
+  section "gh send creates messages.jsonl (first-send-to-empty-room) — TDD for #285"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Seed the gist the way `airc join` actually does: a file named like
+  # airc-invite.* (NOT messages.jsonl). The first send must add
+  # messages.jsonl as a new file.
+  local seed; seed=$(mktemp -d -t airc-it-tdd-seed.XXXXXX)
+  printf '# room invite seed (placeholder)\n' > "$seed/airc-invite.placeholder"
+  local gist_url; gist_url=$(gh gist create -d "airc TDD: first-send-to-empty-room (#285)" "$seed/airc-invite.placeholder" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create test gist (got: $gist_url)"
+    return
+  fi
+  pass "test gist created with airc-invite seed: $gist_id"
+
+  # Verify the seed-only state (no messages.jsonl yet).
+  local pre_files; pre_files=$(gh api "gists/$gist_id" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$pre_files" | grep -q 'messages.jsonl'; then
+    fail "test setup wrong: gist already has messages.jsonl (expected only airc-invite seed)"
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    return
+  fi
+  pass "pre-send: gist has only airc-invite seed (no messages.jsonl)"
+
+  trap "gh gist delete '$gist_id' --yes 2>/dev/null || true" EXIT
+
+  # Run GhBearer.send via bearer_cli (the same path airc msg uses).
+  local marker="tdd-first-send-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local outcome
+  outcome=$(printf '%s' "$probe" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all general --room-gist-id "$gist_id" 2>&1)
+  local kind; kind=$(printf '%s' "$outcome" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+
+  if [ "$kind" = "delivered" ]; then
+    pass "bearer_cli send returned 'delivered'"
+  else
+    fail "bearer_cli send did NOT return 'delivered' (got: $outcome)"
+    trap - EXIT
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    cleanup_all
+    return
+  fi
+
+  # The critical assertion: gist must NOW have messages.jsonl with the marker.
+  # Pre-fix this fails: gh gist edit silently no-ops, gist still has only
+  # airc-invite, send returned delivered with NO actual delivery.
+  local post_files; post_files=$(gh api "gists/$gist_id" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$post_files" | grep -q 'messages.jsonl'; then
+    pass "post-send: gist now has messages.jsonl (file was created)"
+  else
+    fail "POST-SEND BUG: gist still has only [$post_files] — messages.jsonl was NOT created. bearer_cli reported delivered but gh gist edit silently no-op'd."
+  fi
+
+  # Verify the message body actually landed.
+  local content; content=$(gh api "gists/$gist_id" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "post-send: gist messages.jsonl contains the marker"
+  else
+    fail "post-send: gist messages.jsonl missing marker (content len: ${#content})"
+  fi
+
+  trap - EXIT
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_host_msg_publishes_to_gist() {
+  # End-to-end: full `airc msg` from a host actually publishes to the
+  # room gist. The TDD scenario above (gh_send_creates_messages_jsonl)
+  # tests the bearer in isolation; THIS one tests the cmd_send → bearer
+  # path, catching breaks where cmd_send doesn't even invoke the bearer
+  # (the original #285 hole — host's else-branch was a local-only
+  # append, never called bearer_cli).
+  section "host: airc msg publishes to room gist (#285 cmd_send→bearer chain)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+
+  # Spawn a host with a real gh room (NO --no-room / --no-gist — that's
+  # what masked the bug; tests must exercise the production path).
+  local rname="tdd-host-publishes-$$"
+  mkdir -p /tmp/airc-it-tdd-h /tmp/airc-it-tdd-h/state
+  ( cd /tmp/airc-it-tdd-h && AIRC_HOME=/tmp/airc-it-tdd-h/state AIRC_NAME=tdd-host AIRC_PORT=7556 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-tdd-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    [ -f /tmp/airc-it-tdd-h/state/room_gist_id ] && break
+  done
+
+  local gid; gid=$(cat /tmp/airc-it-tdd-h/state/room_gist_id 2>/dev/null)
+  if [ -z "$gid" ]; then
+    fail "host did not publish room gist (room_gist_id absent)"
+    cleanup_all; return
+  fi
+  pass "host published room gist: $gid"
+
+  trap "gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
+
+  # Pre-flight: gist initially has only the airc-invite seed (NOT
+  # messages.jsonl). This is the production state where the bug lived.
+  local pre_files; pre_files=$(gh api "gists/$gid" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$pre_files" | grep -q messages.jsonl; then
+    info "pre-send: gist already has messages.jsonl (host bootstrap created it; bug less likely to trip)"
+  fi
+
+  # Run airc msg from the host scope, broadcasting a unique marker.
+  local marker="tdd-host-publish-marker-$(date +%s%N)"
+  AIRC_HOME=/tmp/airc-it-tdd-h/state "$AIRC" msg "$marker" >/dev/null 2>&1 || true
+
+  # Give gh's eventual-consistency a moment.
+  sleep 2
+
+  # The critical assertion: gist's messages.jsonl now contains the marker.
+  local content; content=$(gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "host's airc msg broadcast landed in gist's messages.jsonl"
+  else
+    local post_files; post_files=$(gh api "gists/$gid" --jq '.files | keys | join(",")' 2>/dev/null)
+    fail "POST-SEND BUG: marker NOT in gist. files: [$post_files]; content len: ${#content}. cmd_send → bearer chain is broken (#285 regression)."
+  fi
+
+  trap - EXIT
+  gh gist delete "$gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_bearer_local() {
   # Phase 3a: LocalBearer serves same-machine peers via direct
   # filesystem reads/writes — no SSH, no subprocess. This scenario
@@ -3246,6 +3411,8 @@ case "$MODE" in
   e2e_encryption) scenario_e2e_encryption ;;
   bearer_local) scenario_bearer_local ;;
   bearer_gh) scenario_bearer_gh ;;
+  gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
+  host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted

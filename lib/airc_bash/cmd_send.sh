@@ -355,12 +355,57 @@ cmd_send() {
       else
         echo "    pidfile:  absent (monitor never started in this scope)" >&2
       fi
-      echo "  Joiners ride on the monitor's SSH tail; with the monitor down, your message reaches no one." >&2
       echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
       echo "       OR cd into the scope you actually meant to send from." >&2
       die "monitor down — refusing to silently broadcast into a void"
     fi
+
+    # Local audit log — plaintext, the user's own record of what they sent.
     echo "$full_msg" >> "$MESSAGES"
+
+    # Phase 3c critical fix (#285): host-side cmd_send must ALSO publish
+    # to the room gist so joiners (who poll the gist via GhBearer) see
+    # broadcasts and DMs from the host. Pre-3c, joiners tailed the host's
+    # local messages.jsonl over SSH; with SSH gone, joiners poll the gist
+    # — local-only append disappears into a void. Worst silent-loss
+    # class until this fix landed.
+    #
+    # Same wrap-if-recipient-known logic as the joiner branch above:
+    # encrypt msg field with recipient's X25519 pub when it's a DM and
+    # we have their pubkey on file; broadcasts go plaintext (group
+    # encryption is a future Phase E.4).
+    local _host_recipient_pub=""
+    if [ "$peer_name" != "all" ]; then
+      _host_recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+        --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
+    fi
+    local _host_wire_msg="$full_msg"
+    if [ -n "$_host_recipient_pub" ]; then
+      _host_wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+        --recipient-pub "$_host_recipient_pub" \
+        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
+    fi
+
+    local _host_room_gist_id=""
+    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+
+    if [ -n "$_host_room_gist_id" ]; then
+      local _host_outcome
+      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+        "$peer_name" "$active_channel" \
+        --room-gist-id "$_host_room_gist_id")
+      local _host_kind
+      _host_kind=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+      case "$_host_kind" in
+        delivered) : ;;
+        *)
+          echo "  ⚠ Gist publish failed (kind=${_host_kind:-empty}); broadcast did not reach joiners." >&2
+          echo "    Local audit log has the message; joiners polling the gist see nothing." >&2
+          ;;
+      esac
+    else
+      echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
+    fi
   fi
 
   # Reset reminder — you sent something, clock restarts
