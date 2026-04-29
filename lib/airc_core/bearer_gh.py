@@ -59,6 +59,18 @@ _MESSAGES_FILE = "messages.jsonl"
 _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
 
+# Rotation thresholds (gh hard limit on a gist file is 1MB; we trim
+# proactively well before that so the next append always has headroom).
+# An average envelope post-Phase-E is ~300-500 bytes (sig + ts + AEAD
+# nonce + ciphertext); 600KB ≈ 1500-2000 envelopes per file. When we
+# cross _GIST_MAX_BYTES, we keep only the last _GIST_KEEP_LINES so the
+# substrate stays writable indefinitely. Older content is dropped —
+# losing it is preferable to the room going write-blocked forever.
+# Both can be tuned at runtime via env vars (AIRC_GIST_MAX_BYTES,
+# AIRC_GIST_KEEP_LINES) for tests + power users.
+_GIST_MAX_BYTES = 600_000   # rotate at 600KB (40% headroom under 1MB hard limit)
+_GIST_KEEP_LINES = 1000     # keep last 1000 lines after rotation
+
 
 def _resolve_gh_bin() -> str:
     """Locate gh CLI on PATH. Returns the path or raises GhBearerError.
@@ -123,6 +135,40 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         return json.loads(r.stdout)
     except (ValueError, TypeError):
         return None
+
+
+def _rotate_if_needed(content: str) -> str:
+    """Trim the gist's messages.jsonl content if it's approaching gh's
+    1MB-per-file limit. Keep the last _GIST_KEEP_LINES so the substrate
+    stays writable forever; old content is dropped (the cost of an
+    eventually-write-blocked-room is far worse than losing old context).
+
+    Reads thresholds from env so tests + power users can tune:
+      AIRC_GIST_MAX_BYTES   — rotation trigger (default 600000)
+      AIRC_GIST_KEEP_LINES  — lines to retain after rotation (default 1000)
+
+    Idempotent below the threshold (returns content unchanged).
+    """
+    try:
+        max_bytes = int(os.environ.get("AIRC_GIST_MAX_BYTES", _GIST_MAX_BYTES))
+    except (TypeError, ValueError):
+        max_bytes = _GIST_MAX_BYTES
+    try:
+        keep_lines = int(os.environ.get("AIRC_GIST_KEEP_LINES", _GIST_KEEP_LINES))
+    except (TypeError, ValueError):
+        keep_lines = _GIST_KEEP_LINES
+
+    # Encode-aware byte count: gh measures bytes, not chars. UTF-8 means
+    # multibyte chars (cyrillic, CJK, emoji) count more than 1 byte each.
+    if len(content.encode("utf-8")) <= max_bytes:
+        return content
+
+    # Trim to the last keep_lines. Skip blank lines so we don't waste
+    # the budget on empties.
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    kept = lines[-keep_lines:] if len(lines) > keep_lines else lines
+    # Trailing newline so the next append starts on its own line.
+    return "\n".join(kept) + "\n"
 
 
 def _read_messages_content(gist_data: dict) -> str:
@@ -303,7 +349,8 @@ class GhBearer(Bearer):
                 kind="transient_failure",
                 detail="payload is not utf-8; gh-bearer requires text envelopes",
             )
-        new_content = _read_messages_content(gist) + framed_str
+        existing_content = _read_messages_content(gist)
+        new_content = _rotate_if_needed(existing_content) + framed_str
 
         ok, detail = _gh_gist_write_file(gist_id, new_content)
         if ok:

@@ -2886,6 +2886,98 @@ scenario_host_msg_publishes_to_gist() {
   cleanup_all
 }
 
+scenario_gist_rotates_under_size_limit() {
+  # TDD: gh gists have a 1MB-per-file soft limit. If we never trim
+  # messages.jsonl, the room eventually goes write-blocked + dead
+  # forever. This scenario verifies rotation: pre-fill a gist near
+  # the threshold, run a send, assert the post-send content is
+  # under the limit AND contains the new line.
+  section "gh gist messages.jsonl rotates under size limit (write-block prevention)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Build a synthetic messages.jsonl with N lines (each ~300 bytes) so
+  # total content is right at the rotation threshold. Then create a
+  # gist seeded with that content.
+  local seed; seed=$(mktemp -d -t airc-it-rot-seed.XXXXXX)
+  python3 - "$seed/messages.jsonl" <<'PYEOF'
+import sys, json
+out = sys.argv[1]
+with open(out, "w") as f:
+    for i in range(50):
+        env = {
+            "from": "seed",
+            "to": "all",
+            "ts": f"2026-04-29T00:00:{i:02d}Z",
+            "channel": "general",
+            "msg": f"line {i:04d} " + "x" * 200,
+            "sig": "x",
+        }
+        f.write(json.dumps(env) + "\n")
+PYEOF
+  if [ ! -s "$seed/messages.jsonl" ]; then
+    fail "could not generate seed messages.jsonl"
+    rm -rf "$seed"; return
+  fi
+  local pre_bytes; pre_bytes=$(wc -c < "$seed/messages.jsonl" | tr -d ' ')
+  local pre_lines; pre_lines=$(wc -l < "$seed/messages.jsonl" | tr -d ' ')
+  pass "seed messages.jsonl: ${pre_lines} lines, ${pre_bytes} bytes"
+
+  local gist_url; gist_url=$(gh gist create -d "airc room: #rotation-test (post-#rot)" "$seed/messages.jsonl" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create rotation-test gist"
+    return
+  fi
+  pass "rotation-test gist created: $gist_id"
+
+  trap "gh gist delete '$gist_id' --yes 2>/dev/null || true" EXIT
+
+  # Force an aggressive rotation threshold via env so the test triggers
+  # on a small file rather than producing ~600KB of content (slow + gh
+  # API noise). With AIRC_GIST_MAX_BYTES=2000 the seed (50 lines × ~250B
+  # ≈ 12.5KB) far exceeds the threshold; one send rotates.
+  local marker="rot-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"rotation-test","msg":"'"$marker"'","sig":"x"}'
+  AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
+    PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all rotation-test \
+      --room-gist-id "$gist_id" <<< "$probe" >/dev/null 2>&1
+
+  sleep 1
+  local post_content; post_content=$(gh api "gists/$gist_id" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  local post_bytes; post_bytes=$(printf '%s' "$post_content" | wc -c | tr -d ' ')
+  local post_lines; post_lines=$(printf '%s' "$post_content" | grep -c '^.' 2>/dev/null || echo 0)
+
+  if [ "$post_bytes" -le 4000 ]; then
+    pass "post-send: gist content trimmed under threshold ($post_bytes bytes)"
+  else
+    fail "BUG: gist content NOT rotated — $post_bytes bytes (expected ≤4000 with KEEP_LINES=10)"
+  fi
+
+  if [ "$post_lines" -le 11 ]; then
+    pass "post-send: line count is keep_lines + 1 new line (got $post_lines)"
+  else
+    fail "BUG: line count $post_lines exceeds expected (KEEP_LINES=10 + 1 new = 11)"
+  fi
+
+  if printf '%s' "$post_content" | grep -q "$marker"; then
+    pass "post-rotation: the new send's marker is preserved (not lost in trim)"
+  else
+    fail "BUG: rotation dropped the new line — marker missing"
+  fi
+
+  trap - EXIT
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_channel_gist_prefers_single_channel() {
   # TDD for #290: when both a canonical post-3c single-channel gist
   # (channels=[<x>]) AND a legacy multi-channel mesh gist (channels=[a,b,c])
@@ -3611,6 +3703,7 @@ case "$MODE" in
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   general_has_shared_gist) scenario_general_has_shared_gist ;;
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
+  gist_rotates_under_size_limit) scenario_gist_rotates_under_size_limit ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
