@@ -144,6 +144,20 @@ else:
     echo "  bearer:      n/a (this scope is hosting; inbound is local log)"
   fi
 
+  # gh auth health — surface mid-session token expiry so users have
+  # a one-line diagnostic instead of mysterious silent failures.
+  # The substrate is gh-as-bearer; when gh's keyring goes invalid,
+  # everything stops working but nothing surfaces unless they look here.
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      echo "  gh auth:     ok"
+    else
+      echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
+    fi
+  else
+    echo "  gh auth:     gh CLI not installed"
+  fi
+
   # Pending queue — how many sends are waiting for a drain. Populated by
   # cmd_send's wire-failure branch; drained by flush_pending_loop.
   local pending="$AIRC_WRITE_DIR/pending.jsonl"

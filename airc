@@ -1028,8 +1028,26 @@ monitor() {
   local my_name; my_name=$(get_name)
 
   # Background reminder timer + pending-flush loops.
+  # Capture their PIDs and append to airc.pid so status / teardown /
+  # send's monitor-alive check see the FULL tree, not just the parent.
+  # Pre-fix airc.pid had only $$; if the parent died first while these
+  # subshells were still running, status said "monitor: not running"
+  # and send refused — even though the subshells were still alive.
+  # Post-#325 the subshells self-reap on parent death anyway, but
+  # tracking them keeps the pidfile honest during the in-between
+  # window and after legitimate parent restarts.
   ( reminder_timer_loop ) &
+  local _reminder_pid=$!
   ( flush_pending_loop ) &
+  local _flush_pid=$!
+  if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
+    # Append to existing pidfile atomically (printf+>> is < PIPE_BUF
+    # so atomic on POSIX). Don't overwrite — cmd_connect already
+    # wrote the parent + handshake + heartbeat pids there.
+    printf ' %s %s\n' "$_reminder_pid" "$_flush_pid" >> "$AIRC_WRITE_DIR/airc.pid"
+  else
+    printf '%s %s %s\n' "$$" "$_reminder_pid" "$_flush_pid" > "$AIRC_WRITE_DIR/airc.pid"
+  fi
 
   # Resolution priority:
   #   1. channel_gists map non-empty → multi-channel mode (post-#283:

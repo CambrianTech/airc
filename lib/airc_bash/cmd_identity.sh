@@ -172,6 +172,25 @@ _identity_set() {
   if [ "$set_pronouns" = 0 ] && [ "$set_role" = 0 ] && [ "$set_bio" = 0 ] && [ "$set_status" = 0 ]; then
     die "Pass at least one of --pronouns / --role / --bio / --status"
   fi
+  # Length caps (continuum-b741 caught 2026-04-29: 4KB bio stored
+  # verbatim → broke peer rendering + ate gist quota). Bio is one line
+  # of context, not a manifesto. Hard caps with loud rejection.
+  local _max_pronouns=64
+  local _max_role=128
+  local _max_bio=512
+  local _max_status=256
+  if [ "$set_pronouns" = 1 ] && [ "${#pronouns}" -gt "$_max_pronouns" ]; then
+    die "pronouns too long (${#pronouns} chars; max $_max_pronouns)"
+  fi
+  if [ "$set_role" = 1 ] && [ "${#role}" -gt "$_max_role" ]; then
+    die "role too long (${#role} chars; max $_max_role)"
+  fi
+  if [ "$set_bio" = 1 ] && [ "${#bio}" -gt "$_max_bio" ]; then
+    die "bio too long (${#bio} chars; max $_max_bio — bios are one-liners, not manifestos)"
+  fi
+  if [ "$set_status" = 1 ] && [ "${#status}" -gt "$_max_status" ]; then
+    die "status too long (${#status} chars; max $_max_status)"
+  fi
   CONFIG="$CONFIG" \
     SET_PRONOUNS="$set_pronouns" PRONOUNS="$pronouns" \
     SET_ROLE="$set_role"         ROLE="$role" \
