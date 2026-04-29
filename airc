@@ -1225,6 +1225,7 @@ monitor() {
         --identity-key "$ssh_key" \
         --remote-home "$rhome" \
         --offset-file "$offset_file" \
+        --state-file "$AIRC_WRITE_DIR/bearer_state.json" \
         | monitor_formatter "$my_name" || true
       local fmt_exit="${PIPESTATUS[1]:-0}"
       local cycle_end; cycle_end=$(date +%s)

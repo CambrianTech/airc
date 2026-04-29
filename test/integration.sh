@@ -689,6 +689,10 @@ scenario_status() {
                                                 || fail "host status: monitor not shown running"
   echo "$h_out" | grep -q 'queue:.*empty' && pass "host status: queue empty (no pending)" \
                                           || fail "host status: queue line wrong"
+  # Phase 2c (#270): host has no inbound bearer — surface that explicitly
+  # rather than the messages.jsonl-mirror-derived "last recv" lie.
+  echo "$h_out" | grep -Eq 'bearer:\s+(n/a|.*hosting)' && pass "host status: bearer line marks 'n/a' (hosting)" \
+                                                       || fail "host status missing bearer:n/a line (got: $h_out)"
 
   # Joiner status: should show "joiner of shost". host port is whatever
   # shost actually bound to (auto-bump-aware) — the joiner records what
@@ -699,6 +703,13 @@ scenario_status() {
                                       || fail "joiner status missing joiner-of line (got: $j_out)"
   echo "$j_out" | grep -qE ':[0-9]+' && pass "joiner status: host port visible" \
                                      || fail "joiner status missing host port (got: $j_out)"
+  # Phase 2c (#270): joiner status MUST surface a bearer line. Either
+  # "awaiting first event" (bearer up but quiet) or "Ns ago via ssh"
+  # (events flowing). The pre-2c "last recv" computed from messages.jsonl
+  # is gone — that was the exact lie that hid 30+ minute outages.
+  echo "$j_out" | grep -qE 'bearer:\s+(awaiting first event|[0-9]+s ago via|no state file)' \
+    && pass "joiner status: bearer-attested liveness line present" \
+    || fail "joiner status missing bearer line (got: $j_out)"
 
   # Send a message then assert status reflects activity
   as_home /tmp/airc-it-s-j send @shost "status-probe" >/dev/null 2>&1
@@ -2710,6 +2721,87 @@ sys.exit(1)
   cleanup_all
 }
 
+scenario_bearer_observability() {
+  # Phase 2c (#270): the bearer-attested liveness surface must replace
+  # the messages.jsonl-mirror-derived "last recv" lie. After a real
+  # message lands on the joiner, bearer_state.json must reflect it AND
+  # `airc status` must report a fresh-seconds age (not a stale 30+ min
+  # gap). `airc peers` must annotate the silent peer with a last-seen
+  # marker so 30 days of silence is impossible to mistake for "active."
+  section "bearer observability: state file + status + peers reflect real liveness"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-bo-h obs-host 7554 || { fail "obs-host failed to start"; return; }
+  pass "obs-host hosting on 7554"
+
+  local join; join=$(read_join_string /tmp/airc-it-bo-h)
+  spawn_joiner /tmp/airc-it-bo-j obs-joiner "$join" || { fail "obs-joiner failed to join"; return; }
+  pass "obs-joiner paired"
+
+  # Send a probe DM through the live monitor so the bearer's recv path
+  # actually fires. as_home picks up the joiner's scope.
+  local marker="bearer-obs-marker-$(date +%s)"
+  as_home /tmp/airc-it-bo-h send @obs-joiner "$marker" >/dev/null 2>&1 || true
+
+  # Give the joiner monitor a moment to receive + write state.
+  sleep 3
+
+  local state_file=/tmp/airc-it-bo-j/state/bearer_state.json
+  if [ -f "$state_file" ]; then
+    pass "bearer_state.json materialized in joiner scope"
+  else
+    fail "bearer_state.json missing — bearer never wrote it"
+    cleanup_all; return
+  fi
+
+  # last_recv_ts must be populated and recent (within 30s).
+  local fresh
+  fresh=$(python3 -c "
+import json, time
+s = json.load(open('$state_file'))
+ts = s.get('last_recv_ts')
+if ts is None:
+    print('NONE')
+elif time.time() - float(ts) > 30:
+    print('STALE')
+else:
+    print('FRESH')
+" 2>/dev/null)
+  case "$fresh" in
+    FRESH) pass "bearer_state.last_recv_ts is fresh (<30s)" ;;
+    STALE) fail "bearer_state.last_recv_ts is stale (state: $(cat "$state_file"))" ;;
+    *)     fail "bearer_state.last_recv_ts not set (state: $(cat "$state_file"))" ;;
+  esac
+
+  # kind must be "ssh" (the only registered bearer in Phase 2c).
+  local kind; kind=$(python3 -c "import json; print(json.load(open('$state_file'))['kind'])" 2>/dev/null)
+  if [ "$kind" = "ssh" ]; then
+    pass "bearer_state.kind == 'ssh' (bearer attests its own KIND)"
+  else
+    fail "bearer_state.kind != 'ssh' (got: $kind)"
+  fi
+
+  # `airc status` must report a fresh "via ssh" line — not a >30s gap.
+  local j_out; j_out=$(AIRC_HOME=/tmp/airc-it-bo-j/state "$AIRC" status 2>&1)
+  if echo "$j_out" | grep -qE 'bearer:\s+[0-9]+s ago via ssh'; then
+    pass "airc status surfaces bearer-attested 'Ns ago via ssh'"
+  else
+    fail "airc status bearer line missing fresh ts (got: $(echo "$j_out" | grep bearer))"
+  fi
+
+  # `airc peers` on the joiner must show the host with a last-seen marker.
+  # Since we just received a message FROM the host, the host's name should
+  # appear with a recent age (seconds, not minutes/hours).
+  local j_peers; j_peers=$(AIRC_HOME=/tmp/airc-it-bo-j/state "$AIRC" peers 2>&1)
+  if echo "$j_peers" | grep -qE 'last seen [0-9]+s ago'; then
+    pass "airc peers shows fresh per-peer last-seen"
+  else
+    fail "airc peers missing last-seen annotation (got: $j_peers)"
+  fi
+
+  cleanup_all
+}
+
 scenario_python_units() {
   # Python unit tests for airc_core/. Currently exercises the bearer
   # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
@@ -2763,6 +2855,7 @@ case "$MODE" in
   bearer_ssh_send) scenario_bearer_ssh_send ;;
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
   bearer_cli_recv) scenario_bearer_cli_recv ;;
+  bearer_observability) scenario_bearer_observability ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2779,6 +2872,7 @@ case "$MODE" in
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
+    scenario_bearer_observability
     ;;
   *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac

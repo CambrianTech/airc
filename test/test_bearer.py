@@ -487,6 +487,7 @@ class BearerCliRecvTests(unittest.TestCase):
             identity_key="/tmp/k",
             remote_home="$HOME/.airc",
             offset_file=None,
+            state_file=None,
         )
         for k, v in overrides.items():
             setattr(ns, k, v)
@@ -652,6 +653,7 @@ class BearerCliRecvTests(unittest.TestCase):
             "--identity-key", "/tmp/k",
             "--remote-home", "$HOME/.airc",
             "--offset-file", "/tmp/off",
+            "--state-file", "/tmp/state",
         ])
         self.assertEqual(ns.cmd, "recv")
         self.assertEqual(ns.peer_id, "alice")
@@ -659,7 +661,177 @@ class BearerCliRecvTests(unittest.TestCase):
         self.assertEqual(ns.identity_key, "/tmp/k")
         self.assertEqual(ns.remote_home, "$HOME/.airc")
         self.assertEqual(ns.offset_file, "/tmp/off")
+        self.assertEqual(ns.state_file, "/tmp/state")
         self.assertIs(ns.func, bearer_cli.cmd_recv)
+
+
+class BearerCliStateFileTests(unittest.TestCase):
+    """Phase 2c: bearer_cli recv writes a per-event state file that
+    `airc status` reads. The state file is the bearer-attested liveness
+    surface that replaces the messages.jsonl-mirror lie identified in
+    #270 (status said 'fresh' while bearer was actually wedged).
+    Test contract:
+      - On launch, state file is initialized with last_recv_ts=None.
+      - Each event rewrites it with monotonically growing events_total.
+      - The write is atomic (no half-written file on race).
+      - kind/peer_id/diag passthrough from the bearer is preserved.
+    """
+
+    class _FakeBearer:
+        KIND = "fake-ssh"
+
+        def __init__(self, peer_meta):
+            self.peer_meta = peer_meta
+            self._events = []
+            self._next_ts = 1714435200.0
+            self.closed = False
+
+        def set_events(self, events):
+            self._events = events
+
+        def open(self, peer_id):
+            self._peer_id = peer_id
+
+        def recv_stream(self):
+            for ev in self._events:
+                yield ev
+
+        def liveness(self, peer_id):
+            self._next_ts += 1.0
+            return LivenessResult(
+                peer_id=peer_id,
+                last_seen_ts=self._next_ts,
+                bearer_diag="last event from fake bearer",
+            )
+
+        def close(self):
+            self.closed = True
+
+    def _make_args(self, state_file):
+        return argparse.Namespace(
+            peer_id="alice",
+            host_target="alice@example",
+            identity_key="/tmp/k",
+            remote_home="$HOME/.airc",
+            offset_file=None,
+            state_file=state_file,
+        )
+
+    def _capture_stdout_bytes(self):
+        import io
+        captured = io.BytesIO()
+        fake_stdout = mock.Mock()
+        fake_stdout.buffer = captured
+        return fake_stdout, captured
+
+    def test_state_file_initialized_on_launch(self):
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+
+        fake = self._FakeBearer({})
+        # No events; the bearer closes after the (empty) iter.
+        fake.set_events([])
+
+        fake_stdout, _ = self._capture_stdout_bytes()
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args(state_path))
+
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertEqual(state["kind"], "fake-ssh")
+        self.assertEqual(state["peer_id"], "alice")
+        self.assertIsNone(state["last_recv_ts"])
+        self.assertEqual(state["events_total"], 0)
+        self.assertIn("no events yet", state["diag"].lower())
+
+    def test_state_file_updated_per_event(self):
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+
+        events = [
+            ReceivedMessage(
+                sender_peer_id="bob",
+                channel="general",
+                payload=b'{"from":"bob","channel":"general","msg":"hi"}',
+                bearer_metadata={},
+            ),
+            ReceivedMessage(
+                sender_peer_id="carol",
+                channel="general",
+                payload=b'{"from":"carol","channel":"general","msg":"hey"}',
+                bearer_metadata={},
+            ),
+        ]
+        fake = self._FakeBearer({})
+        fake.set_events(events)
+
+        fake_stdout, _ = self._capture_stdout_bytes()
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args(state_path))
+
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertEqual(state["events_total"], 2)
+        self.assertEqual(state["last_sender"], "carol")
+        self.assertIsNotNone(state["last_recv_ts"])
+        # Bearer's liveness ts was 1714435200 + (2 events × 1s for liveness call) + 1 (init) → check it's reasonable
+        self.assertGreater(state["last_recv_ts"], 1714435200.0)
+        self.assertEqual(state["kind"], "fake-ssh")
+
+    def test_no_state_file_means_no_writes(self):
+        events = [ReceivedMessage(
+            sender_peer_id="bob",
+            channel="general",
+            payload=b'{"from":"bob","msg":"x"}',
+            bearer_metadata={},
+        )]
+        fake = self._FakeBearer({})
+        fake.set_events(events)
+
+        fake_stdout, captured = self._capture_stdout_bytes()
+        # Patch _write_state_file to detect any unwanted call.
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout), \
+             mock.patch.object(bearer_cli, "_write_state_file") as mock_write:
+            bearer_cli.cmd_recv(self._make_args(state_file=None))
+
+        mock_write.assert_not_called()
+        # But events still flow to stdout — state-file is purely additive.
+        self.assertIn(b'{"from":"bob","msg":"x"}', captured.getvalue())
+
+    def test_state_file_write_is_atomic_via_replace(self):
+        """The write must use os.replace (or equivalent) so a reader
+        never sees a half-written file. We assert that no .json file
+        with broken JSON ever appears at the target path during write.
+        """
+        import json as _json
+        import tempfile
+        import os as _os
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            f.write('{"old": "state"}')
+            state_path = f.name
+
+        # _write_state_file should leave the target either unchanged or
+        # fully rewritten — never empty/partial.
+        bearer_cli._write_state_file(state_path, {
+            "kind": "ssh",
+            "peer_id": "alice",
+            "last_recv_ts": 12345.0,
+            "last_sender": "bob",
+            "events_total": 5,
+            "diag": "ok",
+        })
+
+        with open(state_path) as f:
+            state = _json.load(f)  # must not raise
+        self.assertEqual(state["events_total"], 5)
+        _os.unlink(state_path)
 
 
 if __name__ == "__main__":

@@ -110,37 +110,43 @@ cmd_status() {
     echo "  last send:   never"
   fi
 
-  if [ -s "$MESSAGES" ]; then
-    local last_rx_ts
-    last_rx_ts=$(PEERS_DIR="$PEERS_DIR" MY_NAME="$my_name" "$AIRC_PYTHON" -c "
-import sys, json, os, calendar, time
-name = os.environ.get('MY_NAME', '')
-last_ts = None
+  # Last receive: read the bearer-attested state file written by
+  # bearer_cli recv on each event (Phase 2c, #270 fix). The previous
+  # implementation parsed messages.jsonl for the most recent inbound
+  # ts, but that lied for a 30+ minute mesh outage in #270 — the local
+  # mirror said "fresh" while the bearer was actually wedged. The
+  # bearer-state file is the truth: it's only updated when an event
+  # actually flows off the wire.
+  local bearer_state="$AIRC_WRITE_DIR/bearer_state.json"
+  if [ -f "$bearer_state" ]; then
+    local _bs_summary
+    _bs_summary=$("$AIRC_PYTHON" -c "
+import json, sys, time
 try:
-    with open('$MESSAGES') as f:
-        for line in f:
-            try:
-                m = json.loads(line)
-                if m.get('from') and m.get('from') != name and m.get('from') != 'airc':
-                    last_ts = m.get('ts')
-            except: pass
-except: pass
-if last_ts:
-    # ts is ISO8601 UTC (Z-suffix). Convert to epoch.
-    try:
-        t = time.strptime(last_ts.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
-        print(int(calendar.timegm(t)))
-    except: print('')
+    s = json.load(open('$bearer_state'))
+except Exception as e:
+    print(f'unreadable: {e}'); sys.exit(0)
+ts = s.get('last_recv_ts')
+kind = s.get('kind', '?')
+diag = s.get('diag', '')
+total = s.get('events_total', 0)
+if ts is None:
+    print(f'awaiting first event (bearer={kind}, {diag})')
 else:
-    print('')
+    age = int(time.time() - float(ts))
+    print(f'{age}s ago via {kind} ({total} events; {diag})')
 " 2>/dev/null)
-    if [ -n "$last_rx_ts" ]; then
-      echo "  last recv:   $(( now - last_rx_ts ))s ago"
-    else
-      echo "  last recv:   never"
-    fi
+    echo "  bearer:      ${_bs_summary:-unreadable}"
+  elif [ -n "$host_target" ]; then
+    # Joiner with no bearer state — monitor never came up or hasn't
+    # opened the bearer yet. This was previously a silent gap: status
+    # claimed "monitor running" while the inbound path was dead.
+    echo "  bearer:      no state file ($AIRC_WRITE_DIR/bearer_state.json) — monitor not yet streaming"
   else
-    echo "  last recv:   never"
+    # Host: no inbound bearer (we ARE the host). The bearer-state file
+    # is a joiner-side artifact; on a host the local messages.jsonl IS
+    # the source of truth, but we still surface that explicitly.
+    echo "  bearer:      n/a (this scope is hosting; inbound is local log)"
   fi
 
   # Pending queue — how many sends are waiting for a drain. Populated by
