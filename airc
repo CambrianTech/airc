@@ -1038,15 +1038,29 @@ monitor() {
   # window and after legitimate parent restarts.
   ( reminder_timer_loop ) &
   local _reminder_pid=$!
-  ( flush_pending_loop ) &
-  local _flush_pid=$!
+  # flush_pending_loop returns immediately when host_target is empty
+  # (legacy host mode: no peer paired, nothing to flush). Spawning +
+  # tracking that short-lived PID makes airc.pid lie — kill -0 on it
+  # fails seconds later (caught by clean-install-{macos,linux} smoke).
+  # Skip it entirely in that case; it'll get spawned on the next
+  # monitor invocation if/when host_target becomes non-empty.
+  local _flush_pid=""
+  local _ht; _ht=$(get_config_val host_target "")
+  if [ -n "$_ht" ]; then
+    ( flush_pending_loop ) &
+    _flush_pid=$!
+  fi
+  # Build the appended PID list — only include _flush_pid when we
+  # actually spawned it.
+  local _aux_pids="$_reminder_pid"
+  [ -n "$_flush_pid" ] && _aux_pids="$_aux_pids $_flush_pid"
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
     # Append to existing pidfile atomically (printf+>> is < PIPE_BUF
     # so atomic on POSIX). Don't overwrite — cmd_connect already
     # wrote the parent + handshake + heartbeat pids there.
-    printf ' %s %s\n' "$_reminder_pid" "$_flush_pid" >> "$AIRC_WRITE_DIR/airc.pid"
+    printf ' %s\n' "$_aux_pids" >> "$AIRC_WRITE_DIR/airc.pid"
   else
-    printf '%s %s %s\n' "$$" "$_reminder_pid" "$_flush_pid" > "$AIRC_WRITE_DIR/airc.pid"
+    printf '%s %s\n' "$$" "$_aux_pids" > "$AIRC_WRITE_DIR/airc.pid"
   fi
 
   # Resolution priority:
