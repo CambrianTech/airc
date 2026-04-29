@@ -162,12 +162,9 @@ cmd_connect() {
     fi
   fi
 
-  # Tailscale-installed-but-logged-out nudge. Runs AFTER flag parsing
-  # so --no-tailscale takes effect. Default behavior: if Tailscale is
-  # installed, "just works" — prompt the user to sign in (Mac: opens
-  # Tailscale.app). The 90% case is "I have it and want it on";
-  # --no-tailscale is the explicit opt-out for the few who don't.
-  tailscale_login_check_or_prompt
+  # Phase 3c: Tailscale login nudge removed. Cross-network mesh now
+  # routes via gh-as-bearer (envelope-encrypted gist), no Tailscale
+  # daemon required. See project_airc_transport_architecture memory.
 
   # `airc join` (no args) auto-scopes to the room matching the current cwd.
   # Resolution: git remote org first ('useideem/authenticator' → #useideem),
@@ -839,17 +836,9 @@ cmd_connect() {
     # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
 
-    # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
-    # Resume path (line ~1241) already calls advise_tailscale_if_down, but
-    # that gate doesn't cover (a) cold-start `airc join <invite>` from a
-    # fresh scope or (b) the gist-discovery resolution that lands here
-    # with a tailnet host_target. Without this check, a logged-out
-    # Tailscale produced a silent unreachable-host + self-heal cascade
-    # (issue #78, Memento's case 2026-04-25). Same call site shape as the
-    # resume path: detect-and-instruct, do not auto-tailscale-up.
-    if ! advise_tailscale_if_down "$peer_host_only"; then
-      die "Re-run airc join after starting Tailscale."
-    fi
+    # Phase 3c: Tailscale-down pre-flight removed. Cross-network mesh
+    # routes via gh-as-bearer (envelope-encrypted gist) which doesn't
+    # need Tailscale at all.
 
     echo "  Connecting to $peer_host_only:$peer_port..."
     local my_ssh_pub my_sign_pub my_x25519_pub

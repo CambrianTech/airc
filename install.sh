@@ -743,24 +743,13 @@ ensure_prereqs() {
   # because there's no Touch ID / password input — the runner job
   # silently runs for the full 6-hour timeout. Skip when CI=true so
   # the install completes cleanly and CI tests the rest of the path.
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    info "CI=true — skipping sshd setup (no host-capability test in CI)"
-  elif [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
-    _ensure_sshd_running
-  fi
-
-  # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
-  # works fine without it, so we attempt install but don't fail loud.
-  # Skip in CI: brew install --cask tailscale on macOS runners is slow
-  # (multi-minute download + GUI app install) and there's no tailnet
-  # behind the runner anyway. The install itself is what we're gating
-  # on — Tailscale-as-optional is documented; CI doesn't need it.
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    info "CI=true — skipping Tailscale install (optional, no tailnet in CI)"
-  elif ! tailscale_present; then
-    info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
-    install_tailscale
-  fi
+  # Phase 3c: sshd setup + Tailscale install removed from default path.
+  # Cross-network messaging routes through gh-as-bearer (envelope-encrypted
+  # gist), which works on every platform with `gh auth login` — no
+  # privileged daemon, no sign-in popup. The functions _ensure_sshd_running
+  # and install_tailscale stay defined for any user who explicitly needs
+  # them via opt-in flag, but the default install no longer invokes them.
+  : "Phase 3c: skipping sshd + Tailscale (gh-as-bearer is the cross-network path)"
 
   # gh auth: required for the gist substrate (#general room discovery).
   # We can't auto-login (browser flow), but we surface the exact command
@@ -1050,27 +1039,15 @@ ts_post_check() {
   esac
 }
 
-ts_post_check
+# Phase 3c: ts_post_check call removed. Tailscale is no longer used for
+# cross-network messaging — gh-as-bearer (envelope-encrypted gist) is
+# the universal path. Function definitions remain for any opt-in user.
 
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
 ok "Installed."
 echo ""
-# Tailscale post-install message — be honest about installed state. The
-# pre-fix text always read "Tailscale is optional but recommended:
-# https://tailscale.com" even when winget had just installed it 30s ago,
-# which (per Joel 2026-04-28) reads as a fail. ts_post_check above
-# already nudges sign-in if installed-but-logged-out, so here we only
-# print the "go install it" line when tailscale really isn't present.
-if tailscale_present; then
-  :  # ts_post_check handled the messaging if relevant
-else
-  echo "  Cross-LAN mesh? Tailscale is optional (not installed):"
-  echo "    https://tailscale.com    (then: tailscale up)"
-  echo "  Same-LAN mesh works without it; gist orchestration handles either."
-  echo ""
-fi
 echo "  Next:"
 echo "    1. gh auth login -s gist          # one-time, browser flow"
 echo "    2. airc join                      # auto-#general (joins existing or hosts)"

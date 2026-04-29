@@ -52,6 +52,7 @@ def cmd_send(args) -> int:
         "host_target": args.host_target,
         "remote_home": args.remote_home,
         "identity_key": args.identity_key,
+        "room_gist_id": getattr(args, "room_gist_id", None),
     }
     # Drop None values so can_serve / send check absence cleanly.
     peer_meta = {k: v for k, v in peer_meta.items() if v}
@@ -102,6 +103,7 @@ def cmd_recv(args) -> int:
         "remote_home": args.remote_home,
         "identity_key": args.identity_key,
         "offset_file": args.offset_file,
+        "room_gist_id": getattr(args, "room_gist_id", None),
     }
     peer_meta = {k: v for k, v in peer_meta.items() if v}
 
@@ -209,6 +211,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Path to private key file for SSH bearer")
     send.add_argument("--remote-home", default=None,
                       help="Remote AIRC_WRITE_DIR path (e.g. '$HOME/.airc')")
+    send.add_argument("--room-gist-id", default=None,
+                      help="gh room gist id for GhBearer routing")
     send.set_defaults(func=cmd_send)
 
     recv = sub.add_parser("recv", help="Stream inbound events as JSONL on stdout")
@@ -224,6 +228,8 @@ def _build_parser() -> argparse.ArgumentParser:
     recv.add_argument("--state-file", default=None,
                       help="Path to bearer_state.json — bearer-attested liveness "
                            "for cross-process consumers (airc status, airc peers)")
+    recv.add_argument("--room-gist-id", default=None,
+                      help="gh room gist id for GhBearer routing")
     recv.set_defaults(func=cmd_recv)
 
     return p

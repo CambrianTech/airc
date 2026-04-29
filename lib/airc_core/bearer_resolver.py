@@ -10,19 +10,19 @@ Adding a transport: import its class, add to _REGISTRY at the right
 preference position. Done. Removing a transport: delete the import and
 the registry entry. Done. No other file moves.
 
-Phase 3b (current state): registry has LocalBearer + SshBearer + GhBearer.
+Phase 3c (current state): registry is [LocalBearer, GhBearer]. SshBearer
+and all Tailscale knowledge are deleted. The architecture is now:
+  * Same-machine peers → LocalBearer (direct fs read/write)
+  * Everyone else → GhBearer (gh-gist as transport, polling)
+Encryption is handled at the envelope layer (lib/airc_core/envelope.py),
+making transport-layer encryption (SSH, WireGuard) redundant and letting
+us drop the install-time complexity that came with both — no more
+Windows OpenSSH-Server admin elevation, no more Tailscale daemon.
 
-GhBearer is registered LAST deliberately. Real production peer_meta
-populates host_target (so SshBearer.can_serve wins), so GhBearer only
-activates for peer_meta where host_target is empty but room_gist_id is
-set — a path the resolver doesn't reach in production today. This keeps
-3b purely additive: SshBearer keeps serving today's traffic; GhBearer
-exists in the seam, exercised by tests, ready for Phase 3c to flip.
-
-Phase 3c flips order to [LocalBearer, GhBearer], removes SshBearer +
-Tailscale entirely, and updates the join handshake so cross-network
-pairings populate room_gist_id (not host_target) — at which point
-GhBearer takes over all non-loopback traffic.
+Latency cost: 1-2s typical message latency (gh poll cadence) instead of
+SSH's <100ms. For chat-pace AI traffic this is invisible; if a future
+use case needs sub-second, a new bearer can be added without touching
+this seam.
 """
 
 from __future__ import annotations
@@ -32,19 +32,16 @@ from typing import List, Type
 from .bearer import Bearer, PeerUnreachable
 from .bearer_local import LocalBearer
 from .bearer_gh import GhBearer
-from .bearer_ssh import SshBearer
 
 # Preference order. Earlier = preferred. The resolver tries each in turn
 # via can_serve() and falls through on PeerUnreachable from open().
-#   LocalBearer — same-machine peers skip the SSH layer entirely.
-#   SshBearer   — direct-network peers (Tailscale, LAN, public). What
-#                 production uses today.
-#   GhBearer    — gh-as-bearer fallback for peers without direct-network
-#                 reachability. After Phase 3c becomes the cross-network
-#                 default and SshBearer is removed.
+#   LocalBearer — same-machine peers (loopback host_target + writable
+#                 remote_home). Direct filesystem; zero crypto overhead;
+#                 no network.
+#   GhBearer    — everyone else. gh-gist as transport. Encryption lives
+#                 at the envelope layer above.
 _REGISTRY: List[Type[Bearer]] = [
     LocalBearer,
-    SshBearer,
     GhBearer,
 ]
 
