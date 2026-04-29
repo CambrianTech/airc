@@ -85,27 +85,31 @@ class LocalBearer(Bearer):
 
     @classmethod
     def can_serve(cls, peer_meta: dict) -> bool:
-        """Serve only same-machine peers — loopback host_target AND a
-        remote_home that exists as a writable directory.
+        """Serve same-machine peers — peer's `remote_home` is a writable
+        directory accessible from this process.
 
-        Both conditions must hold. host_target alone isn't enough
-        (someone could have a stale 127.0.0.1 record from a prior
-        session whose airc_home was cleaned up). remote_home alone
-        isn't enough either (a path collision against a local dir
-        named like a remote scope would falsely qualify). Together
-        they identify "we're talking to a peer that lives in a
-        directory on this machine."
+        Phase 3c: load-bearing signal is "can I write to the peer's
+        airc_home directly." That covers two same-machine cases:
+          - Two airc tabs sharing a scope dir
+          - Same-machine pair-handshake where remote_home points at the
+            host's actual scope dir on the same FS (integration tests +
+            colocated dev workflows)
+        We deliberately don't require a loopback host_target — after
+        Phase 3c, host_target is informational only (the bearer doesn't
+        SSH anywhere), so what matters is whether the peer's filesystem
+        is reachable from us. If False here, resolver falls through to
+        GhBearer.
+
+        Edge case considered + accepted: NFS-shared / container-mounted
+        paths could match a remote peer's remote_home. For airc's
+        target use cases (AI agents on a dev's laptops + same-org
+        colleagues) this is benign — the worst case is "we wrote to a
+        shared path the peer also reads," which is exactly the
+        LocalBearer semantics.
         """
-        host_target = peer_meta.get("host_target", "")
-        if not _is_loopback_target(host_target):
-            return False
         home = peer_meta.get("remote_home", "")
         if not home:
             return False
-        # Expand a leading $HOME / ~ so we don't get tripped by raw env-var
-        # strings the way callers serialize them. os.path.expandvars is
-        # safe because we don't trust unsanitized peer_meta for command
-        # execution — only for path resolution.
         expanded = os.path.expanduser(os.path.expandvars(home))
         return os.path.isdir(expanded) and os.access(expanded, os.W_OK)
 

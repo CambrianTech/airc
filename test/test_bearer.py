@@ -30,10 +30,8 @@ from airc_core.bearer_resolver import (  # noqa: E402
     available_kinds,
     resolve,
 )
-from airc_core.bearer_ssh import SshBearer, SshBearerError  # noqa: E402
 from airc_core.bearer_local import LocalBearer, LocalBearerError  # noqa: E402
 from airc_core.bearer_gh import GhBearer, GhBearerError  # noqa: E402
-from airc_core import bearer_ssh  # noqa: E402
 from airc_core import bearer_local  # noqa: E402
 from airc_core import bearer_gh  # noqa: E402
 from airc_core import bearer_cli  # noqa: E402
@@ -77,380 +75,37 @@ class BearerInterfaceTests(unittest.TestCase):
 class ResolverTests(unittest.TestCase):
     """Resolver picks bearers based on can_serve, raises when no candidate."""
 
-    def test_available_kinds_includes_ssh_in_phase0(self):
+    def test_available_kinds_after_phase3c(self):
         kinds = available_kinds()
-        self.assertIn("ssh", kinds)
-
-    def test_resolves_ssh_for_peer_with_host_target(self):
-        bearer = resolve({"host_target": "user@host:7547"})
-        self.assertIsInstance(bearer, SshBearer)
-        self.assertEqual(bearer.KIND, "ssh")
-        bearer.close()
+        # Post-3c registry: LocalBearer + GhBearer; SshBearer deleted.
+        self.assertEqual(set(kinds), {"local", "gh"})
+        self.assertNotIn("ssh", kinds)
 
     def test_unreachable_when_no_bearer_can_serve(self):
-        with self.assertRaises(PeerUnreachable):
-            resolve({})  # no host_target, no bearer matches
+        # Empty peer_meta + no gh auth → PeerUnreachable.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
+            with self.assertRaises(PeerUnreachable):
+                resolve({})
 
     def test_resolved_bearer_is_not_yet_open(self):
-        bearer = resolve({"host_target": "user@host:7547"})
-        # Resolution is cheap — no IO happens yet.
-        self.assertIsInstance(bearer, Bearer)
-        bearer.close()
+        # LocalBearer.can_serve takes a writable dir — pick a tmpdir.
+        import tempfile
+        td = tempfile.mkdtemp()
+        try:
+            bearer = resolve({"host_target": "127.0.0.1", "remote_home": td})
+            self.assertIsInstance(bearer, Bearer)
+            bearer.close()
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
 
     def test_resolver_passes_peer_meta_to_bearer(self):
         # Bearer needs peer_meta to send; resolver must thread it through
         # at construction.
-        bearer = resolve({"host_target": "alice@example:7547"})
-        self.assertEqual(bearer._peer_meta.get("host_target"), "alice@example:7547")
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            bearer = resolve({"room_gist_id": "abc123"})
+        self.assertEqual(bearer._peer_meta.get("room_gist_id"), "abc123")
         bearer.close()
-
-
-class SshBearerSkeletonTests(unittest.TestCase):
-    """Phase 0 SshBearer skeleton: lifecycle methods, NotImplementedError
-    guidance for the parts that arrive in Phase 1+."""
-
-    def test_kind_is_ssh(self):
-        self.assertEqual(SshBearer.KIND, "ssh")
-
-    def test_can_serve_requires_host_target(self):
-        self.assertTrue(SshBearer.can_serve({"host_target": "u@h"}))
-        self.assertFalse(SshBearer.can_serve({}))
-        self.assertFalse(SshBearer.can_serve({"unrelated": "field"}))
-
-    def test_can_serve_is_pure(self):
-        # No IO, no side effects — calling it 100 times is free.
-        for _ in range(100):
-            SshBearer.can_serve({"host_target": "u@h"})
-
-    def test_construct_is_cheap(self):
-        # Cheap-construct invariant: resolver may build candidates
-        # speculatively. No IO on __init__.
-        b1 = SshBearer()
-        b2 = SshBearer({"host_target": "u@h"})
-        self.assertIsNot(b1, b2)
-        b1.close()
-        b2.close()
-
-    def test_open_then_close_is_clean(self):
-        b = SshBearer({"host_target": "u@h"})
-        b.open("alice")
-        b.close()
-        # close() is idempotent
-        b.close()
-
-    def test_post_close_operations_raise(self):
-        b = SshBearer({"host_target": "u@h"})
-        b.close()
-        with self.assertRaises(BearerError):
-            b.open("alice")
-        with self.assertRaises(BearerError):
-            b.send("alice", "general", b"x")
-
-
-class SshBearerSendTests(unittest.TestCase):
-    """Phase 1 SshBearer.send() — the relocated SSH delivery primitive.
-
-    All tests mock subprocess.run + the tailscale resolver so no real
-    network or processes are touched. We verify the bearer correctly
-    classifies outcomes from the underlying transport's signals.
-    """
-
-    def setUp(self):
-        # Default peer_meta — overridden per test as needed.
-        self._meta = {
-            "host_target": "alice@example:7547",
-            "remote_home": "$HOME/.airc",
-            "identity_key": "/tmp/fake_key",
-        }
-
-    def _bearer(self, meta=None):
-        b = SshBearer(meta or self._meta)
-        b.open("alice")
-        return b
-
-    def test_send_without_host_target_raises(self):
-        b = SshBearer({})  # no host_target
-        b.open("alice")
-        with self.assertRaises(SshBearerError) as ctx:
-            b.send("alice", "general", b"hi")
-        self.assertIn("host_target", str(ctx.exception))
-        b.close()
-
-    @mock.patch.object(bearer_ssh, "_is_peer_offline_in_tailnet", return_value=True)
-    def test_send_queues_when_tailnet_reports_offline(self, _mock_offline):
-        b = self._bearer()
-        outcome = b.send("alice", "general", b'{"msg":"hi"}')
-        self.assertEqual(outcome.kind, "queued_unreachable")
-        self.assertIn("offline", outcome.detail.lower())
-        b.close()
-
-    @mock.patch.object(bearer_ssh, "_resolve_ssh_bin", return_value="/usr/bin/ssh")
-    @mock.patch.object(bearer_ssh, "_is_peer_offline_in_tailnet", return_value=False)
-    @mock.patch.object(bearer_ssh.subprocess, "run")
-    def test_send_delivered_when_marker_in_stdout(self, mock_run, *_):
-        mock_run.return_value = mock.Mock(
-            stdout=b"__APPENDED__\n",
-            stderr=b"",
-            returncode=0,
-        )
-        b = self._bearer()
-        outcome = b.send("alice", "general", b'{"msg":"hi"}')
-        self.assertEqual(outcome.kind, "delivered")
-        # Verify the SSH invocation was constructed correctly.
-        args = mock_run.call_args
-        argv = args.args[0]
-        self.assertIn("/usr/bin/ssh", argv)
-        self.assertIn("-i", argv)
-        self.assertIn("/tmp/fake_key", argv)
-        self.assertIn("-p", argv)
-        self.assertIn("7547", argv)
-        # Remote command must contain the messages.jsonl append + marker.
-        self.assertTrue(any("messages.jsonl" in a for a in argv))
-        self.assertTrue(any("__APPENDED__" in a for a in argv))
-        b.close()
-
-    @mock.patch.object(bearer_ssh, "_resolve_ssh_bin", return_value="/usr/bin/ssh")
-    @mock.patch.object(bearer_ssh, "_is_peer_offline_in_tailnet", return_value=False)
-    @mock.patch.object(bearer_ssh.subprocess, "run")
-    def test_send_classifies_auth_failure(self, mock_run, *_):
-        mock_run.return_value = mock.Mock(
-            stdout=b"",
-            stderr=b"alice@example: Permission denied (publickey).\n",
-            returncode=255,
-        )
-        b = self._bearer()
-        outcome = b.send("alice", "general", b'{"msg":"hi"}')
-        self.assertEqual(outcome.kind, "auth_failure")
-        self.assertIn("re-pair", outcome.detail)
-        b.close()
-
-    @mock.patch.object(bearer_ssh, "_resolve_ssh_bin", return_value="/usr/bin/ssh")
-    @mock.patch.object(bearer_ssh, "_is_peer_offline_in_tailnet", return_value=False)
-    @mock.patch.object(bearer_ssh.subprocess, "run")
-    def test_send_classifies_transient_failure(self, mock_run, *_):
-        mock_run.return_value = mock.Mock(
-            stdout=b"",
-            stderr=b"ssh: connect to host example port 7547: Connection refused\n",
-            returncode=255,
-        )
-        b = self._bearer()
-        outcome = b.send("alice", "general", b'{"msg":"hi"}')
-        self.assertEqual(outcome.kind, "transient_failure")
-        self.assertIn("Connection refused", outcome.detail)
-        b.close()
-
-    @mock.patch.object(bearer_ssh, "_resolve_ssh_bin", return_value="/usr/bin/ssh")
-    @mock.patch.object(bearer_ssh, "_is_peer_offline_in_tailnet", return_value=False)
-    @mock.patch.object(
-        bearer_ssh.subprocess,
-        "run",
-        side_effect=bearer_ssh.subprocess.TimeoutExpired(cmd="ssh", timeout=15),
-    )
-    def test_send_handles_timeout(self, *_):
-        b = self._bearer()
-        outcome = b.send("alice", "general", b'{"msg":"hi"}')
-        self.assertEqual(outcome.kind, "transient_failure")
-        self.assertIn("timed out", outcome.detail)
-        b.close()
-
-    def test_send_outcome_is_immutable(self):
-        o = SendOutcome(kind="delivered")
-        with self.assertRaises(Exception):
-            o.kind = "tampered"
-
-
-class SshBearerRecvStreamTests(unittest.TestCase):
-    """Phase 2a SshBearer.recv_stream() — yields ReceivedMessage events
-    parsed from ssh tail's stdout. Tests mock subprocess.Popen so no real
-    network is touched.
-    """
-
-    def _bearer(self, meta=None):
-        m = meta or {
-            "host_target": "alice@example:7547",
-            "remote_home": "$HOME/.airc",
-            "identity_key": "/tmp/fake_key",
-        }
-        b = SshBearer(m)
-        b.open("alice")
-        return b
-
-    def _fake_proc(self, lines, returncode=0):
-        """Build a mock subprocess that yields `lines` via readline() then EOF.
-
-        The bearer reads via while-loop + readline() so EOF (empty bytes)
-        terminates the inner loop. Each line in `lines` is returned in order;
-        after exhaustion, readline returns b'' to signal EOF.
-        """
-        proc = mock.Mock()
-        line_iter = iter(list(lines) + [b""])  # b"" signals EOF
-        proc.stdout = mock.Mock()
-        proc.stdout.readline = mock.Mock(side_effect=lambda: next(line_iter))
-        proc.poll = mock.Mock(return_value=returncode)
-        proc.terminate = mock.Mock()
-        proc.wait = mock.Mock(return_value=returncode)
-        proc.kill = mock.Mock()
-        return proc
-
-    def test_recv_stream_without_host_target_raises(self):
-        b = SshBearer({})
-        b.open("alice")
-        with self.assertRaises(SshBearerError):
-            next(b.recv_stream())
-        b.close()
-
-    def test_envelope_parser_drops_non_json(self):
-        # Junk line → None
-        self.assertIsNone(SshBearer._parse_envelope(b"not json\n"))
-        # Empty line → None
-        self.assertIsNone(SshBearer._parse_envelope(b"\n"))
-        # JSON but not an object → None
-        self.assertIsNone(SshBearer._parse_envelope(b"[1,2,3]\n"))
-        # Object missing `from` → None
-        self.assertIsNone(SshBearer._parse_envelope(b'{"channel":"x"}\n'))
-
-    def test_envelope_parser_accepts_well_formed(self):
-        line = b'{"from":"bob","channel":"general","msg":"hi"}\n'
-        msg = SshBearer._parse_envelope(line)
-        self.assertIsNotNone(msg)
-        self.assertEqual(msg.sender_peer_id, "bob")
-        self.assertEqual(msg.channel, "general")
-        # Payload is the original line (sans trailing newline)
-        self.assertEqual(msg.payload, b'{"from":"bob","channel":"general","msg":"hi"}')
-        self.assertIn("envelope", msg.bearer_metadata)
-        self.assertEqual(msg.bearer_metadata["envelope"]["msg"], "hi")
-
-    def test_compute_tail_position_no_offset_file(self):
-        self.assertEqual(SshBearer._compute_tail_position(None), "-n 0")
-
-    def test_compute_tail_position_invalid_offsets(self):
-        import tempfile
-        for content in ("", "0", "abc", "-1", "  "):
-            with tempfile.NamedTemporaryFile("w", delete=False) as f:
-                f.write(content)
-                path = f.name
-            self.assertEqual(
-                SshBearer._compute_tail_position(path), "-n 0",
-                f"content={content!r} should produce -n 0",
-            )
-
-    def test_compute_tail_position_resumes_past_saved_line(self):
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write("42")
-            path = f.name
-        self.assertEqual(SshBearer._compute_tail_position(path), "-n +43")
-
-    @mock.patch.object(bearer_ssh.subprocess, "Popen")
-    def test_recv_stream_yields_parsed_envelopes(self, mock_popen):
-        lines = [
-            b'{"from":"bob","channel":"general","msg":"hello"}\n',
-            b'{"from":"carol","channel":"general","msg":"world"}\n',
-            b'corrupted line\n',  # should be silently dropped
-            b'{"from":"dave","channel":"useideem","msg":"hi"}\n',
-        ]
-        mock_popen.return_value = self._fake_proc(lines)
-
-        b = self._bearer()
-        events = []
-        # Take 3 events then close (stops the iterator). The mock proc's
-        # stdout iterator will exhaust naturally.
-        gen = b.recv_stream()
-        for ev in gen:
-            events.append(ev)
-            if len(events) >= 3:
-                b.close()
-                break
-
-        self.assertEqual(len(events), 3)
-        self.assertEqual(events[0].sender_peer_id, "bob")
-        self.assertEqual(events[1].sender_peer_id, "carol")
-        # Note: events[2] is "dave" — the malformed line was skipped.
-        self.assertEqual(events[2].sender_peer_id, "dave")
-
-    @mock.patch.object(bearer_ssh.subprocess, "Popen")
-    def test_liveness_updates_on_each_event(self, mock_popen):
-        lines = [b'{"from":"bob","channel":"general","msg":"hi"}\n']
-        mock_popen.return_value = self._fake_proc(lines)
-
-        b = self._bearer()
-        # Pre-stream: no signal
-        live_before = b.liveness("alice")
-        self.assertIsNone(live_before.last_seen_ts)
-        self.assertIn("no events", live_before.bearer_diag.lower())
-
-        # Consume one event, check liveness BEFORE closing
-        gen = b.recv_stream()
-        next(gen)
-        live_after = b.liveness("alice")
-        self.assertIsNotNone(live_after.last_seen_ts)
-        self.assertIn("ssh tail", live_after.bearer_diag.lower())
-        b.close()
-
-    @mock.patch.object(bearer_ssh.subprocess, "Popen")
-    def test_recv_stream_persists_offset(self, mock_popen):
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write("0")
-            offset_path = f.name
-
-        lines = [
-            b'{"from":"bob","channel":"general","msg":"a"}\n',
-            b'{"from":"bob","channel":"general","msg":"b"}\n',
-        ]
-        mock_popen.return_value = self._fake_proc(lines)
-
-        meta = {
-            "host_target": "alice@example:7547",
-            "remote_home": "$HOME/.airc",
-            "identity_key": "/tmp/fake_key",
-            "offset_file": offset_path,
-        }
-        b = self._bearer(meta)
-
-        gen = b.recv_stream()
-        next(gen)
-        next(gen)
-        b.close()
-
-        with open(offset_path) as f:
-            self.assertEqual(f.read().strip(), "2")
-
-    def test_close_terminates_recv_subprocess(self):
-        b = self._bearer()
-        # Simulate a running proc
-        fake_proc = mock.Mock()
-        fake_proc.poll = mock.Mock(return_value=None)  # still running
-        fake_proc.terminate = mock.Mock()
-        fake_proc.wait = mock.Mock(return_value=0)
-        fake_proc.kill = mock.Mock()
-        b._proc = fake_proc
-
-        b.close()
-        fake_proc.terminate.assert_called_once()
-
-
-class CgnatRegexTests(unittest.TestCase):
-    """The Tailscale-CGNAT range matcher is the only Tailscale knowledge
-    in the codebase outside install scripts. Until Phase 3 deletes it,
-    it must reject non-CGNAT IPs cleanly so no LAN/DNS targets get
-    mis-routed through the offline-fast-path."""
-
-    def test_matches_cgnat_addresses(self):
-        for ip in ("100.64.0.1", "100.99.99.99", "100.119.50.20", "100.127.255.254"):
-            self.assertTrue(bearer_ssh._CGNAT_RE.match(ip), f"should match {ip}")
-
-    def test_rejects_non_cgnat_addresses(self):
-        for ip in ("100.63.0.1", "100.128.0.1", "192.168.1.1", "10.0.0.1", "127.0.0.1", "100.5.0.1"):
-            self.assertFalse(bearer_ssh._CGNAT_RE.match(ip), f"should reject {ip}")
-
-    def test_offline_check_strips_user_prefix(self):
-        # Strips user@ correctly so resume paths with `user@host` form
-        # don't bypass the CGNAT gate. (issue #78 root cause)
-        with mock.patch.object(bearer_ssh, "_resolve_tailscale_bin", return_value=None):
-            # No tailscale = always False. Just verify no crash on user@host form.
-            self.assertFalse(bearer_ssh._is_peer_offline_in_tailnet("alice@100.64.0.1"))
-            self.assertFalse(bearer_ssh._is_peer_offline_in_tailnet("alice@192.168.1.5"))
 
 
 class BearerCliRecvTests(unittest.TestCase):
@@ -853,23 +508,16 @@ class LocalBearerCanServeTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    def test_serves_loopback_with_writable_dir(self):
-        for ht in ("127.0.0.1", "localhost", "::1", "[::1]",
-                   "user@127.0.0.1", "user@localhost",
-                   "user@127.0.0.1:7547", "127.0.0.1:7547",
-                   "user@[::1]:7547"):
+    def test_serves_when_remote_home_writable(self):
+        # Phase 3c: any host_target works as long as remote_home is
+        # locally writable. host_target is now informational only —
+        # the bearer doesn't connect anywhere via the address.
+        for ht in ("127.0.0.1", "user@127.0.0.1:7547",
+                   "alice@example.com", "user@192.168.1.5",
+                   "user@100.91.51.87", ""):
             self.assertTrue(
                 LocalBearer.can_serve({"host_target": ht, "remote_home": self._tmpdir}),
-                f"should serve loopback host_target={ht!r}",
-            )
-
-    def test_rejects_non_loopback(self):
-        for ht in ("alice@example.com", "user@192.168.1.5",
-                   "user@100.91.51.87", "100.64.0.1",
-                   "user@10.0.0.5"):
-            self.assertFalse(
-                LocalBearer.can_serve({"host_target": ht, "remote_home": self._tmpdir}),
-                f"should NOT serve non-loopback host_target={ht!r}",
+                f"should serve any host_target={ht!r} when remote_home is writable",
             )
 
     def test_rejects_when_remote_home_missing(self):
@@ -880,6 +528,11 @@ class LocalBearerCanServeTests(unittest.TestCase):
         self.assertFalse(
             LocalBearer.can_serve({"host_target": "127.0.0.1", "remote_home": ""}),
             "should reject when remote_home is empty string",
+        )
+        # Even loopback host_target alone isn't sufficient post-3c —
+        # remote_home is the load-bearing signal.
+        self.assertFalse(
+            LocalBearer.can_serve({"host_target": "127.0.0.1"}),
         )
 
     def test_rejects_when_remote_home_does_not_exist(self):
@@ -1106,10 +759,11 @@ class LocalBearerSkeletonTests(unittest.TestCase):
 
 
 class ResolverOrderTests(unittest.TestCase):
-    """Phase 3a: LocalBearer must be picked over SshBearer when both
-    can serve a peer. SshBearer is the universal fallback; LocalBearer
-    is the same-machine optimization. Reversing this order would make
-    every same-machine 2-tab session waste SSH crypto cycles."""
+    """Phase 3c: registry is [LocalBearer, GhBearer] — SshBearer deleted.
+    LocalBearer for same-machine peers; GhBearer for everyone else.
+    Same-machine resolution must prefer LocalBearer to avoid burning
+    gh API calls (and incurring 1-2s polling latency) for what's
+    really just a filesystem write."""
 
     def setUp(self):
         import tempfile
@@ -1127,30 +781,29 @@ class ResolverOrderTests(unittest.TestCase):
         self.assertEqual(bearer.KIND, "local",
                          "same-machine peer must resolve to LocalBearer")
 
-    def test_ssh_for_remote_peer(self):
-        bearer = resolve({
-            "host_target": "alice@example.com",
-            "remote_home": "/home/alice/.airc",
-        })
-        self.assertEqual(bearer.KIND, "ssh",
-                         "remote peer must resolve to SshBearer")
+    def test_gh_for_remote_peer_with_room_gist(self):
+        # peer_meta has only a room_gist_id (no remote_home pointing at
+        # something locally writable). Resolver picks GhBearer.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            bearer = resolve({"room_gist_id": "abc123"})
+        self.assertEqual(bearer.KIND, "gh",
+                         "non-local peer with room_gist_id must resolve to GhBearer")
 
-    def test_ssh_when_loopback_target_but_no_local_dir(self):
-        # Stale loopback record without a host_airc_home that exists →
-        # LocalBearer.can_serve is False → fall through to SshBearer.
-        bearer = resolve({
-            "host_target": "user@127.0.0.1",
-            "remote_home": "/this/path/definitely/does/not/exist",
-        })
-        self.assertEqual(bearer.KIND, "ssh")
+    def test_gh_when_loopback_target_but_no_local_dir(self):
+        # Stale loopback record without remote_home → LocalBearer
+        # rejects → fall through to GhBearer (if room_gist_id present).
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            bearer = resolve({
+                "host_target": "user@127.0.0.1",
+                "remote_home": "/this/path/definitely/does/not/exist",
+                "room_gist_id": "abc123",
+            })
+        self.assertEqual(bearer.KIND, "gh")
 
-    def test_available_kinds_includes_local(self):
+    def test_available_kinds_local_then_gh(self):
         from airc_core.bearer_resolver import available_kinds
         kinds = available_kinds()
-        self.assertIn("local", kinds)
-        self.assertIn("ssh", kinds)
-        # local must come first (preference order).
-        self.assertLess(kinds.index("local"), kinds.index("ssh"))
+        self.assertEqual(kinds, ["local", "gh"])
 
 
 class GhBearerCanServeTests(unittest.TestCase):
@@ -1456,38 +1109,25 @@ class GhBearerSkeletonTests(unittest.TestCase):
             b.send("alice", "general", b'{"x":1}')
 
 
-class ResolverIncludesGhBearerTests(unittest.TestCase):
-    """Phase 3b: GhBearer is registered (after SshBearer in 3b's
-    additive ordering). Production peer_meta with host_target still
-    routes to SshBearer; only meta lacking host_target reaches gh."""
+class ResolverPostPhase3cTests(unittest.TestCase):
+    """Phase 3c: registry is [LocalBearer, GhBearer]. Same-machine →
+    Local; everyone else with a room_gist_id → Gh. SshBearer deleted."""
 
-    def test_available_kinds_includes_gh(self):
+    def test_available_kinds_local_and_gh_only(self):
         from airc_core.bearer_resolver import available_kinds
         kinds = available_kinds()
-        self.assertIn("gh", kinds)
-        # 3b: gh comes AFTER ssh so today's traffic isn't preempted.
-        self.assertGreater(kinds.index("gh"), kinds.index("ssh"))
-
-    def test_ssh_still_wins_when_host_target_present(self):
-        # Today's production peer_meta. Resolver picks SshBearer; gh
-        # never gets a turn.
-        bearer = resolve({
-            "host_target": "alice@example.com",
-            "remote_home": "/home/alice/.airc",
-        })
-        self.assertEqual(bearer.KIND, "ssh")
+        self.assertEqual(set(kinds), {"local", "gh"})
+        self.assertNotIn("ssh", kinds)
 
     def test_gh_picked_when_only_room_gist_id(self):
-        # Phase 3b activation path. peer_meta has NO host_target
-        # (so SSH and Local both decline) but has a room_gist_id and
-        # gh auth works → GhBearer.
+        # peer_meta has only room_gist_id + gh auth available → GhBearer.
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
             bearer = resolve({"room_gist_id": "abc123"})
         self.assertEqual(bearer.KIND, "gh")
 
     def test_unreachable_when_no_gh_auth_and_no_other_meta(self):
-        # Nothing can serve: no host_target (Ssh declines), no loopback
-        # (Local declines), no gh auth (Gh declines).
+        # Nothing can serve: no loopback (Local declines), no gh auth
+        # (Gh declines).
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
             with self.assertRaises(PeerUnreachable):
                 resolve({"room_gist_id": "abc123"})

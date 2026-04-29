@@ -238,93 +238,7 @@ function Set-HnsPortFreedomFor22 {
 # remote commands assume (POSIX paths, redirects). Git for Windows is
 # already a hard prereq for Windows users (we install it above), so
 # its bash.exe is a stable target.
-function Set-OpenSSHDefaultShellBash {
-    $regPath = 'HKLM:\SOFTWARE\OpenSSH'
-    # Locate Git for Windows bash.exe. Standard install paths first,
-    # fall through to PATH lookup. Without bash.exe we can't set it,
-    # so warn loudly -- every airc host on this machine will break
-    # silently otherwise.
-    $bashCandidates = @(
-        'C:\Program Files\Git\bin\bash.exe',
-        'C:\Program Files (x86)\Git\bin\bash.exe',
-        "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe"
-    )
-    $bashPath = $null
-    foreach ($c in $bashCandidates) {
-        if (Test-Path $c) { $bashPath = $c; break }
-    }
-    if (-not $bashPath) {
-        $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue
-        if ($cmd) { $bashPath = $cmd.Source }
-    }
-    if (-not $bashPath) {
-        Write-Warn2 "Could not locate Git for Windows bash.exe -- leaving OpenSSH DefaultShell at OS default (cmd.exe)."
-        Write-Host '    Without bash, this Windows machine cannot HOST an airc room -- joiners will see [QUEUED] forever.'
-        Write-Host '    Fix: install Git for Windows, then re-run install.ps1.'
-        return
-    }
-    # Idempotent -- read current, only write if different.
-    try {
-        $cur = (Get-ItemProperty -Path $regPath -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
-    } catch { $cur = $null }
-    if ($cur -eq $bashPath) {
-        Write-Ok "OpenSSH DefaultShell already set to $bashPath"
-        return
-    }
-    try {
-        if (-not (Test-Path $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
-        }
-        New-ItemProperty -Path $regPath -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
-        Write-Ok "OpenSSH DefaultShell set to $bashPath (was: $cur)"
-    } catch {
-        Write-Warn2 "Could not set DefaultShell registry value (admin required): $_"
-        Write-Host '    Manual fix (admin PowerShell):'
-        Write-Host "      New-ItemProperty -Path '$regPath' -Name DefaultShell -Value '$bashPath' -PropertyType String -Force"
-    }
-}
 
-function Install-OpenSSHServer {
-    $svc = Get-Service sshd -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq 'Running') {
-        Write-Ok 'OpenSSH server already installed + running'
-        return
-    }
-    Write-Step 'Installing + starting OpenSSH Server (admin required) ...'
-    try {
-        # 1. Capability install (if not already).
-        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
-        if ($cap.State -ne 'Installed') {
-            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
-            Write-Host '    OpenSSH.Server capability installed.'
-        }
-        # 2. HNS port-22 reservation (Hyper-V quirk -- see Set-HnsPortFreedomFor22).
-        Set-HnsPortFreedomFor22
-        # 3. Firewall rule for inbound TCP/22. The capability install
-        # usually creates 'OpenSSH-Server-In-TCP' but it may be disabled
-        # or missing on some systems. Idempotent.
-        if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-            Write-Host '    Creating firewall rule for inbound SSH (TCP/22) ...'
-            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
-                                -DisplayName 'OpenSSH Server (sshd)' `
-                                -Enabled True -Direction Inbound -Protocol TCP `
-                                -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
-        }
-        # 4. Start + persist.
-        Start-Service sshd -ErrorAction Stop
-        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-        Write-Ok 'OpenSSH server installed + started + auto-start on boot'
-    } catch {
-        Write-Warn2 "Could not auto-install OpenSSH Server (run install.ps1 in admin PowerShell): $_"
-        Write-Host '    Manual fix (admin PowerShell):'
-        Write-Host '      Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
-        Write-Host '      reg add HKLM\SYSTEM\CurrentControlSet\Services\hns\State /v EnableExcludedPortRange /d 0 /f'
-        Write-Host '      netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1'
-        Write-Host '      Start-Service sshd'
-        Write-Host '      Set-Service -Name sshd -StartupType Automatic'
-        Write-Host '    (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot.)'
-    }
-}
 
 # -- Banner --------------------------------------------------------------
 Write-Host ''
@@ -352,11 +266,8 @@ Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -Te
 }
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
 Install-IfMissing -Name 'jq'                 -WingetId 'jqlang.jq'           -TestCmd { Get-Command jq -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'Tailscale'          -WingetId 'Tailscale.Tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
 
 Install-OpenSSHClient
-Install-OpenSSHServer
-Set-OpenSSHDefaultShellBash
 
 Write-Host ''
 
@@ -547,28 +458,6 @@ if (Test-Path $skillsSrc) {
     }
 }
 
-# -- Tailscale login check -----------------------------------------------
-# Tailscale-installed-but-logged-out is the most common 'tailscale down'
-# state in practice (post-reboot, fresh install, expired auth). Detect
-# proactively and tell the user to sign in before they hit a confusing
-# 'daemon down' error on their first 'airc join'. Mirrors install.sh
-# ts_post_check.
-$tsBin = $null
-if (Get-Command tailscale -ErrorAction SilentlyContinue) {
-    $tsBin = 'tailscale'
-} elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
-    $tsBin = 'C:\Program Files\Tailscale\tailscale.exe'
-}
-if ($tsBin) {
-    $tsOut = & $tsBin status 2>&1 | Out-String
-    if ($tsOut -match 'Logged out|NeedsLogin') {
-        Write-Host ''
-        Write-Warn2 "Tailscale is installed but you're not signed in."
-        Write-Host '    Click the Tailscale tray icon to sign in, or run:  tailscale up'
-        Write-Host '    Do this BEFORE airc join, or cross-machine joins will hang.'
-    }
-}
-
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'
@@ -576,8 +465,7 @@ Write-Host ''
 Write-Host '  Next:'
 Write-Host '    1. Open a NEW PowerShell window (so PATH refreshes)'
 Write-Host '    2. Authenticate gh once:    gh auth login -s gist'
-Write-Host "    3. Sign in to Tailscale:    click tray icon, or 'tailscale up'  (or skip - LAN works without it)"
-Write-Host '    4. Join the mesh:           airc join'
+Write-Host '    3. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'
 Write-Host ''

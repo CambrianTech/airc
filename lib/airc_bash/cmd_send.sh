@@ -237,12 +237,18 @@ cmd_send() {
     #   4. Branches on the structured SendOutcome.kind
     # Adding a new transport doesn't touch this file — only the
     # resolver registers it. (Phases 1-3 of bearer rewrite; #269 #270.)
+    # Phase 3c: pass room_gist_id so GhBearer can serve cross-machine peers.
+    # LocalBearer.can_serve still wins for loopback host_target + writable
+    # remote_home (same-machine 2-tab case). SshBearer is gone.
+    local room_gist_id=""
+    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+
     local outcome
     outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
       "$peer_name" "$active_channel" \
       --host-target "$host_target" \
-      --identity-key "$IDENTITY_DIR/ssh_key" \
-      --remote-home "$rhome" 2>/dev/null)
+      --remote-home "$rhome" \
+      --room-gist-id "$room_gist_id" 2>/dev/null)
     local kind detail
     kind=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
     detail=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)

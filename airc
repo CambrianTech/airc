@@ -1,6 +1,9 @@
 #!/bin/bash
 # AIRC — Agentic Internet Relay Chat. Peer messaging between AI agent instances.
-# Requires Tailscale: https://tailscale.com
+# Phase 3c: Tailscale dependency removed. Cross-network messaging is
+# served by gh-as-bearer (envelope-encrypted gist) rather than direct
+# IP routing through Tailscale's WireGuard tunnel. See
+# project_airc_transport_architecture memory for the rationale.
 #
 # airc connect              → host, wait for peers
 # airc connect name@host    → join a host
@@ -421,25 +424,13 @@ get_config_val_in() {
 
 get_host() {
   # Address-resolution priority for the host endpoint baked into the room
-  # gist (and inline join strings):
-  #   1. Tailscale IP (100.x.y.z) — works internet-wide for tailnet members
-  #   2. LAN IP (192.168.*, 10.*, 172.16-31.*) — works for same-LAN peers
-  #      with no Tailscale required. This is the path Joel wanted: same
-  #      office, no Tailscale, gh + LAN-routable host = mesh works.
-  #   3. hostname — last-resort, only resolves cross-machine when mDNS
+  # gist (and inline join strings) — Phase 3c (post-Tailscale):
+  #   1. LAN IP (192.168.*, 10.*, 172.16-31.*) — same-office mesh
+  #   2. hostname — last-resort, only resolves cross-machine when mDNS
   #      (.local) or DNS happens to know the name.
-  # AIRC_NO_TAILSCALE=1 forces the LAN/hostname fallback even when
-  # Tailscale is installed. Useful for testing the fallback path AND
-  # for users who want to bind the room to a LAN IP for same-LAN
-  # coordination without dragging guests into their tailnet.
-  local ts_bin=""
-  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
-    ts_bin=$(resolve_tailscale_bin || true)
-  fi
-  if [ -n "$ts_bin" ]; then
-    local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
-    [ -n "$ts_ip" ] && echo "$ts_ip" && return
-  fi
+  # Cross-network peering goes through gh-as-bearer (envelope-encrypted),
+  # not via reachable IP. The address baked into the gist is for the
+  # TCP pair handshake (same-LAN) only; ongoing messaging is gist-based.
 
   # LAN IP via UDP-socket trick: open a UDP socket toward a public IP
   # (no actual packet sent — UDP connect just chooses the route), then
@@ -477,279 +468,17 @@ finally:
   hostname
 }
 
-# Resolve the path to a working tailscale CLI binary across platforms.
-# Returns the path on stdout, or empty if not found. Used by both
-# get_host (Tailscale-IP detection) and advise_tailscale_if_down (down
-# diagnosis). Without this helper, each callsite did `command -v
-# tailscale` only, which silently fails on Windows / Git Bash where
-# the executable is `tailscale.exe` and PATHEXT handling is unreliable —
-# resulting in false "Tailscale appears down" advice when it's actually
-# up. Joel 2026-04-24: "now says your tailscale is down" — that was
-# this bug.
-resolve_tailscale_bin() {
-  if command -v tailscale >/dev/null 2>&1; then
-    echo "tailscale"
-    return 0
-  fi
-  # Windows / Git Bash: command -v doesn't always honor PATHEXT, and
-  # the executable is .exe-suffixed.
-  if command -v tailscale.exe >/dev/null 2>&1; then
-    echo "tailscale.exe"
-    return 0
-  fi
-  # Known-path fallbacks. Both common Windows install locations + the
-  # macOS .app bundle. Use [ -f ] not [ -x ] for the Windows .exe paths
-  # — Git Bash MSYS doesn't always reflect the executable bit on NTFS
-  # for files Windows considers runnable-by-extension. -f catches the
-  # file's existence; .exe is implicitly executable on Windows.
-  local candidate
-  for candidate in \
-    "/c/Program Files/Tailscale/tailscale.exe" \
-    "/c/Program Files (x86)/Tailscale/tailscale.exe" \
-    "/mnt/c/Program Files/Tailscale/tailscale.exe"; do
-    if [ -f "$candidate" ]; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  if [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
-    echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-    return 0
-  fi
-  # Last resort: where.exe searches every PATH+PATHEXT location, catches
-  # winget user-scope installs (%LOCALAPPDATA%\...) that aren't in any
-  # of the hard-coded paths above (Joel 2026-04-28: install.sh's
-  # tailscale_present had the same blind spot).
-  if command -v where.exe >/dev/null 2>&1; then
-    local _wherewin
-    _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
-    if [ -n "$_wherewin" ]; then
-      local _bash; _bash=$(_to_bash_path "$_wherewin")
-      [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
-    fi
-  fi
-  return 1
-}
-
-# is_peer_offline_in_tailnet was here. Relocated to
-# lib/airc_core/bearer_ssh.py:_is_peer_offline_in_tailnet as part of the
-# Phase 1 bearer rewrite — all SSH/Tailscale knowledge consolidates into
-# the SshBearer module. Phase 3 removes Tailscale entirely; the bearer
-# module deletes its CGNAT fast-path in one edit at that point.
-
-advise_tailscale_if_down() {
-  # When the saved pairing points at a Tailscale CGNAT address (100.64/10)
-  # and the local Tailscale daemon is NOT running, `airc join` silently
-  # hangs in the SSH probe's ConnectTimeout, then the monitor loop retries
-  # forever, and every `airc msg` queues with no visible sign that THE
-  # USER has to start their tailnet. Silent queue is the opposite of fail-
-  # loud.
-  #
-  # Fix: detect-and-instruct. Do NOT install tailscale. Do NOT sudo. Do
-  # NOT prompt. Just print the platform-appropriate one-liner the user
-  # runs themselves, then return non-zero so the caller exits instead of
-  # falling into retry-silence.
-  #
-  # Scope:
-  #   - only fires when target is 100.64.0.0/10 (Tailscale CGNAT)
-  #   - LAN peers / localhost / DNS-name targets skip entirely
-  #   - AIRC_NO_TAILSCALE=1 short-circuits for LAN-only workflows
-  [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
-  local target_host="${1:-}"
-  [ -z "$target_host" ] && return 0
-  # Strip leading user@ if present — host_target from config.json is
-  # `user@host` form. Without this strip, every resume-path call
-  # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
-  target_host="${target_host##*@}"
-  case "$target_host" in
-    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
-    *) return 0 ;;
-  esac
-
-  # CLI present AND daemon up + logged in? fall through — if the SSH
-  # probe still fails it's a peer-offline problem, not a tailnet
-  # problem. resolve_tailscale_bin() handles Windows tailscale.exe +
-  # the macOS .app bundle path that PATH lookups miss.
-  local ts_bin; ts_bin=$(resolve_tailscale_bin)
-  local ts_status_out=""
-  local ts_status_rc=1
-  if [ -n "$ts_bin" ]; then
-    # `set -e` aborts on `out=$(...)` if the command exits non-zero.
-    # Logged-out tailscale exits 1 — exactly what we need to inspect.
-    # Wrap in if/else so set -e doesn't abort and rc is preserved.
-    if ts_status_out=$("$ts_bin" status 2>&1); then
-      ts_status_rc=0
-    else
-      ts_status_rc=$?
-    fi
-    if [ "$ts_status_rc" = "0" ]; then
-      # Status command succeeded — check whether we're actually
-      # connected. tailscale prints "Logged out." when the daemon is
-      # running but unauthenticated, with rc=0 on some versions.
-      case "$ts_status_out" in
-        *"Logged out"*|*"NeedsLogin"*) : ;;
-        *) return 0 ;;
-      esac
-    fi
-  fi
-
-  echo "" >&2
-  echo "❌ airc: can't reach Tailscale-routed host $target_host — Tailscale isn't ready on this machine." >&2
-  echo "" >&2
-  if [ -z "$ts_bin" ]; then
-    echo "   Tailscale is not installed. airc needs it only for cross-machine mesh." >&2
-    echo "   Install:" >&2
-    echo "     https://tailscale.com/download" >&2
-    echo "   Or via package manager:" >&2
-    echo "     curl -fsSL https://tailscale.com/install.sh | sh" >&2
-    echo "" >&2
-    echo "   After install, bring the tailnet up and re-run airc join." >&2
-    return 1
-  fi
-
-  # CLI present. Distinguish daemon-down from logged-out — they need
-  # different fixes and used to print the same wrong message.
-  local uname_s; uname_s=$(uname -s 2>/dev/null || echo "")
-  local uname_r; uname_r=$(uname -r 2>/dev/null || echo "")
-
-  case "$ts_status_out" in
-    *"Logged out"*|*"NeedsLogin"*)
-      echo "   Tailscale is installed and running but you're not signed in." >&2
-      case "$uname_s" in
-        Darwin)
-          if [ -d /Applications/Tailscale.app ]; then
-            echo "   Opening Tailscale.app — sign in there, then re-run airc join." >&2
-            # Foreground the GUI app so the sign-in dialog is reachable.
-            # `open -a` is a no-op if the app is already up; harmless.
-            open -a Tailscale 2>/dev/null || true
-          else
-            echo "     tailscale up   # CLI prompts a sign-in URL" >&2
-          fi
-          ;;
-        Linux|MINGW*|MSYS*|CYGWIN*)
-          echo "     tailscale up   # follow the printed sign-in URL" >&2
-          ;;
-        *)
-          echo "     tailscale up" >&2
-          ;;
-      esac
-      return 1
-      ;;
-  esac
-
-  # Status command failed AND output didn't say "logged out" → daemon down.
-  echo "   Tailscale CLI is installed but the daemon is not running. Start it:" >&2
-  case "$uname_s" in
-    Darwin)
-      echo "     (macOS) Click the Tailscale tray icon to start the app, or if you" >&2
-      echo "     installed the CLI-only build:" >&2
-      echo "       sudo launchctl kickstart -k system/com.tailscale.tailscaled" >&2
-      ;;
-    Linux)
-      case "$uname_r" in
-        *microsoft*|*WSL*|*wsl*)
-          echo "     (WSL2) WSL has no systemd by default — run tailscaled directly:" >&2
-          echo "       sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &" >&2
-          echo "       sudo tailscale up --ssh --accept-routes" >&2
-          echo "     Or if Tailscale is installed on the Windows side, start it" >&2
-          echo "     from the Windows tray icon (WSL2 will use the Windows-side" >&2
-          echo "     daemon when routing allows)." >&2
-          ;;
-        *)
-          if [ -d /run/systemd/system ]; then
-            echo "     (Linux) sudo systemctl start tailscaled" >&2
-            echo "             sudo tailscale up --ssh --accept-routes" >&2
-          else
-            echo "     (Linux, no systemd) sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &" >&2
-            echo "                         sudo tailscale up --ssh --accept-routes" >&2
-          fi
-          ;;
-      esac
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      echo "     (Windows Git Bash) Click the Tailscale tray icon to start the service." >&2
-      ;;
-    *)
-      echo "     sudo tailscaled &   # background the daemon" >&2
-      echo "     sudo tailscale up   # join the tailnet" >&2
-      ;;
-  esac
-  echo "" >&2
-  echo "   Then re-run: airc join" >&2
-  return 1
-}
-
-timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-
-# tailscale_login_check_or_prompt: at the top of every cmd_connect, if
-# Tailscale is installed but the daemon reports Logged out / NeedsLogin,
-# tell the user + open the GUI sign-in (mac) / print 'tailscale up'
-# (linux/win). Non-fatal: returns 0 always. Same-machine + same-LAN
-# substrate paths still work without Tailscale; this prompt is for
-# the host-goal-is-mesh case Joel pointed at: "if you got it use it".
-#
-# Opt-out: AIRC_NO_TAILSCALE=1 (env var) — explicit user preference
-# for "I'm intentionally running without Tailscale; stop nagging."
-# Distinct from advise_tailscale_if_down which fires only on a
-# CGNAT-targeted SSH attempt; this one is the unconditional startup
-# nudge for both host and joiner roles.
-tailscale_login_check_or_prompt() {
-  [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
-  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
-  [ -z "$ts_bin" ] && return 0   # not installed; no nag (Tailscale truly optional)
-  # `set -e` at the top of airc aborts on a failed $() assignment.
-  # `tailscale status` exits 1 when logged out — exactly the case we
-  # WANT to detect. Trail with `|| true` so the rc doesn't kill us.
-  local out; out=$("$ts_bin" status 2>&1) || true
-  case "$out" in
-    *"Logged out"*|*"NeedsLogin"*) ;;
-    *) return 0 ;;
-  esac
-  echo "" >&2
-  echo "  ⚠  Tailscale is logged out. Running 'tailscale up' to start the auth flow —" >&2
-  echo "     click the URL it prints to authorize this device." >&2
-  echo "     (Opt out anytime: airc join --no-tailscale)" >&2
-  echo "" >&2
-  # Simple, cross-platform: run `tailscale up` synchronously. It prints
-  # the auth URL straight to the user's terminal (where they're looking)
-  # and blocks until the user authorizes via that URL. PS leaf does the
-  # same. No URL extraction, no bg jobs, no browser auto-launch. The
-  # `|| true` lets us continue if the user cancels (Ctrl-C); we just
-  # proceed without Tailscale, same-machine + same-LAN paths still work.
-  "$ts_bin" up || _ts_up_rc=$?
-  # On Windows, `tailscale up` from non-admin Git Bash can exit silently
-  # if the user's shell isn't allowed to talk to the daemon's named
-  # pipe. Detect that case and fall back to launching the GUI (tailscale-
-  # ipn.exe lives next to tailscale.exe) so the user can click "Log in"
-  # from the tray. Without this fallback, the user sees nothing, has
-  # no obvious next step, and we silently proceed with logged-out
-  # Tailscale (Joel 2026-04-28).
-  if [ "${_ts_up_rc:-0}" != "0" ]; then
-    case "$(uname -s)" in
-      MINGW*|MSYS*|CYGWIN*)
-        echo "" >&2
-        echo "  ⚠  'tailscale up' didn't complete (non-admin shell limitation on Windows)." >&2
-        local _ts_dir _ts_ipn
-        _ts_dir=$(dirname "$ts_bin")
-        _ts_ipn="$_ts_dir/tailscale-ipn.exe"
-        if [ -f "$_ts_ipn" ]; then
-          echo "  Opening Tailscale GUI — click the tray icon → Log in to authorize." >&2
-          "$_ts_ipn" >/dev/null 2>&1 &
-        else
-          echo "  Click the Tailscale tray icon (system tray) → Log in to authorize." >&2
-        fi
-        echo "" >&2
-        ;;
-    esac
-  fi
-  echo "" >&2
-  return 0
-}
 
 # host_machine_id: stable per-machine identifier. Same machine, two
 # terminals: same value. Different machines: different. Used by the
 # multi-address gist envelope so a same-machine joiner knows to dial
 # 127.0.0.1 regardless of what Tailscale/LAN addresses the host
+# UTC ISO-8601 timestamp helper — used by cmd_send + others to stamp
+# envelopes. Lost in the Phase 3c Tailscale-block deletion sweep; restored
+# here as a one-liner. The Z suffix marks UTC explicitly so receivers
+# don't need to guess the zone.
+timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
 # advertised. Cached after first call.
 host_machine_id() {
   if [ -n "${_AIRC_MACHINE_ID_CACHE:-}" ]; then
@@ -805,28 +534,11 @@ host_address_set() {
     done
   fi
 
-  # Tailscale: only emit when the daemon reports signed-in. AIRC_NO_TAILSCALE=1
-  # forces empty.
-  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
-    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
-    if [ -n "$ts_bin" ]; then
-      # set -e + non-zero exit on `tailscale status` (logged out) would
-      # abort. `|| true` is fine here — we only use the output.
-      local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
-      case "$ts_out" in
-        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
-        *)
-          # Pull our own Tailscale IP from `tailscale ip -4`. If that
-          # fails (older versions, weird state), parse from status.
-          local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null | head -1 | tr -d '\r\n ')
-          if [ -z "$ts_ip" ]; then
-            ts_ip=$(printf '%s' "$ts_out" | awk 'NR==1 && /^100\./{print $1; exit}')
-          fi
-          [ -n "$ts_ip" ] && printf 'tailscale|%s|%s|\n' "$ts_ip" "$port"
-          ;;
-      esac
-    fi
-  fi
+  # Phase 3c: Tailscale entries removed. Cross-network reachability is
+  # served by gh-as-bearer (envelope-encrypted gist messaging), not by
+  # advertising a Tailscale IP for direct SSH. The address set still
+  # advertises localhost + LAN for same-LAN TCP pair handshake; gist
+  # routing handles everything else.
 }
 
 # host_addresses_json: assemble host_address_set output into a JSON
@@ -902,13 +614,10 @@ peer_pick_address() {
     fi
   fi
 
-  # Tailscale path: only attempt if I have a working tailscale of my own.
-  local i_have_ts; i_have_ts=$(host_address_set 0 | awk -F'|' '$1=="tailscale"{print; exit}')
-  if [ -n "$i_have_ts" ]; then
-    local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
-      | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
-    if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
-  fi
+  # Phase 3c: Tailscale-pick path removed. If localhost + same-LAN
+  # neither match, the joiner falls through to gh-as-bearer routing
+  # (no TCP pair-handshake needed once gh-pair lands; for now, the
+  # peer is unreachable for direct pair and gh-only messaging suffices).
 
   # Fallback: first entry of any kind. Useful when neither side has a
   # clearly matching scope and we just want to try something.
@@ -1136,225 +845,82 @@ init_identity() {
 }
 
 monitor() {
-  local my_name host_target
+  local my_name host_target room_gist_id
   my_name=$(get_name)
   host_target=$(get_config_val host_target "")
+  room_gist_id=""
+  [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
 
-  # Background reminder timer — fires once if there's no SEND for the
-  # interval, resets when the user sends (cmd_send removes the marker).
+  # Background reminder timer + pending-flush loops (unchanged from
+  # pre-Phase-3c). Trap and parent-PID handling are owned by cmd_connect.
   ( reminder_timer_loop ) &
-  local reminder_pid=$!
-  # Background pending-flush loop — drains queued sends when the host comes
-  # back. No-op on host-mode (empty host_target short-circuits).
   ( flush_pending_loop ) &
-  local flush_pid=$!
-  # DO NOT replace the outer trap set by cmd_connect — it owns the airc.pid
-  # cleanup + whole-subtree child reap (SSH tail, Python formatter, this
-  # function's background loops). Overriding it here leaked those children
-  # as orphans whenever the outer shell exited, which kept the SSH session
-  # open on the remote and left inbound streaming visible-but-untracked.
-  # The `pgrep -P $$` in cmd_connect's trap picks up reminder_pid/flush_pid
-  # transitively, so nothing extra is needed here.
 
-  # Stream inbound via `tail -n 0 -F` (inotify/kqueue) — no polling, every
-  # new line surfaces the moment it's written. Joiner tails the host over
-  # a persistent SSH; host tails its local log.
-  #
-  # Wrapped in a reconnect loop so a dropped SSH session / transient
-  # filesystem error doesn't permanently stop notifications. A brief sleep
-  # between retries avoids hot-looping if the remote is down.
-  # Start position for tail: resume from saved offset if we've run before
-  # AND the offset is meaningful (positive integer). This prevents
-  # [rename] markers that arrived during a teardown window from being
-  # skipped on reconnect, but does NOT replay full history.
-  #
-  # Bug found by continuum-b741 2026-04-28: an empty monitor_offset
-  # file (or one containing "0") expanded to `tail -n +1` which is
-  # "print from line 1" = the entire file. Joiners saw days of
-  # accumulated host history dumped on connect. Treat empty / zero /
-  # non-numeric as "no usable offset" → -n 0 (current EOF).
-  #
-  # Stronger bug found by continuum-b69f 2026-04-28 (Windows e2e):
-  # saved offset can be PAST the host's current log length when the
-  # host's log got reset/truncated between sessions (teardown --flush,
-  # crash + rebuild, fresh daemon, etc.). `tail -n +<larger-than-EOF>`
-  # blocks forever waiting for a line number that won't exist until N
-  # MORE writes happen — meanwhile new writes at lines below the offset
-  # are silently invisible. Joiner sees nothing despite mesh being
-  # alive. Fix: bound-check by querying the host's current line count
-  # before committing to the saved offset.
   local offset_file="$AIRC_WRITE_DIR/monitor_offset"
-  local tail_pos="-n 0"
-  if [ -f "$offset_file" ]; then
-    local _saved_offset; _saved_offset=$(cat "$offset_file" 2>/dev/null | tr -d '[:space:]')
-    case "$_saved_offset" in
-      ''|0|*[!0-9]*) ;; # empty / zero / non-numeric → keep -n 0
-      *)
-        tail_pos="-n +$((_saved_offset + 1))"
-        ;;
-    esac
-  fi
 
-  if [ -n "$host_target" ]; then
-    local rhome; rhome=$(remote_home)
-    local ssh_key="$IDENTITY_DIR/ssh_key"
-    local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
-
-    # Stale-offset sanity check (continuum-b69f's Windows e2e bug).
-    # If our saved offset is past the host's current log length, the
-    # SSH tail will block forever. Probe the host's line count first;
-    # if our offset > line count, reset to EOF (-n 0) and clear the
-    # stale offset file. Quick cheap query — single ssh round-trip,
-    # only on the first cycle of the reconnect loop.
-    if [ "$tail_pos" != "-n 0" ]; then
-      local _saved_off; _saved_off=$(cat "$offset_file" 2>/dev/null | tr -d '[:space:]')
-      local _host_lines; _host_lines=$(ssh $ssh_opts "$host_target" "wc -l < $rhome/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d '[:space:]')
-      case "$_host_lines" in
-        ''|*[!0-9]*) _host_lines=0 ;;
-      esac
-      if [ "$_host_lines" -gt 0 ] && [ "$_saved_off" -gt "$_host_lines" ]; then
-        echo "  ⚠  Saved monitor offset ($_saved_off) is past host's current log length ($_host_lines)."
-        echo "     Host log was reset/truncated between sessions. Clearing offset, resuming at EOF."
-        rm -f "$offset_file" 2>/dev/null || true
-        tail_pos="-n 0"
-      fi
-    fi
-    # Monitor escalation (no-claude-left-behind): count consecutive watchdog
-    # timeouts (formatter exit code 2 = no inbound in WATCHDOG_SEC). After
-    # ESCALATE_AFTER consecutive timeouts, the host is genuinely gone (sleep
-    # without launchd, hard crash, network gone). Exit airc connect with a
-    # distinct code so the platform daemon (launchd / systemd Restart=always)
-    # respawns us into a fresh airc connect — that re-enters the resume path
-    # which now self-heals (PR #46): probes the dead host, gives up, deletes
-    # the stale gist, takes over as the new host of #general. First peer to
-    # complete this loop wins; the others discover the new gist on their next
-    # cold-restart and join as peers. Standard distributed-systems leader
-    # election with optimistic conflict resolution via gh-create.
+  if [ -n "$room_gist_id" ]; then
+    # Phase 3c: gh-bearer mode. Poll the shared room gist for inbound
+    # messages. The bearer (lib/airc_core/bearer_gh.py) handles polling
+    # cadence (15s default), rate-limit recovery, and offset resume.
+    # This loop owns watchdog/escalation (formatter exit 2 = no inbound
+    # for WATCHDOG_SEC).
     local consecutive_timeouts=0
-    local ESCALATE_AFTER=2   # 5 min total dead-host detection (2 × WATCHDOG_SEC=150)
-    # Phase 2b: stream inbound through bearer.recv_stream() instead of an
-    # inline ssh-tail. The bearer (lib/airc_core/bearer_ssh.py) owns
-    # transport-level reconnects, line-buffering, and offset resume across
-    # SSH drops. This bash loop now owns ONLY higher-level policy:
-    #   - watchdog (formatter exit 2 = no inbound for WATCHDOG_SEC)
-    #   - probe-on-quiet (idle host vs dead host)
-    #   - escalation counter → exit 99 → daemon respawn (no-claude-left-behind)
-    # The seam is intentional: swapping in GhBearer or LocalBearer in
-    # Phase 3 changes nothing here; the bearer just reads from a different
-    # transport and the same watchdog policy applies.
+    local ESCALATE_AFTER=4   # ~10min total dead-room detection (4 × 150s)
     while true; do
-      local cycle_start; cycle_start=$(date +%s)
-      # Stderr is NOT redirected — bearer_cli only writes there for
-      # structural failures (resolver error, missing args, exec failure).
-      # Per CLAUDE.md "never swallow errors", surface those. Transport-
-      # level SSH chatter is consumed inside the bearer (stderr=DEVNULL
-      # on the ssh subprocess) so it never reaches us here.
-      "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "$host_target" \
-        --host-target "$host_target" \
-        --identity-key "$ssh_key" \
-        --remote-home "$rhome" \
+      "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+        --room-gist-id "$room_gist_id" \
         --offset-file "$offset_file" \
         --state-file "$AIRC_WRITE_DIR/bearer_state.json" \
         | monitor_formatter "$my_name" || true
       local fmt_exit="${PIPESTATUS[1]:-0}"
-      local cycle_end; cycle_end=$(date +%s)
-      local cycle_lifetime=$((cycle_end - cycle_start))
 
-      # Probe-before-count for fmt_exit=2 (watchdog: no inbound for
-      # WATCHDOG_SEC). Without a probe, healthy-but-idle channels look
-      # identical to dead-host channels — both produce fmt_exit=2 — so
-      # we'd notify+escalate every WATCHDOG_SEC on quiet conversations
-      # (constant restart spam). The probe distinguishes:
-      #   probe success → host is alive, channel is just idle. Reset
-      #     counter, no notification, silent reconnect of the tail.
-      #   probe failure → host is genuinely unreachable. Notify, count
-      #     toward escalation. After ESCALATE_AFTER consecutive REAL
-      #     failures, exit 99 → daemon respawn → self-heal.
-      #
-      # cycle_lifetime < 30s also counts as a timeout (SSH refused or
-      # connection reset before tail even started reading) — that's
-      # the dead-host signature too, no probe needed.
       if [ "$fmt_exit" = "2" ]; then
-        if ssh $ssh_opts -o ConnectTimeout=5 -o BatchMode=yes "$host_target" "true" 2>/dev/null; then
-          # Healthy idle. Stay quiet.
-          consecutive_timeouts=0
-        else
-          echo "airc: host went quiet (probe failed) — restarting"
-          consecutive_timeouts=$((consecutive_timeouts + 1))
-        fi
-      elif [ "$cycle_lifetime" -lt 30 ]; then
-        echo "airc: host unreachable (cycle <30s) — restarting"
+        # Watchdog tripped — formatter saw no input for WATCHDOG_SEC.
+        # Bearer-aware probe (gh API) is a follow-up; for now count and
+        # escalate after N consecutive cycles.
+        echo "airc: no inbound for watchdog interval — restarting bearer poll" >&2
         consecutive_timeouts=$((consecutive_timeouts + 1))
       else
         consecutive_timeouts=0
       fi
 
       if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
-        # Only escalate if we have a saved room name (the substrate use case);
-        # legacy 1:1 invite scopes shouldn't auto-promote — they were
-        # explicit pairings, not channel members.
         local saved_room=""
         [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-        if [ -n "$saved_room" ]; then
-          # Surface to STDOUT (not stderr-only) so Monitor-style consumers
-          # that watch stdout (Claude Code Monitor tool, simple `airc join
-          # | tee log`, integration tests) actually see WHY the mesh just
-          # went dark. The pre-fix behavior printed to stderr only and
-          # consumers got a silent disconnect — Joel's #184 (high severity,
-          # violates CLAUDE.md "never swallow errors").
-          #
-          # Daemon-aware: detect whether `airc daemon install` has been
-          # run on this OS; if yes, the exit-99 will trigger self-heal
-          # via launchd/systemd. If NOT, exit 99 is just death — tell
-          # the user explicitly so they can `airc join` again or install
-          # the daemon for auto-recovery.
-          local _daemon_present=0
-          if _daemon_installed >/dev/null 2>&1; then
-            _daemon_present=1
-          fi
-          echo ""
-          if [ "$_daemon_present" = "1" ]; then
-            echo "airc: mesh disconnected — host of #${saved_room} dead $consecutive_timeouts cycles; daemon restart will self-heal"
-            echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
-            echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
-            echo "  ⚠  (per the no-claude-left-behind protocol — first agent back becomes new host)" >&2
-          else
-            echo "airc: mesh disconnected — host of #${saved_room} dead $consecutive_timeouts cycles; NO DAEMON installed, restart with: airc join"
-            echo "airc:   (for auto-recovery on disconnect: airc daemon install)"
-            echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
-            echo "  ⚠  Exiting airc connect — NO DAEMON installed; rerun 'airc join' to reconnect" >&2
-            echo "  ⚠  Install daemon for auto-recovery: airc daemon install" >&2
-          fi
-          # Specific exit code so postmortems can tell why we left. launchd /
-          # systemd Restart=always treat any non-zero exit as restart-worthy.
-          exit 99
+        local _daemon_present=0
+        if _daemon_installed >/dev/null 2>&1; then _daemon_present=1; fi
+        echo ""
+        if [ "$_daemon_present" = "1" ]; then
+          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; daemon restart will self-heal"
+          echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
         else
-          # Legacy 1:1 invite scope. Don't auto-promote, but warn the user
-          # so they can manually re-pair if the host is genuinely gone.
-          echo "airc: $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down"
-          echo "  ⚠  $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down" >&2
-          consecutive_timeouts=0   # reset to avoid spamming
+          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; NO DAEMON installed, restart with: airc join"
+          echo "airc:   (for auto-recovery: airc daemon install)"
+          echo "  ⚠  Exiting airc connect — NO DAEMON installed; rerun 'airc join' to reconnect" >&2
         fi
+        exit 99
       fi
       sleep 3
     done
   else
+    # Standalone / pure-local mode (no room gist): tail own messages.jsonl
+    # directly. Used by integration tests with --no-room --no-gist and by
+    # any scope that hasn't published a gh room.
+    local tail_pos="-n 0"
+    if [ -f "$offset_file" ]; then
+      local _saved_offset; _saved_offset=$(cat "$offset_file" 2>/dev/null | tr -d '[:space:]')
+      case "$_saved_offset" in
+        ''|0|*[!0-9]*) ;;
+        *) tail_pos="-n +$((_saved_offset + 1))" ;;
+      esac
+    fi
     while true; do
       tail $tail_pos -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name" || true
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
       sleep 1
     done
-    # `while true` should be unreachable here — the body has no break /
-    # exit / return, the pipeline is `|| true`-guarded, and there's no
-    # signal trap in this scope that returns from the loop. Yet Joel
-    # observed the host monitor silently disappearing on canary dee3b6c
-    # (#184 part 2). If we ever fall through, leave a loud diagnostic
-    # on both stdout (Monitor-visible) and stderr (log-visible) so the
-    # next person debugging has something to grep — silent exit was
-    # the original sin per CLAUDE.md "never swallow errors".
-    echo "airc: host monitor loop exited unexpectedly — restart with: airc join"
-    echo "  ⚠  host monitor while-true loop fell through; this should be impossible." >&2
-    echo "  ⚠  If you see this, capture the airc connect stdout/stderr + report on #184." >&2
+    echo "airc: standalone monitor loop fell through — restart with: airc join"
+    echo "  ⚠  while-true fell through; should be impossible." >&2
     exit 99
   fi
 }
