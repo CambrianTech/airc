@@ -65,6 +65,15 @@ cmd_send() {
   # issue. Exposed as a flag (not an env var) so call sites are
   # grep-able and the pattern matches the rest of the airc CLI surface.
   local internal=0
+  # --plaintext: skip envelope-layer encryption even when recipient
+  # x25519 pubkey is on file. For control traffic ([PING:uuid] /
+  # [PONG:uuid]) where the body is a public uuid with zero secret
+  # content. Pre-fix: pings encrypted asymmetrically (sender had
+  # recipient's pubkey; recipient lacked sender's pubkey) → recipient
+  # silently dropped with "missing pubkey/privkey for decrypt" → no
+  # auto-pong → cmd_ping timed out. Plaintext sidesteps the asymmetry
+  # entirely for these short-lived control messages.
+  local plaintext=0
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -89,6 +98,23 @@ cmd_send() {
       --internal)
         internal=1
         shift ;;
+      --plaintext|-plaintext)
+        plaintext=1
+        shift ;;
+      --)
+        # POSIX flag-terminator: anything after this is positional even
+        # if it looks like a flag. Lets users send literal --strings in
+        # message bodies: `airc msg -- --foo bar`.
+        shift
+        while [ $# -gt 0 ]; do positional+=("$1"); shift; done
+        ;;
+      --*|-*)
+        # Unknown flag — pre-fix this fell into the *) catch-all and got
+        # silently absorbed into the message body, so 'airc msg
+        # --invalidflag value body' returned exit 0 broadcast (ideem-
+        # local-4bef caught 2026-04-29). Loud failure now; users with a
+        # literal --string in the message body can use the -- terminator.
+        die "Unknown flag: $1 (use -- to terminate flags if this is part of the message body)" ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -125,6 +151,17 @@ cmd_send() {
     case "$1" in
       @*)
         local _p="${1#@}"
+        # Reject empty `@` (continuum-b741 + ideem-local-4bef caught
+        # 2026-04-29: `airc msg @ body` silently broadcast). Reject
+        # double-@ `@@peer` while we're here (also caught: accepted as
+        # DM to literal '@peer'). Reject numeric-only DMs as per the
+        # peer-name charset rule (`@12345` is a likely typo, not a
+        # real peer).
+        case "$_p" in
+          "")           die "Empty @ recipient (use 'airc msg <message>' for broadcast, or 'airc msg @<peer> ...' for DM)" ;;
+          @*)           die "Double @ recipient '$1' — peer names are bare, not @-prefixed" ;;
+          *[!a-z0-9,-]*) die "Invalid peer name in '$1' — must match [a-z0-9-]+ (comma-separated for multi-DM)" ;;
+        esac
         if [ -z "$_peer_csv" ]; then
           _peer_csv="$_p"
         else
@@ -166,6 +203,12 @@ cmd_send() {
     peer_name="all"
     msg="$*"
   fi
+  # Reject empty broadcast bodies — pre-fix `airc msg ""` printed the
+  # usage line but exited 0 (continuum-b741 caught 2026-04-29). The
+  # other "no message" path already dies above; this one is the
+  # explicit-empty-string case that fell through.
+  [ "$peer_name" = "all" ] && [ -z "$msg" ] \
+    && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
   ensure_init
 
   local my_name ts_val
@@ -221,7 +264,7 @@ cmd_send() {
     # package isn't installed). The wrap CLI passes through plaintext in
     # that case, transparently.
     local recipient_pub=""
-    if [ "$peer_name" != "all" ]; then
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
@@ -341,20 +384,15 @@ cmd_send() {
     # delivery, and the peer in the actual room waited forever for a
     # reply that never landed.
     #
-    # Detect: pidfile exists AND every PID in it is alive. Anything else
-    # = monitor dead = broadcasting into a void. Die loudly so the user
-    # immediately knows their cwd / scope / monitor state is wrong.
+    # Detect monitor liveness via the shared prune_pidfile_and_count
+    # helper (airc top-level). Same contract as cmd_status — pre-fix
+    # this used all-alive logic while status used any-alive, so a
+    # pidfile with 1 stale orphan + 2 live processes showed "monitor:
+    # running" but every msg refused. Helper auto-prunes the orphan.
     local _pidfile="$AIRC_WRITE_DIR/airc.pid"
     local _monitor_alive=0
-    if [ -f "$_pidfile" ]; then
-      local _pids; _pids=$(cat "$_pidfile" 2>/dev/null)
-      if [ -n "$_pids" ]; then
-        local _all_alive=1 _p
-        for _p in $_pids; do
-          kill -0 "$_p" 2>/dev/null || { _all_alive=0; break; }
-        done
-        [ "$_all_alive" = "1" ] && _monitor_alive=1
-      fi
+    if [ "$(prune_pidfile_and_count "$_pidfile")" -gt 0 ]; then
+      _monitor_alive=1
     fi
     if [ "$_monitor_alive" = "0" ]; then
       # --internal callers (informational broadcasts: [rename], etc.):
@@ -401,7 +439,7 @@ cmd_send() {
     # we have their pubkey on file; broadcasts go plaintext (group
     # encryption is a future Phase E.4).
     local _host_recipient_pub=""
-    if [ "$peer_name" != "all" ]; then
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       _host_recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
@@ -522,13 +560,15 @@ cmd_ping() {
   local start_time
   start_time=$(date +%s)
 
-  # Route via #general (the universal lobby sidecar). Pre-fix: ping
-  # used the sender's default channel, but peers in different cwds
-  # auto-scope to different project channels (cambriantech vs ideem
-  # vs useideem) so the recipient often didn't poll the sender's
-  # default channel and never saw the ping. #general is the one
-  # channel everyone subscribes to — guaranteed common ground.
-  cmd_send --channel general "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed (airc status)"
+  # Route via #general (universal lobby) and force PLAINTEXT. Encryption
+  # for [PING:uuid] adds zero security value (the body is a public uuid)
+  # and was the actual cause of #308: pair handshake was asymmetric, so
+  # one side dropped encrypted control traffic with "missing pubkey/
+  # privkey for decrypt" and the auto-pong silently never propagated.
+  # Plaintext sidesteps the asymmetry; the bigger pubkey-symmetry fix
+  # is its own follow-up.
+  cmd_send --channel general --plaintext "@$peer_name" "[PING:$ping_id]" >/dev/null \
+    || die "ping send failed (airc status)"
 
   echo "ping sent to $peer_name (id=$ping_id) — waiting up to ${timeout}s for pong..."
 

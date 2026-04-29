@@ -47,6 +47,7 @@ cmd_rename() {
   # above — making the resulting name unreachable by `airc whois` /
   # `airc kick` (both reject leading-dash). Caught by Copilot review on
   # PR #75 follow-up.
+  local _input="$new_name"
   new_name=$(echo "$new_name" \
     | tr '[:upper:]' '[:lower:]' \
     | sed 's/[^a-z0-9-]/-/g' \
@@ -56,10 +57,28 @@ cmd_rename() {
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
+  # Announce sanitization (vhsm-d1f4 caught 2026-04-29: 'two words' →
+  # 'two-words', 'VHSMD1F4' → 'vhsmd1f4' silently). Pre-fix the user
+  # had no signal that the name they typed wasn't the name that landed.
+  if [ "$_input" != "$new_name" ]; then
+    echo "  Sanitized: '$_input' → '$new_name' (allowed charset: a-z 0-9 -)"
+  fi
+
   local old_name; old_name=$(get_config_val name "")
   if [ "$old_name" = "$new_name" ]; then
     echo "  Already named '$new_name'."
     return
+  fi
+
+  # Collision check against the peer roster (continuum-b741 + ideem-
+  # local-4bef caught 2026-04-29: renaming to an active peer's name
+  # was accepted silently, both peers then visible as the same name,
+  # DM routing ambiguous). Refuse loudly. The roster is whatever
+  # peers/ records this scope has accumulated — not perfect (a peer
+  # we've never paired with won't trigger it), but catches the common
+  # case of a fresh peer typing an existing peer's nick.
+  if [ -d "$PEERS_DIR" ] && [ -f "$PEERS_DIR/$new_name.json" ]; then
+    die "name collision: '$new_name' is already a peer in this scope (use 'airc peers' to see the roster)"
   fi
 
   # Phase 1: write the new name into THIS scope's config (the truth-

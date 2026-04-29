@@ -1257,21 +1257,33 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         echo "     Install: https://cli.github.com  (or: brew install gh)"
         echo "     Skipping gist push; long invite above is the only handoff."
       else
-        local _gist_tmp; _gist_tmp=$(mktemp -t airc-invite.XXXXXX)
+        # Bootstrap basename + description match channel_gist.create_new's
+        # canonical shape (airc-room-<channel>.json + "airc room: #X").
+        # Pre-fix the host path used a random mktemp basename
+        # (airc-invite.XXXXXX) and "airc mesh" description, then
+        # heartbeat (and channel_gist.find_existing on subsequent peers)
+        # tried to find/edit `airc-room-X.json` which didn't exist —
+        # heartbeat 'gh gist edit' silently failed → false eviction
+        # loop → gist deleted mid-conversation. Issue #301.
+        local _gist_tmpdir; _gist_tmpdir=$(mktemp -d -t airc-bootstrap.XXXXXX)
+        local _gist_tmp="$_gist_tmpdir/airc-room-${room_name}.json"
+        if [ "$use_room" != "1" ]; then
+          # Legacy single-pair invite mode keeps the old basename — it's
+          # short-lived (deleted post-pair).
+          _gist_tmp="$_gist_tmpdir/airc-invite.json"
+        fi
         local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         local _gist_kind="invite"
         local _gist_desc="airc invite for $name (delete after pair)"
         local _gist_payload=""
 
         if [ "$use_room" = "1" ]; then
-          # Mesh mode: ONE persistent gist per gh account (description
-          # "airc mesh"), shared by every `airc join` on the account.
-          # Same SSH-pair handshake under the hood — only the discovery
-          # contract changes from per-room to per-account-singleton.
-          #
-          # `channels` is an advisory list of the rooms this client
-          # cares about; in Phase 1 it's purely informational, in
-          # Phase 2 it'll drive message routing.
+          # Mesh-singleton discovery (joiner _mesh_find looks for this
+          # description literal). Filename is canonical airc-room-<channel>.json
+          # so heartbeat's gh-edit basename match works (#297).
+          # Migrating fully to per-channel gist shape is a follow-up
+          # (#301 doc note); changing description here would break
+          # the joiner's _mesh_find call without a paired update.
           _gist_kind="mesh"
           _gist_desc="$(_mesh_desc)"
           # last_heartbeat: host's presence signal, refreshed every
@@ -1337,7 +1349,7 @@ JSON
         # whoever holds the string can pair. Room gists persist; invite
         # gists should be deleted by the host after the first joiner.
         local _gist_url; _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
-        rm -f "$_gist_tmp"
+        rm -rf "$_gist_tmpdir"
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)

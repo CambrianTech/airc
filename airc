@@ -413,6 +413,45 @@ relay_list() { [ -d "$AIRC_WRITE_DIR/$1" ] && ls -1 "$AIRC_WRITE_DIR/$1" 2>/dev/
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Single source of truth for "is this scope's monitor running?" — pre-fix,
+# cmd_status used any-alive logic and cmd_send used all-alive logic, so a
+# pidfile with one stale orphan + one live process showed "monitor:
+# running" in status BUT "Send NOT delivered — pidfile stale" from msg.
+# vhsm-d1f4 + authenticator-448f independently reproduced 2026-04-29.
+#
+# Contract: a scope is "alive" if AT LEAST ONE pid in the pidfile is
+# alive. Stale pids are pruned in-place so the file converges on
+# truth. Echoes the live count to stdout (caller can branch on > 0)
+# and rewrites pidfile with only-living entries.
+#
+# Usage:
+#   if [ "$(prune_pidfile_and_count "$AIRC_WRITE_DIR/airc.pid")" -gt 0 ]; then
+#     ... monitor is up
+#   fi
+prune_pidfile_and_count() {
+  local pidfile="${1:-}"
+  [ -f "$pidfile" ] || { echo 0; return; }
+  local raw; raw=$(cat "$pidfile" 2>/dev/null)
+  local live=""
+  local p
+  for p in $raw; do
+    case "$p" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    if kill -0 "$p" 2>/dev/null; then
+      live="${live:+$live }$p"
+    fi
+  done
+  if [ "$raw" != "$live" ]; then
+    if [ -n "$live" ]; then
+      printf '%s\n' "$live" > "$pidfile" 2>/dev/null || true
+    else
+      rm -f "$pidfile" 2>/dev/null || true
+    fi
+  fi
+  if [ -z "$live" ]; then echo 0; else echo "$(printf '%s\n' $live | wc -w | tr -d ' ')"; fi
+}
+
 # Validate a peer name matches the allowed nick charset BEFORE using it in
 # filesystem paths or remote SSH commands. Same charset cmd_rename uses
 # (a-z 0-9 -) — anything else is unreachable as a real airc identity and
