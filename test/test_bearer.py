@@ -964,6 +964,23 @@ class GhBearerSendTests(unittest.TestCase):
         # Attempt 2 merged racer + ours.
         self.assertEqual(captured[1], racer_line + my_line)
 
+    def test_send_retries_on_409_conflict(self):
+        # continuum-b741 caught HTTP 409 4/5 on a 5-way burst (#299).
+        # First PATCH 409s → loop → second PATCH succeeds → verify ok.
+        gets = [
+            {"files": {}},
+            {"files": {"messages.jsonl": {"content": '{"from":"racer","msg":"a"}\n'}}},
+            {"files": {"messages.jsonl": {"content": '{"from":"racer","msg":"a"}\n{"x":1}\n'}}},
+        ]
+        patches = [
+            (False, "gh: Gist cannot be updated. (HTTP 409)"),
+            (True, ""),
+        ]
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=lambda _: gets.pop(0)), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=lambda *_: patches.pop(0)):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "delivered")
+
     def test_send_transient_when_clobber_retries_exhausted(self):
         # Pathological: every verify fails. Bound the loop, surface
         # transient_failure (no silent loss).
@@ -973,7 +990,7 @@ class GhBearerSendTests(unittest.TestCase):
                                return_value=(True, "")):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "transient_failure")
-        self.assertIn("clobbered", outcome.detail)
+        self.assertIn("conflict", outcome.detail)
 
     def test_send_without_gist_id_raises(self):
         b = GhBearer({})
