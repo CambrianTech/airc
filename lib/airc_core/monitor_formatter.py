@@ -276,6 +276,47 @@ def run(my_name: str, peers_dir: str) -> int:
             continue
         fr = m.get("from", "?")
         to = m.get("to", "")
+        # Phase E.3: decrypt envelope-layer ciphertext if present. Drop
+        # the message rather than display garbage if decrypt fails (per
+        # CLAUDE.md "never swallow errors", emit stderr first). Plaintext
+        # envelopes (no enc field) pass through unchanged.
+        if m.get("enc"):
+            try:
+                from airc_core import envelope as _env
+                from airc_core import identity as _id
+                from airc_core import crypto as _crypto
+            except ImportError:
+                # cryptography missing locally → can't decrypt anything.
+                # Drop encrypted messages with a stderr note so the user
+                # knows their setup is missing the venv/cryptography.
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"cryptography not installed (run install.sh to set up venv)\n"
+                )
+                sys.stderr.flush()
+                continue
+            sender_pub = _id.peer_x25519_pub(peers_dir, fr) if fr else None
+            my_priv = _id.load_priv(os.path.join(scope_dir, "identity"))
+            if sender_pub is None or my_priv is None:
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"missing pubkey/privkey for decrypt\n"
+                )
+                sys.stderr.flush()
+                continue
+            decrypted = _env.unwrap_envelope(m, my_priv, sender_pub)
+            if decrypted is None:
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"AEAD auth failed (tampered or wrong key?)\n"
+                )
+                sys.stderr.flush()
+                continue
+            m = decrypted
+            # Re-serialize the decrypted envelope as `line` so the local
+            # mirror below writes plaintext. This way `airc logs` shows
+            # readable content even though the wire was ciphertext.
+            line = json.dumps(m)
         msg = m.get("msg", "")
         # Filter own sends early, including our own [rename] markers. Read
         # the name fresh so a mid-session rename takes effect immediately.

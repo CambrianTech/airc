@@ -911,6 +911,56 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   export PATH="$BIN_DIR:$PATH"
 fi
 
+# ── Python venv with crypto deps (Phase E: envelope encryption) ────────
+# airc's envelope-layer end-to-end encryption needs the cryptography
+# package. We create a venv inside the install dir and pip-install
+# there because PEP 668 makes `pip install --user` fail on managed
+# Pythons (homebrew, system Python on Debian/Ubuntu/etc). The venv
+# avoids touching system Python at all — fully self-contained.
+#
+# airc's bash wrapper detects this venv at AIRC_PYTHON resolution time
+# and prefers it over system python3. If venv setup fails (no python3,
+# pip module missing, network failure during install), airc falls back
+# to system python3 and runs in plaintext mode. Per the "no scary
+# popups" rule: pip-install never elevates, never prompts; failures
+# print a non-fatal warning.
+_airc_venv="$CLONE_DIR/.venv"
+if [ ! -d "$_airc_venv" ] && command -v python3 >/dev/null 2>&1; then
+  if python3 -m venv "$_airc_venv" 2>/dev/null; then
+    ok "Python venv created: $_airc_venv"
+  else
+    warn "Could not create Python venv (python3-venv missing?). airc will run in plaintext mode."
+  fi
+fi
+# Locate venv pip — POSIX vs Windows-Git-Bash paths.
+_airc_venv_pip=""
+if [ -x "$_airc_venv/bin/pip" ]; then
+  _airc_venv_pip="$_airc_venv/bin/pip"
+elif [ -x "$_airc_venv/Scripts/pip.exe" ]; then
+  _airc_venv_pip="$_airc_venv/Scripts/pip.exe"
+fi
+if [ -n "$_airc_venv_pip" ]; then
+  # Check if cryptography is already installed (idempotent install).
+  _airc_venv_python_bin=""
+  if [ -x "$_airc_venv/bin/python" ]; then
+    _airc_venv_python_bin="$_airc_venv/bin/python"
+  elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
+    _airc_venv_python_bin="$_airc_venv/Scripts/python.exe"
+  fi
+  if [ -n "$_airc_venv_python_bin" ] && \
+     "$_airc_venv_python_bin" -c "import cryptography" >/dev/null 2>&1; then
+    : # already installed; skip
+  else
+    if "$_airc_venv_pip" install -q --upgrade pip >/dev/null 2>&1; then : ; fi
+    if "$_airc_venv_pip" install -q cryptography 2>&1 | tail -3; then
+      ok "cryptography installed in venv (envelope encryption ready)"
+    else
+      warn "cryptography install failed; airc will run in plaintext mode"
+      warn "  Manual fix:  $_airc_venv_pip install cryptography"
+    fi
+  fi
+fi
+
 # ── Skills into Claude Code ─────────────────────────────────────────────
 
 if [ -d "$CLONE_DIR/skills" ]; then

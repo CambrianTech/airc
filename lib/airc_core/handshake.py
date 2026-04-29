@@ -68,6 +68,10 @@ def cmd_send(args) -> int:
         "host": args.my_host,
         "ssh_pub": args.my_ssh_pub,
         "sign_pub": args.my_sign_pub,
+        # Phase E.2: X25519 pubkey for envelope encryption. Optional —
+        # peers without cryptography installed send empty string and
+        # the recipient stores nothing, falling back to plaintext.
+        "x25519_pub": args.my_x25519_pub or "",
         "airc_home": args.my_airc_home,
         "identity": json.loads(args.my_identity_json or "{}"),
     })
@@ -203,15 +207,22 @@ def cmd_accept_one(args) -> int:
                             pass
 
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    peer_record = {
+        "name": jname,
+        "host": joiner.get("host", ""),
+        "airc_home": joiner.get("airc_home", ""),
+        "paired": timestamp,
+        "ssh_pub": joiner.get("ssh_pub", ""),
+        "identity": joiner.get("identity", {}),
+    }
+    # Phase E.2: store peer's X25519 pubkey only if non-empty. Empty
+    # means peer is on pre-Phase-E airc; envelope encryption falls
+    # back to plaintext for them, transparently.
+    j_x25519 = joiner.get("x25519_pub", "")
+    if j_x25519:
+        peer_record["x25519_pub"] = j_x25519
     with open(os.path.join(peers_dir, jname + ".json"), "w") as f:
-        json.dump({
-            "name": jname,
-            "host": joiner.get("host", ""),
-            "airc_home": joiner.get("airc_home", ""),
-            "paired": timestamp,
-            "ssh_pub": joiner.get("ssh_pub", ""),
-            "identity": joiner.get("identity", {}),
-        }, f, indent=2)
+        json.dump(peer_record, f, indent=2)
     if joiner.get("sign_pub"):
         with open(os.path.join(peers_dir, jname + ".pub"), "w") as f:
             f.write(joiner["sign_pub"])
@@ -225,8 +236,26 @@ def cmd_accept_one(args) -> int:
         host_identity = host_config.get("identity", {}) or {}
     except Exception:
         pass
+    # Phase E.2: include host's X25519 pubkey in the response so
+    # joiner can save it for symmetric encryption later. Read from
+    # the identity dir we already have. None = host hasn't bootstrapped
+    # the X25519 keypair (cryptography missing) — joiner stores empty
+    # and falls back to plaintext.
+    host_x25519_pub_b64 = ""
+    try:
+        # Lazy import: cryptography may not be installed; that's fine,
+        # we just send empty in that case.
+        from . import identity as _identity
+        from . import crypto as _crypto
+        host_x25519_pub_raw = _identity.load_pub(identity_dir)
+        if host_x25519_pub_raw is not None:
+            host_x25519_pub_b64 = _crypto.b64encode(host_x25519_pub_raw)
+    except ImportError:
+        pass  # cryptography not installed — empty pubkey, plaintext fallback
+
     response = json.dumps({
         "ssh_pub": host_pub,
+        "x25519_pub": host_x25519_pub_b64,
         "name": args.host_name,
         "reminder": args.reminder_interval,
         "airc_home": args.airc_home,
@@ -276,6 +305,8 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--my-host", default="")
     s.add_argument("--my-ssh-pub", default="")
     s.add_argument("--my-sign-pub", default="")
+    s.add_argument("--my-x25519-pub", default="",
+                   help="Joiner's X25519 pubkey, b64-encoded; for envelope encryption (Phase E)")
     s.add_argument("--my-airc-home", default="")
     s.add_argument("--my-identity-json", default="{}")
     s.set_defaults(func=cmd_send)

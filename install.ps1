@@ -459,6 +459,50 @@ if ($userPath -notlike "*$BIN_TARGET*") {
     Write-Step "Added $BIN_TARGET to user PATH (open a NEW shell to pick up)"
 }
 
+# -- Python venv with crypto deps (Phase E: envelope encryption) --------
+# Mirrors install.sh's venv setup. Per the "no scary popups" rule, this
+# never elevates: pip-install --user is fine, but we use a self-contained
+# venv to avoid PEP 668 issues on managed Pythons. airc's bash wrapper
+# detects this venv at AIRC_PYTHON resolution time. Failure → plaintext
+# fallback (warning, not error).
+$venvDir = Join-Path $CLONE_DIR '.venv'
+if (-not (Test-Path $venvDir)) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if (-not $py) { $py = (Get-Command python3 -ErrorAction SilentlyContinue) }
+    if ($py) {
+        try {
+            & $py.Source -m venv $venvDir 2>&1 | Out-Null
+            Write-Ok "Python venv created: $venvDir"
+        } catch {
+            Write-Warn2 "Could not create Python venv. airc will run in plaintext mode: $_"
+        }
+    } else {
+        Write-Warn2 "python not on PATH; skipping venv setup. airc will run in plaintext mode."
+    }
+}
+$venvPip = Join-Path $venvDir 'Scripts\pip.exe'
+$venvPython = Join-Path $venvDir 'Scripts\python.exe'
+if (Test-Path $venvPip) {
+    $hasCrypto = $false
+    if (Test-Path $venvPython) {
+        try { & $venvPython -c "import cryptography" 2>$null; $hasCrypto = ($LASTEXITCODE -eq 0) } catch {}
+    }
+    if (-not $hasCrypto) {
+        try {
+            & $venvPip install -q --upgrade pip 2>&1 | Out-Null
+            & $venvPip install -q cryptography 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "cryptography installed in venv (envelope encryption ready)"
+            } else {
+                Write-Warn2 "cryptography install failed; airc will run in plaintext mode"
+                Write-Host "    Manual fix:  $venvPip install cryptography"
+            }
+        } catch {
+            Write-Warn2 "cryptography install threw: $_"
+        }
+    }
+}
+
 # -- Skills wiring -------------------------------------------------------
 # Same as install.sh: each subdir under <repo>/skills becomes a slash
 # command in Claude Code. Symlink when possible (so `git pull` updates

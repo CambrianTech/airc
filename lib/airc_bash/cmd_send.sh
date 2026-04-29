@@ -194,23 +194,51 @@ cmd_send() {
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
     # Always mirror locally FIRST so we have an audit trail regardless of
-    # what the wire does. If send succeeds: local + remote both have it.
-    # If send fails: local has it (user can see it + retry), remote doesn't.
-    # This prevents silent loss where both sides forget a message that
-    # never arrived.
+    # what the wire does. Local mirror stays PLAINTEXT (the user's own
+    # audit log of what they sent — the alternative would force `airc
+    # logs` to decrypt own outbound, which is silly). Wire form may be
+    # encrypted below if the recipient has a stored x25519_pub.
     echo "$full_msg" >> "$MESSAGES"
 
+    # Phase E.3: wrap the wire envelope with envelope-layer encryption
+    # if we have the recipient's X25519 pubkey on file. Empty pubkey =
+    # peer is on pre-Phase-E airc (or never paired with us under E),
+    # in which case the wrap CLI passes through unchanged. Failures
+    # also pass through (loud stderr, no silent encryption skip).
+    # Phase E.3: look up recipient's X25519 pubkey for envelope encryption.
+    # Empty result = peer hasn't paired under E2E (or our cryptography
+    # package isn't installed). The wrap CLI passes through plaintext in
+    # that case, transparently.
+    local recipient_pub=""
+    if [ "$peer_name" != "all" ]; then
+      recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+        --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
+    fi
+    local wire_msg="$full_msg"
+    if [ -n "$recipient_pub" ]; then
+      # Stderr unredirected — wrap failures surface loud (CLAUDE.md "never swallow").
+      wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+        --recipient-pub "$recipient_pub" \
+        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
+      # Diagnostic: emit the wire shape to stderr so test logs surface
+      # whether encryption actually engaged. Phase E debug aid; remove
+      # once production has verified the path. (Doubles as a sanity
+      # check for `airc doctor`.)
+      if [ -n "${AIRC_E2E_DEBUG:-}" ]; then
+        echo "[airc:e2e] wire_msg: $wire_msg" >&2
+      fi
+    fi
+
     # Hand the wire to the bearer abstraction. ALL transport-specific
-    # knowledge (SSH invocation, __APPENDED__ confirmation, Tailscale-CGNAT
-    # offline fast-path, auth-vs-transient classification) lives in
-    # lib/airc_core/bearer_ssh.py. cmd_send only:
+    # knowledge lives in lib/airc_core/bearer_*.py. cmd_send only:
     #   1. Builds the signed envelope (above)
-    #   2. Hands payload + peer_meta to bearer_cli
-    #   3. Branches on the structured SendOutcome.kind
-    # Adding a new transport (gh, Reticulum, …) doesn't touch this file —
-    # only the resolver registers it. (Phase 1 of bearer rewrite; refs #270.)
+    #   2. Wraps with envelope-layer crypto if recipient supports it
+    #   3. Hands payload + peer_meta to bearer_cli
+    #   4. Branches on the structured SendOutcome.kind
+    # Adding a new transport doesn't touch this file — only the
+    # resolver registers it. (Phases 1-3 of bearer rewrite; #269 #270.)
     local outcome
-    outcome=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+    outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
       "$peer_name" "$active_channel" \
       --host-target "$host_target" \
       --identity-key "$IDENTITY_DIR/ssh_key" \

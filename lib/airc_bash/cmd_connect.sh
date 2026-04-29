@@ -852,9 +852,14 @@ cmd_connect() {
     fi
 
     echo "  Connecting to $peer_host_only:$peer_port..."
-    local my_ssh_pub my_sign_pub
+    local my_ssh_pub my_sign_pub my_x25519_pub
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
+    # Phase E.2: include our X25519 pubkey for envelope encryption.
+    # bootstrap is idempotent (no-ops if keypair exists). Empty value
+    # if cryptography isn't installed — handshake stays compatible
+    # with peers running pre-Phase-E airc.
+    my_x25519_pub=$("$AIRC_PYTHON" -m airc_core.identity bootstrap --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).
@@ -882,6 +887,7 @@ except Exception:
                   --my-host "$(whoami)@$(get_host)" \
                   --my-ssh-pub "$my_ssh_pub" \
                   --my-sign-pub "$my_sign_pub" \
+                  --my-x25519-pub "$my_x25519_pub" \
                   --my-airc-home "$AIRC_WRITE_DIR" \
                   --my-identity-json "$my_identity_json" 2>&1) || _pair_ok=0
 
@@ -962,9 +968,12 @@ except Exception:
     # Save host as a peer (with their airc_home so wire paths are correct).
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
-    local host_airc_home
+    local host_airc_home host_x25519_pub
     host_airc_home=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field airc_home "" 2>/dev/null || true)
-    "$AIRC_PYTHON" -c "
+    # Phase E.2: capture host's X25519 pubkey from handshake response
+    # so cmd_send can encrypt envelopes destined for this peer.
+    host_x25519_pub=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field x25519_pub "" 2>/dev/null || true)
+    HOST_X25519_PUB="$host_x25519_pub" "$AIRC_PYTHON" -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
@@ -990,6 +999,9 @@ record = {
     'airc_home': '$host_airc_home',
     'paired': '$(timestamp)'
 }
+host_x = os.environ.get('HOST_X25519_PUB', '')
+if host_x:
+    record['x25519_pub'] = host_x
 with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true

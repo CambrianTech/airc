@@ -35,7 +35,31 @@ set -euo pipefail
 # propagate to subshells unconditionally — no function-export quirks.
 # Every callsite now invokes "$AIRC_PYTHON" -c instead of the
 # function-shim name; sed replace across the file did the conversion.
-if python3 --version >/dev/null 2>&1; then
+# Phase E.2: prefer the venv python at $AIRC_DIR/.venv (or sibling of
+# the script when running from a dev checkout). install.sh creates this
+# venv and pip-installs cryptography there. If the venv is absent, we
+# fall back to system python and the envelope-encryption path silently
+# disables (callers gate on identity.cryptography_available()).
+_airc_venv_python=""
+for _airc_venv_root in \
+    "${AIRC_DIR:-}" \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" \
+    "$HOME/.airc-src"; do
+  [ -z "$_airc_venv_root" ] && continue
+  for _candidate in \
+      "$_airc_venv_root/.venv/bin/python" \
+      "$_airc_venv_root/.venv/bin/python3" \
+      "$_airc_venv_root/.venv/Scripts/python.exe"; do
+    if [ -x "$_candidate" ]; then
+      _airc_venv_python="$_candidate"
+      break 2
+    fi
+  done
+done
+
+if [ -n "$_airc_venv_python" ]; then
+  AIRC_PYTHON="$_airc_venv_python"
+elif python3 --version >/dev/null 2>&1; then
   AIRC_PYTHON=python3
 elif command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
   AIRC_PYTHON=python
@@ -1103,6 +1127,11 @@ init_identity() {
       chmod 600 "$HOME/.ssh/authorized_keys"
     }
   fi
+  # Phase E.2: bootstrap X25519 keypair for envelope encryption.
+  # Idempotent — exits silently if files exist or cryptography isn't
+  # installed (in which case airc gracefully falls back to plaintext
+  # for ALL peers; tests cover both paths).
+  "$AIRC_PYTHON" -m airc_core.identity bootstrap --dir "$IDENTITY_DIR" >/dev/null 2>&1 || true
   touch "$MESSAGES"
 }
 
