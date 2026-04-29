@@ -869,13 +869,16 @@ host_addresses_json() {
 peer_pick_address() {
   local addresses_json="${1:-}" host_machine="${2:-}"
   [ -z "$addresses_json" ] || [ "$addresses_json" = "null" ] && return 0
-  command -v jq >/dev/null 2>&1 || return 0
+
+  # #188: parse via airc_core.gistparse (Python stdlib JSON) instead of
+  # jq. Eliminates the jq hard dep — Python is already required for the
+  # truth-layer (#152 Phase 0); jq was redundant.
 
   # Same machine: use localhost.
   local my_machine; my_machine=$(host_machine_id)
   if [ -n "$host_machine" ] && [ "$host_machine" = "$my_machine" ]; then
     local pick; pick=$(printf '%s' "$addresses_json" \
-      | jq -r '.[] | select(.scope=="localhost") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+      | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr localhost 2>/dev/null)
     if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
   fi
 
@@ -886,13 +889,13 @@ peer_pick_address() {
   if [ -n "$my_lan_ips" ]; then
     local lan_entries
     lan_entries=$(printf '%s' "$addresses_json" \
-      | jq -c '.[] | select(.scope=="lan")' 2>/dev/null)
+      | "$AIRC_PYTHON" -m airc_core.gistparse list_lan_entries 2>/dev/null)
     if [ -n "$lan_entries" ]; then
       while IFS= read -r entry; do
         [ -z "$entry" ] && continue
-        local subnet; subnet=$(printf '%s' "$entry" | jq -r '.subnet // empty' 2>/dev/null)
-        local addr; addr=$(printf '%s' "$entry" | jq -r '.addr' 2>/dev/null)
-        local port; port=$(printf '%s' "$entry" | jq -r '.port' 2>/dev/null)
+        local subnet; subnet=$(printf '%s' "$entry" | "$AIRC_PYTHON" -m airc_core.gistparse get .subnet 2>/dev/null)
+        local addr;   addr=$(printf '%s' "$entry"   | "$AIRC_PYTHON" -m airc_core.gistparse get .addr 2>/dev/null)
+        local port;   port=$(printf '%s' "$entry"   | "$AIRC_PYTHON" -m airc_core.gistparse get .port 2>/dev/null)
         # subnet is like "192.168.1.0/24" — match the /24 prefix against my IPs.
         if [ -n "$subnet" ]; then
           local prefix="${subnet%/*}"   # 192.168.1.0
@@ -909,14 +912,14 @@ peer_pick_address() {
   local i_have_ts; i_have_ts=$(host_address_set 0 | awk -F'|' '$1=="tailscale"{print; exit}')
   if [ -n "$i_have_ts" ]; then
     local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
-      | jq -r '.[] | select(.scope=="tailscale") | "\(.addr)|\(.port)"' 2>/dev/null | head -1)
+      | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
     if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
   fi
 
   # Fallback: first entry of any kind. Useful when neither side has a
   # clearly matching scope and we just want to try something.
   printf '%s' "$addresses_json" \
-    | jq -r '.[0] | "\(.addr)|\(.port)"' 2>/dev/null
+    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_first 2>/dev/null
 }
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").

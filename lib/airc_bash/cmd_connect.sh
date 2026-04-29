@@ -515,12 +515,16 @@ cmd_connect() {
       # malformed JSON `"invite": "..."` line (quotes and all), pair
       # handshake failed on garbage host info, and self-heal didn't fire
       # because resolved_room_name was never extracted via the jq path.
-      if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      # #188: Python (stdlib JSON) replaces jq. gh api → gistparse extracts
+      # the first file's content. This is the rest-API path; it's preferred
+      # over the gh gist view --raw path because the latter prepends the
+      # gist description as a header line that we'd then have to strip.
+      if command -v gh >/dev/null 2>&1; then
         raw_content=$( (gh api "gists/$gist_id" 2>/dev/null \
-                        | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null) || true )
+                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null) || true )
       fi
-      # Fallback path 1: gh without jq → degraded gh gist view --raw, with
-      # a description-strip in the consumer below.
+      # Fallback path 1: gh raw view (description leak handled by the
+      # awk strip below at "head -c 1 | grep '{'" cleanup).
       if [ -z "$raw_content" ] && command -v gh >/dev/null 2>&1; then
         raw_content=$(gh gist view "$gist_id" --raw 2>/dev/null || true)
       fi
@@ -548,11 +552,11 @@ cmd_connect() {
         fi
         [ -n "$_gist_tmp" ] && rm -rf "$_gist_tmp"
       fi
-      # Fallback path 3: anonymous curl + jq for environments without gh
-      # OR git. Last resort.
-      if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      # Fallback path 3: anonymous curl + Python for environments
+      # without gh OR git. Last resort. (#188 — was curl + jq.)
+      if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1; then
         raw_content=$( (curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
-                        | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null) || true )
+                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null) || true )
       fi
       # Last-resort cleanup: if raw_content still has the description-header
       # leak from a degraded gh-view path, strip lines before the first '{'
@@ -571,17 +575,19 @@ cmd_connect() {
       # at function-scope above so the JOIN MODE check sees them on the
       # inline-invite path too (where this gist block doesn't run).
       local resolved=""
-      if command -v jq >/dev/null 2>&1; then
-        local airc_ver kind
-        airc_ver=$(printf '%s' "$raw_content" | jq -r '.airc // empty' 2>/dev/null)
-        kind=$(printf '%s' "$raw_content" | jq -r '.kind // empty' 2>/dev/null)
-        if [ -n "$airc_ver" ]; then
+      # #188: was `if command -v jq`; now Python is the truth-layer
+      # (always available since #152 Phase 0). Drop the jq gate.
+      local airc_ver kind
+      airc_ver=$(printf '%s' "$raw_content" | "$AIRC_PYTHON" -m airc_core.gistparse get .airc 2>/dev/null)
+      kind=$(printf '%s' "$raw_content" | "$AIRC_PYTHON" -m airc_core.gistparse get .kind 2>/dev/null)
+      if [ -n "$airc_ver" ]; then
           # Versioned envelope — dispatch on kind.
           case "$kind" in
             invite)
               # Single-pair invite (legacy + --no-general flow). Gist is
               # ephemeral; host deletes after pair.
-              resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
+              resolved=$(printf '%s' "$raw_content" \
+                         | "$AIRC_PYTHON" -m airc_core.gistparse get .invite 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               ;;
             mesh|room)
@@ -592,18 +598,22 @@ cmd_connect() {
               # for back-compat with gists that haven't rolled to mesh
               # yet (joiner can read either). The .invite field carries
               # today's name@user@host:port#pubkey string.
-              resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
+              resolved=$(printf '%s' "$raw_content" \
+                         | "$AIRC_PYTHON" -m airc_core.gistparse get .invite 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               # New mesh shape: .channels[]; legacy room shape: .name.
               # Prefer channels[0] if present; fall back to .name.
-              resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.channels[0] // .name // empty' 2>/dev/null)
+              resolved_room_name=$(printf '%s' "$raw_content" \
+                         | "$AIRC_PYTHON" -m airc_core.gistparse get_first_of '.channels[0]' '.name' 2>/dev/null)
               # Multi-address: capture host.addresses[] + host.machine_id
               # for the joiner's address-picker (peer_pick_address). Empty
               # if the host published a pre-multi-address envelope; in
               # that case JOIN MODE falls back to the parsed-from-invite
               # host:port (legacy single-address path).
-              _resolved_addresses_json=$(printf '%s' "$raw_content" | jq -c '.host.addresses // empty' 2>/dev/null)
-              _resolved_host_machine_id=$(printf '%s' "$raw_content" | jq -r '.host.machine_id // empty' 2>/dev/null)
+              _resolved_addresses_json=$(printf '%s' "$raw_content" \
+                         | "$AIRC_PYTHON" -m airc_core.gistparse get_json .host.addresses 2>/dev/null)
+              _resolved_host_machine_id=$(printf '%s' "$raw_content" \
+                         | "$AIRC_PYTHON" -m airc_core.gistparse get .host.machine_id 2>/dev/null)
 
               # Heartbeat freshness check — the structural fix for
               # orphan-gist class. Hosts update last_heartbeat every
@@ -616,7 +626,7 @@ cmd_connect() {
               # compat; their hosts will get caught by the existing
               # SSH-failure self-heal path at line ~1850.
               local _hb_iso _hb_ts _now_ts _hb_stale_sec
-              _hb_iso=$(printf '%s' "$raw_content" | jq -r '.last_heartbeat // empty' 2>/dev/null)
+              _hb_iso=$(printf '%s' "$raw_content" | "$AIRC_PYTHON" -m airc_core.gistparse get .last_heartbeat 2>/dev/null)
               _hb_stale_sec="${AIRC_HEARTBEAT_STALE:-90}"
               if [ -n "$_hb_iso" ]; then
                 # Cross-platform ISO→epoch via the iso_to_epoch adapter.
@@ -642,11 +652,11 @@ cmd_connect() {
               die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite', 'room', and 'mesh'. Update airc: 'airc update'."
               ;;
           esac
-        fi
       fi
       if [ -z "$resolved" ]; then
-        # Legacy raw-string format OR jq missing — take the first
-        # non-empty line that looks like an invite.
+        # Legacy raw-string format (pre-#222 envelope shape) — take the
+        # first non-empty line that looks like an invite. Still needed
+        # for cross-account paste of a hand-built invite without JSON.
         resolved=$(printf '%s' "$raw_content" | grep -E '@.*@' | head -1 | tr -d '\r\n ')
         # If the matched line is from a JSON envelope (e.g.
         # `"invite": "name@user@host:port#..."`), the grep grabs the

@@ -117,11 +117,6 @@ pkgname_for() {
         winget) echo "GitHub.cli" ;;
         *)      echo "gh" ;;
       esac ;;
-    jq)
-      case "$mgr" in
-        winget) echo "jqlang.jq" ;;
-        *)      echo "jq" ;;
-      esac ;;
     *) echo "$prereq" ;;
   esac
 }
@@ -662,16 +657,15 @@ ensure_prereqs() {
   fi
 
   local missing=() pkgs=() unmappable=()
-  # jq added 2026-04-27: airc's gist envelope parser uses jq for the
-  # canonical path; bash bare-grep fallback handles JSON-key-prefix
-  # leak now (PR fix), but jq is the right tool — without it the
-  # fallback can't extract host.addresses[] for multi-address pick.
-  # On Git Bash, jq is winget-installable as 'jqlang.jq'.
-  for cmd in git gh jq openssl ssh-keygen python3; do
+  # #188: jq removed — airc's gist envelope parser now uses Python's
+  # stdlib JSON (lib/airc_core/gistparse.py). Python was already a hard
+  # dep since #152 Phase 0; jq was redundant. Drop the dep + the
+  # winget step that would install it.
+  for cmd in git gh openssl ssh-keygen python3; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (continuum-b69f, 2026-04-27). git/gh/jq/openssl all
+    # redirect (continuum-b69f, 2026-04-27). git/gh/openssl all
     # support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe

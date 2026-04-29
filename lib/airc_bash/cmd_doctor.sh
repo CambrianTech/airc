@@ -50,7 +50,6 @@ cmd_doctor() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
-  _doctor_probe "jq"           "$mgr" "Gist envelope parser (rooms, addresses)" || issues=$((issues+1))
   _doctor_probe_sshd                                                    || issues=$((issues+1))
   _doctor_probe_tailscale "$mgr"  # optional, never increments issues
 
@@ -341,7 +340,6 @@ _doctor_connect_preflight() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
-  _doctor_probe "jq"           "$mgr" "Gist envelope parser (rooms, addresses)" || issues=$((issues+1))
   _doctor_probe_sshd                                                   || issues=$((issues+1))
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.
