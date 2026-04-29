@@ -312,8 +312,21 @@ ensure_prereqs() {
         warn "  Don't auth gh as root — re-run as your normal user, or run once after install:"
         warn "    gh auth login -h github.com -s gist"
       elif [ -t 0 ] && [ -t 1 ]; then
-        info "gh is not authenticated — launching 'gh auth login -s gist' now."
-        info "  (Browser will open; sign in to GitHub. The 'gist' scope is required for the substrate.)"
+        # Pause-with-Enter before handing the user off to gh's device-code
+        # flow. Without this break, the gh prompt + browser popup arrives
+        # mid-install-output and looks like the script hung — the user
+        # has no signal that "you're now in a different tool". Match
+        # Claude Code's installer convention: bold green "==>" headline,
+        # bold action line, explicit "Press Enter / Ctrl+C" prompt.
+        # Honor AIRC_INSTALL_YES=1 for power users who curl|bash often.
+        printf '\n  \033[1;32m==>\033[0m GitHub authentication required for the gist substrate.\n'
+        printf '      About to launch: \033[1mgh auth login -h github.com -s gist\033[0m\n'
+        printf '      A browser will open; the device code shown in the terminal must be pasted there.\n'
+        if [ "${AIRC_INSTALL_YES:-0}" != "1" ]; then
+          printf '      Press Enter to continue, Ctrl+C to abort: '
+          read -r _ || true
+          printf '\n'
+        fi
         if gh auth login -h github.com -s gist; then
           ok "gh auth complete"
           # Re-run setup-git so the just-acquired token gets wired.
