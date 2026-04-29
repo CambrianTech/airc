@@ -507,41 +507,11 @@ resolve_tailscale_bin() {
   return 1
 }
 
-is_peer_offline_in_tailnet() {
-  # Return 0 if we can CONFIRM the peer at $1 (a Tailscale CGNAT IP) is
-  # offline according to our local tailscale status. Return 1 in every
-  # other case (online, unknown, not a CGNAT target, no tailscale CLI).
-  #
-  # Used as a fast-path gate in cmd_send: when tailscale already knows
-  # the peer is offline, skip the 10s ssh ConnectTimeout and queue
-  # straight away with a cleaner "peer offline, will auto-deliver when
-  # they return" marker. flush_pending_loop + the monitor reconnect
-  # both already handle the drain side — we're just not wasting the
-  # user's time blocking on a predictable failure.
-  local target_host="${1:-}"
-  [ -z "$target_host" ] && return 1
-  # Strip leading user@ if present — host_target is stored as `user@host`
-  # in config.json, but the CGNAT match below only recognizes strings
-  # starting with 100.x. Without this strip, every call from a resume
-  # path silently bypassed the CGNAT gate (issue #78 root cause, caught
-  # in PR #84 Copilot review).
-  target_host="${target_host##*@}"
-  # CGNAT range only. LAN / DNS targets fall through to the normal path.
-  case "$target_host" in
-    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
-    *) return 1 ;;
-  esac
-  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
-  [ -z "$ts_bin" ] && return 1
-  # `tailscale status` plain-text format:
-  #   <IP>  <hostname>  <owner>  <os>  <state...>
-  # When a peer is offline the state column includes the literal word
-  # "offline" followed by "last seen …". Match the target IP at column 1
-  # + the word offline anywhere on that line. No JSON parse dependency
-  # (keeps the pure-shell constraint).
-  "$ts_bin" status 2>/dev/null \
-    | awk -v ip="$target_host" '$1 == ip && /offline/ { found=1 } END { exit !found }'
-}
+# is_peer_offline_in_tailnet was here. Relocated to
+# lib/airc_core/bearer_ssh.py:_is_peer_offline_in_tailnet as part of the
+# Phase 1 bearer rewrite — all SSH/Tailscale knowledge consolidates into
+# the SshBearer module. Phase 3 removes Tailscale entirely; the bearer
+# module deletes its CGNAT fast-path in one edit at that point.
 
 advise_tailscale_if_down() {
   # When the saved pairing points at a Tailscale CGNAT address (100.64/10)

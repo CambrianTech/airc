@@ -60,4 +60,4 @@ def resolve(peer_meta: dict) -> Bearer:
     # fall through on PeerUnreachable from open(). That's intentionally
     # not in Phase 1 — it'd require concrete bearers to be cheap to
     # construct, which is the documented invariant but not yet tested.
-    return candidates[0]()
+    return candidates[0](peer_meta)

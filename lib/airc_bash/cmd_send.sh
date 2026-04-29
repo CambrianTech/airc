@@ -200,76 +200,74 @@ cmd_send() {
     # never arrived.
     echo "$full_msg" >> "$MESSAGES"
 
-    # Fast-path: when tailscale status already reports this peer offline,
-    # don't burn 10s on the ssh ConnectTimeout — queue immediately with a
-    # cleaner "peer offline in tailnet" marker. flush_pending_loop +
-    # monitor reconnect handle the drain automatically when the peer
-    # wakes. Skipped entirely for non-CGNAT targets, LAN peers, or when
-    # tailscale CLI is unavailable (falls through to normal ssh attempt).
-    if is_peer_offline_in_tailnet "$host_target"; then
-      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — peer offline in tailnet, auto-delivers on wake]"}' \
-        "$(timestamp)" "$active_channel" "$peer_name")
-      echo "$queue_marker" >> "$MESSAGES"
-      date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
-      rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
-      return 0
-    fi
+    # Hand the wire to the bearer abstraction. ALL transport-specific
+    # knowledge (SSH invocation, __APPENDED__ confirmation, Tailscale-CGNAT
+    # offline fast-path, auth-vs-transient classification) lives in
+    # lib/airc_core/bearer_ssh.py. cmd_send only:
+    #   1. Builds the signed envelope (above)
+    #   2. Hands payload + peer_meta to bearer_cli
+    #   3. Branches on the structured SendOutcome.kind
+    # Adding a new transport (gh, Reticulum, …) doesn't touch this file —
+    # only the resolver registers it. (Phase 1 of bearer rewrite; refs #270.)
+    local outcome
+    outcome=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+      "$peer_name" "$active_channel" \
+      --host-target "$host_target" \
+      --identity-key "$IDENTITY_DIR/ssh_key" \
+      --remote-home "$rhome" 2>/dev/null)
+    local kind detail
+    kind=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+    detail=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
 
-    # Attempt the wire. Trust the remote's __APPENDED__ marker — some shells
-    # bubble benign ssh stderr warnings up as non-zero exit, but the append
-    # itself succeeded. We check stdout for the marker, not the exit code.
-    # `|| true` prevents set -e from aborting when ssh itself fails (exit 255
-    # on unreachable host); we want to reach the failure-marker branch below.
-    # Pipe message via stdin so apostrophes (or any shell metachar) in the
-    # payload cannot break the single-quoted remote echo.
-    local out err
-    err=$(mktemp -t airc-send-err.XXXXXX)
-    out=$(printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
-    if ! echo "$out" | grep -q '^__APPENDED__$'; then
-      # Wire failed. Queue the payload for automatic retry by flush_pending_loop
-      # in the monitor, then annotate the local log with a [QUEUED] marker so
-      # `airc logs` makes the state obvious. Don't die() — queued is a form of
-      # success. The user's shell scripts can still check pending.jsonl if
-      # they need to block on delivery.
-      # Distinguish auth failures (user must re-pair — retrying won't help)
-      # from network failures (queue + retry makes sense). Prior behavior
-      # silently queued both the same way, hiding auth errors behind a
-      # misleading "Host unreachable" message. This bit the cross-mesh
-      # coordination: fresh-install joiner's SSH key wasn't in host's
-      # authorized_keys, cmd_send queued + returned 0, the joiner thought
-      # their send succeeded when the host never saw anything.
-      local stderr_raw; stderr_raw=$(cat "$err" 2>/dev/null)
-      local stderr; stderr=$(printf '%s' "$stderr_raw" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c1-300)
-      rm -f "$err"
-
-      local is_auth_fail=0
-      if echo "$stderr_raw" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
-        is_auth_fail=1
-      fi
-
-      if [ "$is_auth_fail" = "1" ]; then
+    case "$kind" in
+      delivered)
+        # Wire success. Local mirror already happened above; nothing else to do.
+        :
+        ;;
+      queued_unreachable)
+        # Bearer chose to short-circuit a predictable miss (e.g. tailnet-
+        # offline peer). Queue + marker; monitor's flush_pending_loop drains
+        # when the peer wakes.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — %s]"}' \
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-peer offline}")
+        echo "$queue_marker" >> "$MESSAGES"
+        date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+        rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+        return 0
+        ;;
+      auth_failure)
+        # Hard failure. Don't queue — every retry will fail identically.
+        # Surface loudly + die so the user re-pairs instead of sending
+        # into the void.
         local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
-          "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
         echo "$fail_marker" >> "$MESSAGES"
         echo "  SSH auth to host FAILED. Message NOT queued — every retry would fail identically." >&2
-        echo "  SSH stderr: ${stderr}" >&2
+        echo "  Bearer: ${detail}" >&2
         echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
         die "Authentication failure — re-pair required"
-      fi
-
-      # Network-class wire failure: legitimately transient, queue for retry.
-      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
-        "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
-      echo "$queue_marker" >> "$MESSAGES"
-      echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
-      # Surface the actual stderr so the user understands WHY — the old
-      # generic "host unreachable" was hiding real errors.
-      echo "  SSH stderr: ${stderr:-<none>}" >&2
-    else
-      rm -f "$err"
-    fi
+        ;;
+      transient_failure|"")
+        # Network-class failure or empty/malformed outcome → treat as
+        # transient + queue. Empty kind defends against bearer_cli
+        # crashing or outputting nothing — the message goes to pending
+        # rather than disappearing silently.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
+        echo "$queue_marker" >> "$MESSAGES"
+        echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
+        echo "  Bearer: ${detail:-<none>}" >&2
+        ;;
+      *)
+        # Unknown kind. The bearer.py SendOutcome contract enumerates the
+        # valid kinds — if we hit this, the bearer added a kind without
+        # updating callers. Queue defensively + log loudly so it's caught.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        echo "  Unknown bearer outcome kind '${kind}' (detail: ${detail}). Queued defensively. Update cmd_send.sh." >&2
+        ;;
+    esac
   else
     # Host path: append to OUR messages.jsonl. Joiners' SSH tails will
     # pick it up and route to their monitors. BUT — if our monitor isn't

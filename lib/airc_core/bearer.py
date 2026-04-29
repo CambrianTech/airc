@@ -64,6 +64,39 @@ class ReceivedMessage:
 
 
 @dataclass(frozen=True)
+class SendOutcome:
+    """Structured result of a send() call.
+
+    `kind` is one of a small enumerated set, deliberately bearer-agnostic
+    so callers can branch on the outcome without knowing which transport
+    produced it:
+
+      "delivered"          — bytes accepted by the destination.
+      "queued_unreachable" — peer known-offline pre-attempt; payload queued
+                             locally for automatic retry. Not a failure;
+                             the bearer chose this path to avoid wasting
+                             a 10s connect timeout on a predictable miss.
+      "auth_failure"       — destination refused our identity. Retry is
+                             futile; the user must re-pair. Caller should
+                             surface this loudly.
+      "transient_failure"  — destination unreachable for a probably-transient
+                             reason (network blip, peer just bouncing).
+                             Caller should queue + retry.
+
+    `detail` is a short human-readable string for surfacing in user-facing
+    output ([QUEUED] markers, error messages, status surfaces). Bearers
+    populate it with whatever the transport told them; callers do not
+    parse it.
+
+    Bearers MUST NOT invent kinds outside this set without first widening
+    the bearer.py contract. Adding a kind without updating callers means
+    new outcomes silently get the wrong handling.
+    """
+    kind: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class LivenessResult:
     """Result of a liveness probe against a peer.
 
@@ -138,14 +171,19 @@ class Bearer(ABC):
         """
 
     @abstractmethod
-    def send(self, peer_id: str, channel: str, payload: bytes) -> None:
+    def send(self, peer_id: str, channel: str, payload: bytes) -> SendOutcome:
         """Deliver `payload` to `peer_id` on `channel`. Bytes are opaque.
 
-        Returns when the bearer has accepted responsibility for delivery.
-        Some bearers may complete delivery synchronously (SSH-loopback);
-        others queue and deliver asynchronously (gh polling). Either way,
-        a successful return means the bearer has the bytes; subsequent
-        delivery failures surface via liveness() / recv-stream errors.
+        Returns a SendOutcome describing what happened. Normal failure
+        modes (peer offline, transient network failure, auth refused)
+        are reported via the outcome's `kind` field, NOT exceptions.
+        Exceptions are reserved for programming errors (calling send on
+        a closed bearer, etc.).
+
+        The bearer must populate the outcome promptly — synchronous
+        bearers (SSH) before returning, polling bearers (gh) once the
+        first write attempt resolves. Long-running retry/backoff is
+        the caller's responsibility, not the bearer's.
         """
 
     @abstractmethod
