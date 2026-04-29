@@ -331,6 +331,111 @@ class BearerCliRecvTests(unittest.TestCase):
         self.assertIs(ns.func, bearer_cli.cmd_recv)
 
 
+class BearerCliHeartbeatTests(unittest.TestCase):
+    """The 'monitor dies after a while' bug Joel caught 2026-04-29.
+
+    bearer_cli recv only writes to stdout when bearer.recv_stream
+    yields an event. If the bearer is alive but stuck (gh CLI hang
+    after laptop sleep, network blip, etc), stdout stays silent
+    indefinitely. The bash multi-channel watcher's `kill -0` check
+    sees the process as alive (it is — just stuck), so #302 never
+    triggers a respawn. Result: monitor looks healthy, no events
+    ever flow.
+
+    Fix: bearer_cli emits a periodic heartbeat line to stdout
+    regardless of bearer activity. monitor_formatter recognizes the
+    sentinel + arms its watchdog (existing 150s alarm). Stuck bearer
+    → no heartbeats reach formatter → watchdog trips → formatter
+    exits 2 → outer bash loop kills children + respawns.
+
+    This test enforces the contract: cmd_recv must emit at least one
+    heartbeat per AIRC_BEARER_HEARTBEAT_SEC interval even when the
+    bearer yields nothing. Without it, the production stuck-bearer
+    bug is undetectable.
+    """
+
+    class _IdleBearer:
+        """Yields nothing; recv_stream blocks for `block_seconds` then
+        returns (so cmd_recv exits and the test doesn't hang)."""
+        KIND = "idle-test"
+        def __init__(self, _meta=None):
+            self.closed = False
+        def open(self, _peer_id):
+            pass
+        def recv_stream(self):
+            import time as _t
+            _t.sleep(self._block_seconds)
+            return
+            yield  # unreachable; makes this a generator
+        def close(self):
+            self.closed = True
+        def liveness(self, peer_id):
+            return LivenessResult(peer_id=peer_id, last_seen_ts=None, bearer_diag="idle")
+
+    def _make_args(self, **overrides):
+        ns = argparse.Namespace(
+            peer_id="alice",
+            host_target="alice@example",
+            identity_key=None,
+            remote_home=None,
+            room_gist_id="abc123",
+            offset_file=None,
+            state_file=None,
+        )
+        for k, v in overrides.items():
+            setattr(ns, k, v)
+        return ns
+
+    def _capture_stdout_bytes(self):
+        import io
+        captured = io.BytesIO()
+        fake_stdout = mock.Mock()
+        fake_stdout.buffer = captured
+        return fake_stdout, captured
+
+    def test_recv_emits_heartbeats_when_bearer_idle(self):
+        # Idle for 2.5s; with 1s heartbeat interval, expect ≥2 heartbeats.
+        bearer = self._IdleBearer()
+        bearer._block_seconds = 2.5
+
+        fake_stdout, captured = self._capture_stdout_bytes()
+        import os as _os
+        with mock.patch.dict(_os.environ, {"AIRC_BEARER_HEARTBEAT_SEC": "1"}), \
+             mock.patch.object(bearer_cli, "resolve", return_value=bearer), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args())
+
+        lines = [l for l in captured.getvalue().splitlines() if l.strip()]
+        heartbeats = [l for l in lines if b'"airc_heartbeat"' in l]
+        self.assertGreaterEqual(
+            len(heartbeats), 2,
+            f"expected ≥2 heartbeats in 2.5s @ 1s interval; "
+            f"got {len(heartbeats)} heartbeats / {len(lines)} total lines",
+        )
+
+    def test_heartbeat_line_is_valid_json_with_sentinel(self):
+        # Heartbeat must be a JSON line with airc_heartbeat=1 so
+        # monitor_formatter can identify + suppress + arm watchdog.
+        import json as _json
+        bearer = self._IdleBearer()
+        bearer._block_seconds = 1.5
+
+        fake_stdout, captured = self._capture_stdout_bytes()
+        import os as _os
+        with mock.patch.dict(_os.environ, {"AIRC_BEARER_HEARTBEAT_SEC": "0.5"}), \
+             mock.patch.object(bearer_cli, "resolve", return_value=bearer), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args())
+
+        for raw in captured.getvalue().splitlines():
+            if not raw.strip(): continue
+            if b'"airc_heartbeat"' not in raw: continue
+            obj = _json.loads(raw)
+            self.assertEqual(obj.get("airc_heartbeat"), 1)
+            return  # at least one valid heartbeat is enough
+        self.fail("no heartbeat line emitted")
+
+
 class BearerCliStateFileTests(unittest.TestCase):
     """Phase 2c: bearer_cli recv writes a per-event state file that
     `airc status` reads. The state file is the bearer-attested liveness

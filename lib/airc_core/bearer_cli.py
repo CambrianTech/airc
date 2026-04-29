@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 from dataclasses import asdict
@@ -141,14 +142,64 @@ def cmd_recv(args) -> int:
             "events_total": 0,
             "diag": "bearer open, no events yet",
         })
+
+    # Heartbeat: emit a sentinel JSON line to stdout every N seconds
+    # regardless of bearer activity. Two purposes:
+    #   1. Lets monitor_formatter's stdin-watchdog distinguish "bearer
+    #      idle" (heartbeats arriving) from "bearer stuck" (silence).
+    #      Pre-fix the watchdog was disabled for hosts because there
+    #      was no signal during idle; with heartbeats, it's safe on.
+    #   2. Liveness probe for the bash multi-channel watcher. A
+    #      heartbeat in stdout proves the python loop made it past
+    #      the GH poll, not just that the process is alive.
+    # Joel 2026-04-29: "polling easily shuts down on its own OR never
+    # even worked, sending/pinging triggered anything to occur." This
+    # was the missing signal.
+    import threading as _t
+    try:
+        _heartbeat_sec = float(os.environ.get("AIRC_BEARER_HEARTBEAT_SEC", "30"))
+    except (TypeError, ValueError):
+        _heartbeat_sec = 30.0
+    _stop_heartbeat = _t.Event()
+    _stdout_lock = _t.Lock()
+
+    def _emit_heartbeat():
+        import time as _ti
+        room = getattr(args, "room_gist_id", "") or ""
+        # Tick on a short interval so close() is responsive without
+        # missing the cadence target.
+        next_tick = _ti.monotonic() + _heartbeat_sec
+        while not _stop_heartbeat.is_set():
+            now = _ti.monotonic()
+            if now >= next_tick:
+                line = (json.dumps({
+                    "airc_heartbeat": 1,
+                    "ts": _ti.time(),
+                    "channel": room,
+                }) + "\n").encode("utf-8")
+                with _stdout_lock:
+                    try:
+                        out.write(line)
+                        out.flush()
+                    except (BrokenPipeError, ValueError):
+                        # Downstream gone or stdout closed; stop trying.
+                        return
+                next_tick = now + _heartbeat_sec
+            # Wake every 100ms so close() takes effect promptly.
+            _stop_heartbeat.wait(0.1)
+
+    _hb_thread = _t.Thread(target=_emit_heartbeat, daemon=True)
+    _hb_thread.start()
+
     try:
         for ev in bearer.recv_stream():
             line = ev.payload
             if not line.endswith(b"\n"):
                 line = line + b"\n"
             try:
-                out.write(line)
-                out.flush()
+                with _stdout_lock:
+                    out.write(line)
+                    out.flush()
             except BrokenPipeError:
                 # Downstream formatter exited. Caller's watchdog will
                 # observe the broken cycle and reconnect us if needed.
@@ -167,7 +218,11 @@ def cmd_recv(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        _stop_heartbeat.set()
         bearer.close()
+        # Brief join — daemon=True means we don't hang if the thread
+        # is mid-write; the daemon flag handles process exit.
+        _hb_thread.join(timeout=0.3)
     return 0
 
 

@@ -203,15 +203,14 @@ def run(my_name: str, peers_dir: str) -> int:
     except Exception:
         pass
 
-    # Host mode: disable the inactivity watchdog. The watchdog was
-    # designed to detect a silently-dead SSH tail on the joiner side
-    # (no SIGPIPE, no exit, just no inbound). Hosts read their own
-    # local messages.jsonl — there's no remote pipe to die silently;
-    # idle just means the channel is quiet. Without this disable, the
-    # host formatter cycles every 150s and leaves a 1s+ dead window
-    # where [PING:] arrivals don't get auto-pong'd.
-    if not is_joiner:
-        _disable_watchdog()
+    # Watchdog stays armed for both hosts and joiners. Pre-fix it was
+    # disabled for hosts because there was no inbound traffic during
+    # idle and the alarm would trip every 150s. Post bearer-heartbeat
+    # (bearer_cli emits a sentinel line every AIRC_BEARER_HEARTBEAT_SEC
+    # whether the bearer yielded events or not), idle is no longer
+    # silent — heartbeats keep the watchdog re-armed. Stuck bearers
+    # produce no heartbeats, so the watchdog correctly trips and the
+    # bash multi-channel watcher respawns the recv pipe.
 
     # Room name for the chat-line prefix. Read once at startup; a rename
     # of the room would require a fresh airc connect to pick up. Default
@@ -273,6 +272,16 @@ def run(my_name: str, peers_dir: str) -> int:
         try:
             m = json.loads(line)
         except Exception:
+            continue
+        # bearer_cli emits a sentinel heartbeat line every
+        # AIRC_BEARER_HEARTBEAT_SEC even when the bearer is idle. The
+        # heartbeat's only job is to prove "the python loop completed
+        # a poll cycle" — re-arm the inactivity watchdog and suppress
+        # from user-visible output. If heartbeats stop arriving,
+        # bearer is stuck (Joel 2026-04-29 freeze pattern); watchdog
+        # trips, formatter exits 2, bash watcher respawns the pipe.
+        if m.get("airc_heartbeat") == 1:
+            _arm_watchdog()
             continue
         fr = m.get("from", "?")
         to = m.get("to", "")
