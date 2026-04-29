@@ -133,15 +133,19 @@ try:
 except Exception:
     print("  (no config — run airc connect)"); raise SystemExit(0)
 ident = c.get("identity", {}) or {}
+# Render-time truncation. Peer records from before the write-side
+# length caps (#328) may have multi-KB bios that would clutter
+# screens / break terminal rendering. Truncate to the same caps used
+# at write time, with an ellipsis to signal it happened.
+def _trunc(v, cap):
+    s = str(v or "")
+    return s if len(s) <= cap else s[: cap - 1] + "…"
 fields = [
-    ("name",     c.get("name", "?"),         ""),
-    ("pronouns", ident.get("pronouns", ""),  "(unset)"),
-    ("role",     ident.get("role", ""),      "(unset)"),
-    ("bio",      ident.get("bio", ""),       "(unset)"),
-    # status field is the IRC /away analog. Surface the airc away
-    # command in the unset case so QA users (continuum-b741 2026-04-27)
-    # do not see a half-baked empty field with no obvious setter.
-    ("status",   ident.get("status", ""),    "(unset; airc away <msg> to set)"),
+    ("name",     c.get("name", "?"),                         ""),
+    ("pronouns", _trunc(ident.get("pronouns", ""), 64),      "(unset)"),
+    ("role",     _trunc(ident.get("role", ""), 128),         "(unset)"),
+    ("bio",      _trunc(ident.get("bio", ""), 512),          "(unset)"),
+    ("status",   _trunc(ident.get("status", ""), 256),       "(unset; airc away <msg> to set)"),
 ]
 for k, v, fallback in fields:
     label = k + ":"

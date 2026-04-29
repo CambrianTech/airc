@@ -70,15 +70,37 @@ cmd_rename() {
     return
   fi
 
-  # Collision check against the peer roster (continuum-b741 + ideem-
-  # local-4bef caught 2026-04-29: renaming to an active peer's name
-  # was accepted silently, both peers then visible as the same name,
-  # DM routing ambiguous). Refuse loudly. The roster is whatever
-  # peers/ records this scope has accumulated — not perfect (a peer
-  # we've never paired with won't trigger it), but catches the common
-  # case of a fresh peer typing an existing peer's nick.
+  # Collision check (continuum-b741 + ideem-local-4bef caught
+  # 2026-04-29: renaming to an active peer's name was accepted
+  # silently, both peers then visible as the same name, DM routing
+  # ambiguous). Two-source roster:
+  #   1. PEERS_DIR — peers we've directly paired with via handshake.
+  #   2. Recent unique 'from' values in our local messages.jsonl —
+  #      catches peers we've HEARD from via gist polling but never
+  #      paired with. Post-3c, with gh-substrate, this is the more
+  #      common roster (you see everyone's broadcasts even if you
+  #      never paired).
+  # 200-line scan is cheap and catches the realistic case. Anything
+  # older than that is fair game even if names overlap.
   if [ -d "$PEERS_DIR" ] && [ -f "$PEERS_DIR/$new_name.json" ]; then
-    die "name collision: '$new_name' is already a peer in this scope (use 'airc peers' to see the roster)"
+    die "name collision: '$new_name' is already a paired peer (run 'airc peers' to see the roster)"
+  fi
+  if [ -f "$MESSAGES" ]; then
+    if tail -200 "$MESSAGES" 2>/dev/null \
+         | "$AIRC_PYTHON" -c "
+import sys, json
+target = '$new_name'
+seen = set()
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+        fr = m.get('from')
+        if fr: seen.add(fr)
+    except: pass
+sys.exit(0 if target in seen else 1)
+" 2>/dev/null; then
+      die "name collision: '$new_name' has been seen as an active peer in this room (use 'airc logs' to verify)"
+    fi
   fi
 
   # Phase 1: write the new name into THIS scope's config (the truth-
