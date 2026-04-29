@@ -1098,6 +1098,65 @@ class GhBearerRecvTests(unittest.TestCase):
         finally:
             _os.unlink(offset_path)
 
+    def test_recv_resyncs_after_gist_shrinks_below_offset(self):
+        # Production bug 2026-04-29: gist rotation (or peer-clobber, or
+        # host self-evict + republish) shrinks the file. Every peer
+        # whose offset > new_line_count goes silent forever — the
+        # for-range over (offset, len(lines)) is empty, no yield, no
+        # state change. Joel observed it as "monitor must bomb out
+        # because after awhile this gd thing dies."
+        #
+        # Fix: detect offset > current line count, snap offset to
+        # current end + persist, then continue. Subsequent appends
+        # land beyond the snapped offset and are seen normally.
+        import tempfile, os as _os
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("37")  # offset way past current content
+            offset_path = f.name
+        try:
+            # First poll: gist shrunk to 3 lines (rotation/clobber).
+            # Second poll: 1 new append after the snap.
+            responses = [
+                self._gist_response(
+                    '{"from":"bob","msg":"x"}\n'
+                    '{"from":"bob","msg":"y"}\n'
+                    '{"from":"bob","msg":"z"}\n'
+                ),
+                self._gist_response(
+                    '{"from":"bob","msg":"x"}\n'
+                    '{"from":"bob","msg":"y"}\n'
+                    '{"from":"bob","msg":"z"}\n'
+                    '{"from":"carol","msg":"new-after-resync"}\n'
+                ),
+            ]
+            with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=responses):
+                b = self._bearer({
+                    "room_gist_id": "abc123",
+                    "poll_interval": 0,
+                    "offset_file": offset_path,
+                })
+                events = []
+                gen = b.recv_stream()
+                for ev in gen:
+                    events.append(ev)
+                    b.close()
+                    break
+
+            # The new line MUST surface (pre-fix, range was empty
+            # forever, this loop hung waiting for an event that
+            # could never come).
+            self.assertEqual(len(events), 1)
+            self.assertEqual(
+                events[0].bearer_metadata["envelope"]["msg"],
+                "new-after-resync",
+            )
+            # And the offset must have snapped to the new tail (3 from
+            # poll 1 + the 1 new line = 4).
+            with open(offset_path) as f:
+                self.assertEqual(f.read().strip(), "4")
+        finally:
+            _os.unlink(offset_path)
+
     def test_liveness_updates_on_each_event(self):
         with mock.patch.object(
             bearer_gh, "_gh_api_get",

@@ -500,6 +500,18 @@ class GhBearer(Bearer):
             # each line to bytes for ReceivedMessage.payload symmetry
             # with SshBearer/LocalBearer (which produce bytes from disk).
             lines = content.splitlines()
+            # Shrink/rotation/clobber recovery: if our resume offset is
+            # ahead of the current gist content, the gist must have been
+            # truncated since we last polled (rotation hit, peer
+            # clobbered the file with a bad PATCH, host self-evicted +
+            # republished). Pre-2026-04-29 this stuck the bearer
+            # forever — the for-range was empty, no yield ever fired,
+            # the channel went dead-silent, the user saw "frozen"
+            # monitors. Resync to the current end so future appends are
+            # picked up.
+            if self._consumed_lines > len(lines):
+                self._consumed_lines = len(lines)
+                self._on_line_received(self._consumed_lines, offset_file)
             for idx in range(self._consumed_lines, len(lines)):
                 raw = lines[idx].encode("utf-8")
                 self._consumed_lines = idx + 1
