@@ -73,9 +73,23 @@ spawn_real() {
     )
   fi
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  for i in $(seq 1 20); do
     sleep 1
-    if grep -qE 'Hosting as|Connected to|Joined' "$home/out.log" 2>/dev/null; then
+    grep -qE 'Hosting as|Connected to|Joined' "$home/out.log" 2>/dev/null || continue
+    # For hosts: also wait until config.json has a channel_gists entry,
+    # i.e. the gist was actually published. Without this the next peer
+    # spawned right after sees no mesh on the account and bootstraps as
+    # its own host of the same room → two parallel gists, test fails.
+    if [ "$as_host" = "1" ]; then
+      python3 -c "
+import json,sys
+try:
+    c = json.load(open('$home/state/config.json'))
+    sys.exit(0 if c.get('channel_gists') else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null && return 0
+    else
       return 0
     fi
   done
