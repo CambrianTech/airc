@@ -216,6 +216,41 @@ cmd_teardown() {
     rm -f "$pidfile" 2>/dev/null
   fi
 
+  # Env-var-based catch-all: ANY process whose AIRC_HOME env points at
+  # this scope is ours, even if airc.pid never knew about it. This
+  # catches:
+  #   - Subshells reparented to init (bash forked detached from parent)
+  #   - Python heartbeat / bearer_cli children whose parent died
+  #     before airc.pid was updated
+  #   - Stale background loops surviving multi-bounce sessions
+  # `ps eww -o pid,command -E` includes environment in the output on
+  # macOS + Linux. Match scopes by AIRC_HOME=<exact path>. Skip if the
+  # AIRC_TEARDOWN_PART_ONLY guard is set (cmd_part shouldn't sweep).
+  if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" != "1" ]; then
+    local _scope_env_pids
+    _scope_env_pids=$(ps eww -o pid,command 2>/dev/null \
+                      | awk -v home="AIRC_HOME=$AIRC_WRITE_DIR" \
+                          '$0 ~ home && $1 != PROCINFO["pid"] { print $1 }' \
+                      | sort -un)
+    if [ -n "$_scope_env_pids" ]; then
+      # Exclude our own pid + parent (this very teardown subshell) so
+      # we don't suicide before completing the cleanup.
+      local _self_pid="$$"
+      local _parent_pid="$PPID"
+      local _filter_pids=""
+      for _p in $_scope_env_pids; do
+        [ "$_p" = "$_self_pid" ] && continue
+        [ "$_p" = "$_parent_pid" ] && continue
+        _filter_pids="$_filter_pids $_p"
+      done
+      if [ -n "$_filter_pids" ]; then
+        echo "  killing AIRC_HOME-tagged orphans: $(echo $_filter_pids | tr '\n' ' ')"
+        kill -9 $_filter_pids 2>/dev/null || true
+        killed=1
+      fi
+    fi
+  fi
+
   # Brief pause to let the kernel reparent any airc python listener children
   # to init (PID 1) after we killed their bash parent. Then reap orphans.
   [ "$killed" = "1" ] && sleep 0.5
