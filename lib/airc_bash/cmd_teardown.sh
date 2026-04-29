@@ -230,7 +230,16 @@ cmd_teardown() {
   # Skipped under AIRC_TEARDOWN_PART_ONLY (cmd_part shouldn't sweep).
   if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" != "1" ]; then
     local _scope_path_pids
-    _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un)
+    # pgrep returns 1 when nothing matches. With pipefail + set -e
+    # (airc top-level uses set -euo pipefail), the pipe surfaces that
+    # 1, which dies the whole script HALFWAY through teardown — the
+    # caller never sees "Teardown complete" and the smoke check in CI
+    # was failing as exit 1 with no error message. Caught fresh-runner
+    # only because dev machines tend to have prior-test zombies that
+    # keep pgrep happy. `|| true` swallows the empty-match case;
+    # genuine errors (lsof permissions etc) still produce empty output
+    # which the if-block handles cleanly.
+    _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true)
     if [ -n "$_scope_path_pids" ]; then
       # Exclude our own pid + parent (this very teardown subshell) so
       # we don't suicide before completing the cleanup.

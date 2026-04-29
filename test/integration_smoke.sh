@@ -381,9 +381,12 @@ scenario_orphan_loops_self_reap() {
   fi
   sleep 3
 
-  # Find the parent bash via airc.pid (the parent writes its $$ there).
+  # Find the parent bash via airc.pid. The pidfile has multiple
+  # entries post-#328 (parent on line 1, appended subshells on
+  # subsequent lines). Parent is always the FIRST field of the
+  # FIRST line.
   local parent_pid loop_pids
-  parent_pid=$(awk '{print $1}' "$A_HOME/state/airc.pid" 2>/dev/null)
+  parent_pid=$(awk 'NR==1 {print $1; exit}' "$A_HOME/state/airc.pid" 2>/dev/null)
   [ -n "$parent_pid" ] || { fail "no airc.pid for the test scope"; return; }
   # Filter to BASH subshell children only — those are the loops with
   # the parent-liveness check (#325). Python descendants (handshake,

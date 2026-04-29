@@ -332,6 +332,16 @@ ensure_prereqs
 # ── Clone or update ─────────────────────────────────────────────────────
 
 if [ -d "$CLONE_DIR/.git" ]; then
+  # AIRC_INSTALL_NO_PULL=1: trust CLONE_DIR's checked-out tree exactly
+  # as-is — no branch switch, no pull. CI uses this when it has already
+  # staged the PR's tree at $CLONE_DIR via `cp -r .` and wants the
+  # smoke matrix to exercise the PR's code, not whatever's on main.
+  # Without this escape hatch, install.sh's "I'm-on-a-non-channel-branch
+  # so let me reset to main" recovery path silently overwrites the
+  # PR's code with origin/main's — making the PR's CI a no-op.
+  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ]; then
+    info "AIRC_INSTALL_NO_PULL=1 — using CLONE_DIR tree as-is, skipping branch-switch + pull"
+  else
   info "Updating existing install"
   # Recovery: if the install dir is on a non-channel branch (e.g. someone
   # / some AI checked out a feature branch for testing and forgot to
@@ -394,6 +404,7 @@ Recover with:
 EOF
     exit 1
   fi
+  fi  # AIRC_INSTALL_NO_PULL guard
 else
   # First install. Honor AIRC_CHANNEL if set so users can land on canary
   # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
