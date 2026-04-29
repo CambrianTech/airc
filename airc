@@ -899,23 +899,67 @@ _monitor_multi_channel() {
   local ESCALATE_AFTER=4
   while true; do
     {
+      # Per-child PID tracking so we can detect individual deaths.
+      # Pre-fix: a single `wait` blocked until ALL children exited; if
+      # one bearer_cli recv died (gh transient, decrypt panic, network
+      # blip), the others kept running, that channel silently stopped
+      # emitting events forever, and the outer reconnect only fired
+      # when the formatter pipe broke. Joel observed 2026-04-29:
+      # "monitor must bomb out — frozen is continuum, others responded."
+      # That's the symptom: N-1 channels alive, 1 channel dead,
+      # everyone thinks the monitor's fine.
+      #
+      # New behavior: poll child PIDs every 2s; on first death, kill
+      # the rest + exit subshell. Outer while-true reconnects (full
+      # respawn) so all channels are healthy again.
+      local _pids=()
       while IFS=$'\t' read -r ch gid; do
         [ -z "$ch" ] && continue
         [ -z "$gid" ] && continue
-        # Fire-and-forget: each bearer_cli recv runs as a child of this
-        # subshell; `wait` (after the loop) holds the subshell open
-        # until all of them exit, which they only do on close (broken
-        # pipe / SIGTERM). When the formatter on the other side of the
-        # pipe exits (e.g. watchdog 2), the broken pipe terminates the
-        # bearer_cli children, the wait completes, the subshell exits,
-        # the surrounding while-loop reconnects.
+        # bearer_cli recv stderr → per-channel log file (CLAUDE.md
+        # "never swallow errors"). The previous 2>/dev/null hid every
+        # transient gh failure, leaving "monitor's fine but no events"
+        # undebuggable. Append-mode so a tail of the log shows the
+        # actual cause when a channel dies.
         "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
           --room-gist-id "$gid" \
           --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
           --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
-          2>/dev/null &
+          2>>"$AIRC_WRITE_DIR/bearer_recv.${ch}.log" &
+        _pids+=("$!:$ch")
       done <<< "$channel_map"
-      wait
+
+      # Watch loop: any child death → kill survivors + break.
+      # macOS bash 3.2 lacks `wait -n`, so poll explicitly.
+      local _dead=""
+      while [ "${#_pids[@]}" -gt 0 ]; do
+        sleep 2
+        local _alive=()
+        local entry pid ch
+        for entry in "${_pids[@]}"; do
+          pid="${entry%%:*}"
+          ch="${entry#*:}"
+          if kill -0 "$pid" 2>/dev/null; then
+            _alive+=("$entry")
+          else
+            _dead="$ch"
+            break 2
+          fi
+        done
+        _pids=("${_alive[@]}")
+      done
+      if [ -n "$_dead" ]; then
+        echo "airc: bearer recv for #${_dead} died — see ${AIRC_WRITE_DIR}/bearer_recv.${_dead}.log; restarting all channels" >&2
+        # Surface the last-error tail so the user sees WHY without
+        # having to know to read the log file.
+        if [ -s "$AIRC_WRITE_DIR/bearer_recv.${_dead}.log" ]; then
+          tail -3 "$AIRC_WRITE_DIR/bearer_recv.${_dead}.log" | sed 's/^/airc:   /' >&2
+        fi
+        for entry in "${_pids[@]}"; do
+          kill "${entry%%:*}" 2>/dev/null
+        done
+        wait 2>/dev/null
+      fi
     } | monitor_formatter "$my_name" || true
     local fmt_exit="${PIPESTATUS[1]:-0}"
 
