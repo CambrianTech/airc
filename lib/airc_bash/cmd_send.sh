@@ -522,10 +522,13 @@ cmd_ping() {
   local start_time
   start_time=$(date +%s)
 
-  # Use cmd_send so the ping rides the same signed-message path as
-  # normal traffic — guaranteed shape parity with what the receiver's
-  # monitor_formatter reads.
-  cmd_send "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed — check SSH/auth state (airc status)"
+  # Route via #general (the universal lobby sidecar). Pre-fix: ping
+  # used the sender's default channel, but peers in different cwds
+  # auto-scope to different project channels (cambriantech vs ideem
+  # vs useideem) so the recipient often didn't poll the sender's
+  # default channel and never saw the ping. #general is the one
+  # channel everyone subscribes to — guaranteed common ground.
+  cmd_send --channel general "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed (airc status)"
 
   echo "ping sent to $peer_name (id=$ping_id) — waiting up to ${timeout}s for pong..."
 
