@@ -31,7 +31,9 @@ from airc_core.bearer_resolver import (  # noqa: E402
     resolve,
 )
 from airc_core.bearer_ssh import SshBearer, SshBearerError  # noqa: E402
+from airc_core.bearer_local import LocalBearer, LocalBearerError  # noqa: E402
 from airc_core import bearer_ssh  # noqa: E402
+from airc_core import bearer_local  # noqa: E402
 from airc_core import bearer_cli  # noqa: E402
 
 
@@ -832,6 +834,321 @@ class BearerCliStateFileTests(unittest.TestCase):
             state = _json.load(f)  # must not raise
         self.assertEqual(state["events_total"], 5)
         _os.unlink(state_path)
+
+
+class LocalBearerCanServeTests(unittest.TestCase):
+    """Phase 3a: LocalBearer.can_serve must be conservative — only True
+    when host_target is a literal loopback alias AND remote_home is a
+    writable local directory. Both conditions must hold; either alone is
+    a footgun (stale loopback record without dir, or unrelated local
+    dir whose path collides with a remote scope name)."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-test-localbearer-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_serves_loopback_with_writable_dir(self):
+        for ht in ("127.0.0.1", "localhost", "::1", "[::1]",
+                   "user@127.0.0.1", "user@localhost",
+                   "user@127.0.0.1:7547", "127.0.0.1:7547",
+                   "user@[::1]:7547"):
+            self.assertTrue(
+                LocalBearer.can_serve({"host_target": ht, "remote_home": self._tmpdir}),
+                f"should serve loopback host_target={ht!r}",
+            )
+
+    def test_rejects_non_loopback(self):
+        for ht in ("alice@example.com", "user@192.168.1.5",
+                   "user@100.91.51.87", "100.64.0.1",
+                   "user@10.0.0.5"):
+            self.assertFalse(
+                LocalBearer.can_serve({"host_target": ht, "remote_home": self._tmpdir}),
+                f"should NOT serve non-loopback host_target={ht!r}",
+            )
+
+    def test_rejects_when_remote_home_missing(self):
+        self.assertFalse(
+            LocalBearer.can_serve({"host_target": "127.0.0.1"}),
+            "should reject when remote_home is absent",
+        )
+        self.assertFalse(
+            LocalBearer.can_serve({"host_target": "127.0.0.1", "remote_home": ""}),
+            "should reject when remote_home is empty string",
+        )
+
+    def test_rejects_when_remote_home_does_not_exist(self):
+        bogus = self._tmpdir + "/does-not-exist"
+        self.assertFalse(
+            LocalBearer.can_serve({"host_target": "127.0.0.1", "remote_home": bogus}),
+            "should reject when remote_home points at missing dir",
+        )
+
+    def test_rejects_when_remote_home_is_a_file(self):
+        import os
+        path = os.path.join(self._tmpdir, "not-a-dir.txt")
+        with open(path, "w") as f:
+            f.write("hi")
+        self.assertFalse(
+            LocalBearer.can_serve({"host_target": "127.0.0.1", "remote_home": path}),
+            "should reject when remote_home points at a file (not dir)",
+        )
+
+    def test_can_serve_is_pure(self):
+        # No IO outside of the os.access call. Repeat invocations don't
+        # mutate peer_meta.
+        meta = {"host_target": "127.0.0.1", "remote_home": self._tmpdir}
+        before = dict(meta)
+        for _ in range(3):
+            LocalBearer.can_serve(meta)
+        self.assertEqual(meta, before)
+
+
+class LocalBearerSendTests(unittest.TestCase):
+    """LocalBearer.send appends to remote_home/messages.jsonl directly."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-test-local-send-")
+        self._bearer = LocalBearer({
+            "host_target": "127.0.0.1",
+            "remote_home": self._tmpdir,
+        })
+        self._bearer.open("alice")
+
+    def tearDown(self):
+        import shutil
+        self._bearer.close()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_send_appends_with_trailing_newline(self):
+        outcome = self._bearer.send("alice", "general", b'{"from":"bob","msg":"hi"}')
+        self.assertEqual(outcome.kind, "delivered")
+        import os
+        path = os.path.join(self._tmpdir, "messages.jsonl")
+        with open(path, "rb") as f:
+            content = f.read()
+        self.assertEqual(content, b'{"from":"bob","msg":"hi"}\n')
+
+    def test_send_preserves_existing_trailing_newline(self):
+        self._bearer.send("alice", "general", b'{"x":1}\n')
+        import os
+        with open(os.path.join(self._tmpdir, "messages.jsonl"), "rb") as f:
+            content = f.read()
+        self.assertEqual(content, b'{"x":1}\n', "must not double-newline")
+
+    def test_send_appends_does_not_truncate(self):
+        self._bearer.send("alice", "general", b'{"a":1}')
+        self._bearer.send("alice", "general", b'{"b":2}')
+        import os
+        with open(os.path.join(self._tmpdir, "messages.jsonl"), "rb") as f:
+            content = f.read()
+        self.assertEqual(content, b'{"a":1}\n{"b":2}\n')
+
+    def test_send_reports_transient_when_dir_vanishes(self):
+        # Race: directory disappears between can_serve and send.
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        outcome = self._bearer.send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "transient_failure")
+        self.assertIn("local append failed", outcome.detail)
+        # Re-create for tearDown to clean up cleanly.
+        import os
+        os.makedirs(self._tmpdir, exist_ok=True)
+
+
+class LocalBearerRecvTests(unittest.TestCase):
+    """LocalBearer.recv_stream tails remote_home/messages.jsonl with
+    pure-Python poll-based reads. Tests the file format contract; the
+    integration scenario covers real-time tail behavior under load."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-test-local-recv-")
+        self._meta = {
+            "host_target": "127.0.0.1",
+            "remote_home": self._tmpdir,
+        }
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write(self, lines):
+        import os
+        with open(os.path.join(self._tmpdir, "messages.jsonl"), "ab") as f:
+            for ln in lines:
+                f.write(ln if ln.endswith(b"\n") else ln + b"\n")
+
+    def test_recv_yields_pre_existing_lines_when_no_offset(self):
+        # No offset_file → start position is 0 (read from beginning).
+        # That matches "skip 0 lines" in _compute_skip_lines.
+        self._write([
+            b'{"from":"bob","channel":"general","msg":"first"}',
+            b'{"from":"carol","channel":"general","msg":"second"}',
+        ])
+        b = LocalBearer(self._meta)
+        b.open("alice")
+        events = []
+        gen = b.recv_stream()
+        for ev in gen:
+            events.append(ev)
+            if len(events) >= 2:
+                b.close()
+                break
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].sender_peer_id, "bob")
+        self.assertEqual(events[1].sender_peer_id, "carol")
+
+    def test_recv_resumes_past_offset_file(self):
+        import os, tempfile
+        self._write([
+            b'{"from":"bob","msg":"a"}',
+            b'{"from":"bob","msg":"b"}',
+            b'{"from":"bob","msg":"c"}',
+        ])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("2")  # skip first 2 lines
+            offset_path = f.name
+        try:
+            meta = dict(self._meta, offset_file=offset_path)
+            b = LocalBearer(meta)
+            b.open("alice")
+            events = []
+            gen = b.recv_stream()
+            for ev in gen:
+                events.append(ev)
+                if len(events) >= 1:
+                    b.close()
+                    break
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].bearer_metadata["envelope"]["msg"], "c")
+        finally:
+            os.unlink(offset_path)
+
+    def test_recv_drops_malformed_lines_silently(self):
+        self._write([
+            b'not json',
+            b'{"from":"bob","msg":"good"}',
+            b'[1,2,3]',  # JSON but not an object
+            b'{"from":"carol","msg":"also good"}',
+        ])
+        b = LocalBearer(self._meta)
+        b.open("alice")
+        events = []
+        gen = b.recv_stream()
+        for ev in gen:
+            events.append(ev)
+            if len(events) >= 2:
+                b.close()
+                break
+        self.assertEqual([e.sender_peer_id for e in events], ["bob", "carol"])
+
+    def test_liveness_updates_on_each_event(self):
+        self._write([b'{"from":"bob","msg":"x"}'])
+        b = LocalBearer(self._meta)
+        b.open("alice")
+        live_before = b.liveness("alice")
+        self.assertIsNone(live_before.last_seen_ts)
+        gen = b.recv_stream()
+        next(gen)
+        live_after = b.liveness("alice")
+        self.assertIsNotNone(live_after.last_seen_ts)
+        self.assertIn("local tail", live_after.bearer_diag.lower())
+        b.close()
+
+    def test_offset_persists_after_recv(self):
+        import os, tempfile
+        self._write([
+            b'{"from":"bob","msg":"a"}',
+            b'{"from":"bob","msg":"b"}',
+        ])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("0")
+            offset_path = f.name
+        try:
+            meta = dict(self._meta, offset_file=offset_path)
+            b = LocalBearer(meta)
+            b.open("alice")
+            gen = b.recv_stream()
+            next(gen); next(gen)
+            b.close()
+            with open(offset_path) as f:
+                self.assertEqual(f.read().strip(), "2")
+        finally:
+            os.unlink(offset_path)
+
+
+class LocalBearerSkeletonTests(unittest.TestCase):
+    """Bearer ABC contract — same shape as SshBearerSkeletonTests."""
+
+    def test_kind_is_local(self):
+        self.assertEqual(LocalBearer.KIND, "local")
+
+    def test_construct_is_cheap(self):
+        # Constructor must not touch IO. Pass a peer_meta with a
+        # nonexistent dir; construction succeeds, no exception.
+        b = LocalBearer({"host_target": "127.0.0.1", "remote_home": "/nope/nope"})
+        # Closing without open is a no-op (idempotent).
+        b.close()
+
+    def test_post_close_operations_raise(self):
+        b = LocalBearer({"host_target": "127.0.0.1", "remote_home": "/tmp"})
+        b.open("alice")
+        b.close()
+        with self.assertRaises(LocalBearerError):
+            b.send("alice", "general", b'{"x":1}')
+
+
+class ResolverOrderTests(unittest.TestCase):
+    """Phase 3a: LocalBearer must be picked over SshBearer when both
+    can serve a peer. SshBearer is the universal fallback; LocalBearer
+    is the same-machine optimization. Reversing this order would make
+    every same-machine 2-tab session waste SSH crypto cycles."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-test-resolver-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_local_first_for_same_machine_peer(self):
+        bearer = resolve({
+            "host_target": "user@127.0.0.1",
+            "remote_home": self._tmpdir,
+        })
+        self.assertEqual(bearer.KIND, "local",
+                         "same-machine peer must resolve to LocalBearer")
+
+    def test_ssh_for_remote_peer(self):
+        bearer = resolve({
+            "host_target": "alice@example.com",
+            "remote_home": "/home/alice/.airc",
+        })
+        self.assertEqual(bearer.KIND, "ssh",
+                         "remote peer must resolve to SshBearer")
+
+    def test_ssh_when_loopback_target_but_no_local_dir(self):
+        # Stale loopback record without a host_airc_home that exists →
+        # LocalBearer.can_serve is False → fall through to SshBearer.
+        bearer = resolve({
+            "host_target": "user@127.0.0.1",
+            "remote_home": "/this/path/definitely/does/not/exist",
+        })
+        self.assertEqual(bearer.KIND, "ssh")
+
+    def test_available_kinds_includes_local(self):
+        from airc_core.bearer_resolver import available_kinds
+        kinds = available_kinds()
+        self.assertIn("local", kinds)
+        self.assertIn("ssh", kinds)
+        # local must come first (preference order).
+        self.assertLess(kinds.index("local"), kinds.index("ssh"))
 
 
 if __name__ == "__main__":
