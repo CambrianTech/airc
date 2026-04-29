@@ -2623,6 +2623,93 @@ finally:
   cleanup_all
 }
 
+scenario_bearer_cli_recv() {
+  # Phase 2b: prove `python -m airc_core.bearer_cli recv` (the bridge the
+  # bash monitor now uses instead of an inline ssh-tail) emits one line
+  # per envelope, payload-bytes verbatim, suitable for piping straight
+  # into monitor_formatter. If this scenario passes but the monitor still
+  # misses messages, the bug is in the formatter or in the watchdog —
+  # not in the bearer-CLI seam.
+  section "bearer_cli recv: emits one JSONL line per envelope"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-cli-h alpha 7553 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7553"
+
+  local join; join=$(read_join_string /tmp/airc-it-cli-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-cli-j delta "$join" || { fail "delta joiner failed to start"; return; }
+  pass "joiner delta paired with alpha"
+
+  local jstate=/tmp/airc-it-cli-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  local ikey="$jstate/identity/ssh_key"
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local hstate=/tmp/airc-it-cli-h/state
+
+  local marker="cli-recv-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local cli_out; cli_out=$(mktemp -t airc-it-cli-recv.XXXXXX)
+  local cli_err; cli_err=$(mktemp -t airc-it-cli-err.XXXXXX)
+
+  # Run bearer_cli recv in the background, captured to a file. Different
+  # offset_file path per invocation so we don't fight the live joiner.
+  local off_file; off_file=$(mktemp -t airc-it-cli-off.XXXXXX); rm -f "$off_file"
+  PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli recv alpha \
+    --host-target "$host_target" \
+    --identity-key "$ikey" \
+    --remote-home "$rhome" \
+    --offset-file "$off_file" \
+    >"$cli_out" 2>"$cli_err" &
+  local cli_pid=$!
+
+  # Give ssh ~3s to connect.
+  sleep 3
+  echo "$probe" >> "$hstate/messages.jsonl"
+
+  # Poll output for the marker.
+  local i found=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    if grep -q "$marker" "$cli_out" 2>/dev/null; then
+      found=1
+      break
+    fi
+  done
+
+  # Tear down the CLI; SIGTERM should produce a clean exit.
+  kill "$cli_pid" 2>/dev/null
+  wait "$cli_pid" 2>/dev/null
+
+  if [ $found -eq 1 ]; then
+    pass "bearer_cli recv emitted line containing the planted marker"
+  else
+    fail "bearer_cli recv did NOT emit the marker; out: $(cat "$cli_out" 2>/dev/null); err: $(cat "$cli_err" 2>/dev/null)"
+  fi
+
+  # Verify the line is JSONL-shaped (parseable JSON object). Defends
+  # against accidental wrapping or pretty-printing in the CLI.
+  if [ $found -eq 1 ] && python3 -c "
+import json, sys
+for line in open('$cli_out'):
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    if obj.get('msg') == '$marker':
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+    pass "bearer_cli recv output is parseable JSONL"
+  elif [ $found -eq 1 ]; then
+    fail "bearer_cli recv emitted the marker but output is not parseable JSONL: $(cat "$cli_out" 2>/dev/null)"
+  fi
+
+  rm -f "$cli_out" "$cli_err" "$off_file"
+  cleanup_all
+}
+
 scenario_python_units() {
   # Python unit tests for airc_core/. Currently exercises the bearer
   # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
@@ -2675,6 +2762,7 @@ case "$MODE" in
   python_units) scenario_python_units ;;
   bearer_ssh_send) scenario_bearer_ssh_send ;;
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
+  bearer_cli_recv) scenario_bearer_cli_recv ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2690,7 +2778,7 @@ case "$MODE" in
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
-    scenario_bearer_ssh_send; scenario_bearer_ssh_recv
+    scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     ;;
   *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac

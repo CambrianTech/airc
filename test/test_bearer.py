@@ -7,6 +7,7 @@ or:  cd test && python -m unittest test_bearer
 
 from __future__ import annotations
 
+import argparse
 import sys
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ from airc_core.bearer_resolver import (  # noqa: E402
 )
 from airc_core.bearer_ssh import SshBearer, SshBearerError  # noqa: E402
 from airc_core import bearer_ssh  # noqa: E402
+from airc_core import bearer_cli  # noqa: E402
 
 
 class BearerInterfaceTests(unittest.TestCase):
@@ -445,6 +447,219 @@ class CgnatRegexTests(unittest.TestCase):
             # No tailscale = always False. Just verify no crash on user@host form.
             self.assertFalse(bearer_ssh._is_peer_offline_in_tailnet("alice@100.64.0.1"))
             self.assertFalse(bearer_ssh._is_peer_offline_in_tailnet("alice@192.168.1.5"))
+
+
+class BearerCliRecvTests(unittest.TestCase):
+    """Phase 2b: `python -m airc_core.bearer_cli recv` is the bridge from
+    bash monitor → bearer.recv_stream(). The CLI must:
+      - Print one line per envelope (raw payload bytes + \\n)
+      - Pass offset_file through to the bearer for reconnect resume
+      - Exit cleanly on resolver error (with stderr explanation)
+      - Exit cleanly on BrokenPipeError (formatter died)
+    Tests substitute a fake bearer for the resolver to keep them hermetic.
+    """
+
+    class _FakeBearer:
+        """Records open()/close()/recv_stream() calls; yields fixed events."""
+        def __init__(self, peer_meta):
+            self.peer_meta = peer_meta
+            self.opened_for = None
+            self.closed = False
+            self._events = []
+
+        def set_events(self, events):
+            self._events = events
+
+        def open(self, peer_id):
+            self.opened_for = peer_id
+
+        def recv_stream(self):
+            for ev in self._events:
+                yield ev
+
+        def close(self):
+            self.closed = True
+
+    def _make_args(self, **overrides):
+        ns = argparse.Namespace(
+            peer_id="alice",
+            host_target="alice@example",
+            identity_key="/tmp/k",
+            remote_home="$HOME/.airc",
+            offset_file=None,
+        )
+        for k, v in overrides.items():
+            setattr(ns, k, v)
+        return ns
+
+    def _capture_stdout_bytes(self):
+        """Replace sys.stdout with one whose .buffer captures bytes.
+
+        cmd_recv writes to sys.stdout.buffer (binary). Our capture
+        intercepts at that level and lets us read what the CLI emitted.
+        """
+        import io
+        captured = io.BytesIO()
+        fake_stdout = mock.Mock()
+        fake_stdout.buffer = captured
+        return fake_stdout, captured
+
+    def test_recv_emits_one_line_per_envelope(self):
+        events = [
+            ReceivedMessage(
+                sender_peer_id="bob",
+                channel="general",
+                payload=b'{"from":"bob","channel":"general","msg":"hi"}',
+                bearer_metadata={},
+            ),
+            ReceivedMessage(
+                sender_peer_id="carol",
+                channel="general",
+                payload=b'{"from":"carol","channel":"general","msg":"hey"}\n',
+                bearer_metadata={},
+            ),
+        ]
+        fake = self._FakeBearer({})
+        fake.set_events(events)
+
+        fake_stdout, captured = self._capture_stdout_bytes()
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            rc = bearer_cli.cmd_recv(self._make_args())
+
+        self.assertEqual(rc, 0)
+        out_lines = captured.getvalue().splitlines(keepends=True)
+        self.assertEqual(len(out_lines), 2)
+        # First payload had no newline; CLI must add one.
+        self.assertEqual(
+            out_lines[0],
+            b'{"from":"bob","channel":"general","msg":"hi"}\n',
+        )
+        # Second payload already had a trailing newline; CLI must not double it.
+        self.assertEqual(
+            out_lines[1],
+            b'{"from":"carol","channel":"general","msg":"hey"}\n',
+        )
+        self.assertTrue(fake.closed, "bearer.close() must be called")
+        self.assertEqual(fake.opened_for, "alice")
+
+    def test_recv_passes_offset_file_to_resolver(self):
+        captured_meta = {}
+
+        def fake_resolve(meta):
+            captured_meta.update(meta)
+            fake = self._FakeBearer(meta)
+            return fake
+
+        fake_stdout, _ = self._capture_stdout_bytes()
+        with mock.patch.object(bearer_cli, "resolve", side_effect=fake_resolve), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args(offset_file="/tmp/monitor_offset"))
+
+        self.assertEqual(captured_meta.get("offset_file"), "/tmp/monitor_offset")
+
+    def test_recv_drops_none_meta_fields(self):
+        captured_meta = {}
+
+        def fake_resolve(meta):
+            captured_meta.update(meta)
+            return self._FakeBearer(meta)
+
+        fake_stdout, _ = self._capture_stdout_bytes()
+        with mock.patch.object(bearer_cli, "resolve", side_effect=fake_resolve), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            bearer_cli.cmd_recv(self._make_args(
+                identity_key=None, offset_file=None,
+            ))
+
+        self.assertNotIn("identity_key", captured_meta)
+        self.assertNotIn("offset_file", captured_meta)
+        self.assertEqual(captured_meta.get("host_target"), "alice@example")
+
+    def test_recv_resolver_error_returns_2(self):
+        fake_stderr = mock.Mock()
+
+        def fake_resolve(meta):
+            raise RuntimeError("no bearer can serve this peer")
+
+        with mock.patch.object(bearer_cli, "resolve", side_effect=fake_resolve), \
+             mock.patch.object(bearer_cli.sys, "stderr", fake_stderr):
+            rc = bearer_cli.cmd_recv(self._make_args())
+
+        self.assertEqual(rc, 2)
+        # The error must be surfaced (CLAUDE.md: never swallow errors).
+        printed = "".join(
+            call.args[0] if call.args else ""
+            for call in fake_stderr.print.call_args_list
+        ) if hasattr(fake_stderr, "print") else ""
+        # `print(file=sys.stderr)` calls .write on the file. Inspect that path.
+        write_calls = [c.args[0] for c in fake_stderr.write.call_args_list]
+        joined = "".join(str(x) for x in write_calls)
+        self.assertIn("resolver error", joined)
+
+    def test_recv_broken_pipe_exits_cleanly(self):
+        events = [
+            ReceivedMessage(
+                sender_peer_id="bob",
+                channel="general",
+                payload=b'{"from":"bob","channel":"general","msg":"first"}',
+                bearer_metadata={},
+            ),
+            ReceivedMessage(
+                sender_peer_id="bob",
+                channel="general",
+                payload=b'{"from":"bob","channel":"general","msg":"second"}',
+                bearer_metadata={},
+            ),
+        ]
+        fake = self._FakeBearer({})
+        fake.set_events(events)
+
+        # Buffer that raises BrokenPipeError on the second write — simulates
+        # the formatter exiting after consuming one line.
+        class _BrokenAfter:
+            def __init__(self, n):
+                self.n = n
+                self.writes = 0
+                self.flushes = 0
+
+            def write(self, _data):
+                self.writes += 1
+                if self.writes > self.n:
+                    raise BrokenPipeError()
+
+            def flush(self):
+                self.flushes += 1
+
+        broken = _BrokenAfter(n=1)
+        fake_stdout = mock.Mock()
+        fake_stdout.buffer = broken
+
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout):
+            rc = bearer_cli.cmd_recv(self._make_args())
+
+        self.assertEqual(rc, 0, "broken pipe must produce graceful exit")
+        self.assertTrue(fake.closed, "bearer.close() must run on broken pipe")
+
+    def test_parser_recognizes_recv(self):
+        # Smoke-test: the recv subparser must be registered with the
+        # right defaults so a typo in cmd binding doesn't slip past.
+        parser = bearer_cli._build_parser()
+        ns = parser.parse_args([
+            "recv", "alice",
+            "--host-target", "alice@example",
+            "--identity-key", "/tmp/k",
+            "--remote-home", "$HOME/.airc",
+            "--offset-file", "/tmp/off",
+        ])
+        self.assertEqual(ns.cmd, "recv")
+        self.assertEqual(ns.peer_id, "alice")
+        self.assertEqual(ns.host_target, "alice@example")
+        self.assertEqual(ns.identity_key, "/tmp/k")
+        self.assertEqual(ns.remote_home, "$HOME/.airc")
+        self.assertEqual(ns.offset_file, "/tmp/off")
+        self.assertIs(ns.func, bearer_cli.cmd_recv)
 
 
 if __name__ == "__main__":
