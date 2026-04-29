@@ -2837,6 +2837,176 @@ finally:
   cleanup_all
 }
 
+scenario_bearer_gh() {
+  # Phase 3b: GhBearer round-trip against a real gh gist. Creates a
+  # temporary gist, sends an envelope through the bearer, polls for
+  # it to appear via recv_stream, cleans up. Skip-guarded on gh auth.
+  #
+  # Why a real gist (not mocked): unit tests already cover the bearer's
+  # logic. This scenario validates the gh CLI invocations actually do
+  # what we expect — gh gist edit's filename rules, gh api response
+  # shape, error surfacing — none of which a mock can prove.
+  section "bearer (gh): send/recv round-trip via real gh gist"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Create a private gist with a non-empty seed line. gh refuses gists
+  # whose only file is blank (or even a bare newline). The bearer's
+  # envelope parser drops the seed line as malformed (no `from` field)
+  # so it's invisible in recv_stream output.
+  local seed; seed=$(mktemp -d -t airc-it-bg-seed.XXXXXX)
+  printf '# airc bearer_gh test seed\n' > "$seed/messages.jsonl"
+  local gist_url; gist_url=$(gh gist create -d "airc bearer_gh integration test" "$seed/messages.jsonl" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create test gist (got: $gist_url)"
+    return
+  fi
+  pass "test gist created: $gist_id"
+
+  # Always delete the gist before returning, even on failure. trap so
+  # an unexpected exit (e.g. signal during a long send) still cleans up.
+  local _cleanup_gist=1
+  _bearer_gh_cleanup() {
+    [ "${_cleanup_gist:-0}" = "1" ] && [ -n "${gist_id:-}" ] && \
+      gh gist delete "$gist_id" --yes 2>/dev/null || true
+  }
+  trap _bearer_gh_cleanup EXIT
+
+  local marker="gh-bearer-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+
+  # Send via GhBearer.send (through the resolver, asserts kind=gh).
+  local send_out
+  send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({'room_gist_id': '$gist_id'})
+print(f'KIND={bearer.KIND}')
+bearer.open('alpha')
+out = bearer.send('alpha', 'general', b'$probe')
+print(f'SEND_KIND={out.kind}')
+if out.detail:
+    print(f'SEND_DETAIL={out.detail}')
+bearer.close()
+" 2>&1)
+
+  if echo "$send_out" | grep -q '^KIND=gh$'; then
+    pass "resolver picks GhBearer for room_gist_id-only peer_meta"
+  else
+    fail "resolver did NOT pick GhBearer (got: $send_out)"
+    return
+  fi
+  if echo "$send_out" | grep -q '^SEND_KIND=delivered$'; then
+    pass "GhBearer.send returns delivered"
+  else
+    fail "GhBearer.send did not deliver (got: $send_out)"
+    return
+  fi
+
+  # Verify the marker actually landed in the gist.
+  local content; content=$(gh api "gists/$gist_id" 2>/dev/null \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'])" 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "payload visible in gist's messages.jsonl"
+  else
+    fail "payload NOT visible in gist (content: $content)"
+    return
+  fi
+
+  # Now exercise recv_stream: append a SECOND probe to the gist via gh
+  # CLI directly (simulating another peer's send), then verify
+  # GhBearer.recv_stream picks it up. Use poll_interval=1 to keep the
+  # test fast — production default is 15s.
+  local marker2="gh-bearer-recv-marker-$(date +%s%N)"
+  local probe2='{"from":"beta","to":"all","ts":"2026-04-29T00:00:01Z","channel":"general","msg":"'"$marker2"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-bg-recv.XXXXXX)
+
+  local recv_err; recv_err=$(mktemp -t airc-it-bg-recv-err.XXXXXX)
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({'room_gist_id': '$gist_id', 'poll_interval': 1})
+bearer.open('alpha')
+
+signal.alarm(30)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker2':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 30
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>"$recv_err" &
+  local recv_pid=$!
+
+  # Give the bearer's first poll a beat, then append the marker.
+  # We must preserve ALL prior gist content (seed line + first probe);
+  # otherwise rewriting only probe+probe2 leaves line-count unchanged
+  # at 2, and the bearer's consumed_lines (advanced past those during
+  # poll 1) skips the new marker. gh gist edit replaces the file
+  # wholesale, so reconstruct the full content.
+  sleep 2
+  local prior_content; prior_content=$(gh api "gists/$gist_id" 2>/dev/null \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'], end='')" 2>/dev/null)
+  local seed2; seed2=$(mktemp -d -t airc-it-bg-seed2.XXXXXX)
+  {
+    printf '%s' "$prior_content"
+    # Ensure trailing newline before appending so probe2 lands on its own line.
+    case "$prior_content" in
+      *$'\n') ;;
+      *) printf '\n' ;;
+    esac
+    printf '%s\n' "$probe2"
+  } > "$seed2/messages.jsonl"
+  gh gist edit "$gist_id" "$seed2/messages.jsonl" >/dev/null 2>&1
+  rm -rf "$seed2"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait "$recv_pid" 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "GhBearer.recv_stream picked up the appended marker"
+  else
+    fail "GhBearer.recv_stream did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "GhBearer.liveness reports fresh ts after recv event"
+  else
+    fail "GhBearer.liveness not fresh (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+
+  rm -f "$recv_out" "$recv_err"
+  # cleanup
+  trap - EXIT
+  _bearer_gh_cleanup
+  cleanup_all
+}
+
 scenario_bearer_observability() {
   # Phase 2c (#270): the bearer-attested liveness surface must replace
   # the messages.jsonl-mirror-derived "last recv" lie. After a real
@@ -2973,6 +3143,7 @@ case "$MODE" in
   bearer_cli_recv) scenario_bearer_cli_recv ;;
   bearer_observability) scenario_bearer_observability ;;
   bearer_local) scenario_bearer_local ;;
+  bearer_gh) scenario_bearer_gh ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2989,7 +3160,7 @@ case "$MODE" in
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
-    scenario_bearer_observability; scenario_bearer_local
+    scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     ;;
   *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac

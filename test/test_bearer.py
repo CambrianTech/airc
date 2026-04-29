@@ -32,8 +32,10 @@ from airc_core.bearer_resolver import (  # noqa: E402
 )
 from airc_core.bearer_ssh import SshBearer, SshBearerError  # noqa: E402
 from airc_core.bearer_local import LocalBearer, LocalBearerError  # noqa: E402
+from airc_core.bearer_gh import GhBearer, GhBearerError  # noqa: E402
 from airc_core import bearer_ssh  # noqa: E402
 from airc_core import bearer_local  # noqa: E402
+from airc_core import bearer_gh  # noqa: E402
 from airc_core import bearer_cli  # noqa: E402
 
 
@@ -1149,6 +1151,346 @@ class ResolverOrderTests(unittest.TestCase):
         self.assertIn("ssh", kinds)
         # local must come first (preference order).
         self.assertLess(kinds.index("local"), kinds.index("ssh"))
+
+
+class GhBearerCanServeTests(unittest.TestCase):
+    """Phase 3b: GhBearer.can_serve must require BOTH room_gist_id
+    AND a working gh auth. Either alone is insufficient — gist id with
+    no auth means we can't actually read/write; auth with no gist id
+    means we have nowhere to send to."""
+
+    def test_serves_with_gist_id_and_gh_auth(self):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            self.assertTrue(GhBearer.can_serve({"room_gist_id": "abc123"}))
+
+    def test_rejects_without_gist_id(self):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            self.assertFalse(GhBearer.can_serve({}))
+            self.assertFalse(GhBearer.can_serve({"room_gist_id": ""}))
+
+    def test_rejects_without_gh_auth(self):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
+            self.assertFalse(GhBearer.can_serve({"room_gist_id": "abc123"}))
+
+    def test_can_serve_does_not_mutate_meta(self):
+        meta = {"room_gist_id": "abc123"}
+        before = dict(meta)
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            GhBearer.can_serve(meta)
+        self.assertEqual(meta, before)
+
+
+class GhBearerSendTests(unittest.TestCase):
+    """GhBearer.send: read-modify-write of the room gist's messages.jsonl
+    file. Tests mock _gh_api_get (the read step) and _gh_gist_write_file
+    (the write step) so no real gh API is touched."""
+
+    def _bearer(self, meta=None):
+        m = meta or {"room_gist_id": "abc123"}
+        b = GhBearer(m)
+        b.open("alice")
+        return b
+
+    def test_send_appends_to_existing_messages_file(self):
+        existing = '{"from":"x","msg":"old"}\n'
+        captured = {}
+
+        def fake_write(gist_id, content):
+            captured["gist_id"] = gist_id
+            captured["content"] = content
+            return (True, "")
+
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {"messages.jsonl": {"content": existing}}}), \
+             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+            outcome = self._bearer().send("alice", "general", b'{"from":"bob","msg":"hi"}')
+
+        self.assertEqual(outcome.kind, "delivered")
+        self.assertEqual(captured["gist_id"], "abc123")
+        self.assertEqual(
+            captured["content"],
+            existing + '{"from":"bob","msg":"hi"}\n',
+        )
+
+    def test_send_creates_messages_file_when_absent(self):
+        # First write to the gist — messages.jsonl doesn't exist yet.
+        captured = {}
+
+        def fake_write(gist_id, content):
+            captured["content"] = content
+            return (True, "")
+
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+            outcome = self._bearer().send("alice", "general", b'{"from":"bob","msg":"first"}')
+
+        self.assertEqual(outcome.kind, "delivered")
+        self.assertEqual(captured["content"], '{"from":"bob","msg":"first"}\n')
+
+    def test_send_preserves_existing_trailing_newline(self):
+        captured = {}
+
+        def fake_write(gist_id, content):
+            captured["content"] = content
+            return (True, "")
+
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+            self._bearer().send("alice", "general", b'{"x":1}\n')
+
+        self.assertEqual(captured["content"], '{"x":1}\n')
+
+    def test_send_transient_when_get_fails(self):
+        with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "transient_failure")
+        self.assertIn("could not fetch gist", outcome.detail)
+
+    def test_send_transient_when_write_fails(self):
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_gist_write_file",
+                               return_value=(False, "Network is unreachable")):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "transient_failure")
+        self.assertIn("Network is unreachable", outcome.detail)
+
+    def test_send_auth_failure_on_permission_denied(self):
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_gist_write_file",
+                               return_value=(False, "HTTP 401: Permission denied")):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "auth_failure")
+
+    def test_send_without_gist_id_raises(self):
+        b = GhBearer({})
+        b.open("alice")
+        with self.assertRaises(GhBearerError):
+            b.send("alice", "general", b'{"x":1}')
+
+
+class GhBearerRecvTests(unittest.TestCase):
+    """GhBearer.recv_stream: poll the gist, yield new lines.
+
+    Tests use poll_interval=0 in peer_meta so the loop doesn't sleep
+    between iterations — keeps tests fast. Real production uses the
+    15s default."""
+
+    def _bearer(self, meta=None):
+        m = meta or {"room_gist_id": "abc123", "poll_interval": 0}
+        b = GhBearer(m)
+        b.open("alice")
+        return b
+
+    def _gist_response(self, content):
+        return {"files": {"messages.jsonl": {"content": content}}}
+
+    def test_recv_yields_new_lines_per_poll(self):
+        # First poll sees 2 lines; second poll sees 3 (1 new). Bearer
+        # must yield only the new line on the second poll.
+        responses = [
+            self._gist_response(
+                '{"from":"bob","channel":"general","msg":"a"}\n'
+                '{"from":"carol","channel":"general","msg":"b"}\n'
+            ),
+            self._gist_response(
+                '{"from":"bob","channel":"general","msg":"a"}\n'
+                '{"from":"carol","channel":"general","msg":"b"}\n'
+                '{"from":"dave","channel":"general","msg":"c"}\n'
+            ),
+        ]
+
+        b = self._bearer()
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=responses):
+            events = []
+            gen = b.recv_stream()
+            # Take the first 3 events: 2 from poll1, 1 from poll2.
+            for ev in gen:
+                events.append(ev)
+                if len(events) >= 3:
+                    b.close()
+                    break
+
+        msgs = [ev.bearer_metadata["envelope"]["msg"] for ev in events]
+        self.assertEqual(msgs, ["a", "b", "c"])
+
+    def test_recv_skips_malformed_lines(self):
+        with mock.patch.object(
+            bearer_gh, "_gh_api_get",
+            return_value=self._gist_response(
+                'not json\n'
+                '{"from":"bob","msg":"good"}\n'
+                '[1,2,3]\n'
+                '{"from":"carol","msg":"also good"}\n'
+            ),
+        ):
+            b = self._bearer()
+            events = []
+            gen = b.recv_stream()
+            for ev in gen:
+                events.append(ev)
+                if len(events) >= 2:
+                    b.close()
+                    break
+
+        self.assertEqual([e.sender_peer_id for e in events], ["bob", "carol"])
+
+    def test_recv_handles_get_failures_by_polling_again(self):
+        # First poll fails (None); second succeeds. Bearer should sleep
+        # and re-poll without crashing.
+        responses = [
+            None,  # transient
+            self._gist_response('{"from":"bob","msg":"hi"}\n'),
+        ]
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=responses):
+            b = self._bearer()
+            events = []
+            gen = b.recv_stream()
+            for ev in gen:
+                events.append(ev)
+                b.close()
+                break
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].sender_peer_id, "bob")
+
+    def test_recv_resumes_past_offset_file(self):
+        import tempfile, os as _os
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("2")  # skip first 2 lines
+            offset_path = f.name
+        try:
+            with mock.patch.object(
+                bearer_gh, "_gh_api_get",
+                return_value=self._gist_response(
+                    '{"from":"bob","msg":"a"}\n'
+                    '{"from":"bob","msg":"b"}\n'
+                    '{"from":"bob","msg":"c"}\n'
+                ),
+            ):
+                b = self._bearer({
+                    "room_gist_id": "abc123",
+                    "poll_interval": 0,
+                    "offset_file": offset_path,
+                })
+                events = []
+                gen = b.recv_stream()
+                for ev in gen:
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].bearer_metadata["envelope"]["msg"], "c")
+        finally:
+            _os.unlink(offset_path)
+
+    def test_liveness_updates_on_each_event(self):
+        with mock.patch.object(
+            bearer_gh, "_gh_api_get",
+            return_value=self._gist_response('{"from":"bob","msg":"x"}\n'),
+        ):
+            b = self._bearer()
+            live_before = b.liveness("alice")
+            self.assertIsNone(live_before.last_seen_ts)
+            self.assertIn("no events", live_before.bearer_diag.lower())
+
+            gen = b.recv_stream()
+            next(gen)
+            live_after = b.liveness("alice")
+            self.assertIsNotNone(live_after.last_seen_ts)
+            self.assertIn("gh poll", live_after.bearer_diag.lower())
+            b.close()
+
+    def test_offset_persists_after_recv(self):
+        import tempfile, os as _os
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("0")
+            offset_path = f.name
+        try:
+            with mock.patch.object(
+                bearer_gh, "_gh_api_get",
+                return_value=self._gist_response(
+                    '{"from":"bob","msg":"a"}\n'
+                    '{"from":"bob","msg":"b"}\n'
+                ),
+            ):
+                b = self._bearer({
+                    "room_gist_id": "abc123",
+                    "poll_interval": 0,
+                    "offset_file": offset_path,
+                })
+                gen = b.recv_stream()
+                next(gen); next(gen)
+                b.close()
+
+            with open(offset_path) as f:
+                self.assertEqual(f.read().strip(), "2")
+        finally:
+            _os.unlink(offset_path)
+
+
+class GhBearerSkeletonTests(unittest.TestCase):
+    """ABC contract — same shape as SshBearerSkeleton/LocalBearerSkeleton."""
+
+    def test_kind_is_gh(self):
+        self.assertEqual(GhBearer.KIND, "gh")
+
+    def test_construct_is_cheap(self):
+        # Constructor must do NO IO. _has_gh_auth() must NOT run here —
+        # it's only invoked by can_serve. We verify by patching it to
+        # raise; if construction touched it, this would fail.
+        with mock.patch.object(bearer_gh, "_has_gh_auth",
+                               side_effect=AssertionError("must not run on construct")):
+            b = GhBearer({"room_gist_id": "abc"})
+            b.close()
+
+    def test_post_close_operations_raise(self):
+        b = GhBearer({"room_gist_id": "abc"})
+        b.open("alice")
+        b.close()
+        with self.assertRaises(GhBearerError):
+            b.send("alice", "general", b'{"x":1}')
+
+
+class ResolverIncludesGhBearerTests(unittest.TestCase):
+    """Phase 3b: GhBearer is registered (after SshBearer in 3b's
+    additive ordering). Production peer_meta with host_target still
+    routes to SshBearer; only meta lacking host_target reaches gh."""
+
+    def test_available_kinds_includes_gh(self):
+        from airc_core.bearer_resolver import available_kinds
+        kinds = available_kinds()
+        self.assertIn("gh", kinds)
+        # 3b: gh comes AFTER ssh so today's traffic isn't preempted.
+        self.assertGreater(kinds.index("gh"), kinds.index("ssh"))
+
+    def test_ssh_still_wins_when_host_target_present(self):
+        # Today's production peer_meta. Resolver picks SshBearer; gh
+        # never gets a turn.
+        bearer = resolve({
+            "host_target": "alice@example.com",
+            "remote_home": "/home/alice/.airc",
+        })
+        self.assertEqual(bearer.KIND, "ssh")
+
+    def test_gh_picked_when_only_room_gist_id(self):
+        # Phase 3b activation path. peer_meta has NO host_target
+        # (so SSH and Local both decline) but has a room_gist_id and
+        # gh auth works → GhBearer.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            bearer = resolve({"room_gist_id": "abc123"})
+        self.assertEqual(bearer.KIND, "gh")
+
+    def test_unreachable_when_no_gh_auth_and_no_other_meta(self):
+        # Nothing can serve: no host_target (Ssh declines), no loopback
+        # (Local declines), no gh auth (Gh declines).
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
+            with self.assertRaises(PeerUnreachable):
+                resolve({"room_gist_id": "abc123"})
 
 
 if __name__ == "__main__":
