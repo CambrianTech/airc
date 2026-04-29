@@ -859,34 +859,35 @@ class GhBearerSendTests(unittest.TestCase):
         existing = '{"from":"x","msg":"old"}\n'
         captured = {}
 
-        def fake_write(gist_id, content):
+        def fake_patch(gist_id, content, etag):
             captured["gist_id"] = gist_id
             captured["content"] = content
-            return (True, "")
+            captured["etag"] = etag
+            return (True, 200, "")
 
-        with mock.patch.object(bearer_gh, "_gh_api_get",
-                               return_value={"files": {"messages.jsonl": {"content": existing}}}), \
-             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {"messages.jsonl": {"content": existing}}}, '"e0"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
             outcome = self._bearer().send("alice", "general", b'{"from":"bob","msg":"hi"}')
 
         self.assertEqual(outcome.kind, "delivered")
         self.assertEqual(captured["gist_id"], "abc123")
+        self.assertEqual(captured["etag"], '"e0"')
         self.assertEqual(
             captured["content"],
             existing + '{"from":"bob","msg":"hi"}\n',
         )
 
     def test_send_creates_messages_file_when_absent(self):
-        # First write to the gist — messages.jsonl doesn't exist yet.
         captured = {}
 
-        def fake_write(gist_id, content):
+        def fake_patch(gist_id, content, etag):
             captured["content"] = content
-            return (True, "")
+            return (True, 200, "")
 
-        with mock.patch.object(bearer_gh, "_gh_api_get",
-                               return_value={"files": {}}), \
-             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {}}, '"e0"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
             outcome = self._bearer().send("alice", "general", b'{"from":"bob","msg":"first"}')
 
         self.assertEqual(outcome.kind, "delivered")
@@ -895,39 +896,84 @@ class GhBearerSendTests(unittest.TestCase):
     def test_send_preserves_existing_trailing_newline(self):
         captured = {}
 
-        def fake_write(gist_id, content):
+        def fake_patch(gist_id, content, etag):
             captured["content"] = content
-            return (True, "")
+            return (True, 200, "")
 
-        with mock.patch.object(bearer_gh, "_gh_api_get",
-                               return_value={"files": {}}), \
-             mock.patch.object(bearer_gh, "_gh_gist_write_file", side_effect=fake_write):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {}}, '"e0"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
             self._bearer().send("alice", "general", b'{"x":1}\n')
 
         self.assertEqual(captured["content"], '{"x":1}\n')
 
     def test_send_transient_when_get_fails(self):
-        with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag", return_value=None), \
+             mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "transient_failure")
         self.assertIn("could not fetch gist", outcome.detail)
 
     def test_send_transient_when_write_fails(self):
-        with mock.patch.object(bearer_gh, "_gh_api_get",
-                               return_value={"files": {}}), \
-             mock.patch.object(bearer_gh, "_gh_gist_write_file",
-                               return_value=(False, "Network is unreachable")):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {}}, '"e0"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl",
+                               return_value=(False, 500, "Network is unreachable")):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "transient_failure")
         self.assertIn("Network is unreachable", outcome.detail)
 
     def test_send_auth_failure_on_permission_denied(self):
-        with mock.patch.object(bearer_gh, "_gh_api_get",
-                               return_value={"files": {}}), \
-             mock.patch.object(bearer_gh, "_gh_gist_write_file",
-                               return_value=(False, "HTTP 401: Permission denied")):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {}}, '"e0"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl",
+                               return_value=(False, 401, "HTTP 401: Permission denied")):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "auth_failure")
+
+    def test_send_retries_on_412_then_succeeds(self):
+        # Concurrent-write conflict: first PATCH returns 412 (someone
+        # wrote between our GET and PATCH), retry's GET returns the
+        # newer content + ETag, second PATCH succeeds. This is the
+        # core regression guard for #299.
+        gets = [
+            ({"files": {"messages.jsonl": {"content": '{"from":"racer","msg":"first"}\n'}}}, '"e1"'),
+            ({"files": {"messages.jsonl": {"content": '{"from":"racer","msg":"first"}\n'}}}, '"e2"'),
+        ]
+        patches = [
+            (False, 412, "HTTP 412: Precondition Failed"),
+            (True, 200, ""),
+        ]
+        captured = []
+
+        def fake_get(_):
+            return gets.pop(0)
+
+        def fake_patch(gist_id, content, etag):
+            captured.append((etag, content))
+            return patches.pop(0)
+
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag", side_effect=fake_get), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
+            outcome = self._bearer().send("alice", "general", b'{"from":"me","msg":"hi"}')
+
+        self.assertEqual(outcome.kind, "delivered")
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0][0], '"e1"')
+        self.assertEqual(captured[1][0], '"e2"')
+        # Second attempt must include BOTH the racer's earlier line
+        # AND ours — that's the whole point of the retry.
+        self.assertIn('"first"', captured[1][1])
+        self.assertIn('"hi"', captured[1][1])
+
+    def test_send_transient_when_412_retries_exhausted(self):
+        with mock.patch.object(bearer_gh, "_gh_api_get_with_etag",
+                               return_value=({"files": {}}, '"e"')), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl",
+                               return_value=(False, 412, "Precondition Failed")):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "transient_failure")
+        self.assertIn("ETag conflict", outcome.detail)
 
     def test_send_without_gist_id_raises(self):
         b = GhBearer({})

@@ -137,6 +137,98 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         return None
 
 
+def _gh_api_get_with_etag(gist_id: str) -> Optional[tuple[dict, str]]:
+    """Like _gh_api_get but also returns the ETag for conditional PATCH.
+
+    Implementation: `gh api -i` includes response headers in stdout
+    before the JSON body (RFC 7230 — headers, blank line, body).
+    Parse the ETag header; the body is everything after the first
+    blank line.
+
+    Returns (gist_dict, etag) on success, None on any failure. Empty
+    etag string is acceptable — caller will skip If-Match and accept
+    the lost-write risk; that mirrors pre-2026-04-29 behavior, used
+    only when this helper degrades gracefully on older gh CLI versions
+    that don't surface headers cleanly.
+    """
+    try:
+        gh = _resolve_gh_bin()
+    except GhBearerError:
+        return None
+    try:
+        r = subprocess.run(
+            [gh, "api", "-i", f"gists/{gist_id}"],
+            capture_output=True,
+            text=True,
+            timeout=_GH_API_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    head, _, body = r.stdout.partition("\r\n\r\n")
+    if not body:
+        head, _, body = r.stdout.partition("\n\n")
+    etag = ""
+    for line in head.splitlines():
+        if line.lower().startswith("etag:"):
+            etag = line.split(":", 1)[1].strip()
+            break
+    try:
+        return (json.loads(body), etag)
+    except (ValueError, TypeError):
+        return None
+
+
+def _gh_api_patch_messages_jsonl(
+    gist_id: str, content: str, etag: str
+) -> tuple[bool, int, str]:
+    """PATCH gists/<id> with messages.jsonl=content and If-Match: <etag>.
+
+    Returns (ok, http_status, detail).
+      ok=True              — write landed (status 200)
+      ok=False, status=412 — conflict, ETag stale, caller retries
+      ok=False, other      — fatal-ish, caller surfaces
+
+    Empty etag → unconditional write (no If-Match header). That's the
+    fallback when _gh_api_get_with_etag couldn't parse the ETag; same
+    last-writer-wins risk as pre-fix, but at least the call still
+    works. Loud-fail would be worse here than degrade.
+    """
+    try:
+        gh = _resolve_gh_bin()
+    except GhBearerError as e:
+        return (False, 0, str(e))
+    body = json.dumps({"files": {_MESSAGES_FILE: {"content": content}}})
+    argv = [gh, "api", "--method", "PATCH", "-i", f"gists/{gist_id}", "--input", "-"]
+    if etag:
+        argv += ["-H", f"If-Match: {etag}"]
+    try:
+        r = subprocess.run(
+            argv,
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=_GH_API_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return (False, 0, f"gh api PATCH failed: {e}")
+    # Parse status line from headers (HTTP/1.1 <code> <msg>\r\n...).
+    head = r.stdout.split("\r\n\r\n", 1)[0] if "\r\n\r\n" in r.stdout else \
+           r.stdout.split("\n\n", 1)[0]
+    status = 0
+    for line in head.splitlines():
+        if line.startswith("HTTP/"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                status = int(parts[1])
+            break
+    if r.returncode == 0 and 200 <= status < 300:
+        return (True, status, "")
+    err = (r.stderr or r.stdout or "gh api PATCH failed").strip()
+    return (False, status, err)
+
+
 def _rotate_if_needed(content: str) -> str:
     """Trim the gist's messages.jsonl content when approaching gh's 1MB
     file limit. Trim to a TARGET well below the trigger so we don't
@@ -333,19 +425,28 @@ class GhBearer(Bearer):
         self._consumed_lines = self._read_offset(offset_file)
 
     def send(self, peer_id: str, channel: str, payload: bytes) -> SendOutcome:
-        """Append `payload` to the room gist's messages.jsonl file.
+        """Append `payload` to the room gist's messages.jsonl file with
+        ETag-conditional concurrency control.
 
-        Read-modify-write via gh CLI: GET current content, append our
-        line, edit the gist with combined content. Optimistic concurrency:
-        if two peers race, the loser's write OVERWRITES the winner's.
-        Real fix is ETag/If-Match (gh CLI doesn't expose this directly);
-        deferred to a follow-up — the conflict window is sub-second and
-        rare in practice for chat-pace traffic.
+        Pre-2026-04-29 this was a naive GET-then-PUT race: two peers
+        chattering at the same time would each read the same content,
+        each append their own line, each PUT the result; last writer
+        won, the other's line silently vanished. continuum-b741 caught
+        only-1-of-3 PONGs reaching the gist as the highest-impact
+        symptom (#299), but every concurrent broadcast suffered the
+        same loss class.
+
+        Now: GET captures the gist's ETag, PATCH carries `If-Match: <etag>`.
+        On 412 Precondition Failed (another peer wrote first), retry up
+        to RETRIES times — each retry re-reads, so the merge keeps both
+        the racer's line AND ours. Below the chat-pace traffic level a
+        single retry suffices; bound the loop so a hot room doesn't
+        livelock.
 
         Outcome kinds:
-          delivered          — gh edit succeeded
+          delivered          — PATCH succeeded
           transient_failure  — read failed, write failed, network blip,
-                               rate limit, gh auth lost mid-call
+                               rate limit, retries exhausted on conflict
           auth_failure       — gh auth status currently fails (the
                                can_serve gate caught a stale state, but
                                token expired between can_serve and now)
@@ -359,16 +460,6 @@ class GhBearer(Bearer):
                 f"room_gist_id in peer_meta — open() called with stale meta?"
             )
 
-        gist = _gh_api_get(gist_id)
-        if gist is None:
-            # Most common cause: rate-limited or transient gh API error.
-            # Auth-lost is a sub-case; we don't try to disambiguate
-            # here because caller's queue+retry handles both equally.
-            return SendOutcome(
-                kind="transient_failure",
-                detail=f"could not fetch gist {gist_id} (rate limit, network, or auth)",
-            )
-
         framed = payload if payload.endswith(b"\n") else payload + b"\n"
         try:
             framed_str = framed.decode("utf-8")
@@ -377,19 +468,46 @@ class GhBearer(Bearer):
                 kind="transient_failure",
                 detail="payload is not utf-8; gh-bearer requires text envelopes",
             )
-        existing_content = _read_messages_content(gist)
-        new_content = _rotate_if_needed(existing_content) + framed_str
 
-        ok, detail = _gh_gist_write_file(gist_id, new_content)
-        if ok:
-            return SendOutcome(kind="delivered", detail="")
-        # gh returns "permission denied" or "404" for auth issues.
-        # Treat those as auth_failure so the caller surfaces them
-        # loudly rather than queueing forever.
-        lower = detail.lower()
-        if "permission" in lower or "401" in lower or "not found" in lower:
-            return SendOutcome(kind="auth_failure", detail=detail)
-        return SendOutcome(kind="transient_failure", detail=detail)
+        RETRIES = 4
+        last_detail = ""
+        for attempt in range(RETRIES):
+            result = _gh_api_get_with_etag(gist_id)
+            if result is None:
+                # GET-with-headers failed; fall back to plain GET +
+                # unconditional PATCH (degraded mode, last-writer-wins).
+                gist = _gh_api_get(gist_id)
+                if gist is None:
+                    return SendOutcome(
+                        kind="transient_failure",
+                        detail=f"could not fetch gist {gist_id} (rate limit, network, or auth)",
+                    )
+                etag = ""
+            else:
+                gist, etag = result
+
+            existing = _read_messages_content(gist)
+            new_content = _rotate_if_needed(existing) + framed_str
+
+            ok, status, detail = _gh_api_patch_messages_jsonl(gist_id, new_content, etag)
+            if ok:
+                return SendOutcome(kind="delivered", detail="")
+            last_detail = detail
+            if status == 412:
+                # Another peer wrote between our GET and PATCH — retry
+                # with fresh ETag. Tiny backoff so concurrent retriers
+                # don't lockstep.
+                _time.sleep(0.05 * (attempt + 1))
+                continue
+            lower = detail.lower()
+            if "permission" in lower or status == 401 or "not found" in lower or status == 404:
+                return SendOutcome(kind="auth_failure", detail=detail)
+            return SendOutcome(kind="transient_failure", detail=detail)
+
+        return SendOutcome(
+            kind="transient_failure",
+            detail=f"ETag conflict after {RETRIES} retries (room very busy?); last: {last_detail}",
+        )
 
     def recv_stream(self) -> Iterator[ReceivedMessage]:
         """Poll the room gist on a cadence; yield new envelopes.
