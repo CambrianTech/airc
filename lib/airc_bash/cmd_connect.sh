@@ -1363,7 +1363,22 @@ print(json.dumps(chans))
 }
 JSON
 )
-                local _hb_tmp; _hb_tmp=$(mktemp -t airc-hb.XXXXXX)
+                # Heartbeat target file basename MUST match the canonical
+                # in-gist filename (`airc-room-<channel>.json` per
+                # channel_gist.py). When the gist has multiple files
+                # (messages.jsonl + the room-metadata JSON) and we pass
+                # gh a path with a basename that matches NEITHER, gh
+                # errors with "unsure what file to edit; either specify
+                # --filename or run interactively" — heartbeat fails N
+                # times in a row and the host self-evicts (deletes its
+                # own gist + respawns) when nothing was actually wrong.
+                # That eviction loop is the surface ideem-local-4bef
+                # root-caused 2026-04-29; it's also what nuked the
+                # #useideem gist mid-ping-debug. Ensuring the temp
+                # basename matches the canonical filename closes the
+                # whole convergent class.
+                local _hb_tmpdir; _hb_tmpdir=$(mktemp -d -t airc-hb.XXXXXX)
+                local _hb_tmp="${_hb_tmpdir}/airc-room-${_hb_room}.json"
                 printf '%s\n' "$_hb_payload" > "$_hb_tmp"
                 # Rotate the host's messages.jsonl when it exceeds the
                 # AIRC_LOG_MAX_LINES threshold (default 5000). Trims
@@ -1401,7 +1416,7 @@ JSON
                     exit 0
                   fi
                 fi
-                rm -f "$_hb_tmp"
+                rm -rf "$_hb_tmpdir"
               done
             ) &
             local _hb_pid=$!
