@@ -3175,33 +3175,63 @@ except Exception:
 }
 
 scenario_bearer_local() {
-  # Phase 3a: LocalBearer serves same-machine peers via direct
-  # filesystem reads/writes — no SSH, no subprocess. This scenario
-  # builds a hand-crafted peer_meta (loopback host_target + writable
-  # local dir), exercises send + recv + liveness via the bearer
-  # interface directly, and asserts the resolver picks LocalBearer
-  # over SshBearer.
+  # LocalBearer used to serve same-machine peers via direct filesystem
+  # reads/writes — a "skip the network" optimization correct in the
+  # SSH-tail era when the host's messages.jsonl was the substrate.
+  # Pulled from the resolver registry on 2026-04-29: post-3c the gist
+  # is the substrate, and writing to the host's local file lands in a
+  # place nobody reads (silent loss every joiner-side broadcast).
   #
-  # No spawn_host/spawn_joiner here — LocalBearer's whole point is to
-  # bypass the pair handshake. Lab-style direct construction is the
-  # cleaner test for this layer.
-  section "bearer (local): same-machine send/recv via direct filesystem"
+  # This scenario now ALSO asserts the resolver does NOT route loopback
+  # peers to LocalBearer (the production-blocking guarantee). The
+  # bearer class itself is still tested via direct construction since
+  # we may revive a gh-aware variant later.
+  section "bearer (local): direct filesystem send/recv (deprecated; resolver opt-out)"
   cleanup_all
 
   local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
   local fake_home; fake_home=$(mktemp -d -t airc-it-bl-home.XXXXXX)
   local off_file; off_file="$fake_home/monitor_offset"
 
-  # Round-trip a payload via the bearer's send + verify it lands.
+  # Production guard: resolver MUST refuse to route a loopback peer to
+  # LocalBearer (would cause silent loss against the gist substrate).
+  local resolver_out
+  resolver_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve, available_kinds
+from airc_core.bearer import PeerUnreachable
+
+print('KINDS=' + ','.join(available_kinds()))
+try:
+    b = resolve({'host_target': 'user@127.0.0.1', 'remote_home': '$fake_home'})
+    print(f'PICKED={b.KIND}')
+except PeerUnreachable:
+    print('PICKED=none')
+" 2>&1)
+  if echo "$resolver_out" | grep -q '^KINDS=' && ! echo "$resolver_out" | grep -q 'KINDS=.*local'; then
+    pass "resolver registry no longer contains LocalBearer (post-3c+)"
+  else
+    fail "resolver registry STILL has LocalBearer — silent-loss bug returns. (got: $resolver_out)"
+  fi
+  if echo "$resolver_out" | grep -qE '^PICKED=(gh|none)$'; then
+    pass "resolver routes loopback peers away from LocalBearer (got: $(echo "$resolver_out" | grep ^PICKED=))"
+  else
+    fail "resolver picked LocalBearer for loopback peer — would cause silent loss (got: $resolver_out)"
+  fi
+
+  # Direct-construction smoke test: the LocalBearer class still works as
+  # a pure file-tail transport. Round-trip a payload through send and
+  # verify it lands on disk.
   local marker="local-bearer-send-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
   local send_out
   send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
-import sys, json
+import sys
 sys.path.insert(0, '$_lib_dir')
-from airc_core.bearer_resolver import resolve
+from airc_core.bearer_local import LocalBearer
 
-bearer = resolve({
+bearer = LocalBearer({
     'host_target': 'user@127.0.0.1',
     'remote_home': '$fake_home',
 })
@@ -3213,9 +3243,9 @@ bearer.close()
 " 2>&1)
 
   if echo "$send_out" | grep -q '^KIND=local$'; then
-    pass "resolver picks LocalBearer for loopback host_target"
+    pass "LocalBearer class still constructs (kept on disk for possible revival)"
   else
-    fail "resolver did NOT pick LocalBearer (got: $send_out)"
+    fail "LocalBearer construction failed (got: $send_out)"
     rm -rf "$fake_home"
     return
   fi
@@ -3238,9 +3268,9 @@ bearer.close()
   PYTHONPATH="$_lib_dir" python3 -c "
 import sys, signal, time, json
 sys.path.insert(0, '$_lib_dir')
-from airc_core.bearer_resolver import resolve
+from airc_core.bearer_local import LocalBearer
 
-bearer = resolve({
+bearer = LocalBearer({
     'host_target': '127.0.0.1',
     'remote_home': '$fake_home',
 })

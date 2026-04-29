@@ -75,11 +75,15 @@ class BearerInterfaceTests(unittest.TestCase):
 class ResolverTests(unittest.TestCase):
     """Resolver picks bearers based on can_serve, raises when no candidate."""
 
-    def test_available_kinds_after_phase3c(self):
+    def test_available_kinds_after_phase3c_plus(self):
         kinds = available_kinds()
-        # Post-3c registry: LocalBearer + GhBearer; SshBearer deleted.
-        self.assertEqual(set(kinds), {"local", "gh"})
+        # Post-3c+ registry: GhBearer only. LocalBearer was removed
+        # 2026-04-29 after it was caught silently dropping every
+        # joiner-side broadcast (wrote to host's local file when the
+        # substrate is the gist). SshBearer was deleted in Phase 3c.
+        self.assertEqual(set(kinds), {"gh"})
         self.assertNotIn("ssh", kinds)
+        self.assertNotIn("local", kinds)
 
     def test_unreachable_when_no_bearer_can_serve(self):
         # Empty peer_meta + no gh auth → PeerUnreachable.
@@ -87,14 +91,17 @@ class ResolverTests(unittest.TestCase):
             with self.assertRaises(PeerUnreachable):
                 resolve({})
 
-    def test_resolved_bearer_is_not_yet_open(self):
-        # LocalBearer.can_serve takes a writable dir — pick a tmpdir.
+    def test_resolver_refuses_loopback_peer_without_gist(self):
+        # Production guard: a same-machine peer without a room_gist_id
+        # is unreachable post-3c+. The old resolver routed this to
+        # LocalBearer, which silently dropped every send. Resolver
+        # MUST raise rather than route into the silent-loss path.
         import tempfile
         td = tempfile.mkdtemp()
         try:
-            bearer = resolve({"host_target": "127.0.0.1", "remote_home": td})
-            self.assertIsInstance(bearer, Bearer)
-            bearer.close()
+            with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+                with self.assertRaises(PeerUnreachable):
+                    resolve({"host_target": "127.0.0.1", "remote_home": td})
         finally:
             import shutil
             shutil.rmtree(td, ignore_errors=True)
@@ -759,11 +766,12 @@ class LocalBearerSkeletonTests(unittest.TestCase):
 
 
 class ResolverOrderTests(unittest.TestCase):
-    """Phase 3c: registry is [LocalBearer, GhBearer] — SshBearer deleted.
-    LocalBearer for same-machine peers; GhBearer for everyone else.
-    Same-machine resolution must prefer LocalBearer to avoid burning
-    gh API calls (and incurring 1-2s polling latency) for what's
-    really just a filesystem write."""
+    """Post-3c+: registry is [GhBearer] only. LocalBearer was pulled
+    2026-04-29 after it silently dropped every joiner-side broadcast
+    (wrote to host's local file when the substrate is the gist).
+    Same-machine peers must therefore route through GhBearer too —
+    paying the 1-2s polling latency is fine; sending into a void is
+    not. See bearer_resolver.py docstring for the full history."""
 
     def setUp(self):
         import tempfile
@@ -773,37 +781,40 @@ class ResolverOrderTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    def test_local_first_for_same_machine_peer(self):
-        bearer = resolve({
-            "host_target": "user@127.0.0.1",
-            "remote_home": self._tmpdir,
-        })
-        self.assertEqual(bearer.KIND, "local",
-                         "same-machine peer must resolve to LocalBearer")
+    def test_loopback_peer_without_gist_is_unreachable(self):
+        # Production-blocking guarantee: a same-machine peer with no
+        # room_gist_id MUST raise PeerUnreachable rather than silently
+        # routing to LocalBearer. This is the regression test for the
+        # silent-loss bug fixed 2026-04-29.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+            with self.assertRaises(PeerUnreachable):
+                resolve({
+                    "host_target": "user@127.0.0.1",
+                    "remote_home": self._tmpdir,
+                })
 
     def test_gh_for_remote_peer_with_room_gist(self):
-        # peer_meta has only a room_gist_id (no remote_home pointing at
-        # something locally writable). Resolver picks GhBearer.
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
             bearer = resolve({"room_gist_id": "abc123"})
         self.assertEqual(bearer.KIND, "gh",
-                         "non-local peer with room_gist_id must resolve to GhBearer")
+                         "peer with room_gist_id must resolve to GhBearer")
 
-    def test_gh_when_loopback_target_but_no_local_dir(self):
-        # Stale loopback record without remote_home → LocalBearer
-        # rejects → fall through to GhBearer (if room_gist_id present).
+    def test_gh_for_loopback_peer_with_room_gist(self):
+        # Same-machine peer that has a room_gist_id resolves to gh
+        # (not local). Locality is informational; the gist is the
+        # substrate.
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
             bearer = resolve({
                 "host_target": "user@127.0.0.1",
-                "remote_home": "/this/path/definitely/does/not/exist",
+                "remote_home": self._tmpdir,
                 "room_gist_id": "abc123",
             })
         self.assertEqual(bearer.KIND, "gh")
 
-    def test_available_kinds_local_then_gh(self):
+    def test_available_kinds_gh_only(self):
         from airc_core.bearer_resolver import available_kinds
         kinds = available_kinds()
-        self.assertEqual(kinds, ["local", "gh"])
+        self.assertEqual(kinds, ["gh"])
 
 
 class GhBearerCanServeTests(unittest.TestCase):
@@ -1109,15 +1120,16 @@ class GhBearerSkeletonTests(unittest.TestCase):
             b.send("alice", "general", b'{"x":1}')
 
 
-class ResolverPostPhase3cTests(unittest.TestCase):
-    """Phase 3c: registry is [LocalBearer, GhBearer]. Same-machine →
-    Local; everyone else with a room_gist_id → Gh. SshBearer deleted."""
+class ResolverPostPhase3cPlusTests(unittest.TestCase):
+    """Post-3c+: registry is [GhBearer] only. LocalBearer pulled
+    2026-04-29 (silent-loss bug). SshBearer deleted in Phase 3c."""
 
-    def test_available_kinds_local_and_gh_only(self):
+    def test_available_kinds_gh_only(self):
         from airc_core.bearer_resolver import available_kinds
         kinds = available_kinds()
-        self.assertEqual(set(kinds), {"local", "gh"})
+        self.assertEqual(set(kinds), {"gh"})
         self.assertNotIn("ssh", kinds)
+        self.assertNotIn("local", kinds)
 
     def test_gh_picked_when_only_room_gist_id(self):
         # peer_meta has only room_gist_id + gh auth available → GhBearer.
@@ -1125,9 +1137,8 @@ class ResolverPostPhase3cTests(unittest.TestCase):
             bearer = resolve({"room_gist_id": "abc123"})
         self.assertEqual(bearer.KIND, "gh")
 
-    def test_unreachable_when_no_gh_auth_and_no_other_meta(self):
-        # Nothing can serve: no loopback (Local declines), no gh auth
-        # (Gh declines).
+    def test_unreachable_when_no_gh_auth(self):
+        # Without gh auth, nothing can serve.
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
             with self.assertRaises(PeerUnreachable):
                 resolve({"room_gist_id": "abc123"})

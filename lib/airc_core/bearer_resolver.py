@@ -10,14 +10,25 @@ Adding a transport: import its class, add to _REGISTRY at the right
 preference position. Done. Removing a transport: delete the import and
 the registry entry. Done. No other file moves.
 
-Phase 3c (current state): registry is [LocalBearer, GhBearer]. SshBearer
-and all Tailscale knowledge are deleted. The architecture is now:
-  * Same-machine peers → LocalBearer (direct fs read/write)
-  * Everyone else → GhBearer (gh-gist as transport, polling)
-Encryption is handled at the envelope layer (lib/airc_core/envelope.py),
-making transport-layer encryption (SSH, WireGuard) redundant and letting
-us drop the install-time complexity that came with both — no more
+Phase 3c+ (current state): registry is [GhBearer] only. Encryption is
+handled at the envelope layer (lib/airc_core/envelope.py), making
+transport-layer encryption (SSH, WireGuard) redundant and letting us
+drop the install-time complexity that came with both — no more
 Windows OpenSSH-Server admin elevation, no more Tailscale daemon.
+
+LocalBearer was disabled here on 2026-04-29 after it was caught
+silently dropping every joiner-side broadcast. Its premise — "skip the
+network roundtrip when the peer is on this filesystem" — was correct
+in the SSH-tail era when the host's `messages.jsonl` was the substrate
+that joiners tailed. Post-3c the substrate is the room gist; everyone
+(host AND joiner, same-machine or not) polls the gist via bearer_cli
+recv. LocalBearer's send appended to `<host>/messages.jsonl` directly,
+which nobody reads anymore — `bearer.send()` returned `delivered`
+(file write succeeded) and the message was eaten. Bug was invisible
+because the success contract was at the wrong layer. Until LocalBearer
+is rewritten to write to the gist (or to ALSO write to the gist), it
+must not be in the registry: the gist is the only correct
+destination.
 
 Latency cost: 1-2s typical message latency (gh poll cadence) instead of
 SSH's <100ms. For chat-pace AI traffic this is invisible; if a future
@@ -30,18 +41,14 @@ from __future__ import annotations
 from typing import List, Type
 
 from .bearer import Bearer, PeerUnreachable
-from .bearer_local import LocalBearer
 from .bearer_gh import GhBearer
 
 # Preference order. Earlier = preferred. The resolver tries each in turn
 # via can_serve() and falls through on PeerUnreachable from open().
-#   LocalBearer — same-machine peers (loopback host_target + writable
-#                 remote_home). Direct filesystem; zero crypto overhead;
-#                 no network.
-#   GhBearer    — everyone else. gh-gist as transport. Encryption lives
-#                 at the envelope layer above.
+#   GhBearer — gh-gist as transport. Encryption lives at the envelope
+#              layer above. Single source of truth post-3c+ (see the
+#              module docstring for the LocalBearer history).
 _REGISTRY: List[Type[Bearer]] = [
-    LocalBearer,
     GhBearer,
 ]
 
