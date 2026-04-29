@@ -341,15 +341,22 @@ cmd_send() {
         ;;
       auth_failure)
         # Hard failure. Don't queue — every retry will fail identically.
-        # Surface loudly + die so the user re-pairs instead of sending
-        # into the void.
-        local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
+        # Pre-fix the message claimed 'SSH auth' which was leftover from
+        # the SSH era; post-3c the bearer is gh and the only auth that
+        # can fail is gh's. Direct the user to gh auth login so they
+        # can recover without rebuilding their identity.
+        local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GH AUTH FAILED to %s — re-auth required, NOT queued] %s"}' \
           "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
         echo "$fail_marker" >> "$MESSAGES"
-        echo "  SSH auth to host FAILED. Message NOT queued — every retry would fail identically." >&2
-        echo "  Bearer: ${detail}" >&2
-        echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
-        die "Authentication failure — re-pair required"
+        echo "" >&2
+        echo "  ✗ gh auth check failed — your GitHub token is dead." >&2
+        echo "    Bearer detail: ${detail}" >&2
+        echo "" >&2
+        echo "    Fix:  gh auth login -h github.com" >&2
+        echo "" >&2
+        echo "    After re-authenticating, retry your message. No state lost," >&2
+        echo "    no re-pair needed — it's just gh's keyring that expired." >&2
+        die "gh auth failure — run 'gh auth login -h github.com' and retry"
         ;;
       transient_failure|"")
         # Network-class failure or empty/malformed outcome → treat as

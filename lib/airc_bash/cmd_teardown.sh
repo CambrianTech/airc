@@ -216,6 +216,40 @@ cmd_teardown() {
     rm -f "$pidfile" 2>/dev/null
   fi
 
+  # Scope-path catch-all: ANY process whose argv contains this scope's
+  # path is ours, even if airc.pid never knew about it. Catches:
+  #   - Python handshake / monitor_formatter / bearer_cli children
+  #     whose parent died before airc.pid was updated.
+  #   - Subshells reparented to init that still hold scope state.
+  #   - Stale processes from multi-bounce sessions.
+  # pgrep -f matches command + arguments (not env). Every airc python
+  # subprocess passes scope paths on its argv (--peers-dir,
+  # --offset-file, etc), so cmdline match catches them all. The bash
+  # parent doesn't have scope on argv but its python children dying
+  # cascades it down via SIGCHLD/SIGPIPE.
+  # Skipped under AIRC_TEARDOWN_PART_ONLY (cmd_part shouldn't sweep).
+  if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" != "1" ]; then
+    local _scope_path_pids
+    _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un)
+    if [ -n "$_scope_path_pids" ]; then
+      # Exclude our own pid + parent (this very teardown subshell) so
+      # we don't suicide before completing the cleanup.
+      local _self_pid="$$"
+      local _parent_pid="$PPID"
+      local _filter_pids=""
+      for _p in $_scope_path_pids; do
+        [ "$_p" = "$_self_pid" ] && continue
+        [ "$_p" = "$_parent_pid" ] && continue
+        _filter_pids="$_filter_pids $_p"
+      done
+      if [ -n "$_filter_pids" ]; then
+        echo "  killing scope-path-tagged orphans: $(echo $_filter_pids | tr '\n' ' ')"
+        kill -9 $_filter_pids 2>/dev/null || true
+        killed=1
+      fi
+    fi
+  fi
+
   # Brief pause to let the kernel reparent any airc python listener children
   # to init (PID 1) after we killed their bash parent. Then reap orphans.
   [ "$killed" = "1" ] && sleep 0.5
