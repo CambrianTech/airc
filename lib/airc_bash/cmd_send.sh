@@ -65,6 +65,15 @@ cmd_send() {
   # issue. Exposed as a flag (not an env var) so call sites are
   # grep-able and the pattern matches the rest of the airc CLI surface.
   local internal=0
+  # --plaintext: skip envelope-layer encryption even when recipient
+  # x25519 pubkey is on file. For control traffic ([PING:uuid] /
+  # [PONG:uuid]) where the body is a public uuid with zero secret
+  # content. Pre-fix: pings encrypted asymmetrically (sender had
+  # recipient's pubkey; recipient lacked sender's pubkey) → recipient
+  # silently dropped with "missing pubkey/privkey for decrypt" → no
+  # auto-pong → cmd_ping timed out. Plaintext sidesteps the asymmetry
+  # entirely for these short-lived control messages.
+  local plaintext=0
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -88,6 +97,9 @@ cmd_send() {
         shift 2 ;;
       --internal)
         internal=1
+        shift ;;
+      --plaintext|-plaintext)
+        plaintext=1
         shift ;;
       *) positional+=("$1"); shift ;;
     esac
@@ -221,7 +233,7 @@ cmd_send() {
     # package isn't installed). The wrap CLI passes through plaintext in
     # that case, transparently.
     local recipient_pub=""
-    if [ "$peer_name" != "all" ]; then
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
@@ -396,7 +408,7 @@ cmd_send() {
     # we have their pubkey on file; broadcasts go plaintext (group
     # encryption is a future Phase E.4).
     local _host_recipient_pub=""
-    if [ "$peer_name" != "all" ]; then
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       _host_recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
@@ -517,13 +529,15 @@ cmd_ping() {
   local start_time
   start_time=$(date +%s)
 
-  # Route via #general (the universal lobby sidecar). Pre-fix: ping
-  # used the sender's default channel, but peers in different cwds
-  # auto-scope to different project channels (cambriantech vs ideem
-  # vs useideem) so the recipient often didn't poll the sender's
-  # default channel and never saw the ping. #general is the one
-  # channel everyone subscribes to — guaranteed common ground.
-  cmd_send --channel general "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed (airc status)"
+  # Route via #general (universal lobby) and force PLAINTEXT. Encryption
+  # for [PING:uuid] adds zero security value (the body is a public uuid)
+  # and was the actual cause of #308: pair handshake was asymmetric, so
+  # one side dropped encrypted control traffic with "missing pubkey/
+  # privkey for decrypt" and the auto-pong silently never propagated.
+  # Plaintext sidesteps the asymmetry; the bigger pubkey-symmetry fix
+  # is its own follow-up.
+  cmd_send --channel general --plaintext "@$peer_name" "[PING:$ping_id]" >/dev/null \
+    || die "ping send failed (airc status)"
 
   echo "ping sent to $peer_name (id=$ping_id) — waiting up to ${timeout}s for pong..."
 

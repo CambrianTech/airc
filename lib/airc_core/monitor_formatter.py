@@ -394,7 +394,12 @@ def run(my_name: str, peers_dir: str) -> int:
                 # received it).
                 ping_channel = m.get("channel", "")
                 import subprocess
-                cmd = ["airc", "send"]
+                # Auto-pong as PLAINTEXT (--plaintext) — encryption of
+                # control traffic was the root of #308: pair handshake
+                # asymmetry meant the sender often couldn't decrypt the
+                # encrypted PONG even when we DID auto-reply, so the
+                # round-trip silently failed.
+                cmd = ["airc", "send", "--plaintext"]
                 if ping_channel:
                     cmd += ["--channel", ping_channel]
                 cmd += [f"@{fr}", f"[PONG:{ping_id}]"]
