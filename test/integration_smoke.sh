@@ -272,6 +272,86 @@ scenario_idle_then_recv() {
 # `airc part` from the host should delete the room gist on gh.
 # Joiners parting just teardown locally (host's gist persists).
 # ─────────────────────────────────────────────────────────────────────
+scenario_clean_install_smoke() {
+  # Joel 2026-04-29: 'I have a fresh macbook ... we can make sure
+  # macbook e2e from nothing is covered.' This scenario runs install.sh
+  # in a sandbox (BIN_DIR + SKILLS_TARGET overrides + AIRC_DIR isolated)
+  # so it doesn't clobber the real install, then verifies the resulting
+  # airc binary is callable + recognizes the canonical commands.
+  #
+  # NOT a full e2e (we don't run airc join — that would need a fresh
+  # gh account). Catches: install.sh doesn't crash, the binary lands
+  # on PATH, skills land in SKILLS_TARGET, venv has cryptography.
+  section "clean_install_smoke: install.sh sandbox install lands a working airc"
+  command -v gh >/dev/null 2>&1 || { skip "gh not installed (install.sh would auto-install via brew, but harness can't sudo)"; return; }
+  command -v python3 >/dev/null 2>&1 || { skip "python3 not installed"; return; }
+  if ! command -v brew >/dev/null 2>&1; then
+    skip "brew not installed — install.sh would prompt for it"
+    return
+  fi
+
+  local SANDBOX
+  SANDBOX=$(mktemp -d -t airc-clean-install.XXXXXX)
+  trap "rm -rf '$SANDBOX'" RETURN
+
+  # Run install.sh into sandbox via the env-var overrides.
+  local install_log="$SANDBOX/install.log"
+  if ! AIRC_DIR="$SANDBOX/airc-src" \
+       BIN_DIR="$SANDBOX/bin" \
+       SKILLS_TARGET="$SANDBOX/skills" \
+       bash "$REPO_ROOT/install.sh" > "$install_log" 2>&1; then
+    fail "install.sh exited non-zero — see $install_log"
+    tail -10 "$install_log" | sed 's/^/    /'
+    return
+  fi
+  pass "install.sh completed cleanly"
+
+  # Binary on PATH within sandbox?
+  if [ -x "$SANDBOX/bin/airc" ] || [ -L "$SANDBOX/bin/airc" ]; then
+    pass "airc binary placed at \$BIN_DIR/airc"
+  else
+    fail "airc binary missing from \$BIN_DIR after install"
+    ls -la "$SANDBOX/bin/" 2>&1 | sed 's/^/    /'
+    return
+  fi
+
+  # Binary runs?
+  local version_out
+  version_out=$("$SANDBOX/bin/airc" version 2>&1 || true)
+  if printf '%s' "$version_out" | grep -qE 'airc [a-f0-9]{7}'; then
+    pass "airc version returns a sha"
+  else
+    fail "airc version output unexpected: $version_out"
+  fi
+
+  # help works (smoke for argument parsing)?
+  if "$SANDBOX/bin/airc" --help >/dev/null 2>&1 \
+       || "$SANDBOX/bin/airc" connect --help >/dev/null 2>&1; then
+    pass "airc help paths work"
+  else
+    fail "airc help paths broken"
+  fi
+
+  # Skills landed?
+  if [ -d "$SANDBOX/skills/join" ]; then
+    pass "skills wired to \$SKILLS_TARGET (join skill present)"
+  else
+    fail "skills not wired — \$SKILLS_TARGET/join missing"
+  fi
+
+  # Venv has cryptography (needed for envelope encryption)?
+  local venv_python="$SANDBOX/airc-src/.venv/bin/python3"
+  if [ -x "$venv_python" ]; then
+    if "$venv_python" -c "import cryptography" 2>/dev/null; then
+      pass "venv has cryptography (envelope encryption available)"
+    else
+      fail "venv exists but cryptography not importable"
+    fi
+  else
+    skip "venv not at expected location ($venv_python) — install.sh path may differ"
+  fi
+}
+
 scenario_orphan_loops_self_reap() {
   # Regression for #325. Bash subshells (reminder_timer_loop /
   # flush_pending_loop) capture $PPID at start; on parent death they
@@ -590,6 +670,7 @@ scenario_part_deletes_host_gist() {
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────
 case "${1:-all}" in
+  clean_install_smoke)            scenario_clean_install_smoke ;;
   passive_recv)                   scenario_passive_recv ;;
   round_trip)                     scenario_round_trip ;;
   idle_then_recv)                 scenario_idle_then_recv ;;
@@ -600,6 +681,7 @@ case "${1:-all}" in
   teardown_kills_env_tagged_orphans) scenario_teardown_kills_env_tagged_orphans ;;
   my_scope_in_mesh)               scenario_my_scope_in_mesh ;;
   all)
+    scenario_clean_install_smoke
     scenario_orphan_loops_self_reap
     scenario_teardown_kills_env_tagged_orphans
     scenario_passive_recv
