@@ -2460,6 +2460,28 @@ time.sleep(30)
   cleanup_all
 }
 
+scenario_python_units() {
+  # Python unit tests for airc_core/. Currently exercises the bearer
+  # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
+  # bearer_ssh.py). Add new test_*.py files in test/ as the airc_core
+  # surface grows — each file is auto-discovered by the loop below.
+  echo
+  echo "── scenario: python unit tests ──"
+  local _here; _here="$(cd "$(dirname "$0")" && pwd)"
+  local _failed=0
+  for _t in "$_here"/test_*.py; do
+    [ -f "$_t" ] || continue
+    local _name; _name=$(basename "$_t" .py)
+    if ( cd "$_here" && python3 "$_t" 2>&1 | tail -3 | grep -q '^OK' ); then
+      pass "python units: $_name"
+    else
+      fail "python units: $_name (run: cd test && python3 $(basename "$_t"))"
+      _failed=$((_failed + 1))
+    fi
+  done
+  return $_failed
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2487,6 +2509,7 @@ case "$MODE" in
   list) scenario_list ;;
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
+  python_units) scenario_python_units ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2501,8 +2524,9 @@ case "$MODE" in
     scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
+    scenario_python_units
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|all]"; exit 2 ;;
 esac
 
 echo
