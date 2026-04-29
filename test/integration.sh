@@ -2886,6 +2886,92 @@ scenario_host_msg_publishes_to_gist() {
   cleanup_all
 }
 
+scenario_channel_gist_prefers_single_channel() {
+  # TDD for #290: when both a canonical post-3c single-channel gist
+  # (channels=[<x>]) AND a legacy multi-channel mesh gist (channels=[a,b,c])
+  # exist for the same channel name on the gh account, find_existing
+  # MUST prefer the single-channel one. Otherwise peers split between
+  # the two and never see each other's broadcasts.
+  section "channel_gist.find_existing prefers single-channel over multi-channel (#290)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Publish a LEGACY multi-channel mesh gist FIRST (so it has older
+  # updated_at than the single-channel one — exactly the order that
+  # caused #290 in production).
+  local seed; seed=$(mktemp -d -t airc-it-tdd290-seed.XXXXXX)
+  cat > "$seed/airc-invite.legacy.fake" <<JSON
+{"airc": 1, "kind": "mesh", "channels": ["projx", "lobby-target", "other"], "host": {"name": "fake"}}
+JSON
+  local legacy_url; legacy_url=$(gh gist create -d "airc mesh" "$seed/airc-invite.legacy.fake" 2>&1 | tail -1)
+  local legacy_gid; legacy_gid=$(printf '%s' "$legacy_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+  if [ -z "$legacy_gid" ] || ! printf '%s' "$legacy_gid" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create legacy multi-channel test gist"
+    return
+  fi
+  pass "legacy multi-channel gist published: $legacy_gid (channels=[projx, lobby-target, other])"
+
+  trap "gh gist delete '$legacy_gid' --yes 2>/dev/null || true" EXIT
+
+  # Now resolve channel "lobby-target" with create_if_missing — this
+  # triggers create_new which publishes a canonical single-channel gist.
+  # (The legacy gist also matches "lobby-target" loosely, so the test
+  # is whether find_existing prefers the single-channel one we're
+  # about to create.)
+  sleep 1
+  local single_gid
+  single_gid=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
+
+  if [ -z "$single_gid" ]; then
+    fail "channel_gist resolve returned empty"
+    trap - EXIT
+    gh gist delete "$legacy_gid" --yes 2>/dev/null || true
+    return
+  fi
+
+  if [ "$single_gid" = "$legacy_gid" ]; then
+    fail "BUG #290: resolve returned the LEGACY multi-channel gist ($legacy_gid) — substrate split risk"
+  else
+    pass "resolve returned a different gist than the legacy ($single_gid != $legacy_gid)"
+  fi
+
+  trap "gh gist delete '$legacy_gid' --yes 2>/dev/null || true; gh gist delete '$single_gid' --yes 2>/dev/null || true" EXIT
+
+  # The new single_gid should be a canonical single-channel gist.
+  local single_channels
+  single_channels=$(gh api "gists/$single_gid" --jq '.files | to_entries[0].value.content' 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('channels'))" 2>/dev/null)
+  if [ "$single_channels" = "['lobby-target']" ]; then
+    pass "single-channel gist envelope has channels=['lobby-target'] (post-3c canonical shape)"
+  else
+    fail "single-channel gist envelope shape unexpected: $single_channels"
+  fi
+
+  # Now the critical test: ANOTHER resolve call should ALSO return the
+  # single-channel gist (deterministic preference), not flip back to
+  # the legacy. This is the real production scenario where Peer B
+  # resolves AFTER Peer A already published the canonical single-channel.
+  local second_resolve
+  second_resolve=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target 2>/dev/null)
+  if [ "$second_resolve" = "$single_gid" ]; then
+    pass "second resolve returns the canonical single-channel gist (substrate converges)"
+  else
+    fail "BUG #290: second resolve returned $second_resolve (expected $single_gid) — different peers will resolve different gists"
+  fi
+
+  trap - EXIT
+  gh gist delete "$legacy_gid" --yes 2>/dev/null || true
+  gh gist delete "$single_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_general_has_shared_gist() {
   # TDD for #283: when a peer subscribes to #general (sidecar default
   # on `airc join`), there must be a per-channel gist for #general
@@ -3524,6 +3610,7 @@ case "$MODE" in
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   general_has_shared_gist) scenario_general_has_shared_gist ;;
+  channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted

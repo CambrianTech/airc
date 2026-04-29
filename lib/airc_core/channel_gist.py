@@ -160,14 +160,45 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
         return None
 
 
+def _is_single_channel_match(gist: dict, channel: str) -> bool:
+    """A gist is the canonical post-3c per-channel gist for `channel`
+    iff its envelope has channels=[<exactly channel>]. Single-element
+    list, exact match. The post-3c shape created by create_new()."""
+    files = gist.get("files") or {}
+    for entry in files.values():
+        content = entry.get("content")
+        if not content:
+            continue
+        try:
+            env = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(env, dict):
+            continue
+        channels = env.get("channels")
+        if isinstance(channels, list) and len(channels) == 1 and channels[0] == channel:
+            return True
+    return False
+
+
 def find_existing(channel: str) -> Optional[str]:
     """Look for an existing gist on this gh account hosting `channel`.
     Returns the gist id, or None if no match.
 
-    Walks the user's gist list, pre-filters by description, then does a
-    full GET on candidates whose listing-response content was truncated
-    (large gists). Cheap when there are no candidates; up to N+1 GETs
-    when there are matching descriptions.
+    Two-pass to fix #290 (substrate split): canonical single-channel
+    gists (channels=[<channel>] exactly, description "airc room: #<x>")
+    take priority over legacy multi-channel mesh gists (channels=[a,b,c]).
+    Without this priority, peers resolved different gists when both
+    shapes coexisted on the same gh account, splitting the substrate
+    silently.
+
+    Pass 1: any gist with channels=[<exact channel>] — the post-3c
+            create_new shape; deterministic match.
+    Pass 2: legacy multi-channel match — channels list CONTAINS the
+            target. Returned only if no single-channel canonical exists.
+
+    Each pass first checks the cheap listing-response content, then
+    falls back to a full GET when the listing didn't inline content.
     """
     gists = _gh_list_user_gists()
     candidates: list[dict] = []
@@ -175,12 +206,28 @@ def find_existing(channel: str) -> Optional[str]:
         desc = (g.get("description") or "").strip()
         if desc.startswith("airc mesh") or desc.startswith("airc room:"):
             candidates.append(g)
-    # First pass: in-listing content match (cheap).
+
+    # Pass 1: canonical single-channel match (cheap, listing-response).
+    for g in candidates:
+        if _is_single_channel_match(g, channel):
+            return g.get("id")
+
+    # Pass 1 (deep): full GET for each candidate whose listing-content
+    # was truncated. Same single-channel criterion.
+    for g in candidates:
+        gid = g.get("id")
+        if not gid:
+            continue
+        full = _gh_api_get_gist(gid)
+        if full is None:
+            continue
+        if _is_single_channel_match(full, channel):
+            return gid
+
+    # Pass 2: legacy multi-channel fallback. Only if no canonical exists.
     for g in candidates:
         if _gist_describes_channel(g, channel):
             return g.get("id")
-    # Second pass: full GET on each candidate whose listing response
-    # didn't include content (common for larger gists).
     for g in candidates:
         gid = g.get("id")
         if not gid:
@@ -190,6 +237,7 @@ def find_existing(channel: str) -> Optional[str]:
             continue
         if _gist_describes_channel(full, channel):
             return gid
+
     return None
 
 
