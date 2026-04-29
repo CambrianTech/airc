@@ -427,48 +427,98 @@ else:
   # months later). Walking them was useful when sidecars were live;
   # post-2B.3 it just resurfaces ghosts.
   #
-  # The unified-roster intent from issue #121 still holds, but in the
-  # singleton-mesh world EVERY peer is in the primary scope's peers/.
-  # Multi-channel context comes from envelope.channel (Phase 2A) +
-  # subscribed_channels (Phase 2B), not from sibling scopes.
+  # Phase 2c (#270): surface per-peer last-seen by scanning the local
+  # messages.jsonl for the most recent envelope from each peer. This
+  # is what was missing when "5 peers earlier today, 1 now" looked
+  # identical to "5 peers, all silent for 30 min" in the listing —
+  # silent records persist on disk regardless of liveness.
   "$AIRC_PYTHON" -c "
-import json, os, sys, re
+import json, os, sys, time, calendar
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
-# Phase 2B.3: only walk the primary scope. Sidecar scopes are gone.
-scopes = [primary_scope] if os.path.isdir(os.path.join(primary_scope, 'peers')) else []
+peers_dir = os.path.join(primary_scope, 'peers')
+messages_log = os.path.join(primary_scope, 'messages.jsonl')
 
-# Build {(name, host): [room1, room2, ...]} by walking each scope's peers/.
+if not os.path.isdir(peers_dir):
+    print('  No peers yet.')
+    sys.exit(0)
+
+# Build {(name, host): [room1, room2, ...]} from disk records.
 peers_by_id = {}
-for scope in scopes:
-    peers_dir = os.path.join(scope, 'peers')
-    if not os.path.isdir(peers_dir):
+rn_file = os.path.join(primary_scope, 'room_name')
+room = '(?)'
+if os.path.isfile(rn_file):
+    try: room = open(rn_file).read().strip()
+    except Exception: pass
+for f in sorted(os.listdir(peers_dir)):
+    if not f.endswith('.json'): continue
+    try:
+        d = json.load(open(os.path.join(peers_dir, f)))
+    except Exception:
         continue
-    rn_file = os.path.join(scope, 'room_name')
-    room = '(?)'
-    if os.path.isfile(rn_file):
-        try: room = open(rn_file).read().strip()
-        except Exception: pass
-    for f in sorted(os.listdir(peers_dir)):
-        if not f.endswith('.json'): continue
-        try:
-            d = json.load(open(os.path.join(peers_dir, f)))
-        except Exception:
-            continue
-        key = (d.get('name', f[:-5]), d.get('host', ''))
-        peers_by_id.setdefault(key, []).append(room)
+    key = (d.get('name', f[:-5]), d.get('host', ''))
+    peers_by_id.setdefault(key, []).append(room)
 
 if not peers_by_id:
     print('  No peers yet.')
     sys.exit(0)
 
-# Render. Each peer once, with room annotations sorted + deduped.
+# Compute last-seen per peer name from messages.jsonl. Scan once,
+# track the latest ts per 'from' field. Reading the file forward is
+# fine — it's append-only and rotates at AIRC_LOG_MAX_LINES (5000
+# default), so the scan cost is bounded and we get the most recent
+# ts naturally as the loop terminates.
+last_seen = {}
+def _epoch(ts_str):
+    if not ts_str:
+        return None
+    try:
+        t = time.strptime(ts_str.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
+        return calendar.timegm(t)
+    except Exception:
+        return None
+try:
+    with open(messages_log) as f:
+        for line in f:
+            try:
+                m = json.loads(line)
+            except Exception:
+                continue
+            who = m.get('from')
+            if not who: continue
+            ts = _epoch(m.get('ts'))
+            if ts is None: continue
+            prev = last_seen.get(who)
+            if prev is None or ts > prev:
+                last_seen[who] = ts
+except OSError:
+    pass
+
+now = int(time.time())
+def _fmt_age(ts):
+    if ts is None:
+        return 'never'
+    age = max(0, now - ts)
+    if age < 60:    return f'{age}s ago'
+    if age < 3600:  return f'{age // 60}m ago'
+    if age < 86400: return f'{age // 3600}h ago'
+    return f'{age // 86400}d ago'
+
+# Render. Each peer once, with room annotations + last-seen marker.
+# Silent >1h gets a (silent) flag so the eye catches it immediately.
 for (name, host), rooms in sorted(peers_by_id.items()):
     seen = set(); ordered = []
     for r in rooms:
         if r not in seen:
             ordered.append(r); seen.add(r)
     tags = ', '.join('#' + r for r in ordered)
-    print(f'  {name} → {host}   [{tags}]')
+    last_ts = last_seen.get(name)
+    age_str = _fmt_age(last_ts)
+    silent_flag = ''
+    if last_ts is not None and (now - last_ts) > 3600:
+        silent_flag = ' (silent)'
+    elif last_ts is None:
+        silent_flag = ' (no recorded activity)'
+    print(f'  {name} → {host}   [{tags}]   last seen {age_str}{silent_flag}')
 "
 }

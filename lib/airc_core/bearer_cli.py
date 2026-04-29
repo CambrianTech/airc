@@ -82,6 +82,13 @@ def cmd_recv(args) -> int:
     bearer captured from the wire (see ReceivedMessage.payload), which
     is JSONL-shaped — directly pipeable into monitor_formatter.
 
+    Optional --state-file: the bearer-attested liveness surface for
+    cross-process consumers (airc status, airc peers). After each event
+    we atomically rewrite the file with bearer kind, events_total,
+    last_recv_ts, last_sender, and the bearer's diagnostic. Phase 2c
+    of the bearer rewrite — replaces the messages.jsonl-mirror-derived
+    "last recv" lie that was passing 30+ minute silences as healthy.
+
     The bearer handles transport-level reconnects (transient SSH drops,
     polling cadence for gh-as-bearer, etc). This loop exits only on:
       - EOF from recv_stream (bearer closed)
@@ -118,6 +125,20 @@ def cmd_recv(args) -> int:
 
     bearer.open(args.peer_id)
     out = sys.stdout.buffer
+    state_file = args.state_file
+    events_total = 0
+    if state_file:
+        # Initial state on launch — distinguishes "bearer is up but no events
+        # yet" from "no bearer at all." Status surfaces this as
+        # "awaiting first event" rather than going silent.
+        _write_state_file(state_file, {
+            "kind": getattr(bearer, "KIND", "unknown"),
+            "peer_id": args.peer_id,
+            "last_recv_ts": None,
+            "last_sender": None,
+            "events_total": 0,
+            "diag": "bearer open, no events yet",
+        })
     try:
         for ev in bearer.recv_stream():
             line = ev.payload
@@ -130,11 +151,49 @@ def cmd_recv(args) -> int:
                 # Downstream formatter exited. Caller's watchdog will
                 # observe the broken cycle and reconnect us if needed.
                 break
+            if state_file:
+                events_total += 1
+                live = bearer.liveness(args.peer_id)
+                _write_state_file(state_file, {
+                    "kind": getattr(bearer, "KIND", "unknown"),
+                    "peer_id": args.peer_id,
+                    "last_recv_ts": live.last_seen_ts,
+                    "last_sender": ev.sender_peer_id,
+                    "events_total": events_total,
+                    "diag": live.bearer_diag,
+                })
     except KeyboardInterrupt:
         pass
     finally:
         bearer.close()
     return 0
+
+
+def _write_state_file(path: str, state: dict) -> None:
+    """Atomically rewrite the bearer-state file. Best-effort — failures
+    are swallowed because state-file IO must never break the recv loop;
+    the bash watchdog and the bearer's own liveness signal remain the
+    source of truth even if status surfacing goes stale.
+
+    Atomic rewrite via tmp + rename so a reader (airc status) never
+    sees a half-written file.
+    """
+    import os
+    import tempfile
+    try:
+        d = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".bearer_state-", dir=d)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -162,6 +221,9 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Remote AIRC_WRITE_DIR path (e.g. '$HOME/.airc')")
     recv.add_argument("--offset-file", default=None,
                       help="Path to monitor_offset file for resume-on-reconnect")
+    recv.add_argument("--state-file", default=None,
+                      help="Path to bearer_state.json — bearer-attested liveness "
+                           "for cross-process consumers (airc status, airc peers)")
     recv.set_defaults(func=cmd_recv)
 
     return p
