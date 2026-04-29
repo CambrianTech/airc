@@ -654,14 +654,48 @@ ensure_prereqs() {
   local mgr; mgr=$(detect_pkgmgr)
   if [ "$mgr" = "unknown" ] || [ "$mgr" = "brew-missing" ]; then
     if [ "$mgr" = "brew-missing" ]; then
+      # Joel 2026-04-29: 'whatever agent we have ought to talk to the
+      # user about prereq if they dont have something, and it should
+      # still auto install for the most part'.
+      # When stdin is a TTY, just RUN the official Homebrew installer
+      # — it asks for the user's password (sudo) and runs cleanly.
+      # User clicks through prompts. AI-driven installs see the prompt
+      # surface and can guide the user. Non-TTY installs fall through
+      # to the manual instruction.
       warn "macOS detected but Homebrew not found."
-      warn "  Install Homebrew first:  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-      warn "  Then re-run this installer."
+      if [ -t 0 ] && [ -t 1 ]; then
+        info "  Running Homebrew's official installer now (you'll be prompted for sudo)..."
+        if /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+          # Refresh PATH so the rest of this script sees brew.
+          if [ -x /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [ -x /usr/local/bin/brew ]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+          fi
+          if command -v brew >/dev/null 2>&1; then
+            ok "Homebrew installed and active in this session"
+            mgr="brew"
+          else
+            warn "Homebrew install ran but 'brew' still not on PATH — open a new shell and re-run install.sh"
+            return 0
+          fi
+        else
+          warn "Homebrew install did not complete. Manual:"
+          warn "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+          warn "  Then re-run this installer."
+          return 0
+        fi
+      else
+        warn "  Install Homebrew first:  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        warn "  Then re-run this installer."
+        warn "  (auto-install requires a TTY; this is a non-interactive run)"
+        return 0
+      fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
+      warn "Required prereqs: git, gh, openssl, python3"
+      return 0
     fi
-    warn "Required prereqs: git, gh, openssl, openssh-client, python3"
-    return 0
   fi
 
   local missing=() pkgs=() unmappable=()
