@@ -268,8 +268,16 @@ _ensure_sshd_running() {
       # the elevated window opened, ran nothing, exited silently, no
       # transcript ever written. continuum verified the .ps1 file approach
       # writes a clean transcript every time.
-      local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
-      mkdir -p "$CLONE_DIR"
+      # Stage in TMPDIR, NOT $CLONE_DIR — git clone (line ~872) needs an
+      # empty/nonexistent target. Pre-fix, on a fresh-install user who'd
+      # nuked ~/.airc-src, this function ran first via ensure_prereqs,
+      # mkdir+wrote install-elevated.ps1 into $CLONE_DIR, and the
+      # subsequent `git clone --branch ... $CLONE_DIR` died with
+      # "destination path '...' already exists and is not an empty
+      # directory." Hostile error, no recovery hint, broke #249's
+      # Windows fresh-install row. Caught by continuum-b69f 2026-04-29.
+      local _elevated_ps1="${TMPDIR:-/tmp}/airc-install-elevated.ps1"
+      mkdir -p "$(dirname "$_elevated_ps1")"
       # NOTE: keep this heredoc ASCII-only. PowerShell 5.1 reads BOMless
       # .ps1 files as the system codepage (cp1252 on most Windows). A
       # UTF-8 em-dash (0xE2 0x80 0x94) ends in byte 0x94, which in
@@ -876,6 +884,21 @@ ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
 # Back-compat: `relay` still works for muscle-memory and stale docs.
 # The airc binary detects the invocation name and behaves identically.
 ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
+
+# Windows: also place airc.cmd + airc.ps1 forwarders on PATH.
+# Without these, `airc` invoked from native PowerShell or cmd.exe
+# resolves to the bash script, which PowerShell can't execute
+# ("Cannot run a document in the middle of a pipeline"). PR #262
+# made airc.ps1 a thin forwarder to bash, but that's moot if the
+# .ps1 isn't on PATH. cp (not ln -sf) — Windows symlinks are
+# privileged + flaky; copying is universal. Caught by
+# continuum-b69f 2026-04-29 (issue #249 PowerShell row).
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
+    [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
+    ;;
+esac
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
