@@ -1203,15 +1203,32 @@ monitor() {
     # election with optimistic conflict resolution via gh-create.
     local consecutive_timeouts=0
     local ESCALATE_AFTER=2   # 5 min total dead-host detection (2 × WATCHDOG_SEC=150)
+    # Phase 2b: stream inbound through bearer.recv_stream() instead of an
+    # inline ssh-tail. The bearer (lib/airc_core/bearer_ssh.py) owns
+    # transport-level reconnects, line-buffering, and offset resume across
+    # SSH drops. This bash loop now owns ONLY higher-level policy:
+    #   - watchdog (formatter exit 2 = no inbound for WATCHDOG_SEC)
+    #   - probe-on-quiet (idle host vs dead host)
+    #   - escalation counter → exit 99 → daemon respawn (no-claude-left-behind)
+    # The seam is intentional: swapping in GhBearer or LocalBearer in
+    # Phase 3 changes nothing here; the bearer just reads from a different
+    # transport and the same watchdog policy applies.
     while true; do
       local cycle_start; cycle_start=$(date +%s)
-      ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      # Stderr is NOT redirected — bearer_cli only writes there for
+      # structural failures (resolver error, missing args, exec failure).
+      # Per CLAUDE.md "never swallow errors", surface those. Transport-
+      # level SSH chatter is consumed inside the bearer (stderr=DEVNULL
+      # on the ssh subprocess) so it never reaches us here.
+      "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "$host_target" \
+        --host-target "$host_target" \
+        --identity-key "$ssh_key" \
+        --remote-home "$rhome" \
+        --offset-file "$offset_file" \
+        | monitor_formatter "$my_name" || true
       local fmt_exit="${PIPESTATUS[1]:-0}"
       local cycle_end; cycle_end=$(date +%s)
       local cycle_lifetime=$((cycle_end - cycle_start))
-
-      # Subsequent reconnects use the now-persisted offset updated by the formatter.
-      tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
 
       # Probe-before-count for fmt_exit=2 (watchdog: no inbound for
       # WATCHDOG_SEC). Without a probe, healthy-but-idle channels look
