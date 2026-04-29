@@ -292,27 +292,28 @@ cmd_connect() {
   # if a prior monitor was still around — easy to forget, often resulted in
   # duplicate monitors or port collisions. Now a single `airc connect` or
   # `airc resume` does the right thing.
+  # #292 fix: refuse to stomp a live monitor. Pre-fix this block
+  # auto-killed any PIDs in airc.pid before continuing — which silently
+  # destroyed a live monitor in a sibling shell when the user ran
+  # `airc connect` from a second terminal to verify state. That made
+  # multi-tab sanity-checking destructive. Post-fix: detect liveness,
+  # print a one-liner pointing to the right tools, exit 0 cleanly.
+  # Stale pidfile (no live PIDs) still gets cleaned up + we proceed.
   local stale_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ -f "$stale_pidfile" ]; then
     local stale_pids; stale_pids=$(cat "$stale_pidfile" 2>/dev/null | tr '\n' ' ')
-    local all_stale="$stale_pids"
+    local any_alive=0
     for p in $stale_pids; do
-      # `|| true` — pgrep returns 1 when the parent PID is already dead (no
-      # children to find). With `set -euo pipefail` at the top of the script,
-      # that would abort this block *before* reaching the rm on line 442 that
-      # self-heals the stale pidfile. Result: joiner wedged forever after a
-      # parent crash / laptop sleep until someone manually rm'd the pidfile.
-      all_stale="$all_stale $(proc_children "$p" | tr '\n' ' ' || true)"
+      kill -0 "$p" 2>/dev/null && any_alive=1
     done
-    # Quiet kill — don't warn unless there was actually a live process.
-    if [ -n "$all_stale" ]; then
-      local any_alive=0
-      for p in $all_stale; do kill -0 "$p" 2>/dev/null && any_alive=1; done
-      if [ "$any_alive" = "1" ]; then
-        kill -9 $all_stale 2>/dev/null || true
-        sleep 1
-      fi
+    if [ "$any_alive" = "1" ]; then
+      echo "  airc connect: this scope's monitor is already running (PIDs: $stale_pids)."
+      echo "    To stop it:        airc teardown"
+      echo "    To restart it:     airc teardown && airc connect"
+      echo "    To check it:       airc status"
+      return 0
     fi
+    # Stale pidfile (no live processes) — safe to clean.
     rm -f "$stale_pidfile"
   fi
 

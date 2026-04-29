@@ -184,12 +184,26 @@ def cmd_accept_one(args) -> int:
                 f.write(ssh_key.strip() + "\n")
             os.chmod(ak, 0o600)
 
-    # Save joiner as peer (with stable-host stale cleanup).
+    # Save joiner as peer (with rename-chain stale cleanup).
+    # #288 fix: match by X25519 pubkey, not host. Same-machine multi-tab
+    # peers all share `host: user@<machine-ip>` but have DIFFERENT
+    # pubkeys (each scope generates its own X25519 keypair). Pre-fix
+    # cleanup deleted legitimate distinct peers because their host
+    # field matched. Post-fix: identity is the X25519 pub; same pubkey
+    # = same peer (rename or re-pair); different pubkey = different
+    # peer (don't touch).
+    #
+    # Falls back to (host, airc_home) match when x25519_pub is absent
+    # (joiner on pre-Phase-E airc, or cryptography unavailable on
+    # their side). That's still safer than host-only — different
+    # scopes on the same machine have different airc_homes.
     peers_dir = os.path.expanduser(args.peers_dir)
     os.makedirs(peers_dir, exist_ok=True)
     jname = joiner["name"]
     jhost = joiner.get("host", "")
-    if jhost and os.path.isdir(peers_dir):
+    j_x25519 = joiner.get("x25519_pub", "")
+    j_airc_home = joiner.get("airc_home", "")
+    if os.path.isdir(peers_dir):
         for entry in os.listdir(peers_dir):
             if not entry.endswith(".json") or entry == jname + ".json":
                 continue
@@ -197,7 +211,14 @@ def cmd_accept_one(args) -> int:
                 d = json.load(open(os.path.join(peers_dir, entry)))
             except Exception:
                 continue
-            if d.get("host") == jhost:
+            # Decide: is this record the joiner's stale prior name?
+            same_identity = False
+            if j_x25519 and d.get("x25519_pub") == j_x25519:
+                same_identity = True
+            elif (jhost and d.get("host") == jhost
+                  and j_airc_home and d.get("airc_home") == j_airc_home):
+                same_identity = True
+            if same_identity:
                 for ext in (".json", ".pub"):
                     p = os.path.join(peers_dir, entry[:-5] + ext)
                     if os.path.isfile(p):
