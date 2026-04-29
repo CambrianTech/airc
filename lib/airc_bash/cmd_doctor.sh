@@ -25,12 +25,15 @@ cmd_doctor() {
     -h|--help)
       echo "Usage: airc doctor [mode]"
       echo "  airc doctor              environment health check (default)"
+      echo "  airc doctor --fix        attempt to repair recoverable issues"
+      echo "                           (currently: gh auth re-login if invalid)"
       echo "  airc doctor --connect    pre-flight checks for 'airc connect'"
       echo "  airc doctor --tests      run the integration test suite"
       echo "                           (aliases: tests, test, run, suite)"
       return 0 ;;
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
     --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
+    --fix|fix)                       shift; _doctor_fix "$@"; return ;;
   esac
 
   echo ""
@@ -429,6 +432,49 @@ _doctor_connect_preflight() {
     echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc connect'."
     return 1
   fi
+}
+
+_doctor_fix() {
+  # Attempt to repair recoverable issues. Currently scoped to gh auth
+  # because that's the highest-impact silent-failure mode (Joel
+  # 2026-04-29 — token expired, every gh API call failed silently,
+  # peers froze). Future fixes can be added here as discrete recovery
+  # paths.
+  echo
+  echo "  airc doctor --fix"
+  echo "  -----------------"
+  local fixed=0 skipped=0 failed=0
+
+  # gh auth: if invalid, re-run gh auth login. Needs a TTY for the
+  # browser/device-code flow.
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      echo "  [skip] gh auth already valid"
+      skipped=$((skipped + 1))
+    elif [ -t 0 ] && [ -t 1 ]; then
+      echo "  [fix]  gh auth invalid — running 'gh auth login -h github.com -s gist'"
+      if gh auth login -h github.com -s gist; then
+        echo "  [ok]   gh auth restored"
+        # Re-wire git credential helper while we have the token.
+        gh auth setup-git 2>/dev/null && echo "  [ok]   gh token wired into git credential helper" || true
+        fixed=$((fixed + 1))
+      else
+        echo "  [FAIL] gh auth login did not complete; re-run when ready"
+        failed=$((failed + 1))
+      fi
+    else
+      echo "  [FAIL] gh auth invalid AND no TTY for the interactive login"
+      echo "         Run from a real shell:  gh auth login -h github.com -s gist"
+      failed=$((failed + 1))
+    fi
+  else
+    echo "  [skip] gh CLI not installed (separate fix — install via brew/apt/winget)"
+    skipped=$((skipped + 1))
+  fi
+
+  echo
+  echo "  Summary: $fixed fixed, $skipped skipped, $failed failed."
+  [ "$failed" = "0" ]
 }
 
 _doctor_run_tests() {
