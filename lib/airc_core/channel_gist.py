@@ -325,15 +325,31 @@ def resolve(channel: str, create_if_missing: bool = False) -> Optional[str]:
     if the channel can't be resolved (no gh auth, no existing gist
     AND create_if_missing=False, or creation failed).
 
-    Two-step: find_existing then optionally create_new. Keeps create
-    opt-in so callers that just want to look up don't accidentally
-    publish stray gists.
+    Two-step: find_existing then optionally create_new.
+
+    Retry on miss: gh's gist listing has eventual consistency — a
+    just-created gist may not appear in `gh gist list` for several
+    seconds. Without retry, a peer who reconnects right after another
+    peer hosted misses the canonical and creates a duplicate. Retry
+    twice with backoff before giving up; bounded so create_if_missing
+    callers don't wait forever on a genuinely-empty account.
     """
     if not channel or not isinstance(channel, str):
         return None
-    existing = find_existing(channel)
-    if existing:
-        return existing
+    import os as _os
+    import time as _t
+    # AIRC_RESOLVE_NO_RETRY: callers that DON'T want to wait on gh's
+    # listing-consistency lag (host-bootstrap find-first — if no gist
+    # exists, we'll create one anyway, no point waiting). Joiner paths
+    # leave it unset so they retry through the propagation window.
+    no_retry = _os.environ.get("AIRC_RESOLVE_NO_RETRY") == "1"
+    attempts = 1 if no_retry else 3
+    for attempt in range(attempts):
+        existing = find_existing(channel)
+        if existing:
+            return existing
+        if attempt < attempts - 1:
+            _t.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
     if create_if_missing:
         return create_new(channel)
     return None

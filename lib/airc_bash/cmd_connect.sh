@@ -1267,6 +1267,13 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         # all hosts on the gh account converge on the oldest canonical.
         local _existing_room_gid=""
         if [ "$use_room" = "1" ]; then
+          # Use full retry so gh's gist-listing eventual consistency
+          # (a just-created gist may not appear in `gh gist list` for
+          # several seconds) doesn't cause the host to create a
+          # duplicate of a gist that already exists. Cost: up to
+          # ~4.5s on a fresh-account first-spawn (no existing gist
+          # ever); accepted as a one-time cost on bootstrap to
+          # guarantee convergence on every later restart.
           _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
                                --channel "$room_name" 2>/dev/null || true)
         fi

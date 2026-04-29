@@ -73,7 +73,7 @@ spawn_real() {
     )
   fi
   local i
-  for i in $(seq 1 20); do
+  for i in $(seq 1 30); do
     sleep 1
     grep -qE 'Hosting as|Connected to|Joined' "$home/out.log" 2>/dev/null || continue
     # For hosts: also wait until config.json has a channel_gists entry,
@@ -327,6 +327,14 @@ scenario_stale_config_auto_resyncs() {
   pass "first spawn: channel_gists['$rname']=$good_gid"
 
   AIRC_HOME="$A_HOME/state" "$AIRC" teardown >/dev/null 2>&1
+  # Defensive: kill orphans that survived teardown's airc.pid-driven
+  # kill (background subshells re-write airc.pid after teardown, then
+  # stomp guard refuses spawn2). Aggressive pkill targeting just this
+  # test scope.
+  pkill -9 -f "$A_HOME" 2>/dev/null || true
+  sleep 2
+  # Also wipe airc.pid in case a surviving subshell re-wrote it.
+  rm -f "$A_HOME/state/airc.pid"
 
   # Poison: replace channel_gists[$rname] with a bogus id
   python3 -c "
