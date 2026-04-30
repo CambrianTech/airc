@@ -177,6 +177,41 @@ read_join_string() {
   grep -oE '[a-z0-9-]+@[a-z]+@[^:]+(:[0-9]+)?#[A-Za-z0-9+/=]+' "$1/out.log" | head -1
 }
 
+# Synthesize the identity files a real `airc connect` would create:
+# ssh_key + private.pem + public.pem. Used by scenarios that pre-build
+# a host scope manually (rather than going through spawn_host) so they
+# can test specific code paths in isolation.
+#
+# Pre-#343 the scaffold only needed `ssh-keygen ed25519 ssh_key` because
+# init_identity used `openssl genpkey` which the test scenarios
+# implicitly depended on running at first airc invocation. Post-#343
+# init_identity uses python-cryptography via airc_core.identity
+# bootstrap-ed25519, but scenarios that synthesize state without going
+# through airc connect at all (cmd_send liveness probe, away-status
+# scaffold, etc.) need to create private.pem themselves or sign-message
+# fails with `ed25519 sign failed: [Errno 2] No such file or directory:
+# .../private.pem` before reaching the actual code-under-test.
+#
+# Args: identity_dir (the directory where ssh_key + private.pem land,
+# usually $home/identity or $home/state/identity), name (used for the
+# ssh_key comment).
+scaffold_identity() {
+  local identity_dir="$1" name="${2:-airc-test}"
+  mkdir -p "$identity_dir"
+  if [ ! -f "$identity_dir/ssh_key" ]; then
+    ssh-keygen -t ed25519 -f "$identity_dir/ssh_key" -N '' -q -C "$name" 2>/dev/null
+  fi
+  if [ ! -f "$identity_dir/private.pem" ]; then
+    # PYTHONPATH must include airc_core's parent (lib/) so the module
+    # is importable when invoking python directly. The airc binary
+    # sets this env at startup; tests calling python directly need
+    # the same setup.
+    local _lib_dir; _lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+    PYTHONPATH="${_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+      "${AIRC_PYTHON:-python3}" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir" 2>/dev/null
+  fi
+}
+
 # airc send from a given home.
 as_home() {
   local home="$1"; shift
@@ -1779,7 +1814,7 @@ scenario_send_dead_monitor_dies() {
   # we're testing cmd_send's pre-flight liveness check, not the wire.
   local home=/tmp/airc-it-sdmd/state
   mkdir -p "$home/identity" "$home/peers"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'airc-test-sdmd' 2>/dev/null
+  scaffold_identity "$home/identity" 'airc-test-sdmd'
   cat > "$home/config.json" <<'JSON'
 { "name": "ghost-host" }
 JSON
@@ -2108,7 +2143,7 @@ scenario_away() {
 
   local home=/tmp/airc-it-aw/state
   mkdir -p "$home/identity"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'aw-test' 2>/dev/null
+  scaffold_identity "$home/identity" 'aw-test'
   cat > "$home/config.json" <<'JSON'
 { "name": "alpha", "identity": {} }
 JSON
@@ -2178,7 +2213,7 @@ scenario_list() {
   # auth which the integration suite doesn't depend on).
   local home=/tmp/airc-it-ls/state
   mkdir -p "$home/identity"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'ls-test' 2>/dev/null
+  scaffold_identity "$home/identity" 'ls-test'
   cat > "$home/config.json" <<'JSON'
 { "name": "alpha" }
 JSON
@@ -2224,7 +2259,7 @@ scenario_quit() {
 
   local home=/tmp/airc-it-q-quit/state
   mkdir -p "$home/identity"
-  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'quit-test' 2>/dev/null
+  scaffold_identity "$home/identity" 'quit-test'
   # Minimal config simulating a paired joiner: has name + identity AND
   # host-pairing fields. quit should drop the pairing and keep identity.
   cat > "$home/config.json" <<'JSON'
