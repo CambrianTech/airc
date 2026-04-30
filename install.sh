@@ -265,29 +265,15 @@ ensure_prereqs() {
   # cryptography module now; the system openssl version (LibreSSL or
   # otherwise) is irrelevant to airc.
 
-  # sshd: airc joiners ssh into the host's airc_home to tail messages.
-  # Every airc user who'll host a room (which is most users — first to
-  # discover becomes the host) needs sshd RUNNING. install.sh actually
-  # turns it on instead of just warning, since "warn + leave it to the
-  # user" was Joel's "this needs to be in the install dude" pushback
-  # 2026-04-27. ONE sudo / UAC prompt during install (same shape as
-  # install_with_pkgmgr already uses for apt/dnf/etc); after that
-  # airc just works for hosting.
-  #
-  # AIRC_SKIP_SSHD=1 short-circuits the whole block — for headless CI
-  # boxes that genuinely don't host, or environments that manage sshd
-  # via their own config-management (Ansible, Chef).
-  #
-  # Auto-detect: GitHub Actions sets CI=true; so does almost every CI
-  # system (Travis, CircleCI, GitLab, BuildKite, Jenkins). On macOS
-  # specifically, the osascript admin-prompt path hangs forever in CI
-  # because there's no Touch ID / password input — the runner job
-  # silently runs for the full 6-hour timeout. Skip when CI=true so
-  # the install completes cleanly and CI tests the rest of the path.
   # Post-3c: sshd setup + Tailscale install fully removed. Cross-network
   # messaging routes through gh-as-bearer (envelope-encrypted gist),
   # which works on every platform with `gh auth login` — no privileged
-  # daemon, no sign-in popup, no admin elevation.
+  # daemon, no sign-in popup, no admin elevation. The earlier sshd-on-
+  # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +
+  # CI auto-detect) was deleted as part of issue #341 follow-up #345
+  # (doctor's sshd probe also dropped); leaving this single tombstone
+  # comment so a reader who finds 'sshd' in old git history sees why
+  # it's not here anymore.
 
   # gh auth: required for the gist substrate. We CAN drive the login
   # interactively when stdin is a TTY (Joel 2026-04-29: 'thought that'd
