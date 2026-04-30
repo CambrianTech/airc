@@ -92,28 +92,6 @@ ensure_channel_subscribed_with_gist() {
 }
 
 cmd_connect() {
-  # Pre-flight: gh auth check. The gh keyring can silently invalidate
-  # (token revoked / 2FA flow expired / brew upgrade replaced gh
-  # without re-auth) and EVERY downstream gh API call then fails
-  # silently — bearer.send returns auth_failure, bearer recv polls
-  # forever getting nothing, peers see "monitor running, no traffic"
-  # which is the exact freeze pattern Joel kept hitting. Catch this
-  # at connect time so the user gets a clear error instead of a
-  # mystery timeout.
-  if command -v gh >/dev/null 2>&1; then
-    if ! gh auth status >/dev/null 2>&1; then
-      echo "" >&2
-      echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
-      echo "    Detail:" >&2
-      gh auth status 2>&1 | sed 's/^/      /' >&2
-      echo "" >&2
-      echo "    Fix:  gh auth login -h github.com" >&2
-      echo "" >&2
-      echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
-      die "gh auth invalid — run 'gh auth login -h github.com' first"
-    fi
-  fi
-
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
   #   default (no gh OR gh not authed): long invite only (today's behavior)
@@ -257,6 +235,52 @@ cmd_connect() {
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+
+  # Pre-flight: gh auth check. The gh keyring can silently invalidate
+  # (token revoked / 2FA flow expired / brew upgrade replaced gh
+  # without re-auth) and EVERY downstream gh API call then fails
+  # silently — bearer.send returns auth_failure, bearer recv polls
+  # forever getting nothing, peers see "monitor running, no traffic"
+  # which is the exact freeze pattern Joel kept hitting. Catch this
+  # at connect time so the user gets a clear error instead of a
+  # mystery timeout.
+  #
+  # Gated on use_room=1: when the user opts into legacy 1:1 invite
+  # mode (--no-room), the substrate isn't used and gh is irrelevant.
+  # The CI clean-install smoke test specifically exercises that
+  # offline path with no gh auth — pre-#338 the unconditional check
+  # killed it before the host loop could start (PR #338 regression).
+  if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
+    if ! gh auth status >/dev/null 2>&1; then
+      # `gh auth status` probes /user, which returns 403 during a GitHub
+      # secondary rate limit (abuse detection) and which gh then misreports
+      # as "token invalid". The /rate_limit endpoint is reachable during
+      # secondary limits — if it works, the token is fine and the user
+      # just needs to wait, not re-auth. Issue #341.
+      echo "" >&2
+      if gh api rate_limit >/dev/null 2>&1; then
+        echo "  ! GitHub secondary rate limit (abuse detection) triggered." >&2
+        echo "    Your token is fine — wait 5-15 minutes and retry 'airc join'." >&2
+        echo "" >&2
+        echo "    Why this is confusing: 'gh auth status' calls /user which gets 403'd" >&2
+        echo "    during secondary rate limits; gh then prints 'token invalid'. The" >&2
+        echo "    /rate_limit endpoint is reachable, which proves the token works." >&2
+        echo "" >&2
+        echo "    Caused by: too many gh API calls in a short window (polling loops," >&2
+        echo "    rapid-fire PR/issue/comment activity, etc.)." >&2
+        die "GitHub rate-limited — retry in 5-15 min (token is fine)"
+      else
+        echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
+        echo "    Detail:" >&2
+        gh auth status 2>&1 | sed 's/^/      /' >&2
+        echo "" >&2
+        echo "    Fix:  gh auth login -h github.com" >&2
+        echo "" >&2
+        echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
+        die "gh auth invalid — run 'gh auth login -h github.com' first"
+      fi
+    fi
+  fi
 
   # Issue #136: --general re-opt-in. Clear parted state on primary
   # scope and force the sidecar back on. Done after arg parsing so we
@@ -1318,10 +1342,13 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         fi
 
         # Skip create-new entirely if we already adopted an existing
-        # canonical gist above (find-first convergence path).
+        # canonical gist above (find-first convergence path). Still
+        # need to set the variables downstream heartbeat setup uses
+        # — _now (timestamp) and _machine_id — since the create-new
+        # block populates them and we're skipping it.
         if [ -n "${_existing_room_gid:-}" ]; then
-          true  # No-op; downstream heartbeat + monitor setup uses
-                # _gist_id / _gist_url already set above.
+          local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          local _machine_id; _machine_id=$(host_machine_id)
         else
         # Bootstrap basename + description match channel_gist.create_new's
         # canonical shape (airc-room-<channel>.json + "airc room: #X").

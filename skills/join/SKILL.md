@@ -43,7 +43,7 @@ If `gh` is not on PATH or not authed: install + `gh auth login`. There's no grac
 
 ## 2. Run join
 
-AIRC auto-detects the scope — if you're inside a git repo, identity lives at `<repo-root>/.airc/`; otherwise `~/.airc/`. No env vars needed.
+AIRC auto-detects the scope — if you're inside a git repo, identity lives at `<repo-root>/.airc/`; otherwise at `$PWD/.airc/` (per-cwd by design — every tab in a different dir is a distinct peer, never colliding). Set `AIRC_HOME=/path` to force a specific scope dir.
 
 **Default — auto-scoped project room + #general sidecar:**
 ```

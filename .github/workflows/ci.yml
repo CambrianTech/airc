@@ -48,7 +48,7 @@ jobs:
           cp -r . $HOME/.airc-src/
           # Real install — no AIRC_SKIP_PREREQS. install.sh must
           # detect the package manager and install everything missing.
-          AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
 
       - name: airc doctor (must report environment-clean)
         run: |
@@ -107,7 +107,7 @@ jobs:
         run: |
           mkdir -p $HOME/.airc-src
           cp -r . $HOME/.airc-src/
-          AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
 
       - name: airc doctor (must report environment-clean)
         run: |
@@ -210,7 +210,7 @@ jobs:
         run: |
           mkdir -p $HOME/.airc-src
           cp -r . $HOME/.airc-src/
-          AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
 
       - name: Run integration suite
         run: |

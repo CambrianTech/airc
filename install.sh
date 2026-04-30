@@ -48,8 +48,11 @@ _to_bash_path() {
 # install via the platform's package manager, then verify. Designed for
 # FIRST-TIME users with nothing pre-installed beyond a shell.
 #
-# Required: git, gh, openssl, ssh-keygen, python3
+# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip)
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
+# Deliberately not required: openssl. Issue #341 — identity Ed25519 ops
+# moved to the venv cryptography module so we don't depend on system
+# openssl flavoring (LibreSSL vs OpenSSL etc).
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -95,11 +98,6 @@ pkgname_for() {
         pacman) echo "openssh" ;;
         apk)    echo "openssh-client" ;;
         winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
-      esac ;;
-    openssl)
-      case "$mgr" in
-        winget) echo "" ;;  # bundled with Git for Windows; if Git is installed, openssl is there
-        *)      echo "openssl" ;;
       esac ;;
     python3)
       case "$mgr" in
@@ -194,7 +192,7 @@ ensure_prereqs() {
       fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
-      warn "Required prereqs: git, gh, openssl, python3"
+      warn "Required prereqs: git, gh, python3 (cryptography via pip)"
       return 0
     fi
   fi
@@ -204,11 +202,16 @@ ensure_prereqs() {
   # stdlib JSON (lib/airc_core/gistparse.py). Python was already a hard
   # dep since #152 Phase 0; jq was redundant. Drop the dep + the
   # winget step that would install it.
-  for cmd in git gh openssl ssh-keygen python3; do
+  # Issue #341 follow-up: openssl removed from the prereq list. airc
+  # no longer shells out to it for Ed25519 — identity gen + signing
+  # both route through the venv cryptography module (which is already
+  # a hard dep, pip-installed below). LibreSSL on macOS used to make
+  # this an ordeal; now it's a non-issue at the source.
+  for cmd in git gh ssh-keygen python3; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (continuum-b69f, 2026-04-27). git/gh/openssl all
+    # redirect (continuum-b69f, 2026-04-27). git/gh all
     # support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
@@ -251,37 +254,26 @@ ensure_prereqs() {
       warn "These prereqs need manual install on $mgr: ${unmappable[*]}"
       case "$mgr" in
         winget)
-          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client"
-          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' provides it" ;;
+          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client" ;;
       esac
     fi
   else
     ok "All required prereqs present"
   fi
+  # Issue #341 follow-up: openssl Ed25519-capability probe + brew
+  # install dance removed. Identity gen + signing live in the venv
+  # cryptography module now; the system openssl version (LibreSSL or
+  # otherwise) is irrelevant to airc.
 
-  # sshd: airc joiners ssh into the host's airc_home to tail messages.
-  # Every airc user who'll host a room (which is most users — first to
-  # discover becomes the host) needs sshd RUNNING. install.sh actually
-  # turns it on instead of just warning, since "warn + leave it to the
-  # user" was Joel's "this needs to be in the install dude" pushback
-  # 2026-04-27. ONE sudo / UAC prompt during install (same shape as
-  # install_with_pkgmgr already uses for apt/dnf/etc); after that
-  # airc just works for hosting.
-  #
-  # AIRC_SKIP_SSHD=1 short-circuits the whole block — for headless CI
-  # boxes that genuinely don't host, or environments that manage sshd
-  # via their own config-management (Ansible, Chef).
-  #
-  # Auto-detect: GitHub Actions sets CI=true; so does almost every CI
-  # system (Travis, CircleCI, GitLab, BuildKite, Jenkins). On macOS
-  # specifically, the osascript admin-prompt path hangs forever in CI
-  # because there's no Touch ID / password input — the runner job
-  # silently runs for the full 6-hour timeout. Skip when CI=true so
-  # the install completes cleanly and CI tests the rest of the path.
   # Post-3c: sshd setup + Tailscale install fully removed. Cross-network
   # messaging routes through gh-as-bearer (envelope-encrypted gist),
   # which works on every platform with `gh auth login` — no privileged
-  # daemon, no sign-in popup, no admin elevation.
+  # daemon, no sign-in popup, no admin elevation. The earlier sshd-on-
+  # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +
+  # CI auto-detect) was deleted as part of issue #341 follow-up #345
+  # (doctor's sshd probe also dropped); leaving this single tombstone
+  # comment so a reader who finds 'sshd' in old git history sees why
+  # it's not here anymore.
 
   # gh auth: required for the gist substrate. We CAN drive the login
   # interactively when stdin is a TTY (Joel 2026-04-29: 'thought that'd
@@ -292,9 +284,35 @@ ensure_prereqs() {
   # a TTY, CI, etc).
   if command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
-      if [ -t 0 ] && [ -t 1 ]; then
-        info "gh is not authenticated — launching 'gh auth login -s gist' now."
-        info "  (Browser will open; sign in to GitHub. The 'gist' scope is required for the substrate.)"
+      # Skip the interactive auth path under sudo/root: gh stores the token
+      # for the calling user (root's keyring), but airc runs as the real
+      # user and reads the real user's token. Authing as root silently
+      # produces a working-as-root / broken-as-user state. Joel 2026-04-29:
+      # 'detect and if not, open it if it isnt sudo'.
+      _running_as_root=0
+      if [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" = "0" ] || [ -n "${SUDO_USER:-}" ]; then
+        _running_as_root=1
+      fi
+      if [ "$_running_as_root" = "1" ]; then
+        warn "gh is not authenticated, and install is running as root/sudo."
+        warn "  Don't auth gh as root — re-run as your normal user, or run once after install:"
+        warn "    gh auth login -h github.com -s gist"
+      elif [ -t 0 ] && [ -t 1 ]; then
+        # Pause-with-Enter before handing the user off to gh's device-code
+        # flow. Without this break, the gh prompt + browser popup arrives
+        # mid-install-output and looks like the script hung — the user
+        # has no signal that "you're now in a different tool". Match
+        # Claude Code's installer convention: bold green "==>" headline,
+        # bold action line, explicit "Press Enter / Ctrl+C" prompt.
+        # Honor AIRC_INSTALL_YES=1 for power users who curl|bash often.
+        printf '\n  \033[1;32m==>\033[0m GitHub authentication required for the gist substrate.\n'
+        printf '      About to launch: \033[1mgh auth login -h github.com -s gist\033[0m\n'
+        printf '      A browser will open; the device code shown in the terminal must be pasted there.\n'
+        if [ "${AIRC_INSTALL_YES:-0}" != "1" ]; then
+          printf '      Press Enter to continue, Ctrl+C to abort: '
+          read -r _ || true
+          printf '\n'
+        fi
         if gh auth login -h github.com -s gist; then
           ok "gh auth complete"
           # Re-run setup-git so the just-acquired token gets wired.
@@ -332,6 +350,16 @@ ensure_prereqs
 # ── Clone or update ─────────────────────────────────────────────────────
 
 if [ -d "$CLONE_DIR/.git" ]; then
+  # AIRC_INSTALL_NO_PULL=1: trust CLONE_DIR's checked-out tree exactly
+  # as-is — no branch switch, no pull. CI uses this when it has already
+  # staged the PR's tree at $CLONE_DIR via `cp -r .` and wants the
+  # smoke matrix to exercise the PR's code, not whatever's on main.
+  # Without this escape hatch, install.sh's "I'm-on-a-non-channel-branch
+  # so let me reset to main" recovery path silently overwrites the
+  # PR's code with origin/main's — making the PR's CI a no-op.
+  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ]; then
+    info "AIRC_INSTALL_NO_PULL=1 — using CLONE_DIR tree as-is, skipping branch-switch + pull"
+  else
   info "Updating existing install"
   # Recovery: if the install dir is on a non-channel branch (e.g. someone
   # / some AI checked out a feature branch for testing and forgot to
@@ -394,6 +422,7 @@ Recover with:
 EOF
     exit 1
   fi
+  fi  # AIRC_INSTALL_NO_PULL guard
 else
   # First install. Honor AIRC_CHANNEL if set so users can land on canary
   # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
@@ -508,8 +537,11 @@ if [ -d "$CLONE_DIR/skills" ]; then
   # Clean up old symlinks from previous installs.
   # Includes the airc-classic skill names (connect/send/rename/disconnect) that
   # were renamed to IRC-canonical (join/msg/nick/quit) — leaving the old symlinks
-  # in place would shadow the new skills with stale content.
-  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup "$SKILLS_TARGET"/uninstall \
+  # in place would shadow the new skills with stale content. (`uninstall` was
+  # previously listed here when the skill didn't exist; now that we ship a real
+  # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
+  # this list omits it.)
+  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup \
              "$SKILLS_TARGET"/connect "$SKILLS_TARGET"/send "$SKILLS_TARGET"/rename "$SKILLS_TARGET"/disconnect; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
@@ -536,9 +568,16 @@ fi
 echo ""
 ok "Installed."
 echo ""
-echo "  Next:"
-echo "    airc join                      # auto-#general (joins existing or hosts)"
-echo "    airc msg @<peer> <message>     # DM (or omit @peer to broadcast)"
+echo "  Next — open your agent:"
+echo "    claude          # or codex, cursor, opencode, windsurf, openclaw, ..."
+echo ""
+echo "  Then, inside the agent:"
+echo "    /join                          # auto-scopes to your project's room"
+echo "    /msg @<peer> <message>         # DM (or omit @peer to broadcast)"
+echo ""
+echo "  Or run airc directly from this shell:"
+echo "    airc join"
+echo "    airc msg @<peer> <message>"
 echo ""
 echo "  Diagnose anytime:    airc doctor"
 echo "  Repair if needed:    airc doctor --fix"

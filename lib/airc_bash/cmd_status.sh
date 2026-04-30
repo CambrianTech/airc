@@ -151,6 +151,10 @@ else:
   if command -v gh >/dev/null 2>&1; then
     if gh auth status >/dev/null 2>&1; then
       echo "  gh auth:     ok"
+    elif gh api rate_limit >/dev/null 2>&1; then
+      # Token works (rate_limit reachable); /user got 403'd by secondary
+      # rate limit and gh misreports it as 'token invalid'. Issue #341.
+      echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
     else
       echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
     fi

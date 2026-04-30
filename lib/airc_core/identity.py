@@ -30,6 +30,15 @@ from typing import Optional
 X25519_PRIV_FILENAME = "x25519_priv"
 X25519_PUB_FILENAME = "x25519_pub"
 
+# Ed25519 envelope-signing keypair lives as PEM files at fixed names —
+# matching the on-disk shape that prior shell-openssl init wrote, so a
+# scope upgraded across the cryptography-migration boundary doesn't see
+# its identity rotate. Different file names from X25519 (which uses raw
+# bytes) because the openssl-created private.pem / public.pem pre-date
+# this module and we keep them.
+ED25519_PRIV_FILENAME = "private.pem"
+ED25519_PUB_FILENAME = "public.pem"
+
 
 def x25519_paths(identity_dir: str) -> tuple[str, str]:
     """Return (priv_path, pub_path) for an identity directory."""
@@ -69,6 +78,60 @@ def bootstrap(identity_dir: str) -> tuple[bytes, bytes]:
     priv, pub = crypto.generate_x25519_keypair()
     crypto.save_keypair(priv, pub, priv_path, pub_path)
     return (priv, pub)
+
+
+# ── Ed25519 envelope-signing keypair (issue #341 migration) ────────
+#
+# Pre-#341 init_identity() shelled out to `openssl genpkey -algorithm
+# Ed25519`. macOS LibreSSL doesn't implement Ed25519, which silently
+# broke fresh-Mac installs (the `2>/dev/null` ate the error). The
+# cryptography venv module already supports Ed25519 natively and is
+# already an install.sh prereq for envelope encryption — so the shell
+# openssl is a redundant footgun. These functions are the migration
+# target.
+
+def ed25519_paths(identity_dir: str) -> tuple[str, str]:
+    """Return (priv_path, pub_path) for an identity directory."""
+    return (
+        os.path.join(identity_dir, ED25519_PRIV_FILENAME),
+        os.path.join(identity_dir, ED25519_PUB_FILENAME),
+    )
+
+
+def has_ed25519_keypair(identity_dir: str) -> bool:
+    priv_path, pub_path = ed25519_paths(identity_dir)
+    return os.path.isfile(priv_path) and os.path.isfile(pub_path)
+
+
+def bootstrap_ed25519(identity_dir: str) -> None:
+    """Idempotent: generate the Ed25519 envelope-signing keypair if
+    missing. Writes private.pem (PKCS#8 PEM, 0600) + public.pem (SPKI
+    PEM, 0644) — same on-disk format the prior `openssl genpkey` path
+    produced, so an upgraded scope's identity is unchanged.
+
+    Raises ImportError if cryptography is unavailable. Callers higher
+    up (`airc init_identity` bash) treat that as a hard fatal: the
+    envelope signing key is required, not optional.
+    """
+    from . import crypto
+
+    priv_path, pub_path = ed25519_paths(identity_dir)
+    if has_ed25519_keypair(identity_dir):
+        return
+    os.makedirs(identity_dir, exist_ok=True)
+    priv_pem, pub_pem = crypto.generate_ed25519_keypair_pem()
+    crypto.save_ed25519_keypair_pem(priv_pem, pub_pem, priv_path, pub_path)
+
+
+def sign_ed25519(identity_dir: str, data: bytes) -> bytes:
+    """Sign `data` with the scope's Ed25519 private key. Raw 64-byte
+    signature output — same as `openssl pkeyutl -sign` produces. Caller
+    base64s for invite-string / envelope embedding.
+    """
+    from . import crypto
+
+    priv_path, _ = ed25519_paths(identity_dir)
+    return crypto.sign_ed25519_pem(priv_path, data)
 
 
 def cryptography_available() -> bool:
@@ -221,6 +284,20 @@ def _cli() -> int:
     )
     pp.add_argument("--peers-dir", required=True)
     pp.add_argument("--peer-name", required=True)
+    # Ed25519 envelope-signing key — replaces the prior shell openssl
+    # path. bootstrap_ed25519 is invoked from airc's init_identity;
+    # sign_ed25519 from sign_message. See module docstring (Ed25519
+    # block above) for migration context.
+    be = sub.add_parser(
+        "bootstrap-ed25519",
+        help="Generate Ed25519 envelope-signing keypair if missing",
+    )
+    be.add_argument("--dir", required=True, help="Identity directory path")
+    se = sub.add_parser(
+        "sign-ed25519",
+        help="Sign stdin bytes; print base64 signature on stdout",
+    )
+    se.add_argument("--dir", required=True, help="Identity directory path")
     args = parser.parse_args()
 
     if args.cmd == "bootstrap":
@@ -261,6 +338,48 @@ def _cli() -> int:
             return 0
         from . import crypto
         print(crypto.b64encode(pub))
+        return 0
+
+    if args.cmd == "bootstrap-ed25519":
+        # Hard-fatal if cryptography missing — Ed25519 signing is required
+        # for the envelope path, not optional. install.sh's prereq check
+        # ensures the venv has cryptography; if we got here without it,
+        # the install is broken.
+        if not cryptography_available():
+            print(
+                "cryptography package not available; airc envelope signing "
+                "requires it. Re-run install.sh to set up the venv.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            bootstrap_ed25519(args.dir)
+        except OSError as e:
+            print(f"ed25519 bootstrap failed: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.cmd == "sign-ed25519":
+        # Reads message bytes from stdin (binary-safe; bash pipes message
+        # data via `printf '%s' "$msg" | python -m airc_core.identity
+        # sign-ed25519 ...`). Prints b64 signature on stdout, matching
+        # the prior `openssl pkeyutl -sign | base64` output shape so
+        # callers don't need to change.
+        if not cryptography_available():
+            print("cryptography missing", file=sys.stderr)
+            return 1
+        try:
+            data = sys.stdin.buffer.read()
+            sig = sign_ed25519(args.dir, data)
+        except (OSError, ValueError) as e:
+            print(f"ed25519 sign failed: {e}", file=sys.stderr)
+            return 1
+        # Standard base64 (with padding, newline-terminated) — matches
+        # `openssl pkeyutl -sign | base64` byte-for-byte. Don't use the
+        # urlsafe variant `crypto.b64encode` here; bash callers expect
+        # the openssl-compatible format.
+        import base64
+        sys.stdout.write(base64.b64encode(sig).decode("ascii") + "\n")
         return 0
 
     return 1

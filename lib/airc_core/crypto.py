@@ -55,6 +55,10 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -128,6 +132,80 @@ def load_pub(pub_path: str) -> bytes:
             f"X25519 public key at {pub_path} is {len(raw)} bytes; expected 32"
         )
     return raw
+
+
+# ──────────────────────────────────────────────────────────────────
+# Ed25519 keypairs — generation, save, load, sign
+#
+# Different on-disk format from X25519 above: Ed25519 keys live as PEM
+# files (PKCS#8 for private, SubjectPublicKeyInfo for public) at fixed
+# names `private.pem` / `public.pem` for compatibility with the prior
+# shell-openssl-generated identity layout. Existing scopes that paired
+# under the openssl path will load cleanly here — `cryptography`'s
+# load_pem_private_key parses the same PKCS#8 wrapping that
+# `openssl genpkey -algorithm Ed25519` writes. Verified: round-trip
+# byte-equal between the two for the same seed material.
+#
+# Why PEM (not raw like X25519): X25519 keys are this module's truth,
+# only ever read by Python. Ed25519 keys pre-existed in shell-openssl
+# format and we maintain the same disk shape so nobody's identity
+# silently rotates on upgrade.
+# ──────────────────────────────────────────────────────────────────
+
+def generate_ed25519_keypair_pem() -> tuple[bytes, bytes]:
+    """Generate a fresh Ed25519 keypair, return (priv_pem, pub_pem) bytes.
+
+    Output format matches `openssl genpkey -algorithm Ed25519` (PKCS#8 PEM)
+    and `openssl pkey -pubout` (SPKI PEM) byte-for-byte modulo the random
+    seed. Existing peers that signed under shell-openssl Ed25519 verify
+    correctly against pubkeys generated here and vice versa — both are
+    the same NIST/IETF-standard primitive.
+    """
+    priv = Ed25519PrivateKey.generate()
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return (priv_pem, pub_pem)
+
+
+def load_ed25519_priv_pem(priv_path: str) -> Ed25519PrivateKey:
+    """Read an Ed25519 PKCS#8 PEM private key from disk. Raises
+    FileNotFoundError or ValueError on malformed input. Used by
+    sign_ed25519_pem below; exposed so callers can do their own
+    framing if they prefer."""
+    with open(priv_path, "rb") as f:
+        pem = f.read()
+    key = serialization.load_pem_private_key(pem, password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError(
+            f"key at {priv_path} is not Ed25519 ({type(key).__name__})"
+        )
+    return key
+
+
+def sign_ed25519_pem(priv_path: str, data: bytes) -> bytes:
+    """Sign `data` with the Ed25519 private key at `priv_path`. Returns
+    the raw 64-byte signature — same as `openssl pkeyutl -sign` output
+    on the same key+message. Caller base64-encodes if needed; we keep
+    bytes here so the layer above decides on encoding.
+    """
+    return load_ed25519_priv_pem(priv_path).sign(data)
+
+
+def save_ed25519_keypair_pem(
+    priv_pem: bytes, pub_pem: bytes, priv_path: str, pub_path: str
+) -> None:
+    """Write Ed25519 PEMs to disk with appropriate perms (0600 / 0644).
+    Atomic via temp + rename so SIGKILL mid-write can't leave partial
+    state. Mirror of save_keypair() above for X25519."""
+    _atomic_write_bytes(priv_path, priv_pem, mode=0o600)
+    _atomic_write_bytes(pub_path, pub_pem, mode=0o644)
 
 
 # ──────────────────────────────────────────────────────────────────

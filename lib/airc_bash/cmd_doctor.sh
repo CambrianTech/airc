@@ -49,11 +49,14 @@ cmd_doctor() {
   _doctor_probe "git"          "$mgr" "VCS for clone/update" || issues=$((issues+1))
   _doctor_probe "gh"           "$mgr" "Gist substrate (room discovery)" || issues=$((issues+1))
   _doctor_probe_gh_auth                                             || issues=$((issues+1))
-  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"     || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
-  _doctor_probe_sshd                                                    || issues=$((issues+1))
+  _doctor_probe_cryptography                                            || issues=$((issues+1))
+  # sshd probe removed post-3c: the gist IS the wire for ALL peers; airc no
+  # longer ssh's into the host's airc_home. ssh-keygen above stays (identity
+  # key generation), ssh client stays (occasional manual diagnostic + future
+  # wire-pluggable bearers). Issue #341 follow-up.
   _doctor_probe_tailscale "$mgr"  # optional, never increments issues
 
   echo ""
@@ -187,107 +190,24 @@ _doctor_probe_gh_auth() {
   return 1
 }
 
-# Probe sshd (SSH server). airc joiners ssh into the host's airc_home
-# to `tail -F messages.jsonl`. So every airc user who'll host a room
-# (which is most users — first to discover a room becomes its host)
-# needs sshd running on their box. Pre-fix: airc doctor probed for the
-# ssh CLIENT but not the SERVER. Joel + continuum-b69f hit this on
-# 2026-04-27 mid-cross-machine bringup: TCP handshake worked, but
-# message stream silently failed because Windows ships OpenSSH client
-# but NOT the server enabled by default.
-#
-# Per-platform probes:
-#   macOS         — launchctl + systemsetup (Remote Login)
-#   linux / wsl   — systemctl is-active on ssh OR sshd unit names
-#                   (Debian/Ubuntu unit is 'ssh', RHEL/Fedora is 'sshd')
-#   windows-bash  — powershell.exe Get-Service sshd, distinguish
-#                   Running / Stopped / Missing-capability
-#
-# Returns 0 on ok, 1 on missing/broken, 0 on platforms we can't probe
-# (don't penalize if we can't tell).
-_doctor_probe_sshd() {
-  local plat; plat=$(detect_platform)
-  case "$plat" in
-    darwin)
-      # macOS Remote Login = launchd-managed sshd. Detect WITHOUT sudo:
-      #   - `launchctl list` (user scope) does NOT show system services
-      #     like com.openssh.sshd, so the user-scope probe always misses.
-      #   - `launchctl print system` DOES list system services and works
-      #     without sudo. Look for `com.openssh.sshd` (the service id).
-      #   - `systemsetup -getremotelogin` requires admin to read state
-      #     (returns "You need administrator access..." otherwise) — keep
-      #     it as the second-attempt fallback in case sudo is cached.
-      if launchctl print system 2>/dev/null | grep -qE 'com\.openssh\.sshd($|[[:space:]])'; then
-        printf "  [ok] sshd (Remote Login enabled)\n"
-        return 0
-      fi
-      if systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
-        printf "  [ok] sshd (Remote Login enabled)\n"
-        return 0
-      fi
-      printf "  [MISSING] sshd -- needed when you HOST a room\n"
-      printf "         Fix: System Settings -> General -> Sharing -> Remote Login (toggle on)\n"
-      printf "         Or:  sudo systemsetup -setremotelogin on\n"
-      return 1
-      ;;
-    linux|wsl)
-      # Debian/Ubuntu uses 'ssh', RHEL/Fedora/Arch uses 'sshd'.
-      if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
-        printf "  [ok] sshd (systemd active)\n"
-        return 0
-      fi
-      printf "  [MISSING] sshd -- needed when you HOST a room\n"
-      printf "         Fix (Debian/Ubuntu): sudo apt-get install openssh-server && sudo systemctl enable --now ssh\n"
-      printf "         Fix (RHEL/Fedora):    sudo dnf install openssh-server && sudo systemctl enable --now sshd\n"
-      return 1
-      ;;
-    windows)
-      # powershell.exe is the canonical PS launcher in Git Bash. Some
-      # boxes also ship pwsh.exe (PS Core); prefer powershell.exe for
-      # broadest reach since OpenSSH service control works in both.
-      local _ps=""
-      if command -v powershell.exe >/dev/null 2>&1; then _ps="powershell.exe"
-      elif command -v pwsh.exe >/dev/null 2>&1; then _ps="pwsh.exe"
-      fi
-      if [ -z "$_ps" ]; then
-        printf "  [info] sshd probe skipped (powershell.exe not on PATH)\n"
-        return 0
-      fi
-      local _state
-      _state=$("$_ps" -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
-      case "$_state" in
-        Running)
-          printf "  [ok] sshd (Windows OpenSSH.Server running)\n"
-          return 0
-          ;;
-        Stopped|StopPending|StartPending|Paused)
-          printf "  [BROKEN] sshd -- installed but not running (state: %s)\n" "$_state"
-          printf "         Fix (admin PowerShell):  Start-Service sshd; Set-Service sshd -StartupType Automatic\n"
-          return 1
-          ;;
-        "")
-          printf "  [MISSING] sshd -- needed when you HOST a room\n"
-          printf "         Fix (admin PowerShell — five lines, run all together):\n"
-          printf "           Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0\n"
-          printf "           reg add HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\hns\\\\State /v EnableExcludedPortRange /d 0 /f\n"
-          printf "           netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1\n"
-          printf "           Start-Service sshd\n"
-          printf "           Set-Service -Name sshd -StartupType Automatic\n"
-          printf "         (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot —\n"
-          printf "          continuum-b69f's diagnosis 2026-04-27. Without them, sshd bind returns EPERM.)\n"
-          return 1
-          ;;
-        *)
-          printf "  [info] sshd state unknown (Get-Service returned: '%s')\n" "$_state"
-          return 0
-          ;;
-      esac
-      ;;
-    *)
-      printf "  [info] sshd probe unsupported on platform '%s'\n" "$plat"
-      return 0
-      ;;
-  esac
+# Probe the venv cryptography package — issue #341 follow-up. airc's
+# Ed25519 identity gen + signing now route through python-cryptography;
+# without it init_identity / sign_message hard-fail. install.sh's venv
+# step pip-installs it, so the failure surface here is "venv setup
+# didn't complete cleanly" or "the system python the resolver picked
+# differs from the venv one". Either way: surface clearly so doctor
+# tells the user to re-run install.sh.
+_doctor_probe_cryptography() {
+  if ! command -v "${AIRC_PYTHON:-python3}" >/dev/null 2>&1; then
+    return 0  # already reported missing by the python3 probe
+  fi
+  if "${AIRC_PYTHON:-python3}" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
+    printf "  [ok] cryptography (Ed25519 identity gen + signing)\n"
+    return 0
+  fi
+  printf "  [MISSING] cryptography (Python package, used for Ed25519 identity)\n"
+  printf "         Fix: re-run install.sh (sets up the venv with cryptography)\n"
+  return 1
 }
 
 _doctor_probe_tailscale() {
@@ -339,11 +259,11 @@ _doctor_connect_preflight() {
 
   # ── Required prereqs (same as default doctor) ──
   _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
-  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"    || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
-  _doctor_probe_sshd                                                   || issues=$((issues+1))
+  _doctor_probe_cryptography                                           || issues=$((issues+1))
+  # sshd probe removed post-3c — see cmd_doctor() in this file for rationale.
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.
   # Single chain (early-return on first failure) so a missing gh isn't
@@ -353,16 +273,32 @@ _doctor_connect_preflight() {
   if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
     issues=$((issues+1))
   elif ! gh auth status >/dev/null 2>&1; then
-    printf "  [BLOCKED] gh authenticated\n"
-    printf "         Fix: gh auth login -s gist\n"
+    # Distinguish a real auth failure from a GitHub secondary rate limit
+    # (abuse detection). The /rate_limit endpoint is reachable during
+    # secondary limits, so if it works, the token is fine — the user just
+    # needs to wait. `gh auth status` probes /user, which gets 403'd, and
+    # gh then misreports the symptom as 'token invalid'. Issue #341.
+    if gh api rate_limit >/dev/null 2>&1; then
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
+      printf "         Fix: wait 5-15 min then re-run; cause is too many gh API calls in a short window\n"
+    else
+      printf "  [BLOCKED] gh authenticated\n"
+      printf "         Fix: gh auth login -s gist\n"
+    fi
     issues=$((issues+1))
   elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))
   elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
-    printf "  [BLOCKED] gist API not reachable -- network outage or rate-limit\n"
-    printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    # Same misdiagnosis risk here — distinguish rate-limit vs other.
+    if gh api rate_limit >/dev/null 2>&1; then
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token + scope are fine\n"
+      printf "         Fix: wait 5-15 min then re-run\n"
+    else
+      printf "  [BLOCKED] gist API not reachable -- network outage or token revoked\n"
+      printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    fi
     issues=$((issues+1))
   else
     printf "  [ok] gh authed with gist scope, gists API reachable\n"
