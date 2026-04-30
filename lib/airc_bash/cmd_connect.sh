@@ -236,40 +236,31 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
-  # Trust-existing-monitor short-circuit. If a live airc process is
-  # already in this scope (per airc.pid with at least one alive PID),
-  # the user's intent ("airc join") is satisfied — there's nothing
-  # to do, and the gh-auth probe below would only generate noise (or
-  # worse, false-positive failures from a flaky gh probe in environments
-  # like Codex's sandbox; #367) on a scope that's already working.
+  # Trust-existing-monitor short-circuit (#369, sandbox-aware via
+  # _monitor_alive_with_bearer_fallback per #372). If a live airc
+  # process is already in this scope, the user's intent ("airc join")
+  # is satisfied — there's nothing to do, and the gh-auth probe below
+  # would only generate noise (or false-positive failures from flaky
+  # gh probes in environments like Codex's sandbox; #367) on a scope
+  # that's already working.
   #
-  # The gh-auth probe is meant to catch "user is about to do real work,
-  # let's make sure their gh credential is healthy first." If real work
-  # is ALREADY HAPPENING in this scope (live monitor → live bearer →
-  # live gh API calls), the running monitor's own health is the
-  # authoritative signal, not an out-of-band probe.
-  #
-  # The downstream "monitor is already running" message at the canonical
-  # detection point (post-arg-parse, lines ~440 below) is what the user
-  # actually wants. Hoist that detection here; on a hit, return 0 with
-  # the same message, before any preflight noise can fire.
+  # Pre-#372 this used naked kill -0 inline, which returned false on
+  # Codex (sandbox process-tree blindness) even when the monitor was
+  # provably alive (bearer-state.json updates every poll cycle).
+  # The shared helper checks bearer-state freshness as a fallback, so
+  # Codex sessions ALSO hit this short-circuit when their monitor
+  # is alive — exactly the Carl-experience win for cross-vendor mesh.
   local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
-  if [ -f "$_early_pidfile" ]; then
-    local _early_pids _early_alive=0 _p
-    _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-    for _p in $_early_pids; do
-      kill -0 "$_p" 2>/dev/null && _early_alive=1
-    done
-    if [ "$_early_alive" = "1" ]; then
-      echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
-      echo "    To stop it:        airc teardown"
-      echo "    To restart it:     airc teardown && airc connect"
-      echo "    To check it:       airc status"
-      return 0
-    fi
-    # Stale pidfile (no live PIDs) — leave for the canonical cleanup
-    # block below to remove + proceed normally with the connect flow.
+  if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
+    local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+    echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
+    echo "    To stop it:        airc teardown"
+    echo "    To restart it:     airc teardown && airc connect"
+    echo "    To check it:       airc status"
+    return 0
   fi
+  # Stale or absent pidfile — leave for the canonical cleanup block
+  # below to remove + proceed normally with the connect flow.
 
   # Pre-flight: gh auth check. The gh keyring can silently invalidate
   # (token revoked / 2FA flow expired / brew upgrade replaced gh

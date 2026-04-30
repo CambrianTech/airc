@@ -461,6 +461,80 @@ prune_pidfile_and_count() {
   if [ -z "$live" ]; then echo 0; else echo "$(printf '%s\n' $live | wc -w | tr -d ' ')"; fi
 }
 
+# Liveness check that's robust to sandbox process-tree blindness.
+# Returns "yes" if the monitor is alive, "no" otherwise. Two-phase:
+#
+#   1. kill -0 on PIDs in pidfile (the canonical, fast path)
+#   2. bearer-state-freshness fallback when (1) returns no live PIDs but
+#      a pidfile is present — covers Codex's sandbox where kill -0 across
+#      process trees returns false-negative even when the monitor's
+#      bearer-recv loop is provably writing to bearer_state.<channel>.json
+#      every poll cycle. #370/#371/#372 root cause.
+#
+# Pure read — does NOT prune the pidfile (which would silently corrupt
+# state when phase 1 was wrong about death). Use prune_pidfile_and_count
+# only when you genuinely want pids removed (e.g. teardown).
+#
+# Phase-2 freshness window = 2x the reminder interval (default 300s →
+# 600s window). bearer-state's last_recv_ts is the truth: it's only
+# updated when a bearer_recv subprocess actually reads from the wire.
+_monitor_alive_with_bearer_fallback() {
+  local pidfile="${1:-}"
+  local scope_dir
+  scope_dir=$(dirname "$pidfile")
+
+  # Phase 1: kill -0 (works in non-sandboxed shells; blind in Codex).
+  if [ -f "$pidfile" ]; then
+    local p raw
+    raw=$(cat "$pidfile" 2>/dev/null)
+    for p in $raw; do
+      case "$p" in ''|*[!0-9]*) continue ;; esac
+      if kill -0 "$p" 2>/dev/null; then
+        echo "yes"
+        return 0
+      fi
+    done
+  else
+    # No pidfile = monitor was never started (or already torn down).
+    # Bearer-state fallback would lie in this case (stale state file
+    # from a prior session). Return no without checking phase 2.
+    echo "no"
+    return 0
+  fi
+
+  # Phase 2: bearer-state-freshness fallback. Only reached when pidfile
+  # exists but kill -0 said all PIDs dead — could be real death, could
+  # be sandbox blindness. bearer-state freshness disambiguates.
+  local _reminder_secs=300
+  if [ -f "$scope_dir/reminder" ]; then
+    _reminder_secs=$(cat "$scope_dir/reminder" 2>/dev/null)
+  fi
+  if [ -z "$_reminder_secs" ] || ! [ "$_reminder_secs" -gt 0 ] 2>/dev/null; then
+    _reminder_secs=300
+  fi
+  local _fresh_window=$((_reminder_secs * 2))
+  if ls "$scope_dir"/bearer_state.*.json >/dev/null 2>&1; then
+    if "$AIRC_PYTHON" -c "
+import json, glob, sys, time
+window = $_fresh_window
+for path in glob.glob('$scope_dir/bearer_state.*.json'):
+    try:
+        s = json.load(open(path))
+    except Exception:
+        continue
+    ts = s.get('last_recv_ts')
+    if ts and (time.time() - float(ts)) <= window:
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+      echo "yes"
+      return 0
+    fi
+  fi
+
+  echo "no"
+}
+
 # Validate a peer name matches the allowed nick charset BEFORE using it in
 # filesystem paths or remote SSH commands. Same charset cmd_rename uses
 # (a-z 0-9 -) — anything else is unreachable as a real airc identity and
