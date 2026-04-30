@@ -39,21 +39,23 @@ If `airc` is not on PATH:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-If `gh` is not on PATH: install it (e.g. `brew install gh` on macOS, `apt install gh` on Debian/Ubuntu), then handle auth as below. There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
+If `gh` is not on PATH: install it (e.g. `brew install gh` on macOS, `apt install gh` on Debian/Ubuntu). There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
 
-### gh auth — run it yourself, don't tell the user to
+### gh auth — handle silently, only surface text when action is needed
 
-If `gh auth status` fails (or `airc join` dies with `gh auth invalid` / `GitHub token is invalid`), **execute the login flow yourself** — same as `install.sh` does. Don't dump a manual command on the user. Run:
+**Don't pre-flight gh auth.** Just run `airc join`. The user does not need to see `gh api rate_limit` probes or "token is actually fine" diagnostics — that chatter looks like a bug to a Carl who just typed `/join` and expects it to work. Pre-flight checks belong inside airc's own preflight (where they're invisible until they fire), not in your narration.
 
-```bash
-gh auth login -h github.com -s gist -p https -w
-```
+ONLY if `airc join` itself dies with a gh-auth message ("token invalid", "gh auth invalid", "rate-limited"), then react:
 
-The `-h`/`-p`/`-w` flags skip every interactive prompt; `-w` triggers the browser device-code flow. gh prints the device code + URL to stdout and BLOCKS until the user completes the browser auth — your Bash tool blocks with it, the user opens the URL + types the code, gh returns 0, you proceed to `airc join`.
+- **`airc join` says "GitHub rate-limited — retry in 5-15 min (token is fine)"**: airc already disambiguated for you (issue #344). Tell the user verbatim. Don't re-probe.
+- **`airc join` says "gh auth invalid — run 'gh auth login -h github.com' first"**: do it for them. Run silently:
+  ```bash
+  gh auth login -h github.com -s gist -p https -w
+  ```
+  The `-h`/`-p`/`-w` flags skip every interactive prompt; `-w` triggers the browser device-code flow. gh blocks until the user completes auth — your Bash tool blocks with it. **Do quote the device-code line back to the user prominently** (`First copy your one-time code: XXXX-XXXX`) — that's the one thing they need from gh's output. Once gh returns 0, retry `airc join` without further narration.
+- **gh isn't on PATH at all**: install + auth. One short line ("installing gh"), then proceed.
 
-Show the user the device code line from gh's output (`First copy your one-time code: XXXX-XXXX`) prominently so they don't miss it — Bash output buffering can hide it otherwise. Then keep going.
-
-**Pre-flight diagnose** — before falling through to "real auth failure", check `gh api rate_limit` (which is exempt from gh's secondary rate limit). If `rate_limit` works but `gh auth status` doesn't, the token is FINE — gh is misreporting a 403-from-secondary-rate-limit as "token invalid" (issue #341, fixed in cmd_connect.sh's preflight but worth handling at skill level too). Tell the user "GitHub rate-limited — wait 5-15 min" instead of triggering an unnecessary re-auth.
+The principle: a Carl running `/join` should see `airc join` events and outcomes, not your auth-handling internals. Internal disambiguation = silent. User-actionable result = one short sentence.
 
 ## 2. Run join
 
