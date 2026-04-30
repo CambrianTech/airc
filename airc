@@ -1139,6 +1139,22 @@ monitor() {
   if [ -n "$_ht" ]; then
     ( flush_pending_loop ) &
     _flush_pid=$!
+  else
+    # Host mode — spawn the host-side mirror loop. Same pidfile-honesty
+    # rule as the joiner branch above: only spawn when there's a
+    # publishable route (channel_gists OR legacy room_gist_id), otherwise
+    # the subshell exits immediately and airc.pid lists a dead PID.
+    local _has_pub=0
+    if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+      _has_pub=1
+    fi
+    if [ "$_has_pub" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+      _has_pub=1
+    fi
+    if [ "$_has_pub" = "1" ]; then
+      ( flush_pending_host_loop ) &
+      _flush_pid=$!
+    fi
   fi
   # Build the appended PID list — only include _flush_pid when we
   # actually spawned it.
@@ -1336,6 +1352,164 @@ flush_pending_loop() {
       drain_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[DRAINED %d queued message(s) to host]"}' \
         "$(timestamp)" "$_drain_chan" "$delivered")
       echo "$drain_marker" >> "$MESSAGES"
+    fi
+
+    rm -f "$snapshot" "$unsent" 2>/dev/null
+  done
+}
+
+# Host-side mirror of flush_pending_loop. Drains pending.jsonl via gist
+# publish (bearer_cli send) instead of SSH push to a host. Symmetric to the
+# joiner-side loop above so host-side cmd_send can queue on transient gist
+# failure without dropping the broadcast on the floor (#381 layer B).
+#
+# Pre-fix: host-side cmd_send had no queue path at all — gist publish
+# failure printed a warning and exited 0, with the message permanently
+# lost from peers' POV. This loop closes the gap: cmd_send writes to
+# pending.jsonl on transient_failure; this loop replays those lines on
+# the same 5s tick the joiner uses, retrying until gh API recovers or
+# the user tears down.
+flush_pending_host_loop() {
+  local pending="$AIRC_WRITE_DIR/pending.jsonl"
+  local host_target; host_target=$(get_config_val host_target "")
+  # Joiner-mode handled by flush_pending_loop; we're host-only.
+  [ -n "$host_target" ] && return 0
+
+  # Standalone (--no-gist) hosts have no publishable route. Self-check
+  # at startup so the spawn site can rely on a quick return when nothing
+  # to do, mirroring the joiner-side host_target gate.
+  local _has_route=0
+  if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+    _has_route=1
+  fi
+  if [ "$_has_route" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    _has_route=1
+  fi
+  [ "$_has_route" = "0" ] && return 0
+
+  # Parent-liveness gate (#324 follow-up — same orphan-subshell rationale
+  # as flush_pending_loop above). Without this the loop survives parent
+  # death and keeps publishing to dead-scope state forever.
+  local _parent_pid="$PPID"
+
+  while true; do
+    sleep 5
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      return 0
+    fi
+    [ -s "$pending" ] || continue
+
+    local snapshot; snapshot=$(mktemp -t airc-pending-host-snap.XXXXXX)
+    local unsent;   unsent=$(mktemp -t airc-pending-host-unsent.XXXXXX)
+    # Atomic-ish snapshot: mv is atomic on same FS so concurrent cmd_send
+    # invocations during drain land in a fresh pending.jsonl.
+    mv "$pending" "$snapshot" 2>/dev/null || { rm -f "$snapshot" "$unsent"; continue; }
+
+    local delivered=0 failed=0
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+
+      # Extract channel from the queued line (plaintext signed JSON,
+      # never the wrapped envelope — cmd_send queues pre-wrap so the
+      # drain can re-resolve recipient pubkey at retry time).
+      local _line_channel
+      _line_channel=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.loads(sys.stdin.readline()).get("channel",""))
+except Exception:
+  print("")' 2>/dev/null)
+
+      # Resolve channel → gist. Fall back to legacy room_gist_id only
+      # when the line carries no channel (older queued lines may pre-date
+      # the channel field).
+      local _line_gist=""
+      if [ -n "$_line_channel" ]; then
+        _line_gist=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+          --config "$CONFIG" --channel "$_line_channel" 2>/dev/null || true)
+      fi
+      if [ -z "$_line_gist" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        _line_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
+      if [ -z "$_line_gist" ]; then
+        # No route — keep in pending; channel_gists may populate later
+        # via 'airc join --room <name>'.
+        echo "$line" >> "$unsent"
+        failed=$((failed + 1))
+        continue
+      fi
+
+      # Re-resolve recipient pubkey at drain time. Pre-pair queued lines
+      # shipped plaintext; post-pair drain wraps them with the new pubkey.
+      local _line_to
+      _line_to=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.loads(sys.stdin.readline()).get("to",""))
+except Exception:
+  print("")' 2>/dev/null)
+      local _line_pub=""
+      if [ -n "$_line_to" ] && [ "$_line_to" != "all" ]; then
+        _line_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+          --peers-dir "$PEERS_DIR" --peer-name "$_line_to" 2>/dev/null || true)
+      fi
+      local _wire="$line"
+      if [ -n "$_line_pub" ]; then
+        _wire=$(printf '%s' "$line" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+          --recipient-pub "$_line_pub" \
+          --identity-dir "$IDENTITY_DIR" 2>/dev/null || printf '%s' "$line")
+      fi
+
+      local _outcome _kind
+      _outcome=$(printf '%s' "$_wire" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+        "${_line_to:-all}" "$_line_channel" \
+        --room-gist-id "$_line_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
+      _kind=$(printf '%s' "$_outcome" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.load(sys.stdin).get("kind",""))
+except Exception:
+  print("")' 2>/dev/null)
+
+      case "$_kind" in
+        delivered)
+          # Append the now-delivered original line to local audit log.
+          # cmd_send.sh's transient_failure branch withheld this write
+          # specifically so the user's chat widget wouldn't echo a
+          # message that hadn't actually shipped (the false-success
+          # bug from #381 RCA). Drain confirms delivery → safe to
+          # reflect in the local log.
+          echo "$line" >> "$MESSAGES"
+          delivered=$((delivered + 1))
+          ;;
+        *)
+          # transient_failure / auth_failure / unknown — keep queued.
+          # auth_failure here is awkward (can't fix without user re-auth)
+          # but the next cmd_send invocation will surface it loudly via
+          # the auth_failure case + die. We don't want a background loop
+          # to die or block on auth state.
+          echo "$line" >> "$unsent"
+          failed=$((failed + 1))
+          ;;
+      esac
+    done < "$snapshot"
+
+    # Prepend failures back to head of pending so they retry first on
+    # next iteration (mirror joiner-side flow).
+    if [ -s "$unsent" ]; then
+      if [ -s "$pending" ]; then
+        cat "$unsent" "$pending" > "${pending}.new" && mv "${pending}.new" "$pending"
+      else
+        mv "$unsent" "$pending"
+        unsent=""
+      fi
+    fi
+
+    if [ "$delivered" -gt 0 ]; then
+      local _drain_chan="general"
+      [ -f "$AIRC_WRITE_DIR/room_name" ] && _drain_chan=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || echo general)
+      [ -z "$_drain_chan" ] && _drain_chan="general"
+      local _drain_marker
+      _drain_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[DRAINED %d queued message(s) via gist publish]"}' \
+        "$(timestamp)" "$_drain_chan" "$delivered")
+      echo "$_drain_marker" >> "$MESSAGES"
     fi
 
     rm -f "$snapshot" "$unsent" 2>/dev/null
