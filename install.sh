@@ -640,44 +640,63 @@ TOML
     _changed=1
   fi
 
-  # Filesystem permissions companion. Codex emits a warning at session
-  # start when a permissions profile defines no filesystem entries
-  # ('does not define any recognized filesystem entries for this version
-  # of Codex'); the warning surfaces because the profile is technically
-  # valid but Codex falls back to the default-restricted filesystem
-  # access. Joel hit this on the codex first-encounter QA — explicit
-  # write grants for airc's actual filesystem footprint silence the
-  # warning AND ensure airc verbs that mutate state (update, teardown,
-  # join writing identity files) work without per-call approval.
-  #
-  # Scope is intentionally narrow:
-  #   ~/.airc-src/         airc clone + .venv (airc update writes git pull;
-  #                        identity bootstrap-ed25519 reads venv python)
-  #   ~/.airc/             user-default state dir (when no project scope)
-  #   ~/.local/bin/airc    binary symlink (read for exec; write needed only
-  #                        for uninstall, which user can re-grant if asked)
-  #   :project_roots .airc/ + .airc.general/  per-cwd state (airc auto-scopes
-  #                        identity into $PWD/.airc/ for non-git dirs and
-  #                        the #general sidecar lives in $cwd/.airc.general/)
-  if ! grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
-    cat >> "$config" <<'TOML'
+  # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
+  # to ~/.airc-src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
+  # block — Codex's runtime hard-rejected the profile at startup with:
+  #   "permissions profile requests filesystem writes outside the
+  #   workspace root, which is not supported until the runtime enforces
+  #   FileSystemSandboxPolicy directly"
+  # …meaning Codex 0.125 can't honor home-dir-scoped filesystem grants in
+  # named profiles yet. Even the :project_roots-only variant didn't help.
+  # The startup error broke every Codex session on the machine. We removed
+  # the block entirely; living with Codex's "does not define any recognized
+  # filesystem entries" warning is preferable to a hard-fail-on-startup.
+  # When Codex's runtime supports outside-workspace filesystem profiles,
+  # restore the block (history at git log -- install.sh).
 
-# airc filesystem permissions — pairs with [permissions.airc.network]
-# above. Without this, Codex warns 'permissions profile airc does not
-# define any recognized filesystem entries' and falls back to the
-# default-restricted filesystem; airc verbs that write identity keys
-# or pull updates would silently fail. Scoped to only airc's footprint;
-# everything else stays restricted by Codex defaults.
-[permissions.airc.filesystem]
-"~/.airc-src/" = "write"
-"~/.airc/" = "write"
-"~/.local/bin/airc" = "write"
-"~/.local/bin/relay" = "write"
-
-[permissions.airc.filesystem.":project_roots"]
-".airc/" = "write"
-".airc.general/" = "write"
-TOML
+  # Cleanup: machines that ran the buggy intermediate (3b20369..c1)
+  # still have the [permissions.airc.filesystem] block in their
+  # config.toml and Codex won't start. Detect and strip it on every
+  # install.sh run so Codex starts cleanly without the user having
+  # to hand-edit their config.
+  if grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
+    info "Removing stale [permissions.airc.filesystem] block from ~/.codex/config.toml (Codex 0.125 doesn't support outside-workspace filesystem profiles; was breaking session startup)..."
+    "${AIRC_PYTHON:-python3}" - "$config" <<'PY'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+# Strip from any '# airc filesystem permissions' header (or bare
+# [permissions.airc.filesystem] header) through end of that section
+# and any [permissions.airc.filesystem.<sub>] children. Section ends
+# at the next top-level header that is NOT under [permissions.airc.filesystem].
+lines = text.splitlines(keepends=True)
+out = []
+in_airc_fs = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith('# airc filesystem permissions'):
+        # Drop the leading comment block too (cohesive with the section)
+        in_airc_fs = True
+        continue
+    if stripped.startswith('[permissions.airc.filesystem'):
+        in_airc_fs = True
+        continue
+    if in_airc_fs:
+        # Continue dropping comment lines and key=value lines until we
+        # hit a new section header that isn't airc.filesystem.
+        if stripped.startswith('[') and not stripped.startswith('[permissions.airc.filesystem'):
+            in_airc_fs = False
+            out.append(line)
+        # else: drop (comment, blank, or key=value within the section)
+        continue
+    out.append(line)
+# Collapse runs of >2 blank lines that the strip might have left.
+result = ''.join(out)
+result = re.sub(r'\n{3,}', '\n\n', result)
+with open(path, 'w') as f:
+    f.write(result)
+PY
     _changed=1
   fi
 
