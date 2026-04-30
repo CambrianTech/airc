@@ -373,16 +373,32 @@ _doctor_connect_preflight() {
   if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
     issues=$((issues+1))
   elif ! gh auth status >/dev/null 2>&1; then
-    printf "  [BLOCKED] gh authenticated\n"
-    printf "         Fix: gh auth login -s gist\n"
+    # Distinguish a real auth failure from a GitHub secondary rate limit
+    # (abuse detection). The /rate_limit endpoint is reachable during
+    # secondary limits, so if it works, the token is fine — the user just
+    # needs to wait. `gh auth status` probes /user, which gets 403'd, and
+    # gh then misreports the symptom as 'token invalid'. Issue #341.
+    if gh api rate_limit >/dev/null 2>&1; then
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
+      printf "         Fix: wait 5-15 min then re-run; cause is too many gh API calls in a short window\n"
+    else
+      printf "  [BLOCKED] gh authenticated\n"
+      printf "         Fix: gh auth login -s gist\n"
+    fi
     issues=$((issues+1))
   elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))
   elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
-    printf "  [BLOCKED] gist API not reachable -- network outage or rate-limit\n"
-    printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    # Same misdiagnosis risk here — distinguish rate-limit vs other.
+    if gh api rate_limit >/dev/null 2>&1; then
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token + scope are fine\n"
+      printf "         Fix: wait 5-15 min then re-run\n"
+    else
+      printf "  [BLOCKED] gist API not reachable -- network outage or token revoked\n"
+      printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
+    fi
     issues=$((issues+1))
   else
     printf "  [ok] gh authed with gist scope, gists API reachable\n"

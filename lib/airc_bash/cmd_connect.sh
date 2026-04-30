@@ -252,15 +252,33 @@ cmd_connect() {
   # killed it before the host loop could start (PR #338 regression).
   if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
+      # `gh auth status` probes /user, which returns 403 during a GitHub
+      # secondary rate limit (abuse detection) and which gh then misreports
+      # as "token invalid". The /rate_limit endpoint is reachable during
+      # secondary limits — if it works, the token is fine and the user
+      # just needs to wait, not re-auth. Issue #341.
       echo "" >&2
-      echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
-      echo "    Detail:" >&2
-      gh auth status 2>&1 | sed 's/^/      /' >&2
-      echo "" >&2
-      echo "    Fix:  gh auth login -h github.com" >&2
-      echo "" >&2
-      echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
-      die "gh auth invalid — run 'gh auth login -h github.com' first"
+      if gh api rate_limit >/dev/null 2>&1; then
+        echo "  ! GitHub secondary rate limit (abuse detection) triggered." >&2
+        echo "    Your token is fine — wait 5-15 minutes and retry 'airc join'." >&2
+        echo "" >&2
+        echo "    Why this is confusing: 'gh auth status' calls /user which gets 403'd" >&2
+        echo "    during secondary rate limits; gh then prints 'token invalid'. The" >&2
+        echo "    /rate_limit endpoint is reachable, which proves the token works." >&2
+        echo "" >&2
+        echo "    Caused by: too many gh API calls in a short window (polling loops," >&2
+        echo "    rapid-fire PR/issue/comment activity, etc.)." >&2
+        die "GitHub rate-limited — retry in 5-15 min (token is fine)"
+      else
+        echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
+        echo "    Detail:" >&2
+        gh auth status 2>&1 | sed 's/^/      /' >&2
+        echo "" >&2
+        echo "    Fix:  gh auth login -h github.com" >&2
+        echo "" >&2
+        echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
+        die "gh auth invalid — run 'gh auth login -h github.com' first"
+      fi
     fi
   fi
 
