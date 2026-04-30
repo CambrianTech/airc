@@ -640,6 +640,47 @@ TOML
     _changed=1
   fi
 
+  # Filesystem permissions companion. Codex emits a warning at session
+  # start when a permissions profile defines no filesystem entries
+  # ('does not define any recognized filesystem entries for this version
+  # of Codex'); the warning surfaces because the profile is technically
+  # valid but Codex falls back to the default-restricted filesystem
+  # access. Joel hit this on the codex first-encounter QA — explicit
+  # write grants for airc's actual filesystem footprint silence the
+  # warning AND ensure airc verbs that mutate state (update, teardown,
+  # join writing identity files) work without per-call approval.
+  #
+  # Scope is intentionally narrow:
+  #   ~/.airc-src/         airc clone + .venv (airc update writes git pull;
+  #                        identity bootstrap-ed25519 reads venv python)
+  #   ~/.airc/             user-default state dir (when no project scope)
+  #   ~/.local/bin/airc    binary symlink (read for exec; write needed only
+  #                        for uninstall, which user can re-grant if asked)
+  #   :project_roots .airc/ + .airc.general/  per-cwd state (airc auto-scopes
+  #                        identity into $PWD/.airc/ for non-git dirs and
+  #                        the #general sidecar lives in $cwd/.airc.general/)
+  if ! grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
+    cat >> "$config" <<'TOML'
+
+# airc filesystem permissions — pairs with [permissions.airc.network]
+# above. Without this, Codex warns 'permissions profile airc does not
+# define any recognized filesystem entries' and falls back to the
+# default-restricted filesystem; airc verbs that write identity keys
+# or pull updates would silently fail. Scoped to only airc's footprint;
+# everything else stays restricted by Codex defaults.
+[permissions.airc.filesystem]
+"~/.airc-src/" = "write"
+"~/.airc/" = "write"
+"~/.local/bin/airc" = "write"
+"~/.local/bin/relay" = "write"
+
+[permissions.airc.filesystem.":project_roots"]
+".airc/" = "write"
+".airc.general/" = "write"
+TOML
+    _changed=1
+  fi
+
   # Set default_permissions = "airc" at the file's top level, but only if
   # no default is currently set. A pre-existing default belongs to the
   # user; we don't overwrite. We prepend to the file so the assignment
