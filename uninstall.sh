@@ -133,6 +133,12 @@ if [ -f "$codex_config" ]; then
     mv "$_tmp" "$codex_config"
     ok "Removed airc GH_TOKEN injection from $codex_config"
   fi
+  if grep -qF "AIRC-COMMAND-RULES-START" "$codex_config" 2>/dev/null; then
+    _tmp=$(mktemp)
+    sed '/^# AIRC-COMMAND-RULES-START/,/^# AIRC-COMMAND-RULES-END/d' "$codex_config" > "$_tmp"
+    mv "$_tmp" "$codex_config"
+    ok "Removed airc command-rules pre-approval from $codex_config"
+  fi
 fi
 
 # 4. Binary forwarders on PATH.
