@@ -436,9 +436,6 @@ cmd_send() {
       die "monitor down — refusing to silently broadcast into a void"
     fi
 
-    # Local audit log — plaintext, the user's own record of what they sent.
-    echo "$full_msg" >> "$MESSAGES"
-
     # Phase 3c critical fix (#285): host-side cmd_send must ALSO publish
     # to the room gist so joiners (who poll the gist via GhBearer) see
     # broadcasts and DMs from the host. Pre-3c, joiners tailed the host's
@@ -484,17 +481,59 @@ cmd_send() {
       _host_outcome=$(printf '%s' "$_host_wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
         "$peer_name" "$active_channel" \
         --room-gist-id "$_host_room_gist_id")
-      local _host_kind
+      local _host_kind _host_detail
       _host_kind=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+      _host_detail=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
       case "$_host_kind" in
-        delivered) : ;;
+        delivered)
+          # Append to local audit log only on confirmed delivery. Pre-fix
+          # this happened unconditionally before the publish attempt, so
+          # the user's own monitor would echo their message back even when
+          # joiners never saw it — false success surface (#381 RCA).
+          echo "$full_msg" >> "$MESSAGES"
+          ;;
+        auth_failure)
+          # Hard failure mirror of joiner branch above. Don't queue —
+          # every retry hits the same dead token. Surface re-auth path
+          # loudly + die so the caller knows to fix gh before retrying.
+          local _host_fail_marker; _host_fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GH AUTH FAILED on host gist publish — re-auth required, NOT queued] %s"}' \
+            "$(timestamp)" "$active_channel" "${_host_detail:-no detail}")
+          echo "$_host_fail_marker" >> "$MESSAGES"
+          echo "" >&2
+          echo "  ✗ gh auth check failed during host gist publish — your GitHub token is dead." >&2
+          echo "    Bearer detail: ${_host_detail}" >&2
+          echo "" >&2
+          echo "    Fix:  gh auth login -h github.com" >&2
+          echo "" >&2
+          echo "    After re-authenticating, retry. No state lost — it's just gh's keyring that expired." >&2
+          die "gh auth failure on host gist publish — run 'gh auth login -h github.com' and retry"
+          ;;
+        transient_failure|"")
+          # Mirror joiner-side queue/drain symmetry (#381 layer B). Pre-fix
+          # the host branch printed a warning + dropped the message on
+          # the floor: exit 0 with the broadcast never reaching peers.
+          # Now the message goes to pending.jsonl + a [QUEUED] marker
+          # surfaces in the user's own log so the chat widget reads
+          # 'queued for retry' instead of 'sent successfully'.
+          # flush_pending_host_loop (in airc top-level) drains this on
+          # the same 5s tick joiners use.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          local _host_queue_marker; _host_queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to gist %s — network error, will retry] %s"}' \
+            "$(timestamp)" "$active_channel" "$_host_room_gist_id" "${_host_detail:-no detail}")
+          echo "$_host_queue_marker" >> "$MESSAGES"
+          echo "  Network error reaching gist — broadcast queued for retry. Monitor will flush when gist returns." >&2
+          echo "  Bearer: ${_host_detail:-<none>}" >&2
+          ;;
         *)
-          echo "  ⚠ Gist publish failed (kind=${_host_kind:-empty}); broadcast did not reach joiners." >&2
-          echo "    Local audit log has the message; joiners polling the gist see nothing." >&2
+          # Unknown kind — bearer_cli added an outcome without updating
+          # callers. Queue defensively + log loudly so it gets caught.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          echo "  Unknown bearer outcome kind '${_host_kind}' on host send (detail: ${_host_detail}). Queued defensively. Update cmd_send.sh." >&2
           ;;
       esac
     else
       echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
+      echo "$full_msg" >> "$MESSAGES"
     fi
   fi
 
