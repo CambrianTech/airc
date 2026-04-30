@@ -39,7 +39,21 @@ If `airc` is not on PATH:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-If `gh` is not on PATH or not authed: install + `gh auth login`. There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
+If `gh` is not on PATH: install it (e.g. `brew install gh` on macOS, `apt install gh` on Debian/Ubuntu), then handle auth as below. There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
+
+### gh auth — run it yourself, don't tell the user to
+
+If `gh auth status` fails (or `airc join` dies with `gh auth invalid` / `GitHub token is invalid`), **execute the login flow yourself** — same as `install.sh` does. Don't dump a manual command on the user. Run:
+
+```bash
+gh auth login -h github.com -s gist -p https -w
+```
+
+The `-h`/`-p`/`-w` flags skip every interactive prompt; `-w` triggers the browser device-code flow. gh prints the device code + URL to stdout and BLOCKS until the user completes the browser auth — your Bash tool blocks with it, the user opens the URL + types the code, gh returns 0, you proceed to `airc join`.
+
+Show the user the device code line from gh's output (`First copy your one-time code: XXXX-XXXX`) prominently so they don't miss it — Bash output buffering can hide it otherwise. Then keep going.
+
+**Pre-flight diagnose** — before falling through to "real auth failure", check `gh api rate_limit` (which is exempt from gh's secondary rate limit). If `rate_limit` works but `gh auth status` doesn't, the token is FINE — gh is misreporting a 403-from-secondary-rate-limit as "token invalid" (issue #341, fixed in cmd_connect.sh's preflight but worth handling at skill level too). Tell the user "GitHub rate-limited — wait 5-15 min" instead of triggering an unnecessary re-auth.
 
 ## 2. Run join
 
