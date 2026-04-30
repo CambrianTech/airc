@@ -59,42 +59,31 @@ cmd_status() {
     fi
   fi
 
-  # Monitor alive? Single helper at airc top-level (prune_pidfile_and_count)
-  # owns the contract: returns count of living pids and prunes dead orphans.
-  # Both cmd_status and cmd_send call it so they can never disagree
-  # again (the bug vhsm + authenticator hit 2026-04-29).
-  #
-  # Cross-sandbox blindness fallback (#370): inside Codex's sandbox,
-  # `kill -0 <pid>` for processes spawned outside the sandbox returns
-  # failure even when the process is alive. Result: prune_pidfile_and_count
-  # returns 0, status reports "not running" when the monitor IS running
-  # and visibly streaming events. Fix: when kill -0 returns all-dead BUT
-  # any bearer_state.<channel>.json file in scope has a fresh last_recv_ts
-  # (within 2x the reminder interval), the bearer recv loop is provably
-  # alive — a different process than the parent monitor, but in the same
-  # tree, and only a live monitor can be updating that file. Report alive
-  # via bearer-attested freshness instead of falsely reporting "not running".
+  # Monitor alive? Use the shared sandbox-robust helper
+  # (_monitor_alive_with_bearer_fallback in airc top-level). Phase 1 =
+  # kill -0 against airc.pid (canonical, fast); phase 2 = bearer-state
+  # freshness fallback (covers Codex sandbox kill -0 blindness — see
+  # #370/#371/#372). The helper is read-only (doesn't prune the pidfile
+  # the way the older prune_pidfile_and_count did, which would silently
+  # corrupt state when phase 1 was wrong).
   local monitor_state="not running"
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
-  local live_count
-  live_count=$(prune_pidfile_and_count "$pidfile")
-  if [ "$live_count" -gt 0 ]; then
-    local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
-    monitor_state="running (PID $first_alive)"
-  elif [ -f "$pidfile" ]; then
-    # Try the bearer-state freshness fallback before giving up. Walk all
-    # bearer_state.*.json files in the scope; if any has a last_recv_ts
-    # within the freshness window, the monitor's bearer-recv child is
-    # alive even though kill -0 didn't see it.
-    local _reminder_secs=300
-    [ -f "$AIRC_WRITE_DIR/reminder" ] && _reminder_secs=$(cat "$AIRC_WRITE_DIR/reminder" 2>/dev/null)
-    [ -z "$_reminder_secs" ] || ! [ "$_reminder_secs" -gt 0 ] 2>/dev/null && _reminder_secs=300
-    local _fresh_window=$((_reminder_secs * 2))
-    local _fresh_via_bearer=""
-    if ls "$AIRC_WRITE_DIR"/bearer_state.*.json >/dev/null 2>&1; then
-      _fresh_via_bearer=$("$AIRC_PYTHON" -c "
-import json, glob, sys, time
-window = $_fresh_window
+  if [ "$(_monitor_alive_with_bearer_fallback "$pidfile")" = "yes" ]; then
+    if [ -f "$pidfile" ]; then
+      local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
+      # Distinguish "alive per kill -0" (we have a verified PID) from
+      # "alive per bearer-state-only" (kill -0 blind, but bearer-recv
+      # child is provably writing to bearer_state). For the latter,
+      # surface the diagnostic so a Carl debugging "why does pid X
+      # show running when it's not in ps" has the answer.
+      if kill -0 "$first_alive" 2>/dev/null; then
+        monitor_state="running (PID $first_alive)"
+      else
+        # Walk bearer_state to find which channel is freshest, for the
+        # informational message. (The helper already proved freshness;
+        # we re-check just to extract the age + channel name.)
+        local _bs_summary; _bs_summary=$("$AIRC_PYTHON" -c "
+import json, glob, time
 fresh = []
 for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
     try:
@@ -102,23 +91,19 @@ for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
     except Exception:
         continue
     ts = s.get('last_recv_ts')
-    if ts is None:
-        continue
-    age = int(time.time() - float(ts))
-    if age <= window:
+    if ts:
         ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
-        fresh.append((age, ch))
+        fresh.append((int(time.time() - float(ts)), ch))
 if fresh:
     fresh.sort()
     age, ch = fresh[0]
     print(f'{age}s via #{ch}')
 " 2>/dev/null)
+        monitor_state="likely-alive (${_bs_summary:-bearer-state fresh}; kill -0 blind in this sandbox — see #370)"
+      fi
     fi
-    if [ -n "$_fresh_via_bearer" ]; then
-      monitor_state="likely-alive ($_fresh_via_bearer; kill -0 blind in this sandbox — see #370)"
-    else
-      monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
-    fi
+  elif [ -f "$pidfile" ]; then
+    monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
   fi
   echo "  monitor:     $monitor_state"
 
