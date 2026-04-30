@@ -63,6 +63,17 @@ cmd_status() {
   # owns the contract: returns count of living pids and prunes dead orphans.
   # Both cmd_status and cmd_send call it so they can never disagree
   # again (the bug vhsm + authenticator hit 2026-04-29).
+  #
+  # Cross-sandbox blindness fallback (#370): inside Codex's sandbox,
+  # `kill -0 <pid>` for processes spawned outside the sandbox returns
+  # failure even when the process is alive. Result: prune_pidfile_and_count
+  # returns 0, status reports "not running" when the monitor IS running
+  # and visibly streaming events. Fix: when kill -0 returns all-dead BUT
+  # any bearer_state.<channel>.json file in scope has a fresh last_recv_ts
+  # (within 2x the reminder interval), the bearer recv loop is provably
+  # alive — a different process than the parent monitor, but in the same
+  # tree, and only a live monitor can be updating that file. Report alive
+  # via bearer-attested freshness instead of falsely reporting "not running".
   local monitor_state="not running"
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
   local live_count
@@ -71,7 +82,43 @@ cmd_status() {
     local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
     monitor_state="running (PID $first_alive)"
   elif [ -f "$pidfile" ]; then
-    monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
+    # Try the bearer-state freshness fallback before giving up. Walk all
+    # bearer_state.*.json files in the scope; if any has a last_recv_ts
+    # within the freshness window, the monitor's bearer-recv child is
+    # alive even though kill -0 didn't see it.
+    local _reminder_secs=300
+    [ -f "$AIRC_WRITE_DIR/reminder" ] && _reminder_secs=$(cat "$AIRC_WRITE_DIR/reminder" 2>/dev/null)
+    [ -z "$_reminder_secs" ] || ! [ "$_reminder_secs" -gt 0 ] 2>/dev/null && _reminder_secs=300
+    local _fresh_window=$((_reminder_secs * 2))
+    local _fresh_via_bearer=""
+    if ls "$AIRC_WRITE_DIR"/bearer_state.*.json >/dev/null 2>&1; then
+      _fresh_via_bearer=$("$AIRC_PYTHON" -c "
+import json, glob, sys, time
+window = $_fresh_window
+fresh = []
+for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
+    try:
+        s = json.load(open(path))
+    except Exception:
+        continue
+    ts = s.get('last_recv_ts')
+    if ts is None:
+        continue
+    age = int(time.time() - float(ts))
+    if age <= window:
+        ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
+        fresh.append((age, ch))
+if fresh:
+    fresh.sort()
+    age, ch = fresh[0]
+    print(f'{age}s via #{ch}')
+" 2>/dev/null)
+    fi
+    if [ -n "$_fresh_via_bearer" ]; then
+      monitor_state="likely-alive ($_fresh_via_bearer; kill -0 blind in this sandbox — see #370)"
+    else
+      monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
+    fi
   fi
   echo "  monitor:     $monitor_state"
 
