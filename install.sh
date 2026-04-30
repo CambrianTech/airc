@@ -529,10 +529,25 @@ if [ -n "$_airc_venv_pip" ]; then
   fi
 fi
 
-# ── Skills into Claude Code ─────────────────────────────────────────────
+# ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
+#
+# Both Claude Code and OpenAI Codex use the same on-disk skill format:
+# a directory per skill, with a SKILL.md inside (YAML frontmatter +
+# markdown body). They differ only in WHERE they look:
+#   Claude Code → ~/.claude/skills/<name>/
+#   Codex       → ~/.codex/skills/<name>/
+#
+# We symlink airc's skills into both whenever the corresponding agent
+# is installed on the machine. Each agent picks up the same skill
+# content; airc's skill text is intentionally written to be agent-
+# generic where the operation is shell-callable (which most airc verbs
+# are). Claude-Code-specific nuances like Monitor invocations are
+# additive — Codex agents fall back to direct shell calls.
 
-if [ -d "$CLONE_DIR/skills" ]; then
-  mkdir -p "$SKILLS_TARGET"
+_install_airc_skills_into() {
+  local skills_target="$1" agent_label="$2"
+  [ -d "$CLONE_DIR/skills" ] || return 0
+  mkdir -p "$skills_target"
 
   # Clean up old symlinks from previous installs.
   # Includes the airc-classic skill names (connect/send/rename/disconnect) that
@@ -541,15 +556,17 @@ if [ -d "$CLONE_DIR/skills" ]; then
   # previously listed here when the skill didn't exist; now that we ship a real
   # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
   # this list omits it.)
-  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup \
-             "$SKILLS_TARGET"/connect "$SKILLS_TARGET"/send "$SKILLS_TARGET"/rename "$SKILLS_TARGET"/disconnect; do
+  local old
+  for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
+             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
+  local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name="$(basename "$skill_dir")"
-    target="$SKILLS_TARGET/$skill_name"
+    target="$skills_target/$skill_name"
     # If the target is a real directory (from a pre-rename hand-install
     # or an old copy-based installer), it shadows the new symlink. Nuke it.
     if [ -d "$target" ] && [ ! -L "$target" ]; then
@@ -558,8 +575,139 @@ if [ -d "$CLONE_DIR/skills" ]; then
       rm "$target"
     fi
     ln -sf "$skill_dir" "$target"
-    ok "Skill: /$skill_name"
+    ok "Skill ($agent_label): /$skill_name"
   done
+}
+
+# Claude Code: install whenever the SKILLS_TARGET path exists or is
+# requested via env. The previous behavior was unconditional; preserve.
+_install_airc_skills_into "$SKILLS_TARGET" "claude-code"
+
+# Codex: install only when `codex` is on PATH AND ~/.codex exists (i.e.
+# Codex has been run at least once and created its config dir). Skips
+# silently on machines where Codex isn't installed, so this is a
+# no-op for Claude-Code-only setups. Honors CODEX_SKILLS_TARGET env
+# override for the same reason BIN_DIR / SKILLS_TARGET do (test
+# harnesses + non-default Codex layouts).
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
+fi
+
+# ── Codex permission profile (network access for gh subcommands) ───────
+# Codex's default sandbox blocks subcommand network egress. airc's substrate
+# IS gh-API-driven, so without elevation, every airc verb fails with
+# 'error connecting to github.com' or 'token invalid' depending on which
+# layer the call lands at. Codex skills can't declare required permissions
+# inline, so the cleanest automation is to write a named permission profile
+# scoped to ONLY github.com / api.github.com / gist.github.com, then set
+# default_permissions = "airc" if no other default is configured. Per
+# Codex docs, named permission profiles round-trip across TUI sessions
+# and are the preferred way to grant scoped network access.
+#
+# Idempotent: only adds [permissions.airc.network] if not already present;
+# only sets default_permissions = "airc" if no default is currently set.
+# A user who has set a different default keeps it + can invoke airc-needing
+# Codex sessions via `codex --profile airc`.
+#
+# Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
+# skill symlinks but NOT the config write.
+
+_install_airc_codex_permission_profile() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_CONFIG:-0}" = "1" ] && return 0
+  [ -f "$config" ] || touch "$config"
+
+  local _changed=0
+
+  # Append the named profile if absent. The block goes at the end of the
+  # file (TOML allows section order to be arbitrary; downstream sections
+  # don't capture this one because [permissions.airc.network] is its own
+  # explicit header).
+  if ! grep -q '^\[permissions\.airc\.network\]' "$config" 2>/dev/null; then
+    cat >> "$config" <<'TOML'
+
+# airc network permissions — added by airc install.sh so gh subcommands
+# (which the substrate is built on) can reach GitHub from inside Codex's
+# default sandbox. Scoped to ONLY the gh hosts airc actually uses; other
+# domains stay restricted. Remove this block + `default_permissions = "airc"`
+# below to opt out. Re-runs of install.sh detect existing presence and
+# don't duplicate.
+[permissions.airc.network]
+enabled = true
+mode = "limited"
+domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
+TOML
+    _changed=1
+  fi
+
+  # Filesystem permissions companion. Codex emits a warning at session
+  # start when a permissions profile defines no filesystem entries
+  # ('does not define any recognized filesystem entries for this version
+  # of Codex'); the warning surfaces because the profile is technically
+  # valid but Codex falls back to the default-restricted filesystem
+  # access. Joel hit this on the codex first-encounter QA — explicit
+  # write grants for airc's actual filesystem footprint silence the
+  # warning AND ensure airc verbs that mutate state (update, teardown,
+  # join writing identity files) work without per-call approval.
+  #
+  # Scope is intentionally narrow:
+  #   ~/.airc-src/         airc clone + .venv (airc update writes git pull;
+  #                        identity bootstrap-ed25519 reads venv python)
+  #   ~/.airc/             user-default state dir (when no project scope)
+  #   ~/.local/bin/airc    binary symlink (read for exec; write needed only
+  #                        for uninstall, which user can re-grant if asked)
+  #   :project_roots .airc/ + .airc.general/  per-cwd state (airc auto-scopes
+  #                        identity into $PWD/.airc/ for non-git dirs and
+  #                        the #general sidecar lives in $cwd/.airc.general/)
+  if ! grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
+    cat >> "$config" <<'TOML'
+
+# airc filesystem permissions — pairs with [permissions.airc.network]
+# above. Without this, Codex warns 'permissions profile airc does not
+# define any recognized filesystem entries' and falls back to the
+# default-restricted filesystem; airc verbs that write identity keys
+# or pull updates would silently fail. Scoped to only airc's footprint;
+# everything else stays restricted by Codex defaults.
+[permissions.airc.filesystem]
+"~/.airc-src/" = "write"
+"~/.airc/" = "write"
+"~/.local/bin/airc" = "write"
+"~/.local/bin/relay" = "write"
+
+[permissions.airc.filesystem.":project_roots"]
+".airc/" = "write"
+".airc.general/" = "write"
+TOML
+    _changed=1
+  fi
+
+  # Set default_permissions = "airc" at the file's top level, but only if
+  # no default is currently set. A pre-existing default belongs to the
+  # user; we don't overwrite. We prepend to the file so the assignment
+  # lands at the top level and is not captured by any section that
+  # already opens further down.
+  if ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=' "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    {
+      printf '# airc: default permission profile (added by install.sh; remove to opt out)\n'
+      printf 'default_permissions = "airc"\n\n'
+      cat "$config"
+    } > "$_tmp"
+    mv "$_tmp" "$config"
+    _changed=1
+  elif ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=[[:space:]]*"airc"' "$config" 2>/dev/null; then
+    # Different default already set — don't override, but tell the user
+    # how to use airc explicitly without changing their default.
+    info "  ~/.codex/config.toml already has default_permissions set; invoke airc-needing Codex sessions via:  codex --profile airc"
+  fi
+
+  if [ "$_changed" = "1" ]; then
+    ok "Added airc network profile to ~/.codex/config.toml — restart Codex to activate (gh subcommands work in airc-needing sessions)."
+  fi
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_permission_profile
 fi
 
 

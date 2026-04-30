@@ -59,7 +59,7 @@ cd "$HOME" 2>/dev/null || cd /
 cat <<EOF
 This will remove airc from this machine:
   binary symlinks   $BIN_DIR/{airc,relay,airc.cmd,airc.ps1}
-  skill symlinks    $SKILLS_TARGET/<airc-skills>/
+  skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR (clone + .venv)
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
   running processes airc teardown --all (if airc is on PATH)
@@ -99,20 +99,28 @@ fi
 
 # 3. Skill symlinks. Walk every entry in the skills dir and drop any
 # symlink that resolves into the clone — covers both current names and
-# any stale ones from prior installs (relay-*, etc.).
-removed_skills=0
-if [ -d "$SKILLS_TARGET" ]; then
-  for entry in "$SKILLS_TARGET"/*; do
+# any stale ones from prior installs (relay-*, etc.). install.sh writes
+# into both ~/.claude/skills (Claude Code) and ~/.codex/skills (Codex)
+# when both agents are present, so we walk both on uninstall.
+_remove_clone_owned_skill_symlinks() {
+  local skills_dir="$1"
+  local removed=0 entry target
+  [ -d "$skills_dir" ] || { echo 0; return; }
+  for entry in "$skills_dir"/*; do
     [ -L "$entry" ] || continue
     target="$(readlink "$entry" 2>/dev/null || true)"
     case "$target" in
       "$CLONE_DIR"/*|"$CLONE_DIR")
         rm -f "$entry"
-        removed_skills=$((removed_skills + 1)) ;;
+        removed=$((removed + 1)) ;;
     esac
   done
-fi
-[ "$removed_skills" -gt 0 ] && ok "Removed $removed_skills skill symlink(s) from $SKILLS_TARGET"
+  echo "$removed"
+}
+removed_skills_claude=$(_remove_clone_owned_skill_symlinks "$SKILLS_TARGET")
+removed_skills_codex=$(_remove_clone_owned_skill_symlinks "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}")
+[ "$removed_skills_claude" -gt 0 ] && ok "Removed $removed_skills_claude skill symlink(s) from $SKILLS_TARGET"
+[ "$removed_skills_codex"  -gt 0 ] && ok "Removed $removed_skills_codex skill symlink(s) from ${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}"
 
 # 4. Binary forwarders on PATH.
 removed_bins=0
