@@ -259,6 +259,45 @@ ensure_prereqs() {
     ok "All required prereqs present"
   fi
 
+  # Capability probe: openssl --version is not enough — macOS ships LibreSSL
+  # as /usr/bin/openssl, which passes --version but does NOT support
+  # `genpkey -algorithm Ed25519` (the airc identity key). The probe loop
+  # above can't catch this because LibreSSL is "openssl" by name. Run an
+  # actual Ed25519 key gen against a tempfile; if it fails on Mac, install
+  # brew openssl@3 (keg-only, doesn't shadow /usr/bin/openssl — airc's
+  # runtime resolver locates it via /opt/homebrew/opt/). Issue #341.
+  if command -v openssl >/dev/null 2>&1 \
+     && ! openssl genpkey -algorithm Ed25519 -out /dev/null >/dev/null 2>&1; then
+    case "$(uname -s 2>/dev/null)" in
+      Darwin)
+        # Already-present keg-only openssl@3 is enough — no install needed.
+        _have_brew_ossl=0
+        for c in /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+          if [ -x "$c" ] && "$c" genpkey -algorithm Ed25519 -out /dev/null >/dev/null 2>&1; then
+            ok "openssl Ed25519 capability via $c (system openssl is LibreSSL)"
+            _have_brew_ossl=1
+            break
+          fi
+        done
+        if [ "$_have_brew_ossl" = "0" ] && command -v brew >/dev/null 2>&1; then
+          info "System openssl is LibreSSL (no Ed25519). Installing openssl@3 via brew..."
+          if brew install openssl@3 >/dev/null 2>&1; then
+            ok "openssl@3 installed (airc resolves it at runtime; no PATH change needed)"
+          else
+            warn "brew install openssl@3 failed. Run manually:  brew install openssl@3"
+          fi
+        elif [ "$_have_brew_ossl" = "0" ]; then
+          warn "System openssl is LibreSSL (no Ed25519) and brew is unavailable."
+          warn "  Install Homebrew + openssl@3, or set AIRC_OPENSSL=/path/to/openssl manually."
+        fi
+        ;;
+      *)
+        warn "openssl on this machine doesn't support 'genpkey -algorithm Ed25519'."
+        warn "  airc identity creation will fail. Install openssl 1.1.1+ or set AIRC_OPENSSL."
+        ;;
+    esac
+  fi
+
   # sshd: airc joiners ssh into the host's airc_home to tail messages.
   # Every airc user who'll host a room (which is most users — first to
   # discover becomes the host) needs sshd RUNNING. install.sh actually

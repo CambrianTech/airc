@@ -81,6 +81,62 @@ else
 fi
 export AIRC_PYTHON
 
+# Resolve openssl with Ed25519 capability. Probed once at startup so that
+# init_identity / sign_message can trust the binary at runtime. macOS
+# /usr/bin/openssl is LibreSSL — it passes `openssl --version` (so a naive
+# probe says it's fine) but does NOT support `genpkey -algorithm Ed25519`.
+# Brew openssl@3 / openssl works. Search Mac brew layouts before falling
+# back to PATH; on Linux/Windows the PATH default is openssl 1.1.1+ which
+# is fine. AIRC_OPENSSL env var is the user override (custom layouts).
+# Tracking: issue #341.
+_resolve_openssl() {
+  local cands=() c
+  [ -n "${AIRC_OPENSSL:-}" ] && cands+=("$AIRC_OPENSSL")
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      [ -x /opt/homebrew/opt/openssl@3/bin/openssl ] && cands+=(/opt/homebrew/opt/openssl@3/bin/openssl)
+      [ -x /opt/homebrew/opt/openssl/bin/openssl   ] && cands+=(/opt/homebrew/opt/openssl/bin/openssl)
+      [ -x /usr/local/opt/openssl@3/bin/openssl    ] && cands+=(/usr/local/opt/openssl@3/bin/openssl)
+      [ -x /usr/local/opt/openssl/bin/openssl      ] && cands+=(/usr/local/opt/openssl/bin/openssl)
+      ;;
+  esac
+  local path_openssl; path_openssl=$(command -v openssl 2>/dev/null) || path_openssl=""
+  [ -n "$path_openssl" ] && cands+=("$path_openssl")
+  for c in "${cands[@]}"; do
+    if "$c" genpkey -algorithm Ed25519 -out /dev/null >/dev/null 2>&1; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+AIRC_OPENSSL=$(_resolve_openssl) || AIRC_OPENSSL=""
+export AIRC_OPENSSL
+
+_die_no_ed25519_openssl() {
+  cat >&2 <<EOF
+ERROR: airc identity needs an openssl that supports Ed25519, and none was found.
+
+  Resolved openssl on PATH: $(command -v openssl 2>/dev/null || echo '<none>')
+  $(openssl version 2>/dev/null || true)
+
+  macOS ships LibreSSL as /usr/bin/openssl — it does not implement Ed25519.
+  Fix:
+    brew install openssl@3
+    airc join
+
+  Or point AIRC_OPENSSL at a working binary:
+    AIRC_OPENSSL=/path/to/openssl airc join
+
+  Linux: install openssl 1.1.1+ from your package manager (most distros
+  ship it by default). Windows: Git for Windows bundles a working openssl;
+  ensure it's on PATH ahead of any older system one.
+
+  Tracking: https://github.com/CambrianTech/airc/issues/341
+EOF
+  exit 1
+}
+
 # MSYS Git Bash on Windows translates argv VALUES that look like
 # Unix-rooted paths when bash invokes a Windows-native binary. So
 # `--host-airc-home /Users/joelteply/.airc` arrives at python.exe as
@@ -730,9 +786,10 @@ humanhash() {
 }
 
 sign_message() {
+  [ -z "${AIRC_OPENSSL:-}" ] && _die_no_ed25519_openssl
   local tmpfile; tmpfile=$(mktemp)
   printf '%s' "$1" > "$tmpfile"
-  openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" -in "$tmpfile" 2>/dev/null | base64
+  "$AIRC_OPENSSL" pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" -in "$tmpfile" 2>/dev/null | base64
   rm -f "$tmpfile"
 }
 
@@ -899,8 +956,9 @@ init_identity() {
   local name="$1"
   mkdir -p "$AIRC_WRITE_DIR" "$IDENTITY_DIR" "$PEERS_DIR"
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
-    openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
-    openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
+    [ -z "${AIRC_OPENSSL:-}" ] && _die_no_ed25519_openssl
+    "$AIRC_OPENSSL" genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
+    "$AIRC_OPENSSL" pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
     chmod 600 "$IDENTITY_DIR/private.pem"
   fi
   if [ ! -f "$IDENTITY_DIR/ssh_key" ]; then
