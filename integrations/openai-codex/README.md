@@ -46,6 +46,23 @@ Codex's `[shell_environment_policy.set]` is documented as "explicit environment 
 
 When upstream openai/codex#10695 lands a fix that makes `dependency_env` propagate properly, this injection becomes a no-op safety net rather than a load-bearing workaround.
 
+## Per-command approval gate (Codex `[rules]` block)
+
+Codex's per-command approval gate doesn't just control prompts — **it also restricts network access** for un-approved commands. A command not in the user's "always run commands starting with X" allowlist runs in a stricter sandbox where its gh API calls are blocked. Caught live during the QA pass: `airc join` had been pre-approved earlier so its gh calls reached the network, but `airc msg` hadn't, so its gh calls hit the network sandbox and failed silently. Codex then prompted to approve `airc msg` with "always" — once approved, it worked instantly.
+
+Codex docs (config-reference) document a `[rules]` block with `prefix_rules` for declaring approved command prefixes statically. install.sh adds:
+
+```toml
+[rules]
+prefix_rules = [
+  { pattern = [{ token = "airc" }], decision = "allow" }
+]
+```
+
+This pre-approves ALL `airc *` verbs (join, msg, status, peers, etc.) so the user never sees the per-command approval cycle. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_RULES=1` to opt out (e.g., if you'd rather grant approval interactively per-command).
+
+Combined with the GH_TOKEN injection above and the `[permissions.airc.network]` profile, Codex sessions get a fully-pre-configured airc surface — no manual flags, no approval-prompt friction, no keychain probe flakes.
+
 If you've already run install.sh on this machine for Claude Code and THEN install Codex, just re-run `airc update` (or the install one-liner again) — the next pass will detect Codex and add the Codex symlinks.
 
 ## 2. Verify the install

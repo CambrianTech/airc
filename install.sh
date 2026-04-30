@@ -804,6 +804,54 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_gh_token
 fi
 
+# ── Codex pre-approve airc command prefix ──────────────────────────────
+# Codex's per-command approval gate also restricts network access — a
+# command not in the user's "always run" allowlist runs in a stricter
+# sandbox where network is blocked. Joel's Codex first-encounter QA
+# hit this on `airc msg`: `airc join` had been pre-approved earlier so
+# its gh API calls reached the network, but `airc msg` hadn't, so its
+# gh API calls hit a network sandbox and failed. Codex prompted the
+# user to "always run commands that start with airc msg" and once
+# approved, it worked instantly.
+#
+# Codex supports declaring approved command prefixes statically in
+# config.toml's [rules] block (per Codex docs config-reference). Adding
+# `airc` as an allow-prefix pre-approves ALL airc verbs (join, msg,
+# status, peers, etc) so the user never sees the per-command approval
+# prompt cycle. Idempotent: only adds if not already present.
+#
+# Honors AIRC_SKIP_CODEX_RULES=1 if a user wants to manage approvals
+# manually.
+
+_install_airc_codex_command_rules() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_RULES:-0}" = "1" ] && return 0
+  [ -f "$config" ] || return 0
+  if grep -qF 'AIRC-COMMAND-RULES-START' "$config" 2>/dev/null; then
+    return 0
+  fi
+  cat >> "$config" <<'TOML'
+
+# AIRC-COMMAND-RULES-START — managed by install.sh; pre-approves all
+# `airc *` commands so they aren't blocked by Codex's per-command approval
+# gate (which also restricts network access for un-approved commands).
+# Without this, only commands the user has manually approved-with-always
+# can reach the gist substrate; airc msg / airc status / etc would
+# silently fail in the sandbox until first-time approval. Remove this
+# block through AIRC-COMMAND-RULES-END to opt out.
+[rules]
+prefix_rules = [
+  { pattern = [{ token = "airc" }], decision = "allow" }
+]
+# AIRC-COMMAND-RULES-END
+TOML
+  ok "Codex airc-command pre-approval rule added to ~/.codex/config.toml — restart Codex to activate (no per-command approval prompts for airc verbs)"
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_command_rules
+fi
+
 
 # ── Done ────────────────────────────────────────────────────────────────
 
