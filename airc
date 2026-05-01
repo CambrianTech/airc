@@ -851,6 +851,20 @@ else
 fi
 # ── End mesh gist abstraction ───────────────────────────────────────────
 
+# ── Auth self-heal helpers ──────────────────────────────────────────────
+# airc_detect_gh_auth_state + airc_self_heal_gh_auth — let airc be the
+# instigator when the gh keyring token silently invalidates (frequent
+# in practice per Joel; observed twice on M5 in the last 48h). Sourced
+# unconditionally so all command surfaces can call into it.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/lib_auth.sh" ]; then
+  # shellcheck source=lib/airc_bash/lib_auth.sh
+  source "$_airc_lib_dir/airc_bash/lib_auth.sh"
+else
+  echo "ERROR: airc_bash/lib_auth.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+# ── End auth self-heal helpers ──────────────────────────────────────────
+
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s

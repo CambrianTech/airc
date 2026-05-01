@@ -340,23 +340,37 @@ cmd_send() {
         return 0
         ;;
       auth_failure)
-        # Hard failure. Don't queue — every retry will fail identically.
-        # Pre-fix the message claimed 'SSH auth' which was leftover from
-        # the SSH era; post-3c the bearer is gh and the only auth that
-        # can fail is gh's. Direct the user to gh auth login so they
-        # can recover without rebuilding their identity.
+        # Don't queue — every retry will fail identically until the
+        # underlying auth is fixed. airc IS the instigator: trigger
+        # browser self-heal flow via the centralized state machine,
+        # then retry the send ONCE if heal succeeded.
+        # Joel: "gh logouts are FREQUENT" / "script needs to self-heal".
+        if airc_ensure_gh_auth_or_heal "airc send → $peer_name (#$active_channel)"; then
+          # Auth restored. Retry once. We don't loop — if the retry
+          # fails too, something else is going on (scope missing? gist
+          # deleted?) and the user needs to see the original error.
+          echo "  ↻ Retrying send post-heal..." >&2
+          local retry_outcome retry_kind retry_detail
+          retry_outcome=$(send_via_bearer "$active_channel" "$full_msg" "$peer_name" 2>&1) || true
+          retry_kind=$(echo "$retry_outcome" | head -1)
+          retry_detail=$(echo "$retry_outcome" | tail -n +2)
+          if [ "$retry_kind" = "ok" ]; then
+            echo "  ✓ Sent post-heal." >&2
+            return 0
+          fi
+          echo "  ✗ Retry post-heal also failed (kind=$retry_kind detail=$retry_detail)" >&2
+          # Fall through to the failure-marker block so the message is
+          # recorded as failed in the local log + user sees the error.
+        fi
         local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GH AUTH FAILED to %s — re-auth required, NOT queued] %s"}' \
           "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
         echo "$fail_marker" >> "$MESSAGES"
         echo "" >&2
-        echo "  ✗ gh auth check failed — your GitHub token is dead." >&2
-        echo "    Bearer detail: ${detail}" >&2
-        echo "" >&2
-        echo "    Fix:  gh auth login -h github.com" >&2
-        echo "" >&2
-        echo "    After re-authenticating, retry your message. No state lost," >&2
-        echo "    no re-pair needed — it's just gh's keyring that expired." >&2
-        die "gh auth failure — run 'gh auth login -h github.com' and retry"
+        echo "  ✗ gh auth check failed (post-heal-attempt) — bearer detail: ${detail}" >&2
+        echo "    Re-run 'airc send' to retry the self-heal flow," >&2
+        echo "    or fix manually: gh auth login -h github.com -s gist" >&2
+        echo "    No state lost; no re-pair needed — gh's keyring expired." >&2
+        die "gh auth failure — re-run 'airc send' or 'gh auth login -h github.com -s gist'"
         ;;
       transient_failure|"")
         # Network-class failure or empty/malformed outcome → treat as
