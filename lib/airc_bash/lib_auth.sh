@@ -36,13 +36,21 @@
 # explanatory text goes to STDERR.
 #
 # State definitions:
-#   ok            — gh exists, /user reachable, token valid + has gist scope
-#   invalid       — gh exists, but /user returns 401 AND /rate_limit ALSO fails
-#                   (the keyring token is genuinely dead — both endpoints would
-#                    succeed if it were just secondary-limited)
-#   rate_limited  — gh exists, /user 403'd by secondary rate limit, but
-#                   /rate_limit still works → token is FINE, just wait
-#   not_installed — gh binary not on PATH; can't diagnose further
+#   ok                 — gh exists, /user reachable, token valid
+#   invalid            — gh exists, /user 401 AND /rate_limit ALSO fails
+#                        AND no GH_TOKEN env var set (the keyring token is
+#                        genuinely dead; self-heal can fix this).
+#   env_token_invalid  — gh exists, /user 401 AND /rate_limit ALSO fails,
+#                        AND GH_TOKEN env var IS set. self-heal CANNOT fix
+#                        this: gh refuses to run `gh auth login` while
+#                        GH_TOKEN is set (verbatim: "first clear the
+#                        value from the environment"). User must unset
+#                        GH_TOKEN themselves OR fix the env var's value.
+#                        Discovered live on canary 73ab85e while testing
+#                        PR #389's heal flow.
+#   rate_limited       — /user 403'd by secondary rate limit, /rate_limit
+#                        still works → token is FINE, just wait.
+#   not_installed      — gh binary not on PATH.
 airc_detect_gh_auth_state() {
   if ! command -v gh >/dev/null 2>&1; then
     echo "not_installed"
@@ -54,19 +62,27 @@ airc_detect_gh_auth_state() {
     return 0
   fi
 
-  # gh auth status failed. Two possibilities:
-  # (a) Real auth failure — keyring token is dead.
-  # (b) Secondary rate limit — gh's `auth status` probes /user which
+  # gh auth status failed. Three possibilities:
+  # (a) Secondary rate limit — gh's `auth status` probes /user which
   #     gets 403'd, then prints "token invalid" misleadingly. The
   #     /rate_limit endpoint is reachable during secondary rate limits;
   #     if it works, the token is fine. (issue #341 in airc)
-  #
-  # The KEYRING-INVALID case is what Joel reports as common (and is
-  # what just happened on M5: heartbeat.stderr 403'd Apr 30 with the
-  # rate-limit-shaped error message but `gh api rate_limit` ALSO failed
-  # → token is dead, not rate-limited).
+  # (b) GH_TOKEN env var is set + invalid. gh prefers env-var tokens
+  #     over keyring; if the env-var token is dead, gh refuses to run
+  #     `gh auth login` until the env var is unset. self-heal cannot
+  #     proceed without user action.
+  # (c) Real keyring auth failure (no GH_TOKEN env, keyring is dead).
+  #     This is the common Joel-reports-FREQUENT case, and the case
+  #     self-heal CAN fix via the browser flow.
   if gh api rate_limit >/dev/null 2>&1; then
     echo "rate_limited"
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    # GH_TOKEN takes precedence over the keyring in gh's auth resolution.
+    # If we got here, /user AND /rate_limit both failed AND a GH_TOKEN
+    # env var is what gh's using. Distinguish from keyring-invalid so
+    # self-heal can refuse with a clear "unset GH_TOKEN first" message
+    # instead of running `gh auth login --web` (which gh will reject).
+    echo "env_token_invalid"
   else
     echo "invalid"
   fi
@@ -157,12 +173,15 @@ airc_self_heal_gh_auth() {
 #   airc_ensure_gh_auth_or_heal "airc join" || die "..."
 #
 # Behaviour by detected state:
-#   ok            → return 0; caller proceeds
-#   rate_limited  → emit explanation; return 1 (token is fine, just wait)
-#   invalid       → trigger self-heal browser flow; on success re-detect
-#                   to confirm + return 0; on failure emit fallback +
-#                   return 1 (caller dies with its own message)
-#   not_installed → emit install-gh hint; return 1
+#   ok                → return 0; caller proceeds
+#   rate_limited      → emit explanation; return 1 (token is fine, wait)
+#   invalid           → trigger self-heal browser flow; on success re-detect
+#                       to confirm + return 0; on failure emit fallback +
+#                       return 1 (caller dies with its own message)
+#   env_token_invalid → emit clear "unset GH_TOKEN first" message + return 1.
+#                       gh refuses to run `gh auth login` while GH_TOKEN is
+#                       set, so self-heal cannot proceed. User action needed.
+#   not_installed     → emit install-gh hint; return 1
 #
 # The auth_state echoed on stderr is the SAME identifier the
 # airc_detect_gh_auth_state helper produces, so callers can grep their
@@ -217,6 +236,35 @@ airc_ensure_gh_auth_or_heal() {
       echo "    Manual fix: gh auth login -h github.com -s gist" >&2
       echo "" >&2
       echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
+      return 1
+      ;;
+    env_token_invalid)
+      # gh refuses `gh auth login` while GH_TOKEN env var is set
+      # (verbatim message: "first clear the value from the environment").
+      # Self-heal can't fix this — only the user can. Surface the exact
+      # action they need to take, plus what gh sees, so they can decide
+      # whether to unset GH_TOKEN (if it's stale dotfile pollution) or
+      # fix its value (if it's a real CI token that's just dead).
+      echo "" >&2
+      echo "  ✗ GH_TOKEN environment variable is set + invalid." >&2
+      echo "    Context: $context" >&2
+      echo "" >&2
+      echo "    airc can't auto-heal this — gh refuses to run 'gh auth login'" >&2
+      echo "    while GH_TOKEN is set. (gh's exact message: 'first clear the" >&2
+      echo "    value from the environment'.) Self-heal would just bounce." >&2
+      echo "" >&2
+      echo "    Two paths to fix, depending on where GH_TOKEN came from:" >&2
+      echo "    1. Stale dotfile / leftover export → just unset it:" >&2
+      echo "         unset GH_TOKEN" >&2
+      echo "       Then re-run your airc command. airc will detect the" >&2
+      echo "       keyring auth + self-heal it via the browser flow." >&2
+      echo "    2. Real CI token (Actions, Codespace, dotfile sourcing a" >&2
+      echo "       managed token) → fix the source. Don't run gh auth login;" >&2
+      echo "       refresh whichever system writes GH_TOKEN." >&2
+      echo "" >&2
+      echo "    What gh sees right now:" >&2
+      gh auth status 2>&1 | sed 's/^/      /' >&2
+      echo "" >&2
       return 1
       ;;
     not_installed)
