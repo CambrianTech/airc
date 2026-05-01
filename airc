@@ -166,6 +166,21 @@ fi
 # one machine? Open each tab in its own dir (or repo) — they're distinct
 # peers automatically.
 #
+# Carve-out: if cwd is INSIDE an existing .airc/ ancestor (e.g. user
+# `cd`'d into the scope dir for forensic inspection), resolve to that
+# ancestor instead of appending /.airc to cwd. Pre-fix this produced
+# wrong nested paths like /repo/.airc/.airc — every command then died
+# with "Not initialized" against a scope that didn't exist. Discovered
+# 2026-05-01 on M5 while diagnosing a different airc issue: the very
+# act of `cd .airc; airc status` to inspect state broke airc.
+#
+# Doesn't change behaviour for the "fresh cwd, no enclosing scope"
+# case — that still gets $PWD/.airc, preserving the per-cwd identity
+# model. Doesn't walk up across non-.airc parents either, so cwd
+# /repo/src (with /repo/.airc existing) still creates /repo/src/.airc
+# the way it always has — that broader change would be a contract
+# shift worth its own design discussion.
+#
 # AIRC_HOME env var overrides, for tests / edge cases. Normal users don't
 # touch it.
 detect_scope() {
@@ -173,8 +188,23 @@ detect_scope() {
     echo "$AIRC_HOME"
     return
   fi
+
   # Resolve symlinks so /tmp/x and /private/tmp/x are the same scope.
-  echo "$(pwd -P)/.airc"
+  local cur; cur="$(pwd -P)"
+
+  # Walk up looking for an ancestor whose basename is .airc — that's
+  # the scope dir we should resolve to. Stops at / (or empty cur).
+  local probe; probe="$cur"
+  while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+    if [ "$(basename "$probe")" = ".airc" ] && [ -d "$probe" ]; then
+      echo "$probe"
+      return
+    fi
+    probe="$(dirname "$probe")"
+  done
+
+  # No enclosing .airc/ ancestor — apply the documented per-cwd default.
+  echo "$cur/.airc"
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
