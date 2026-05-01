@@ -1704,13 +1704,13 @@ JSON
             # Surface it earlier here, on first host-bootstrap, so the user
             # can flip auto-restart on while their mesh is still healthy.
             # Only fires when the daemon isn't already installed (idempotent
-            # re-runs / re-hosts stay silent).
-            _daemon_plist_or_unit=""
-            case "$(uname -s 2>/dev/null)" in
-              Darwin) _daemon_plist_or_unit="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ;;
-              Linux)  _daemon_plist_or_unit="$HOME/.config/systemd/user/airc.service" ;;
-            esac
-            if [ -n "$_daemon_plist_or_unit" ] && [ ! -f "$_daemon_plist_or_unit" ]; then
+            # re-runs / re-hosts stay silent). Uses the centralized
+            # cross-platform detector (lib_daemon_detect.sh) so this fires
+            # correctly on darwin / linux / wsl / windows. Pre-fix this
+            # block only checked Darwin/Linux file paths and never fired
+            # on Windows where the daemon lives in HKCU\...\Run (Copilot
+            # review on PR #388 caught this gap).
+            if ! airc_daemon_is_installed; then
               echo "  Tip: 'airc daemon install' keeps this mesh alive across machine sleep."
             fi
           else

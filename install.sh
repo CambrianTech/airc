@@ -872,36 +872,64 @@ fi
 #     config-management like Ansible/Chef/Nix)
 #   - AIRC_INSTALL_YES=1 (power-user one-liner: install the daemon
 #     without asking)
-_daemon_already_installed() {
-  case "$(uname -s 2>/dev/null)" in
-    Darwin) [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] ;;
-    Linux)  [ -f "$HOME/.config/systemd/user/airc.service" ] ;;
-    *) return 1 ;;  # treat unknown as "not installed" — best-effort prompt
-  esac
-}
+# Source the centralized cross-platform daemon detector + its dependency
+# (detect_platform from platform_adapters.sh). Lets install.sh ask the
+# same "is the daemon installed?" question that cmd_daemon.sh + cmd_connect.sh
+# ask, so the answer is consistent across darwin / linux / wsl / windows.
+# Pre-fix install.sh had its own _daemon_already_installed() that only
+# covered Darwin/Linux file paths — Copilot review on PR #388 caught
+# that this would re-prompt on every install rerun on Windows Git Bash
+# even after `airc daemon install` had registered the HKCU Run-key.
+if [ -f "$CLONE_DIR/lib/airc_bash/platform_adapters.sh" ] \
+   && [ -f "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh" ]; then
+  # shellcheck source=lib/airc_bash/platform_adapters.sh
+  source "$CLONE_DIR/lib/airc_bash/platform_adapters.sh"
+  # shellcheck source=lib/airc_bash/lib_daemon_detect.sh
+  source "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh"
+else
+  # Defensive fallback so install doesn't die on a weird CLONE_DIR layout.
+  # The prompt block below tolerates the function being absent (treats
+  # "unknown daemon state" as "not installed → offer prompt").
+  airc_daemon_is_installed() { return 1; }
+fi
 
-if _daemon_already_installed; then
-  info "airc daemon already installed (skipping prompt)"
-elif [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
+# Order matters here. Four NON-prompt branches first, ordered so the
+# loudest user intent wins:
+#   1. AIRC_INSTALL_NO_DAEMON=1 — explicit opt-out trumps everything.
+#   2. AIRC_INSTALL_YES=1       — explicit auto-install (Copilot #388:
+#                                 must come BEFORE the non-TTY check
+#                                 so `curl … | AIRC_INSTALL_YES=1 bash`
+#                                 actually installs instead of falling
+#                                 into the non-TTY tip branch).
+#   3. daemon already installed  — idempotent re-run; nothing to do.
+#   4. Non-TTY                   — no human to prompt; surface tip text.
+#   5. TTY interactive prompt    — default path.
+if [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
   info "AIRC_INSTALL_NO_DAEMON=1 — skipping daemon install prompt"
+elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
+  if airc_daemon_is_installed; then
+    info "AIRC_INSTALL_YES=1 — airc daemon already installed (no-op)"
+  else
+    info "AIRC_INSTALL_YES=1 — installing airc daemon"
+    if "$BIN_DIR/airc" daemon install; then
+      ok "airc daemon installed"
+    else
+      warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
+    fi
+  fi
+elif airc_daemon_is_installed; then
+  info "airc daemon already installed (skipping prompt)"
 elif [ ! -t 0 ] || [ ! -t 1 ]; then
   # Non-TTY install can't prompt. Surface the option so the user sees it
   # in their install transcript and can run it later — the help string
   # mirrors the post-disconnect tip in airc's reconnect path.
   info "Tip: run 'airc daemon install' to keep the mesh alive across machine sleep/wake/crash"
-elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
-  info "AIRC_INSTALL_YES=1 — installing airc daemon"
-  if "$BIN_DIR/airc" daemon install; then
-    ok "airc daemon installed"
-  else
-    warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
-  fi
 else
   printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
   printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
   printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
-  printf '      a launchd/systemd entry that auto-restarts the host process.\n'
-  printf '      Skip with --no-daemon-prompt next time, or set AIRC_INSTALL_NO_DAEMON=1.\n'
+  printf '      a launchd / systemd / HKCU-Run entry that auto-restarts the host.\n'
+  printf '      Skip next time by setting AIRC_INSTALL_NO_DAEMON=1.\n'
   printf '      [Y/n] '
   read -r _daemon_reply || _daemon_reply=""
   case "${_daemon_reply}" in

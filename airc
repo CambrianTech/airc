@@ -865,6 +865,21 @@ else
 fi
 # ── End auth self-heal helpers ──────────────────────────────────────────
 
+# ── Daemon-installed detector ───────────────────────────────────────────
+# airc_daemon_is_installed — single source of truth shared by
+# cmd_daemon.sh, cmd_connect.sh first-host tip, and install.sh's
+# daemon-install prompt. Pre-fix, three places had near-identical
+# detection that drifted across platforms; Copilot review on PR #388
+# caught Windows + WSL gaps. ONE detect, called from every site.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/lib_daemon_detect.sh" ]; then
+  # shellcheck source=lib/airc_bash/lib_daemon_detect.sh
+  source "$_airc_lib_dir/airc_bash/lib_daemon_detect.sh"
+else
+  echo "ERROR: airc_bash/lib_daemon_detect.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+# ── End daemon-installed detector ───────────────────────────────────────
+
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s

@@ -103,16 +103,12 @@ _daemon_scope() {
 # (daemon present) or just kill the relay silently (no daemon — they
 # need to `airc join` again).
 _daemon_installed() {
-  local os; os=$(detect_platform)
-  case "$os" in
-    darwin)
-      [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] && return 0 ;;
-    linux|wsl)
-      [ -f "$HOME/.config/systemd/user/airc.service" ] && return 0 ;;
-    windows)
-      reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor >/dev/null 2>&1 && return 0 ;;
-  esac
-  return 1
+  # Delegates to airc_daemon_is_installed (lib/airc_bash/lib_daemon_detect.sh).
+  # Kept as a thin wrapper to preserve the local-private-helper shape
+  # callers in this file use; the cross-platform detection logic lives
+  # in the shared detector so install.sh + cmd_connect.sh see the same
+  # answer (Copilot review #388 caught the prior drift).
+  airc_daemon_is_installed
 }
 
 cmd_daemon_install() {
