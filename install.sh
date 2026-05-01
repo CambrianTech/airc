@@ -853,6 +853,69 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 
+# ── Optional: background daemon for sleep/wake/crash survival (#382) ───
+#
+# Issue: by default the mesh dies when peer laptops sleep — `airc connect`
+# is just a process, sleeps with the machine, never re-spawns on wake.
+# The remedy (`airc daemon install`) already exists but was only surfaced
+# AFTER the mesh had gone down (see the in-disconnect tip in the airc
+# top-level). By that time peers have missed however many hours of mesh
+# activity. This block surfaces the offer at install time, when the user
+# is already engaged in setup and can flip the auto-restart on with one
+# keystroke.
+#
+# Skip conditions:
+#   - daemon already installed (idempotent re-run)
+#   - non-TTY install (curl-bash piped without terminal)
+#   - AIRC_INSTALL_NO_DAEMON=1 (explicit opt-out for headless servers,
+#     CI runners, environments that manage daemons via their own
+#     config-management like Ansible/Chef/Nix)
+#   - AIRC_INSTALL_YES=1 (power-user one-liner: install the daemon
+#     without asking)
+_daemon_already_installed() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] ;;
+    Linux)  [ -f "$HOME/.config/systemd/user/airc.service" ] ;;
+    *) return 1 ;;  # treat unknown as "not installed" — best-effort prompt
+  esac
+}
+
+if _daemon_already_installed; then
+  info "airc daemon already installed (skipping prompt)"
+elif [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
+  info "AIRC_INSTALL_NO_DAEMON=1 — skipping daemon install prompt"
+elif [ ! -t 0 ] || [ ! -t 1 ]; then
+  # Non-TTY install can't prompt. Surface the option so the user sees it
+  # in their install transcript and can run it later — the help string
+  # mirrors the post-disconnect tip in airc's reconnect path.
+  info "Tip: run 'airc daemon install' to keep the mesh alive across machine sleep/wake/crash"
+elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
+  info "AIRC_INSTALL_YES=1 — installing airc daemon"
+  if "$BIN_DIR/airc" daemon install; then
+    ok "airc daemon installed"
+  else
+    warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
+  fi
+else
+  printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
+  printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
+  printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
+  printf '      a launchd/systemd entry that auto-restarts the host process.\n'
+  printf '      Skip with --no-daemon-prompt next time, or set AIRC_INSTALL_NO_DAEMON=1.\n'
+  printf '      [Y/n] '
+  read -r _daemon_reply || _daemon_reply=""
+  case "${_daemon_reply}" in
+    n|N|no|No|NO)
+      info "Skipped daemon install. Run 'airc daemon install' later if you change your mind." ;;
+    *)
+      if "$BIN_DIR/airc" daemon install; then
+        ok "airc daemon installed"
+      else
+        warn "airc daemon install returned non-zero — re-run manually:  airc daemon install"
+      fi ;;
+  esac
+fi
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
