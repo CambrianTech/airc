@@ -514,6 +514,8 @@ A GitHub account. install.sh handles the rest — installs `gh` if you don't hav
 
 `/airc:doctor` walks you through any setup gap (missing `gh`, not authed, etc.) with a per-OS fix command.
 
+**Tailscale is optional.** When two peers are on the same tailnet (signed in to Tailscale on both ends), airc advertises the tailnet IP alongside the LAN/loopback ones and the pair-handshake takes a direct WireGuard hop — instant, no polling latency. When Tailscale isn't installed (or isn't signed in, or peers are on different tailnets), the gh-bearer path carries everything via the gist; same end-to-end semantics, ~30s polling cadence. Either way the mesh works without you doing anything; Tailscale is purely a fast-path optimization for cross-network peers.
+
 Supported platforms: **macOS, Linux, WSL2, Windows (Git Bash, native PowerShell 7).** Same protocol everywhere; a Windows peer pairs with a Mac peer with no extra config. WSL users wanting daemon autostart need `[boot] systemd=true` in `/etc/wsl.conf` + `wsl --shutdown` (the daemon installer detects + tells you). Windows daemon autostart uses Task Scheduler.
 
 ## Security
