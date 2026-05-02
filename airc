@@ -906,16 +906,22 @@ peer_pick_address() {
     fi
   fi
 
-  # Tailscale: only pick if WE have a Tailscale interface ourselves.
-  # Without one, dialing 100.x just dies with "no route to host" —
-  # and (worse) the resulting "host unreachable" triggers the
-  # self-heal-as-new-host path in cmd_connect.sh which DEMOLISHES
-  # the working host's gist. Bug observed live 2026-05-02: a Mac
-  # without Tailscale fell through to the nonlocal-first fallback,
-  # picked Windows host's tailscale 100.x, failed, self-healed,
-  # nuked the gist that other peers were happily using. Joiner-side
-  # reachability is non-negotiable.
-  if _have_tailscale_locally; then
+  # Tailscale: only pick if WE have a Tailscale interface ourselves
+  # AND the user hasn't opted out via AIRC_NO_TAILSCALE=1.
+  #
+  # Without a local Tailscale interface, dialing 100.x just dies with
+  # "no route to host" — and (worse) the resulting "host unreachable"
+  # triggers the self-heal-as-new-host path in cmd_connect.sh which
+  # DEMOLISHES the working host's gist. Bug observed live 2026-05-02:
+  # a Mac without Tailscale fell through to the nonlocal-first
+  # fallback, picked Windows host's tailscale 100.x, failed,
+  # self-healed, nuked the gist that other peers were happily using.
+  # Joiner-side reachability is non-negotiable.
+  #
+  # AIRC_NO_TAILSCALE=1 (from main's #396 hotfix): respect explicit
+  # opt-out even when local interface is present (some users have
+  # tailscale up but want airc to skip it for routing decisions).
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ] && _have_tailscale_locally; then
     local pick; pick=$(printf '%s' "$addresses_json" \
       | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
     if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi

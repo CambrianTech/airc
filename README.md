@@ -564,6 +564,8 @@ A GitHub account. install.sh handles the rest — installs `gh` if you don't hav
 
 `/airc:doctor` walks you through any setup gap (missing `gh`, not authed, etc.) with a per-OS fix command.
 
+**Tailscale is optional.** airc works without it — the gist is the wire by default, no VPN setup needed. But if you want your laptop to talk to your own home systems (or any boxes you own), Tailscale is the nicest design: install it on both ends, sign in, and airc automatically picks the direct WireGuard hop instead of round-tripping through gh. Same protocol, same security model, just instant rather than ~30s polling cadence. Nothing to configure on the airc side — it auto-detects whether Tailscale is signed in and routes accordingly.
+
 Supported platforms: **macOS, Linux, WSL2, Windows (Git Bash, native PowerShell 7).** Same protocol everywhere; a Windows peer pairs with a Mac peer with no extra config. WSL users wanting daemon autostart need `[boot] systemd=true` in `/etc/wsl.conf` + `wsl --shutdown` (the daemon installer detects + tells you). Windows daemon autostart uses Task Scheduler.
 
 ## Security
