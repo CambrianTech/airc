@@ -883,6 +883,26 @@ cmd_connect() {
     # This is what makes Tailscale truly optional — same-machine and
     # same-LAN peers connect via 127.0.0.1 / LAN IP regardless of the
     # invite string's host:port (which historically advertised one IP).
+    #
+    # `_addr_picker_state` tracks what happened so the self-heal block
+    # below can decide whether nuking the host's gist is justified:
+    #   "no_addrs"    — host published no addresses[] (legacy gist or
+    #                   pre-multi-address protocol). We tried only the
+    #                   invite-string ssh_target. Self-heal allowed —
+    #                   we have no other reachability info to act on.
+    #   "picked"      — picker returned a believed-reachable address
+    #                   AND we used it. If THAT failed, the host really
+    #                   does seem dead. Self-heal allowed.
+    #   "no_match"    — host published addresses[] BUT picker found
+    #                   no scope this peer can reach (e.g. Mac without
+    #                   tailscale + Windows host whose only non-
+    #                   localhost entry is tailscale). Falling through
+    #                   to invite-string ssh_target is no more reachable
+    #                   than what the picker rejected. Self-heal here
+    #                   would nuke the gist for OTHER peers who CAN
+    #                   reach the host — destructive cross-peer
+    #                   damage from one peer's network mismatch.
+    local _addr_picker_state="no_addrs"
     if [ -n "$_resolved_addresses_json" ] && [ "$_resolved_addresses_json" != "null" ]; then
       local _picked; _picked=$(peer_pick_address "$_resolved_addresses_json" "$_resolved_host_machine_id")
       if [ -n "$_picked" ]; then
@@ -895,6 +915,9 @@ cmd_connect() {
         ssh_target="${_ssh_user:+${_ssh_user}@}${_picked_addr}"
         peer_port="$_picked_port"
         echo "  ✓ Multi-address pick: ${_picked_addr}:${_picked_port} (from host.addresses)"
+        _addr_picker_state="picked"
+      else
+        _addr_picker_state="no_match"
       fi
     fi
 
@@ -1042,13 +1065,26 @@ except Exception:
       #      room name. AIRC_NO_DISCOVERY=1 so we don't re-find the gist
       #      we just deleted (gh propagation lag).
       #
-      # Only fires when ALL three are true:
+      # Only fires when ALL FOUR are true:
       #   - We resolved a kind:room gist (resolved_room_name + _resolved_gist_id non-empty)
       #   - gh CLI is available (to delete the stale gist)
       #   - Pair handshake failed (TCP unreachable / timeout)
+      #   - Address picker either succeeded ("picked") OR host published
+      #     no addresses[] at all ("no_addrs"). If picker ran but found
+      #     no reachable scope ("no_match"), the failure is THIS peer's
+      #     network mismatch — not host-down. Nuking the gist would
+      #     destroy reachability for other peers who CAN reach the host.
+      #     Bug observed live 2026-05-02: a Mac without tailscale joined
+      #     a Windows host whose only non-localhost entry was tailscale,
+      #     fell through to the invite-string ssh_target, TCP timed out,
+      #     self-heal nuked the gist that 4 other peers were happily
+      #     using. The address-picker reachability check (#397) prevents
+      #     the most common shape of this; this guard catches the
+      #     remaining "invite-string fallback after no_match" path.
       # If any condition isn't met, fall through to the original die().
       if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
-         && command -v gh >/dev/null 2>&1; then
+         && command -v gh >/dev/null 2>&1 \
+         && [ "$_addr_picker_state" != "no_match" ]; then
         echo ""
         echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
         echo "     (prior host's gist: $_resolved_gist_id)"
@@ -1060,6 +1096,19 @@ except Exception:
         # caught only by running two tabs against a stale gist
         # simultaneously, NOT by the integration test).
         _self_heal_stale_host "$_resolved_gist_id"
+      elif [ "$_addr_picker_state" = "no_match" ]; then
+        # Picker found no scope this peer can reach. Surface the situation
+        # but do NOT nuke the gist. The host may be perfectly reachable
+        # for peers on the other matching scope (e.g. peers on the same
+        # tailnet when WE lack tailscale). Per the global "evidence is
+        # for the debugger, not the trash" rule — print explicit reason
+        # so users debugging "why didn't I auto-pair" know it's a network
+        # topology mismatch rather than a host-down event.
+        echo "" >&2
+        echo "  ⚠  Host of #${resolved_room_name} published no scope this peer can reach." >&2
+        echo "     Skipping self-heal (gist preserved for peers who CAN reach the host)." >&2
+        echo "     Direct pair unavailable; gh-bearer broadcasts still work via gist." >&2
+        echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
