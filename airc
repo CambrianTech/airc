@@ -743,12 +743,35 @@ host_address_set() {
   printf 'localhost|127.0.0.1|%s|\n' "$port"
 
   # LAN: enumerate interfaces, pick non-loopback IPv4s. macOS + Linux
-  # converge on `ifconfig`; we use that and reject loopback + CGNAT.
+  # converge on `ifconfig`; Windows Git Bash uses `ipconfig` (no
+  # ifconfig in MINGW). Either way, reject loopback (127.) and link-
+  # local (169.254.), and reject Tailscale's CGNAT range (100.64-127.)
+  # which is emitted separately below as scope=tailscale.
   local lan_ips
-  lan_ips=$(ifconfig 2>/dev/null \
-            | awk '/inet /{print $2}' \
-            | grep -vE '^(127\.|169\.254\.)' \
-            | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows ipconfig output line:
+      #   "   IPv4 Address. . . . . . . . . . . : 192.168.1.42"
+      # CRLF needs stripping. The IP is the last colon-delimited field.
+      # Fix: pre-2026-05-02 Windows hosts emitted only [localhost,
+      # tailscale] in addresses[] — the bash ifconfig path returned
+      # nothing on Git Bash, so no lan entry — and joiners on the same
+      # /24 LAN had no way to reach the Windows host directly. Logged
+      # by Joel 2026-05-02: Windows peer joined as host but Mac
+      # joiner without Tailscale couldn't reach.
+      lan_ips=$(ipconfig 2>/dev/null \
+                | tr -d '\r' \
+                | awk -F': ' '/IPv4 Address/{print $NF}' \
+                | grep -vE '^(127\.|169\.254\.)' \
+                | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+      ;;
+    *)
+      lan_ips=$(ifconfig 2>/dev/null \
+                | awk '/inet /{print $2}' \
+                | grep -vE '^(127\.|169\.254\.)' \
+                | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+      ;;
+  esac
   if [ -n "$lan_ips" ]; then
     printf '%s\n' "$lan_ips" | while read -r ip; do
       [ -z "$ip" ] && continue
@@ -865,25 +888,80 @@ peer_pick_address() {
     fi
   fi
 
-  # Phase 3c: Tailscale-pick path removed. If localhost + same-LAN
-  # neither match, the joiner falls through to gh-as-bearer routing
-  # (no TCP pair-handshake needed once gh-pair lands; for now, the
-  # peer is unreachable for direct pair and gh-only messaging suffices).
+  # Tailscale: only pick if WE have a Tailscale interface ourselves.
+  # Without one, dialing 100.x just dies with "no route to host" —
+  # and (worse) the resulting "host unreachable" triggers the
+  # self-heal-as-new-host path in cmd_connect.sh which DEMOLISHES
+  # the working host's gist. Bug observed live 2026-05-02: a Mac
+  # without Tailscale fell through to the nonlocal-first fallback,
+  # picked Windows host's tailscale 100.x, failed, self-healed,
+  # nuked the gist that other peers were happily using. Joiner-side
+  # reachability is non-negotiable.
+  if _have_tailscale_locally; then
+    local pick; pick=$(printf '%s' "$addresses_json" \
+      | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
+    if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
+  fi
 
-  # Fallback: first NON-LOCALHOST entry. The pre-fix `pick_addr_first`
-  # included localhost entries which the joiner — by definition on a
-  # different machine — would dial against THEIR own loopback (never
-  # reaches the host). Symptom: Joel's Windows peer subscribed to
-  # #cambriantech but stuck on a 127.0.0.1 connection because their
-  # IP didn't match the host's lan/24 subnet check + the fallback then
-  # picked the localhost entry that happened to be first in the gist's
-  # addresses[]. pick_addr_nonlocal_first skips localhost; if only
-  # localhost remains, returns empty so the caller falls through to
-  # gh-bearer-only routing (broadcast still works; direct-pair
-  # handshake is skipped). Aligns with the documented Phase 3c
-  # gh-as-bearer routing behaviour above.
+  # Fallback: first entry whose scope we can REACH. We've already
+  # tried localhost (machine_id match), lan (subnet match), and
+  # tailscale (local-presence check) above. What remains in
+  # addresses[] is some scope we don't model — e.g. a future "wan"
+  # entry, or a bespoke routing tag — give that a chance instead of
+  # ignoring it. But excluding localhost and tailscale here ensures
+  # we don't dial them blindly: localhost would mean our own loopback
+  # (never the host), and tailscale was already gated above on local
+  # presence — picking it here would re-introduce the destructive
+  # self-heal chain. Empty return → caller falls through to
+  # gh-bearer-only routing (broadcast still works; direct pair
+  # skipped).
   printf '%s' "$addresses_json" \
-    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_nonlocal_first 2>/dev/null
+    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_excluding localhost tailscale 2>/dev/null
+}
+
+# _have_tailscale_locally: do WE currently have a Tailscale interface
+# we can route packets through? Two probes, in priority order:
+#
+#   1. `tailscale status` reports a usable session. This is the
+#      authoritative signal — daemon is up AND signed in. Uses the
+#      same resolve_tailscale_bin chain as host_address_set so we
+#      catch winget/AppStore installs that aren't on PATH.
+#
+#   2. We have a 100.x interface. Catches the case where Tailscale
+#      is up but the CLI binary isn't reachable (e.g. macOS
+#      Tailscale.app pre-MacOS-CLI-helper, sandboxed daemon).
+#
+# Used by peer_pick_address to decide whether picking a host's
+# tailscale-scope address is reachable. Empty return on no = caller
+# treats tailscale entries as unreachable.
+_have_tailscale_locally() {
+  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  if [ -n "$ts_bin" ]; then
+    local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
+    case "$ts_out" in
+      *"Logged out"*|*"NeedsLogin"*|*"stopped"*) ;;  # daemon down / signed out
+      *)
+        # Anything else from `tailscale status` (including the IP
+        # listing or "Tailscale is running") means we can route.
+        return 0
+        ;;
+    esac
+  fi
+  # Fallback: probe for a 100.x interface IP directly.
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      ipconfig 2>/dev/null \
+        | tr -d '\r' \
+        | grep -qE 'IPv4 Address[^:]*: 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' \
+        && return 0
+      ;;
+    *)
+      ifconfig 2>/dev/null \
+        | grep -qE 'inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' \
+        && return 0
+      ;;
+  esac
+  return 1
 }
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
