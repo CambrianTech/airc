@@ -904,31 +904,48 @@ fi
 #   3. daemon already installed  — idempotent re-run; nothing to do.
 #   4. Non-TTY                   — no human to prompt; surface tip text.
 #   5. TTY interactive prompt    — default path.
+# Scope the daemon will end up wired to. Mirrors cmd_daemon.sh::_daemon_scope
+# so the "is daemon installed for this scope?" check below matches what
+# `airc daemon install` would actually create. b69f 2026-05-02 caught the
+# scope-mismatch bug: any-daemon-registered → install.sh skipped → user
+# left with no daemon for the scope they were bootstrapping.
+INSTALL_DAEMON_SCOPE="${AIRC_HOME:-$(pwd -P)/.airc}"
+
 if [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
   info "AIRC_INSTALL_NO_DAEMON=1 — skipping daemon install prompt"
 elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
-  if airc_daemon_is_installed; then
-    info "AIRC_INSTALL_YES=1 — airc daemon already installed (no-op)"
+  if airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
+    info "AIRC_INSTALL_YES=1 — airc daemon already installed for this scope (no-op)"
   else
-    info "AIRC_INSTALL_YES=1 — installing airc daemon"
+    if airc_daemon_is_installed; then
+      info "AIRC_INSTALL_YES=1 — daemon registered for a different scope; reinstalling for $INSTALL_DAEMON_SCOPE"
+    else
+      info "AIRC_INSTALL_YES=1 — installing airc daemon"
+    fi
     if "$BIN_DIR/airc" daemon install; then
       ok "airc daemon installed"
     else
       warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
     fi
   fi
-elif airc_daemon_is_installed; then
-  info "airc daemon already installed (skipping prompt)"
+elif airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
+  info "airc daemon already installed for this scope (skipping prompt)"
 elif [ ! -t 0 ] || [ ! -t 1 ]; then
   # Non-TTY install can't prompt. Surface the option so the user sees it
   # in their install transcript and can run it later — the help string
   # mirrors the post-disconnect tip in airc's reconnect path.
   info "Tip: run 'airc daemon install' to keep the mesh alive across machine sleep/wake/crash"
 else
-  printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
-  printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
-  printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
-  printf '      a launchd / systemd / HKCU-Run entry that auto-restarts the host.\n'
+  if airc_daemon_is_installed; then
+    printf '\n  \033[1;32m==>\033[0m airc daemon is registered, but for a different scope.\n'
+    printf '      Reinstall and wire it to %s?\n' "$INSTALL_DAEMON_SCOPE"
+    printf '      Re-registers the launcher to point at this scope; safe to do.\n'
+  else
+    printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
+    printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
+    printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
+    printf '      a launchd / systemd / HKCU-Run entry that auto-restarts the host.\n'
+  fi
   printf '      Skip next time by setting AIRC_INSTALL_NO_DAEMON=1.\n'
   printf '      [Y/n] '
   read -r _daemon_reply || _daemon_reply=""

@@ -53,3 +53,90 @@ airc_daemon_is_installed() {
   esac
   return 1
 }
+
+# ── airc_daemon_is_installed_for_scope <scope> ─────────────────────────
+#
+# STRICTER variant: returns 0 only when the daemon's autostart entry is
+# installed AND wired to the given scope (i.e. a launcher / unit / plist
+# pointing at <scope>'s .bat or AIRC_HOME=<scope>).
+#
+# Use case: install.sh idempotency. The plain airc_daemon_is_installed
+# answers "user has any airc daemon" — fine for global presence checks
+# (post-disconnect tip, status banner). It returns true even when the
+# registered daemon is wired to a DIFFERENT scope from the one being
+# bootstrapped. b69f 2026-05-02 hit this: installed daemon while in
+# /c/.airc-src, then re-ran AIRC_INSTALL_YES=1 install.sh from
+# ~/continuum — install.sh saw "any airc daemon registered" → no-op'd
+# the prompt → ~/continuum had no daemon serving it. The fix is for
+# install.sh to ask scope-aware: "does the registered daemon point at
+# THIS scope?" If not, regenerate.
+#
+# Returns:
+#   0 — daemon entry exists AND points at <scope>
+#   1 — no daemon entry OR points at a different scope OR the launcher
+#       file the entry points at no longer exists on disk
+#
+# Detection strategy by platform:
+#   darwin    — read AIRC_HOME from plist EnvironmentVariables; match scope
+#   linux/wsl — grep Environment=AIRC_HOME=<scope> from systemd unit
+#   windows   — extract launcher .bat path from registry value, match
+#               against expected <scope>/airc-daemon.bat AND verify
+#               the .bat file exists
+airc_daemon_is_installed_for_scope() {
+  local target_scope="${1:-}"
+  [ -n "$target_scope" ] || return 1
+  local os; os=$(detect_platform)
+  case "$os" in
+    darwin)
+      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      [ -f "$plist_path" ] || return 1
+      local got
+      got=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$plist_path" 2>/dev/null)
+      [ "$got" = "$target_scope" ] && return 0
+      return 1
+      ;;
+    linux|wsl)
+      local unit_path="$HOME/.config/systemd/user/airc.service"
+      [ -f "$unit_path" ] || return 1
+      # Match Environment="AIRC_HOME=<scope>" or Environment=AIRC_HOME=<scope>.
+      grep -qE "Environment=\"?AIRC_HOME=${target_scope//\//\\/}\"?($|[[:space:]])" "$unit_path" \
+        && return 0
+      return 1
+      ;;
+    windows)
+      airc_daemon_is_installed || return 1
+      # Extract registered launcher cmd line. Format from cmd_daemon.sh:
+      # `cmd /c start "" /MIN "<scope_win>\airc-daemon.bat"`.
+      local got_value
+      got_value=$(reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor 2>/dev/null \
+                  | awk -F'    ' '/REG_SZ/ {print $NF}')
+      [ -n "$got_value" ] || return 1
+      # Need _to_win_path from platform_adapters.sh. Both install.sh and
+      # the airc lib-dir resolver source platform_adapters before this
+      # file. If somehow absent (atypical), fall back to a substring
+      # match on the unix-form scope which the registered .bat path
+      # won't contain — caller will see "different scope, not installed
+      # for me" which is the safer side of the failure mode (re-prompts
+      # vs falsely claims-already-installed).
+      local target_bat_win=""
+      if command -v _to_win_path >/dev/null 2>&1; then
+        target_bat_win="$(_to_win_path "$target_scope/airc-daemon.bat")"
+      fi
+      local target_bat_unix="$target_scope/airc-daemon.bat"
+      # Match either path representation in the registered cmd line.
+      # Windows form is what cmd_daemon writes, but defense-in-depth.
+      case "$got_value" in
+        *"$target_bat_win"*)
+          [ -f "$target_bat_unix" ] && return 0
+          return 1
+          ;;
+        *"$target_bat_unix"*)
+          [ -f "$target_bat_unix" ] && return 0
+          return 1
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+  return 1
+}
