@@ -202,11 +202,39 @@ airc_ensure_gh_auth_or_heal() {
       return 0
       ;;
     rate_limited)
+      # When daemon-mode (AIRC_BACKGROUND_OK=1) is active, returning 1
+      # here means the launchd/systemd unit respawns us in ~10s, which
+      # immediately hits the rate limit again, deepens the throttle,
+      # and never recovers. The cascade is THE rate-limit-killer Joel
+      # called out 2026-05-02. Fix: sleep WITHIN the airc-connect
+      # process for the rate-limit window (10 min) instead of exiting.
+      # The daemon stays alive (no respawn = no new API calls), the
+      # limit clears naturally, then we re-check. Interactive mode
+      # (no AIRC_BACKGROUND_OK) keeps the existing fail-fast behavior
+      # because a human at the terminal needs to see the error + decide
+      # whether to wait or change networks/account.
       echo "" >&2
       echo "  ! GitHub secondary rate limit (abuse detection) triggered." >&2
       echo "    Your token is fine — wait 5-15 minutes and retry." >&2
       echo "    Context: $context" >&2
       echo "" >&2
+      if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
+        local _wait_secs="${AIRC_RATE_LIMIT_WAIT_SEC:-600}"
+        echo "    [daemon mode] sleeping ${_wait_secs}s in-process (avoids respawn cascade)..." >&2
+        sleep "$_wait_secs" || return 1
+        # Re-check after wait; loop if still rate-limited (gives full
+        # window every cycle without exiting + respawning).
+        local _new_state; _new_state="$(airc_detect_gh_auth_state)"
+        if [ "$_new_state" = "ok" ]; then
+          echo "    [daemon mode] rate-limit cleared, proceeding." >&2
+          return 0
+        fi
+        # Still throttled — fall through to return 1 + let daemon
+        # respawn give us a fresh process state. Respawn cycle is now
+        # at least _wait_secs apart, not 10s.
+        echo "    [daemon mode] still rate-limited after wait; deferring to launchd respawn." >&2
+        return 1
+      fi
       echo "    Why this is confusing: 'gh auth status' calls /user which gets 403'd" >&2
       echo "    during secondary rate limits; gh then prints 'token invalid'. The" >&2
       echo "    /rate_limit endpoint is reachable, which proves the token works." >&2
