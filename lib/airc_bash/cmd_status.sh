@@ -82,8 +82,22 @@ cmd_status() {
         # Walk bearer_state to find which channel is freshest, for the
         # informational message. (The helper already proved freshness;
         # we re-check just to extract the age + channel name.)
+        # Scope to subscribed_channels ONLY — same fix-shape as #428
+        # for --health. Pre-fix this globbed every bearer_state.*.json
+        # on disk INCLUDING stale files from prior subscriptions, so a
+        # parted #cambriantech room (last_recv_ts = 14kS ago) would
+        # show as the "freshest" stale value, making `airc status`
+        # report monitor age way off from actual liveness. QA caught
+        # this 2026-05-02 self-test.
         local _bs_summary; _bs_summary=$("$AIRC_PYTHON" -c "
 import json, glob, time
+subs = set()
+try:
+    cfg = json.load(open('$CONFIG'))
+    for c in cfg.get('subscribed_channels') or []:
+        subs.add(c)
+except Exception:
+    pass
 fresh = []
 for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
     try:
@@ -91,9 +105,14 @@ for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
     except Exception:
         continue
     ts = s.get('last_recv_ts')
-    if ts:
-        ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
-        fresh.append((int(time.time() - float(ts)), ch))
+    if not ts:
+        continue
+    ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
+    # Skip channels we no longer subscribe to. Empty subs (legacy
+    # scope) falls back to all-files for backward compat.
+    if subs and ch not in subs:
+        continue
+    fresh.append((int(time.time() - float(ts)), ch))
 if fresh:
     fresh.sort()
     age, ch = fresh[0]

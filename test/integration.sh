@@ -2539,17 +2539,21 @@ time.sleep(30)
     || fail "file_size on missing: expected 0, got '$_sz'"
 
   # ── detect_platform ──
+  # Canonical values per platform_adapters.sh:detect_platform —
+  # darwin / linux / wsl / windows / unknown. (2026-05-02 QA: test
+  # was originally written with 'macos'/'windows-bash' which never
+  # matched the implementation; aligned to actual emit values.)
   local _plat; _plat=$(_adapter_call "detect_platform")
   case "$_plat" in
-    macos|linux|wsl|windows-bash|unknown)
+    darwin|linux|wsl|windows|unknown)
       pass "detect_platform: returns valid value '$_plat'" ;;
     *)
       fail "detect_platform: unexpected value '$_plat'" ;;
   esac
   case "$(uname -s 2>/dev/null)" in
-    Darwin) [ "$_plat" = "macos" ] \
-      && pass "detect_platform: 'macos' on Darwin matches uname" \
-      || fail "detect_platform: Darwin should map to 'macos' (got '$_plat')" ;;
+    Darwin) [ "$_plat" = "darwin" ] \
+      && pass "detect_platform: 'darwin' on Darwin matches uname" \
+      || fail "detect_platform: Darwin should map to 'darwin' (got '$_plat')" ;;
     Linux)
       case "$_plat" in
         linux|wsl) pass "detect_platform: '$_plat' on Linux matches uname (linux or wsl)" ;;

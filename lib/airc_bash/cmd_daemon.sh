@@ -53,17 +53,31 @@ cmd_daemon() {
   shift 2>/dev/null || true
   case "$action" in
     -h|--help|help)
-      echo "Usage: airc daemon [install|uninstall|status|log]"
+      echo "Usage: airc daemon [install|uninstall|restart|status|log]"
       echo "  install     register OS auto-restart (launchd/systemd/schtasks)"
       echo "  uninstall   remove auto-restart registration"
+      echo "  restart     uninstall + install (pick up new airc binary)"
       echo "  status      print platform-native unit/plist state + log tail"
       echo "  log [N]     tail the daemon stdout log (default 50 lines)"
       return 0 ;;
     install)   cmd_daemon_install "$@" ;;
-    uninstall|remove|stop) cmd_daemon_uninstall "$@" ;;
+    uninstall|remove) cmd_daemon_uninstall "$@" ;;
+    restart)   shift; cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
     status)    cmd_daemon_status "$@" ;;
     log|logs)  cmd_daemon_log "$@" ;;
-    *)         die "Usage: airc daemon [install|uninstall|status|log]" ;;
+    stop|start)
+      # 2026-05-02 QA caught: 'stop' was silently aliased to uninstall
+      # (removes registration entirely, not just halts the running
+      # process). systemd/launchd convention: stop = halt, disable =
+      # unregister. Pre-fix users typing 'airc daemon stop' got the
+      # daemon UNINSTALLED, which broke auto-restart on next login.
+      # Surface this honestly + point at the right command.
+      die "airc daemon $action is not a verb. Use:
+  airc daemon uninstall   — remove the registration entirely
+  airc daemon restart     — bounce the daemon to pick up new airc binary
+  airc daemon install     — re-register (idempotent if already installed)
+The OS launchd/systemd/HKCU manages start/stop of registered units automatically." ;;
+    *)         die "Usage: airc daemon [install|uninstall|restart|status|log]" ;;
   esac
 }
 
