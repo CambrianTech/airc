@@ -348,7 +348,7 @@ Each rung is incremental — you don't need them all to start. The ladder lets y
 
 ### Vuln-A sandbox (security)
 
-Peer chat broadcasts arrive at the receiving Claude session wrapped in `<peer-message-{nonce} from="..." channel="..." to="...">...</peer-message-{nonce}>` tags with all peer-controlled fields XML-escaped and a per-session random nonce on the boundary token. A peer cannot guess the nonce so cannot forge a closing tag this session; literal `</peer-message>` in body is escaped. This raises the bar against prompt-injection from peer messages — see `lib/airc_core/monitor_formatter.py` and PRs #423 + #424 for details.
+Peer chat broadcasts arrive at the receiving AI session wrapped in `<pm-{nonce} from="..." channel="..." [to="..."]>...</pm-{nonce}>` tags with all peer-controlled fields XML-escaped and a per-session random nonce on the boundary token. A peer cannot guess the nonce so cannot forge a closing tag this session; literal `</pm-{nonce}>` in body is escaped. The compact tag name keeps per-message overhead small for poll-mode agents that re-ingest history (Codex etc.). See `lib/airc_core/monitor_formatter.py` and PRs #423 + #424 + #432 for details.
 
 ## Version & Update
 
