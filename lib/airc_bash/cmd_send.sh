@@ -351,10 +351,19 @@ cmd_send() {
           # deleted?) and the user needs to see the original error.
           echo "  ↻ Retrying send post-heal..." >&2
           local retry_outcome retry_kind retry_detail
-          retry_outcome=$(send_via_bearer "$active_channel" "$full_msg" "$peer_name" 2>&1) || true
-          retry_kind=$(echo "$retry_outcome" | head -1)
-          retry_detail=$(echo "$retry_outcome" | tail -n +2)
-          if [ "$retry_kind" = "ok" ]; then
+          # Pre-fix called undefined `send_via_bearer` (Copilot caught
+          # this on PR #422 review — would crash at runtime under
+          # set -euo pipefail). Re-invoke the same bearer_cli pipeline
+          # the initial send used (lines ~316-320) so the retry path is
+          # exactly the original send path replayed against fresh auth.
+          retry_outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+            "$peer_name" "$active_channel" \
+            --host-target "$host_target" \
+            --remote-home "$rhome" \
+            --room-gist-id "$room_gist_id" 2>&1) || true
+          retry_kind=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+          retry_detail=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+          if [ "$retry_kind" = "delivered" ]; then
             echo "  ✓ Sent post-heal." >&2
             return 0
           fi

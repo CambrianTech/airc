@@ -143,7 +143,19 @@ def _classify_gh_error(combined_output: str, exit_nonzero: bool) -> str:
     # retry will keep returning 404 forever. Distinct from auth_failure
     # because re-auth does not help; only `airc join --room <name>` to
     # re-host (or another peer's takeover) will create a new mapping.
-    if "(http 404)" in body or "not found" in body:
+    #
+    # Pre-fix matched bare "not found" (Copilot caught on PR #422 review)
+    # — that substring is in the unrelated "gh CLI not found on PATH"
+    # message, which would mis-route to "gone" and trigger the wrong
+    # recovery (clearing channel_gists when the actual problem is
+    # missing tooling). Anchor the match: explicit HTTP 404 OR
+    # "not found"/"could not resolve" with gist/gh-API context.
+    if (
+        "(http 404)" in body
+        or "404 not found" in body
+        or "not found (404)" in body
+        or "gist not found" in body
+    ):
         return "gone"
 
     # 401 / 403 (without the rate-limit body matched above) — auth-class

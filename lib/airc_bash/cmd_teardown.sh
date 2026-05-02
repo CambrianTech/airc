@@ -151,13 +151,17 @@ cmd_teardown() {
   if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" = "1" ]; then
     : # cmd_part path — skip sidecar
   elif [ -d "$_sidecar_scope" ]; then
-    if [ -f "$_sidecar_scope/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+    # PRESERVE sidecar #general gist (Copilot caught on PR #422 review:
+    # primary scope correctly preserves per #415's bus stability
+    # principle, but sidecar #general was still being deleted — defeating
+    # the same principle for the lobby. Apply #415's fix-shape here too.
+    # Use 'airc part #general' when you actually want to dissolve the
+    # lobby; otherwise let the gist persist across teardowns.
+    if [ -f "$_sidecar_scope/host_gist_id" ]; then
       local _td_sc_gist; _td_sc_gist=$(cat "$_sidecar_scope/host_gist_id" 2>/dev/null)
       if [ -n "$_td_sc_gist" ]; then
-        if gh gist delete "$_td_sc_gist" --yes >/dev/null 2>&1; then
-          echo "  deleted sidecar #general gist: $_td_sc_gist"
-        fi
-        rm -f "$_sidecar_scope/host_gist_id"
+        echo "  preserving sidecar #general gist: $_td_sc_gist (bus stability — use 'airc part #general' to dissolve)"
+        # Intentionally do NOT rm host_gist_id — next start re-uses it.
       fi
     fi
     if [ -f "$_sidecar_scope/airc.pid" ]; then

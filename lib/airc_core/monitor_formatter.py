@@ -603,12 +603,23 @@ def run(my_name: str, peers_dir: str) -> int:
                 _maybe_emit_drop_warning(subs_norm)
                 continue
         try:
+            # `line_channel` comes from the envelope's "channel" field
+            # which is peer-controlled. Pre-fix it was printed raw in
+            # the `airc: [#...]` prefix on BOTH system + peer paths,
+            # leaving an injection surface OUTSIDE the <pm-NONCE> wrap
+            # (Copilot residual on #432). Sanitize to a strict charset
+            # — channel names should be alnum + dash + underscore only;
+            # anything else is suspicious and gets replaced with `_` so
+            # the line stays single-line + parseable. Strict-but-graceful
+            # rather than reject: reject would lose visibility of bad
+            # peer messages entirely.
+            line_channel_safe = re.sub(r'[^A-Za-z0-9_\-]', '_', line_channel or '')
             if fr in ("airc", "sys"):
                 # System events (joins, parts, drain, auth, watchdog).
                 # No sandbox wrap — system-source content is trusted
                 # (originated by airc itself, not a peer).
                 # Example:  airc: [#general] alice joined
-                print(f"airc: [#{line_channel}] {msg_one_line}", flush=True)
+                print(f"airc: [#{line_channel_safe}] {msg_one_line}", flush=True)
             else:
                 # PEER-SUPPLIED content. Sandbox-wrap per vuln-A
                 # mitigation (described in docs/fusion-transport.md
@@ -671,8 +682,12 @@ def run(my_name: str, peers_dir: str) -> int:
                 # Example output:
                 #   airc: [#general] <pm-a3f1b7e2 from="bigmama"
                 #   channel="general" to="alice">quick question</pm-a3f1b7e2>
+                # Outer `[#...]` prefix uses line_channel_safe (sanitized
+                # to alnum+dash+underscore) so a peer can't escape via
+                # the channel name; INSIDE the tag, ch_e is the real
+                # value (XML-escaped) so receivers see the truth.
                 print(
-                    f"airc: [#{line_channel}] {tag_open}\n"
+                    f"airc: [#{line_channel_safe}] {tag_open}\n"
                     f"{msg_e}\n"
                     f"{tag_close}",
                     flush=True,
