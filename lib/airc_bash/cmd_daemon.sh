@@ -53,17 +53,31 @@ cmd_daemon() {
   shift 2>/dev/null || true
   case "$action" in
     -h|--help|help)
-      echo "Usage: airc daemon [install|uninstall|status|log]"
+      echo "Usage: airc daemon [install|uninstall|restart|status|log]"
       echo "  install     register OS auto-restart (launchd/systemd/schtasks)"
       echo "  uninstall   remove auto-restart registration"
+      echo "  restart     uninstall + install (pick up new airc binary)"
       echo "  status      print platform-native unit/plist state + log tail"
       echo "  log [N]     tail the daemon stdout log (default 50 lines)"
       return 0 ;;
     install)   cmd_daemon_install "$@" ;;
-    uninstall|remove|stop) cmd_daemon_uninstall "$@" ;;
+    uninstall|remove) cmd_daemon_uninstall "$@" ;;
+    restart)   shift; cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
     status)    cmd_daemon_status "$@" ;;
     log|logs)  cmd_daemon_log "$@" ;;
-    *)         die "Usage: airc daemon [install|uninstall|status|log]" ;;
+    stop|start)
+      # 2026-05-02 QA caught: 'stop' was silently aliased to uninstall
+      # (removes registration entirely, not just halts the running
+      # process). systemd/launchd convention: stop = halt, disable =
+      # unregister. Pre-fix users typing 'airc daemon stop' got the
+      # daemon UNINSTALLED, which broke auto-restart on next login.
+      # Surface this honestly + point at the right command.
+      die "airc daemon $action is not a verb. Use:
+  airc daemon uninstall   — remove the registration entirely
+  airc daemon restart     — bounce the daemon to pick up new airc binary
+  airc daemon install     — re-register (idempotent if already installed)
+The OS launchd/systemd/HKCU manages start/stop of registered units automatically." ;;
+    *)         die "Usage: airc daemon [install|uninstall|restart|status|log]" ;;
   esac
 }
 
@@ -103,16 +117,12 @@ _daemon_scope() {
 # (daemon present) or just kill the relay silently (no daemon — they
 # need to `airc join` again).
 _daemon_installed() {
-  local os; os=$(detect_platform)
-  case "$os" in
-    darwin)
-      [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] && return 0 ;;
-    linux|wsl)
-      [ -f "$HOME/.config/systemd/user/airc.service" ] && return 0 ;;
-    windows)
-      reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor >/dev/null 2>&1 && return 0 ;;
-  esac
-  return 1
+  # Delegates to airc_daemon_is_installed (lib/airc_bash/lib_daemon_detect.sh).
+  # Kept as a thin wrapper to preserve the local-private-helper shape
+  # callers in this file use; the cross-platform detection logic lives
+  # in the shared detector so install.sh + cmd_connect.sh see the same
+  # answer (Copilot review #388 caught the prior drift).
+  airc_daemon_is_installed
 }
 
 cmd_daemon_install() {
@@ -187,10 +197,37 @@ _daemon_install_launchd() {
 PLIST
   echo "  Wrote $plist_path"
   # Bootout first to reset any prior load (idempotent install).
-  launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 \
-    || die "launchctl bootstrap failed. Plist written but not loaded; check Console.app for errors."
-  launchctl enable "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  # 2026-05-02 QA caught (#9): on a re-install over an existing
+  # daemon (e.g., switching scopes), bootout removes the registration
+  # but the previous launchd-managed PID can still be in-flight when
+  # the next bootstrap fires → "Input/output error 5" (launchd's
+  # "service already loaded" signal). Wait for the PID to actually
+  # exit before bootstrapping the new plist.
+  local _service="com.cambriantech.airc"
+  local _domain="gui/$(id -u)"
+  launchctl bootout "$_domain/$_service" 2>/dev/null || true
+  # Wait up to 3s for launchd to fully unload (poll launchctl list).
+  local _i
+  for _i in 1 2 3 4 5 6; do
+    launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "$_service" || break
+    sleep 0.5
+  done
+  # Bootstrap. Capture stderr for verification — "Input/output error"
+  # can appear even when the bootstrap actually succeeded (launchd's
+  # error reporting on re-bootstrap is unreliable). Don't die() on
+  # stderr alone; verify by checking launchctl list for the service.
+  local _bs_out
+  _bs_out=$(launchctl bootstrap "$_domain" "$plist_path" 2>&1) || true
+  if launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "$_service"; then
+    : # success — service is in launchd's list; bootstrap stderr (if any) is noise
+  else
+    # Genuine failure — service not loaded.
+    if [ -n "$_bs_out" ]; then
+      echo "  ⚠  launchctl stderr: $_bs_out" >&2
+    fi
+    die "launchctl bootstrap failed — service not loaded after bootstrap call. Check Console.app for com.cambriantech.airc errors."
+  fi
+  launchctl enable "$_domain/$_service" 2>/dev/null || true
   _daemon_install_done "Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)" "$scope" \
     "Note: if 'airc canary' / gist push fails under launchd, the gh keychain may not be unlocked at boot. Workaround: 'gh auth status' once after login to unlock; airc daemon picks it up on next restart."
 }
@@ -236,7 +273,15 @@ REM since the new airc bash from the exec is now the daemon.
 cd /d "$cwd_win"
 set AIRC_BACKGROUND_OK=1
 :loop
-"$bash_exe" -c "exec '$airc_bin_unix' connect"
+REM Stdout → daemon.log so the operator + the AI Monitor (when daemon
+REM is being read post-mortem) can see what airc actually emitted.
+REM Pre-fix: stdout went to nowhere (start /MIN cmd window had no
+REM redirect), only daemon.err captured the launcher's own restart
+REM messages — so 'airc daemon log' showed nothing useful, and
+REM "daemon.log doesn't exist" became a real symptom (b69f
+REM 2026-05-02 in #cambriantech). Stderr → daemon.err keeps the
+REM launcher's restart records separate from the airc event stream.
+"$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> "$scope_win\\daemon.log" 2>> "$scope_win\\daemon.err"
 REM Did airc just intentionally re-exec? If marker exists and is recent,
 REM the new airc process from the exec is now the running daemon —
 REM exit the launcher loop instead of racing-respawn it.
@@ -246,12 +291,12 @@ REM date math is too brittle for .bat; "today" is our 60s proxy).
 if exist "$marker_win" (
   forfiles /p "$scope_win" /m airc.reexec-marker /d 0 /c "cmd /c exit 0" >nul 2>&1
   if not errorlevel 1 (
-    echo [%date% %time%] airc re-exec'd into different mode ^(host-takeover or rejoin^); new process is now daemon, launcher exiting. >> daemon.err
+    echo [%date% %time%] airc re-exec'd into different mode ^(host-takeover or rejoin^); new process is now daemon, launcher exiting. >> "$scope_win\\daemon.err"
     del "$marker_win" >nul 2>&1
     exit /b 0
   )
 )
-echo [%date% %time%] airc connect exited. Restarting in 5s. >> daemon.err
+echo [%date% %time%] airc connect exited. Restarting in 5s. >> "$scope_win\\daemon.err"
 timeout /t 5 /nobreak >nul
 goto loop
 EOF
@@ -434,8 +479,24 @@ cmd_daemon_status() {
         # look for the airc-connect process (PPID=1 = orphaned-into-
         # init, which is what `start /B` produces on Windows). Falling
         # back to airc.pid lookup if that fails.
+        # Bug #3 from b69f's 2026-05-02 audit: pre-fix reported RUNNING
+        # whenever ps-ef awk matched, WITHOUT verifying with kill -0.
+        # ps-ef can report zombie/defunct/stale matches. ALWAYS verify
+        # the matched PID with kill -0 before claiming RUNNING.
+        # Also verify the launcher .bat still exists — if registry points
+        # to a deleted path, status must surface STALE rather than say
+        # RUNNING based on an unrelated airc-connect process.
+        local launcher_bat="$scope/airc-daemon.bat"
+        local launcher_status="ok"
+        if [ ! -f "$launcher_bat" ]; then
+          launcher_status="missing"
+        fi
         local live_pid
-        live_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*connect/ && !/grep/ {print $2; exit}')
+        local raw_pid
+        raw_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*connect/ && !/grep/ {print $2; exit}')
+        if [ -n "$raw_pid" ] && kill -0 "$raw_pid" 2>/dev/null; then
+          live_pid="$raw_pid"
+        fi
         if [ -z "$live_pid" ] && [ -f "$scope/airc.pid" ]; then
           local pidfile_pid
           pidfile_pid=$(head -1 "$scope/airc.pid" 2>/dev/null | tr -d '[:space:]')
@@ -443,10 +504,19 @@ cmd_daemon_status() {
             live_pid="$pidfile_pid (from airc.pid)"
           fi
         fi
-        if [ -n "$live_pid" ]; then
-          echo "  Status:  RUNNING (PID $live_pid)"
+        # Status decision tree, in priority order so the user sees the
+        # actionable failure mode first when more than one applies:
+        #   1. launcher_status=missing → MISSING_LAUNCHER (registry
+        #      points to a path that doesn't exist; reinstall needed)
+        #   2. live_pid set + launcher present → RUNNING (truly alive)
+        #   3. launcher present, no live pid → registered (waiting on
+        #      next logon OR daemon was killed; user can re-fire)
+        if [ "$launcher_status" = "missing" ]; then
+          echo "  Status:  MISSING_LAUNCHER ($launcher_bat absent — registry stale; reinstall: airc daemon uninstall && airc daemon install)"
+        elif [ -n "$live_pid" ]; then
+          echo "  Status:  RUNNING (PID $live_pid, launcher exists, kill -0 verified)"
         else
-          echo "  Status:  registered (will start at next logon — or 'airc daemon install' to start now)"
+          echo "  Status:  STALE/STOPPED (launcher exists but no live airc process; will start at next logon — or 'airc daemon install' to start now)"
         fi
       else
         echo "  No daemon installed. Run: airc daemon install"

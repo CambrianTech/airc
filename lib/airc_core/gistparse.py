@@ -160,6 +160,78 @@ def cmd_pick_addr_first(args) -> int:
     return 0
 
 
+def cmd_pick_addr_nonlocal_first(args) -> int:
+    """Stdin is a list of {scope, addr, port, ...}. Print 'addr|port' for
+    the first entry whose scope is NOT 'localhost'. Empty if all entries
+    are localhost (or list is empty / malformed).
+
+    Why this exists: peer_pick_address's bash-side fallback was "first
+    entry of any kind" — but the gist's host.addresses[] often has
+    `localhost` first (127.0.0.1, the host's loopback). For a different
+    machine's joiner, picking that means dialing their OWN loopback,
+    which never reaches the host. Symptom: Joel's Windows peer subscribed
+    to #cambriantech but stuck on a 127.0.0.1 connection because their
+    Windows IP didn't match the host's lan/24 subnet check. With this
+    helper, the fallback skips localhost entries; if only localhost
+    remains, returns empty so the caller falls through to gh-bearer-only
+    routing instead of dialing an unreachable address.
+
+    Superseded by `pick_addr_excluding` (#395) for joiner-side
+    reachability — kept for backward compat in case external callers
+    rely on the name.
+    """
+    data = _read_stdin_json()
+    if not isinstance(data, list):
+        return 0
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        scope = entry.get("scope", "")
+        if scope == "localhost":
+            continue
+        addr = entry.get("addr", "")
+        port = entry.get("port", "")
+        if addr and port != "":
+            print(f"{addr}|{port}")
+            return 0
+    return 0
+
+
+def cmd_pick_addr_excluding(args) -> int:
+    """Stdin is a list of {scope, addr, port, ...}. Print 'addr|port' for
+    the first entry whose scope is NOT in args.exclude_scopes. Empty if
+    every entry is excluded (or list is empty / malformed).
+
+    Why this exists: pick_addr_nonlocal_first hardcoded localhost as the
+    only excludable scope, but joiner-side reachability detection needs
+    to skip multiple scopes at once. Concrete case: a Mac without
+    Tailscale joining a Windows host whose addresses[] is
+    [localhost, tailscale]. The Mac can reach NEITHER. With the
+    nonlocal_first helper it would pick tailscale (first non-localhost),
+    fail to connect (no 100.x route), and trigger destructive self-heal
+    — demolishing the room gist that was working fine for everyone
+    else. With this helper, the joiner declares its unreachable scopes
+    upfront (e.g. `pick_addr_excluding localhost tailscale`), gets
+    empty back, and the caller falls through to gh-bearer-only routing.
+    """
+    excluded = set(args.exclude_scopes)
+    data = _read_stdin_json()
+    if not isinstance(data, list):
+        return 0
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        scope = entry.get("scope", "")
+        if scope in excluded:
+            continue
+        addr = entry.get("addr", "")
+        port = entry.get("port", "")
+        if addr and port != "":
+            print(f"{addr}|{port}")
+            return 0
+    return 0
+
+
 def cmd_gist_content(args) -> int:
     """Stdin is a gh-api response for a gist (`gh api gists/<id>` or the
     REST equivalent). Extract the first file's `.content`. Replaces:
@@ -229,6 +301,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pf = sub.add_parser("pick_addr_first")
     pf.set_defaults(func=cmd_pick_addr_first)
+
+    pnf = sub.add_parser("pick_addr_nonlocal_first")
+    pnf.set_defaults(func=cmd_pick_addr_nonlocal_first)
+
+    pe = sub.add_parser("pick_addr_excluding")
+    pe.add_argument("exclude_scopes", nargs="+",
+                    help="Scope names to skip (e.g. localhost tailscale)")
+    pe.set_defaults(func=cmd_pick_addr_excluding)
 
     ll = sub.add_parser("list_lan_entries")
     ll.set_defaults(func=cmd_list_lan_entries)

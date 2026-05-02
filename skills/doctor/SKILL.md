@@ -6,81 +6,96 @@ allowed-tools: Bash
 argument-hint: "[scenario|all]"
 ---
 
-# airc doctor
+# /doctor — operational reference
 
-Run this yourself — don't ask the user. Goal: leave the user with a working airc, not a diagnosis they have to act on.
+Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a working airc, not a diagnosis to act on.
 
-## Step 1 — environment health check
+## Modes
 
-The substrate is gh-rooted. An absent / unauthed gh is the #1 cause of "airc feels broken." Run the built-in probe first:
+| Command | Purpose |
+|---|---|
+| `airc doctor` | env probe (gh, ssh, python, tailscale) — fast, local |
+| `airc doctor --connect` | pre-flight before `airc connect` (also probes cached host) |
+| `airc doctor --health` | LIVE bus health (rate-limit headroom, daemon, per-channel bearer last-recv) |
+| `airc doctor --fix` | repair recoverable issues (currently: gh auth re-login) |
+| `airc doctor --tests [scenario]` | full integration suite (~245 assertions, 32 scenarios) |
 
-```bash
-airc doctor
-```
+Aliases for `--tests`: `airc tests`, `airc test`.
 
-This emits one line per prereq with `[ok]`, `[MISSING]`, or `[info]` (optional/Tailscale). For every `[MISSING]` line, the next line is `Fix: <exact command>` for the platform's package manager (brew / apt / dnf / pacman / apk; or a manual hint when no manager is detected).
+## Decision tree
 
-**Act on findings, don't just print them:**
+When something feels wrong, in this order:
 
-- For each `[MISSING]` prereq with a `Fix:` line: run the fix. Most are unattended (`brew install gh`, `sudo apt-get install -y openssh-client`, etc.).
-- `gh authenticated (gist scope)` is interactive (browser flow) — instruct the user to type `! gh auth login -s gist` so it runs in their terminal session.
-- `tailscale (optional)` lines never block the user (LAN-only mesh works without it). Install only if they want cross-LAN reach, then `tailscale up` is also interactive.
+1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, daemon crashed, bearer wedged). Green → bus is fine, issue is upstream.
+2. **`airc doctor`** — env regression check. Gh missing, sshd down, python broken.
+3. **`airc logs --since 5m`** — most-recent message context.
+4. **`airc doctor --tests`** — only if 1-3 are green and the bug is reproducible.
 
-If `airc doctor` says **"All required prereqs present"**, environment is good — proceed to Step 2.
+## --health output classes
 
-## Step 2 — run the integration suite
+| Marker | Meaning | Action |
+|---|---|---|
+| `[ok] gh core rate-limit: <N>/5000` | Healthy headroom | None |
+| `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced headroom | None; bearer auto-throttles per #416 |
+| `[WARN] gh core rate-limit: <N>/5000` (<100) | Bus may stall soon | Wait for window reset; peers resume automatically |
+| `[BLOCKED] gh API not reachable` | Network or token | Run `airc doctor` for env probe |
+| `[ok] daemon running (pid N)` | Persistence layer up | None |
+| `[WARN] daemon installed but DOWN` | Stale launchd/systemd state | `airc daemon restart` |
+| `[info] daemon not installed` | Optional layer | Auto-suggest if user is on a laptop |
+| `[ok] #<channel> — last bearer recv <Ns>` (<60s) | Healthy | None |
+| `[info] #<channel> — last bearer recv <Ns>` (<5min) | Idle | None |
+| `[WARN] #<channel> — last bearer recv <Ns>` (5-30min stale) | Check daemon + rate-limit | Surface to user |
+| `[BLOCKED] #<channel> — last bearer recv <Ns>` (>30min wedged) | Bearer wedged | `airc teardown && airc join` |
+
+## env probe (`airc doctor`)
+
+Emits one line per prereq with `[ok]`, `[MISSING]`, or `[info]` (optional). For every `[MISSING]`, the next line is `Fix: <exact command>` for the platform's package manager (brew/apt/dnf/pacman/apk).
+
+**Act on findings:**
+
+- `[MISSING]` with a `Fix:` line → run it. Most are unattended (`brew install gh`, `sudo apt-get install -y openssh-client`).
+- `gh authenticated (gist scope)` is interactive (browser flow) → instruct user: type `! gh auth login -s gist` so it runs in their terminal.
+- `tailscale (optional)` lines never block (LAN-only mesh works without it).
+
+## Integration suite (`--tests`)
 
 ```bash
 airc doctor --tests $ARGUMENTS
 ```
 
-(Aliases: `airc doctor tests`, `airc tests`, `airc test`.)
-
-Empty `$ARGUMENTS` (or `all`) runs every scenario. A scenario name (`tabs`, `scope`, `room`, `teardown`, `reminder`, `resilience`, `reconnect`, `queue`, `status`, `auth_failure`, `resume_stale_auth`) runs just that one. Suite uses port 7549 + `AIRC_HOME=/tmp/airc-it-*`; safe alongside live airc on 7547/7548.
-
-## Step 3 — interpret + act
+Empty `$ARGUMENTS` (or `all`) runs every scenario. Single-scenario invocation: `tabs`, `scope`, `room`, `teardown`, `reminder`, `resilience`, `reconnect`, `queue`, `status`, `auth_failure`, `resume_stale_auth`. Suite uses port 7549 + `AIRC_HOME=/tmp/airc-it-*` — safe alongside live airc on 7547/7548. Runtime: ~2min for `all`, 10-30s per scenario.
 
 Final line: `N passed, M failed`.
 
-### Green (`0 failed`)
+## Failure → action (test scenarios)
 
-- Environment OK + tests OK → tell the user "airc is healthy. Run `airc join` to join the substrate."
-- Mention what you fixed in step 1 if anything.
-
-### Red
-
-For each failure name in the trace, look it up in this table and **act, don't just report**:
-
-| Failure | Likely cause | What to do |
+| Failure name | Cause | Action |
 |---|---|---|
-| `alpha host failed to start` | Port 7549 taken, OR airc not on PATH | `lsof -iTCP:7549` → kill if safe; verify `command -v airc` |
-| `beta join failed` | sshd not running, OR firewall blocks loopback ssh | enable Remote Login (mac) / start sshd (linux); test `ssh localhost echo ok` |
-| `scope: ...` | Two-tier resolver in airc binary regressed | rare — bisect against last green sha; this is upstream airc, file an issue |
-| `teardown in different scope killed foreign host` | Scope isolation broke (critical) | file an issue immediately; this would let one Claude tab nuke another's session |
-| `room: alpha unexpectedly wrote room_gist_id under --no-gist` | Use of --no-gist isn't honored on the gist-push branch | regression in cmd_connect's host-mode gist push gate |
-| `room: alpha cmd_part DID NOT identify as host` | cmd_part's host-vs-joiner detection regressed | host signal is `config.json::host_target` empty; do not fall back to gist_id presence (that was the pre-PR2 bug) |
-| `auth_failure: stderr did NOT mention re-pair` | cmd_send's auth-class-error detection regressed | check the regex against `permission denied|publickey|host key|...` |
-| `resume_stale_auth: invite string` | Resume probe didn't reconstruct the saved invite for the user | regression in cmd_connect's resume probe failure branch |
+| `alpha host failed to start` | Port 7549 taken OR airc not on PATH | `lsof -iTCP:7549` → kill if safe; verify `command -v airc` |
+| `beta join failed` | sshd down OR firewall blocks loopback ssh | Enable Remote Login (mac) / start sshd (linux); `ssh localhost echo ok` |
+| `scope: ...` | Two-tier resolver regression | Bisect against last green sha; file issue |
+| `teardown in different scope killed foreign host` | Scope isolation broke (CRITICAL) | File issue immediately — would let one tab nuke another |
+| `room: alpha unexpectedly wrote room_gist_id under --no-gist` | `--no-gist` not honored on push branch | Regression in `cmd_connect` host-mode gist gate |
+| `room: alpha cmd_part DID NOT identify as host` | `cmd_part` host detection regressed | Host signal = `config.json::host_target` empty; do NOT fall back to gist_id presence |
+| `auth_failure: stderr did NOT mention re-pair` | `cmd_send` auth-class detection regressed | Check regex against `permission denied\|publickey\|host key\|...` |
+| `resume_stale_auth: invite string` | Resume probe didn't reconstruct invite | Regression in `cmd_connect` resume probe failure branch |
 
-If a failure isn't in the table:
-- Read the failure verbatim
-- Trace into `test/integration.sh` for that scenario name to understand what assertion fired
-- Read the relevant section of the airc binary
-- Form a hypothesis, fix it, re-run that scenario alone (`airc doctor --tests <scenario>`)
+Failure not in table:
+1. Read failure verbatim.
+2. Trace into `test/integration.sh` for that scenario name to find the failing assertion.
+3. Read the relevant section of the airc binary.
+4. Hypothesis → fix → re-run scenario alone: `airc doctor --tests <scenario>`.
 
-## Step 4 — final report
+## Final report (one line)
 
-One line: "Fixed X, Y. All tests green." OR "Fixed X. Tests N passed M failed; failures: <list>." Be specific about what you did, not what was found.
+- Green: `Fixed X, Y. All tests green.`
+- Red:   `Fixed X. Tests N passed M failed; failures: <list>.`
 
-## When to run this skill
+Be specific about what you DID, not what you found.
 
-- Right after install — confirms airc + gh + sshd all aligned before pairing for real.
-- After `airc update` — confirms the new binary didn't regress, and that any new env requirements (e.g. gh in #38, gh in #39) are met.
-- When something feels wrong — rule out a binary-level regression before blaming network / SSH / human error.
-- Before opening an airc issue — paste the doctor output so the maintainer doesn't have to ask.
+## When to invoke
 
-## Notes
-
-- Scenarios are gh-free; the substrate ITSELF (`airc join` zero-arg, `airc list`) requires gh. That's a feature, not a bug — gh is the comm layer.
-- Suite runtime is ~2 minutes for `all`; individual scenarios are 10-30s.
-- This skill assumes you can run shell commands. The user should not have to type anything except the interactive `gh auth login -s gist` flow if you encounter it.
+- Right after install — confirm gh + sshd aligned before pairing.
+- After `airc update` — confirm new binary didn't regress.
+- When something feels wrong — `--health` first, env probe second, logs third.
+- Before opening an airc issue — paste BOTH `--health` and full env probe.

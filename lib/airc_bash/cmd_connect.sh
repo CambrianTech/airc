@@ -252,6 +252,41 @@ cmd_connect() {
   # is alive — exactly the Carl-experience win for cross-vendor mesh.
   local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
+    # 2026-05-02 QA caught (B5): if user passed --room NEWNAME and that
+    # name is NOT in subscribed_channels yet, the user's intent is
+    # "subscribe to a NEW room" — NOT "check if I'm already in mesh".
+    # Pre-fix the short-circuit always returned 0, blocking multi-room
+    # workflow. Now: if the requested room is fresh, fall through to
+    # the subscribe path so it gets added.
+    local _add_subscription=0
+    if [ "$room_explicit" = "1" ] && [ -n "$room_name" ] && [ -f "$CONFIG" ]; then
+      local _existing_subs; _existing_subs=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+      if ! printf '%s\n' "$_existing_subs" | grep -qFx "$room_name"; then
+        _add_subscription=1
+      fi
+    fi
+    if [ "$_add_subscription" = "1" ]; then
+      echo "  airc connect: monitor already running; subscribing to additional room #${room_name}..."
+      # Add #room_name to subscribed_channels + resolve its gist
+      # (create if missing). The bearer for this channel will be
+      # picked up on the next _monitor_multi_channel cycle (which
+      # re-reads channel_map at top of each outer poll).
+      "$AIRC_PYTHON" -m airc_core.config subscribe --config "$CONFIG" --channel "$room_name" 2>/dev/null || true
+      # Resolve --create-if-missing: returns the gist id (find existing
+      # or create new gist named "airc room: #<channel>").
+      local _new_gist; _new_gist=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+          --channel "$room_name" --create-if-missing 2>&1)
+      if [ -n "$_new_gist" ] && printf '%s' "$_new_gist" | grep -qE '^[0-9a-f]{32}$'; then
+        # Save the channel→gist mapping in config so cmd_send can route to it.
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$room_name" --gist-id "$_new_gist" 2>/dev/null || true
+        echo "  ✓ Subscribed to #${room_name} (gist $_new_gist). Bearer respawn picks it up within ~30s."
+      else
+        echo "  ⚠ Subscribed to #${room_name} but gist resolve failed: $_new_gist"
+        echo "  Bearer may not pick up new room until next cycle. Try: airc list to verify gist."
+      fi
+      return 0
+    fi
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
     echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
     echo "    To stop it:        airc teardown"
@@ -271,44 +306,29 @@ cmd_connect() {
   # at connect time so the user gets a clear error instead of a
   # mystery timeout.
   #
-  # Gated on use_room=1: when the user opts into legacy 1:1 invite
-  # mode (--no-room), the substrate isn't used and gh is irrelevant.
-  # The CI clean-install smoke test specifically exercises that
-  # offline path with no gh auth — pre-#338 the unconditional check
-  # killed it before the host loop could start (PR #338 regression).
-  #
-  # Skipped entirely if a live monitor exists in this scope (handled
-  # by the trust-existing-monitor short-circuit above).
-  if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
-    if ! gh auth status >/dev/null 2>&1; then
-      # `gh auth status` probes /user, which returns 403 during a GitHub
-      # secondary rate limit (abuse detection) and which gh then misreports
-      # as "token invalid". The /rate_limit endpoint is reachable during
-      # secondary limits — if it works, the token is fine and the user
-      # just needs to wait, not re-auth. Issue #341.
-      echo "" >&2
-      if gh api rate_limit >/dev/null 2>&1; then
-        echo "  ! GitHub secondary rate limit (abuse detection) triggered." >&2
-        echo "    Your token is fine — wait 5-15 minutes and retry 'airc join'." >&2
-        echo "" >&2
-        echo "    Why this is confusing: 'gh auth status' calls /user which gets 403'd" >&2
-        echo "    during secondary rate limits; gh then prints 'token invalid'. The" >&2
-        echo "    /rate_limit endpoint is reachable, which proves the token works." >&2
-        echo "" >&2
-        echo "    Caused by: too many gh API calls in a short window (polling loops," >&2
-        echo "    rapid-fire PR/issue/comment activity, etc.)." >&2
-        die "GitHub rate-limited — retry in 5-15 min (token is fine)"
-      else
-        echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
-        echo "    Detail:" >&2
-        gh auth status 2>&1 | sed 's/^/      /' >&2
-        echo "" >&2
-        echo "    Fix:  gh auth login -h github.com" >&2
-        echo "" >&2
-        echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
-        die "gh auth invalid — run 'gh auth login -h github.com' first"
-      fi
-    fi
+  # Skip cases (gh isn't needed):
+  #   1. --no-room → user opted into legacy 1:1 invite mode (no
+  #      substrate). Pre-#338 the unconditional check killed CI's
+  #      clean-install smoke test which exercises this path.
+  #   2. Inline invite-string positional arg (`name@user@host[:port]#pubkey`)
+  #      → JOIN MODE legacy direct-pair, also no substrate. The
+  #      integration suite's spawn_joiner uses this; pre-fix the
+  #      check fired and CI runners (no PAT) failed every joiner.
+  #      Pattern matches what JOIN MODE itself parses at line ~862.
+  #   3. Live monitor exists in this scope (trust-existing-monitor
+  #      short-circuit above already returned).
+  local _looks_like_invite=0
+  if [ "$#" -ge 1 ] && [[ "$1" == *@*@*#* ]]; then
+    _looks_like_invite=1
+  fi
+  if [ "$use_room" = "1" ] && [ "$_looks_like_invite" = "0" ] \
+     && command -v gh >/dev/null 2>&1; then
+    # Pre-flight via the centralized state machine (lib_auth.sh).
+    # ok → proceed; rate_limited → wait + retry (token fine);
+    # invalid → airc instigates the browser self-heal in-process;
+    # not_installed → caller's outer guard already handled this.
+    airc_ensure_gh_auth_or_heal "airc join" \
+      || die "gh auth not OK — see message above for next step"
   fi
 
   # Issue #136: --general re-opt-in. Clear parted state on primary
@@ -906,6 +926,26 @@ cmd_connect() {
     # This is what makes Tailscale truly optional — same-machine and
     # same-LAN peers connect via 127.0.0.1 / LAN IP regardless of the
     # invite string's host:port (which historically advertised one IP).
+    #
+    # `_addr_picker_state` tracks what happened so the self-heal block
+    # below can decide whether nuking the host's gist is justified:
+    #   "no_addrs"    — host published no addresses[] (legacy gist or
+    #                   pre-multi-address protocol). We tried only the
+    #                   invite-string ssh_target. Self-heal allowed —
+    #                   we have no other reachability info to act on.
+    #   "picked"      — picker returned a believed-reachable address
+    #                   AND we used it. If THAT failed, the host really
+    #                   does seem dead. Self-heal allowed.
+    #   "no_match"    — host published addresses[] BUT picker found
+    #                   no scope this peer can reach (e.g. Mac without
+    #                   tailscale + Windows host whose only non-
+    #                   localhost entry is tailscale). Falling through
+    #                   to invite-string ssh_target is no more reachable
+    #                   than what the picker rejected. Self-heal here
+    #                   would nuke the gist for OTHER peers who CAN
+    #                   reach the host — destructive cross-peer
+    #                   damage from one peer's network mismatch.
+    local _addr_picker_state="no_addrs"
     if [ -n "$_resolved_addresses_json" ] && [ "$_resolved_addresses_json" != "null" ]; then
       local _picked; _picked=$(peer_pick_address "$_resolved_addresses_json" "$_resolved_host_machine_id")
       if [ -n "$_picked" ]; then
@@ -918,6 +958,9 @@ cmd_connect() {
         ssh_target="${_ssh_user:+${_ssh_user}@}${_picked_addr}"
         peer_port="$_picked_port"
         echo "  ✓ Multi-address pick: ${_picked_addr}:${_picked_port} (from host.addresses)"
+        _addr_picker_state="picked"
+      else
+        _addr_picker_state="no_match"
       fi
     fi
 
@@ -1065,13 +1108,26 @@ except Exception:
       #      room name. AIRC_NO_DISCOVERY=1 so we don't re-find the gist
       #      we just deleted (gh propagation lag).
       #
-      # Only fires when ALL three are true:
+      # Only fires when ALL FOUR are true:
       #   - We resolved a kind:room gist (resolved_room_name + _resolved_gist_id non-empty)
       #   - gh CLI is available (to delete the stale gist)
       #   - Pair handshake failed (TCP unreachable / timeout)
+      #   - Address picker either succeeded ("picked") OR host published
+      #     no addresses[] at all ("no_addrs"). If picker ran but found
+      #     no reachable scope ("no_match"), the failure is THIS peer's
+      #     network mismatch — not host-down. Nuking the gist would
+      #     destroy reachability for other peers who CAN reach the host.
+      #     Bug observed live 2026-05-02: a Mac without tailscale joined
+      #     a Windows host whose only non-localhost entry was tailscale,
+      #     fell through to the invite-string ssh_target, TCP timed out,
+      #     self-heal nuked the gist that 4 other peers were happily
+      #     using. The address-picker reachability check (#397) prevents
+      #     the most common shape of this; this guard catches the
+      #     remaining "invite-string fallback after no_match" path.
       # If any condition isn't met, fall through to the original die().
       if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
-         && command -v gh >/dev/null 2>&1; then
+         && command -v gh >/dev/null 2>&1 \
+         && [ "$_addr_picker_state" != "no_match" ]; then
         echo ""
         echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
         echo "     (prior host's gist: $_resolved_gist_id)"
@@ -1083,6 +1139,19 @@ except Exception:
         # caught only by running two tabs against a stale gist
         # simultaneously, NOT by the integration test).
         _self_heal_stale_host "$_resolved_gist_id"
+      elif [ "$_addr_picker_state" = "no_match" ]; then
+        # Picker found no scope this peer can reach. Surface the situation
+        # but do NOT nuke the gist. The host may be perfectly reachable
+        # for peers on the other matching scope (e.g. peers on the same
+        # tailnet when WE lack tailscale). Per the global "evidence is
+        # for the debugger, not the trash" rule — print explicit reason
+        # so users debugging "why didn't I auto-pair" know it's a network
+        # topology mismatch rather than a host-down event.
+        echo "" >&2
+        echo "  ⚠  Host of #${resolved_room_name} published no scope this peer can reach." >&2
+        echo "     Skipping self-heal (gist preserved for peers who CAN reach the host)." >&2
+        echo "     Direct pair unavailable; gh-bearer broadcasts still work via gist." >&2
+        echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
@@ -1216,6 +1285,16 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       echo "  Connected to '$peer_name' (SSH verified, reminder: ${host_reminder}s)"
     else
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
+    fi
+
+    # Daemon-install discoverability on the joiner success-path (#5 from
+    # b69f's 2026-05-02 daemon audit). Pre-fix the prompt only fired
+    # at install.sh time + the post-disconnect tip in the host branch
+    # (line ~1763). Daily 'airc join' users never saw it. Adding here
+    # so every successful joiner gets the visibility — non-blocking,
+    # silent on already-installed scopes (idempotent check).
+    if ! airc_daemon_is_installed; then
+      echo "  Tip: 'airc daemon install' keeps this mesh alive across Claude session ends + sleep/wake."
     fi
 
     # Write PID file so `airc teardown` can find us later.
@@ -1721,6 +1800,21 @@ JSON
             echo "    airc connect $_invite_long"
             echo ""
             echo "  (Room gist: $_gist_url — persistent; deleted on 'airc part'.)"
+            # First-time-host daemon hint (#382). The reconnect-loop in the
+            # airc top-level already prints the "(for auto-recovery: airc
+            # daemon install)" tip — but only AFTER the mesh has gone down.
+            # Surface it earlier here, on first host-bootstrap, so the user
+            # can flip auto-restart on while their mesh is still healthy.
+            # Only fires when the daemon isn't already installed (idempotent
+            # re-runs / re-hosts stay silent). Uses the centralized
+            # cross-platform detector (lib_daemon_detect.sh) so this fires
+            # correctly on darwin / linux / wsl / windows. Pre-fix this
+            # block only checked Darwin/Linux file paths and never fired
+            # on Windows where the daemon lives in HKCU\...\Run (Copilot
+            # review on PR #388 caught this gap).
+            if ! airc_daemon_is_installed; then
+              echo "  Tip: 'airc daemon install' keeps this mesh alive across machine sleep."
+            fi
           else
             echo "  On the other machine (pick whichever is easiest to share):"
             echo ""

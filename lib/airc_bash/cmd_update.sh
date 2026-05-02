@@ -33,6 +33,7 @@ cmd_update() {
   local dir="${AIRC_DIR:-$HOME/.airc-src}"
   local channel_file="$dir/.channel"
   local requested_channel=""
+  local force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help)
@@ -50,6 +51,7 @@ cmd_update() {
         ;;
       --canary) requested_channel="canary"; shift ;;
       --main)   requested_channel="main";   shift ;;
+      --force|-f) force=1; shift ;;
       *) shift ;;
     esac
   done
@@ -74,10 +76,6 @@ cmd_update() {
   # surfaced a hostile install.sh failure with no recovery path. Either
   # auto-stash with --force, OR print a single-line copy-pasteable
   # recovery suggestion. Defaults to safety (refuse without consent).
-  local force=0
-  for _arg in "$@"; do
-    case "$_arg" in --force|-f) force=1 ;; esac
-  done
   if ! git -C "$dir" diff --quiet 2>/dev/null || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
     if [ "$force" = "1" ]; then
       echo "  ⚠  Local mods detected in $dir; --force passed → auto-stash."

@@ -147,6 +147,21 @@ cmd_send() {
   # Mixed:          airc msg @user1,user2 @user3 message
   local peer_name="" msg=""
   local _peer_csv=""
+  # Pre-process: if first arg starts with `@` AND contains whitespace,
+  # the user ran `airc msg "@peer message text"` (single quoted arg).
+  # 2026-05-02 QA catch (#10): the strict charset reject below would
+  # die on the spaces. Split on first whitespace: front = @peer-token,
+  # rest = message body. Common UX intuition; matches IRC `/msg peer
+  # the message`. Bash's set -- rebuild positional args.
+  if [ $# -ge 1 ]; then
+    case "$1" in
+      @*[[:space:]]*)
+        local _front="${1%% *}"
+        local _back="${1#* }"
+        set -- "$_front" "$_back" "${@:2}"
+        ;;
+    esac
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
       @*)
@@ -340,23 +355,73 @@ cmd_send() {
         return 0
         ;;
       auth_failure)
-        # Hard failure. Don't queue — every retry will fail identically.
-        # Pre-fix the message claimed 'SSH auth' which was leftover from
-        # the SSH era; post-3c the bearer is gh and the only auth that
-        # can fail is gh's. Direct the user to gh auth login so they
-        # can recover without rebuilding their identity.
+        # Don't queue — every retry will fail identically until the
+        # underlying auth is fixed. airc IS the instigator: trigger
+        # browser self-heal flow via the centralized state machine,
+        # then retry the send ONCE if heal succeeded.
+        # Joel: "gh logouts are FREQUENT" / "script needs to self-heal".
+        if airc_ensure_gh_auth_or_heal "airc send → $peer_name (#$active_channel)"; then
+          # Auth restored. Retry once. We don't loop — if the retry
+          # fails too, something else is going on (scope missing? gist
+          # deleted?) and the user needs to see the original error.
+          echo "  ↻ Retrying send post-heal..." >&2
+          local retry_outcome retry_kind retry_detail
+          # Pre-fix called undefined `send_via_bearer` (Copilot caught
+          # this on PR #422 review — would crash at runtime under
+          # set -euo pipefail). Re-invoke the same bearer_cli pipeline
+          # the initial send used (lines ~316-320) so the retry path is
+          # exactly the original send path replayed against fresh auth.
+          retry_outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+            "$peer_name" "$active_channel" \
+            --host-target "$host_target" \
+            --remote-home "$rhome" \
+            --room-gist-id "$room_gist_id" 2>&1) || true
+          retry_kind=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+          retry_detail=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+          if [ "$retry_kind" = "delivered" ]; then
+            echo "  ✓ Sent post-heal." >&2
+            return 0
+          fi
+          echo "  ✗ Retry post-heal also failed (kind=$retry_kind detail=$retry_detail)" >&2
+          # Fall through to the failure-marker block so the message is
+          # recorded as failed in the local log + user sees the error.
+        fi
         local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GH AUTH FAILED to %s — re-auth required, NOT queued] %s"}' \
           "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
         echo "$fail_marker" >> "$MESSAGES"
         echo "" >&2
-        echo "  ✗ gh auth check failed — your GitHub token is dead." >&2
-        echo "    Bearer detail: ${detail}" >&2
+        echo "  ✗ gh auth check failed (post-heal-attempt) — bearer detail: ${detail}" >&2
+        echo "    Re-run 'airc send' to retry the self-heal flow," >&2
+        echo "    or fix manually: gh auth login -h github.com -s gist" >&2
+        echo "    No state lost; no re-pair needed — gh's keyring expired." >&2
+        die "gh auth failure — re-run 'airc send' or 'gh auth login -h github.com -s gist'"
+        ;;
+      gone)
+        # Permanent destination loss (#381 layer A — HTTP 404 on the
+        # gist). Joiner-side mirror of the host-branch handler below:
+        # clear stale mapping, surface [GONE] marker, do NOT queue
+        # (retries would all 404 too). Recovery: airc join --room
+        # rediscovers / re-hosts.
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$active_channel" --gist-id "" \
+          >/dev/null 2>&1 || true
+        local gone_marker; gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
+          "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${detail:-no detail}")
+        echo "$gone_marker" >> "$MESSAGES"
         echo "" >&2
-        echo "    Fix:  gh auth login -h github.com" >&2
-        echo "" >&2
-        echo "    After re-authenticating, retry your message. No state lost," >&2
-        echo "    no re-pair needed — it's just gh's keyring that expired." >&2
-        die "gh auth failure — run 'gh auth login -h github.com' and retry"
+        echo "  ✗ Gist for #${active_channel} returned 404 — channel dissolved." >&2
+        echo "    Stale channel_gists[${active_channel}] cleared." >&2
+        echo "    Re-host:  airc join --room ${active_channel}" >&2
+        ;;
+      secondary_rate_limit)
+        # gh secondary throttle (#381 layer A). Queue + distinct marker.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local rate_marker; rate_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[RATE-LIMITED on gh secondary throttle — queued, will retry once gh window clears (60-180s)] %s"}' \
+          "$(timestamp)" "$active_channel" "${detail:-no detail}")
+        echo "$rate_marker" >> "$MESSAGES"
+        echo "  ⏳ gh secondary rate limit — message queued. Drain loop retries when window clears (~60-180s)." >&2
+        echo "  Avoid sending more for ~2 minutes." >&2
+        echo "  Bearer: ${detail:-<none>}" >&2
         ;;
       transient_failure|"")
         # Network-class failure or empty/malformed outcome → treat as
@@ -436,9 +501,6 @@ cmd_send() {
       die "monitor down — refusing to silently broadcast into a void"
     fi
 
-    # Local audit log — plaintext, the user's own record of what they sent.
-    echo "$full_msg" >> "$MESSAGES"
-
     # Phase 3c critical fix (#285): host-side cmd_send must ALSO publish
     # to the room gist so joiners (who poll the gist via GhBearer) see
     # broadcasts and DMs from the host. Pre-3c, joiners tailed the host's
@@ -484,17 +546,113 @@ cmd_send() {
       _host_outcome=$(printf '%s' "$_host_wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
         "$peer_name" "$active_channel" \
         --room-gist-id "$_host_room_gist_id")
-      local _host_kind
+      local _host_kind _host_detail
       _host_kind=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+      _host_detail=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
       case "$_host_kind" in
-        delivered) : ;;
+        delivered)
+          # Append to local audit log only on confirmed delivery. Pre-fix
+          # this happened unconditionally before the publish attempt, so
+          # the user's own monitor would echo their message back even when
+          # joiners never saw it — false success surface (#381 RCA).
+          echo "$full_msg" >> "$MESSAGES"
+          ;;
+        auth_failure)
+          # Hard failure mirror of joiner branch above. Don't queue —
+          # every retry hits the same dead token. Surface re-auth path
+          # loudly + die so the caller knows to fix gh before retrying.
+          local _host_fail_marker; _host_fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GH AUTH FAILED on host gist publish — re-auth required, NOT queued] %s"}' \
+            "$(timestamp)" "$active_channel" "${_host_detail:-no detail}")
+          echo "$_host_fail_marker" >> "$MESSAGES"
+          echo "" >&2
+          echo "  ✗ gh auth check failed during host gist publish — your GitHub token is dead." >&2
+          echo "    Bearer detail: ${_host_detail}" >&2
+          echo "" >&2
+          echo "    Fix:  gh auth login -h github.com -s gist" >&2
+          echo "" >&2
+          echo "    The -s gist scope is required — token without it can authenticate but can't publish to gists." >&2
+          echo "    After re-authenticating, retry. No state lost — it's just gh's keyring that expired." >&2
+          die "gh auth failure on host gist publish — run 'gh auth login -h github.com -s gist' and retry"
+          ;;
+        gone)
+          # Permanent destination loss (#381 layer A — HTTP 404 on the
+          # gist). The room dissolved: peer ran `airc part`, gh deleted
+          # the gist, or the gist was wiped. Retrying is futile — the
+          # next send + every send after will keep returning 404.
+          #
+          # Recovery: drop the stale channel_gists entry so the next
+          # `airc join --room <name>` (by us or another peer) creates a
+          # fresh canonical gist instead of polling the dead one. Also
+          # surface a [GONE] marker so the user knows their message was
+          # NOT delivered AND why — pre-fix the substrate had no signal
+          # for "this channel is gone forever" so users sent into a void
+          # for hours not knowing.
+          #
+          # Do NOT queue: pending.jsonl drains via the SAME publish path
+          # which would also return 404 every retry, just consuming gh
+          # API budget for nothing. Drop the message on the floor with
+          # loud surface (the [GONE] marker) — same UX as auth_failure
+          # but a different remedy.
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$active_channel" --gist-id "" \
+            >/dev/null 2>&1 || true
+          local _host_gone_marker; _host_gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
+            "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${_host_detail:-no detail}")
+          echo "$_host_gone_marker" >> "$MESSAGES"
+          echo "" >&2
+          echo "  ✗ Gist for #${active_channel} returned 404 — channel dissolved (peer ran 'airc part', gh deleted, or wiped)." >&2
+          echo "    Bearer detail: ${_host_detail}" >&2
+          echo "    Stale channel_gists[${active_channel}] cleared from config." >&2
+          echo "" >&2
+          echo "    To re-host this channel: airc join --room ${active_channel}" >&2
+          echo "    To wait for a peer to take over: leave it; next 'airc join' that resolves the mesh-singleton will publish a fresh gist." >&2
+          ;;
+        secondary_rate_limit)
+          # gh per-burst write throttle (#381 layer A — HTTP 403 with
+          # "rate limit exceeded" / "secondary rate limit" body). Every
+          # peer on this gh account writing concurrently can trip this;
+          # primary rate stays nominal but the secondary clamps for
+          # 60-180s. Re-auth does not help; only waiting does.
+          #
+          # Queue + emit a DISTINCT marker so users see this is the
+          # rate-limit case (not generic transient/network) and know to
+          # back off their own sends until it clears. flush_pending_host_loop
+          # will drain on the next cycle when bearer_gh.send returns
+          # delivered again.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          local _host_rate_marker; _host_rate_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[RATE-LIMITED on gh secondary throttle — %d msg(s) queued, will retry once gh window clears (60-180s)] %s"}' \
+            "$(timestamp)" "$active_channel" "$(wc -l < "$AIRC_WRITE_DIR/pending.jsonl" | tr -d " ")" "${_host_detail:-no detail}")
+          echo "$_host_rate_marker" >> "$MESSAGES"
+          echo "  ⏳ gh secondary rate limit hit — broadcast queued. Drain loop will retry once the burst window clears (60-180s typical)." >&2
+          echo "  Avoid sending more for ~2 minutes to let the throttle clear." >&2
+          echo "  Bearer: ${_host_detail:-<none>}" >&2
+          ;;
+        transient_failure|"")
+          # Mirror joiner-side queue/drain symmetry (#381 layer B). Pre-fix
+          # the host branch printed a warning + dropped the message on
+          # the floor: exit 0 with the broadcast never reaching peers.
+          # Now the message goes to pending.jsonl + a [QUEUED] marker
+          # surfaces in the user's own log so the chat widget reads
+          # 'queued for retry' instead of 'sent successfully'.
+          # flush_pending_host_loop (in airc top-level) drains this on
+          # the same 5s tick joiners use.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          local _host_queue_marker; _host_queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to gist %s — network error, will retry] %s"}' \
+            "$(timestamp)" "$active_channel" "$_host_room_gist_id" "${_host_detail:-no detail}")
+          echo "$_host_queue_marker" >> "$MESSAGES"
+          echo "  Network error reaching gist — broadcast queued for retry. Monitor will flush when gist returns." >&2
+          echo "  Bearer: ${_host_detail:-<none>}" >&2
+          ;;
         *)
-          echo "  ⚠ Gist publish failed (kind=${_host_kind:-empty}); broadcast did not reach joiners." >&2
-          echo "    Local audit log has the message; joiners polling the gist see nothing." >&2
+          # Unknown kind — bearer_cli added an outcome without updating
+          # callers. Queue defensively + log loudly so it gets caught.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          echo "  Unknown bearer outcome kind '${_host_kind}' on host send (detail: ${_host_detail}). Queued defensively. Update cmd_send.sh." >&2
           ;;
       esac
     else
       echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
+      echo "$full_msg" >> "$MESSAGES"
     fi
   fi
 

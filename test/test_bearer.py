@@ -1104,6 +1104,146 @@ class GhBearerSendTests(unittest.TestCase):
             b.send("alice", "general", b'{"x":1}')
 
 
+class GhBearerErrorClassificationTests(unittest.TestCase):
+    """airc#381 layer A: distinguish 404 (gone) / 403-rate-limit
+    (secondary_rate_limit) / 401 (auth_failure) / 5xx-network
+    (transient_failure) / 409 (conflict) — pre-fix all of these
+    coalesced into transient_failure or auth_failure with the wrong
+    recovery surface."""
+
+    def _bearer(self, meta=None):
+        m = meta or {"room_gist_id": "abc123"}
+        b = GhBearer(m)
+        b.open("alice")
+        return b
+
+    def test_classify_secondary_rate_limit_from_403_body(self):
+        """gh emits HTTP 403 with body containing 'rate limit exceeded'
+        for secondary throttle hits (NOT exposed by /rate_limit endpoint)."""
+        body = (
+            '{"message":"API rate limit exceeded for user ID 347104. '
+            'If you reach out to GitHub Support... ","status":"403"}\n'
+            'gh: API rate limit exceeded ... (HTTP 403)'
+        )
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True),
+            "secondary_rate_limit",
+        )
+
+    def test_classify_secondary_rate_limit_alt_phrase(self):
+        """Some gh responses use 'secondary rate limit' verbatim."""
+        body = "gh: You have exceeded a secondary rate limit. (HTTP 403)"
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True),
+            "secondary_rate_limit",
+        )
+
+    def test_classify_gone_from_404(self):
+        """Gist deleted permanently — distinct from auth_failure."""
+        body = (
+            '{"message":"Not Found","documentation_url":"https://docs.github.com/'
+            'rest/gists/gists#get-a-gist","status":"404"}\n'
+            'gh: Not Found (HTTP 404)'
+        )
+        self.assertEqual(bearer_gh._classify_gh_error(body, True), "gone")
+
+    def test_classify_auth_failure_from_401(self):
+        body = "gh: Bad credentials (HTTP 401)"
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True), "auth_failure"
+        )
+
+    def test_classify_auth_failure_from_403_without_rate_limit(self):
+        """403 on a permission denial (NOT rate limit) maps to auth_failure."""
+        body = "gh: Permission denied to write to gist (HTTP 403)"
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True), "auth_failure"
+        )
+
+    def test_classify_transient_for_5xx(self):
+        body = "gh: Server Error (HTTP 502)"
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True), "transient_failure"
+        )
+
+    def test_classify_transient_for_unknown_body(self):
+        """Default conservative — unknown bodies treated as transient
+        (queue + retry, never silent loss)."""
+        body = "weird gh output that doesn't match any pattern"
+        self.assertEqual(
+            bearer_gh._classify_gh_error(body, True), "transient_failure"
+        )
+
+    def test_send_returns_gone_when_gist_404s_on_get(self):
+        """End-to-end: send() propagates gone kind so cmd_send.sh can
+        clear stale channel_gists mapping. Pre-fix this returned
+        auth_failure which sent users to gh auth login (wrong remedy)."""
+        # Simulate 404 by patching _gh_api_get to return None AND
+        # stash the body sentinel that classifier reads.
+        def _fake_get(_gist_id):
+            bearer_gh._gh_api_get._last_err = "gh: Not Found (HTTP 404)"
+            return None
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "gone")
+        self.assertIn("gone", outcome.detail)
+
+    def test_send_returns_secondary_rate_limit_when_get_throttled(self):
+        """End-to-end: 403+rate-limit on initial GET propagates as
+        secondary_rate_limit so caller backs off LONG, not short."""
+        def _fake_get(_gist_id):
+            bearer_gh._gh_api_get._last_err = (
+                "gh: API rate limit exceeded for user ID 347104 (HTTP 403)"
+            )
+            return None
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "secondary_rate_limit")
+
+    def test_send_returns_gone_when_patch_404s(self):
+        """Pre-#381 the PATCH 404 case fell into the auth_failure branch
+        (the old `if "404" in detail or "permission" in lower` mash-up).
+        Now it propagates as gone — cleaner remedy."""
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl",
+                               return_value=(False, "gh: Not Found (HTTP 404)")):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "gone")
+
+    def test_send_returns_secondary_rate_limit_when_patch_throttled(self):
+        """403+rate-limit on PATCH propagates as secondary_rate_limit
+        (not auth_failure — re-auth doesn't help, only waiting does)."""
+        with mock.patch.object(bearer_gh, "_gh_api_get",
+                               return_value={"files": {}}), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl",
+                               return_value=(False,
+                                             "gh: secondary rate limit (HTTP 403)")):
+            outcome = self._bearer().send("alice", "general", b'{"x":1}')
+        self.assertEqual(outcome.kind, "secondary_rate_limit")
+
+    def test_jittered_backoff_grows_exponentially(self):
+        """Replaces pre-#381 0.05*(attempt+1) linear schedule. After 8
+        attempts the linear schedule capped at 0.4s; jittered exponential
+        grows meaningfully (~12.8s base at attempt=7) so total retry
+        window is ~60-90s — long enough to clear most secondary rate
+        bursts."""
+        # Sample multiple times to verify jitter is non-zero AND that
+        # base growth is exponential.
+        samples = [bearer_gh._jittered_backoff(7) for _ in range(20)]
+        # Base for attempt=7 is 0.1 * 2^7 = 12.8; jitter 0.5..1.5x → 6.4..19.2.
+        self.assertTrue(all(6.4 <= s <= 19.2 for s in samples))
+        # And jitter actually varies — not deterministic.
+        self.assertGreater(len(set(samples)), 5)
+
+    def test_jittered_backoff_caps_at_30s(self):
+        """For attempt >= 8 the unbounded base would explode (25.6s, 51.2s,
+        ...); cap so worst-case single backoff stays bounded. With
+        jitter 0.5-1.5x, max is 1.5*30 = 45s; that's the per-call max."""
+        max_observed = max(bearer_gh._jittered_backoff(20) for _ in range(20))
+        self.assertLess(max_observed, 50.0)
+
+
 class GhBearerRecvTests(unittest.TestCase):
     """GhBearer.recv_stream: poll the gist, yield new lines.
 

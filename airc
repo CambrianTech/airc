@@ -166,6 +166,21 @@ fi
 # one machine? Open each tab in its own dir (or repo) — they're distinct
 # peers automatically.
 #
+# Carve-out: if cwd is INSIDE an existing .airc/ ancestor (e.g. user
+# `cd`'d into the scope dir for forensic inspection), resolve to that
+# ancestor instead of appending /.airc to cwd. Pre-fix this produced
+# wrong nested paths like /repo/.airc/.airc — every command then died
+# with "Not initialized" against a scope that didn't exist. Discovered
+# 2026-05-01 on M5 while diagnosing a different airc issue: the very
+# act of `cd .airc; airc status` to inspect state broke airc.
+#
+# Doesn't change behaviour for the "fresh cwd, no enclosing scope"
+# case — that still gets $PWD/.airc, preserving the per-cwd identity
+# model. Doesn't walk up across non-.airc parents either, so cwd
+# /repo/src (with /repo/.airc existing) still creates /repo/src/.airc
+# the way it always has — that broader change would be a contract
+# shift worth its own design discussion.
+#
 # AIRC_HOME env var overrides, for tests / edge cases. Normal users don't
 # touch it.
 detect_scope() {
@@ -173,8 +188,23 @@ detect_scope() {
     echo "$AIRC_HOME"
     return
   fi
+
   # Resolve symlinks so /tmp/x and /private/tmp/x are the same scope.
-  echo "$(pwd -P)/.airc"
+  local cur; cur="$(pwd -P)"
+
+  # Walk up looking for an ancestor whose basename is .airc — that's
+  # the scope dir we should resolve to. Stops at / (or empty cur).
+  local probe; probe="$cur"
+  while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+    if [ "$(basename "$probe")" = ".airc" ] && [ -d "$probe" ]; then
+      echo "$probe"
+      return
+    fi
+    probe="$(dirname "$probe")"
+  done
+
+  # No enclosing .airc/ ancestor — apply the documented per-cwd default.
+  echo "$cur/.airc"
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
@@ -505,6 +535,24 @@ _monitor_alive_with_bearer_fallback() {
   # Phase 2: bearer-state-freshness fallback. Only reached when pidfile
   # exists but kill -0 said all PIDs dead — could be real death, could
   # be sandbox blindness. bearer-state freshness disambiguates.
+  #
+  # Skip when AIRC_BACKGROUND_OK=1 — that env var is set by the daemon
+  # launcher (cmd_daemon.sh's .bat / launchd plist / systemd unit), and
+  # in daemon context kill -0 is reliable (no Codex-style sandbox
+  # blindness). The fallback's 600s window otherwise creates a
+  # 10-minute "daemon can't take over" blackout after an interactive
+  # airc connect dies: the dying process leaves bearer_state with a
+  # fresh last_recv_ts, the daemon's next launch sees it as "monitor
+  # alive," early-exits, and the .bat retries every 5s for 10 minutes
+  # before the window expires. b69f filed as #4 in the 2026-05-02
+  # daemon audit. Trust kill -0 in daemon context so takeover is
+  # immediate. Joel's BIOS-grade self-heal directive: substrate must
+  # work without a human in the loop, including across interactive
+  # process death.
+  if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
+    echo "no"
+    return 0
+  fi
   local _reminder_secs=300
   if [ -f "$scope_dir/reminder" ]; then
     _reminder_secs=$(cat "$scope_dir/reminder" 2>/dev/null)
@@ -656,6 +704,49 @@ host_machine_id() {
   printf '%s\n' "$id"
 }
 
+# resolve_tailscale_bin: find the tailscale CLI on this machine, even
+# in the awkward MSYS Git Bash + PATHEXT case. Returns the binary path
+# on stdout or non-zero if Tailscale isn't installed. Restored from the
+# pre-Phase-3c codebase (commit 4d41dab) — host_address_set's Tailscale
+# entry needs it back so cross-network peers can dial direct WireGuard
+# instead of paying the gh-bearer 30s polling latency floor.
+resolve_tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then
+    echo "tailscale"
+    return 0
+  fi
+  if command -v tailscale.exe >/dev/null 2>&1; then
+    echo "tailscale.exe"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "/c/Program Files/Tailscale/tailscale.exe" \
+    "/c/Program Files (x86)/Tailscale/tailscale.exe" \
+    "/mnt/c/Program Files/Tailscale/tailscale.exe"; do
+    if [ -f "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    return 0
+  fi
+  # where.exe catches winget user-scope installs (%LOCALAPPDATA%\...) the
+  # hard-coded paths miss. Joel 2026-04-28: install.sh's tailscale_present
+  # had the same blind spot.
+  if command -v where.exe >/dev/null 2>&1; then
+    local _wherewin
+    _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
+    if [ -n "$_wherewin" ]; then
+      local _bash; _bash=$(_to_bash_path "$_wherewin" 2>/dev/null)
+      [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
+    fi
+  fi
+  return 1
+}
+
 # host_address_set: enumerate this host's currently-usable addresses,
 # in priority order: localhost first (always present), then any LAN
 # interface with a non-loopback IP, then Tailscale (only if the daemon
@@ -670,12 +761,35 @@ host_address_set() {
   printf 'localhost|127.0.0.1|%s|\n' "$port"
 
   # LAN: enumerate interfaces, pick non-loopback IPv4s. macOS + Linux
-  # converge on `ifconfig`; we use that and reject loopback + CGNAT.
+  # converge on `ifconfig`; Windows Git Bash uses `ipconfig` (no
+  # ifconfig in MINGW). Either way, reject loopback (127.) and link-
+  # local (169.254.), and reject Tailscale's CGNAT range (100.64-127.)
+  # which is emitted separately below as scope=tailscale.
   local lan_ips
-  lan_ips=$(ifconfig 2>/dev/null \
-            | awk '/inet /{print $2}' \
-            | grep -vE '^(127\.|169\.254\.)' \
-            | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows ipconfig output line:
+      #   "   IPv4 Address. . . . . . . . . . . : 192.168.1.42"
+      # CRLF needs stripping. The IP is the last colon-delimited field.
+      # Fix: pre-2026-05-02 Windows hosts emitted only [localhost,
+      # tailscale] in addresses[] — the bash ifconfig path returned
+      # nothing on Git Bash, so no lan entry — and joiners on the same
+      # /24 LAN had no way to reach the Windows host directly. Logged
+      # by Joel 2026-05-02: Windows peer joined as host but Mac
+      # joiner without Tailscale couldn't reach.
+      lan_ips=$(ipconfig 2>/dev/null \
+                | tr -d '\r' \
+                | awk -F': ' '/IPv4 Address/{print $NF}' \
+                | grep -vE '^(127\.|169\.254\.)' \
+                | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+      ;;
+    *)
+      lan_ips=$(ifconfig 2>/dev/null \
+                | awk '/inet /{print $2}' \
+                | grep -vE '^(127\.|169\.254\.)' \
+                | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' )
+      ;;
+  esac
   if [ -n "$lan_ips" ]; then
     printf '%s\n' "$lan_ips" | while read -r ip; do
       [ -z "$ip" ] && continue
@@ -685,11 +799,38 @@ host_address_set() {
     done
   fi
 
-  # Phase 3c: Tailscale entries removed. Cross-network reachability is
-  # served by gh-as-bearer (envelope-encrypted gist messaging), not by
-  # advertising a Tailscale IP for direct SSH. The address set still
-  # advertises localhost + LAN for same-LAN TCP pair handshake; gist
-  # routing handles everything else.
+  # Tailscale: only emit when the binary is present AND the daemon
+  # reports signed-in. AIRC_NO_TAILSCALE=1 forces empty for users who
+  # explicitly opt out (or for tests).
+  #
+  # Phase 3c made gh-as-bearer the universal transport, but a direct
+  # WireGuard hop via Tailscale is still vastly faster than a 30s
+  # gh-poll loop when both peers are on the same tailnet. Restored
+  # 2026-05-02 (Joel: "we need tailscale to work when optionally
+  # installed. this is just a simple matter of IP/address, which we
+  # had supported"). Behavior: if Tailscale is up, the host advertises
+  # its tailnet IP; cross-network peers in the same tailnet pick it
+  # via peer_pick_address fallback; pair-handshake completes over
+  # WireGuard. If Tailscale is absent or logged-out, no entry — gist
+  # bearer takes the path it already takes today.
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      # set -e + non-zero exit on `tailscale status` (logged out) would
+      # abort. `|| true` is fine here — we only use the output.
+      local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
+      case "$ts_out" in
+        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
+        *)
+          local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null | head -1 | tr -d '\r\n ')
+          if [ -z "$ts_ip" ]; then
+            ts_ip=$(printf '%s' "$ts_out" | awk 'NR==1 && /^100\./{print $1; exit}')
+          fi
+          [ -n "$ts_ip" ] && printf 'tailscale|%s|%s|\n' "$ts_ip" "$port"
+          ;;
+      esac
+    fi
+  fi
 }
 
 # host_addresses_json: assemble host_address_set output into a JSON
@@ -765,38 +906,86 @@ peer_pick_address() {
     fi
   fi
 
-  # Tailscale: only useful if I'm signed in to Tailscale myself. Pick
-  # the host's tailscale entry when both sides share that scope; the
-  # WireGuard hop is dramatically faster than gh-bearer's polling
-  # cadence. If I have no Tailscale (or the daemon's logged out), the
-  # host's tailscale entry isn't reachable for me and we fall through.
-  # Joel 2026-05-02: "have to think of how that would work with an
-  # outsider, outside our tailscale, with it in this mode" — outsiders
-  # without Tailscale used to land on `pick_addr_first`'s arbitrary
-  # entry, often the host's tailnet IP, which they'd then time out
-  # against. Now they skip cleanly to the gh fallback.
-  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ] && command -v "$AIRC_PYTHON" >/dev/null 2>&1; then
-    local my_ts_bin; my_ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
-    if [ -n "$my_ts_bin" ]; then
-      local my_ts_status; my_ts_status=$("$my_ts_bin" status 2>&1) || true
-      case "$my_ts_status" in
-        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → skip tailscale pick
-        *)
-          local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
-            | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
-          if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
-          ;;
-      esac
-    fi
+  # Tailscale: only pick if WE have a Tailscale interface ourselves
+  # AND the user hasn't opted out via AIRC_NO_TAILSCALE=1.
+  #
+  # Without a local Tailscale interface, dialing 100.x just dies with
+  # "no route to host" — and (worse) the resulting "host unreachable"
+  # triggers the self-heal-as-new-host path in cmd_connect.sh which
+  # DEMOLISHES the working host's gist. Bug observed live 2026-05-02:
+  # a Mac without Tailscale fell through to the nonlocal-first
+  # fallback, picked Windows host's tailscale 100.x, failed,
+  # self-healed, nuked the gist that other peers were happily using.
+  # Joiner-side reachability is non-negotiable.
+  #
+  # AIRC_NO_TAILSCALE=1 (from main's #396 hotfix): respect explicit
+  # opt-out even when local interface is present (some users have
+  # tailscale up but want airc to skip it for routing decisions).
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ] && _have_tailscale_locally; then
+    local pick; pick=$(printf '%s' "$addresses_json" \
+      | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
+    if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
   fi
 
-  # Nothing reachable from here — neither localhost (different machine),
-  # LAN (different subnet), nor Tailscale (I'm not on the same tailnet
-  # OR I have no Tailscale). Return empty; cmd_connect's caller treats
-  # this as "no direct path; gh-bearer takes over." Pre-fix we returned
-  # `pick_addr_first` which often handed back the host's loopback or
-  # tailnet IP — outsiders then dialed an unreachable address and ate
-  # a TCP timeout for nothing.
+  # Fallback: first entry whose scope we can REACH. We've already
+  # tried localhost (machine_id match), lan (subnet match), and
+  # tailscale (local-presence check) above. What remains in
+  # addresses[] is some scope we don't model — e.g. a future "wan"
+  # entry, or a bespoke routing tag — give that a chance instead of
+  # ignoring it. But excluding localhost and tailscale here ensures
+  # we don't dial them blindly: localhost would mean our own loopback
+  # (never the host), and tailscale was already gated above on local
+  # presence — picking it here would re-introduce the destructive
+  # self-heal chain. Empty return → caller falls through to
+  # gh-bearer-only routing (broadcast still works; direct pair
+  # skipped).
+  printf '%s' "$addresses_json" \
+    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_excluding localhost tailscale 2>/dev/null
+}
+
+# _have_tailscale_locally: do WE currently have a Tailscale interface
+# we can route packets through? Two probes, in priority order:
+#
+#   1. `tailscale status` reports a usable session. This is the
+#      authoritative signal — daemon is up AND signed in. Uses the
+#      same resolve_tailscale_bin chain as host_address_set so we
+#      catch winget/AppStore installs that aren't on PATH.
+#
+#   2. We have a 100.x interface. Catches the case where Tailscale
+#      is up but the CLI binary isn't reachable (e.g. macOS
+#      Tailscale.app pre-MacOS-CLI-helper, sandboxed daemon).
+#
+# Used by peer_pick_address to decide whether picking a host's
+# tailscale-scope address is reachable. Empty return on no = caller
+# treats tailscale entries as unreachable.
+_have_tailscale_locally() {
+  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  if [ -n "$ts_bin" ]; then
+    local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
+    case "$ts_out" in
+      *"Logged out"*|*"NeedsLogin"*|*"stopped"*) ;;  # daemon down / signed out
+      *)
+        # Anything else from `tailscale status` (including the IP
+        # listing or "Tailscale is running") means we can route.
+        return 0
+        ;;
+    esac
+  fi
+  # Fallback: probe for a 100.x interface IP directly.
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      ipconfig 2>/dev/null \
+        | tr -d '\r' \
+        | grep -qE 'IPv4 Address[^:]*: 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' \
+        && return 0
+      ;;
+    *)
+      ifconfig 2>/dev/null \
+        | grep -qE 'inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' \
+        && return 0
+      ;;
+  esac
+  return 1
 }
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
@@ -873,6 +1062,35 @@ else
   exit 1
 fi
 # ── End mesh gist abstraction ───────────────────────────────────────────
+
+# ── Auth self-heal helpers ──────────────────────────────────────────────
+# airc_detect_gh_auth_state + airc_self_heal_gh_auth — let airc be the
+# instigator when the gh keyring token silently invalidates (frequent
+# in practice per Joel; observed twice on M5 in the last 48h). Sourced
+# unconditionally so all command surfaces can call into it.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/lib_auth.sh" ]; then
+  # shellcheck source=lib/airc_bash/lib_auth.sh
+  source "$_airc_lib_dir/airc_bash/lib_auth.sh"
+else
+  echo "ERROR: airc_bash/lib_auth.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+# ── End auth self-heal helpers ──────────────────────────────────────────
+
+# ── Daemon-installed detector ───────────────────────────────────────────
+# airc_daemon_is_installed — single source of truth shared by
+# cmd_daemon.sh, cmd_connect.sh first-host tip, and install.sh's
+# daemon-install prompt. Pre-fix, three places had near-identical
+# detection that drifted across platforms; Copilot review on PR #388
+# caught Windows + WSL gaps. ONE detect, called from every site.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/lib_daemon_detect.sh" ]; then
+  # shellcheck source=lib/airc_bash/lib_daemon_detect.sh
+  source "$_airc_lib_dir/airc_bash/lib_daemon_detect.sh"
+else
+  echo "ERROR: airc_bash/lib_daemon_detect.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+# ── End daemon-installed detector ───────────────────────────────────────
 
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
@@ -1050,6 +1268,19 @@ _monitor_multi_channel() {
   local consecutive_timeouts=0
   local ESCALATE_AFTER=4
   while true; do
+    # Re-read channel_map from config at top of each outer cycle so
+    # an in-flight config change (e.g. _mesh_rediscover_loop swapping
+    # the host gist after rotation) takes effect on the next bearer
+    # respawn, no full daemon restart required. Falls back to the
+    # parameter passed at startup if the re-read returns empty
+    # (transient config-write race or missing list_channel_gists
+    # support on older airc_core).
+    local _refreshed_map
+    _refreshed_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null || true)
+    if [ -n "$_refreshed_map" ]; then
+      channel_map="$_refreshed_map"
+    fi
     {
       # Per-child PID tracking so we can detect individual deaths.
       # Pre-fix: a single `wait` blocked until ALL children exited; if
@@ -1116,7 +1347,12 @@ _monitor_multi_channel() {
     local fmt_exit="${PIPESTATUS[1]:-0}"
 
     if [ "$fmt_exit" = "2" ]; then
-      echo "airc: watchdog tripped — restarting multi-channel poll" >&2
+      # STDOUT (not >&2) so the AI's Monitor surfaces this as an event.
+      # Per the global "evidence is for the debugger" rule + the receive-
+      # silence-watchdog beacon below — every restart needs to be loud
+      # enough to wake whoever's watching, not buried in stderr where
+      # only post-mortem log-readers find it.
+      echo "airc: watchdog tripped — restarting multi-channel poll"
       consecutive_timeouts=$((consecutive_timeouts + 1))
     else
       consecutive_timeouts=0
@@ -1151,6 +1387,10 @@ monitor() {
   # window and after legitimate parent restarts.
   ( reminder_timer_loop ) &
   local _reminder_pid=$!
+  # Self-heal: periodically re-run mesh discovery and swap channel_gists
+  # if the host rotated. No-op when gh is absent or no rotation occurred.
+  ( _mesh_rediscover_loop ) &
+  local _rediscover_pid=$!
   # flush_pending_loop returns immediately when host_target is empty
   # (legacy host mode: no peer paired, nothing to flush). Spawning +
   # tracking that short-lived PID makes airc.pid lie — kill -0 on it
@@ -1162,10 +1402,26 @@ monitor() {
   if [ -n "$_ht" ]; then
     ( flush_pending_loop ) &
     _flush_pid=$!
+  else
+    # Host mode — spawn the host-side mirror loop. Same pidfile-honesty
+    # rule as the joiner branch above: only spawn when there's a
+    # publishable route (channel_gists OR legacy room_gist_id), otherwise
+    # the subshell exits immediately and airc.pid lists a dead PID.
+    local _has_pub=0
+    if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+      _has_pub=1
+    fi
+    if [ "$_has_pub" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+      _has_pub=1
+    fi
+    if [ "$_has_pub" = "1" ]; then
+      ( flush_pending_host_loop ) &
+      _flush_pid=$!
+    fi
   fi
   # Build the appended PID list — only include _flush_pid when we
   # actually spawned it.
-  local _aux_pids="$_reminder_pid"
+  local _aux_pids="$_reminder_pid $_rediscover_pid"
   [ -n "$_flush_pid" ] && _aux_pids="$_aux_pids $_flush_pid"
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
     # Append to existing pidfile atomically (printf+>> is < PIPE_BUF
@@ -1212,7 +1468,9 @@ monitor() {
         # Watchdog tripped — formatter saw no input for WATCHDOG_SEC.
         # Bearer-aware probe (gh API) is a follow-up; for now count and
         # escalate after N consecutive cycles.
-        echo "airc: no inbound for watchdog interval — restarting bearer poll" >&2
+        # STDOUT (not >&2) so this surfaces as a Monitor event; same
+        # silent-failure rule as the multi-channel branch above.
+        echo "airc: no inbound for watchdog interval — restarting bearer poll"
         consecutive_timeouts=$((consecutive_timeouts + 1))
       else
         consecutive_timeouts=0
@@ -1269,7 +1527,21 @@ monitor() {
 # same env vars (PEERS_DIR) and argv (my_name).
 monitor_formatter() {
   local my_name="$1"
-  "$AIRC_PYTHON" -u -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+  # -X utf8 forces UTF-8 mode regardless of locale (cp1252 on Windows
+  # default + non-UTF-8 macOS terminals). Without it, monitor_formatter
+  # CRASHES SILENTLY on print() of any line containing unicode (→, ✓,
+  # ⚠ — all of which we use in airc system messages + peer chat). The
+  # crash kills the formatter mid-stream; bash sees the pipe close,
+  # restarts the bearer/formatter pair, and the missed event is
+  # silently lost. Symptom: substrate writes events to messages.jsonl
+  # correctly, formatter "runs," but Claude Code Monitor surfaces
+  # nothing. Joel's "your monitor code is the problem" was exactly
+  # this — caught 2026-05-02 after b69f's tail-direct workaround
+  # (which uses `python -X utf8`) wakes their AI session reliably
+  # while airc's own monitor_formatter (no -X utf8) drops events.
+  # Same fix here closes the gap at the SOURCE rather than relying on
+  # each operator to add their own tail-pipeline.
+  "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
 }
 
 # Drain pending.jsonl when the host is reachable again. Runs in background
@@ -1365,6 +1637,164 @@ flush_pending_loop() {
   done
 }
 
+# Host-side mirror of flush_pending_loop. Drains pending.jsonl via gist
+# publish (bearer_cli send) instead of SSH push to a host. Symmetric to the
+# joiner-side loop above so host-side cmd_send can queue on transient gist
+# failure without dropping the broadcast on the floor (#381 layer B).
+#
+# Pre-fix: host-side cmd_send had no queue path at all — gist publish
+# failure printed a warning and exited 0, with the message permanently
+# lost from peers' POV. This loop closes the gap: cmd_send writes to
+# pending.jsonl on transient_failure; this loop replays those lines on
+# the same 5s tick the joiner uses, retrying until gh API recovers or
+# the user tears down.
+flush_pending_host_loop() {
+  local pending="$AIRC_WRITE_DIR/pending.jsonl"
+  local host_target; host_target=$(get_config_val host_target "")
+  # Joiner-mode handled by flush_pending_loop; we're host-only.
+  [ -n "$host_target" ] && return 0
+
+  # Standalone (--no-gist) hosts have no publishable route. Self-check
+  # at startup so the spawn site can rely on a quick return when nothing
+  # to do, mirroring the joiner-side host_target gate.
+  local _has_route=0
+  if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+    _has_route=1
+  fi
+  if [ "$_has_route" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    _has_route=1
+  fi
+  [ "$_has_route" = "0" ] && return 0
+
+  # Parent-liveness gate (#324 follow-up — same orphan-subshell rationale
+  # as flush_pending_loop above). Without this the loop survives parent
+  # death and keeps publishing to dead-scope state forever.
+  local _parent_pid="$PPID"
+
+  while true; do
+    sleep 5
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      return 0
+    fi
+    [ -s "$pending" ] || continue
+
+    local snapshot; snapshot=$(mktemp -t airc-pending-host-snap.XXXXXX)
+    local unsent;   unsent=$(mktemp -t airc-pending-host-unsent.XXXXXX)
+    # Atomic-ish snapshot: mv is atomic on same FS so concurrent cmd_send
+    # invocations during drain land in a fresh pending.jsonl.
+    mv "$pending" "$snapshot" 2>/dev/null || { rm -f "$snapshot" "$unsent"; continue; }
+
+    local delivered=0 failed=0
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+
+      # Extract channel from the queued line (plaintext signed JSON,
+      # never the wrapped envelope — cmd_send queues pre-wrap so the
+      # drain can re-resolve recipient pubkey at retry time).
+      local _line_channel
+      _line_channel=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.loads(sys.stdin.readline()).get("channel",""))
+except Exception:
+  print("")' 2>/dev/null)
+
+      # Resolve channel → gist. Fall back to legacy room_gist_id only
+      # when the line carries no channel (older queued lines may pre-date
+      # the channel field).
+      local _line_gist=""
+      if [ -n "$_line_channel" ]; then
+        _line_gist=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+          --config "$CONFIG" --channel "$_line_channel" 2>/dev/null || true)
+      fi
+      if [ -z "$_line_gist" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        _line_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
+      if [ -z "$_line_gist" ]; then
+        # No route — keep in pending; channel_gists may populate later
+        # via 'airc join --room <name>'.
+        echo "$line" >> "$unsent"
+        failed=$((failed + 1))
+        continue
+      fi
+
+      # Re-resolve recipient pubkey at drain time. Pre-pair queued lines
+      # shipped plaintext; post-pair drain wraps them with the new pubkey.
+      local _line_to
+      _line_to=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.loads(sys.stdin.readline()).get("to",""))
+except Exception:
+  print("")' 2>/dev/null)
+      local _line_pub=""
+      if [ -n "$_line_to" ] && [ "$_line_to" != "all" ]; then
+        _line_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+          --peers-dir "$PEERS_DIR" --peer-name "$_line_to" 2>/dev/null || true)
+      fi
+      local _wire="$line"
+      if [ -n "$_line_pub" ]; then
+        _wire=$(printf '%s' "$line" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+          --recipient-pub "$_line_pub" \
+          --identity-dir "$IDENTITY_DIR" 2>/dev/null || printf '%s' "$line")
+      fi
+
+      local _outcome _kind
+      _outcome=$(printf '%s' "$_wire" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+        "${_line_to:-all}" "$_line_channel" \
+        --room-gist-id "$_line_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
+      _kind=$(printf '%s' "$_outcome" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.load(sys.stdin).get("kind",""))
+except Exception:
+  print("")' 2>/dev/null)
+
+      case "$_kind" in
+        delivered)
+          # Append the now-delivered original line to local audit log.
+          # cmd_send.sh's transient_failure branch withheld this write
+          # specifically so the user's chat widget wouldn't echo a
+          # message that hadn't actually shipped (the false-success
+          # bug from #381 RCA). Drain confirms delivery → safe to
+          # reflect in the local log.
+          echo "$line" >> "$MESSAGES"
+          delivered=$((delivered + 1))
+          ;;
+        *)
+          # transient_failure / auth_failure / unknown — keep queued.
+          # auth_failure here is awkward (can't fix without user re-auth)
+          # but the next cmd_send invocation will surface it loudly via
+          # the auth_failure case + die. We don't want a background loop
+          # to die or block on auth state.
+          echo "$line" >> "$unsent"
+          failed=$((failed + 1))
+          ;;
+      esac
+    done < "$snapshot"
+
+    # Prepend failures back to head of pending so they retry first on
+    # next iteration (mirror joiner-side flow).
+    if [ -s "$unsent" ]; then
+      if [ -s "$pending" ]; then
+        cat "$unsent" "$pending" > "${pending}.new" && mv "${pending}.new" "$pending"
+      else
+        mv "$unsent" "$pending"
+        unsent=""
+      fi
+    fi
+
+    if [ "$delivered" -gt 0 ]; then
+      local _drain_chan="general"
+      [ -f "$AIRC_WRITE_DIR/room_name" ] && _drain_chan=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || echo general)
+      [ -z "$_drain_chan" ] && _drain_chan="general"
+      local _drain_marker
+      _drain_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[DRAINED %d queued message(s) via gist publish]"}' \
+        "$(timestamp)" "$_drain_chan" "$delivered")
+      echo "$_drain_marker" >> "$MESSAGES"
+    fi
+
+    rm -f "$snapshot" "$unsent" 2>/dev/null
+  done
+}
+
 # Separate loop, runs in background during monitor.
 # Periodically checks whether the user has been silent longer than their
 # configured interval. Fires ONCE per silence period (via reminded marker).
@@ -1375,25 +1805,260 @@ reminder_timer_loop() {
   # "monitor frozen but reminder firing" pattern Joel kept seeing.
   # Capture parent PID at start; exit when it dies.
   local _parent_pid="$PPID"
+  # Receive-side silence threshold: how long to wait between inbound
+  # events before emitting a "haven't HEARD anything in Ns" beacon to
+  # stdout (so the AI's Monitor surfaces it as an event the user can
+  # see). Without this, a silently-broken receive path (formatter
+  # filter dropping legit chat, bearer never escalating, etc.) looks
+  # identical to "no one's talking" — the failure mode b69f filed as
+  # #399 + Joel observed 2026-05-02 ("airc won't alert you to new
+  # convo, you have to send to receive"). Threshold matches the send
+  # reminder default: 300s.
+  local recv_threshold=300
+  local last_recv_warned=0
   while true; do
     sleep 5
     if ! kill -0 "$_parent_pid" 2>/dev/null; then
       return 0
     fi
+    local now; now=$(date +%s)
+
+    # Send-side reminder (existing behavior).
     local reminder_file="$AIRC_WRITE_DIR/reminder"
     local reminded_file="$AIRC_WRITE_DIR/reminded"
-    [ -f "$reminder_file" ] || continue
-    [ -f "$reminded_file" ] && continue
-    local interval; interval=$(cat "$reminder_file" 2>/dev/null)
-    [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null || continue
-    local now; now=$(date +%s)
-    local last_sent=0
-    [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
-    local silent=$(( now - last_sent ))
-    if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-      printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
-      touch "$reminded_file"
+    if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
+      local interval; interval=$(cat "$reminder_file" 2>/dev/null)
+      if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+        local last_sent=0
+        [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
+        local silent=$(( now - last_sent ))
+        if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
+          printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
+          touch "$reminded_file"
+        fi
+      fi
     fi
+
+    # Receive-side silence beacon. If we have ANY bearer_state file at
+    # all and its last_recv_ts is older than recv_threshold (or null
+    # since process start), emit a stdout warning the user's Monitor
+    # will surface. Re-fires every recv_threshold seconds so the user
+    # sees it as a recurring beacon, not a one-shot they might miss.
+    # Read all per-channel state files (bearer_state.<channel>.json)
+    # plus the legacy unscoped one — pick the freshest last_recv_ts as
+    # "we received SOMETHING recently somewhere."
+    local time_since_warn=$(( now - last_recv_warned ))
+    if [ "$time_since_warn" -ge "$recv_threshold" ]; then
+      local freshest_recv=0
+      local has_any_state=0
+      local sf
+      # Build the set of CURRENTLY subscribed channels — only their
+      # bearer_state files are relevant. Stale files from previously-
+      # subscribed channels (e.g. test rooms left weeks ago) hold
+      # ancient last_recv_ts values that, if included in the MAX, would
+      # silently rot the beacon's calculation. Caught live 2026-05-02:
+      # beacon reported '288919s silent' on a fresh-restart bearer
+      # because bearer_state.useideem.json from 80hrs prior had a
+      # positive last_recv_ts that won the MAX over the freshly-opened
+      # bearer's null. The freshly-opened bearer's correct read should
+      # have been "small recv_silent because the file was just written"
+      # — but the stale-file's older positive ts beat the fresh file's
+      # null and produced false 80hr alarms.
+      local subs_file_glob=""
+      local sub
+      while IFS= read -r sub; do
+        [ -n "$sub" ] || continue
+        # Strip leading '#' if present in config (#401 tolerance pattern).
+        sub="${sub#\#}"
+        local sf_path="$AIRC_WRITE_DIR/bearer_state.${sub}.json"
+        subs_file_glob="${subs_file_glob}${sf_path}|"
+      done < <("$AIRC_PYTHON" -c "
+import json, sys
+try:
+    cfg = json.load(open('$CONFIG'))
+    for c in cfg.get('subscribed_channels') or []:
+        print(c)
+except Exception:
+    pass
+" 2>/dev/null)
+
+      for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
+        [ -f "$sf" ] || continue
+        # Filter: skip stale files whose channel is no longer subscribed.
+        # If subs list is empty (no subscribed_channels in config), fall
+        # back to including all bearer_state files (preserves old behavior
+        # for legacy scopes that haven't populated subscribed_channels).
+        if [ -n "$subs_file_glob" ]; then
+          case "|$subs_file_glob" in
+            *"|$sf|"*) ;;  # in subs list, keep
+            *) continue ;;  # stale, skip
+          esac
+        fi
+        has_any_state=1
+        local ts; ts=$("$AIRC_PYTHON" -c "
+import json, sys, calendar, time
+try:
+    d = json.load(open('$sf'))
+    v = d.get('last_recv_ts')
+    if v is None:
+        print(0)
+    elif isinstance(v, (int, float)):
+        print(int(v))
+    else:
+        # ISO-8601 string — parse to epoch seconds
+        try:
+            t = time.strptime(v.rstrip('Z'), '%Y-%m-%dT%H:%M:%S')
+            print(calendar.timegm(t))
+        except Exception:
+            print(0)
+except Exception:
+    print(0)
+" 2>/dev/null)
+        if [ -n "$ts" ] && [ "$ts" -gt "$freshest_recv" ] 2>/dev/null; then
+          freshest_recv="$ts"
+        fi
+      done
+      if [ "$has_any_state" = "1" ]; then
+        local recv_silent
+        if [ "$freshest_recv" -eq 0 ]; then
+          # Bearer open since process start, never received an event.
+          # Use the freshest bearer_state file's mtime as the floor —
+          # the bearer rewrites these files on each open + on each
+          # event, so mtime IS "when the bearer last did anything."
+          # Pre-fix used airc.pid mtime, which is stale across teardown
+          # cycles (the file gets re-appended-to but mtime can be from
+          # an earlier process if the parent was the one to create it
+          # initially). Symptom: beacon reported "no inbound in 287715s"
+          # (80 hrs) on a bearer that had only just opened, because
+          # airc.pid had been touched 80hrs earlier by a prior session.
+          # bearer_state.<channel>.json is per-process: rewritten on
+          # bearer open, so its mtime is bounded by current process age.
+          # Use file_mtime (numeric-validated, MSYS-safe per #421);
+          # raw `stat -f %m` reintroduces the BSD/GNU/MSYS trap that
+          # the platform_adapters helper exists to prevent.
+          local bs_mtime=0
+          for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
+            [ -f "$sf" ] || continue
+            local m; m=$(file_mtime "$sf")
+            if [ "$m" -gt "$bs_mtime" ] 2>/dev/null; then
+              bs_mtime="$m"
+            fi
+          done
+          if [ "$bs_mtime" -gt 0 ]; then
+            recv_silent=$(( now - bs_mtime ))
+          else
+            # Fallback: airc.pid mtime if for some reason no bearer
+            # state files have meaningful mtimes. Same wrong-time
+            # caveat as the pre-fix code, but it's the last resort.
+            local pid_mtime; pid_mtime=$(file_mtime "$AIRC_WRITE_DIR/airc.pid")
+            recv_silent=$(( now - pid_mtime ))
+          fi
+        else
+          recv_silent=$(( now - freshest_recv ))
+        fi
+        if [ "$recv_silent" -ge "$recv_threshold" ]; then
+          printf '[%s] airc: Receive silence — no inbound events in %ss across any bearer. Mesh may be partitioned. Try: airc peers; airc logs 20; airc teardown && airc connect\n' "$(timestamp)" "$recv_silent"
+          last_recv_warned="$now"
+        fi
+      fi
+    fi
+  done
+}
+
+# Self-heal loop: detect host gist rotation and swap channel_gists in
+# config without human-in-the-loop teardown+rejoin. Joel 2026-05-02:
+# "you have the easy part, must self-heal, no one can be there to fix
+# your umbilical cord for you." Tonight's repro: host (Mac) tore down
+# + rejoined → new mesh gist on the same gh account; joiner (b69f) kept
+# polling the dead old gist; needed Joel to relay "rejoin." Without
+# this loop, every host restart breaks the substrate until manual
+# intervention — the satellite-killer scenario.
+#
+# Cost: one `gh gist list` per cycle (~150 bytes over the wire). At
+# 300s default cadence: 12 calls/hour, well under gh's 5000/hr ceiling.
+#
+# Single-account scope: _mesh_find lists the CURRENT gh account's
+# gists. For mesh peers on the same gh account (the dominant case
+# tonight — Mac and b69f both auth'd as joelteply), gist rotation on
+# host-side is reflected on the next list. Cross-account peers (friend
+# on a different gh) take the legacy invite path; this loop no-ops
+# because _mesh_find returns empty there. That's acceptable — cross-
+# account auto-rediscovery would need a different signal channel and
+# is out of scope; loud-fail (Mac's bearer_gh.py PR) covers that path.
+_mesh_rediscover_loop() {
+  local _parent_pid="$PPID"
+  # Cadence: 30s default. Was 300s → 60s in #407 → 30s here. Joel's
+  # "satellite/bios" framing wants the tightest cadence that's still
+  # gh-rate-limit safe. _mesh_find does ~1 gh api call per cycle
+  # (~120 calls/hour/peer at 30s), well under gh's 5000/hr limit.
+  # Tonight's repro 2026-05-02: I rotated my host gist via teardown,
+  # 60s+ later b69f still couldn't reach me — Joel had to relay.
+  # 30s halves that worst-case window and starts approaching the
+  # bearer's own 15s poll cadence so the rediscover happens at most
+  # 2 polls late from the bearer's PoV.
+  local interval="${AIRC_MESH_REDISCOVER_SEC:-30}"
+  while true; do
+    sleep "$interval"
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      return 0
+    fi
+    # _mesh_find requires gh; if absent, no-op (we're in legacy local-
+    # tail mode or pre-mesh scope).
+    command -v gh >/dev/null 2>&1 || continue
+    # Resolve the current default-channel gist from config. We compare
+    # against the singleton mesh, so any divergence on the default
+    # channel implies host rotation.
+    local current_gist
+    current_gist=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null \
+      | awk -F'\t' 'NR==1 {print $2}')
+    [ -n "$current_gist" ] || continue
+    local found_gist
+    found_gist=$(_mesh_find 2>/dev/null || true)
+    [ -n "$found_gist" ] || continue
+    if [ "$found_gist" = "$current_gist" ]; then
+      continue
+    fi
+    # Rotation detected. Update every channel's gist in config to the
+    # singleton mesh — Phase 3c shares one gist across channel tags, so
+    # the same id applies to all subscribed channels. STDOUT (not
+    # stderr) so the AI's Monitor wakes and the user sees what
+    # happened, even if the bearer respawn that follows is invisible.
+    local channels
+    channels=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null \
+      | awk -F'\t' '{print $1}')
+    while IFS= read -r ch; do
+      [ -z "$ch" ] && continue
+      # The CLI flag is --gist-id (see lib/airc_core/config.py:325).
+      # Pre-fix this was --gist (silently rejected → rotation self-heal
+      # never updated config). Surface non-zero exit to stderr so a
+      # subsequent bearer mismatch is debuggable; do NOT swallow with
+      # `|| true` — that's the exact silent-failure family this PR set
+      # is removing.
+      if ! "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$ch" --gist-id "$found_gist" 2>&1; then
+        printf '[%s] airc: WARNING — failed to update channel_gists[%s] to %s; rotation self-heal incomplete\n' \
+          "$(timestamp)" "$ch" "$found_gist" >&2
+      fi
+    done <<< "$channels"
+    printf '[%s] airc: HOST GIST ROTATED — was %s, now %s. Auto-swapped config; bearer respawning on new gist.\n' \
+      "$(timestamp)" "$current_gist" "$found_gist"
+    # Force a bearer respawn so the new gist takes effect immediately.
+    # _monitor_multi_channel re-reads channel_map at the top of each
+    # outer cycle (companion change in this PR), so killing the
+    # bearer_cli children triggers respawn against the freshly-updated
+    # config.
+    #
+    # SCOPE-SAFE pkill (Copilot review #422 caught this): bearer_cli
+    # processes from OTHER scopes (different AIRC_HOME) on the same
+    # machine match a bare 'airc_core.bearer_cli recv' pattern. Each
+    # bearer_cli is launched with `--state-file $AIRC_WRITE_DIR/...`
+    # so AIRC_WRITE_DIR appears uniquely in this scope's process
+    # command lines. Match on that to scope the kill to OUR children
+    # only — multi-scope safety, same principle as cmd_teardown's
+    # scope-isolation guarantee.
+    pkill -f "airc_core.bearer_cli recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
   done
 }
 

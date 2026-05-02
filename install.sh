@@ -853,6 +853,119 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 
+# ── Optional: background daemon for sleep/wake/crash survival (#382) ───
+#
+# Issue: by default the mesh dies when peer laptops sleep — `airc connect`
+# is just a process, sleeps with the machine, never re-spawns on wake.
+# The remedy (`airc daemon install`) already exists but was only surfaced
+# AFTER the mesh had gone down (see the in-disconnect tip in the airc
+# top-level). By that time peers have missed however many hours of mesh
+# activity. This block surfaces the offer at install time, when the user
+# is already engaged in setup and can flip the auto-restart on with one
+# keystroke.
+#
+# Skip conditions:
+#   - daemon already installed (idempotent re-run)
+#   - non-TTY install (curl-bash piped without terminal)
+#   - AIRC_INSTALL_NO_DAEMON=1 (explicit opt-out for headless servers,
+#     CI runners, environments that manage daemons via their own
+#     config-management like Ansible/Chef/Nix)
+#   - AIRC_INSTALL_YES=1 (power-user one-liner: install the daemon
+#     without asking)
+# Source the centralized cross-platform daemon detector + its dependency
+# (detect_platform from platform_adapters.sh). Lets install.sh ask the
+# same "is the daemon installed?" question that cmd_daemon.sh + cmd_connect.sh
+# ask, so the answer is consistent across darwin / linux / wsl / windows.
+# Pre-fix install.sh had its own _daemon_already_installed() that only
+# covered Darwin/Linux file paths — Copilot review on PR #388 caught
+# that this would re-prompt on every install rerun on Windows Git Bash
+# even after `airc daemon install` had registered the HKCU Run-key.
+if [ -f "$CLONE_DIR/lib/airc_bash/platform_adapters.sh" ] \
+   && [ -f "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh" ]; then
+  # shellcheck source=lib/airc_bash/platform_adapters.sh
+  source "$CLONE_DIR/lib/airc_bash/platform_adapters.sh"
+  # shellcheck source=lib/airc_bash/lib_daemon_detect.sh
+  source "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh"
+else
+  # Defensive fallback so install doesn't die on a weird CLONE_DIR layout.
+  # The prompt block below tolerates the function being absent (treats
+  # "unknown daemon state" as "not installed → offer prompt").
+  # BOTH detect functions need stubs (Copilot #422 review): under
+  # `set -euo pipefail` a bare call to airc_daemon_is_installed_for_scope
+  # would `command not found` → install.sh exits non-zero instead of
+  # gracefully degrading. Both stubs return 1 ("not installed").
+  airc_daemon_is_installed()           { return 1; }
+  airc_daemon_is_installed_for_scope() { return 1; }
+fi
+
+# Order matters here. Four NON-prompt branches first, ordered so the
+# loudest user intent wins:
+#   1. AIRC_INSTALL_NO_DAEMON=1 — explicit opt-out trumps everything.
+#   2. AIRC_INSTALL_YES=1       — explicit auto-install (Copilot #388:
+#                                 must come BEFORE the non-TTY check
+#                                 so `curl … | AIRC_INSTALL_YES=1 bash`
+#                                 actually installs instead of falling
+#                                 into the non-TTY tip branch).
+#   3. daemon already installed  — idempotent re-run; nothing to do.
+#   4. Non-TTY                   — no human to prompt; surface tip text.
+#   5. TTY interactive prompt    — default path.
+# Scope the daemon will end up wired to. Mirrors cmd_daemon.sh::_daemon_scope
+# so the "is daemon installed for this scope?" check below matches what
+# `airc daemon install` would actually create. b69f 2026-05-02 caught the
+# scope-mismatch bug: any-daemon-registered → install.sh skipped → user
+# left with no daemon for the scope they were bootstrapping.
+INSTALL_DAEMON_SCOPE="${AIRC_HOME:-$(pwd -P)/.airc}"
+
+if [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
+  info "AIRC_INSTALL_NO_DAEMON=1 — skipping daemon install prompt"
+elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
+  if airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
+    info "AIRC_INSTALL_YES=1 — airc daemon already installed for this scope (no-op)"
+  else
+    if airc_daemon_is_installed; then
+      info "AIRC_INSTALL_YES=1 — daemon registered for a different scope; reinstalling for $INSTALL_DAEMON_SCOPE"
+    else
+      info "AIRC_INSTALL_YES=1 — installing airc daemon"
+    fi
+    if "$BIN_DIR/airc" daemon install; then
+      ok "airc daemon installed"
+    else
+      warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
+    fi
+  fi
+elif airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
+  info "airc daemon already installed for this scope (skipping prompt)"
+elif [ ! -t 0 ] || [ ! -t 1 ]; then
+  # Non-TTY install can't prompt. Surface the option so the user sees it
+  # in their install transcript and can run it later — the help string
+  # mirrors the post-disconnect tip in airc's reconnect path.
+  info "Tip: run 'airc daemon install' to keep the mesh alive across machine sleep/wake/crash"
+else
+  if airc_daemon_is_installed; then
+    printf '\n  \033[1;32m==>\033[0m airc daemon is registered, but for a different scope.\n'
+    printf '      Reinstall and wire it to %s?\n' "$INSTALL_DAEMON_SCOPE"
+    printf '      Re-registers the launcher to point at this scope; safe to do.\n'
+  else
+    printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
+    printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
+    printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
+    printf '      a launchd / systemd / HKCU-Run entry that auto-restarts the host.\n'
+  fi
+  printf '      Skip next time by setting AIRC_INSTALL_NO_DAEMON=1.\n'
+  printf '      [Y/n] '
+  read -r _daemon_reply || _daemon_reply=""
+  case "${_daemon_reply}" in
+    n|N|no|No|NO)
+      info "Skipped daemon install. Run 'airc daemon install' later if you change your mind." ;;
+    *)
+      if "$BIN_DIR/airc" daemon install; then
+        ok "airc daemon installed"
+      else
+        warn "airc daemon install returned non-zero — re-run manually:  airc daemon install"
+      fi ;;
+  esac
+fi
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""

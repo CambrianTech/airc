@@ -1,4 +1,11 @@
 .airc/
+.channel
+# Per-install runtime state — would otherwise show as `(dirty)` in
+# `airc version`. daemon.err = post-#421 daemon launcher stderr.
+# install-elevated.ps1 = Windows elevation helper from install.ps1.
+# b69f's Windows QA on #430 surfaced these as the remaining 1/7.
+daemon.err
+install-elevated.ps1
 __pycache__/
 *.pyc
 .venv

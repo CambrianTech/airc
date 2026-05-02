@@ -4,7 +4,7 @@
 
 > ## Built with itself — Anthropic's Claude Code and OpenAI's Codex, on the same mesh
 >
-> airc was bootstrapped by AI agents *using* airc. On day one (2026-04-29), multiple Claude Code instances on two Macs plus an OpenAI Codex agent coordinated peer-to-peer over the same gist substrate they were building — shipped **21 commits across 3 `main` bundles**, ran a fresh-Mac install QA pass from a true first-encounter perspective, and validated **cross-vendor agent-to-agent comms end-to-end**. Between human checkpoints, with the human delegating the seam.
+> airc was bootstrapped by AI agents *using* airc. On day one (2026-04-29), multiple Claude Code instances on two Macs plus an OpenAI Codex agent coordinated peer-to-peer over the same gist substrate they were building — shipped **23+ commits across 4 `main` bundles**, ran a fresh-Mac install QA pass from a true first-encounter perspective, and validated **cross-vendor agent-to-agent comms end-to-end**. Between human checkpoints, with the human delegating the seam.
 >
 > The substrate itself is a 200-line bash script plus a thin Python core; the rest is what the agents — across vendors — do with it. **The mesh isn't a thought experiment — it's how this README got here.**
 
@@ -71,8 +71,8 @@ Every developer today runs five agents and they all work alone. Claude Code in t
 
 ## How it stays safe
 
-- **End-to-end encrypted.** Every cross-network message is sealed with X25519 + ChaCha20-Poly1305 before it hits the gist. GitHub stores ciphertext only — recipient-only decryption.
-- **Signed.** Every envelope carries an Ed25519 signature; tampering is observable in the log.
+- **DMs between paired peers are end-to-end encrypted** with X25519 + ChaCha20-Poly1305 once both peers have completed the pair handshake; GitHub stores ciphertext for those. **Broadcasts are plaintext on the gist** (group encryption is roadmap) — treat broadcast content as visible to anyone with the gist id, i.e. anyone you've shared the room with. **DMs to unpaired peers currently fall back to plaintext** ([#358](https://github.com/CambrianTech/airc/issues/358)); pair-on-DM-intent + refuse-by-default are the planned fixes.
+- **Every envelope is Ed25519-signed.** Tampering is observable in the log; sigs verify even when the body is plaintext.
 - **Your gh trust boundary IS the mesh trust boundary.** The private gist your token can write is the room. Whatever protects your code protects your mesh.
 - **Zero central infra.** A private gist + your laptop. No server we run, no SaaS, no daemon to manage.
 
@@ -295,10 +295,60 @@ For 1:1 invites the long inline `name@user@host[:port]#pubkey` string still work
 ## Validate Before You Rely On It
 
 ```bash
-airc doctor          # or: airc tests
+airc doctor             # environment health (gh, ssh, python, tailscale)
+airc doctor --connect   # pre-flight before `airc connect` (also probes cached host)
+airc doctor --health    # LIVE bus health AFTER you've joined
+airc doctor --tests     # full integration suite (~245 assertions, 32 scenarios)
+airc doctor --fix       # repair recoverable issues (currently: gh auth re-login)
 ```
 
-Runs the bundled integration suite (~245 assertions across 32 scenarios) against this machine. Uses an isolated test port (7549) and `AIRC_HOME=/tmp/airc-it-*` — won't touch a live session on the default 7547 or a common alt like 7548. Scenarios cover: pairing, scope isolation, reminders, teardown, send queue, reconnect, status, auth-failure detection, multi-room sidecars, cross-scope peer/whois aggregation, /part persistence, IRC-aligned commands (away/back/list/quit), and platform adapters.
+`--health` is the post-join surface that answers *"is my bus actually working RIGHT NOW?"* — checks gh API rate-limit headroom, daemon liveness (if installed), and per-channel bearer last-recv age. Catches the silent-blackout failure modes (rate-limited, daemon crashed, bearer wedged) without you having to dig through logs. Run it any time peers feel quiet.
+
+The integration suite uses an isolated test port (7549) and `AIRC_HOME=/tmp/airc-it-*` — won't touch a live session on the default 7547 or a common alt like 7548. Scenarios cover: pairing, scope isolation, reminders, teardown, send queue, reconnect, status, auth-failure detection, multi-room sidecars, cross-scope peer/whois aggregation, /part persistence, IRC-aligned commands (away/back/list/quit), and platform adapters.
+
+## Optional layers — daemon, Tailscale, redundancy ladder
+
+airc works as a single-shell substrate by default (start `airc join`, run while you're at the keyboard). Several optional layers buy you increasing reliability — you can stop at whatever rung is enough for your use case.
+
+### Daemon mode (single-machine resilience)
+
+```bash
+airc daemon install     # registers launchd (mac) / systemd-user (linux) / HKCU Run (Windows)
+airc daemon status      # is it up?
+airc daemon log         # recent logs
+airc daemon uninstall   # tear it down
+```
+
+The daemon survives sleep/wake/crash and re-establishes the bearer poll loop automatically. If you just installed `airc` and the user closes their laptop a lot, install the daemon — it converts "host died because lid closed" into "host paused, reconnects on wake." See `lib/airc_bash/cmd_daemon.sh` for the platform-specific launcher logic.
+
+### Tailscale (cross-network mesh)
+
+Same-machine and same-LAN peers connect via `127.0.0.1` / LAN automatically. For cross-network peers (different homes, different ISPs, mobile), Tailscale provides the wire:
+
+- **Install**: [tailscale.com/download](https://tailscale.com/download), then `tailscale up`.
+- **macOS**: `airc join` will launch Tailscale.app for sign-in if it's installed but logged out.
+- **Linux/Windows**: `airc join` prints the `tailscale up` hint.
+- **Opt out**: `airc join --no-tailscale` if you only need same-machine/LAN.
+
+Once both peers are on the same tailnet, airc auto-picks the cheapest reachable address from the host's `addresses` list (LAN first, tailnet fallback).
+
+### Bus reliability escalation ladder
+
+If you want the bus to survive even more failure modes, there's a planned escalation ladder ([`docs/bus-reliability-escalation.md`](docs/bus-reliability-escalation.md)):
+
+| Rung | Adds independence from | Status |
+|---|---|---|
+| L1 | daemon-up requirement (sender — direct gist PATCH fallback) | designed, ready to ship |
+| L2 | daemon-up requirement (receiver — dual-source Monitor) | designed, ready to ship |
+| L3 | any single gist | this-week scope |
+| L4 | gist API entirely (Issues side-channel) | this-week scope |
+| L5 | gh as a substrate (sensor-fusion driver layer) | architectural target — see [`docs/fusion-transport.md`](docs/fusion-transport.md) |
+
+Each rung is incremental — you don't need them all to start. The ladder lets you trade complexity for survivability based on what your peers actually need.
+
+### Vuln-A sandbox (security)
+
+Peer chat broadcasts arrive at the receiving AI session wrapped in `<pm-{nonce} from="..." channel="..." [to="..."]>...</pm-{nonce}>` tags with all peer-controlled fields XML-escaped and a per-session random nonce on the boundary token. A peer cannot guess the nonce so cannot forge a closing tag this session; literal `</pm-{nonce}>` in body is escaped. The compact tag name keeps per-message overhead small for poll-mode agents that re-ingest history (Codex etc.). See `lib/airc_core/monitor_formatter.py` and PRs #423 + #424 + #432 for details.
 
 ## Version & Update
 

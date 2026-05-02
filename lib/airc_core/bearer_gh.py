@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import json
 import os
+import random as _random
 import shutil
 import subprocess
+import sys
 import tempfile
 import time as _time
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Tuple
 
 from .bearer import (
     Bearer,
@@ -110,15 +112,91 @@ def _has_gh_auth() -> bool:
     return r.returncode == 0
 
 
+def _classify_gh_error(combined_output: str, exit_nonzero: bool) -> str:
+    """Map a `gh api` failure's stderr+stdout body to a SendOutcome.kind.
+
+    Pattern-match on the response body / gh CLI's "(HTTP NNN)" suffix.
+    The order matters: secondary_rate_limit must be checked BEFORE
+    auth_failure (both can be HTTP 403, but the rate-limit text qualifies
+    differently and the recovery path is "wait" not "re-auth").
+
+    Returns one of: "secondary_rate_limit" | "gone" | "auth_failure"
+                  | "transient_failure"
+    """
+    if not exit_nonzero:
+        return "transient_failure"  # caller should not call us if exit=0
+    body = (combined_output or "").lower()
+
+    # Secondary / abuse rate limit — empirically returned as 403 with a
+    # body string containing "rate limit exceeded" or "secondary rate
+    # limit" (gh's REST docs:
+    # https://docs.github.com/en/rest/overview/rate-limits-for-the-rest-api).
+    # NOT exposed by the rate_limit endpoint, so the only signal is the
+    # error body. Caller must back off LONG (90s+) — short retries
+    # extend the throttle window. airc#381 forensics 2026-04-30: trip-
+    # ped during a 4-peer concurrent-coord burst with primary rate at
+    # 4542/5000 still nominally available.
+    if "secondary rate limit" in body or "rate limit exceeded" in body:
+        return "secondary_rate_limit"
+
+    # 404 — gist deleted. Permanent. Caller MUST clear stale mapping;
+    # retry will keep returning 404 forever. Distinct from auth_failure
+    # because re-auth does not help; only `airc join --room <name>` to
+    # re-host (or another peer's takeover) will create a new mapping.
+    #
+    # Pre-fix matched bare "not found" (Copilot caught on PR #422 review)
+    # — that substring is in the unrelated "gh CLI not found on PATH"
+    # message, which would mis-route to "gone" and trigger the wrong
+    # recovery (clearing channel_gists when the actual problem is
+    # missing tooling). Anchor the match: explicit HTTP 404 OR
+    # "not found"/"could not resolve" with gist/gh-API context.
+    if (
+        "(http 404)" in body
+        or "404 not found" in body
+        or "not found (404)" in body
+        or "gist not found" in body
+    ):
+        return "gone"
+
+    # 401 / 403 (without the rate-limit body matched above) — auth-class
+    # failure. User must re-auth (gh auth login -h github.com).
+    if (
+        "(http 401)" in body
+        or "(http 403)" in body
+        or "bad credentials" in body
+        or "permission" in body
+        or "401" in body
+    ):
+        return "auth_failure"
+
+    # Default conservative: transient. Includes 5xx, network errors,
+    # subprocess timeouts surfaced as gh's own retry-loop exhaustion.
+    return "transient_failure"
+
+
 def _gh_api_get(gist_id: str) -> Optional[dict]:
     """GET gists/<id> via gh api. Returns parsed JSON dict or None on
     failure (rate-limited, network blip, auth lost mid-stream).
 
     No retry here — caller (recv_stream's poll loop, send's read step)
-    decides whether to retry or back off."""
+    decides whether to retry or back off.
+
+    Failure CLASSIFICATION (for callers that need to branch on 404 vs
+    403-rate vs network) is done by `_gh_api_get_classified` which is a
+    thin wrapper. Keep this function as the subprocess caller so existing
+    test mocks of `_gh_api_get` keep working."""
     try:
         gh = _resolve_gh_bin()
-    except GhBearerError:
+    except GhBearerError as e:
+        # Loud-fail per the global "evidence is for the debugger, not
+        # the trash" rule. Pre-fix every silent return None below
+        # masked real failures (auth lost, rate-limited, gist-gone) as
+        # "transient gh hiccup, sleep+retry forever" — joiners' Monitor
+        # surfaces nothing while peer chat rots in the void. Joel
+        # 2026-05-02: "you fuckers use try/catch to eat errors."
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh binary not resolvable: {e}\n")
+        sys.stderr.flush()
+        _gh_api_get._last_err = str(e)  # type: ignore[attr-defined]
         return None
     try:
         r = subprocess.run(
@@ -127,14 +205,56 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
             text=True,
             timeout=_GH_API_TIMEOUT,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): subprocess error: {e}\n")
+        sys.stderr.flush()
+        _gh_api_get._last_err = ""  # type: ignore[attr-defined]
         return None
     if r.returncode != 0:
+        combined = (r.stderr or "") + (r.stdout or "")
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh api exit={r.returncode}: {combined.strip()[:500]}\n")
+        sys.stderr.flush()
+        _gh_api_get._last_err = combined  # type: ignore[attr-defined]
         return None
     try:
         return json.loads(r.stdout)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): JSON parse failed: {e}; first 200 bytes: {(r.stdout or '')[:200]!r}\n")
+        sys.stderr.flush()
         return None
+
+
+def _gh_api_get_classified(gist_id: str) -> Tuple[Optional[dict], str]:
+    """GET gists/<id> with failure CLASSIFICATION.
+
+    Returns (gist_dict_or_None, kind):
+      (dict, "delivered")              — success, JSON parsed
+      (None, "gone")                   — 404 (gist deleted)
+      (None, "secondary_rate_limit")   — 403 + rate-limit body
+      (None, "auth_failure")           — 401, or 403 without rate-limit
+      (None, "transient_failure")      — network, 5xx, timeout, parse,
+                                         missing gh binary
+
+    Wraps `_gh_api_get` so existing test mocks that patch _gh_api_get
+    still work — the wrapper just reads the stashed _last_err sidecar
+    to do classification when the underlying call returned None.
+
+    Added 2026-04-30 (airc#381 layer A) to give send() the right kind
+    to propagate."""
+    # Reset sidecar before call so a stale value from a prior failure
+    # doesn't bleed into a fresh attempt that returns None for some
+    # other reason (test mocks that don't set _last_err).
+    if hasattr(_gh_api_get, "_last_err"):
+        delattr(_gh_api_get, "_last_err")
+    gist = _gh_api_get(gist_id)
+    if gist is not None:
+        return (gist, "delivered")
+    body = getattr(_gh_api_get, "_last_err", "") or ""
+    if not body:
+        # No sidecar — could mean test mock returned None directly.
+        # Default to transient_failure (the conservative pre-#381 behavior).
+        return (None, "transient_failure")
+    return (None, _classify_gh_error(body, True))
 
 
 def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]:
@@ -146,6 +266,11 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
     supported by the endpoint"), confirmed empirically 2026-04-29.
     Concurrency control is the caller's problem (see GhBearer.send's
     verify-after-write loop).
+
+    Failure CLASSIFICATION (gone vs secondary rate vs 409-conflict vs
+    auth vs network) is done by `_gh_api_patch_classified` which is a
+    thin wrapper. Keep this function as the subprocess caller so existing
+    test mocks of `_gh_api_patch_messages_jsonl` keep working.
 
     Body is built via json.dumps so the file content's newlines /
     quotes / unicode are properly escaped — embedded literal newlines
@@ -170,6 +295,80 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
         return (True, "")
     err = (r.stderr or r.stdout or "gh api PATCH failed").strip()
     return (False, err)
+
+
+def _gh_api_patch_classified(
+    gist_id: str, content: str
+) -> Tuple[bool, str, str]:
+    """PATCH with failure CLASSIFICATION.
+
+    Returns (ok, detail, kind):
+      (True,  "",    "delivered")          — PATCH accepted (caller still
+                                             must verify-after-write to
+                                             catch silent clobbers)
+      (False, body,  "conflict")           — HTTP 409 / "Gist cannot be
+                                             updated" — concurrent write
+                                             collision; caller should
+                                             jittered-backoff + retry
+      (False, body,  "secondary_rate_limit")
+                                           — HTTP 403 with rate-limit
+                                             body; back off LONG (90s+)
+      (False, body,  "gone")               — HTTP 404 (gist deleted)
+      (False, body,  "auth_failure")       — HTTP 401 / 403-not-rate
+      (False, body,  "transient_failure")  — network, 5xx, timeout, etc
+
+    Wraps `_gh_api_patch_messages_jsonl` so existing test mocks that
+    patch the unclassified function still work.
+
+    Added 2026-04-30 (airc#381 layer A). Splits what used to be a
+    string-match-on-detail by the caller into a single classified
+    return so all callers branch on the same kind taxonomy.
+    """
+    ok, detail = _gh_api_patch_messages_jsonl(gist_id, content)
+    if ok:
+        return (True, "", "delivered")
+
+    detail_lower = detail.lower()
+
+    # 409 conflict — distinct kind; caller retries with jittered backoff.
+    # Pre-#381 this was string-matched in the caller; folding it in here
+    # so all classification lives in one place.
+    if "409" in detail or "cannot be updated" in detail_lower:
+        return (False, detail, "conflict")
+
+    kind = _classify_gh_error(detail, True)
+    return (False, detail, kind)
+
+
+def _jittered_backoff(attempt: int) -> float:
+    """Exponential backoff with per-call jitter.
+
+    Replaces the pre-#381 `0.05 * (attempt + 1)` linear schedule which
+    had two failure modes:
+
+      1. Linear progression maxes out at 0.4s after 8 attempts, total
+         retry window ~1.8s. Far too short for gh's secondary rate
+         limit (clears in 60-180s) — every retry hit the same throttle
+         and the bearer gave up well before the window opened.
+
+      2. Identical schedule across peers means 4 peers all retry at the
+         same 0.05/0.10/0.15... offsets, amplifying the contention
+         that triggered the original collision. Jitter desyncs them.
+
+    Returns seconds to sleep. Caps at 30s per single backoff to keep
+    the worst-case retry path bounded; a caller running RETRIES=8
+    iterations gives a total worst-case retry window of ~60-90s with
+    randomization, which IS long enough to clear secondary rate-limit
+    bursts in most observed cases.
+
+    For the secondary_rate_limit class specifically, callers should
+    NOT use this function — they should sleep ~90s outright (one
+    backoff burst won't clear gh's per-burst window). This function
+    targets the conflict / transient classes where ~exponential growth
+    fits."""
+    base = 0.1 * (2 ** attempt)
+    base = min(base, 30.0)
+    return _random.uniform(0.5, 1.5) * base
 
 
 def _rotate_if_needed(content: str) -> str:
@@ -381,10 +580,20 @@ class GhBearer(Bearer):
         paths bounded by RETRIES.
 
         Outcome kinds:
-          delivered          — PATCH succeeded and verify saw our line
-          transient_failure  — read/write/network failure or retries
-                               exhausted on conflicts
-          auth_failure       — 401/404/permission from gh
+          delivered             — PATCH succeeded and verify saw our line
+          transient_failure     — network / 5xx / conflict-after-retries
+          gone                  — gist returned 404 (deleted permanently);
+                                  caller MUST clear stale mapping
+          secondary_rate_limit  — gh threw 403 with rate-limit body;
+                                  back off LONG (90s+) before next attempt
+          auth_failure          — 401, or 403 not matching rate-limit body
+
+        airc#381 layer A (2026-04-30) split the pre-existing single
+        "transient_failure" catch-all into the four real classes above.
+        Old code returned auth_failure on 404 ("permission/401/not
+        found/404" matched together) which was wrong for two reasons:
+        (a) re-auth doesn't bring back a deleted gist, and (b) it sent
+        users to `gh auth login` for a remedy that wouldn't help.
         """
         self._check_alive()
 
@@ -414,42 +623,66 @@ class GhBearer(Bearer):
         # keep verify-after-write as a second-line defense for the rarer
         # silent-clobber path (PATCH returns 200 but our line isn't in
         # the post-write content).
+        #
+        # Backoff schedule (2026-04-30 fix, airc#381 layer A): replaced
+        # `0.05 * (attempt + 1)` with `_jittered_backoff(attempt)` which
+        # is exponential + per-call randomized. Old linear schedule
+        # was identical across peers, so 4 peers all retried at the
+        # same offsets and amplified contention; jittered exponential
+        # desyncs them and gives a meaningfully longer total retry
+        # window (~60-90s vs ~1.8s).
         RETRIES = 8
         last_detail = ""
         for attempt in range(RETRIES):
-            gist = _gh_api_get(gist_id)
+            gist, get_kind = _gh_api_get_classified(gist_id)
             if gist is None:
+                # GET failed — distinguish permanent (gone) / wait (rate)
+                # / re-auth (auth) / retry (transient). Old code coalesced
+                # all into transient_failure; new path propagates the
+                # right kind so caller takes the right recovery action.
+                if get_kind in ("gone", "secondary_rate_limit", "auth_failure"):
+                    return SendOutcome(
+                        kind=get_kind,
+                        detail=f"GET gists/{gist_id} failed: {get_kind}",
+                    )
+                # transient — caller will queue + retry; no point
+                # spinning the inner loop on this attempt.
                 return SendOutcome(
                     kind="transient_failure",
-                    detail=f"could not fetch gist {gist_id} (rate limit, network, or auth)",
+                    detail=f"could not fetch gist {gist_id} (network/5xx/timeout)",
                 )
             existing = _read_messages_content(gist)
             new_content = _rotate_if_needed(existing) + framed_str
 
-            ok, detail = _gh_api_patch_messages_jsonl(gist_id, new_content)
+            ok, detail, patch_kind = _gh_api_patch_classified(gist_id, new_content)
             if not ok:
                 last_detail = detail
-                lower = detail.lower()
-                # 409 = concurrent-update conflict. Retry with fresh
-                # content (the racer's line is now visible to our next
-                # GET and the merge keeps both).
-                if "409" in detail or "cannot be updated" in lower:
-                    _time.sleep(0.05 * (attempt + 1))
+                # Conflict is the only case where we loop — every other
+                # class is structurally not retryable on this attempt
+                # (gone won't un-gone, rate-limit won't clear in 1s,
+                # auth won't unfail without user intervention).
+                if patch_kind == "conflict":
+                    _time.sleep(_jittered_backoff(attempt))
                     continue
-                if "permission" in lower or "401" in lower or "not found" in lower or "404" in lower:
-                    return SendOutcome(kind="auth_failure", detail=detail)
-                return SendOutcome(kind="transient_failure", detail=detail)
+                # gone / secondary_rate_limit / auth_failure /
+                # transient_failure all propagate as-is.
+                return SendOutcome(kind=patch_kind, detail=detail)
 
             # PATCH said OK — verify-after-write to catch silent clobbers
             # (rare; gh sometimes accepts our PATCH even when it
             # overwrote a racer's commit).
-            verify = _gh_api_get(gist_id)
+            verify, _verify_kind = _gh_api_get_classified(gist_id)
             if verify is None:
+                # Verify GET failed — assume delivered (PATCH said ok).
+                # Treating a verify-failure as delivered is safer than
+                # treating it as not-delivered: a false-positive duplicate
+                # is recoverable (verify-after-write next iteration on the
+                # caller side will dedup), a false-negative loss is not.
                 return SendOutcome(kind="delivered", detail="")
             if framed_str.rstrip("\n") in _read_messages_content(verify):
                 return SendOutcome(kind="delivered", detail="")
             last_detail = "verify-after-write: line not in gist post-PATCH (silent clobber)"
-            _time.sleep(0.05 * (attempt + 1))
+            _time.sleep(_jittered_backoff(attempt))
 
         return SendOutcome(
             kind="transient_failure",

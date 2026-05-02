@@ -134,6 +134,37 @@ requires_gh_auth_or_skip() {
   return 0
 }
 
+# Local-pair bearer probe (#281 vestigial-test gate). The 'tabs',
+# 'reconnect', 'status', 'auth_failure', and bearer_(ssh|cli|observability)
+# scenarios use spawn_host with --no-room --no-gist + spawn_joiner via
+# inline invite, then call `airc send` expecting peer-to-peer
+# messaging. That whole transport (LocalBearer + SshBearer) was removed
+# in #281 (Phase 3c) — substrate is gh-only. The pair handshake still
+# works (TCP listener), but there's no transport for the SEND. Resolver
+# returns 'no registered bearer can serve' → cmd_send queues silently
+# → asserts fire on 'beta monitor did NOT see m2', etc.
+#
+# Gate these scenarios on a local-pair bearer being registered. Today
+# returns false (only ['gh']); when a non-gh peer-bearer comes back,
+# this auto-enables. Honest categorization beats permanent skip.
+_airc_have_local_bearer=""
+requires_local_pair_bearer_or_skip() {
+  local _scn="$1"
+  if [ -z "$_airc_have_local_bearer" ]; then
+    local _kinds
+    _kinds=$(PYTHONPATH="$(dirname "$AIRC")/lib" python3 -c "from airc_core.bearer_resolver import available_kinds; print(' '.join(available_kinds()))" 2>/dev/null || echo "")
+    case " $_kinds " in
+      *" local "*|*" ssh "*) _airc_have_local_bearer="yes" ;;
+      *)                     _airc_have_local_bearer="no" ;;
+    esac
+  fi
+  if [ "$_airc_have_local_bearer" = "no" ]; then
+    pass "$_scn (skipped: requires local-pair bearer — only gh registered post-#281, see resolver)"
+    return 1
+  fi
+  return 0
+}
+
 # Reap any orphan room gists left over from prior test runs that
 # kill -9'd before EXIT traps could fire (which is most of them under
 # the test harness's pkill cleanup). Without this, `airc list` on the
@@ -180,10 +211,15 @@ spawn_host() {
       AIRC_NO_DISCOVERY=1 \
       "$AIRC" connect --no-room --no-gist > "$home/out.log" 2>&1 & )
   local i
-  for i in 1 2 3 4 5; do
+  # Was 5s — bumped to 12s for slow CI runners (cold ed25519 keygen +
+  # entropy pool warmup + container overhead pushes init past 5s on
+  # ubuntu-latest). Mac local takes ~2s; CI runners need more headroom.
+  for i in $(seq 1 12); do
     sleep 1
     grep -q 'Hosting as' "$home/out.log" 2>/dev/null && return 0
   done
+  echo "  (spawn_host: 'Hosting as' not seen in $home/out.log after 12s; tail:)" >&2
+  tail -10 "$home/out.log" 2>/dev/null | sed 's/^/    /' >&2
   return 1
 }
 
@@ -199,10 +235,20 @@ spawn_joiner() {
       AIRC_NO_DISCOVERY=1 \
       "$AIRC" connect "$join" > "$home/out.log" 2>&1 & )
   local i
-  for i in 1 2 3 4 5 6; do
+  # Was 6s — bumped to 18s for slow CI runners. Joiner init does
+  # ed25519 keygen + TCP pair-handshake + SSH-verify, all serial.
+  # Local Mac runs in 3-5s; CI runner observation: 6s timeout was
+  # marginal, causing 10 false-negative "joiner failed to start"
+  # errors per integration-suite run since ~2026-04-30. 18s gives
+  # 3x headroom. If it's still failing with 18s, the failure is real
+  # (sshd config, firewall, etc.) and the dump-on-fail below makes
+  # it diagnosable.
+  for i in $(seq 1 18); do
     sleep 1
     grep -q 'Connected to' "$home/out.log" 2>/dev/null && return 0
   done
+  echo "  (spawn_joiner: 'Connected to' not seen in $home/out.log after 18s; tail:)" >&2
+  tail -10 "$home/out.log" 2>/dev/null | sed 's/^/    /' >&2
   return 1
 }
 
@@ -256,6 +302,7 @@ as_home() {
 
 scenario_tabs() {
   section "tabs: two processes on one machine (ports + isolated homes)"
+  requires_local_pair_bearer_or_skip "tabs" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-h alpha 7549 || { fail "alpha host failed to start"; return; }
@@ -592,6 +639,7 @@ scenario_resilience() {
 
 scenario_reconnect() {
   section "reconnect: joiner survives host down/up cycle without manual intervention"
+  requires_local_pair_bearer_or_skip "reconnect" || return
   cleanup_all
 
   # ── Setup: alpha hosts on 7549, beta joins ──────────────────────────
@@ -739,6 +787,7 @@ json.dump(c, open(p, 'w'))
 
 scenario_status() {
   section "status: liveness view reflects identity, monitor, queue, last-activity"
+  requires_local_pair_bearer_or_skip "status" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-s-h shost 7549 || { fail "shost failed to start"; return; }
@@ -809,6 +858,7 @@ json.dump(c, open(p, 'w'))
 
 scenario_auth_failure() {
   section "auth_failure: fresh-install joiner with stale authorized_keys must fail LOUDLY"
+  requires_local_pair_bearer_or_skip "auth_failure" || return
   cleanup_all
 
   # This scenario mimics the exact situation memento hit today: a joiner
@@ -2489,17 +2539,21 @@ time.sleep(30)
     || fail "file_size on missing: expected 0, got '$_sz'"
 
   # ── detect_platform ──
+  # Canonical values per platform_adapters.sh:detect_platform —
+  # darwin / linux / wsl / windows / unknown. (2026-05-02 QA: test
+  # was originally written with 'macos'/'windows-bash' which never
+  # matched the implementation; aligned to actual emit values.)
   local _plat; _plat=$(_adapter_call "detect_platform")
   case "$_plat" in
-    macos|linux|wsl|windows-bash|unknown)
+    darwin|linux|wsl|windows|unknown)
       pass "detect_platform: returns valid value '$_plat'" ;;
     *)
       fail "detect_platform: unexpected value '$_plat'" ;;
   esac
   case "$(uname -s 2>/dev/null)" in
-    Darwin) [ "$_plat" = "macos" ] \
-      && pass "detect_platform: 'macos' on Darwin matches uname" \
-      || fail "detect_platform: Darwin should map to 'macos' (got '$_plat')" ;;
+    Darwin) [ "$_plat" = "darwin" ] \
+      && pass "detect_platform: 'darwin' on Darwin matches uname" \
+      || fail "detect_platform: Darwin should map to 'darwin' (got '$_plat')" ;;
     Linux)
       case "$_plat" in
         linux|wsl) pass "detect_platform: '$_plat' on Linux matches uname (linux or wsl)" ;;
@@ -2560,6 +2614,7 @@ scenario_bearer_ssh_send() {
   # scenario; future bearers (gh, local) will have parallel scenarios in
   # the same shape.
   section "bearer (ssh): send via bearer_cli, verify lands in host log"
+  requires_local_pair_bearer_or_skip "bearer_ssh_send" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-bs-h alpha 7551 || { fail "alpha host failed to start"; return; }
@@ -2620,6 +2675,7 @@ scenario_bearer_ssh_recv() {
   # — exercise the bearer alone, with no monitor in the loop, so a green
   # result here means the cutover only has to trust the bearer is sound.
   section "bearer (ssh): recv_stream picks up messages appended remotely"
+  requires_local_pair_bearer_or_skip "bearer_ssh_recv" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-br-h alpha 7552 || { fail "alpha host failed to start"; return; }
@@ -2721,6 +2777,7 @@ scenario_bearer_cli_recv() {
   # misses messages, the bug is in the formatter or in the watchdog —
   # not in the bearer-CLI seam.
   section "bearer_cli recv: emits one JSONL line per envelope"
+  requires_local_pair_bearer_or_skip "bearer_cli_recv" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-cli-h alpha 7553 || { fail "alpha host failed to start"; return; }
@@ -3710,6 +3767,7 @@ scenario_bearer_observability() {
   # gap). `airc peers` must annotate the silent peer with a last-seen
   # marker so 30 days of silence is impossible to mistake for "active."
   section "bearer observability: state file + status + peers reflect real liveness"
+  requires_local_pair_bearer_or_skip "bearer_observability" || return
   cleanup_all
 
   spawn_host /tmp/airc-it-bo-h obs-host 7554 || { fail "obs-host failed to start"; return; }

@@ -86,20 +86,43 @@ cmd_rename() {
     die "name collision: '$new_name' is already a paired peer (run 'airc peers' to see the roster)"
   fi
   if [ -f "$MESSAGES" ]; then
+    # 2026-05-02 QA caught: my OWN historical nick (visible in
+    # messages.jsonl from before my last rename) was being treated as
+    # an "active peer" collision, blocking the natural rename-back
+    # workflow (rename to test, rename back to original). Fix: walk
+    # the [rename] chain inside the same 200-line window to mark all
+    # nicks that were US, exclude them from the collision set. The
+    # check still blocks renaming TO another peer's nick — original
+    # safety property preserved.
     if tail -200 "$MESSAGES" 2>/dev/null \
-         | "$AIRC_PYTHON" -c "
-import sys, json
-target = '$new_name'
+         | AIRC_NEW_NAME="$new_name" AIRC_OLD_NAME="$old_name" "$AIRC_PYTHON" -c "
+import sys, os, json, re
+target = os.environ.get('AIRC_NEW_NAME', '')
+my_current = os.environ.get('AIRC_OLD_NAME', '')
 seen = set()
+my_history = {my_current}  # current nick is always 'mine'
+_rn = re.compile(r'\[rename\] old=([a-z0-9-]+) new=([a-z0-9-]+)')
 for line in sys.stdin:
     try:
         m = json.loads(line)
         fr = m.get('from')
-        if fr: seen.add(fr)
-    except: pass
-sys.exit(0 if target in seen else 1)
+        msg = m.get('msg', '') or ''
+        if fr:
+            seen.add(fr)
+        # Trace [rename] chain: if either side of a rename was us,
+        # both sides are us. Multi-pass would be more correct, but
+        # the linear pass catches the common case (consecutive renames).
+        mm = _rn.match(msg)
+        if mm:
+            old_n, new_n = mm.group(1), mm.group(2)
+            if old_n in my_history or new_n in my_history:
+                my_history.add(old_n)
+                my_history.add(new_n)
+    except Exception:
+        pass
+sys.exit(0 if (target in seen and target not in my_history) else 1)
 " 2>/dev/null; then
-      die "name collision: '$new_name' has been seen as an active peer in this room (use 'airc logs' to verify)"
+      die "name collision: '$new_name' has been seen as an active (foreign) peer in this room (use 'airc logs' to verify)"
     fi
   fi
 
