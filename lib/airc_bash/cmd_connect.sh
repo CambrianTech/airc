@@ -1244,6 +1244,16 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
     fi
 
+    # Daemon-install discoverability on the joiner success-path (#5 from
+    # b69f's 2026-05-02 daemon audit). Pre-fix the prompt only fired
+    # at install.sh time + the post-disconnect tip in the host branch
+    # (line ~1763). Daily 'airc join' users never saw it. Adding here
+    # so every successful joiner gets the visibility — non-blocking,
+    # silent on already-installed scopes (idempotent check).
+    if ! airc_daemon_is_installed; then
+      echo "  Tip: 'airc daemon install' keeps this mesh alive across Claude session ends + sleep/wake."
+    fi
+
     # Write PID file so `airc teardown` can find us later.
     echo $$ > "$AIRC_WRITE_DIR/airc.pid"
     # Clean exit on tab close / signal: reap the ssh tail subprocess so the

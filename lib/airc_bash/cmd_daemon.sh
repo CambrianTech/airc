@@ -438,8 +438,24 @@ cmd_daemon_status() {
         # look for the airc-connect process (PPID=1 = orphaned-into-
         # init, which is what `start /B` produces on Windows). Falling
         # back to airc.pid lookup if that fails.
+        # Bug #3 from b69f's 2026-05-02 audit: pre-fix reported RUNNING
+        # whenever ps-ef awk matched, WITHOUT verifying with kill -0.
+        # ps-ef can report zombie/defunct/stale matches. ALWAYS verify
+        # the matched PID with kill -0 before claiming RUNNING.
+        # Also verify the launcher .bat still exists — if registry points
+        # to a deleted path, status must surface STALE rather than say
+        # RUNNING based on an unrelated airc-connect process.
+        local launcher_bat="$scope/airc-daemon.bat"
+        local launcher_status="ok"
+        if [ ! -f "$launcher_bat" ]; then
+          launcher_status="missing"
+        fi
         local live_pid
-        live_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*connect/ && !/grep/ {print $2; exit}')
+        local raw_pid
+        raw_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*connect/ && !/grep/ {print $2; exit}')
+        if [ -n "$raw_pid" ] && kill -0 "$raw_pid" 2>/dev/null; then
+          live_pid="$raw_pid"
+        fi
         if [ -z "$live_pid" ] && [ -f "$scope/airc.pid" ]; then
           local pidfile_pid
           pidfile_pid=$(head -1 "$scope/airc.pid" 2>/dev/null | tr -d '[:space:]')
@@ -447,10 +463,19 @@ cmd_daemon_status() {
             live_pid="$pidfile_pid (from airc.pid)"
           fi
         fi
-        if [ -n "$live_pid" ]; then
-          echo "  Status:  RUNNING (PID $live_pid)"
+        # Status decision tree, in priority order so the user sees the
+        # actionable failure mode first when more than one applies:
+        #   1. launcher_status=missing → MISSING_LAUNCHER (registry
+        #      points to a path that doesn't exist; reinstall needed)
+        #   2. live_pid set + launcher present → RUNNING (truly alive)
+        #   3. launcher present, no live pid → registered (waiting on
+        #      next logon OR daemon was killed; user can re-fire)
+        if [ "$launcher_status" = "missing" ]; then
+          echo "  Status:  MISSING_LAUNCHER ($launcher_bat absent — registry stale; reinstall: airc daemon uninstall && airc daemon install)"
+        elif [ -n "$live_pid" ]; then
+          echo "  Status:  RUNNING (PID $live_pid, launcher exists, kill -0 verified)"
         else
-          echo "  Status:  registered (will start at next logon — or 'airc daemon install' to start now)"
+          echo "  Status:  STALE/STOPPED (launcher exists but no live airc process; will start at next logon — or 'airc daemon install' to start now)"
         fi
       else
         echo "  No daemon installed. Run: airc daemon install"
