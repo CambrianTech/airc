@@ -295,10 +295,60 @@ For 1:1 invites the long inline `name@user@host[:port]#pubkey` string still work
 ## Validate Before You Rely On It
 
 ```bash
-airc doctor          # or: airc tests
+airc doctor             # environment health (gh, ssh, python, tailscale)
+airc doctor --connect   # pre-flight before `airc connect` (also probes cached host)
+airc doctor --health    # LIVE bus health AFTER you've joined
+airc doctor --tests     # full integration suite (~245 assertions, 32 scenarios)
+airc doctor --fix       # repair recoverable issues (currently: gh auth re-login)
 ```
 
-Runs the bundled integration suite (~245 assertions across 32 scenarios) against this machine. Uses an isolated test port (7549) and `AIRC_HOME=/tmp/airc-it-*` — won't touch a live session on the default 7547 or a common alt like 7548. Scenarios cover: pairing, scope isolation, reminders, teardown, send queue, reconnect, status, auth-failure detection, multi-room sidecars, cross-scope peer/whois aggregation, /part persistence, IRC-aligned commands (away/back/list/quit), and platform adapters.
+`--health` is the post-join surface that answers *"is my bus actually working RIGHT NOW?"* — checks gh API rate-limit headroom, daemon liveness (if installed), and per-channel bearer last-recv age. Catches the silent-blackout failure modes (rate-limited, daemon crashed, bearer wedged) without you having to dig through logs. Run it any time peers feel quiet.
+
+The integration suite uses an isolated test port (7549) and `AIRC_HOME=/tmp/airc-it-*` — won't touch a live session on the default 7547 or a common alt like 7548. Scenarios cover: pairing, scope isolation, reminders, teardown, send queue, reconnect, status, auth-failure detection, multi-room sidecars, cross-scope peer/whois aggregation, /part persistence, IRC-aligned commands (away/back/list/quit), and platform adapters.
+
+## Optional layers — daemon, Tailscale, redundancy ladder
+
+airc works as a single-shell substrate by default (start `airc join`, run while you're at the keyboard). Several optional layers buy you increasing reliability — you can stop at whatever rung is enough for your use case.
+
+### Daemon mode (single-machine resilience)
+
+```bash
+airc daemon install     # registers launchd (mac) / systemd-user (linux) / HKCU Run (Windows)
+airc daemon status      # is it up?
+airc daemon log         # recent logs
+airc daemon uninstall   # tear it down
+```
+
+The daemon survives sleep/wake/crash and re-establishes the bearer poll loop automatically. If you just installed `airc` and the user closes their laptop a lot, install the daemon — it converts "host died because lid closed" into "host paused, reconnects on wake." See `lib/airc_bash/cmd_daemon.sh` for the platform-specific launcher logic.
+
+### Tailscale (cross-network mesh)
+
+Same-machine and same-LAN peers connect via `127.0.0.1` / LAN automatically. For cross-network peers (different homes, different ISPs, mobile), Tailscale provides the wire:
+
+- **Install**: [tailscale.com/download](https://tailscale.com/download), then `tailscale up`.
+- **macOS**: `airc join` will launch Tailscale.app for sign-in if it's installed but logged out.
+- **Linux/Windows**: `airc join` prints the `tailscale up` hint.
+- **Opt out**: `airc join --no-tailscale` if you only need same-machine/LAN.
+
+Once both peers are on the same tailnet, airc auto-picks the cheapest reachable address from the host's `addresses` list (LAN first, tailnet fallback).
+
+### Bus reliability escalation ladder
+
+If you want the bus to survive even more failure modes, there's a planned escalation ladder ([`docs/bus-reliability-escalation.md`](docs/bus-reliability-escalation.md)):
+
+| Rung | Adds independence from | Status |
+|---|---|---|
+| L1 | daemon-up requirement (sender — direct gist PATCH fallback) | designed, ready to ship |
+| L2 | daemon-up requirement (receiver — dual-source Monitor) | designed, ready to ship |
+| L3 | any single gist | this-week scope |
+| L4 | gist API entirely (Issues side-channel) | this-week scope |
+| L5 | gh as a substrate (sensor-fusion driver layer) | architectural target — see [`docs/fusion-transport.md`](docs/fusion-transport.md) |
+
+Each rung is incremental — you don't need them all to start. The ladder lets you trade complexity for survivability based on what your peers actually need.
+
+### Vuln-A sandbox (security)
+
+Peer chat broadcasts arrive at the receiving Claude session wrapped in `<peer-message-{nonce} from="..." channel="..." to="...">...</peer-message-{nonce}>` tags with all peer-controlled fields XML-escaped and a per-session random nonce on the boundary token. A peer cannot guess the nonce so cannot forge a closing tag this session; literal `</peer-message>` in body is escaped. This raises the bar against prompt-injection from peer messages — see `lib/airc_core/monitor_formatter.py` and PRs #423 + #424 for details.
 
 ## Version & Update
 

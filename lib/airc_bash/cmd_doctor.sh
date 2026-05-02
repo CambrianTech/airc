@@ -28,11 +28,14 @@ cmd_doctor() {
       echo "  airc doctor --fix        attempt to repair recoverable issues"
       echo "                           (currently: gh auth re-login if invalid)"
       echo "  airc doctor --connect    pre-flight checks for 'airc connect'"
+      echo "  airc doctor --health     LIVE bus health (after join — daemon, gh"
+      echo "                           rate-limit headroom, channel last-recv age)"
       echo "  airc doctor --tests      run the integration test suite"
       echo "                           (aliases: tests, test, run, suite)"
       return 0 ;;
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
     --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
+    --health|-H|health)              shift; _doctor_health "$@"; return ;;
     --fix|fix)                       shift; _doctor_fix "$@"; return ;;
   esac
 
@@ -411,6 +414,115 @@ _doctor_fix() {
   echo
   echo "  Summary: $fixed fixed, $skipped skipped, $failed failed."
   [ "$failed" = "0" ]
+}
+
+_doctor_health() {
+  # LIVE bus-health probe — answers "is my bus actively working RIGHT NOW?"
+  # Complements --connect (pre-flight, before join) with post-join checks
+  # against the running substrate. Joel 2026-05-02: "maybe doctor can test /
+  # so doctor could check the connection health". Surfaces the silent-
+  # blackout failure modes that bit us through the bios-hardening sprint —
+  # bearer falling behind, daemon crashed, gh rate-limit eating throughput.
+  echo
+  echo "  airc doctor --health -- live bus health"
+  echo "  ---------------------------------------"
+  echo
+  local issues=0 warns=0
+  local now; now=$(date +%s 2>/dev/null || echo 0)
+
+  # ── gh API headroom (rate-limit). Cheap; reveals whether we're near
+  # the cliff that wedged the bus pre-#416/#419.
+  if command -v gh >/dev/null 2>&1; then
+    local rate_json
+    if rate_json=$(gh api rate_limit 2>/dev/null); then
+      local core_remaining core_limit
+      core_remaining=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['remaining'])" 2>/dev/null || echo "")
+      core_limit=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['limit'])" 2>/dev/null || echo "")
+      if [ -n "$core_remaining" ] && [ -n "$core_limit" ]; then
+        if [ "$core_remaining" -lt 100 ]; then
+          printf "  [WARN] gh core rate-limit: %s/%s remaining — bus may stall soon\n" "$core_remaining" "$core_limit"
+          printf "         Mitigation: bearer auto-throttles (#416); peers will resume when window resets\n"
+          warns=$((warns+1))
+        elif [ "$core_remaining" -lt 1000 ]; then
+          printf "  [info] gh core rate-limit: %s/%s remaining (healthy headroom)\n" "$core_remaining" "$core_limit"
+        else
+          printf "  [ok] gh core rate-limit: %s/%s remaining\n" "$core_remaining" "$core_limit"
+        fi
+      else
+        printf "  [info] gh rate_limit reachable but parse failed (skipping)\n"
+      fi
+    else
+      printf "  [BLOCKED] gh API not reachable — can't probe rate-limit\n"
+      printf "         Fix: airc doctor (full env probe will diagnose)\n"
+      issues=$((issues+1))
+    fi
+  fi
+
+  # ── Daemon liveness (if installed). Daemon is optional but if installed
+  # and DOWN, the bus is in degraded mode (sends fall back to direct PATCH
+  # per #420 L1 once that ships; receives fall back per L2).
+  local daemon_pidfile="$AIRC_WRITE_DIR/daemon.pid"
+  if [ -f "$daemon_pidfile" ]; then
+    local dpid; dpid=$(cat "$daemon_pidfile" 2>/dev/null)
+    if [ -n "$dpid" ] && kill -0 "$dpid" 2>/dev/null; then
+      printf "  [ok] daemon running (pid %s)\n" "$dpid"
+    else
+      printf "  [WARN] daemon installed but DOWN (stale pid %s)\n" "${dpid:-?}"
+      printf "         Fix: airc daemon restart  (or: airc daemon status for triage)\n"
+      warns=$((warns+1))
+    fi
+  else
+    printf "  [info] daemon not installed (substrate runs in-shell only)\n"
+    printf "         Optional: airc daemon install  (survives sleep/crash, see README → Optional layers)\n"
+  fi
+
+  # ── Per-channel bearer health. bearer_state.<channel>.json's last_recv_ts
+  # is the heartbeat — if it's > 5min stale, the bearer is wedged and the
+  # AI session is going dormant on that channel.
+  local found_state=0
+  if [ -d "$AIRC_WRITE_DIR" ]; then
+    for state_file in "$AIRC_WRITE_DIR"/bearer_state.*.json; do
+      [ -f "$state_file" ] || continue
+      found_state=1
+      local channel; channel=$(basename "$state_file" .json | sed 's/^bearer_state\.//')
+      local last_recv_ts
+      last_recv_ts=$(python3 -c "import sys,json; d=json.load(open('$state_file')); print(int(d.get('last_recv_ts',0)))" 2>/dev/null || echo 0)
+      if [ "$last_recv_ts" = "0" ]; then
+        printf "  [WARN] #%s — bearer state has no last_recv_ts (never received?)\n" "$channel"
+        warns=$((warns+1))
+      else
+        local age=$((now - last_recv_ts))
+        if [ "$age" -lt 60 ]; then
+          printf "  [ok] #%s — last bearer recv %ds ago (healthy)\n" "$channel" "$age"
+        elif [ "$age" -lt 300 ]; then
+          printf "  [info] #%s — last bearer recv %ds ago (idle channel?)\n" "$channel" "$age"
+        elif [ "$age" -lt 1800 ]; then
+          printf "  [WARN] #%s — last bearer recv %ds ago (>5min stale; check daemon/rate-limit)\n" "$channel" "$age"
+          warns=$((warns+1))
+        else
+          printf "  [BLOCKED] #%s — last bearer recv %ds ago (>30min — bearer is wedged)\n" "$channel" "$age"
+          printf "           Fix: airc teardown && airc join  (re-establishes bearer poll loop)\n"
+          issues=$((issues+1))
+        fi
+      fi
+    done
+  fi
+  if [ "$found_state" = "0" ]; then
+    printf "  [info] no bearer state files — not joined to any channel yet\n"
+    printf "         Fix: airc join  (then re-run airc doctor --health)\n"
+  fi
+
+  echo
+  if [ "$issues" -eq 0 ] && [ "$warns" -eq 0 ]; then
+    echo "  ✓ Bus healthy."
+    return 0
+  elif [ "$issues" -eq 0 ]; then
+    echo "  ⚠ Bus working, $warns warning(s) above worth a look."
+    return 0
+  else
+    echo "  ✗ Bus DEGRADED on $issues issue(s) ($warns warning(s)) — see fixes above."
+    return 1
+  fi
 }
 
 _doctor_run_tests() {

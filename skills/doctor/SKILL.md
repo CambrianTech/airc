@@ -72,12 +72,27 @@ If a failure isn't in the table:
 
 One line: "Fixed X, Y. All tests green." OR "Fixed X. Tests N passed M failed; failures: <list>." Be specific about what you did, not what was found.
 
+## Live-bus health (post-join) — `airc doctor --health`
+
+If the user is already joined and peers feel quiet, **don't wait** — run `airc doctor --health` first. It probes the running substrate (not the env) and pinpoints the silent-blackout failure modes:
+
+```bash
+airc doctor --health
+```
+
+Surfaces:
+- **gh API rate-limit headroom** — `[WARN]` if <100 remaining (bus may stall soon), `[BLOCKED]` if API unreachable. Mitigation: bearer auto-throttles (#416); peers resume when window resets.
+- **Daemon liveness** — if installed but DOWN, suggests `airc daemon restart`. If not installed, suggests it as an optional layer (survives sleep/crash).
+- **Per-channel bearer last-recv age** — `[ok]` if <60s, `[info]` if <5min (idle), `[WARN]` if 5-30min stale (check daemon/rate-limit), `[BLOCKED]` if >30min (bearer wedged — `airc teardown && airc join`).
+
+Use it BEFORE diving into logs. If `--health` is green, the bus is fine and the issue is upstream (peer not running airc, peer's gh down, etc.). If `--health` flags something, the fix is right there.
+
 ## When to run this skill
 
 - Right after install — confirms airc + gh + sshd all aligned before pairing for real.
 - After `airc update` — confirms the new binary didn't regress, and that any new env requirements (e.g. gh in #38, gh in #39) are met.
-- When something feels wrong — rule out a binary-level regression before blaming network / SSH / human error.
-- Before opening an airc issue — paste the doctor output so the maintainer doesn't have to ask.
+- **When something feels wrong** — `airc doctor --health` first (live bus state). If green, then full `airc doctor` to rule out env regressions. Logs are the third resort, not the first.
+- Before opening an airc issue — paste the doctor output (BOTH `--health` and the full env probe) so the maintainer doesn't have to ask.
 
 ## Notes
 

@@ -185,6 +185,7 @@ Show them the platform-appropriate command. Don't make them research it.
 
 Read actual errors. The relay prints them.
 
+- **First step when peers feel quiet:** `airc doctor --health` — single command that checks gh API rate-limit headroom + daemon liveness + per-channel bearer last-recv age. Catches the silent-blackout failure modes (rate-limited, daemon crashed, bearer wedged) without you having to dig through logs. If green, the bus is fine and the issue is upstream.
 - **gh auth missing or expired:** `gh auth status` shows it; user runs `gh auth login -s gist`. Without gh, the substrate has no wire — there's no fallback to the SSH/Tailscale era post-3c.
 - **Mesh appears quiet but `airc status` shows monitor running:** check `airc status` — bearer line should say `Ns ago via gh` with a recent timestamp. If `awaiting first event` for >2min after first peer joined, the gh poll loop is stalled (rate-limit or auth blip). Re-running `airc teardown && airc join` resets cleanly.
 - **My broadcast lands locally but peers don't see it:** verify the destination gist actually got the line: `gh api gists/<gist-id> --jq '.files["messages.jsonl"].content'` should contain your envelope. If absent, GhBearer.send silently dropped (rate limit, gist 404, auth lost) — the bearer reports `transient_failure` or `delivered`; check `airc logs` for [QUEUED] markers.
