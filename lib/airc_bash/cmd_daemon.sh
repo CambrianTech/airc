@@ -197,10 +197,37 @@ _daemon_install_launchd() {
 PLIST
   echo "  Wrote $plist_path"
   # Bootout first to reset any prior load (idempotent install).
-  launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 \
-    || die "launchctl bootstrap failed. Plist written but not loaded; check Console.app for errors."
-  launchctl enable "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  # 2026-05-02 QA caught (#9): on a re-install over an existing
+  # daemon (e.g., switching scopes), bootout removes the registration
+  # but the previous launchd-managed PID can still be in-flight when
+  # the next bootstrap fires → "Input/output error 5" (launchd's
+  # "service already loaded" signal). Wait for the PID to actually
+  # exit before bootstrapping the new plist.
+  local _service="com.cambriantech.airc"
+  local _domain="gui/$(id -u)"
+  launchctl bootout "$_domain/$_service" 2>/dev/null || true
+  # Wait up to 3s for launchd to fully unload (poll launchctl list).
+  local _i
+  for _i in 1 2 3 4 5 6; do
+    launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "$_service" || break
+    sleep 0.5
+  done
+  # Bootstrap. Capture stderr for verification — "Input/output error"
+  # can appear even when the bootstrap actually succeeded (launchd's
+  # error reporting on re-bootstrap is unreliable). Don't die() on
+  # stderr alone; verify by checking launchctl list for the service.
+  local _bs_out
+  _bs_out=$(launchctl bootstrap "$_domain" "$plist_path" 2>&1) || true
+  if launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "$_service"; then
+    : # success — service is in launchd's list; bootstrap stderr (if any) is noise
+  else
+    # Genuine failure — service not loaded.
+    if [ -n "$_bs_out" ]; then
+      echo "  ⚠  launchctl stderr: $_bs_out" >&2
+    fi
+    die "launchctl bootstrap failed — service not loaded after bootstrap call. Check Console.app for com.cambriantech.airc errors."
+  fi
+  launchctl enable "$_domain/$_service" 2>/dev/null || true
   _daemon_install_done "Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)" "$scope" \
     "Note: if 'airc canary' / gist push fails under launchd, the gh keychain may not be unlocked at boot. Workaround: 'gh auth status' once after login to unlock; airc daemon picks it up on next restart."
 }

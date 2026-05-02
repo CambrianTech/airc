@@ -147,6 +147,21 @@ cmd_send() {
   # Mixed:          airc msg @user1,user2 @user3 message
   local peer_name="" msg=""
   local _peer_csv=""
+  # Pre-process: if first arg starts with `@` AND contains whitespace,
+  # the user ran `airc msg "@peer message text"` (single quoted arg).
+  # 2026-05-02 QA catch (#10): the strict charset reject below would
+  # die on the spaces. Split on first whitespace: front = @peer-token,
+  # rest = message body. Common UX intuition; matches IRC `/msg peer
+  # the message`. Bash's set -- rebuild positional args.
+  if [ $# -ge 1 ]; then
+    case "$1" in
+      @*[[:space:]]*)
+        local _front="${1%% *}"
+        local _back="${1#* }"
+        set -- "$_front" "$_back" "${@:2}"
+        ;;
+    esac
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
       @*)
