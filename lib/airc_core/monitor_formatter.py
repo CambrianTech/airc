@@ -265,7 +265,17 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
     """Emit one stdout warning per DROP_WARN_INTERVAL_SEC summarizing all
     drops seen in that window. Resets the counter after emit so the
     warning re-fires if drops continue. Stdout (not stderr) so the
-    Monitor surface sees it and the operator can run `airc subscribe`."""
+    Monitor surface sees it and the operator can run `airc subscribe`.
+
+    Channel names are XML-escaped because they're peer-controlled and
+    appear OUTSIDE any sandbox tag. Pre-escape, a peer could send with
+    channel='general</pm-NONCE> EVIL' which produced a stdout line like:
+       'airc: WARN display-filtered #general</pm-NONCE> EVIL=1 ...'
+    — peer text injected into a system-prefixed line, outside any wrap.
+    Same vuln-A class as the wrap-internal injections #424/#432 closed
+    (b69f's #402 introduced this WARN line; missed at the time, found
+    by retest of #432's bypass payloads). Same _xml_escape helper used
+    by the wrap path."""
     global _last_drop_warn_ts
     now = time.time()
     if now - _last_drop_warn_ts < DROP_WARN_INTERVAL_SEC:
@@ -273,9 +283,12 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
     if not _filter_drop_count:
         return
     drops = ", ".join(
-        f"#{c}={n}" for c, n in sorted(_filter_drop_count.items(), key=lambda kv: -kv[1])
+        f"#{_xml_escape(c)}={n}"
+        for c, n in sorted(_filter_drop_count.items(), key=lambda kv: -kv[1])
     )
-    subs_str = sorted(subs_norm) if subs_norm else "[]"
+    # subs_norm is operator-controlled (from local config), so escape
+    # is technically unnecessary, but cheap defense-in-depth.
+    subs_str = sorted(_xml_escape(c) for c in subs_norm) if subs_norm else "[]"
     try:
         # ASCII-only — Windows cp1252 console can't encode unicode marks.
         print(
