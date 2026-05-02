@@ -271,15 +271,23 @@ cmd_connect() {
   # at connect time so the user gets a clear error instead of a
   # mystery timeout.
   #
-  # Gated on use_room=1: when the user opts into legacy 1:1 invite
-  # mode (--no-room), the substrate isn't used and gh is irrelevant.
-  # The CI clean-install smoke test specifically exercises that
-  # offline path with no gh auth — pre-#338 the unconditional check
-  # killed it before the host loop could start (PR #338 regression).
-  #
-  # Skipped entirely if a live monitor exists in this scope (handled
-  # by the trust-existing-monitor short-circuit above).
-  if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
+  # Skip cases (gh isn't needed):
+  #   1. --no-room → user opted into legacy 1:1 invite mode (no
+  #      substrate). Pre-#338 the unconditional check killed CI's
+  #      clean-install smoke test which exercises this path.
+  #   2. Inline invite-string positional arg (`name@user@host[:port]#pubkey`)
+  #      → JOIN MODE legacy direct-pair, also no substrate. The
+  #      integration suite's spawn_joiner uses this; pre-fix the
+  #      check fired and CI runners (no PAT) failed every joiner.
+  #      Pattern matches what JOIN MODE itself parses at line ~862.
+  #   3. Live monitor exists in this scope (trust-existing-monitor
+  #      short-circuit above already returned).
+  local _looks_like_invite=0
+  if [ "$#" -ge 1 ] && [[ "$1" == *@*@*#* ]]; then
+    _looks_like_invite=1
+  fi
+  if [ "$use_room" = "1" ] && [ "$_looks_like_invite" = "0" ] \
+     && command -v gh >/dev/null 2>&1; then
     # Pre-flight via the centralized state machine (lib_auth.sh).
     # ok → proceed; rate_limited → wait + retry (token fine);
     # invalid → airc instigates the browser self-heal in-process;
