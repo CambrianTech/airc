@@ -98,9 +98,13 @@ airc_daemon_is_installed_for_scope() {
     linux|wsl)
       local unit_path="$HOME/.config/systemd/user/airc.service"
       [ -f "$unit_path" ] || return 1
-      # Match Environment="AIRC_HOME=<scope>" or Environment=AIRC_HOME=<scope>.
-      grep -qE "Environment=\"?AIRC_HOME=${target_scope//\//\\/}\"?($|[[:space:]])" "$unit_path" \
-        && return 0
+      # Fixed-string match (Copilot #422 review caught regex injection):
+      # target_scope contains '.' and other regex metacharacters
+      # (paths like '/Users/.../.airc/.airc'); the prior ERE form
+      # only escaped '/' which let '.airc' false-match. Two passes
+      # cover both quoted and unquoted forms emitted by cmd_daemon.sh.
+      grep -qF "Environment=\"AIRC_HOME=${target_scope}\"" "$unit_path" && return 0
+      grep -qF "Environment=AIRC_HOME=${target_scope}"     "$unit_path" && return 0
       return 1
       ;;
     windows)

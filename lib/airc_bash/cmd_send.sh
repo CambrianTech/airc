@@ -544,10 +544,11 @@ cmd_send() {
           echo "  ✗ gh auth check failed during host gist publish — your GitHub token is dead." >&2
           echo "    Bearer detail: ${_host_detail}" >&2
           echo "" >&2
-          echo "    Fix:  gh auth login -h github.com" >&2
+          echo "    Fix:  gh auth login -h github.com -s gist" >&2
           echo "" >&2
+          echo "    The -s gist scope is required — token without it can authenticate but can't publish to gists." >&2
           echo "    After re-authenticating, retry. No state lost — it's just gh's keyring that expired." >&2
-          die "gh auth failure on host gist publish — run 'gh auth login -h github.com' and retry"
+          die "gh auth failure on host gist publish — run 'gh auth login -h github.com -s gist' and retry"
           ;;
         gone)
           # Permanent destination loss (#381 layer A — HTTP 404 on the

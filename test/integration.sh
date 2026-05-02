@@ -180,10 +180,15 @@ spawn_host() {
       AIRC_NO_DISCOVERY=1 \
       "$AIRC" connect --no-room --no-gist > "$home/out.log" 2>&1 & )
   local i
-  for i in 1 2 3 4 5; do
+  # Was 5s — bumped to 12s for slow CI runners (cold ed25519 keygen +
+  # entropy pool warmup + container overhead pushes init past 5s on
+  # ubuntu-latest). Mac local takes ~2s; CI runners need more headroom.
+  for i in $(seq 1 12); do
     sleep 1
     grep -q 'Hosting as' "$home/out.log" 2>/dev/null && return 0
   done
+  echo "  (spawn_host: 'Hosting as' not seen in $home/out.log after 12s; tail:)" >&2
+  tail -10 "$home/out.log" 2>/dev/null | sed 's/^/    /' >&2
   return 1
 }
 
@@ -199,10 +204,20 @@ spawn_joiner() {
       AIRC_NO_DISCOVERY=1 \
       "$AIRC" connect "$join" > "$home/out.log" 2>&1 & )
   local i
-  for i in 1 2 3 4 5 6; do
+  # Was 6s — bumped to 18s for slow CI runners. Joiner init does
+  # ed25519 keygen + TCP pair-handshake + SSH-verify, all serial.
+  # Local Mac runs in 3-5s; CI runner observation: 6s timeout was
+  # marginal, causing 10 false-negative "joiner failed to start"
+  # errors per integration-suite run since ~2026-04-30. 18s gives
+  # 3x headroom. If it's still failing with 18s, the failure is real
+  # (sshd config, firewall, etc.) and the dump-on-fail below makes
+  # it diagnosable.
+  for i in $(seq 1 18); do
     sleep 1
     grep -q 'Connected to' "$home/out.log" 2>/dev/null && return 0
   done
+  echo "  (spawn_joiner: 'Connected to' not seen in $home/out.log after 18s; tail:)" >&2
+  tail -10 "$home/out.log" 2>/dev/null | sed 's/^/    /' >&2
   return 1
 }
 

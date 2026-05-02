@@ -1927,10 +1927,13 @@ except Exception:
           # airc.pid had been touched 80hrs earlier by a prior session.
           # bearer_state.<channel>.json is per-process: rewritten on
           # bearer open, so its mtime is bounded by current process age.
+          # Use file_mtime (numeric-validated, MSYS-safe per #421);
+          # raw `stat -f %m` reintroduces the BSD/GNU/MSYS trap that
+          # the platform_adapters helper exists to prevent.
           local bs_mtime=0
           for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
             [ -f "$sf" ] || continue
-            local m; m=$(stat -f %m "$sf" 2>/dev/null || stat -c %Y "$sf" 2>/dev/null || echo 0)
+            local m; m=$(file_mtime "$sf")
             if [ "$m" -gt "$bs_mtime" ] 2>/dev/null; then
               bs_mtime="$m"
             fi
@@ -1941,8 +1944,7 @@ except Exception:
             # Fallback: airc.pid mtime if for some reason no bearer
             # state files have meaningful mtimes. Same wrong-time
             # caveat as the pre-fix code, but it's the last resort.
-            local pid_mtime=0
-            [ -f "$AIRC_WRITE_DIR/airc.pid" ] && pid_mtime=$(stat -f %m "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || stat -c %Y "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || echo 0)
+            local pid_mtime; pid_mtime=$(file_mtime "$AIRC_WRITE_DIR/airc.pid")
             recv_silent=$(( now - pid_mtime ))
           fi
         else
@@ -2022,8 +2024,17 @@ _mesh_rediscover_loop() {
       | awk -F'\t' '{print $1}')
     while IFS= read -r ch; do
       [ -z "$ch" ] && continue
-      "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-        --config "$CONFIG" --channel "$ch" --gist "$found_gist" 2>/dev/null || true
+      # The CLI flag is --gist-id (see lib/airc_core/config.py:325).
+      # Pre-fix this was --gist (silently rejected → rotation self-heal
+      # never updated config). Surface non-zero exit to stderr so a
+      # subsequent bearer mismatch is debuggable; do NOT swallow with
+      # `|| true` — that's the exact silent-failure family this PR set
+      # is removing.
+      if ! "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$ch" --gist-id "$found_gist" 2>&1; then
+        printf '[%s] airc: WARNING — failed to update channel_gists[%s] to %s; rotation self-heal incomplete\n' \
+          "$(timestamp)" "$ch" "$found_gist" >&2
+      fi
     done <<< "$channels"
     printf '[%s] airc: HOST GIST ROTATED — was %s, now %s. Auto-swapped config; bearer respawning on new gist.\n' \
       "$(timestamp)" "$current_gist" "$found_gist"
@@ -2031,11 +2042,17 @@ _mesh_rediscover_loop() {
     # _monitor_multi_channel re-reads channel_map at the top of each
     # outer cycle (companion change in this PR), so killing the
     # bearer_cli children triggers respawn against the freshly-updated
-    # config. We don't have a stable handle to those PIDs from here, so
-    # use a name-based pkill as a best-effort. The watchdog/death-watch
-    # in _monitor_multi_channel will catch any survivors on its 2s
-    # poll. Safe to call even if no children match (idempotent no-op).
-    pkill -f 'airc_core.bearer_cli recv' 2>/dev/null || true
+    # config.
+    #
+    # SCOPE-SAFE pkill (Copilot review #422 caught this): bearer_cli
+    # processes from OTHER scopes (different AIRC_HOME) on the same
+    # machine match a bare 'airc_core.bearer_cli recv' pattern. Each
+    # bearer_cli is launched with `--state-file $AIRC_WRITE_DIR/...`
+    # so AIRC_WRITE_DIR appears uniquely in this scope's process
+    # command lines. Match on that to scope the kill to OUR children
+    # only — multi-scope safety, same principle as cmd_teardown's
+    # scope-isolation guarantee.
+    pkill -f "airc_core.bearer_cli recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
   done
 }
 

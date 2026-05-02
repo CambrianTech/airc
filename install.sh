@@ -890,7 +890,12 @@ else
   # Defensive fallback so install doesn't die on a weird CLONE_DIR layout.
   # The prompt block below tolerates the function being absent (treats
   # "unknown daemon state" as "not installed → offer prompt").
-  airc_daemon_is_installed() { return 1; }
+  # BOTH detect functions need stubs (Copilot #422 review): under
+  # `set -euo pipefail` a bare call to airc_daemon_is_installed_for_scope
+  # would `command not found` → install.sh exits non-zero instead of
+  # gracefully degrading. Both stubs return 1 ("not installed").
+  airc_daemon_is_installed()           { return 1; }
+  airc_daemon_is_installed_for_scope() { return 1; }
 fi
 
 # Order matters here. Four NON-prompt branches first, ordered so the
