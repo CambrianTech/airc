@@ -219,5 +219,79 @@ class HeartbeatSuppressionTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "", "heartbeat must produce zero stdout output")
 
 
+class DisplayFilterLoudDropTests(unittest.TestCase):
+    """#399 follow-up to #401: when monitor_formatter's display filter
+    drops a peer broadcast (channel name truly differs, e.g.
+    'cambriantech' vs subs=['general'] — #401's '#'-prefix tolerance
+    cannot help), emit a stdout warning so Claude Code's Monitor wakes
+    + the operator sees they need `airc subscribe <channel>`.
+
+    Pre-fix: silent drop produced #399's 9-hour blackout pattern even
+    after #401 merged.
+    """
+
+    def setUp(self):
+        self._scope = tempfile.mkdtemp(prefix="airc-mf-drop-test-")
+        self._peers = os.path.join(self._scope, "peers")
+        os.makedirs(self._peers, exist_ok=True)
+        cfg = {"name": "alice", "subscribed_channels": ["general"]}
+        with open(os.path.join(self._scope, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        # Force warning interval to 0 so a single drop fires the warning
+        # immediately — keeps the test deterministic.
+        self._saved_interval = mf.DROP_WARN_INTERVAL_SEC
+        mf.DROP_WARN_INTERVAL_SEC = 0
+        mf._filter_drop_count.clear()
+        mf._last_drop_warn_ts = 0.0
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._scope, ignore_errors=True)
+        mf.DROP_WARN_INTERVAL_SEC = self._saved_interval
+        mf._filter_drop_count.clear()
+        mf._last_drop_warn_ts = 0.0
+
+    def _run(self, lines):
+        body = "\n".join(json.dumps(l) for l in lines) + "\n"
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
+             mock.patch.object(mf.sys, "stdout", out), \
+             mock.patch.object(mf.sys, "stderr", err):
+            mf.run("alice", self._peers)
+        return out.getvalue(), err.getvalue()
+
+    def test_cross_channel_drop_emits_stdout_warning(self):
+        msg = {"from": "bob", "to": "all", "channel": "cambriantech",
+               "msg": "should drop", "ts": "2026-05-02T15:00:00Z"}
+        out, err = self._run([msg])
+        self.assertNotIn("should drop", out,
+            "cross-channel msg body must not display when subs filter rejects")
+        self.assertIn("WARN display-filtered", out,
+            "cross-channel drop must surface to stdout so Monitor wakes")
+        self.assertIn("cambriantech", out,
+            "warning must name the dropped channel so operator can subscribe")
+        self.assertIn("display-filter drop", err,
+            "stderr trace must record evidence for daemon.log debugging")
+
+    def test_subscribed_channel_does_not_drop(self):
+        msg = {"from": "bob", "to": "all", "channel": "general",
+               "msg": "should display", "ts": "2026-05-02T15:00:00Z"}
+        out, err = self._run([msg])
+        self.assertIn("should display", out,
+            "subscribed-channel msg must display normally")
+        self.assertNotIn("WARN display-filtered", out,
+            "subscribed-channel msg must not trigger drop warning")
+
+    def test_addressed_to_me_bypasses_filter(self):
+        msg = {"from": "bob", "to": "alice", "channel": "cambriantech",
+               "msg": "DM bypasses filter", "ts": "2026-05-02T15:00:00Z"}
+        out, err = self._run([msg])
+        self.assertIn("DM bypasses filter", out,
+            "DM addressed to us must surface across channel boundary")
+        self.assertNotIn("WARN display-filtered", out,
+            "DM bypass path must not warn-spam (no actual drop happened)")
+
+
 if __name__ == "__main__":
     unittest.main()

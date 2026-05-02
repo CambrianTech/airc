@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import sys
+import time
 
 # Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
 # exit with a distinct code so the caller's while-loop reconnects.
@@ -185,6 +186,61 @@ def _handle_rename(peers_dir: str, msg: str) -> bool:
             print(f"airc: nick (chain-repair) {current} → {new}", flush=True)
             return True
     return False
+
+
+# ── Display-filter drop tracking (#399 follow-up to #401) ───────────────
+# When monitor_formatter's display filter drops a peer broadcast (channel
+# stamped on the message isn't in our subscribed_channels set), we emit a
+# periodic stdout warning so the drop becomes loud — Claude Code's Monitor
+# wakes on stdout, not stderr (Mac entity 2026-05-02 PR #400 spec).
+# Without this, name-drift between sender's stamped channel and joiner's
+# subscribed_channels causes #399's 9hr silent blackout pattern.
+_filter_drop_count: dict[str, int] = {}
+_last_drop_warn_ts: float = 0.0
+DROP_WARN_INTERVAL_SEC = 60
+
+
+def _record_filter_drop(channel: str | None, fr: str) -> None:
+    if not channel:
+        return
+    _filter_drop_count[channel] = _filter_drop_count.get(channel, 0) + 1
+    # Stderr trace for daemon.log debuggability — gives the next debugger
+    # exact evidence even if stdout warning interval hasn't tripped yet.
+    try:
+        sys.stderr.write(
+            f"[airc:formatter] display-filter drop: from={fr} channel={channel!r}\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
+    """Emit one stdout warning per DROP_WARN_INTERVAL_SEC summarizing all
+    drops seen in that window. Resets the counter after emit so the
+    warning re-fires if drops continue. Stdout (not stderr) so the
+    Monitor surface sees it and the operator can run `airc subscribe`."""
+    global _last_drop_warn_ts
+    now = time.time()
+    if now - _last_drop_warn_ts < DROP_WARN_INTERVAL_SEC:
+        return
+    if not _filter_drop_count:
+        return
+    drops = ", ".join(
+        f"#{c}={n}" for c, n in sorted(_filter_drop_count.items(), key=lambda kv: -kv[1])
+    )
+    subs_str = sorted(subs_norm) if subs_norm else "[]"
+    try:
+        # ASCII-only — Windows cp1252 console can't encode unicode marks.
+        print(
+            f"airc: WARN display-filtered {drops} (subscribed: {subs_str}). "
+            f"To see them: airc subscribe <channel>",
+            flush=True,
+        )
+    except Exception:
+        pass
+    _filter_drop_count.clear()
+    _last_drop_warn_ts = now
 
 
 def run(my_name: str, peers_dir: str) -> int:
@@ -474,6 +530,18 @@ def run(my_name: str, peers_dir: str) -> int:
             line_norm = _norm(line_channel)
             subs_norm = {_norm(c) for c in subs}
             if line_norm and line_norm not in subs_norm and not addressed_to_me:
+                # b69f 2026-05-02: even after #401's '#'-prefix tolerance,
+                # legit drops still happen when the channel NAME differs
+                # (e.g. peer stamps channel='cambriantech', subs=['general'],
+                # both polling the same gist). #401 catches '#general' vs
+                # 'general'; this catches every other shape of name drift.
+                # Make the drop LOUD instead of silent — emit one stdout
+                # warning per minute summarizing what was dropped + how to
+                # subscribe. Stdout is what wakes Claude Code's Monitor;
+                # without this the bug reproduces #399's 9hr blackout
+                # under any name-mismatch (#401 only solves the # variant).
+                _record_filter_drop(line_norm, fr)
+                _maybe_emit_drop_warning(subs_norm)
                 continue
         try:
             if fr in ("airc", "sys"):
