@@ -194,23 +194,31 @@ def run(my_name: str, peers_dir: str) -> int:
     local_log = os.path.join(scope_dir, "messages.jsonl")
     offset_path = os.path.join(scope_dir, "monitor_offset")
 
-    # Only mirror inbound to the local log when we are a joiner (tailing a
-    # REMOTE host over SSH). For a HOST, the local log IS the source the
-    # tail reads from — mirroring creates an infinite feedback loop.
+    # Host vs joiner detection drives the watchdog gate below. host_target
+    # empty = we are the host (we publish the room gist; joiners poll us);
+    # host_target set = we are a joiner (we poll the host's gist).
     is_joiner = False
     try:
         is_joiner = bool(json.load(open(config_path)).get("host_target", ""))
     except Exception:
         pass
 
-    # Watchdog stays armed for both hosts and joiners. Pre-fix it was
-    # disabled for hosts because there was no inbound traffic during
-    # idle and the alarm would trip every 150s. Post bearer-heartbeat
-    # (bearer_cli emits a sentinel line every AIRC_BEARER_HEARTBEAT_SEC
-    # whether the bearer yielded events or not), idle is no longer
-    # silent — heartbeats keep the watchdog re-armed. Stuck bearers
-    # produce no heartbeats, so the watchdog correctly trips and the
-    # bash multi-channel watcher respawns the recv pipe.
+    # #383: disable the no-inbound watchdog in host mode. The watchdog's
+    # original purpose is to catch joiner bearer-poll loops that hang
+    # silently (gh API stuck, middlebox dropping idle TCP) — that failure
+    # shape exists for joiners, not hosts. Hosts don't poll a remote;
+    # they serve writes, and "no inbound for 150s" is normal during quiet
+    # periods (overnight, weekends). The previous "heartbeats keep the
+    # watchdog re-armed" theory broke in field use: daemon mode runs
+    # `airc connect` in $HOME/.airc with KeepAlive, the watchdog tripped
+    # every 150s, launchctl re-spawned, ~1500-2000 spawns over 8 hours
+    # with last_exit_code=1 reported as "running" but never serving
+    # messages. Real host failures (bearer death, gh auth death) are
+    # caught independently — bash _monitor_multi_channel polls each
+    # bearer's child PID and respawns on death, so process-level signals
+    # still propagate.
+    if not is_joiner:
+        _disable_watchdog()
 
     # Room name for the chat-line prefix. Read once at startup; a rename
     # of the room would require a fresh airc connect to pick up. Default

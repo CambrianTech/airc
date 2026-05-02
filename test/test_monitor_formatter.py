@@ -127,6 +127,73 @@ class AutoPongTests(unittest.TestCase):
         self.assertEqual(popens, [], "broadcast ping must not auto-pong")
 
 
+class HostModeWatchdogTests(unittest.TestCase):
+    """#383: the no-inbound watchdog must be disabled in host mode.
+
+    Without this gate, a daemon-launched `airc connect` in $HOME/.airc
+    (no host_target = host mode) trips the 150s watchdog every quiet
+    interval, launchctl re-spawns, and the daemon thrashes with
+    last_exit_code=1 while never actually serving messages.
+    """
+
+    def setUp(self):
+        self._scope = tempfile.mkdtemp(prefix="airc-mf-wd-test-")
+        self._peers = os.path.join(self._scope, "peers")
+        os.makedirs(self._peers, exist_ok=True)
+        # Re-arm the module-level flag in case a prior test disabled it.
+        mf._watchdog_active = True
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._scope, ignore_errors=True)
+        mf._watchdog_active = True
+
+    def _write_config(self, host_target):
+        cfg = {"name": "alice"}
+        if host_target:
+            cfg["host_target"] = host_target
+        with open(os.path.join(self._scope, "config.json"), "w") as f:
+            json.dump(cfg, f)
+
+    def _run_empty_stdin(self):
+        with mock.patch.object(mf.sys, "stdin", io.StringIO("")), \
+             mock.patch.object(mf.sys, "stdout", io.StringIO()):
+            mf.run("alice", self._peers)
+
+    def test_host_mode_disables_watchdog(self):
+        # Host mode = config has no host_target.
+        self._write_config(host_target=None)
+        with mock.patch.object(mf, "_disable_watchdog", wraps=mf._disable_watchdog) as spy:
+            self._run_empty_stdin()
+            self.assertEqual(spy.call_count, 1,
+                             "host mode must call _disable_watchdog exactly once")
+        self.assertFalse(mf._watchdog_active,
+                         "watchdog must be inactive after host-mode run()")
+
+    def test_joiner_mode_keeps_watchdog_armed(self):
+        # Joiner mode = config carries a non-empty host_target.
+        self._write_config(host_target="user@10.0.0.5")
+        with mock.patch.object(mf, "_disable_watchdog", wraps=mf._disable_watchdog) as spy:
+            self._run_empty_stdin()
+            self.assertEqual(spy.call_count, 0,
+                             "joiner mode must not call _disable_watchdog")
+        self.assertTrue(mf._watchdog_active,
+                        "watchdog must remain active after joiner-mode run()")
+
+    def test_missing_config_treated_as_host_mode(self):
+        # No config.json at all (transient startup window before cmd_join
+        # writes one) — fall through to host mode (is_joiner=False), which
+        # disables the watchdog. Conservative: a missing config is more
+        # often a fresh host than a joiner with corrupted state, and
+        # disabling the watchdog only loses an early-warning probe; real
+        # bearer death is still caught by the bash retry loop.
+        # (No _write_config call.)
+        with mock.patch.object(mf, "_disable_watchdog", wraps=mf._disable_watchdog) as spy:
+            self._run_empty_stdin()
+            self.assertEqual(spy.call_count, 1,
+                             "missing config must default to host-mode behavior")
+
+
 class HeartbeatSuppressionTests(unittest.TestCase):
     """bearer_cli heartbeat lines must be recognized + suppressed +
     arm the watchdog. Display would clutter chat with airc_heartbeat
