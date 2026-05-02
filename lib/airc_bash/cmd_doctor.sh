@@ -479,12 +479,32 @@ _doctor_health() {
   # ── Per-channel bearer health. bearer_state.<channel>.json's last_recv_ts
   # is the heartbeat — if it's > 5min stale, the bearer is wedged and the
   # AI session is going dormant on that channel.
+  #
+  # Scope to subscribed_channels ONLY (Codex's first-run report 2026-05-02
+  # exposed this — same fix-shape as #406's beacon scoping). Pre-fix the
+  # probe globbed every bearer_state.*.json on disk INCLUDING stale files
+  # from prior subscriptions (a #cambriantech the user parted, an old
+  # qa-foo room from a previous test, etc.). Codex correctly identified
+  # the noise: "sees stale bearer-state files for older channels". Real
+  # fix is to intersect with the current subscribed_channels list — same
+  # principle as bearer scoping in the receive-silence beacon.
+  local _subs=""
+  if [ -f "$CONFIG" ] && command -v "$AIRC_PYTHON" >/dev/null 2>&1; then
+    _subs=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  fi
   local found_state=0
   if [ -d "$AIRC_WRITE_DIR" ]; then
     for state_file in "$AIRC_WRITE_DIR"/bearer_state.*.json; do
       [ -f "$state_file" ] || continue
-      found_state=1
       local channel; channel=$(basename "$state_file" .json | sed 's/^bearer_state\.//')
+      # Skip stale files for channels we no longer subscribe to.
+      # Empty _subs (legacy scope without subscribed_channels populated)
+      # falls back to checking everything — preserves old behavior on
+      # uninitialized scopes.
+      if [ -n "$_subs" ] && ! printf '%s\n' "$_subs" | grep -qFx "$channel"; then
+        continue
+      fi
+      found_state=1
       local last_recv_ts
       last_recv_ts=$(python3 -c "import sys,json; d=json.load(open('$state_file')); print(int(d.get('last_recv_ts',0)))" 2>/dev/null || echo 0)
       if [ "$last_recv_ts" = "0" ]; then
