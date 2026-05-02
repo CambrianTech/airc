@@ -1827,10 +1827,35 @@ except Exception:
         local recv_silent
         if [ "$freshest_recv" -eq 0 ]; then
           # Bearer open since process start, never received an event.
-          # Use process start time (airc.pid mtime) as the floor.
-          local pid_mtime=0
-          [ -f "$AIRC_WRITE_DIR/airc.pid" ] && pid_mtime=$(stat -f %m "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || stat -c %Y "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || echo 0)
-          recv_silent=$(( now - pid_mtime ))
+          # Use the freshest bearer_state file's mtime as the floor —
+          # the bearer rewrites these files on each open + on each
+          # event, so mtime IS "when the bearer last did anything."
+          # Pre-fix used airc.pid mtime, which is stale across teardown
+          # cycles (the file gets re-appended-to but mtime can be from
+          # an earlier process if the parent was the one to create it
+          # initially). Symptom: beacon reported "no inbound in 287715s"
+          # (80 hrs) on a bearer that had only just opened, because
+          # airc.pid had been touched 80hrs earlier by a prior session.
+          # bearer_state.<channel>.json is per-process: rewritten on
+          # bearer open, so its mtime is bounded by current process age.
+          local bs_mtime=0
+          for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
+            [ -f "$sf" ] || continue
+            local m; m=$(stat -f %m "$sf" 2>/dev/null || stat -c %Y "$sf" 2>/dev/null || echo 0)
+            if [ "$m" -gt "$bs_mtime" ] 2>/dev/null; then
+              bs_mtime="$m"
+            fi
+          done
+          if [ "$bs_mtime" -gt 0 ]; then
+            recv_silent=$(( now - bs_mtime ))
+          else
+            # Fallback: airc.pid mtime if for some reason no bearer
+            # state files have meaningful mtimes. Same wrong-time
+            # caveat as the pre-fix code, but it's the last resort.
+            local pid_mtime=0
+            [ -f "$AIRC_WRITE_DIR/airc.pid" ] && pid_mtime=$(stat -f %m "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || stat -c %Y "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || echo 0)
+            recv_silent=$(( now - pid_mtime ))
+          fi
         else
           recv_silent=$(( now - freshest_recv ))
         fi
