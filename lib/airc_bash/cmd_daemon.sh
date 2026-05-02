@@ -232,7 +232,15 @@ REM since the new airc bash from the exec is now the daemon.
 cd /d "$cwd_win"
 set AIRC_BACKGROUND_OK=1
 :loop
-"$bash_exe" -c "exec '$airc_bin_unix' connect"
+REM Stdout → daemon.log so the operator + the AI Monitor (when daemon
+REM is being read post-mortem) can see what airc actually emitted.
+REM Pre-fix: stdout went to nowhere (start /MIN cmd window had no
+REM redirect), only daemon.err captured the launcher's own restart
+REM messages — so 'airc daemon log' showed nothing useful, and
+REM "daemon.log doesn't exist" became a real symptom (b69f
+REM 2026-05-02 in #cambriantech). Stderr → daemon.err keeps the
+REM launcher's restart records separate from the airc event stream.
+"$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> daemon.log 2>> daemon.err
 REM Did airc just intentionally re-exec? If marker exists and is recent,
 REM the new airc process from the exec is now the running daemon —
 REM exit the launcher loop instead of racing-respawn it.
