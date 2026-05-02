@@ -36,6 +36,7 @@ import os
 import random as _random
 import shutil
 import subprocess
+import sys
 import tempfile
 import time as _time
 from typing import Iterator, Optional, Tuple
@@ -174,7 +175,16 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
     test mocks of `_gh_api_get` keep working."""
     try:
         gh = _resolve_gh_bin()
-    except GhBearerError:
+    except GhBearerError as e:
+        # Loud-fail per the global "evidence is for the debugger, not
+        # the trash" rule. Pre-fix every silent return None below
+        # masked real failures (auth lost, rate-limited, gist-gone) as
+        # "transient gh hiccup, sleep+retry forever" — joiners' Monitor
+        # surfaces nothing while peer chat rots in the void. Joel
+        # 2026-05-02: "you fuckers use try/catch to eat errors."
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh binary not resolvable: {e}\n")
+        sys.stderr.flush()
+        _gh_api_get._last_err = str(e)  # type: ignore[attr-defined]
         return None
     try:
         r = subprocess.run(
@@ -183,23 +193,22 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
             text=True,
             timeout=_GH_API_TIMEOUT,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        # Stash a sentinel for the classified wrapper to read. Subprocess
-        # exceptions don't otherwise have a body to classify; "" trips
-        # the default transient_failure branch in _classify_gh_error.
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): subprocess error: {e}\n")
+        sys.stderr.flush()
         _gh_api_get._last_err = ""  # type: ignore[attr-defined]
         return None
     if r.returncode != 0:
-        # Stash the combined output for the classified wrapper. Same
-        # process boundary so the next call to _gh_api_get_classified()
-        # sees this value (single-threaded subprocess pattern). Tests
-        # mocking _gh_api_get must NOT depend on this attribute (they
-        # bypass it entirely).
-        _gh_api_get._last_err = (r.stderr or "") + (r.stdout or "")  # type: ignore[attr-defined]
+        combined = (r.stderr or "") + (r.stdout or "")
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh api exit={r.returncode}: {combined.strip()[:500]}\n")
+        sys.stderr.flush()
+        _gh_api_get._last_err = combined  # type: ignore[attr-defined]
         return None
     try:
         return json.loads(r.stdout)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): JSON parse failed: {e}; first 200 bytes: {(r.stdout or '')[:200]!r}\n")
+        sys.stderr.flush()
         return None
 
 
