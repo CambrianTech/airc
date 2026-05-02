@@ -71,17 +71,35 @@ class SendOutcome:
     so callers can branch on the outcome without knowing which transport
     produced it:
 
-      "delivered"          — bytes accepted by the destination.
-      "queued_unreachable" — peer known-offline pre-attempt; payload queued
-                             locally for automatic retry. Not a failure;
-                             the bearer chose this path to avoid wasting
-                             a 10s connect timeout on a predictable miss.
-      "auth_failure"       — destination refused our identity. Retry is
-                             futile; the user must re-pair. Caller should
-                             surface this loudly.
-      "transient_failure"  — destination unreachable for a probably-transient
-                             reason (network blip, peer just bouncing).
-                             Caller should queue + retry.
+      "delivered"            — bytes accepted by the destination.
+      "queued_unreachable"   — peer known-offline pre-attempt; payload queued
+                               locally for automatic retry. Not a failure;
+                               the bearer chose this path to avoid wasting
+                               a 10s connect timeout on a predictable miss.
+      "auth_failure"         — destination refused our identity. Retry is
+                               futile; the user must re-pair (or `gh auth
+                               login` for gh-bearer). Caller should surface
+                               this loudly.
+      "transient_failure"    — destination unreachable for a probably-transient
+                               reason (network blip, peer just bouncing,
+                               5xx, conflict-after-retries). Caller should
+                               queue + retry with backoff.
+      "secondary_rate_limit" — gh's per-burst write throttle (HTTP 403 with
+                               body matching "rate limit exceeded" / "secondary
+                               rate limit"). Distinct from auth_failure: re-
+                               authing won't help; only waiting will. Callers
+                               must back off LONG (90s+) to clear the burst
+                               window, NOT short-retry like transient_failure.
+                               Added 2026-04-30 after airc#381 forensics.
+      "gone"                 — destination is permanently absent (HTTP 404 on
+                               our gist). Retrying is futile; the room
+                               dissolved (peer ran `airc part`, gh deleted,
+                               or the gist was wiped). Caller should clear
+                               any stale mapping that points here and surface
+                               the loss to the user. Distinct from
+                               auth_failure: this is "the resource doesn't
+                               exist," not "you don't have access." Added
+                               2026-04-30 after airc#381 forensics.
 
     `detail` is a short human-readable string for surfacing in user-facing
     output ([QUEUED] markers, error messages, status surfaces). Bearers

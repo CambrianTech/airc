@@ -372,6 +372,33 @@ cmd_send() {
         echo "    No state lost; no re-pair needed — gh's keyring expired." >&2
         die "gh auth failure — re-run 'airc send' or 'gh auth login -h github.com -s gist'"
         ;;
+      gone)
+        # Permanent destination loss (#381 layer A — HTTP 404 on the
+        # gist). Joiner-side mirror of the host-branch handler below:
+        # clear stale mapping, surface [GONE] marker, do NOT queue
+        # (retries would all 404 too). Recovery: airc join --room
+        # rediscovers / re-hosts.
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$active_channel" --gist-id "" \
+          >/dev/null 2>&1 || true
+        local gone_marker; gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
+          "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${detail:-no detail}")
+        echo "$gone_marker" >> "$MESSAGES"
+        echo "" >&2
+        echo "  ✗ Gist for #${active_channel} returned 404 — channel dissolved." >&2
+        echo "    Stale channel_gists[${active_channel}] cleared." >&2
+        echo "    Re-host:  airc join --room ${active_channel}" >&2
+        ;;
+      secondary_rate_limit)
+        # gh secondary throttle (#381 layer A). Queue + distinct marker.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local rate_marker; rate_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[RATE-LIMITED on gh secondary throttle — queued, will retry once gh window clears (60-180s)] %s"}' \
+          "$(timestamp)" "$active_channel" "${detail:-no detail}")
+        echo "$rate_marker" >> "$MESSAGES"
+        echo "  ⏳ gh secondary rate limit — message queued. Drain loop retries when window clears (~60-180s)." >&2
+        echo "  Avoid sending more for ~2 minutes." >&2
+        echo "  Bearer: ${detail:-<none>}" >&2
+        ;;
       transient_failure|"")
         # Network-class failure or empty/malformed outcome → treat as
         # transient + queue. Empty kind defends against bearer_cli
@@ -521,6 +548,59 @@ cmd_send() {
           echo "" >&2
           echo "    After re-authenticating, retry. No state lost — it's just gh's keyring that expired." >&2
           die "gh auth failure on host gist publish — run 'gh auth login -h github.com' and retry"
+          ;;
+        gone)
+          # Permanent destination loss (#381 layer A — HTTP 404 on the
+          # gist). The room dissolved: peer ran `airc part`, gh deleted
+          # the gist, or the gist was wiped. Retrying is futile — the
+          # next send + every send after will keep returning 404.
+          #
+          # Recovery: drop the stale channel_gists entry so the next
+          # `airc join --room <name>` (by us or another peer) creates a
+          # fresh canonical gist instead of polling the dead one. Also
+          # surface a [GONE] marker so the user knows their message was
+          # NOT delivered AND why — pre-fix the substrate had no signal
+          # for "this channel is gone forever" so users sent into a void
+          # for hours not knowing.
+          #
+          # Do NOT queue: pending.jsonl drains via the SAME publish path
+          # which would also return 404 every retry, just consuming gh
+          # API budget for nothing. Drop the message on the floor with
+          # loud surface (the [GONE] marker) — same UX as auth_failure
+          # but a different remedy.
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$active_channel" --gist-id "" \
+            >/dev/null 2>&1 || true
+          local _host_gone_marker; _host_gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
+            "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${_host_detail:-no detail}")
+          echo "$_host_gone_marker" >> "$MESSAGES"
+          echo "" >&2
+          echo "  ✗ Gist for #${active_channel} returned 404 — channel dissolved (peer ran 'airc part', gh deleted, or wiped)." >&2
+          echo "    Bearer detail: ${_host_detail}" >&2
+          echo "    Stale channel_gists[${active_channel}] cleared from config." >&2
+          echo "" >&2
+          echo "    To re-host this channel: airc join --room ${active_channel}" >&2
+          echo "    To wait for a peer to take over: leave it; next 'airc join' that resolves the mesh-singleton will publish a fresh gist." >&2
+          ;;
+        secondary_rate_limit)
+          # gh per-burst write throttle (#381 layer A — HTTP 403 with
+          # "rate limit exceeded" / "secondary rate limit" body). Every
+          # peer on this gh account writing concurrently can trip this;
+          # primary rate stays nominal but the secondary clamps for
+          # 60-180s. Re-auth does not help; only waiting does.
+          #
+          # Queue + emit a DISTINCT marker so users see this is the
+          # rate-limit case (not generic transient/network) and know to
+          # back off their own sends until it clears. flush_pending_host_loop
+          # will drain on the next cycle when bearer_gh.send returns
+          # delivered again.
+          echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+          local _host_rate_marker; _host_rate_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[RATE-LIMITED on gh secondary throttle — %d msg(s) queued, will retry once gh window clears (60-180s)] %s"}' \
+            "$(timestamp)" "$active_channel" "$(wc -l < "$AIRC_WRITE_DIR/pending.jsonl" | tr -d " ")" "${_host_detail:-no detail}")
+          echo "$_host_rate_marker" >> "$MESSAGES"
+          echo "  ⏳ gh secondary rate limit hit — broadcast queued. Drain loop will retry once the burst window clears (60-180s typical)." >&2
+          echo "  Avoid sending more for ~2 minutes to let the throttle clear." >&2
+          echo "  Bearer: ${_host_detail:-<none>}" >&2
           ;;
         transient_failure|"")
           # Mirror joiner-side queue/drain symmetry (#381 layer B). Pre-fix
