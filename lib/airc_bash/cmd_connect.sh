@@ -252,6 +252,41 @@ cmd_connect() {
   # is alive — exactly the Carl-experience win for cross-vendor mesh.
   local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
+    # 2026-05-02 QA caught (B5): if user passed --room NEWNAME and that
+    # name is NOT in subscribed_channels yet, the user's intent is
+    # "subscribe to a NEW room" — NOT "check if I'm already in mesh".
+    # Pre-fix the short-circuit always returned 0, blocking multi-room
+    # workflow. Now: if the requested room is fresh, fall through to
+    # the subscribe path so it gets added.
+    local _add_subscription=0
+    if [ "$room_explicit" = "1" ] && [ -n "$room_name" ] && [ -f "$CONFIG" ]; then
+      local _existing_subs; _existing_subs=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+      if ! printf '%s\n' "$_existing_subs" | grep -qFx "$room_name"; then
+        _add_subscription=1
+      fi
+    fi
+    if [ "$_add_subscription" = "1" ]; then
+      echo "  airc connect: monitor already running; subscribing to additional room #${room_name}..."
+      # Add #room_name to subscribed_channels + resolve its gist
+      # (create if missing). The bearer for this channel will be
+      # picked up on the next _monitor_multi_channel cycle (which
+      # re-reads channel_map at top of each outer poll).
+      "$AIRC_PYTHON" -m airc_core.config subscribe --config "$CONFIG" --channel "$room_name" 2>/dev/null || true
+      # Resolve --create-if-missing: returns the gist id (find existing
+      # or create new gist named "airc room: #<channel>").
+      local _new_gist; _new_gist=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+          --channel "$room_name" --create-if-missing 2>&1)
+      if [ -n "$_new_gist" ] && printf '%s' "$_new_gist" | grep -qE '^[0-9a-f]{32}$'; then
+        # Save the channel→gist mapping in config so cmd_send can route to it.
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$room_name" --gist-id "$_new_gist" 2>/dev/null || true
+        echo "  ✓ Subscribed to #${room_name} (gist $_new_gist). Bearer respawn picks it up within ~30s."
+      else
+        echo "  ⚠ Subscribed to #${room_name} but gist resolve failed: $_new_gist"
+        echo "  Bearer may not pick up new room until next cycle. Try: airc list to verify gist."
+      fi
+      return 0
+    fi
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
     echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
     echo "    To stop it:        airc teardown"

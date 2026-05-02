@@ -125,7 +125,11 @@ cmd_teardown() {
   if [ "$flush" = "1" ]; then
     : # don't delete gist on --flush either; bus stays for peers
   fi
-  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ]; then
+  # Skip the "preserving" message when cmd_part is the caller (it
+  # already handles its own gist-deletion + the message would
+  # contradict the "✓ Room gist deleted" line cmd_part just printed
+  # for the same scope. Caught 2026-05-02 self-QA — B6).
+  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && [ "${AIRC_TEARDOWN_PART_ONLY:-0}" != "1" ]; then
     local _td_gist; _td_gist=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
     if [ -n "$_td_gist" ]; then
       echo "  preserving hosted gist: $_td_gist (bus stability — use 'airc part' to actually delete the channel)"

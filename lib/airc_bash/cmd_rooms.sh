@@ -291,9 +291,28 @@ cmd_send_file() {
   host_target=$(get_config_val host_target "")
   my_name=$(get_name)
 
+  # Precheck: send-file uses scp which requires the destination peer to
+  # have authorized our identity-key via the local pair-handshake. Post-
+  # Phase-3c (#281), gh-only peers (joined via gist substrate, never
+  # via TCP pair-handshake) have NO SSH authorization in the host's
+  # authorized_keys — scp would hang on "Permission denied (publickey)"
+  # for 30+ seconds with no useful error. Caught 2026-05-02 self-QA (B7).
+  #
+  # Detect the broken case + fail loud with a clear remediation.
+  if [ -z "$host_target" ]; then
+    die "send-file requires a directly-paired peer with host_target set.
+Current scope has no host_target — you're either:
+  • A host yourself (send-file is for sending TO peers, not from)
+  • A gh-only joiner whose host pair-handshake never ran
+Post-Phase-3c, send-file works only for local-pair peers (same machine
+or LAN with TCP pair-handshake). For gh-substrate peers, file transfer
+is not yet supported (gh gist has a 1MB hard limit; tracked separately).
+Use 'airc msg @${peer_name} <text>' to message via gh-bus instead, or
+share a link if the file is hosted elsewhere."
+  fi
+
   local filename; filename=$(basename "$filepath")
   local target_host="$host_target"
-  [ -z "$target_host" ] && target_host="localhost"
 
   local rhome; rhome=$(remote_home)
   relay_ssh "$target_host" "mkdir -p $rhome/files/${my_name}" 2>/dev/null
