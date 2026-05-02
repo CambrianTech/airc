@@ -57,10 +57,40 @@ airc_detect_gh_auth_state() {
     return 0
   fi
 
+  # Cache the OK state for AIRC_AUTH_CACHE_SEC seconds to avoid hitting
+  # /user (gh auth status's probe target) on every airc-connect startup.
+  # Repeated calls trip GitHub's secondary rate limiter — discovered
+  # 2026-05-02 by continuum-b69f when daemon respawn cascade made many
+  # calls/min and the secondary throttle locked us out for ~15 min.
+  # Core API limit was fine (4766/5000); /user-specific throttle was
+  # the actual cause. Caching reduces /user hits from
+  # "every airc-connect startup" to "once per AIRC_AUTH_CACHE_SEC."
+  # Cache lives at /tmp/airc-gh-auth-ok-<uid> with 300s default TTL.
+  # Only "ok" is cached — the failure-classification path runs fresh
+  # so transient causes (rate-limit, expired token) get accurate
+  # diagnosis on every check.
+  local _cache_file="${TMPDIR:-/tmp}/airc-gh-auth-ok-$(id -u 2>/dev/null || echo nobody)"
+  local _cache_ttl="${AIRC_AUTH_CACHE_SEC:-300}"
+  if [ -f "$_cache_file" ]; then
+    local _cache_age=0
+    local _now; _now=$(date +%s 2>/dev/null || echo 0)
+    local _cache_mtime; _cache_mtime=$(stat -f %m "$_cache_file" 2>/dev/null || stat -c %Y "$_cache_file" 2>/dev/null || echo 0)
+    _cache_age=$(( _now - _cache_mtime ))
+    if [ "$_cache_age" -lt "$_cache_ttl" ] 2>/dev/null; then
+      echo "ok"
+      return 0
+    fi
+  fi
+
   if gh auth status >/dev/null 2>&1; then
     echo "ok"
+    # Refresh cache on success.
+    touch "$_cache_file" 2>/dev/null
     return 0
   fi
+  # Auth not OK — invalidate cache so we re-check freshly next time
+  # (don't want a stale "ok" cache hiding a now-bad state).
+  rm -f "$_cache_file" 2>/dev/null
 
   # gh auth status failed. Three possibilities:
   # (a) Secondary rate limit — gh's `auth status` probes /user which
