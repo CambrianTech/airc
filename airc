@@ -1244,6 +1244,19 @@ _monitor_multi_channel() {
   local consecutive_timeouts=0
   local ESCALATE_AFTER=4
   while true; do
+    # Re-read channel_map from config at top of each outer cycle so
+    # an in-flight config change (e.g. _mesh_rediscover_loop swapping
+    # the host gist after rotation) takes effect on the next bearer
+    # respawn, no full daemon restart required. Falls back to the
+    # parameter passed at startup if the re-read returns empty
+    # (transient config-write race or missing list_channel_gists
+    # support on older airc_core).
+    local _refreshed_map
+    _refreshed_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null || true)
+    if [ -n "$_refreshed_map" ]; then
+      channel_map="$_refreshed_map"
+    fi
     {
       # Per-child PID tracking so we can detect individual deaths.
       # Pre-fix: a single `wait` blocked until ALL children exited; if
@@ -1350,6 +1363,10 @@ monitor() {
   # window and after legitimate parent restarts.
   ( reminder_timer_loop ) &
   local _reminder_pid=$!
+  # Self-heal: periodically re-run mesh discovery and swap channel_gists
+  # if the host rotated. No-op when gh is absent or no rotation occurred.
+  ( _mesh_rediscover_loop ) &
+  local _rediscover_pid=$!
   # flush_pending_loop returns immediately when host_target is empty
   # (legacy host mode: no peer paired, nothing to flush). Spawning +
   # tracking that short-lived PID makes airc.pid lie — kill -0 on it
@@ -1380,7 +1397,7 @@ monitor() {
   fi
   # Build the appended PID list — only include _flush_pid when we
   # actually spawned it.
-  local _aux_pids="$_reminder_pid"
+  local _aux_pids="$_reminder_pid $_rediscover_pid"
   [ -n "$_flush_pid" ] && _aux_pids="$_aux_pids $_flush_pid"
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
     # Append to existing pidfile atomically (printf+>> is < PIPE_BUF
@@ -1865,6 +1882,82 @@ except Exception:
         fi
       fi
     fi
+  done
+}
+
+# Self-heal loop: detect host gist rotation and swap channel_gists in
+# config without human-in-the-loop teardown+rejoin. Joel 2026-05-02:
+# "you have the easy part, must self-heal, no one can be there to fix
+# your umbilical cord for you." Tonight's repro: host (Mac) tore down
+# + rejoined → new mesh gist on the same gh account; joiner (b69f) kept
+# polling the dead old gist; needed Joel to relay "rejoin." Without
+# this loop, every host restart breaks the substrate until manual
+# intervention — the satellite-killer scenario.
+#
+# Cost: one `gh gist list` per cycle (~150 bytes over the wire). At
+# 300s default cadence: 12 calls/hour, well under gh's 5000/hr ceiling.
+#
+# Single-account scope: _mesh_find lists the CURRENT gh account's
+# gists. For mesh peers on the same gh account (the dominant case
+# tonight — Mac and b69f both auth'd as joelteply), gist rotation on
+# host-side is reflected on the next list. Cross-account peers (friend
+# on a different gh) take the legacy invite path; this loop no-ops
+# because _mesh_find returns empty there. That's acceptable — cross-
+# account auto-rediscovery would need a different signal channel and
+# is out of scope; loud-fail (Mac's bearer_gh.py PR) covers that path.
+_mesh_rediscover_loop() {
+  local _parent_pid="$PPID"
+  # Cadence in seconds. 300s = 5min. Joel's "satellite" framing argues
+  # for tighter cadence on critical infra; 60s would also be fine cost-
+  # wise but bursty races during legitimate teardowns get noisy.
+  local interval="${AIRC_MESH_REDISCOVER_SEC:-300}"
+  while true; do
+    sleep "$interval"
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      return 0
+    fi
+    # _mesh_find requires gh; if absent, no-op (we're in legacy local-
+    # tail mode or pre-mesh scope).
+    command -v gh >/dev/null 2>&1 || continue
+    # Resolve the current default-channel gist from config. We compare
+    # against the singleton mesh, so any divergence on the default
+    # channel implies host rotation.
+    local current_gist
+    current_gist=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null \
+      | awk -F'\t' 'NR==1 {print $2}')
+    [ -n "$current_gist" ] || continue
+    local found_gist
+    found_gist=$(_mesh_find 2>/dev/null || true)
+    [ -n "$found_gist" ] || continue
+    if [ "$found_gist" = "$current_gist" ]; then
+      continue
+    fi
+    # Rotation detected. Update every channel's gist in config to the
+    # singleton mesh — Phase 3c shares one gist across channel tags, so
+    # the same id applies to all subscribed channels. STDOUT (not
+    # stderr) so the AI's Monitor wakes and the user sees what
+    # happened, even if the bearer respawn that follows is invisible.
+    local channels
+    channels=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+      --config "$CONFIG" 2>/dev/null \
+      | awk -F'\t' '{print $1}')
+    while IFS= read -r ch; do
+      [ -z "$ch" ] && continue
+      "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+        --config "$CONFIG" --channel "$ch" --gist "$found_gist" 2>/dev/null || true
+    done <<< "$channels"
+    printf '[%s] airc: HOST GIST ROTATED — was %s, now %s. Auto-swapped config; bearer respawning on new gist.\n' \
+      "$(timestamp)" "$current_gist" "$found_gist"
+    # Force a bearer respawn so the new gist takes effect immediately.
+    # _monitor_multi_channel re-reads channel_map at the top of each
+    # outer cycle (companion change in this PR), so killing the
+    # bearer_cli children triggers respawn against the freshly-updated
+    # config. We don't have a stable handle to those PIDs from here, so
+    # use a name-based pkill as a best-effort. The watchdog/death-watch
+    # in _monitor_multi_channel will catch any survivors on its 2s
+    # poll. Safe to call even if no children match (idempotent no-op).
+    pkill -f 'airc_core.bearer_cli recv' 2>/dev/null || true
   done
 }
 
