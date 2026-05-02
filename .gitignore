@@ -1,4 +1,5 @@
 .airc/
+.channel
 __pycache__/
 *.pyc
 .venv
