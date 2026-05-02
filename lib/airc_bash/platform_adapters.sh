@@ -109,16 +109,52 @@ port_listeners() {
   fi
 }
 
-# Return file size in bytes. Empty / 0 on failure.
-# stat is not POSIX (different flags on BSD vs GNU); chain both with
-# fallback to wc -c which IS POSIX.
+# ── Portable stat helpers — must validate numeric output, not just exit code ──
+#
+# stat differs across BSD/GNU AND has a Windows-MSYS trap: `stat -f` is
+# BSD's "format specifier" but GNU's "filesystem info." On MSYS Git Bash
+# (GNU stat), `stat -f %m FILE` exits 0 and prints multi-line filesystem
+# metadata to STDOUT — silently succeeding with non-numeric junk. The
+# usual `bsd_cmd || gnu_cmd || fallback` chain DOESN'T fall through
+# because the BSD attempt exits 0. b69f 2026-05-02 hit this on Windows:
+# arithmetic at lib_auth.sh:78 expanded the captured string and bash
+# strict-mode flagged "File: unbound variable" because the captured
+# value started with `  File: "<path>"`.
+#
+# Fix shape: each helper validates that the output is a non-empty
+# all-digits string. If not, fall through to the next strategy. Final
+# fallback echoes "0" (safe for arithmetic, signals "couldn't tell").
+
+# Internal: emit value to stdout if it's a non-negative integer, else
+# return non-zero so the caller's || chain advances.
+_emit_if_numeric() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$1"; return 0 ;;
+  esac
+}
+
+# Return file mtime as epoch seconds. Echoes 0 on any failure.
+# Try GNU stat first (Linux + MSYS) since BSD `stat -f` on MSYS
+# silently succeeds with filesystem metadata — that's the trap.
+file_mtime() {
+  local path="$1"
+  [ -f "$path" ] || { echo 0; return 0; }
+  local v
+  if v=$(stat -c %Y "$path" 2>/dev/null) && _emit_if_numeric "$v"; then return 0; fi
+  if v=$(stat -f %m "$path" 2>/dev/null) && _emit_if_numeric "$v"; then return 0; fi
+  echo 0
+}
+
+# Return file size in bytes. Echoes 0 on any failure.
 file_size() {
   local path="$1"
   [ -f "$path" ] || { echo 0; return 0; }
-  stat -f%z "$path" 2>/dev/null \
-    || stat -c%s "$path" 2>/dev/null \
-    || wc -c < "$path" 2>/dev/null \
-    || echo 0
+  local v
+  if v=$(stat -c %s "$path" 2>/dev/null) && _emit_if_numeric "$v"; then return 0; fi
+  if v=$(stat -f %z "$path" 2>/dev/null) && _emit_if_numeric "$v"; then return 0; fi
+  if v=$(wc -c < "$path" 2>/dev/null | tr -d '[:space:]') && _emit_if_numeric "$v"; then return 0; fi
+  echo 0
 }
 
 # Detect platform: emits one of macos, linux, wsl, windows-bash (Git Bash

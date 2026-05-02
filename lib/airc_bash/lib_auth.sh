@@ -74,7 +74,13 @@ airc_detect_gh_auth_state() {
   if [ -f "$_cache_file" ]; then
     local _cache_age=0
     local _now; _now=$(date +%s 2>/dev/null || echo 0)
-    local _cache_mtime; _cache_mtime=$(stat -f %m "$_cache_file" 2>/dev/null || stat -c %Y "$_cache_file" 2>/dev/null || echo 0)
+    # Use file_mtime helper from platform_adapters.sh — handles the
+    # MSYS-trap where `stat -f %m` exits 0 with filesystem-info junk
+    # instead of an mtime, breaking the `||` fallback chain. Pre-fix,
+    # _cache_mtime captured `  File: "<path>" / ID: ... / Block size:`
+    # multi-line junk and `$(( _now - _cache_mtime ))` arithmetic
+    # tripped strict-mode "File: unbound variable" via word-splitting.
+    local _cache_mtime; _cache_mtime=$(file_mtime "$_cache_file")
     _cache_age=$(( _now - _cache_mtime ))
     if [ "$_cache_age" -lt "$_cache_ttl" ] 2>/dev/null; then
       echo "ok"
