@@ -535,6 +535,24 @@ _monitor_alive_with_bearer_fallback() {
   # Phase 2: bearer-state-freshness fallback. Only reached when pidfile
   # exists but kill -0 said all PIDs dead — could be real death, could
   # be sandbox blindness. bearer-state freshness disambiguates.
+  #
+  # Skip when AIRC_BACKGROUND_OK=1 — that env var is set by the daemon
+  # launcher (cmd_daemon.sh's .bat / launchd plist / systemd unit), and
+  # in daemon context kill -0 is reliable (no Codex-style sandbox
+  # blindness). The fallback's 600s window otherwise creates a
+  # 10-minute "daemon can't take over" blackout after an interactive
+  # airc connect dies: the dying process leaves bearer_state with a
+  # fresh last_recv_ts, the daemon's next launch sees it as "monitor
+  # alive," early-exits, and the .bat retries every 5s for 10 minutes
+  # before the window expires. b69f filed as #4 in the 2026-05-02
+  # daemon audit. Trust kill -0 in daemon context so takeover is
+  # immediate. Joel's BIOS-grade self-heal directive: substrate must
+  # work without a human in the loop, including across interactive
+  # process death.
+  if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
+    echo "no"
+    return 0
+  fi
   local _reminder_secs=300
   if [ -f "$scope_dir/reminder" ]; then
     _reminder_secs=$(cat "$scope_dir/reminder" 2>/dev/null)
