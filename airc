@@ -1521,7 +1521,21 @@ monitor() {
 # same env vars (PEERS_DIR) and argv (my_name).
 monitor_formatter() {
   local my_name="$1"
-  "$AIRC_PYTHON" -u -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+  # -X utf8 forces UTF-8 mode regardless of locale (cp1252 on Windows
+  # default + non-UTF-8 macOS terminals). Without it, monitor_formatter
+  # CRASHES SILENTLY on print() of any line containing unicode (→, ✓,
+  # ⚠ — all of which we use in airc system messages + peer chat). The
+  # crash kills the formatter mid-stream; bash sees the pipe close,
+  # restarts the bearer/formatter pair, and the missed event is
+  # silently lost. Symptom: substrate writes events to messages.jsonl
+  # correctly, formatter "runs," but Claude Code Monitor surfaces
+  # nothing. Joel's "your monitor code is the problem" was exactly
+  # this — caught 2026-05-02 after b69f's tail-direct workaround
+  # (which uses `python -X utf8`) wakes their AI session reliably
+  # while airc's own monitor_formatter (no -X utf8) drops events.
+  # Same fix here closes the gap at the SOURCE rather than relying on
+  # each operator to add their own tail-pipeline.
+  "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
 }
 
 # Drain pending.jsonl when the host is reachable again. Runs in background
