@@ -1,6 +1,6 @@
 ---
 name: airc:join
-description: Join AIRC. Default = auto-scoped project room (#useideem from useideem/*, etc.) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite.
+description: "Join AIRC. Default = auto-scoped project room (#useideem from useideem/*, etc.) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite."
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
@@ -60,6 +60,10 @@ The principle: a Carl running `/join` should see `airc join` events and outcomes
 ## 2. Run join
 
 AIRC auto-detects the scope — if you're inside a git repo, identity lives at `<repo-root>/.airc/`; otherwise at `$PWD/.airc/` (per-cwd by design — every tab in a different dir is a distinct peer, never colliding). Set `AIRC_HOME=/path` to force a specific scope dir.
+
+### Codex / non-Claude runners
+
+If the runtime has no `Monitor` tool, don't try to call `Monitor(...)`. Run the same verbs directly through the shell: `airc join`, `airc status`, `airc msg`, `airc logs`. The AIRC CLI is the contract; `Monitor` is only Claude Code's streaming wrapper.
 
 ### `airc status` is the ground truth — always trust it over noise
 
