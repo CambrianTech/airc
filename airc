@@ -1947,10 +1947,15 @@ except Exception:
 # is out of scope; loud-fail (Mac's bearer_gh.py PR) covers that path.
 _mesh_rediscover_loop() {
   local _parent_pid="$PPID"
-  # Cadence in seconds. 300s = 5min. Joel's "satellite" framing argues
-  # for tighter cadence on critical infra; 60s would also be fine cost-
-  # wise but bursty races during legitimate teardowns get noisy.
-  local interval="${AIRC_MESH_REDISCOVER_SEC:-300}"
+  # Cadence: 60s default (was 300s). Joel's "satellite/bios" framing
+  # argues for the tightest cadence that's still gh-rate-limit safe.
+  # _mesh_find does ~1 gh api call (gist list filtered by description);
+  # 60 calls/hour/peer is well under the 5000/hr authenticated limit.
+  # Tonight's incident 2026-05-02 made this concrete: a host rotation
+  # + 5min cadence = 5min comms blackout = Joel having to manually
+  # notify every peer. 60s reduces that to <1min worst-case (still
+  # not great but 5x improvement over 300s).
+  local interval="${AIRC_MESH_REDISCOVER_SEC:-60}"
   while true; do
     sleep "$interval"
     if ! kill -0 "$_parent_pid" 2>/dev/null; then
