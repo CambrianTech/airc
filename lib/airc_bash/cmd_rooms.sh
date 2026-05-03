@@ -215,6 +215,17 @@ cmd_part() {
 
   ensure_init
 
+  # CRITICAL bug fix 2026-05-02 (B8 from continuum-b69f): pre-fix
+  # `airc part QANAME` IGNORED the room arg and parted the scope's
+  # DEFAULT room — deleting #general's gist when user thought they
+  # were parting a test room. Mesh-splitting catastrophe: every peer
+  # on #general was islanded. Defeats #415's bus stability principle.
+  #
+  # Now honor the room arg. If passed, look up that channel's gist
+  # in channel_gists, delete it (if we host), remove from
+  # subscribed_channels. ONLY operate on default room when arg absent.
+  local arg_room="${1:-}"
+
   local gist_id_file="$AIRC_WRITE_DIR/room_gist_id"
   local room_name_file="$AIRC_WRITE_DIR/room_name"
   local room_name="(unnamed)"
@@ -222,6 +233,34 @@ cmd_part() {
 
   local host_target; host_target=$(get_config_val host_target "")
 
+  # ── Branch: room-specific part (arg given) vs scope-default part ──
+  if [ -n "$arg_room" ] && [ "$arg_room" != "$room_name" ]; then
+    # Room-specific part. Look up the gist from channel_gists.
+    # Default-room path below (no arg or matching arg) handles the
+    # primary scope teardown; this path JUST removes the named room
+    # without touching primary scope state.
+    local _ch_gist; _ch_gist=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+        --config "$CONFIG" --channel "$arg_room" 2>/dev/null || true)
+    if [ -z "$_ch_gist" ]; then
+      die "Not subscribed to #${arg_room} (no channel_gists mapping). Use 'airc list' to see open rooms; 'airc status' for your subscriptions."
+    fi
+    # Delete the gist ONLY if we're hosting it — i.e., it appears
+    # under our gh account. Try delete; ignore failure (someone else's
+    # gist isn't ours to delete; gh will reject with 404/403).
+    if command -v gh >/dev/null 2>&1; then
+      if gh gist delete "$_ch_gist" --yes 2>/dev/null; then
+        echo "  ✓ Parted #${arg_room} (we hosted; gist ${_ch_gist} deleted)."
+      else
+        echo "  ✓ Parted #${arg_room} (gist ${_ch_gist} not ours / already gone — left alone)."
+      fi
+    fi
+    # Remove from subscribed_channels + clear channel_gists mapping.
+    "$AIRC_PYTHON" -m airc_core.config unsubscribe --config "$CONFIG" --channel "$arg_room" 2>/dev/null || true
+    "$AIRC_PYTHON" -m airc_core.config set_channel_gist --config "$CONFIG" --channel "$arg_room" --gist-id "" 2>/dev/null || true
+    return 0
+  fi
+
+  # ── Scope-default part (no arg, or arg matches default) ──
   if [ -z "$host_target" ]; then
     # ── Host path ──
     if [ -f "$gist_id_file" ]; then
