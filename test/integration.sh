@@ -3846,6 +3846,13 @@ scenario_python_units() {
   # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
   # bearer_ssh.py). Add new test_*.py files in test/ as the airc_core
   # surface grows — each file is auto-discovered by the loop below.
+  #
+  # 2026-05-03 reliability fix: pre-fix grepped `tail -3 | ^OK` which
+  # broke when unittest emitted DeprecationWarning + skipped lines
+  # ahead of the OK marker (CI Python 3.x pushes OK past tail -3).
+  # Now: trust the exit code (unittest exits 0 on pass, non-zero on
+  # fail). Capture stderr+stdout to a tempfile so on failure we can
+  # surface the actual error to CI logs instead of just '✗ test_X'.
   echo
   echo "── scenario: python unit tests ──"
   local _here; _here="$(cd "$(dirname "$0")" && pwd)"
@@ -3853,10 +3860,17 @@ scenario_python_units() {
   for _t in "$_here"/test_*.py; do
     [ -f "$_t" ] || continue
     local _name; _name=$(basename "$_t" .py)
-    if ( cd "$_here" && python3 "$_t" 2>&1 | tail -3 | grep -q '^OK' ); then
+    local _out; _out=$(mktemp -t "airc-pyunit-${_name}.XXXXXX")
+    if ( cd "$_here" && python3 "$_t" >"$_out" 2>&1 ); then
       pass "python units: $_name"
+      rm -f "$_out"
     else
-      fail "python units: $_name (run: cd test && python3 $(basename "$_t"))"
+      local _exit=$?
+      fail "python units: $_name (exit=$_exit; run: cd test && python3 $(basename "$_t"))"
+      echo "  ── failure output (last 30 lines): ──" >&2
+      tail -30 "$_out" >&2
+      echo "  ────────────────────────────────────" >&2
+      rm -f "$_out"
       _failed=$((_failed + 1))
     fi
   done
