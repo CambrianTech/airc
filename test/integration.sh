@@ -2404,6 +2404,52 @@ scenario_attach_spawn_strips_attach_flag() {
   cleanup_all
 }
 
+# ── Scenario: join_rejects_unknown_flag ────────────────────────────────
+# Pre-fix `cmd_connect`'s arg loop had a single `*) positional+=("$1")` arm
+# that silently accepted any `--anything` as a positional. That positional
+# became `target` and then host-mode `name`, written to config.json.
+# Observed in the wild (continuum-8e97 on Windows): `airc join --background`
+# produced "Hosting as '--background'" and persisted the bad name in
+# config.json `name` field. Identity stayed corrupted across restarts
+# until the user manually edited the JSON. Same shape as the original
+# --attach leak in #511/#521, generalized to all unrecognized flags.
+scenario_join_rejects_unknown_flag() {
+  section "join_rejects_unknown_flag: cmd_connect rejects --unknown-flag instead of accepting as positional"
+  cleanup_all
+
+  local home=/tmp/airc-it-unknown-flag/state
+  local out=/tmp/airc-it-unknown-flag/out.log
+  local err=/tmp/airc-it-unknown-flag/err.log
+  mkdir -p /tmp/airc-it-unknown-flag
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --background --no-room --no-gist >"$out" 2>"$err"
+  local rc=$?
+
+  [ "$rc" != "0" ] \
+    && pass "unknown flag rejected with non-zero exit (rc=$rc)" \
+    || fail "unknown flag accepted (rc=$rc); stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null)"
+
+  grep -q "unknown flag" "$err" \
+    && pass "stderr names the rejection" \
+    || fail "stderr did not mention 'unknown flag': $(cat "$err" 2>/dev/null)"
+
+  ! grep -q "Hosting as '--background'" "$out" \
+    && pass "host setup never started with the bad name" \
+    || fail "host setup proceeded with --background as identity: $(cat "$out" 2>/dev/null)"
+
+  if [ -f "$home/config.json" ]; then
+    ! grep -q '"name":[[:space:]]*"--background"' "$home/config.json" \
+      && pass "config.json identity not corrupted by rejected flag" \
+      || fail "config.json was poisoned: $(cat "$home/config.json" 2>/dev/null)"
+  else
+    pass "config.json was not written (rejected before init)"
+  fi
+
+  rm -rf /tmp/airc-it-unknown-flag
+  cleanup_all
+}
+
 # ── Scenario: codex_join_detaches_transport ────────────────────────────
 # Public Codex flow is plain `airc join`. The shell dispatch detects Codex
 # and routes through the detach adapter, while the spawned child is guarded
@@ -4905,6 +4951,7 @@ case "$MODE" in
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_transport_survives_launcher_hup) scenario_attach_transport_survives_launcher_hup ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
+  join_rejects_unknown_flag) scenario_join_rejects_unknown_flag ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
   codex_join_idempotent_when_healthy) scenario_codex_join_idempotent_when_healthy ;;
   codex_join_waits_for_duplicate_repair) scenario_codex_join_waits_for_duplicate_repair ;;
@@ -4945,7 +4992,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
+    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_join_rejects_unknown_flag; scenario_codex_join_detaches_transport
     scenario_codex_join_idempotent_when_healthy
     scenario_codex_join_waits_for_duplicate_repair
     scenario_join_reaps_duplicate_scope_transport

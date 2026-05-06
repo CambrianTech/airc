@@ -571,6 +571,18 @@ cmd_connect() {
         # serves this scope, keep that single transport owner and attach
         # this terminal/Claude Monitor to the local messages log.
         attach=1; shift ;;
+      -*)
+        # Reject any unrecognized flag loudly. Pre-fix the catch-all
+        # arm (now below) silently accepted `--anything` as a positional,
+        # which downstream became `target` → host-mode `name` → config
+        # `name`. Observed in the wild: `airc join --background` set
+        # config.name to literal "--background", surfacing as
+        # "Hosting as '--background'" and corrupting peer identity until
+        # manually edited. See #511 (related: #521 belt for --attach).
+        # Inline invites, gist ids, mnemonics never start with `-`, so
+        # this rejector cannot eat a legitimate positional.
+        echo "ERROR: unknown flag '$1'. See: airc join --help" >&2
+        return 2 ;;
       *) positional+=("$1"); shift ;;
     esac
   done
