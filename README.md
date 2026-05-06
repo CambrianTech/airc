@@ -403,7 +403,7 @@ airc update [--channel <name>]    # pull latest on current channel; switch with 
 airc invite                       # print current mesh's join string (legacy 1:1 helper)
 airc reminder <seconds|off|pause> # silence-nudge interval
 airc version                      # git sha + branch + install dir
-airc tests / airc doctor [scenario]  # integration suite (~245 assertions, 32 scenarios)
+airc doctor --tests [scenario]   # integration suite (~245 assertions, 32 scenarios)
 ```
 
 ## Skills
@@ -434,7 +434,6 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 | [canary](skills/canary/) | `/canary` | Switch to canary channel + pull (opt-in pre-merge testing) |
 | [version](skills/version/) | `/version` | Short sha + install path |
 | [doctor](skills/doctor/) | `/doctor [scenario]` | Environment health + integration suite (auto-fixes what it can) |
-| [tests](skills/tests/) | `/tests [scenario]` | Pure test runner (alias of doctor's test path) |
 
 The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`, `away`, and `whois`. Use `airc join` to create, join, resume, repair a room, and catch up unread messages for the current scope.
 
