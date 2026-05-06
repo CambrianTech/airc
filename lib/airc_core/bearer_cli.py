@@ -454,6 +454,20 @@ def cmd_recv(args) -> int:
                 _touch_state_heartbeat(state_file, time.time())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        if state_file:
+            _write_state_file(state_file, {
+                "kind": getattr(bearer, "KIND", "unknown"),
+                "peer_id": args.peer_id,
+                "last_recv_ts": None,
+                "last_sender": None,
+                "events_total": events_total,
+                "diag": f"bearer recv failed: {e}",
+                "last_error": str(e),
+                "last_error_ts": time.time(),
+            })
+        print(f"bearer recv: stream failed: {e}", file=sys.stderr, flush=True)
+        return 3
     finally:
         _stop_heartbeat.set()
         bearer.close()
