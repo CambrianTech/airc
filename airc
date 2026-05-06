@@ -1459,9 +1459,13 @@ _monitor_multi_channel() {
             fi
             if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ] \
                && tail -20 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | grep -qE 'returned 404|\(gone\)|GET gists/.* failed: gone'; then
+              local _gone_gid
+              _gone_gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+                --config "$CONFIG" --channel "$ch" 2>/dev/null || true)
               "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
                 --config "$CONFIG" --channel "$ch" --gist-id "" \
                 >/dev/null 2>&1 || true
+              [ -n "$_gone_gid" ] && printf '%s\n' "$_gone_gid" > "$AIRC_WRITE_DIR/gone_channel_gist.${ch}" 2>/dev/null || true
               printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved. Monitor stopped respawning this channel; re-host with: airc join --room %s]"}\n' \
                 "$(timestamp)" "$ch" "$ch" "$ch" >> "$MESSAGES"
               echo "airc: #${ch} gist returned 404 (gone); cleared stale channel_gists[${ch}] and stopped respawning that channel" >&2
