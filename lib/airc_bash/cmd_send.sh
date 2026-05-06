@@ -433,6 +433,7 @@ cmd_send() {
         "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
           --config "$CONFIG" --channel "$active_channel" --gist-id "" \
           >/dev/null 2>&1 || true
+        [ -n "${room_gist_id:-}" ] && printf '%s\n' "$room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
         local gone_marker; gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
           "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${detail:-no detail}")
         echo "$gone_marker" >> "$MESSAGES"
@@ -630,6 +631,7 @@ cmd_send() {
           "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
             --config "$CONFIG" --channel "$active_channel" --gist-id "" \
             >/dev/null 2>&1 || true
+          [ -n "${_host_room_gist_id:-}" ] && printf '%s\n' "$_host_room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
           local _host_gone_marker; _host_gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
             "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${_host_detail:-no detail}")
           echo "$_host_gone_marker" >> "$MESSAGES"

@@ -2204,6 +2204,10 @@ scenario_monitor_gone_gist_stops_respawn() {
     && pass "monitor clears dissolved channel gist mapping" \
     || fail "monitor does not clear dissolved channel gist mapping"
 
+  grep -q 'gone_channel_gist' "$src" \
+    && pass "monitor persists gone channel marker for scope repair" \
+    || fail "monitor does not persist gone channel marker for scope repair"
+
   grep -q "no channel_gists mappings remain" "$src" \
     && pass "empty refreshed channel map is treated as authoritative" \
     || fail "empty refreshed channel map still falls back to stale startup map"
