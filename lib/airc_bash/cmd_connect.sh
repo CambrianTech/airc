@@ -169,6 +169,7 @@ _join_restart_scope_processes() {
     [ -f "$_pidfile" ] || continue
     _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
   done
+  _pids="$_pids $(_join_scope_transport_pids 2>/dev/null | tr '\n' ' ')"
   local _p _c
   for _p in $_pids; do
     case "$_p" in ''|*[!0-9]*) continue ;; esac
@@ -178,6 +179,89 @@ _join_restart_scope_processes() {
     done
   done
   rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR"/bearer_gist.*.pid 2>/dev/null || true
+}
+
+_join_scope_transport_pids() {
+  # Scope-path catch-all for `airc join` self-heal. Pidfiles are not
+  # enough after Monitor restarts: old bearer_cli / monitor_formatter
+  # children can be reparented to init and keep serving the same scope
+  # while the new generation also runs. Match only transport/process
+  # owners for THIS scope; leave UI-only log_tail attach streams alone.
+  local _pids=""
+  local _pid _cmd
+  for _pid in $(proc_airc_pids_matching "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true); do
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_pid" = "$$" ] && continue
+    [ "$_pid" = "$PPID" ] && continue
+    _cmd=$(proc_cmdline "$_pid" || true)
+    case "$_cmd" in
+      *airc_core.log_tail*) continue ;;
+      *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
+        _pids="$_pids $_pid"
+        ;;
+      *) continue ;;
+    esac
+
+    # Reap airc wrapper ancestors too. They often do not include
+    # AIRC_HOME in argv because the scope is in the environment, but if
+    # their Python children are ours, the wrapper is ours.
+    local _ancestor _depth _ancestor_cmd
+    _ancestor=$(proc_parent "$_pid" || true)
+    _depth=0
+    while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
+      _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
+      if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+        _pids="$_pids $_ancestor"
+        _ancestor=$(proc_parent "$_ancestor" || true)
+        _depth=$((_depth + 1))
+      else
+        break
+      fi
+    done
+  done
+
+  # Include direct children of everything we found. This catches short
+  # wrapper trees without relying on one pidfile generation being current.
+  local _base _child
+  for _base in $_pids; do
+    for _child in $(proc_children "$_base" 2>/dev/null); do
+      _pids="$_pids $_child"
+    done
+  done
+  for _pid in $_pids; do
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_pid" = "$$" ] && continue
+    [ "$_pid" = "$PPID" ] && continue
+    printf '%s\n' "$_pid"
+  done | sort -un
+}
+
+_join_scope_has_duplicate_transport() {
+  local _fmt_count
+  _fmt_count=$(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${_fmt_count:-0}" -gt 1 ] 2>/dev/null; then
+    return 0
+  fi
+
+  local _seen_gists="" _pid _cmd _gid
+  for _pid in $(proc_airc_pids_matching 'airc_core\.bearer_cli[[:space:]]+recv' 2>/dev/null | sort -un || true); do
+    _cmd=$(proc_cmdline "$_pid" || true)
+    printf '%s\n' "$_cmd" | grep -Fq -- "$AIRC_WRITE_DIR" || continue
+    _gid=$(printf '%s\n' "$_cmd" | awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == "--room-gist-id" && (i + 1) <= NF) {
+          print $(i + 1); exit
+        }
+      }
+    }')
+    [ -n "$_gid" ] || continue
+    case " $_seen_gists " in
+      *" $_gid "*) return 0 ;;
+      *) _seen_gists="$_seen_gists $_gid" ;;
+    esac
+  done
+
+  return 1
 }
 
 _join_attach_local_stream() {
@@ -589,6 +673,10 @@ cmd_connect() {
     fi
     if [ "$_repair_running_monitor" = "1" ]; then
       echo "  airc join: restarting this scope's AIRC process to leave the solo island."
+      _join_restart_scope_processes
+      sleep 1
+    elif _join_scope_has_duplicate_transport; then
+      echo "  airc join: duplicate same-scope transport generation detected; restarting this scope's AIRC process."
       _join_restart_scope_processes
       sleep 1
     else
