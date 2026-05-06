@@ -582,6 +582,33 @@ class BearerCliStateFileTests(unittest.TestCase):
         self.assertEqual(state["last_heartbeat_ts"], 456.0)
         _os.unlink(state_path)
 
+    def test_stream_exception_marks_state_failed(self):
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+
+        class _FailingBearer(self._FakeBearer):
+            def recv_stream(self):
+                raise RuntimeError("room gist abc123 returned 404 (gone)")
+                yield  # pragma: no cover
+
+        fake = _FailingBearer({})
+        fake_stdout, _ = self._capture_stdout_bytes()
+        fake_stderr = mock.Mock()
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout), \
+             mock.patch.object(bearer_cli.sys, "stderr", fake_stderr):
+            rc = bearer_cli.cmd_recv(self._make_args(state_path))
+
+        self.assertEqual(rc, 3)
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertIn("returned 404", state["last_error"])
+        self.assertIn("bearer recv failed", state["diag"])
+        self.assertIsNone(state["last_recv_ts"])
+        self.assertTrue(fake.closed)
+
     def test_no_state_file_means_no_writes(self):
         events = [ReceivedMessage(
             sender_peer_id="bob",
@@ -1759,6 +1786,18 @@ class GhBearerRecvTests(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].sender_peer_id, "bob")
+
+    def test_recv_raises_when_gist_is_gone(self):
+        b = self._bearer()
+        with mock.patch.object(
+            bearer_gh,
+            "_gh_api_get_classified",
+            return_value=(None, "gone"),
+        ):
+            with self.assertRaises(GhBearerError) as ctx:
+                next(b.recv_stream())
+
+        self.assertIn("returned 404", str(ctx.exception))
 
     def test_recv_secondary_rate_limit_sleeps_through_shared_backoff(self):
         b = self._bearer({"poll_interval": 15})

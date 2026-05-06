@@ -2071,6 +2071,116 @@ PY
   cleanup_all
 }
 
+# ── Scenario: send_gone_gist_does_not_claim_delivery (#525) ─────────────
+# A dissolved gh room (HTTP 404) is a permanent send failure. Pre-fix,
+# cmd_send printed the correct "channel dissolved" diagnostic and then
+# fell through to the shared success footer:
+#
+#   ✗ Gist for #general returned 404 — channel dissolved.
+#   → @peer on #general
+#
+# That is worse than failure: it trains agents and humans to trust a
+# message that never landed. This scenario stubs only bearer_cli send;
+# all config, signing, and cmd_send shell behavior stays real.
+scenario_send_gone_gist_does_not_claim_delivery() {
+  section "send_gone_gist_does_not_claim_delivery: 404 suppresses delivered banner"
+  cleanup_all
+
+  local root=/tmp/airc-it-gone
+  local home="$root/state"
+  local fakebin="$root/bin"
+  mkdir -p "$home/identity" "$home/peers" "$fakebin"
+  scaffold_identity "$home/identity" 'airc-test-gone' || {
+    fail "could not scaffold identity"
+    cleanup_all; return
+  }
+  cat > "$home/config.json" <<'JSON'
+{
+  "name": "gone-joiner",
+  "host_target": "nobody@127.0.0.1",
+  "host_airc_home": "/tmp/airc-it-gone/host",
+  "subscribed_channels": ["general"],
+  "channel_gists": {
+    "general": "deadbeefdeadbeefdeadbeefdeadbeef"
+  }
+}
+JSON
+
+  printf '{"kind":"gh","peer_id":"self","last_recv_ts":null,"events_total":0,"diag":"bearer recv failed: room gist deadbeef returned 404 (gone)","last_error":"room gist deadbeef returned 404 (gone)","last_error_ts":%s,"last_heartbeat_ts":%s}\n' \
+    "$(date +%s)" "$(date +%s)" > "$home/bearer_state.general.json"
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'transport health: DEGRADED' \
+    && echo "$status_out" | grep -q 'bearer error: room gist deadbeef returned 404' \
+    && pass "status reports recv-side 404 as degraded despite fresh heartbeat" \
+    || fail "status treated recv-side 404 as healthy (got: $status_out)"
+
+  local real_py="${AIRC_PYTHON:-$(command -v python3)}"
+  cat > "$fakebin/python" <<SH
+#!/bin/bash
+if [ "\${1:-}" = "-m" ] && [ "\${2:-}" = "airc_core.bearer_cli" ] && [ "\${3:-}" = "send" ]; then
+  cat >/dev/null
+  case "\${AIRC_FAKE_BEARER_KIND:-gone}" in
+    gone)
+      printf '%s\n' '{"kind":"gone","detail":"GET gists/deadbeefdeadbeefdeadbeefdeadbeef failed: gone"}'
+      exit 0
+      ;;
+    transient_failure)
+      printf '%s\n' '{"kind":"transient_failure","detail":"simulated network outage"}'
+      exit 0
+      ;;
+  esac
+fi
+exec "$real_py" "\$@"
+SH
+  chmod +x "$fakebin/python"
+
+  local out err rc
+  out=$(mktemp -t airc-gone-out.XXXXXX)
+  err=$(mktemp -t airc-gone-err.XXXXXX)
+  AIRC_HOME="$home" AIRC_PYTHON="$fakebin/python" "$AIRC" msg @ghost "lost forever" >"$out" 2>"$err"
+  rc=$?
+
+  [ "$rc" -ne 0 ] \
+    && pass "404 send exits non-zero" \
+    || fail "404 send exited 0"
+
+  grep -qE 'returned 404|channel dissolved|message NOT delivered|Re-host' "$err" \
+    && pass "stderr surfaces dissolved-channel recovery" \
+    || fail "stderr missed dissolved-channel diagnostic (got: $(cat "$err"))"
+
+  if grep -qE '→ @ghost|→ #general' "$out"; then
+    fail "printed delivered arrow after 404 (stdout: $(cat "$out"))"
+  else
+    pass "404 does not print delivered arrow"
+  fi
+
+  local mapping
+  mapping=$(AIRC_HOME="$home" "$real_py" -m airc_core.config get_channel_gist \
+    --config "$home/config.json" --channel general 2>/dev/null || true)
+  [ -z "$mapping" ] \
+    && pass "stale channel gist mapping cleared" \
+    || fail "stale channel gist mapping still present: $mapping"
+
+  AIRC_FAKE_BEARER_KIND=transient_failure AIRC_HOME="$home" AIRC_PYTHON="$fakebin/python" \
+    "$AIRC" msg @ghost "retry later" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" -eq 0 ] \
+    && pass "transient send still queues successfully" \
+    || fail "transient queue exited non-zero ($rc)"
+  if grep -qE '→ @ghost|→ #general' "$out"; then
+    fail "printed delivered arrow for queued send (stdout: $(cat "$out"))"
+  elif grep -q '↻ queued for @ghost on #general' "$out"; then
+    pass "queued send prints queued banner, not delivered banner"
+  else
+    fail "queued send missing queued banner (stdout: $(cat "$out"); stderr: $(cat "$err"))"
+  fi
+
+  rm -f "$out" "$err"
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: monitor_liveness_process_evidence ────────────────────────
 # A project .airc scope can be shared by several Claude/Codex tabs. This
 # scenario keeps monitor liveness honest at the process-evidence layer:
@@ -4557,6 +4667,7 @@ case "$MODE" in
   two_tab_localhost) scenario_two_tab_localhost ;;
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
+  send_gone_gist_does_not_claim_delivery) scenario_send_gone_gist_does_not_claim_delivery ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
@@ -4596,7 +4707,7 @@ case "$MODE" in
     scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
-    scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
+    scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
     scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
@@ -4611,7 +4722,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|monitor_liveness_process_evidence|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo

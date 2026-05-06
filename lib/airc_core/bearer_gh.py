@@ -849,6 +849,10 @@ class GhBearer(Bearer):
                     return
             gist, get_kind = _gh_api_get_classified(gist_id)
             if gist is None:
+                if get_kind == "gone":
+                    raise GhBearerError(
+                        f"room gist {gist_id} returned 404 (gone)"
+                    )
                 if get_kind == "secondary_rate_limit":
                     delay = max(self._poll_interval, gh_backoff.backoff_until() - _time.time(), 60.0)
                     self._sleep_or_break(delay)

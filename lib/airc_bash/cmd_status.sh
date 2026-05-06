@@ -113,6 +113,8 @@ for ch in subs:
         issues.append("missing channel_gists mapping")
 
     state, state_issue, state_path = load_state(ch)
+    if state.get("last_error"):
+        issues.append(f"bearer error: {state.get('last_error')}")
     signal = signal_for_gist(ch, gist, state)
     signal_source = ch
     if signal is not None:
