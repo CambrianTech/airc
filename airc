@@ -239,17 +239,45 @@ detect_scope() {
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
-# Format: <repo>-<4-char-hash> when in a git repo (basename of the git
-# top-level), or <dir-basename>-<4-char-hash> otherwise. Hash
+# Format: <platform>-<repo>-<4-char-hash> when in a git repo (basename of
+# the git top-level), or <platform>-<dir-basename>-<4-char-hash> otherwise.
+# Hash
 # disambiguates same-name directories across different parent paths
 # (two "src" dirs, two clones of the same repo, etc.).
 #
 # Within a room scoped to a single org (which is the auto-scope default
 # — see infer_repo_org), every peer is from that org by construction, so
 # adding the org as a name prefix is redundant and lengthens @-mentions.
-# Cap is 20 chars on the basename, comfortably fitting common repo names
-# (`authenticator-d1f4`, `merchant-browser-d1f4`) without truncation.
+# Cap is 16 chars on the basename, comfortably fitting common repo names
+# (`mac-authenticator-d1f4`, `win-continuum-d1f4`) without truncation.
 # Users can override any time with `airc nick`.
+platform_nick_prefix() {
+  local kind="${AIRC_PLATFORM_KIND:-}"
+  if [ -z "$kind" ]; then
+    case "$(uname -s 2>/dev/null)" in
+      Darwin*) kind="mac" ;;
+      MINGW*|MSYS*|CYGWIN*) kind="win" ;;
+      Linux*)
+        if grep -qi microsoft /proc/version 2>/dev/null; then
+          kind="win"
+        elif [ -r /etc/os-release ]; then
+          kind=$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release)
+        else
+          kind="linux"
+        fi
+        ;;
+      *) kind="$(uname -s 2>/dev/null || echo airc)" ;;
+    esac
+  fi
+  kind=$(printf '%s' "$kind" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-3 \
+    | sed 's/-*$//')
+  [ -z "$kind" ] && kind="air"
+  printf '%s\n' "$kind"
+}
+
 derive_name() {
   local dir="${1:-$(pwd -P)}"
   local base_dir git_root base
@@ -259,13 +287,13 @@ derive_name() {
     | tr '[:upper:]' '[:lower:]' \
     | sed 's/[^a-z0-9-]/-/g' \
     | sed 's/--*/-/g; s/^-*//; s/-*$//' \
-    | cut -c1-20 \
+    | cut -c1-16 \
     | sed 's/-*$//')
   [ -z "$base" ] && base="airc"
   local hash
   hash=$(printf '%s' "$dir" | shasum -a 256 2>/dev/null | cut -c1-4)
   [ -z "$hash" ] && hash=$(printf '%s' "$dir" | cksum | cut -c1-4)
-  echo "${base}-${hash}"
+  echo "$(platform_nick_prefix)-${base}-${hash}"
 }
 
 # Infer default room name from the git repo at $PWD. Maps mesh scope to
