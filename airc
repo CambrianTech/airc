@@ -1366,16 +1366,18 @@ _monitor_multi_channel() {
   while true; do
     # Re-read channel_map from config at top of each outer cycle so
     # an in-flight config change (e.g. _mesh_rediscover_loop swapping
-    # the host gist after rotation) takes effect on the next bearer
-    # respawn, no full process restart required. Falls back to the
-    # parameter passed at startup if the re-read returns empty
-    # (transient config-write race or missing list_channel_gists
-    # support on older airc_core).
+    # the host gist after rotation, or a gone-gist prune below) takes
+    # effect on the next bearer respawn, no full process restart
+    # required. Empty is meaningful: it means no channel currently has
+    # a viable wire, so do not fall back to the stale startup map.
     local _refreshed_map
     _refreshed_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
       --config "$CONFIG" 2>/dev/null || true)
-    if [ -n "$_refreshed_map" ]; then
-      channel_map="$_refreshed_map"
+    channel_map="$_refreshed_map"
+    if [ -z "$channel_map" ]; then
+      echo "airc: no channel_gists mappings remain; monitor waiting for 'airc join --room <channel>' to re-host" >&2
+      sleep 30
+      continue
     fi
     {
       # Per-child PID tracking so we can detect individual deaths.
@@ -1454,6 +1456,16 @@ _monitor_multi_channel() {
             # having to know to read the log file.
             if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ]; then
               tail -3 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | sed 's/^/airc:   /' >&2
+            fi
+            if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ] \
+               && tail -20 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | grep -qE 'returned 404|\(gone\)|GET gists/.* failed: gone'; then
+              "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+                --config "$CONFIG" --channel "$ch" --gist-id "" \
+                >/dev/null 2>&1 || true
+              printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved. Monitor stopped respawning this channel; re-host with: airc join --room %s]"}\n' \
+                "$(timestamp)" "$ch" "$ch" "$ch" >> "$MESSAGES"
+              echo "airc: #${ch} gist returned 404 (gone); cleared stale channel_gists[${ch}] and stopped respawning that channel" >&2
+              continue
             fi
             # Re-read the channel's gist from config. If the host rotated
             # or send-path self-heal updated channel_gists while this

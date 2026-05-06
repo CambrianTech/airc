@@ -2181,6 +2181,36 @@ SH
   cleanup_all
 }
 
+# ── Scenario: monitor_gone_gist_stops_respawn ──────────────────────────
+# Send-path 404 handling already clears stale channel_gists. Recv-path
+# monitor handling must do the same; otherwise a dissolved subscribed
+# channel exits bearer_cli with "room gist ... returned 404 (gone)" and
+# the supervisor respawns it forever, wasting gh budget and flapping the
+# Monitor. This is a structural regression test for that supervisor path.
+scenario_monitor_gone_gist_stops_respawn() {
+  section "monitor_gone_gist_stops_respawn: recv-side 404 clears stale mapping instead of respawning forever"
+  cleanup_all
+
+  local src="$AIRC"
+  grep -q 'GET gists/.* failed: gone' "$src" \
+    && pass "monitor detects gone gist errors from bearer recv logs" \
+    || fail "monitor does not detect gone gist errors from bearer recv logs"
+
+  grep -q 'gist returned 404 (gone); cleared stale channel_gists' "$src" \
+    && pass "monitor surfaces stale channel_gists cleanup" \
+    || fail "monitor does not surface stale channel_gists cleanup"
+
+  grep -q -- '--gist-id ""' "$src" \
+    && pass "monitor clears dissolved channel gist mapping" \
+    || fail "monitor does not clear dissolved channel gist mapping"
+
+  grep -q "no channel_gists mappings remain" "$src" \
+    && pass "empty refreshed channel map is treated as authoritative" \
+    || fail "empty refreshed channel map still falls back to stale startup map"
+
+  cleanup_all
+}
+
 # ── Scenario: monitor_liveness_process_evidence ────────────────────────
 # A project .airc scope can be shared by several Claude/Codex tabs. This
 # scenario keeps monitor liveness honest at the process-evidence layer:
@@ -5005,6 +5035,7 @@ case "$MODE" in
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   send_gone_gist_does_not_claim_delivery) scenario_send_gone_gist_does_not_claim_delivery ;;
+  monitor_gone_gist_stops_respawn) scenario_monitor_gone_gist_stops_respawn ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_transport_survives_launcher_hup) scenario_attach_transport_survives_launcher_hup ;;
@@ -5050,7 +5081,7 @@ case "$MODE" in
     scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
-    scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
+    scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_gone_gist_stops_respawn; scenario_monitor_liveness_process_evidence
     scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_join_rejects_unknown_flag; scenario_join_intent_failure_falls_back_to_host; scenario_codex_join_detaches_transport
     scenario_codex_join_idempotent_when_healthy
     scenario_codex_join_waits_for_duplicate_repair
@@ -5068,7 +5099,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
