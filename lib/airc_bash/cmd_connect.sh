@@ -135,6 +135,12 @@ _join_show_status_and_inbox() {
 
 _join_transport_health_ok() {
   [ -f "$CONFIG" ] || return 1
+  local _channels
+  _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  # Legacy/no-room mode has no gist bearer to heartbeat. If the caller
+  # already proved the scope owner is alive, transport_health has no
+  # channel rows to evaluate and must not force a duplicate restart.
+  [ -n "$_channels" ] || return 0
   "$AIRC_PYTHON" -m airc_core.transport_health check \
     --home "$AIRC_WRITE_DIR" \
     --config "$CONFIG" \
@@ -178,6 +184,15 @@ _join_restart_scope_processes() {
       kill "$_c" 2>/dev/null || true
     done
   done
+  sleep 1
+  for _p in $_pids; do
+    case "$_p" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_p" 2>/dev/null || continue
+    kill -9 "$_p" 2>/dev/null || true
+    for _c in $(proc_children "$_p" 2>/dev/null); do
+      kill -9 "$_c" 2>/dev/null || true
+    done
+  done
   rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR"/bearer_gist.*.pid 2>/dev/null || true
 }
 
@@ -188,37 +203,42 @@ _join_scope_transport_pids() {
   # while the new generation also runs. Match only transport/process
   # owners for THIS scope; leave UI-only log_tail attach streams alone.
   local _pids=""
-  local _pid _cmd
-  for _pid in $(proc_airc_pids_matching "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true); do
-    case "$_pid" in ''|*[!0-9]*) continue ;; esac
-    [ "$_pid" = "$$" ] && continue
-    [ "$_pid" = "$PPID" ] && continue
-    _cmd=$(proc_cmdline "$_pid" || true)
-    case "$_cmd" in
-      *airc_core.log_tail*) continue ;;
-      *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
-        _pids="$_pids $_pid"
-        ;;
-      *) continue ;;
-    esac
+  local _pid _cmd _scope_variant
+  while IFS= read -r _scope_variant; do
+    [ -n "$_scope_variant" ] || continue
+    for _pid in $(proc_airc_pids_matching "$_scope_variant" 2>/dev/null | sort -un || true); do
+      case "$_pid" in ''|*[!0-9]*) continue ;; esac
+      [ "$_pid" = "$$" ] && continue
+      [ "$_pid" = "$PPID" ] && continue
+      _cmd=$(proc_cmdline "$_pid" || true)
+      case "$_cmd" in
+        *airc_core.log_tail*) continue ;;
+        *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
+          _pids="$_pids $_pid"
+          ;;
+        *) continue ;;
+      esac
 
-    # Reap airc wrapper ancestors too. They often do not include
-    # AIRC_HOME in argv because the scope is in the environment, but if
-    # their Python children are ours, the wrapper is ours.
-    local _ancestor _depth _ancestor_cmd
-    _ancestor=$(proc_parent "$_pid" || true)
-    _depth=0
-    while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
-      _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
-      if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
-        _pids="$_pids $_ancestor"
-        _ancestor=$(proc_parent "$_ancestor" || true)
-        _depth=$((_depth + 1))
-      else
-        break
-      fi
+      # Reap airc wrapper ancestors too. They often do not include
+      # AIRC_HOME in argv because the scope is in the environment, but if
+      # their Python children are ours, the wrapper is ours.
+      local _ancestor _depth _ancestor_cmd
+      _ancestor=$(proc_parent "$_pid" || true)
+      _depth=0
+      while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
+        _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
+        if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+          _pids="$_pids $_ancestor"
+          _ancestor=$(proc_parent "$_ancestor" || true)
+          _depth=$((_depth + 1))
+        else
+          break
+        fi
+      done
     done
-  done
+  done <<EOF
+$(_airc_scope_path_variants "$AIRC_WRITE_DIR")
+EOF
 
   # Include direct children of everything we found. This catches short
   # wrapper trees without relying on one pidfile generation being current.
@@ -246,7 +266,7 @@ _join_scope_has_duplicate_transport() {
   local _seen_gists="" _pid _cmd _gid
   for _pid in $(proc_airc_pids_matching 'airc_core\.bearer_cli[[:space:]]+recv' 2>/dev/null | sort -un || true); do
     _cmd=$(proc_cmdline "$_pid" || true)
-    printf '%s\n' "$_cmd" | grep -Fq -- "$AIRC_WRITE_DIR" || continue
+    _airc_cmdline_mentions_scope "$_cmd" "$AIRC_WRITE_DIR" || continue
     _gid=$(printf '%s\n' "$_cmd" | awk '{
       for (i = 1; i <= NF; i++) {
         if ($i == "--room-gist-id" && (i + 1) <= NF) {

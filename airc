@@ -190,9 +190,33 @@ fi
 #
 # AIRC_HOME env var overrides, for tests / edge cases. Normal users don't
 # touch it.
+canonical_scope_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    (cd "$p" 2>/dev/null && pwd -P) || echo "$p"
+    return
+  fi
+
+  # Scope dirs often do not exist yet on first join. Canonicalize the
+  # existing parent so /tmp/foo/.airc and /private/tmp/foo/.airc still
+  # resolve to one owner on macOS, without requiring non-portable
+  # realpath/readlink -f.
+  local parent base
+  parent="$(dirname "$p")"
+  base="$(basename "$p")"
+  if [ -d "$parent" ]; then
+    local parent_abs
+    parent_abs="$(cd "$parent" 2>/dev/null && pwd -P)" || parent_abs="$parent"
+    echo "$parent_abs/$base"
+    return
+  fi
+
+  echo "$p"
+}
+
 detect_scope() {
   if [ -n "${AIRC_HOME:-}" ]; then
-    echo "$AIRC_HOME"
+    canonical_scope_path "$AIRC_HOME"
     return
   fi
 
@@ -509,9 +533,39 @@ _airc_scope_monitor_formatter_pids() {
     case "$p" in ''|*[!0-9]*) continue ;; esac
     cmd=$(proc_cmdline "$p" 2>/dev/null || true)
     printf '%s\n' "$cmd" | grep -Fq -- 'airc_core.monitor_formatter' || continue
-    printf '%s\n' "$cmd" | grep -Fq -- "--peers-dir $scope_dir/peers" || continue
+    _airc_cmdline_mentions_scope "$cmd" "$scope_dir/peers" || continue
     printf '%s\n' "$p"
   done
+}
+
+_airc_scope_path_variants() {
+  local scope_dir="${1:-}"
+  [ -n "$scope_dir" ] || return 0
+  local canon
+  canon=$(canonical_scope_path "$scope_dir")
+  {
+    printf '%s\n' "$scope_dir"
+    printf '%s\n' "$canon"
+    case "$canon" in
+      /private/tmp/*) printf '/tmp/%s\n' "${canon#/private/tmp/}" ;;
+      /tmp/*)         printf '/private/tmp/%s\n' "${canon#/tmp/}" ;;
+    esac
+  } | sort -u
+}
+
+_airc_cmdline_mentions_scope() {
+  local cmd="${1:-}"
+  local scope_dir="${2:-}"
+  [ -n "$cmd" ] || return 1
+  [ -n "$scope_dir" ] || return 1
+  local variant
+  while IFS= read -r variant; do
+    [ -n "$variant" ] || continue
+    printf '%s\n' "$cmd" | grep -Fq -- "$variant" && return 0
+  done <<EOF
+$(_airc_scope_path_variants "$scope_dir")
+EOF
+  return 1
 }
 
 _airc_cmdline_is_monitor_wrapper() {
