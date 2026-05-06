@@ -3578,6 +3578,43 @@ time.sleep(30)
   cleanup_all
 }
 
+# ── Scenario: windows_cmd_shim_direct_bash ─────────────────────────────
+# Windows Claude Code Monitor invokes `airc` through the .cmd shim. Keep
+# that path short: cmd -> Git Bash -> bash airc. A prior cmd ->
+# PowerShell -> ps1 -> bash chain hung before the bash entrypoint ran.
+scenario_windows_cmd_shim_direct_bash() {
+  section "windows_cmd_shim_direct_bash: airc.cmd launches Git Bash directly"
+  cleanup_all
+
+  local root; root=$(cd "$(dirname "$AIRC")" && pwd)
+  local cmd="$root/airc.cmd"
+  local installer="$root/install.ps1"
+
+  [ -f "$cmd" ] \
+    && pass "airc.cmd exists" \
+    || { fail "airc.cmd missing at $cmd"; return; }
+
+  grep -q 'Git\\bin\\bash.exe' "$cmd" \
+    && pass "airc.cmd probes standard Git Bash locations" \
+    || fail "airc.cmd does not probe Git Bash locations"
+
+  grep -q '"%BASH_EXE%" "%AIRC_SCRIPT%" %\*' "$cmd" \
+    && pass "airc.cmd forwards directly to bash airc script" \
+    || fail "airc.cmd does not directly invoke bash airc"
+
+  if grep -qi 'powershell .*airc.ps1' "$cmd"; then
+    fail "airc.cmd still routes through PowerShell airc.ps1"
+  else
+    pass "airc.cmd avoids PowerShell hop"
+  fi
+
+  grep -q '"%BASH_EXE%" "%AIRC_SCRIPT%" %\*' "$installer" \
+    && pass "install.ps1 fallback shim also uses direct bash" \
+    || fail "install.ps1 fallback shim still differs from checked-in airc.cmd"
+
+  cleanup_all
+}
+
 scenario_bearer_ssh_send() {
   # Phase 2b prep: prove SshBearer.send works end-to-end against a real
   # paired SSH listener BEFORE the monitor cutover. If this scenario
@@ -5105,6 +5142,7 @@ case "$MODE" in
   list) scenario_list ;;
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
+  windows_cmd_shim_direct_bash) scenario_windows_cmd_shim_direct_bash ;;
   python_units) scenario_python_units ;;
   bearer_ssh_send) scenario_bearer_ssh_send ;;
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
@@ -5141,7 +5179,7 @@ case "$MODE" in
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
-    scenario_list; scenario_quit; scenario_platform_adapters
+    scenario_list; scenario_quit; scenario_platform_adapters; scenario_windows_cmd_shim_direct_bash
     scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
@@ -5150,7 +5188,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
