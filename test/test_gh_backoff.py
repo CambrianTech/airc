@@ -6,6 +6,7 @@ Run: cd test && python3 test_gh_backoff.py
 from __future__ import annotations
 
 import json
+import io
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,21 @@ class GhGuardTests(unittest.TestCase):
 
             self.assertEqual(gh_backoff.wait_seconds(now=940.2), 59)
             self.assertEqual(gh_backoff.wait_seconds(now=1001.0), 0)
+
+    def test_doctor_surfaces_shared_backoff(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.dict("os.environ", {
+                 "AIRC_GH_AUDIT_LOG": str(Path(tmp) / "audit.jsonl"),
+             }, clear=False), \
+             mock.patch.object(gh_backoff.time, "time", return_value=900.0), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            gh_backoff.record_backoff("retry-after: 120")
+
+            rc = gh_backoff._main(["doctor", "--count", "10"])
+
+            self.assertEqual(rc, 2)
+            self.assertIn("gh governor shared backoff active", stdout.getvalue())
 
     def test_unguarded_command_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp, \

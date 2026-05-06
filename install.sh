@@ -559,7 +559,7 @@ _install_airc_skills_into() {
   local old
   for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
              "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect \
-             "$skills_target"/inbox; do
+             "$skills_target"/inbox "$skills_target"/tests; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 

@@ -20,7 +20,7 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 | `airc doctor --fix` | repair recoverable issues (currently: gh auth re-login) |
 | `airc doctor --tests [scenario]` | full integration suite (~245 assertions, 32 scenarios) |
 
-Aliases for `--tests`: `airc tests`, `airc test`.
+CLI aliases for `--tests`: `airc tests`, `airc test`. Do not expose a separate tests skill; `/doctor` owns diagnosis and validation.
 
 ## Decision tree
 
@@ -39,6 +39,9 @@ When something feels wrong, in this order:
 | `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced headroom | None; bearer auto-throttles per #416 |
 | `[WARN] gh core rate-limit: <N>/5000` (<100) | Bus may stall soon | Wait for window reset; peers resume automatically |
 | `[BLOCKED] gh API not reachable` | Network or token | Run `airc doctor` for env probe |
+| `[ok] gh governor: no active backoff` | Cross-process gh guard is healthy | None |
+| `[WARN] gh governor blocked <N>/<M>` | Local guard prevented gh spam recently | Wait; inspect top classes in output |
+| `[BLOCKED] gh governor shared backoff active` | GitHub told this user/device to wait | Do not retry; wait for displayed seconds |
 | `[ok] airc process running` | Join process up | None |
 | `[WARN] airc process not running` | Disconnected scope | `airc join` |
 | `[ok] #<channel> — last bearer recv <Ns>` (<60s) | Healthy | None |
@@ -56,7 +59,7 @@ Emits one line per prereq with `[ok]`, `[MISSING]`, or `[info]` (optional). For 
 - `gh authenticated (gist scope)` is interactive (browser flow) → instruct user: type `! gh auth login -s gist` so it runs in their terminal.
 - `tailscale (optional)` lines never block (LAN-only mesh works without it).
 
-## Integration suite (`--tests`)
+## Integration Suite (`--tests`)
 
 ```bash
 airc doctor --tests $ARGUMENTS

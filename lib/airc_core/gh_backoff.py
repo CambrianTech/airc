@@ -441,6 +441,62 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _recent_events(count: int) -> list[dict]:
+    path = Path(audit_path())
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in lines[-max(count * 4, count):]:
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict):
+            rows.append(event)
+    return rows[-count:]
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    now = time.time()
+    wait = wait_seconds(now=now)
+    rows = _recent_events(args.count)
+    blocked = sum(1 for event in rows if not event.get("allowed", True))
+    classes: dict[str, int] = {}
+    for event in rows:
+        cls = str(event.get("class") or "unknown")
+        classes[cls] = classes.get(cls, 0) + 1
+
+    with _guard_lock():
+        used = _recent_request_count(now)
+    limit = max_requests_per_min()
+
+    print(f"  gh governor audit: {audit_path()}")
+    if wait > 0:
+        print(f"  [BLOCKED] gh governor shared backoff active for {wait}s")
+        rc = 2
+    elif blocked > 0:
+        print(f"  [WARN] gh governor blocked {blocked}/{len(rows)} recent guarded request(s)")
+        rc = 1
+    elif used >= limit:
+        print(f"  [WARN] gh governor local request budget full ({used}/{limit} in 60s)")
+        rc = 1
+    else:
+        print(f"  [ok] gh governor: no active backoff; {blocked}/{len(rows)} blocked; budget {used}/{limit} in 60s")
+        rc = 0
+
+    if classes:
+        print("         recent gh classes:")
+        for cls, cls_count in sorted(classes.items(), key=lambda item: (-item[1], item[0]))[:5]:
+            print(f"           {cls_count:4d}  {cls}")
+    else:
+        print("         no guarded gh requests recorded yet")
+    return rc
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="airc_core.gh_backoff")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -453,12 +509,16 @@ def _main(argv: list[str] | None = None) -> int:
     audit.add_argument("--clear-audit", action="store_true", help="delete the local gh audit log")
     wait = sub.add_parser("wait-seconds")
     wait.set_defaults(cmd="wait-seconds")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--count", type=int, default=80)
     args = parser.parse_args(argv)
     if args.cmd == "audit":
         return _cmd_audit(args)
     if args.cmd == "wait-seconds":
         print(wait_seconds())
         return 0
+    if args.cmd == "doctor":
+        return _cmd_doctor(args)
     if args.cmd != "run":
         return 2
 
