@@ -1776,6 +1776,14 @@ flush_pending_loop() {
     [ -z "$host_target" ] && continue
     rhome=$(remote_home)
 
+    local _gh_wait=0
+    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
+      [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
+      sleep "$_gh_wait"
+      continue
+    fi
+
     local snapshot; snapshot=$(mktemp -t airc-pending-snap.XXXXXX)
     local unsent;   unsent=$(mktemp -t airc-pending-unsent.XXXXXX)
     # Atomic-ish snapshot: mv is atomic on same filesystem, so new sends that
@@ -1867,6 +1875,14 @@ flush_pending_host_loop() {
     fi
     [ -s "$pending" ] || continue
 
+    local _gh_wait=0
+    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
+      [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
+      sleep "$_gh_wait"
+      continue
+    fi
+
     local snapshot; snapshot=$(mktemp -t airc-pending-host-snap.XXXXXX)
     local unsent;   unsent=$(mktemp -t airc-pending-host-unsent.XXXXXX)
     # Atomic-ish snapshot: mv is atomic on same FS so concurrent cmd_send
@@ -1874,6 +1890,34 @@ flush_pending_host_loop() {
     mv "$pending" "$snapshot" 2>/dev/null || { rm -f "$snapshot" "$unsent"; continue; }
 
     local delivered=0 failed=0
+    local _fallback_gist=""
+    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _fallback_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    local _batch_route _batch_ok _batch_channel _batch_gist _batch_count
+    _batch_route=$("$AIRC_PYTHON" -m airc_core.pending_batch host-broadcast-route \
+      --snapshot "$snapshot" --config "$CONFIG" --fallback-gist "$_fallback_gist" 2>/dev/null || true)
+    IFS="$(printf '\t')" read -r _batch_ok _batch_channel _batch_gist _batch_count <<EOF
+$_batch_route
+EOF
+    if [ "$_batch_ok" = "ok" ] && [ -n "$_batch_gist" ]; then
+      local _batch_outcome _batch_kind
+      _batch_outcome=$(cat "$snapshot" | "$AIRC_PYTHON" -m airc_core.bearer_cli send-batch \
+        all "$_batch_channel" --room-gist-id "$_batch_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
+      _batch_kind=$(printf '%s' "$_batch_outcome" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.load(sys.stdin).get("kind",""))
+except Exception:
+  print("")' 2>/dev/null)
+      if [ "$_batch_kind" = "delivered" ]; then
+        cat "$snapshot" >> "$MESSAGES"
+        delivered=${_batch_count:-0}
+        : > "$snapshot"
+      else
+        cat "$snapshot" >> "$unsent"
+        failed=${_batch_count:-0}
+        : > "$snapshot"
+      fi
+    fi
+
     while IFS= read -r line; do
       [ -z "$line" ] && continue
 

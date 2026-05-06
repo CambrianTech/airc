@@ -100,6 +100,12 @@ def backoff_active() -> bool:
     return time.time() < backoff_until()
 
 
+def wait_seconds(now: float | None = None) -> int:
+    """Seconds callers should wait before the next guarded gh request."""
+    current = time.time() if now is None else now
+    return max(0, int(backoff_until() - current))
+
+
 def _write_backoff(until: float) -> None:
     if until <= time.time():
         return
@@ -445,9 +451,14 @@ def _main(argv: list[str] | None = None) -> int:
     audit.add_argument("--summary", action="store_true")
     audit.add_argument("--reset", action="store_true", help="clear shared backoff/budget state; keep audit log")
     audit.add_argument("--clear-audit", action="store_true", help="delete the local gh audit log")
+    wait = sub.add_parser("wait-seconds")
+    wait.set_defaults(cmd="wait-seconds")
     args = parser.parse_args(argv)
     if args.cmd == "audit":
         return _cmd_audit(args)
+    if args.cmd == "wait-seconds":
+        print(wait_seconds())
+        return 0
     if args.cmd != "run":
         return 2
 

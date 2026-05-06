@@ -65,6 +65,15 @@ class GhGuardTests(unittest.TestCase):
             self.assertEqual(event["class"], "gist:list")
             self.assertFalse(event["allowed"])
 
+    def test_wait_seconds_reports_shared_backoff_remaining(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp):
+            with mock.patch.object(gh_backoff.time, "time", return_value=900.0):
+                gh_backoff._write_backoff(1000.0)
+
+            self.assertEqual(gh_backoff.wait_seconds(now=940.2), 59)
+            self.assertEqual(gh_backoff.wait_seconds(now=1001.0), 0)
+
     def test_unguarded_command_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(tempfile, "gettempdir", return_value=tmp), \

@@ -822,6 +822,100 @@ class GhBearer(Bearer):
             detail=f"concurrent-write conflict after {RETRIES} retries; last: {last_detail}; local bus: {local_detail}",
         )
 
+    def send_many(self, peer_id: str, channel: str, payloads: list[bytes]) -> SendOutcome:
+        """Append a queued batch to the room gist with one GET/PATCH cycle.
+
+        The queue flusher may have many pending lines after a network or
+        GitHub throttle window. Replaying them through send() one at a
+        time turns recovery into another burst of API calls. Gh gist is an
+        append surface, so batch the queued JSONL into a single content
+        update and verify every payload landed.
+        """
+        self._check_alive()
+        if not payloads:
+            return SendOutcome(kind="delivered", detail="0 payload(s)")
+
+        gist_id = self._peer_meta.get("room_gist_id")
+        if not gist_id:
+            raise GhBearerError(
+                f"GhBearer.send_many called for peer_id={peer_id!r} with no room_gist_id"
+            )
+
+        framed_lines: list[str] = []
+        for payload in payloads:
+            framed = payload if payload.endswith(b"\n") else payload + b"\n"
+            try:
+                framed_lines.append(framed.decode("utf-8"))
+            except UnicodeDecodeError:
+                return SendOutcome(
+                    kind="transient_failure",
+                    detail="payload is not utf-8; gh-bearer requires text envelopes",
+                )
+        batch_content = "".join(framed_lines)
+
+        local_ok = True
+        local_detail = ""
+        for line in framed_lines:
+            ok, detail = _local_bus_append(gist_id, line, self._peer_meta)
+            if not ok:
+                local_ok = False
+                local_detail = detail
+
+        RETRIES = 8
+        last_detail = ""
+        for attempt in range(RETRIES):
+            gist, get_kind = _gh_api_get_classified(gist_id)
+            if gist is None:
+                if local_ok and get_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered batch via local bus; gh publish deferred ({get_kind})",
+                    )
+                if get_kind in ("gone", "secondary_rate_limit", "auth_failure"):
+                    return SendOutcome(
+                        kind=get_kind,
+                        detail=f"GET gists/{gist_id} failed: {get_kind}",
+                    )
+                return SendOutcome(
+                    kind="transient_failure",
+                    detail=f"could not fetch gist {gist_id} (network/5xx/timeout)",
+                )
+
+            existing = _read_messages_content(gist)
+            new_content = _rotate_if_needed(_rotate_if_needed(existing) + batch_content)
+
+            ok, detail, patch_kind = _gh_api_patch_classified(gist_id, new_content)
+            if not ok:
+                last_detail = detail
+                if patch_kind == "conflict":
+                    _time.sleep(_jittered_backoff(attempt))
+                    continue
+                if local_ok and patch_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered batch via local bus; gh publish deferred ({patch_kind})",
+                    )
+                return SendOutcome(kind=patch_kind, detail=detail)
+
+            verify, _verify_kind = _gh_api_get_classified(gist_id)
+            if verify is None:
+                return SendOutcome(kind="delivered", detail=f"{len(framed_lines)} payload(s)")
+            content = _read_messages_content(verify)
+            if all(line.rstrip("\n") in content for line in framed_lines):
+                return SendOutcome(kind="delivered", detail=f"{len(framed_lines)} payload(s)")
+            last_detail = "verify-after-write: one or more batch lines missing post-PATCH"
+            _time.sleep(_jittered_backoff(attempt))
+
+        if local_ok:
+            return SendOutcome(
+                kind="delivered",
+                detail=f"delivered batch via local bus; gh conflict after {RETRIES} retries; last: {last_detail}",
+            )
+        return SendOutcome(
+            kind="transient_failure",
+            detail=f"batch conflict after {RETRIES} retries; last: {last_detail}; local bus: {local_detail}",
+        )
+
     def recv_stream(self) -> Iterator[ReceivedMessage]:
         """Poll the room gist on a cadence; yield new envelopes.
 
