@@ -1503,6 +1503,14 @@ cmd_connect() {
            || ! ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null; then
           _intent_ok=0
         fi
+        # We already resolved the host's room gist to get here. Persist that
+        # mapping before subscribing to the host channel so the fallback path
+        # does not immediately hit GitHub discovery again during the exact
+        # transient/rate-limited condition it is meant to survive.
+        if [ -n "${_resolved_gist_id:-}" ]; then
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+        fi
         if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$resolved_room_name" ] \
            || ! ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null; then
           _host_ok=0

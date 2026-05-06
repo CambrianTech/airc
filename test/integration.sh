@@ -2488,6 +2488,10 @@ scenario_join_intent_failure_falls_back_to_host() {
     && pass "fallback path is present in cmd_connect.sh" \
     || fail "fallback path message not found in cmd_connect.sh"
 
+  grep -q 'does not immediately hit GitHub discovery again' "$_src" \
+    && pass "host gist is preseeded before fallback subscription" \
+    || fail "host gist is not preseeded before fallback subscription"
+
   # Verify the diverged-intent block no longer holds the unconditional die.
   # Pre-fix the line was:
   #   ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null \
