@@ -2293,6 +2293,75 @@ scenario_attach_starts_background_transport() {
   cleanup_all
 }
 
+# ── Scenario: attach_transport_survives_launcher_hup ──────────────────
+# Regression for #511/#522: Windows Claude Code launches via
+# `wsl bash -lc 'airc join --attach'`. When that launcher exits, WSL can
+# SIGHUP the launcher's process group. The UI attach process must not
+# own the transport lifetime.
+scenario_attach_transport_survives_launcher_hup() {
+  section "attach_transport_survives_launcher_hup: transport survives UI launcher SIGHUP"
+  cleanup_all
+
+  if ! command -v setsid >/dev/null 2>&1; then
+    pass "attach launcher HUP simulation skipped: setsid unavailable on this platform"
+    return 0
+  fi
+
+  local root=/tmp/airc-it-attach-hup
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$root"
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    setsid "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local seen=0 status_out="" i
+  for i in $(seq 1 20); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if echo "$status_out" | grep -qE 'airc process:\s+AIRC background process running for scope'; then
+      seen=1
+      break
+    fi
+    if ! kill -0 "$ui_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$seen" = "1" ] \
+    && pass "attach mode started a verified background transport before launcher HUP" \
+    || fail "attach mode did not start transport before HUP (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  local pgid
+  pgid=$(ps -o pgid= -p "$ui_pid" 2>/dev/null | tr -d ' ' || true)
+  if [ -n "$pgid" ]; then
+    kill -HUP "-$pgid" 2>/dev/null || true
+  else
+    kill -HUP "$ui_pid" 2>/dev/null || true
+  fi
+
+  local survived=0
+  for i in $(seq 1 15); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if echo "$status_out" | grep -qE 'airc process:\s+AIRC background process running for scope'; then
+      survived=1
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$survived" = "1" ] \
+    && pass "background transport survived launcher process-group HUP" \
+    || fail "background transport died after launcher HUP (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: attach_spawn_strips_attach_flag ───────────────────────────
 # Regression for #511/#521: the attach UI wrapper recursively starts the
 # transport with AIRC_NO_ATTACH=1. That child must not see --attach as a
@@ -4834,6 +4903,7 @@ case "$MODE" in
   send_gone_gist_does_not_claim_delivery) scenario_send_gone_gist_does_not_claim_delivery ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
+  attach_transport_survives_launcher_hup) scenario_attach_transport_survives_launcher_hup ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
   codex_join_idempotent_when_healthy) scenario_codex_join_idempotent_when_healthy ;;
@@ -4875,7 +4945,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
+    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
     scenario_codex_join_idempotent_when_healthy
     scenario_codex_join_waits_for_duplicate_repair
     scenario_join_reaps_duplicate_scope_transport
@@ -4892,7 +4962,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
