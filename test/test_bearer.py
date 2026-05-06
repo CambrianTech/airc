@@ -1272,6 +1272,29 @@ class GhBearerSendTests(unittest.TestCase):
 
         self.assertEqual(captured["content"], my_line)
 
+    def test_send_many_batches_payloads_into_one_patch(self):
+        existing = '{"from":"x","msg":"old"}\n'
+        lines = [b'{"from":"a","msg":"one"}', b'{"from":"b","msg":"two"}\n']
+        captured = {}
+
+        def fake_patch(gist_id, content):
+            captured["gist_id"] = gist_id
+            captured["content"] = content
+            return (True, "")
+
+        merged = existing + '{"from":"a","msg":"one"}\n{"from":"b","msg":"two"}\n'
+        gets = [
+            {"files": {"messages.jsonl": {"content": existing}}},
+            {"files": {"messages.jsonl": {"content": merged}}},
+        ]
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=lambda _: gets.pop(0)), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
+            outcome = self._bearer().send_many("alice", "general", lines)
+
+        self.assertEqual(outcome.kind, "delivered")
+        self.assertEqual(captured["gist_id"], "abc123")
+        self.assertEqual(captured["content"], merged)
+
     def test_send_transient_when_get_fails(self):
         with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
