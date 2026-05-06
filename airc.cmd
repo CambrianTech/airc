@@ -12,6 +12,23 @@ REM   %USERPROFILE%\AppData\Local\Programs\airc
 REM and adds that directory to user PATH.
 setlocal
 
+REM Single-source rule for dual Windows+WSL dev boxes: if the user has a
+REM WSL airc install, run THAT clone. Otherwise Windows Monitor can run
+REM %USERPROFILE%\.airc-src while WSL `airc update` updates
+REM /home/<user>/.airc-src, leaving two drifting implementations.
+REM Set AIRC_WINDOWS_NATIVE=1 or AIRC_DIR=... to force the native
+REM Windows/Git-Bash clone.
+if not defined AIRC_WINDOWS_NATIVE if not defined AIRC_DIR (
+  where wsl.exe >nul 2>nul
+  if not errorlevel 1 (
+    wsl.exe sh -lc "test -x \"$HOME/.airc-src/airc\"" >nul 2>nul
+    if not errorlevel 1 (
+      wsl.exe sh -lc "exec \"$HOME/.airc-src/airc\" \"$@\"" airc %*
+      exit /b %ERRORLEVEL%
+    )
+  )
+)
+
 set "AIRC_SRC=%AIRC_DIR%"
 if not defined AIRC_SRC set "AIRC_SRC=%USERPROFILE%\.airc-src"
 set "AIRC_SCRIPT=%AIRC_SRC%\airc"

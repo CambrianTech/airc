@@ -3578,12 +3578,12 @@ time.sleep(30)
   cleanup_all
 }
 
-# ── Scenario: windows_cmd_shim_direct_bash ─────────────────────────────
+# ── Scenario: windows_cmd_shim_prefers_wsl_single_source ───────────────
 # Windows Claude Code Monitor invokes `airc` through the .cmd shim. Keep
-# that path short: cmd -> Git Bash -> bash airc. A prior cmd ->
-# PowerShell -> ps1 -> bash chain hung before the bash entrypoint ran.
+# dual Windows+WSL installs single-source: if WSL has ~/.airc-src, route
+# there. Otherwise fall back to the native Git Bash clone.
 scenario_windows_cmd_shim_direct_bash() {
-  section "windows_cmd_shim_direct_bash: airc.cmd launches Git Bash directly"
+  section "windows_cmd_shim_direct_bash: airc.cmd prefers WSL single-source, then Git Bash"
   cleanup_all
 
   local root; root=$(cd "$(dirname "$AIRC")" && pwd)
@@ -3594,8 +3594,16 @@ scenario_windows_cmd_shim_direct_bash() {
     && pass "airc.cmd exists" \
     || { fail "airc.cmd missing at $cmd"; return; }
 
+  grep -q 'wsl.exe sh -lc' "$cmd" \
+    && pass "airc.cmd probes WSL install first" \
+    || fail "airc.cmd does not probe WSL install first"
+
+  grep -q 'AIRC_WINDOWS_NATIVE' "$cmd" \
+    && pass "airc.cmd has explicit native-Windows override" \
+    || fail "airc.cmd cannot opt out of WSL preference"
+
   grep -q 'Git\\bin\\bash.exe' "$cmd" \
-    && pass "airc.cmd probes standard Git Bash locations" \
+    && pass "airc.cmd keeps native Git Bash fallback" \
     || fail "airc.cmd does not probe Git Bash locations"
 
   grep -q '"%BASH_EXE%" "%AIRC_SCRIPT%" %\*' "$cmd" \
@@ -3608,8 +3616,9 @@ scenario_windows_cmd_shim_direct_bash() {
     pass "airc.cmd avoids PowerShell hop"
   fi
 
-  grep -q '"%BASH_EXE%" "%AIRC_SCRIPT%" %\*' "$installer" \
-    && pass "install.ps1 fallback shim also uses direct bash" \
+  grep -q 'wsl.exe sh -lc' "$installer" \
+    && grep -q '"%BASH_EXE%" "%AIRC_SCRIPT%" %\*' "$installer" \
+    && pass "install.ps1 fallback shim matches WSL-first/native-fallback policy" \
     || fail "install.ps1 fallback shim still differs from checked-in airc.cmd"
 
   cleanup_all
