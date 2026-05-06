@@ -448,23 +448,42 @@ fi
 # ── airc on PATH ───────────────────────────────────────────────────────
 
 mkdir -p "$BIN_DIR"
-ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-# Back-compat: `relay` still works for muscle-memory and stale docs.
-# The airc binary detects the invocation name and behaves identically.
-ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
-
-# Windows: also place airc.cmd + airc.ps1 forwarders on PATH.
-# Without these, `airc` invoked from native PowerShell or cmd.exe
-# resolves to the bash script, which PowerShell can't execute
-# ("Cannot run a document in the middle of a pipeline"). PR #262
-# made airc.ps1 a thin forwarder to bash, but that's moot if the
-# .ps1 isn't on PATH. cp (not ln -sf) — Windows symlinks are
-# privileged + flaky; copying is universal. Caught by
-# 2026-04-29 (issue #249 PowerShell row).
+# Single-source rule (#543/#544 follow-up): on real Linux/macOS the
+# symlink is fine — the kernel resolves it to $CLONE_DIR/airc each
+# invocation, so `airc update` propagates instantly. On Git Bash for
+# Windows (MINGW), `ln -sf` falls back to a literal COPY because
+# Developer Mode is off by default; that copy goes stale the moment
+# `airc update` (run from WSL) refreshes the canonical clone, and
+# Claude Code's Monitor running this stale copy was the root cause
+# of months of "Windows runs old code while airc version reports new
+# SHA" diagnoses. Use the polyglot shim on Windows instead — it
+# delegates to whichever live install (WSL canonical, then native)
+# is present at runtime. No copies, no drift.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
+    if [ -f "$CLONE_DIR/airc.shim" ]; then
+      # Replace any pre-existing full-script copy that earlier installs
+      # might have left in PATH. Failing soft is fine — best-effort
+      # cleanup is enough to fix dual-install drift.
+      [ -f "$BIN_DIR/airc" ] && rm -f "$BIN_DIR/airc" 2>/dev/null || true
+      [ -f "$BIN_DIR/relay" ] && rm -f "$BIN_DIR/relay" 2>/dev/null || true
+      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
+      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/relay"
+      chmod +x "$BIN_DIR/airc" "$BIN_DIR/relay" 2>/dev/null || true
+    else
+      # Repo predates the shim (transitional). Symlink-or-copy the full
+      # script as before; clean the duplicate next install.
+      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
+      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
+    fi
     [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
     [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
+    ;;
+  *)
+    # Real Linux/macOS: symlink is right.
+    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
+    # Back-compat: `relay` still works for muscle-memory and stale docs.
+    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
     ;;
 esac
 
