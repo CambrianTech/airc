@@ -2378,6 +2378,56 @@ scenario_codex_join_detaches_transport() {
   cleanup_all
 }
 
+# ── Scenario: join_reaps_duplicate_scope_transport ─────────────────────
+# `airc join` is the public recovery verb. If prior Monitor / attach
+# bounces leave multiple same-scope transport generations alive, join
+# must repair the scope without requiring users to know about teardown.
+scenario_join_reaps_duplicate_scope_transport() {
+  section "join_reaps_duplicate_scope_transport: join restarts duplicate same-scope generations"
+  cleanup_all
+
+  local root=/tmp/airc-it-dup-scope
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$home/peers" "$root"
+
+  echo "99999" > "$home/airc.pid"
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  local stale_one=$!
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  local stale_two=$!
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_CODEX_DETACH=1 \
+    "$AIRC" join --no-room --no-gist >"$out" 2>"$err" &
+  local join_pid=$!
+
+  local saw=0 i
+  for i in $(seq 1 20); do
+    if grep -q 'duplicate same-scope transport generation detected' "$out" 2>/dev/null; then
+      saw=1
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$saw" = "1" ] \
+    && pass "join detects duplicate same-scope transport" \
+    || fail "join did not report duplicate transport (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  if kill -0 "$stale_one" 2>/dev/null || kill -0 "$stale_two" 2>/dev/null; then
+    fail "duplicate formatter processes survived join self-heal"
+  else
+    pass "join reaped duplicate formatter processes"
+  fi
+
+  kill "$join_pid" 2>/dev/null || true
+  wait "$join_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
 # GitHub secondary throttling must not prevent monitor startup. On
 # 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
@@ -4672,6 +4722,7 @@ case "$MODE" in
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
+  join_reaps_duplicate_scope_transport) scenario_join_reaps_duplicate_scope_transport ;;
   gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
@@ -4709,6 +4760,7 @@ case "$MODE" in
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
     scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
+    scenario_join_reaps_duplicate_scope_transport
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
@@ -4722,7 +4774,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_spawn_strips_attach_flag|codex_join_detaches_transport|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
