@@ -141,7 +141,8 @@ airc_detect_gh_auth_state() {
     fi
   fi
 
-  if gh auth status >/dev/null 2>&1; then
+  local _auth_status_out=""
+  if _auth_status_out=$(gh auth status 2>&1); then
     echo "ok"
     # Refresh cache on success.
     touch "$_cache_file" 2>/dev/null
@@ -163,7 +164,9 @@ airc_detect_gh_auth_state() {
   # (c) Real keyring auth failure (no GH_TOKEN env, keyring is dead).
   #     This is the common Joel-reports-FREQUENT case, and the case
   #     self-heal CAN fix via the browser flow.
-  if airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
+  if printf '%s\n' "$_auth_status_out" | grep -qiE 'airc gh guard:.*(backoff|budget|refusing gh auth status)|secondary rate limit|rate limit exceeded|abuse detection'; then
+    echo "rate_limited"
+  elif airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
     echo "rate_limited"
   elif [ -n "${GH_TOKEN:-}" ]; then
     # GH_TOKEN takes precedence over the keyring in gh's auth resolution.
