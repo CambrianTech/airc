@@ -2448,8 +2448,23 @@ _airc_should_use_codex_start() {
   [ -n "${AIRC_NO_ATTACH:-}" ] && return 1
 
   local _arg
-  for _arg in "$@"; do
-    [ "$_arg" = "--attach" ] && return 1
+  while [ "$#" -gt 0 ]; do
+    _arg="$1"
+    case "$_arg" in
+      --attach|-attach) return 1 ;;
+      -h|--help|--gist|-gist|--no-gist|-no-gist|--no-room|-no-room|--no-general|-no-general|--general|-general|--takeover|-takeover|--no-tailscale|-no-tailscale)
+        shift ;;
+      --room|-room|--room-only|-room-only)
+        shift 2 ;;
+      -*)
+        # Let cmd_connect's parser reject unknown flags directly. If we
+        # launch Codex-detached first, the child fails in the background
+        # and the foreground parent can mask the real "unknown flag"
+        # with a later "Not initialized" status/inbox check.
+        return 1 ;;
+      *)
+        shift ;;
+    esac
   done
 
   [ -n "${CODEX_THREAD_ID:-}${CODEX_CI:-}${CODEX_MANAGED_BY_NPM:-}" ]
