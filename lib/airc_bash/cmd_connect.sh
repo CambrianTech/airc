@@ -1491,12 +1491,46 @@ cmd_connect() {
         # host's channel traffic too). The user's intent gets a real
         # gist (find-or-create) — that's what was missing pre-2026-04-29
         # and turned `airc join --room qa-foo` into a phantom-room.
+        #
+        # Test hook: AIRC_TEST_FAIL_ENSURE_CHANNEL — when set, treat
+        # ensure_channel_subscribed_with_gist as failed for that exact
+        # channel name. Lets the regression scenario exercise the
+        # intent-failed-but-host-reachable fallback path deterministically
+        # without needing a real gh rate-limit / missing-permissions repro.
         echo "$_intent" > "$AIRC_WRITE_DIR/room_name"
-        ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null \
-          || die "Could not bootstrap #${_intent}; refusing to join with broken state"
-        ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null \
-          || echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
-        echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
+        local _intent_ok=1 _host_ok=1
+        if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$_intent" ] \
+           || ! ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null; then
+          _intent_ok=0
+        fi
+        if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$resolved_room_name" ] \
+           || ! ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null; then
+          _host_ok=0
+        fi
+        if [ "$_intent_ok" = "1" ]; then
+          if [ "$_host_ok" = "1" ]; then
+            echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
+          else
+            echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
+            echo "  Joined #${_intent}"
+          fi
+        else
+          # Intent bootstrap failed. Pre-fix this die'd the whole join,
+          # which made plain `airc join` (auto-scope intent) inexplicably
+          # exit on a working mesh whenever the intent gist couldn't be
+          # resolved (gh rate-limit, missing scope on token, transient
+          # API error). When the host's channel IS reachable the join
+          # has a viable subscription — fall back to it as primary,
+          # warn the user, and keep going. Only die when BOTH are gone:
+          # at that point there's no channel to land in.
+          if [ "$_host_ok" = "1" ]; then
+            echo "  ⚠ Could not bootstrap intended #${_intent}; falling back to host's channel #${resolved_room_name} as primary." >&2
+            echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
+            echo "  Joined #${resolved_room_name} (your intent #${_intent} could not bootstrap; rerun 'airc join --room ${_intent}' once gh is healthy)"
+          else
+            die "Could not bootstrap #${_intent} OR host's channel #${resolved_room_name}; no viable subscription. Check 'gh auth status' + retry."
+          fi
+        fi
       fi
       # Identity bootstrap nudge (#146). Skill /join SKILL.md prompts
       # AIs to set pronouns/role/bio at first join, but users running
