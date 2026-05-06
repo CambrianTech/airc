@@ -289,10 +289,11 @@ _join_attach_local_stream() {
   echo "  Attaching this terminal to the local AIRC stream."
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  local _tail_name; _tail_name=$(get_name 2>/dev/null || echo "airc")
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
   else
-    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
   fi
 }
 
@@ -974,6 +975,24 @@ cmd_connect() {
   if [ "$attach" = "1" ] && [ "${AIRC_NO_ATTACH:-0}" != "1" ]; then
     _join_spawn_transport_for_attach ${_orig_args[@]+"${_orig_args[@]}"}
     return $?
+  fi
+
+  # Mark transport ownership before expensive discovery/bootstrap work.
+  # Host/joiner mode rewrites this later with child PIDs once those
+  # loops exist; until then, the parent shell itself is the live
+  # transport startup owner. Without this early marker, attach-mode
+  # launchers can report "not running" for a process that is alive but
+  # still doing gh discovery, stale-state repair, or first-host setup.
+  mkdir -p "$AIRC_WRITE_DIR"
+  : >> "$MESSAGES"
+  echo "$$" > "$AIRC_WRITE_DIR/airc.pid"
+  trap '
+    _airc_startup_rc=$?
+    rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+    exit $_airc_startup_rc
+  ' EXIT INT TERM
+  if [ -n "${AIRC_TEST_STARTUP_DELAY_SEC:-}" ]; then
+    sleep "$AIRC_TEST_STARTUP_DELAY_SEC"
   fi
 
   # No resume code path. (#130, 2026-04-26.)

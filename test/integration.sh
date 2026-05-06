@@ -2444,6 +2444,46 @@ scenario_attach_spawn_strips_attach_flag() {
   cleanup_all
 }
 
+# ── Scenario: attach_reports_starting_transport ────────────────────────
+# Attach launchers must see a live transport immediately, even while the
+# child is still in slow discovery/bootstrap before the richer host/join
+# pidfile is written. This is the Windows cold-start shape: no airc.pid
+# meant Monitor concluded "not running" while startup was still in-flight.
+scenario_attach_reports_starting_transport() {
+  section "attach_reports_starting_transport: startup owner is visible before bootstrap finishes"
+  cleanup_all
+
+  local root=/tmp/airc-it-attach-starting
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$root"
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_TEST_STARTUP_DELAY_SEC=5 \
+    "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local attached=0 status_out="" i
+  for i in $(seq 1 3); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if grep -q 'airc: attached to local message stream for this scope' "$out" 2>/dev/null; then
+      attached=1
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$attached" = "1" ] \
+    && pass "attach UI attaches while transport is still in startup delay" \
+    || fail "attach UI did not see startup transport promptly (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  kill "$ui_pid" 2>/dev/null || true
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: join_rejects_unknown_flag ────────────────────────────────
 # Pre-fix `cmd_connect`'s arg loop had a single `*) positional+=("$1")` arm
 # that silently accepted any `--anything` as a positional. That positional
@@ -5050,6 +5090,7 @@ case "$MODE" in
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_transport_survives_launcher_hup) scenario_attach_transport_survives_launcher_hup ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
+  attach_reports_starting_transport) scenario_attach_reports_starting_transport ;;
   join_rejects_unknown_flag) scenario_join_rejects_unknown_flag ;;
   join_intent_failure_falls_back_to_host) scenario_join_intent_failure_falls_back_to_host ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
@@ -5092,7 +5133,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_gone_gist_stops_respawn; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_join_rejects_unknown_flag; scenario_join_intent_failure_falls_back_to_host; scenario_codex_join_detaches_transport
+    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_attach_reports_starting_transport; scenario_join_rejects_unknown_flag; scenario_join_intent_failure_falls_back_to_host; scenario_codex_join_detaches_transport
     scenario_codex_join_idempotent_when_healthy
     scenario_codex_join_waits_for_duplicate_repair
     scenario_join_reaps_duplicate_scope_transport
@@ -5109,7 +5150,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
