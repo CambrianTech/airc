@@ -575,15 +575,46 @@ cmd_codex_hook() {
 
 cmd_codex_start() {
   local _log="$AIRC_WRITE_DIR/codex-airc.log"
+  local _pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ "$(_monitor_alive_with_bearer_fallback "$_pidfile")" = "yes" ] \
+      && _join_transport_health_ok \
+      && ! _join_scope_has_duplicate_transport; then
+    echo "airc join: already joined in this scope."
+    echo ""
+    echo "Status"
+    echo "------"
+    cmd_status
+    echo ""
+    echo "Inbox"
+    echo "-----"
+    AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 10 || true
+    return 0
+  fi
+
+  local _started_at
+  _started_at=$(date +%s)
   "$AIRC_PYTHON" -m airc_core.codex_start \
     --airc "$0" \
     --home "$AIRC_WRITE_DIR" \
     --log "$_log" \
     -- "$@"
 
-  # Give the detached process a short startup window, then print the same
-  # useful local surfaces that `airc join` prints when it returns quickly.
-  sleep 2
+  # Wait for the detached child to write fresh scope process evidence
+  # before printing status. A fixed sleep was too short when `airc join`
+  # had to self-heal duplicate same-scope generations: Codex printed
+  # "not running" while the detached child was still reaping/restarting.
+  local _wait_sec="${AIRC_CODEX_START_WAIT_SEC:-45}"
+  local _i _mtime
+  for _i in $(seq 1 "$_wait_sec"); do
+    if [ -f "$_pidfile" ]; then
+      _mtime=$(file_mtime "$_pidfile" 2>/dev/null || echo 0)
+      if [ "${_mtime:-0}" -ge "$_started_at" ] 2>/dev/null \
+          && [ -n "$(_airc_pidfile_first_live_monitor_pid "$_pidfile")" ]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
   echo ""
   echo "Status"
   echo "------"

@@ -2378,6 +2378,55 @@ scenario_codex_join_detaches_transport() {
   cleanup_all
 }
 
+# ── Scenario: codex_join_waits_for_duplicate_repair ────────────────────
+# Codex start returns to the tool after launching a detached transport.
+# If that transport must first reap duplicate same-scope generations,
+# Codex must wait for fresh pidfile evidence instead of printing an
+# immediate "not running" status.
+scenario_codex_join_waits_for_duplicate_repair() {
+  section "codex_join_waits_for_duplicate_repair: Codex status waits for scoped self-heal"
+  cleanup_all
+
+  local root=/tmp/airc-it-codex-dup
+  mkdir -p "$root"
+  root=$(cd "$root" && pwd -P)
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$home/peers"
+
+  echo "99999" > "$home/airc.pid"
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  local stale_one=$!
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  local stale_two=$!
+
+  CODEX_THREAD_ID=airc-it-codex-dup AIRC_CODEX_START_WAIT_SEC=25 \
+    AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --no-room --no-gist >"$out" 2>"$err"
+  local rc=$?
+
+  [ "$rc" = "0" ] \
+    && pass "codex duplicate-repair join command returned success" \
+    || fail "codex duplicate-repair join failed rc=$rc stdout=$(cat "$out" 2>/dev/null) stderr=$(cat "$err" 2>/dev/null)"
+  grep -q 'airc process:.*running' "$out" \
+    && pass "codex start waited until status saw a live transport" \
+    || fail "codex start printed status before transport was live (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  grep -q 'duplicate same-scope transport generation detected' "$home/codex-airc.log" \
+    && pass "detached child performed duplicate transport repair" \
+    || fail "detached child log did not show duplicate repair (log=$(tail -80 "$home/codex-airc.log" 2>/dev/null))"
+
+  if kill -0 "$stale_one" 2>/dev/null || kill -0 "$stale_two" 2>/dev/null; then
+    fail "codex duplicate-repair left stale formatter processes alive"
+  else
+    pass "codex duplicate-repair reaped stale formatter processes"
+  fi
+
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: join_reaps_duplicate_scope_transport ─────────────────────
 # `airc join` is the public recovery verb. If prior Monitor / attach
 # bounces leave multiple same-scope transport generations alive, join
@@ -4722,6 +4771,7 @@ case "$MODE" in
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
+  codex_join_waits_for_duplicate_repair) scenario_codex_join_waits_for_duplicate_repair ;;
   join_reaps_duplicate_scope_transport) scenario_join_reaps_duplicate_scope_transport ;;
   gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
@@ -4760,6 +4810,7 @@ case "$MODE" in
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_liveness_process_evidence
     scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
+    scenario_codex_join_waits_for_duplicate_repair
     scenario_join_reaps_duplicate_scope_transport
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
@@ -4774,7 +4825,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_spawn_strips_attach_flag|codex_join_detaches_transport|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_liveness_process_evidence|attach_starts_background_transport|attach_spawn_strips_attach_flag|codex_join_detaches_transport|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
