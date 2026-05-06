@@ -11,11 +11,13 @@ mutation, polling cadence, rate-limit handling. The room-registry role
 of gh (cmd_rooms, gistparse) lives elsewhere and is a separate concern.
 
 Why polling rather than push: gh has no streaming API for gist updates.
-Polling at a sane cadence (15s default) costs ~240 requests/hour/peer,
-well under gh's 5000/hour authenticated rate limit. ETag conditional
-GETs are a future optimization (saves bytes, still counts toward primary
-rate limit per gh docs); deferred until rotation pressure makes the
-read payload large enough that bandwidth matters.
+Polling at a sane cadence (15s default) costs ~240 requests/hour/peer
+before same-machine coalescing. A short per-user cache merges concurrent
+monitor reads for the same gist so four local agents do not all spend a
+GitHub request on the same payload. ETag conditional GETs are a future
+optimization (saves bytes, still counts toward primary rate limit per gh
+docs); deferred until rotation pressure makes the read payload large
+enough that bandwidth matters.
 
 Why subprocess `gh api` rather than direct HTTPS: gh CLI handles auth
 (token discovery, refresh, GHE detection), retry on transient errors,
@@ -64,6 +66,8 @@ _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
 _LOCAL_BUS_ROOT_ENV = "AIRC_LOCAL_BUS_DIR"
 _DISABLE_LOCAL_BUS_ENV = "AIRC_DISABLE_LOCAL_BUS"
+_GET_CACHE_DIR_ENV = "AIRC_GH_GET_CACHE_DIR"
+_GET_CACHE_SEC_ENV = "AIRC_GH_GET_CACHE_SEC"
 _SEEN_PAYLOAD_MAX = 5000
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -160,6 +164,79 @@ def _local_bus_read_from(gist_id: str, byte_offset: int, peer_meta: Optional[dic
     except UnicodeDecodeError:
         return ([], byte_offset)
     return (text.splitlines(), new_offset)
+
+
+def _get_cache_ttl(poll_interval: float) -> float:
+    raw = os.environ.get(_GET_CACHE_SEC_ENV)
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
+    if poll_interval <= 0:
+        return 0.0
+    # Coalesce same-machine monitor polls without materially delaying
+    # cross-machine delivery. Send/patch paths do not use this cache.
+    return min(2.0, max(0.0, poll_interval / 3.0))
+
+
+def _get_cache_path(gist_id: str) -> str:
+    root = os.environ.get(_GET_CACHE_DIR_ENV)
+    if not root:
+        uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+        root = os.path.join(tempfile.gettempdir(), f"airc-gh-get-cache-{uid}")
+    return os.path.join(root, f"{_safe_gist_id(gist_id)}.json")
+
+
+def _load_cached_get(gist_id: str, max_age: float) -> Optional[dict]:
+    if max_age <= 0:
+        return None
+    path = _get_cache_path(gist_id)
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > max_age:
+            return None
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict) and isinstance(loaded.get("gist"), dict):
+            return loaded["gist"]
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _save_cached_get(gist_id: str, gist: dict) -> None:
+    path = _get_cache_path(gist_id)
+    directory = os.path.dirname(path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"gist": gist}, f)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _gh_api_get_for_recv(gist_id: str, max_age: float) -> Tuple[Optional[dict], str]:
+    cached = _load_cached_get(gist_id, max_age)
+    if cached is not None:
+        return (cached, "delivered")
+    gist, kind = _gh_api_get_classified(gist_id)
+    if gist is not None:
+        _save_cached_get(gist_id, gist)
+    return (gist, kind)
 
 
 def _resolve_gh_bin() -> str:
@@ -944,7 +1021,10 @@ class GhBearer(Bearer):
                 yield msg
                 if self._closed:
                     return
-            gist, get_kind = _gh_api_get_classified(gist_id)
+            gist, get_kind = _gh_api_get_for_recv(
+                gist_id,
+                _get_cache_ttl(self._poll_interval),
+            )
             if gist is None:
                 if get_kind == "gone":
                     raise GhBearerError(
