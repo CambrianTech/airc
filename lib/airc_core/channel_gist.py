@@ -147,8 +147,9 @@ def _gh_list_user_gists() -> list[dict]:
         _LAST_GIST_LIST_UNAVAILABLE = True
         return _load_cached_gist_list(stale_sec) or []
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", f"gists?per_page={_GIST_LIST_LIMIT}"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", f"gists?per_page={_GIST_LIST_LIMIT}"],
             capture_output=True,
             text=True,
             timeout=_GH_API_TIMEOUT * 3,
@@ -231,8 +232,9 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
     if gh_backoff.backoff_active():
         return None
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", f"gists/{gist_id}"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", f"gists/{gist_id}"],
             capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -660,8 +662,9 @@ def create_new(channel: str) -> Optional[str]:
             json.dump(envelope, f)
         desc = f"airc room: #{channel} (post-3c per-channel gist)"
         try:
-            r = subprocess.run(
-                [gh, "gist", "create", "-d", desc, seed_path],
+            r = gh_backoff.run_gh(
+                gh,
+                ["gist", "create", "-d", desc, seed_path],
                 capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError):

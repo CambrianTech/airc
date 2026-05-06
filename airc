@@ -385,6 +385,16 @@ _gh_resolved=$(resolve_gh_bin 2>/dev/null || true)
 if [ -n "$_gh_resolved" ] && ! command -v gh >/dev/null 2>&1; then
   export PATH="$(dirname "$_gh_resolved"):$PATH"
 fi
+
+# Central GitHub request guard. All shell `gh ...` calls below route
+# through the Python adapter so one per-user budget/backoff/audit layer
+# protects every AIRC tab on this machine. Python modules call the same
+# adapter directly via airc_core.gh_backoff.run_gh().
+if [ -n "$_gh_resolved" ] || command -v gh >/dev/null 2>&1; then
+  gh() {
+    "$AIRC_PYTHON" -m airc_core.gh_backoff run -- "$@"
+  }
+fi
 unset _gh_resolved
 
 AIRC_WRITE_DIR="$(detect_scope)"
@@ -2435,6 +2445,7 @@ case "${1:-help}" in
   codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
   codex-start) shift; cmd_codex_start "$@" ;;
   codex-hook) shift; cmd_codex_hook "$@" ;;
+  gh-audit) shift; "$AIRC_PYTHON" -m airc_core.gh_backoff audit "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

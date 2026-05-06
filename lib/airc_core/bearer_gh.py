@@ -189,8 +189,9 @@ def _has_gh_auth() -> bool:
     except GhBearerError:
         return False
     try:
-        r = subprocess.run(
-            [gh, "auth", "status"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["auth", "status"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -290,8 +291,9 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         _gh_api_get._last_err = "secondary rate limit backoff active"  # type: ignore[attr-defined]
         return None
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", f"gists/{gist_id}"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", f"gists/{gist_id}"],
             capture_output=True,
             text=True,
             timeout=_GH_API_TIMEOUT,
@@ -381,8 +383,9 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
         return (False, "secondary rate limit backoff active")
     body = json.dumps({"files": {_MESSAGES_FILE: {"content": content}}})
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
             input=body,
             capture_output=True,
             text=True,
@@ -592,8 +595,8 @@ def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
         else:
             argv = [gh, "gist", "edit", gist_id, "-a", path]    # add new
         try:
-            r = subprocess.run(
-                argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
+            r = gh_backoff.run_gh(
+                gh, argv[1:], capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return (False, f"gh gist edit failed: {e}")
@@ -607,8 +610,8 @@ def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
             else [gh, "gist", "edit", gist_id, "-a", path]
         )
         try:
-            r2 = subprocess.run(
-                alt_argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
+            r2 = gh_backoff.run_gh(
+                gh, alt_argv[1:], capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return (False, f"gh gist edit retry failed: {e}")
