@@ -1834,6 +1834,10 @@ class GhBearerRecvTests(unittest.TestCase):
             bearer_gh,
             "_gh_api_get_classified",
             return_value=(None, "secondary_rate_limit"),
+        ), mock.patch.dict(
+            os.environ,
+            {"AIRC_GH_GET_CACHE_SEC": "0"},
+            clear=False,
         ), mock.patch.object(
             bearer_gh.gh_backoff,
             "backoff_until",
@@ -1844,6 +1848,25 @@ class GhBearerRecvTests(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertGreaterEqual(sleeps[0], 60)
         self.assertGreater(sleeps[0], 100)
+
+    def test_recv_get_cache_coalesces_same_gist_reads(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {
+                 "AIRC_GH_GET_CACHE_DIR": tmp,
+                 "AIRC_GH_GET_CACHE_SEC": "10",
+             }, clear=False), \
+             mock.patch.object(
+                 bearer_gh,
+                 "_gh_api_get_classified",
+                 return_value=(self._gist_response('{"from":"bob","msg":"cached"}\n'), "delivered"),
+             ) as get:
+            first, first_kind = bearer_gh._gh_api_get_for_recv("abc123", 10)
+            second, second_kind = bearer_gh._gh_api_get_for_recv("abc123", 10)
+
+        self.assertEqual(first_kind, "delivered")
+        self.assertEqual(second_kind, "delivered")
+        self.assertEqual(first, second)
+        self.assertEqual(get.call_count, 1)
 
     def test_recv_resumes_past_offset_file(self):
         import tempfile, os as _os
