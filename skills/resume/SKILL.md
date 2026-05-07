@@ -1,6 +1,6 @@
 ---
 name: airc:resume
-description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes start it as a session-local background process and check inbox.
+description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes use the same public join command, which detaches the local transport owner when needed and checks inbox.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -14,7 +14,7 @@ Run this yourself — don't ask the user.
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join")
+Monitor(persistent=true, description="airc", command="airc join --attach")
 ```
 
 Codex / non-Monitor runtimes:
