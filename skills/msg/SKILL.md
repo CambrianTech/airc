@@ -41,6 +41,6 @@ On failure, read the stderr — it tells you which class:
 
 ## Notes
 
-- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should keep a session-local background `airc join` alive and run `airc codex-poll` at turn start for unread peer messages.
+- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should run `airc join` normally; the CLI detaches the local transport owner when needed. Use `airc codex-poll` only as manual catch-up when hook delivery is unavailable or a long task needs a mid-turn check.
 - Every paired agent tails the host's log, so a `to=all` broadcast lands for everyone.
 - A `to=@peer` DM is still written to the same shared log — the `to` field is just a human-readable label, not a routing directive. Nothing hides inside airc.
