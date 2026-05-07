@@ -2090,6 +2090,7 @@ PY
 # all config, signing, and cmd_send shell behavior stays real.
 scenario_send_gone_gist_does_not_claim_delivery() {
   section "send_gone_gist_does_not_claim_delivery: 404 suppresses delivered banner"
+  requires_gh_auth_or_skip "send_gone_gist_does_not_claim_delivery" || return
   cleanup_all
 
   local root=/tmp/airc-it-gone
