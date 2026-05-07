@@ -21,9 +21,25 @@ REM Windows/Git-Bash clone.
 if not defined AIRC_WINDOWS_NATIVE if not defined AIRC_DIR (
   where wsl.exe >nul 2>nul
   if not errorlevel 1 (
-    wsl.exe sh -lc "test -x \"$HOME/.airc-src/airc\"" >nul 2>nul
+    wsl.exe bash -lc "test -x \"$HOME/.airc-src/airc\"" >nul 2>nul
     if not errorlevel 1 (
-      wsl.exe sh -lc "exec \"$HOME/.airc-src/airc\" \"$@\"" airc %*
+      REM Forwarding-args fix (post-#543): the previous shape
+      REM    wsl.exe sh -lc "...\"$@\"..." airc %*
+      REM dropped every positional arg silently. wsl.exe does not
+      REM forward args after `-lc <string>` as $0, $1, $2... to the
+      REM inline script — they get consumed by wsl.exe itself — so $@
+      REM inside the script was always empty. `airc.cmd join` ended up
+      REM running `exec airc` (no verb), fell through to the generic
+      REM help banner, and Claude Code's Monitor saw airc print help
+      REM and exit before any transport spawned. The "fresh start"
+      REM banner the Windows trace showed was actually airc's no-args
+      REM idle-host autostart path, not a real takeover.
+      REM
+      REM Fix: inline cmd's %* directly into the bash command string,
+      REM so positional args become part of the script string before
+      REM wsl.exe sees them. bash (not sh) matches the airc script's
+      REM `#!/bin/bash` shebang and avoids subtle sh/dash divergence.
+      wsl.exe bash -lc "exec \"$HOME/.airc-src/airc\" %*"
       exit /b %ERRORLEVEL%
     )
   )
