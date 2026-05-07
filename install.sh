@@ -22,6 +22,7 @@ SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 info()  { printf '  \033[1;34m->\033[0m %s\n' "$*"; }
 ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
+fail()  { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
 # MSYS / Git Bash path conversion. Three callsites in this file used the
 # same `if command -v cygpath ... else sed ...` block; #205 Target #3
@@ -506,17 +507,16 @@ fi
 # avoids touching system Python at all — fully self-contained.
 #
 # airc's bash wrapper detects this venv at AIRC_PYTHON resolution time
-# and prefers it over system python3. If venv setup fails (no python3,
-# pip module missing, network failure during install), airc falls back
-# to system python3 and runs in plaintext mode. Per the "no scary
-# popups" rule: pip-install never elevates, never prompts; failures
-# print a non-fatal warning.
+# and prefers it over system python3. Ed25519 signing is required for
+# identity bootstrap, so cryptography is a hard install dependency: if
+# we cannot provide it through the venv or an existing system Python,
+# fail here instead of reporting "Installed" and breaking at first join.
 _airc_venv="$CLONE_DIR/.venv"
 if [ ! -d "$_airc_venv" ] && command -v python3 >/dev/null 2>&1; then
   if python3 -m venv "$_airc_venv" 2>/dev/null; then
     ok "Python venv created: $_airc_venv"
   else
-    warn "Could not create Python venv (python3-venv missing?). airc will run in plaintext mode."
+    warn "Could not create Python venv (python3-venv missing?). Will use system python3 only if cryptography is already available."
   fi
 fi
 # Locate venv pip — POSIX vs Windows-Git-Bash paths.
@@ -542,10 +542,21 @@ if [ -n "$_airc_venv_pip" ]; then
     if "$_airc_venv_pip" install -q cryptography 2>&1 | tail -3; then
       ok "cryptography installed in venv (envelope encryption ready)"
     else
-      warn "cryptography install failed; airc will run in plaintext mode"
-      warn "  Manual fix:  $_airc_venv_pip install cryptography"
+      fail "cryptography install failed; airc requires it for Ed25519 signing. Manual fix: $_airc_venv_pip install cryptography"
     fi
   fi
+fi
+
+_airc_crypto_python=""
+if [ -x "$_airc_venv/bin/python" ]; then
+  _airc_crypto_python="$_airc_venv/bin/python"
+elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
+  _airc_crypto_python="$_airc_venv/Scripts/python.exe"
+elif command -v python3 >/dev/null 2>&1; then
+  _airc_crypto_python="python3"
+fi
+if [ -z "$_airc_crypto_python" ] || ! "$_airc_crypto_python" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
+  fail "cryptography is not importable after install; airc cannot bootstrap signed identity. Re-run install.sh after fixing Python/pip."
 fi
 
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
