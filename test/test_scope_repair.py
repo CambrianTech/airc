@@ -108,6 +108,37 @@ class ScopeRepairTests(unittest.TestCase):
             self.assertEqual(data["subscribed_channels"], ["cambriantech", "general"])
             self.assertEqual(data["channel_gists"]["cambriantech"], "df40c8ae6c90f8e14009426fd6e16e22")
 
+    def test_gone_marker_prevents_repair_from_restoring_dead_gist(self):
+        tmp = tempfile.TemporaryDirectory()
+        with tmp:
+            home = Path(tmp.name)
+            config = home / "config.json"
+            dead = "a2bb8d168e50c05a47b726378624a4a9"
+            config.write_text(
+                json.dumps(
+                    {
+                        "name": "continuum-8e97",
+                        "subscribed_channels": ["cambriantech", "qa-test-b69f"],
+                        "channel_gists": {"cambriantech": "df40c8ae6c90f8e14009426fd6e16e22"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (home / "bearer_state.qa-test-b69f.json").write_text("{}\n", encoding="utf-8")
+            (home / "bearer_recv.qa-test-b69f.log").write_text(
+                f"[airc:bearer_gh] _gh_api_get({dead}): gh api exit=1: Not Found (HTTP 404)\n"
+                f"bearer recv: stream failed: room gist {dead} returned 404 (gone)\n",
+                encoding="utf-8",
+            )
+            (home / "gone_channel_gist.qa-test-b69f").write_text(dead + "\n", encoding="utf-8")
+
+            rc = scope_repair.main(["repair-config", "--home", str(home), "--config", str(config)])
+
+            self.assertEqual(rc, 0)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(data["subscribed_channels"], ["cambriantech", "qa-test-b69f"])
+            self.assertNotIn("qa-test-b69f", data.get("channel_gists", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

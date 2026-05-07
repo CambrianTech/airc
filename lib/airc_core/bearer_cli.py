@@ -298,6 +298,36 @@ def cmd_send(args) -> int:
     return 0
 
 
+def cmd_send_batch(args) -> int:
+    peer_meta = {
+        "host_target": args.host_target,
+        "remote_home": args.remote_home,
+        "identity_key": args.identity_key,
+        "room_gist_id": getattr(args, "room_gist_id", None),
+    }
+    peer_meta = {k: v for k, v in peer_meta.items() if v}
+
+    try:
+        bearer = resolve(peer_meta)
+    except Exception as e:
+        print(json.dumps({"kind": "transient_failure", "detail": f"resolver error: {e}"}))
+        return 0
+
+    bearer.open(args.peer_id)
+    payloads = [
+        (line if line.endswith(b"\n") else line + b"\n")
+        for line in sys.stdin.buffer.read().splitlines()
+        if line.strip()
+    ]
+    try:
+        outcome = bearer.send_many(args.peer_id, args.channel, payloads)
+    finally:
+        bearer.close()
+
+    print(json.dumps(asdict(outcome)))
+    return 0
+
+
 def cmd_recv(args) -> int:
     """Stream events from the bearer to stdout as raw envelope bytes.
 
@@ -454,6 +484,20 @@ def cmd_recv(args) -> int:
                 _touch_state_heartbeat(state_file, time.time())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        if state_file:
+            _write_state_file(state_file, {
+                "kind": getattr(bearer, "KIND", "unknown"),
+                "peer_id": args.peer_id,
+                "last_recv_ts": None,
+                "last_sender": None,
+                "events_total": events_total,
+                "diag": f"bearer recv failed: {e}",
+                "last_error": str(e),
+                "last_error_ts": time.time(),
+            })
+        print(f"bearer recv: stream failed: {e}", file=sys.stderr, flush=True)
+        return 3
     finally:
         _stop_heartbeat.set()
         bearer.close()
@@ -525,6 +569,19 @@ def _build_parser() -> argparse.ArgumentParser:
     send.add_argument("--room-gist-id", default=None,
                       help="gh room gist id for GhBearer routing")
     send.set_defaults(func=cmd_send)
+
+    send_batch = sub.add_parser("send-batch", help="Deliver JSONL payload batch from stdin to peer")
+    send_batch.add_argument("peer_id")
+    send_batch.add_argument("channel")
+    send_batch.add_argument("--host-target", default=None,
+                            help="user@host[:port] for SSH bearer")
+    send_batch.add_argument("--identity-key", default=None,
+                            help="Path to private key file for SSH bearer")
+    send_batch.add_argument("--remote-home", default=None,
+                            help="Remote AIRC_WRITE_DIR path (e.g. '$HOME/.airc')")
+    send_batch.add_argument("--room-gist-id", default=None,
+                            help="gh room gist id for GhBearer routing")
+    send_batch.set_defaults(func=cmd_send_batch)
 
     recv = sub.add_parser("recv", help="Stream inbound events as JSONL on stdout")
     recv.add_argument("peer_id")

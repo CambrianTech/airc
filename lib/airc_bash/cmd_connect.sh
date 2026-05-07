@@ -135,6 +135,12 @@ _join_show_status_and_inbox() {
 
 _join_transport_health_ok() {
   [ -f "$CONFIG" ] || return 1
+  local _channels
+  _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  # Legacy/no-room mode has no gist bearer to heartbeat. If the caller
+  # already proved the scope owner is alive, transport_health has no
+  # channel rows to evaluate and must not force a duplicate restart.
+  [ -n "$_channels" ] || return 0
   "$AIRC_PYTHON" -m airc_core.transport_health check \
     --home "$AIRC_WRITE_DIR" \
     --config "$CONFIG" \
@@ -159,16 +165,70 @@ _join_transport_in_startup_grace() {
 }
 
 _join_restart_scope_processes() {
+  # This is a best-effort cleanup function. Pipefail + set -e applied
+  # to its multi-source PID assembly is fatal: pgrep (via
+  # proc_airc_pids_matching) returns 1 when no matches, the pipefail
+  # pipeline propagates the 1, and the simple var assignment then
+  # triggers set -e — killing the whole airc process partway through
+  # cleanup. The fix is per-line `|| true` shielding around each
+  # substitution that may legitimately exit non-zero on a clean tree
+  # (no formatters, no bearer pidfiles, no transport pids).
   local _pids=""
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
-    _pids="$_pids $(cat "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null | tr '\n' ' ')"
+    _pids="$_pids $(cat "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null | tr '\n' ' ' || true)"
   fi
-  _pids="$_pids $(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | tr '\n' ' ')"
+  _pids="$_pids $(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | tr '\n' ' ' || true)"
   local _pidfile
   for _pidfile in "$AIRC_WRITE_DIR"/bearer_gist.*.pid; do
     [ -f "$_pidfile" ] || continue
-    _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || true)"
   done
+  _pids="$_pids $(_join_scope_transport_pids 2>/dev/null | tr '\n' ' ' || true)"
+  # Self-kill guard with cmdline verification. Two failure shapes
+  # combine to make this function lethal-to-self otherwise:
+  #
+  #   (1) After `_reexec_into host` the new airc inherits the same
+  #       PID as the pre-exec instance, so airc.pid (written by the
+  #       pre-exec airc with $$) names US. Filtering $$/$PPID handles
+  #       this — same defense already used by _join_scope_transport_pids
+  #       at line 211-212.
+  #
+  #   (2) OS PID recycling. The other PID sources (airc.pid contents
+  #       from a crashed predecessor, bearer_gist.*.pid stragglers)
+  #       can name a slot the kernel has since reassigned to an
+  #       unrelated process — including, on Windows WSL2, the parent
+  #       wsl.exe / cmd.exe shell in our launcher chain. Killing one
+  #       of those takes Claude Code's Monitor down with us. Joel hit
+  #       this exact shape in #97 / #446 in a different code path; the
+  #       fix there ("verify cmdline before treating PID as ours") was
+  #       never propagated here. Without this guard, _join_restart_scope_processes
+  #       was the last self-killer left in the join cold-start path.
+  #
+  # Filter rules:
+  #   - drop non-numeric / empty entries (already a no-op)
+  #   - drop $$ and $PPID (case 1)
+  #   - drop any PID whose cmdline doesn't look like airc/airc_core
+  #     (case 2). Same regex shape as the stale-pidfile check at
+  #     ~line 971 and cmd_teardown's parent-chain reaper.
+  local _self_filtered_pids="" _candidate _candidate_cmd
+  for _candidate in $_pids; do
+    case "$_candidate" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$_candidate" = "$$" ] && continue
+    [ "$_candidate" = "$PPID" ] && continue
+    # Live PID? If the slot is empty the candidate is already gone —
+    # nothing to kill, no risk of misidentification.
+    kill -0 "$_candidate" 2>/dev/null || continue
+    _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
+    case "$_candidate_cmd" in
+      *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
+      *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
+      *) continue ;;
+    esac
+    _self_filtered_pids="$_self_filtered_pids $_candidate"
+  done
+  _pids="$_self_filtered_pids"
   local _p _c
   for _p in $_pids; do
     case "$_p" in ''|*[!0-9]*) continue ;; esac
@@ -177,7 +237,104 @@ _join_restart_scope_processes() {
       kill "$_c" 2>/dev/null || true
     done
   done
+  sleep 1
+  for _p in $_pids; do
+    case "$_p" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_p" 2>/dev/null || continue
+    kill -9 "$_p" 2>/dev/null || true
+    for _c in $(proc_children "$_p" 2>/dev/null); do
+      kill -9 "$_c" 2>/dev/null || true
+    done
+  done
   rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR"/bearer_gist.*.pid 2>/dev/null || true
+}
+
+_join_scope_transport_pids() {
+  # Scope-path catch-all for `airc join` self-heal. Pidfiles are not
+  # enough after Monitor restarts: old bearer_cli / monitor_formatter
+  # children can be reparented to init and keep serving the same scope
+  # while the new generation also runs. Match only transport/process
+  # owners for THIS scope; leave UI-only log_tail attach streams alone.
+  local _pids=""
+  local _pid _cmd _scope_variant
+  while IFS= read -r _scope_variant; do
+    [ -n "$_scope_variant" ] || continue
+    for _pid in $(proc_airc_pids_matching "$_scope_variant" 2>/dev/null | sort -un || true); do
+      case "$_pid" in ''|*[!0-9]*) continue ;; esac
+      [ "$_pid" = "$$" ] && continue
+      [ "$_pid" = "$PPID" ] && continue
+      _cmd=$(proc_cmdline "$_pid" || true)
+      case "$_cmd" in
+        *airc_core.log_tail*) continue ;;
+        *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
+          _pids="$_pids $_pid"
+          ;;
+        *) continue ;;
+      esac
+
+      # Reap airc wrapper ancestors too. They often do not include
+      # AIRC_HOME in argv because the scope is in the environment, but if
+      # their Python children are ours, the wrapper is ours.
+      local _ancestor _depth _ancestor_cmd
+      _ancestor=$(proc_parent "$_pid" || true)
+      _depth=0
+      while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
+        _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
+        if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+          _pids="$_pids $_ancestor"
+          _ancestor=$(proc_parent "$_ancestor" || true)
+          _depth=$((_depth + 1))
+        else
+          break
+        fi
+      done
+    done
+  done <<EOF
+$(_airc_scope_path_variants "$AIRC_WRITE_DIR")
+EOF
+
+  # Include direct children of everything we found. This catches short
+  # wrapper trees without relying on one pidfile generation being current.
+  local _base _child
+  for _base in $_pids; do
+    for _child in $(proc_children "$_base" 2>/dev/null); do
+      _pids="$_pids $_child"
+    done
+  done
+  for _pid in $_pids; do
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_pid" = "$$" ] && continue
+    [ "$_pid" = "$PPID" ] && continue
+    printf '%s\n' "$_pid"
+  done | sort -un
+}
+
+_join_scope_has_duplicate_transport() {
+  local _fmt_count
+  _fmt_count=$(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${_fmt_count:-0}" -gt 1 ] 2>/dev/null; then
+    return 0
+  fi
+
+  local _seen_gists="" _pid _cmd _gid
+  for _pid in $(proc_airc_pids_matching 'airc_core\.bearer_cli[[:space:]]+recv' 2>/dev/null | sort -un || true); do
+    _cmd=$(proc_cmdline "$_pid" || true)
+    _airc_cmdline_mentions_scope "$_cmd" "$AIRC_WRITE_DIR" || continue
+    _gid=$(printf '%s\n' "$_cmd" | awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == "--room-gist-id" && (i + 1) <= NF) {
+          print $(i + 1); exit
+        }
+      }
+    }')
+    [ -n "$_gid" ] || continue
+    case " $_seen_gists " in
+      *" $_gid "*) return 0 ;;
+      *) _seen_gists="$_seen_gists $_gid" ;;
+    esac
+  done
+
+  return 1
 }
 
 _join_attach_local_stream() {
@@ -185,10 +342,11 @@ _join_attach_local_stream() {
   echo "  Attaching this terminal to the local AIRC stream."
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  local _tail_name; _tail_name=$(get_name 2>/dev/null || echo "airc")
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
   else
-    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
   fi
 }
 
@@ -467,6 +625,18 @@ cmd_connect() {
         # serves this scope, keep that single transport owner and attach
         # this terminal/Claude Monitor to the local messages log.
         attach=1; shift ;;
+      -*)
+        # Reject any unrecognized flag loudly. Pre-fix the catch-all
+        # arm (now below) silently accepted `--anything` as a positional,
+        # which downstream became `target` → host-mode `name` → config
+        # `name`. Observed in the wild: `airc join --background` set
+        # config.name to literal "--background", surfacing as
+        # "Hosting as '--background'" and corrupting peer identity until
+        # manually edited. See #511 (related: #521 belt for --attach).
+        # Inline invites, gist ids, mnemonics never start with `-`, so
+        # this rejector cannot eat a legitimate positional.
+        echo "ERROR: unknown flag '$1'. See: airc join --help" >&2
+        return 2 ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -589,6 +759,10 @@ cmd_connect() {
     fi
     if [ "$_repair_running_monitor" = "1" ]; then
       echo "  airc join: restarting this scope's AIRC process to leave the solo island."
+      _join_restart_scope_processes
+      sleep 1
+    elif _join_scope_has_duplicate_transport; then
+      echo "  airc join: duplicate same-scope transport generation detected; restarting this scope's AIRC process."
       _join_restart_scope_processes
       sleep 1
     else
@@ -854,6 +1028,24 @@ cmd_connect() {
   if [ "$attach" = "1" ] && [ "${AIRC_NO_ATTACH:-0}" != "1" ]; then
     _join_spawn_transport_for_attach ${_orig_args[@]+"${_orig_args[@]}"}
     return $?
+  fi
+
+  # Mark transport ownership before expensive discovery/bootstrap work.
+  # Host/joiner mode rewrites this later with child PIDs once those
+  # loops exist; until then, the parent shell itself is the live
+  # transport startup owner. Without this early marker, attach-mode
+  # launchers can report "not running" for a process that is alive but
+  # still doing gh discovery, stale-state repair, or first-host setup.
+  mkdir -p "$AIRC_WRITE_DIR"
+  : >> "$MESSAGES"
+  echo "$$" > "$AIRC_WRITE_DIR/airc.pid"
+  trap '
+    _airc_startup_rc=$?
+    rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+    exit $_airc_startup_rc
+  ' EXIT INT TERM
+  if [ -n "${AIRC_TEST_STARTUP_DELAY_SEC:-}" ]; then
+    sleep "$AIRC_TEST_STARTUP_DELAY_SEC"
   fi
 
   # No resume code path. (#130, 2026-04-26.)
@@ -1371,12 +1563,54 @@ cmd_connect() {
         # host's channel traffic too). The user's intent gets a real
         # gist (find-or-create) — that's what was missing pre-2026-04-29
         # and turned `airc join --room qa-foo` into a phantom-room.
+        #
+        # Test hook: AIRC_TEST_FAIL_ENSURE_CHANNEL — when set, treat
+        # ensure_channel_subscribed_with_gist as failed for that exact
+        # channel name. Lets the regression scenario exercise the
+        # intent-failed-but-host-reachable fallback path deterministically
+        # without needing a real gh rate-limit / missing-permissions repro.
         echo "$_intent" > "$AIRC_WRITE_DIR/room_name"
-        ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null \
-          || die "Could not bootstrap #${_intent}; refusing to join with broken state"
-        ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null \
-          || echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
-        echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
+        local _intent_ok=1 _host_ok=1
+        if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$_intent" ] \
+           || ! ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null; then
+          _intent_ok=0
+        fi
+        # We already resolved the host's room gist to get here. Persist that
+        # mapping before subscribing to the host channel so the fallback path
+        # does not immediately hit GitHub discovery again during the exact
+        # transient/rate-limited condition it is meant to survive.
+        if [ -n "${_resolved_gist_id:-}" ]; then
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+        fi
+        if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$resolved_room_name" ] \
+           || ! ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null; then
+          _host_ok=0
+        fi
+        if [ "$_intent_ok" = "1" ]; then
+          if [ "$_host_ok" = "1" ]; then
+            echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
+          else
+            echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
+            echo "  Joined #${_intent}"
+          fi
+        else
+          # Intent bootstrap failed. Pre-fix this die'd the whole join,
+          # which made plain `airc join` (auto-scope intent) inexplicably
+          # exit on a working mesh whenever the intent gist couldn't be
+          # resolved (gh rate-limit, missing scope on token, transient
+          # API error). When the host's channel IS reachable the join
+          # has a viable subscription — fall back to it as primary,
+          # warn the user, and keep going. Only die when BOTH are gone:
+          # at that point there's no channel to land in.
+          if [ "$_host_ok" = "1" ]; then
+            echo "  ⚠ Could not bootstrap intended #${_intent}; falling back to host's channel #${resolved_room_name} as primary." >&2
+            echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
+            echo "  Joined #${resolved_room_name} (your intent #${_intent} could not bootstrap; rerun 'airc join --room ${_intent}' once gh is healthy)"
+          else
+            die "Could not bootstrap #${_intent} OR host's channel #${resolved_room_name}; no viable subscription. Check 'gh auth status' + retry."
+          fi
+        fi
       fi
       # Identity bootstrap nudge (#146). Skill /join SKILL.md prompts
       # AIs to set pronouns/role/bio at first join, but users running

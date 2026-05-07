@@ -481,6 +481,17 @@ _doctor_health() {
     fi
   fi
 
+  # ── gh request governor. This is the product-facing surface for the
+  # per-user cross-process guard. Keep `airc gh-audit` as an advanced
+  # escape hatch, but doctor owns the normal diagnosis so users/agents
+  # don't need another public verb.
+  local _gov_rc=0
+  "$AIRC_PYTHON" -m airc_core.gh_backoff doctor --count 80 || _gov_rc=$?
+  case "$_gov_rc" in
+    1) warns=$((warns+1)) ;;
+    2) issues=$((issues+1)) ;;
+  esac
+
   # ── Legacy daemon registration check. Daemon is deprecated; surface
   # stale installed units only so users can remove them. Do not suggest
   # installing a new background service.

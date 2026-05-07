@@ -113,6 +113,8 @@ for ch in subs:
         issues.append("missing channel_gists mapping")
 
     state, state_issue, state_path = load_state(ch)
+    if state.get("last_error"):
+        issues.append(f"bearer error: {state.get('last_error')}")
     signal = signal_for_gist(ch, gist, state)
     signal_source = ch
     if signal is not None:
@@ -359,7 +361,13 @@ else:
   local pending_count=0
   [ -f "$pending" ] && pending_count=$(grep -c '^.' "$pending" 2>/dev/null || echo 0)
   if [ "$pending_count" -gt 0 ]; then
-    echo "  queue:       ${pending_count} pending (auto-retries every ~5s)"
+    local _gh_wait=0
+    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  queue:       ${pending_count} pending (paused by gh governor for ${_gh_wait}s)"
+    else
+      echo "  queue:       ${pending_count} pending (governed auto-drain)"
+    fi
   else
     echo "  queue:       empty"
   fi
@@ -573,15 +581,46 @@ cmd_codex_hook() {
 
 cmd_codex_start() {
   local _log="$AIRC_WRITE_DIR/codex-airc.log"
+  local _pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ "$(_monitor_alive_with_bearer_fallback "$_pidfile")" = "yes" ] \
+      && _join_transport_health_ok \
+      && ! _join_scope_has_duplicate_transport; then
+    echo "airc join: already joined in this scope."
+    echo ""
+    echo "Status"
+    echo "------"
+    cmd_status
+    echo ""
+    echo "Inbox"
+    echo "-----"
+    AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 10 || true
+    return 0
+  fi
+
+  local _started_at
+  _started_at=$(date +%s)
   "$AIRC_PYTHON" -m airc_core.codex_start \
     --airc "$0" \
     --home "$AIRC_WRITE_DIR" \
     --log "$_log" \
     -- "$@"
 
-  # Give the detached process a short startup window, then print the same
-  # useful local surfaces that `airc join` prints when it returns quickly.
-  sleep 2
+  # Wait for the detached child to write fresh scope process evidence
+  # before printing status. A fixed sleep was too short when `airc join`
+  # had to self-heal duplicate same-scope generations: Codex printed
+  # "not running" while the detached child was still reaping/restarting.
+  local _wait_sec="${AIRC_CODEX_START_WAIT_SEC:-45}"
+  local _i _mtime
+  for _i in $(seq 1 "$_wait_sec"); do
+    if [ -f "$_pidfile" ]; then
+      _mtime=$(file_mtime "$_pidfile" 2>/dev/null || echo 0)
+      if [ "${_mtime:-0}" -ge "$_started_at" ] 2>/dev/null \
+          && [ -n "$(_airc_pidfile_first_live_monitor_pid "$_pidfile")" ]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
   echo ""
   echo "Status"
   echo "------"

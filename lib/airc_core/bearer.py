@@ -204,6 +204,20 @@ class Bearer(ABC):
         the caller's responsibility, not the bearer's.
         """
 
+    def send_many(self, peer_id: str, channel: str, payloads: list[bytes]) -> SendOutcome:
+        """Deliver multiple payloads to the same peer/channel.
+
+        Default implementation preserves existing bearer semantics by
+        sending in order and stopping at the first non-delivered outcome.
+        Bearers with native append surfaces, such as gh gist, can override
+        this to batch many queued messages into one transport operation.
+        """
+        for payload in payloads:
+            outcome = self.send(peer_id, channel, payload)
+            if outcome.kind != "delivered":
+                return outcome
+        return SendOutcome(kind="delivered", detail=f"{len(payloads)} payload(s)")
+
     @abstractmethod
     def recv_stream(self) -> Iterator[ReceivedMessage]:
         """Yield ReceivedMessage events as they arrive on this bearer.

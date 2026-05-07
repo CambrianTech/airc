@@ -393,7 +393,7 @@ airc update [--channel <name>]    # pull latest on current channel; switch with 
 # Diagnostic
 airc reminder <seconds|off|pause> # silence-nudge interval
 airc version                      # git sha + branch + install dir
-airc tests / airc doctor [scenario]  # integration suite (~245 assertions, 32 scenarios)
+airc doctor --tests [scenario]   # integration suite (~245 assertions, 32 scenarios)
 ```
 
 ## Skills
@@ -424,7 +424,6 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 | [canary](skills/canary/) | `/canary` | Switch to canary channel + pull (opt-in pre-merge testing) |
 | [version](skills/version/) | `/version` | Short sha + install path |
 | [doctor](skills/doctor/) | `/doctor [scenario]` | Environment health + integration suite (auto-fixes what it can) |
-| [tests](skills/tests/) | `/tests [scenario]` | Pure test runner (alias of doctor's test path) |
 
 The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`, `away`, and `whois`. Use `airc join` to create, join, resume, repair a room, and catch up unread messages for the current scope.
 
@@ -432,15 +431,15 @@ The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`,
 
 **Your identity is tied to where you are.** Run `airc` from any directory — state lives at `$PWD/.airc/`, auto-created on first `airc join`. Different cwd = different scope = different peer. Multi-tab on one machine? Open each tab in its own dir (or repo); they're distinct automatically.
 
-Identity name auto-derives: `<basename>-<4-char-hash>`. Basename is the git-repo-root name if you're in a repo (so nested subdirs don't fragment the display name), else the cwd basename. The 4-char hash disambiguates — two "src" dirs in different projects never collide.
+Identity name auto-derives: `<platform>-<basename>-<4-char-hash>` (`mac-continuum-8e97`, `win-continuum-8e97`, `ubu-api-d1f4`). Basename is the git-repo-root name if you're in a repo (so nested subdirs don't fragment the display name), else the cwd basename. The 4-char hash disambiguates — two "src" dirs in different projects never collide.
 
-Example: `/Users/joel/Development/cambrian/airc` → `airc-96dd`.
+Example: `/Users/joel/Development/cambrian/airc` on macOS → `mac-airc-96dd`.
 
 Rename any time: `airc nick <new>` — paired peers auto-update via the `[rename]` broadcast. Chain-repair is baked in: the rename marker carries a stable `host=` field so receivers rename their record for you even if a prior marker was missed.
 
 ## Agent identity & WHOIS
 
-The bootstrap name (`airc-96dd`) tells you which repo an agent is running from but nothing about *who they are*. Agents in a busy multi-room mesh benefit from a small structured layer on top: pronouns, role, bio, status — and a way to link the same persona across platforms (continuum, slack, telegram, …).
+The bootstrap name (`mac-airc-96dd`) tells you which platform and repo an agent is running from but nothing about *who they are*. Agents in a busy multi-room mesh benefit from a small structured layer on top: pronouns, role, bio, status — and a way to link the same persona across platforms (continuum, slack, telegram, …).
 
 ### Fields
 

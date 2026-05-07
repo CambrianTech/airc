@@ -190,9 +190,33 @@ fi
 #
 # AIRC_HOME env var overrides, for tests / edge cases. Normal users don't
 # touch it.
+canonical_scope_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    (cd "$p" 2>/dev/null && pwd -P) || echo "$p"
+    return
+  fi
+
+  # Scope dirs often do not exist yet on first join. Canonicalize the
+  # existing parent so /tmp/foo/.airc and /private/tmp/foo/.airc still
+  # resolve to one owner on macOS, without requiring non-portable
+  # realpath/readlink -f.
+  local parent base
+  parent="$(dirname "$p")"
+  base="$(basename "$p")"
+  if [ -d "$parent" ]; then
+    local parent_abs
+    parent_abs="$(cd "$parent" 2>/dev/null && pwd -P)" || parent_abs="$parent"
+    echo "$parent_abs/$base"
+    return
+  fi
+
+  echo "$p"
+}
+
 detect_scope() {
   if [ -n "${AIRC_HOME:-}" ]; then
-    echo "$AIRC_HOME"
+    canonical_scope_path "$AIRC_HOME"
     return
   fi
 
@@ -215,17 +239,45 @@ detect_scope() {
 }
 
 # Short, clash-resistant name auto-derived from the scope path.
-# Format: <repo>-<4-char-hash> when in a git repo (basename of the git
-# top-level), or <dir-basename>-<4-char-hash> otherwise. Hash
+# Format: <platform>-<repo>-<4-char-hash> when in a git repo (basename of
+# the git top-level), or <platform>-<dir-basename>-<4-char-hash> otherwise.
+# Hash
 # disambiguates same-name directories across different parent paths
 # (two "src" dirs, two clones of the same repo, etc.).
 #
 # Within a room scoped to a single org (which is the auto-scope default
 # — see infer_repo_org), every peer is from that org by construction, so
 # adding the org as a name prefix is redundant and lengthens @-mentions.
-# Cap is 20 chars on the basename, comfortably fitting common repo names
-# (`authenticator-d1f4`, `merchant-browser-d1f4`) without truncation.
+# Cap is 16 chars on the basename, comfortably fitting common repo names
+# (`mac-authenticator-d1f4`, `win-continuum-d1f4`) without truncation.
 # Users can override any time with `airc nick`.
+platform_nick_prefix() {
+  local kind="${AIRC_PLATFORM_KIND:-}"
+  if [ -z "$kind" ]; then
+    case "$(uname -s 2>/dev/null)" in
+      Darwin*) kind="mac" ;;
+      MINGW*|MSYS*|CYGWIN*) kind="win" ;;
+      Linux*)
+        if grep -qi microsoft /proc/version 2>/dev/null; then
+          kind="win"
+        elif [ -r /etc/os-release ]; then
+          kind=$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release)
+        else
+          kind="linux"
+        fi
+        ;;
+      *) kind="$(uname -s 2>/dev/null || echo airc)" ;;
+    esac
+  fi
+  kind=$(printf '%s' "$kind" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-3 \
+    | sed 's/-*$//')
+  [ -z "$kind" ] && kind="air"
+  printf '%s\n' "$kind"
+}
+
 derive_name() {
   local dir="${1:-$(pwd -P)}"
   local base_dir git_root base
@@ -235,13 +287,13 @@ derive_name() {
     | tr '[:upper:]' '[:lower:]' \
     | sed 's/[^a-z0-9-]/-/g' \
     | sed 's/--*/-/g; s/^-*//; s/-*$//' \
-    | cut -c1-20 \
+    | cut -c1-16 \
     | sed 's/-*$//')
   [ -z "$base" ] && base="airc"
   local hash
   hash=$(printf '%s' "$dir" | shasum -a 256 2>/dev/null | cut -c1-4)
   [ -z "$hash" ] && hash=$(printf '%s' "$dir" | cksum | cut -c1-4)
-  echo "${base}-${hash}"
+  echo "$(platform_nick_prefix)-${base}-${hash}"
 }
 
 # Infer default room name from the git repo at $PWD. Maps mesh scope to
@@ -360,6 +412,16 @@ resolve_gh_bin() {
 _gh_resolved=$(resolve_gh_bin 2>/dev/null || true)
 if [ -n "$_gh_resolved" ] && ! command -v gh >/dev/null 2>&1; then
   export PATH="$(dirname "$_gh_resolved"):$PATH"
+fi
+
+# Central GitHub request guard. All shell `gh ...` calls below route
+# through the Python adapter so one per-user budget/backoff/audit layer
+# protects every AIRC tab on this machine. Python modules call the same
+# adapter directly via airc_core.gh_backoff.run_gh().
+if [ -n "$_gh_resolved" ] || command -v gh >/dev/null 2>&1; then
+  gh() {
+    "$AIRC_PYTHON" -m airc_core.gh_backoff run -- "$@"
+  }
 fi
 unset _gh_resolved
 
@@ -509,9 +571,39 @@ _airc_scope_monitor_formatter_pids() {
     case "$p" in ''|*[!0-9]*) continue ;; esac
     cmd=$(proc_cmdline "$p" 2>/dev/null || true)
     printf '%s\n' "$cmd" | grep -Fq -- 'airc_core.monitor_formatter' || continue
-    printf '%s\n' "$cmd" | grep -Fq -- "--peers-dir $scope_dir/peers" || continue
+    _airc_cmdline_mentions_scope "$cmd" "$scope_dir/peers" || continue
     printf '%s\n' "$p"
   done
+}
+
+_airc_scope_path_variants() {
+  local scope_dir="${1:-}"
+  [ -n "$scope_dir" ] || return 0
+  local canon
+  canon=$(canonical_scope_path "$scope_dir")
+  {
+    printf '%s\n' "$scope_dir"
+    printf '%s\n' "$canon"
+    case "$canon" in
+      /private/tmp/*) printf '/tmp/%s\n' "${canon#/private/tmp/}" ;;
+      /tmp/*)         printf '/private/tmp/%s\n' "${canon#/tmp/}" ;;
+    esac
+  } | sort -u
+}
+
+_airc_cmdline_mentions_scope() {
+  local cmd="${1:-}"
+  local scope_dir="${2:-}"
+  [ -n "$cmd" ] || return 1
+  [ -n "$scope_dir" ] || return 1
+  local variant
+  while IFS= read -r variant; do
+    [ -n "$variant" ] || continue
+    printf '%s\n' "$cmd" | grep -Fq -- "$variant" && return 0
+  done <<EOF
+$(_airc_scope_path_variants "$scope_dir")
+EOF
+  return 1
 }
 
 _airc_cmdline_is_monitor_wrapper() {
@@ -1302,16 +1394,18 @@ _monitor_multi_channel() {
   while true; do
     # Re-read channel_map from config at top of each outer cycle so
     # an in-flight config change (e.g. _mesh_rediscover_loop swapping
-    # the host gist after rotation) takes effect on the next bearer
-    # respawn, no full process restart required. Falls back to the
-    # parameter passed at startup if the re-read returns empty
-    # (transient config-write race or missing list_channel_gists
-    # support on older airc_core).
+    # the host gist after rotation, or a gone-gist prune below) takes
+    # effect on the next bearer respawn, no full process restart
+    # required. Empty is meaningful: it means no channel currently has
+    # a viable wire, so do not fall back to the stale startup map.
     local _refreshed_map
     _refreshed_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
       --config "$CONFIG" 2>/dev/null || true)
-    if [ -n "$_refreshed_map" ]; then
-      channel_map="$_refreshed_map"
+    channel_map="$_refreshed_map"
+    if [ -z "$channel_map" ]; then
+      echo "airc: no channel_gists mappings remain; monitor waiting for 'airc join --room <channel>' to re-host" >&2
+      sleep 30
+      continue
     fi
     {
       # Per-child PID tracking so we can detect individual deaths.
@@ -1390,6 +1484,20 @@ _monitor_multi_channel() {
             # having to know to read the log file.
             if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ]; then
               tail -3 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | sed 's/^/airc:   /' >&2
+            fi
+            if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ] \
+               && tail -20 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | grep -qE 'returned 404|\(gone\)|GET gists/.* failed: gone'; then
+              local _gone_gid
+              _gone_gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+                --config "$CONFIG" --channel "$ch" 2>/dev/null || true)
+              "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+                --config "$CONFIG" --channel "$ch" --gist-id "" \
+                >/dev/null 2>&1 || true
+              [ -n "$_gone_gid" ] && printf '%s\n' "$_gone_gid" > "$AIRC_WRITE_DIR/gone_channel_gist.${ch}" 2>/dev/null || true
+              printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved. Monitor stopped respawning this channel; re-host with: airc join --room %s]"}\n' \
+                "$(timestamp)" "$ch" "$ch" "$ch" >> "$MESSAGES"
+              echo "airc: #${ch} gist returned 404 (gone); cleared stale channel_gists[${ch}] and stopped respawning that channel" >&2
+              continue
             fi
             # Re-read the channel's gist from config. If the host rotated
             # or send-path self-heal updated channel_gists while this
@@ -1712,6 +1820,14 @@ flush_pending_loop() {
     [ -z "$host_target" ] && continue
     rhome=$(remote_home)
 
+    local _gh_wait=0
+    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
+      [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
+      sleep "$_gh_wait"
+      continue
+    fi
+
     local snapshot; snapshot=$(mktemp -t airc-pending-snap.XXXXXX)
     local unsent;   unsent=$(mktemp -t airc-pending-unsent.XXXXXX)
     # Atomic-ish snapshot: mv is atomic on same filesystem, so new sends that
@@ -1803,6 +1919,14 @@ flush_pending_host_loop() {
     fi
     [ -s "$pending" ] || continue
 
+    local _gh_wait=0
+    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
+      [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
+      sleep "$_gh_wait"
+      continue
+    fi
+
     local snapshot; snapshot=$(mktemp -t airc-pending-host-snap.XXXXXX)
     local unsent;   unsent=$(mktemp -t airc-pending-host-unsent.XXXXXX)
     # Atomic-ish snapshot: mv is atomic on same FS so concurrent cmd_send
@@ -1810,6 +1934,34 @@ flush_pending_host_loop() {
     mv "$pending" "$snapshot" 2>/dev/null || { rm -f "$snapshot" "$unsent"; continue; }
 
     local delivered=0 failed=0
+    local _fallback_gist=""
+    [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _fallback_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    local _batch_route _batch_ok _batch_channel _batch_gist _batch_count
+    _batch_route=$("$AIRC_PYTHON" -m airc_core.pending_batch host-broadcast-route \
+      --snapshot "$snapshot" --config "$CONFIG" --fallback-gist "$_fallback_gist" 2>/dev/null || true)
+    IFS="$(printf '\t')" read -r _batch_ok _batch_channel _batch_gist _batch_count <<EOF
+$_batch_route
+EOF
+    if [ "$_batch_ok" = "ok" ] && [ -n "$_batch_gist" ]; then
+      local _batch_outcome _batch_kind
+      _batch_outcome=$(cat "$snapshot" | "$AIRC_PYTHON" -m airc_core.bearer_cli send-batch \
+        all "$_batch_channel" --room-gist-id "$_batch_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
+      _batch_kind=$(printf '%s' "$_batch_outcome" | "$AIRC_PYTHON" -c 'import json,sys
+try:
+  print(json.load(sys.stdin).get("kind",""))
+except Exception:
+  print("")' 2>/dev/null)
+      if [ "$_batch_kind" = "delivered" ]; then
+        cat "$snapshot" >> "$MESSAGES"
+        delivered=${_batch_count:-0}
+        : > "$snapshot"
+      else
+        cat "$snapshot" >> "$unsent"
+        failed=${_batch_count:-0}
+        : > "$snapshot"
+      fi
+    fi
+
     while IFS= read -r line; do
       [ -z "$line" ] && continue
 
@@ -2340,8 +2492,23 @@ _airc_should_use_codex_start() {
   [ -n "${AIRC_NO_ATTACH:-}" ] && return 1
 
   local _arg
-  for _arg in "$@"; do
-    [ "$_arg" = "--attach" ] && return 1
+  while [ "$#" -gt 0 ]; do
+    _arg="$1"
+    case "$_arg" in
+      --attach|-attach) return 1 ;;
+      -h|--help|--gist|-gist|--no-gist|-no-gist|--no-room|-no-room|--no-general|-no-general|--general|-general|--takeover|-takeover|--no-tailscale|-no-tailscale)
+        shift ;;
+      --room|-room|--room-only|-room-only)
+        shift 2 ;;
+      -*)
+        # Let cmd_connect's parser reject unknown flags directly. If we
+        # launch Codex-detached first, the child fails in the background
+        # and the foreground parent can mask the real "unknown flag"
+        # with a later "Not initialized" status/inbox check.
+        return 1 ;;
+      *)
+        shift ;;
+    esac
   done
 
   [ -n "${CODEX_THREAD_ID:-}${CODEX_CI:-}${CODEX_MANAGED_BY_NPM:-}" ]
@@ -2381,6 +2548,7 @@ case "${1:-help}" in
   codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
   codex-start) shift; cmd_codex_start "$@" ;;
   codex-hook) shift; cmd_codex_hook "$@" ;;
+  gh-audit) shift; "$AIRC_PYTHON" -m airc_core.gh_backoff audit "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

@@ -51,6 +51,11 @@ def _gist_from_bearer_log(home: Path, channel: str) -> str:
     return ""
 
 
+def _gone_channel_gist(home: Path, channel: str) -> str:
+    gid = _read(home / f"gone_channel_gist.{channel}")
+    return gid if GIST_RE.match(gid) else ""
+
+
 def _name_from_messages(home: Path) -> str:
     try:
         lines = (home / "messages.jsonl").read_text(encoding="utf-8").splitlines()[-500:]
@@ -94,9 +99,14 @@ def infer_config(home: Path, default_name: str, host: str, existing: dict | None
         channels = [room_name] + [ch for ch in channels if ch != room_name]
 
     channel_gists: dict[str, str] = dict(existing.get("channel_gists", {}) or {})
-    if room_name and GIST_RE.match(room_gist):
+    if room_name and GIST_RE.match(room_gist) and _gone_channel_gist(home, room_name) != room_gist:
         channel_gists[room_name] = room_gist
     for channel in channels:
+        gone_gist = _gone_channel_gist(home, channel)
+        if gone_gist:
+            if channel_gists.get(channel) == gone_gist:
+                channel_gists.pop(channel, None)
+            continue
         log_gist = _gist_from_bearer_log(home, channel)
         if GIST_RE.match(log_gist):
             channel_gists[channel] = log_gist

@@ -582,6 +582,33 @@ class BearerCliStateFileTests(unittest.TestCase):
         self.assertEqual(state["last_heartbeat_ts"], 456.0)
         _os.unlink(state_path)
 
+    def test_stream_exception_marks_state_failed(self):
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+
+        class _FailingBearer(self._FakeBearer):
+            def recv_stream(self):
+                raise RuntimeError("room gist abc123 returned 404 (gone)")
+                yield  # pragma: no cover
+
+        fake = _FailingBearer({})
+        fake_stdout, _ = self._capture_stdout_bytes()
+        fake_stderr = mock.Mock()
+        with mock.patch.object(bearer_cli, "resolve", return_value=fake), \
+             mock.patch.object(bearer_cli.sys, "stdout", fake_stdout), \
+             mock.patch.object(bearer_cli.sys, "stderr", fake_stderr):
+            rc = bearer_cli.cmd_recv(self._make_args(state_path))
+
+        self.assertEqual(rc, 3)
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertIn("returned 404", state["last_error"])
+        self.assertIn("bearer recv failed", state["diag"])
+        self.assertIsNone(state["last_recv_ts"])
+        self.assertTrue(fake.closed)
+
     def test_no_state_file_means_no_writes(self):
         events = [ReceivedMessage(
             sender_peer_id="bob",
@@ -1245,6 +1272,29 @@ class GhBearerSendTests(unittest.TestCase):
 
         self.assertEqual(captured["content"], my_line)
 
+    def test_send_many_batches_payloads_into_one_patch(self):
+        existing = '{"from":"x","msg":"old"}\n'
+        lines = [b'{"from":"a","msg":"one"}', b'{"from":"b","msg":"two"}\n']
+        captured = {}
+
+        def fake_patch(gist_id, content):
+            captured["gist_id"] = gist_id
+            captured["content"] = content
+            return (True, "")
+
+        merged = existing + '{"from":"a","msg":"one"}\n{"from":"b","msg":"two"}\n'
+        gets = [
+            {"files": {"messages.jsonl": {"content": existing}}},
+            {"files": {"messages.jsonl": {"content": merged}}},
+        ]
+        with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=lambda _: gets.pop(0)), \
+             mock.patch.object(bearer_gh, "_gh_api_patch_messages_jsonl", side_effect=fake_patch):
+            outcome = self._bearer().send_many("alice", "general", lines)
+
+        self.assertEqual(outcome.kind, "delivered")
+        self.assertEqual(captured["gist_id"], "abc123")
+        self.assertEqual(captured["content"], merged)
+
     def test_send_transient_when_get_fails(self):
         with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
@@ -1760,6 +1810,18 @@ class GhBearerRecvTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].sender_peer_id, "bob")
 
+    def test_recv_raises_when_gist_is_gone(self):
+        b = self._bearer()
+        with mock.patch.object(
+            bearer_gh,
+            "_gh_api_get_classified",
+            return_value=(None, "gone"),
+        ):
+            with self.assertRaises(GhBearerError) as ctx:
+                next(b.recv_stream())
+
+        self.assertIn("returned 404", str(ctx.exception))
+
     def test_recv_secondary_rate_limit_sleeps_through_shared_backoff(self):
         b = self._bearer({"poll_interval": 15})
         sleeps = []
@@ -1772,6 +1834,10 @@ class GhBearerRecvTests(unittest.TestCase):
             bearer_gh,
             "_gh_api_get_classified",
             return_value=(None, "secondary_rate_limit"),
+        ), mock.patch.dict(
+            os.environ,
+            {"AIRC_GH_GET_CACHE_SEC": "0"},
+            clear=False,
         ), mock.patch.object(
             bearer_gh.gh_backoff,
             "backoff_until",
@@ -1782,6 +1848,25 @@ class GhBearerRecvTests(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertGreaterEqual(sleeps[0], 60)
         self.assertGreater(sleeps[0], 100)
+
+    def test_recv_get_cache_coalesces_same_gist_reads(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {
+                 "AIRC_GH_GET_CACHE_DIR": tmp,
+                 "AIRC_GH_GET_CACHE_SEC": "10",
+             }, clear=False), \
+             mock.patch.object(
+                 bearer_gh,
+                 "_gh_api_get_classified",
+                 return_value=(self._gist_response('{"from":"bob","msg":"cached"}\n'), "delivered"),
+             ) as get:
+            first, first_kind = bearer_gh._gh_api_get_for_recv("abc123", 10)
+            second, second_kind = bearer_gh._gh_api_get_for_recv("abc123", 10)
+
+        self.assertEqual(first_kind, "delivered")
+        self.assertEqual(second_kind, "delivered")
+        self.assertEqual(first, second)
+        self.assertEqual(get.call_count, 1)
 
     def test_recv_resumes_past_offset_file(self):
         import tempfile, os as _os

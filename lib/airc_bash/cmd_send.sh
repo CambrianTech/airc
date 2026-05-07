@@ -69,6 +69,10 @@ cmd_send() {
   # peers see lifecycle state on gh/local transports, but stamps from=airc
   # so monitor/inbox render it as a system notice instead of peer text.
   local system_event=0
+  # Final user-facing confirmation state. The transport branches below
+  # may queue or fail after writing a loud diagnostic; the shared footer
+  # must not print the same delivered arrow for those cases.
+  local _airc_delivery_state="delivered"
   # --plaintext: skip envelope-layer encryption even when recipient
   # x25519 pubkey is on file. For control traffic ([PING:uuid] /
   # [PONG:uuid]) where the body is a public uuid with zero secret
@@ -429,6 +433,7 @@ cmd_send() {
         "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
           --config "$CONFIG" --channel "$active_channel" --gist-id "" \
           >/dev/null 2>&1 || true
+        [ -n "${room_gist_id:-}" ] && printf '%s\n' "$room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
         local gone_marker; gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
           "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${detail:-no detail}")
         echo "$gone_marker" >> "$MESSAGES"
@@ -436,6 +441,7 @@ cmd_send() {
         echo "  ✗ Gist for #${active_channel} returned 404 — channel dissolved." >&2
         echo "    Stale channel_gists[${active_channel}] cleared." >&2
         echo "    Re-host:  airc join --room ${active_channel}" >&2
+        return 1
         ;;
       secondary_rate_limit)
         # gh secondary throttle (#381 layer A). Queue + distinct marker.
@@ -446,6 +452,7 @@ cmd_send() {
         echo "  ⏳ gh secondary rate limit — message queued. Drain loop retries when window clears (~60-180s)." >&2
         echo "  Avoid sending more for ~2 minutes." >&2
         echo "  Bearer: ${detail:-<none>}" >&2
+        _airc_delivery_state="queued"
         ;;
       transient_failure|"")
         # Network-class failure or empty/malformed outcome → treat as
@@ -458,6 +465,7 @@ cmd_send() {
         echo "$queue_marker" >> "$MESSAGES"
         echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
         echo "  Bearer: ${detail:-<none>}" >&2
+        _airc_delivery_state="queued"
         ;;
       *)
         # Unknown kind. The bearer.py SendOutcome contract enumerates the
@@ -465,6 +473,7 @@ cmd_send() {
         # updating callers. Queue defensively + log loudly so it's caught.
         echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
         echo "  Unknown bearer outcome kind '${kind}' (detail: ${detail}). Queued defensively. Update cmd_send.sh." >&2
+        _airc_delivery_state="queued"
         ;;
     esac
   else
@@ -622,6 +631,7 @@ cmd_send() {
           "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
             --config "$CONFIG" --channel "$active_channel" --gist-id "" \
             >/dev/null 2>&1 || true
+          [ -n "${_host_room_gist_id:-}" ] && printf '%s\n' "$_host_room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
           local _host_gone_marker; _host_gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
             "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${_host_detail:-no detail}")
           echo "$_host_gone_marker" >> "$MESSAGES"
@@ -632,6 +642,7 @@ cmd_send() {
           echo "" >&2
           echo "    To re-host this channel: airc join --room ${active_channel}" >&2
           echo "    To wait for a peer to take over: leave it; next 'airc join' that resolves the mesh-singleton will publish a fresh gist." >&2
+          return 1
           ;;
         secondary_rate_limit)
           # gh per-burst write throttle (#381 layer A — HTTP 403 with
@@ -652,6 +663,7 @@ cmd_send() {
           echo "  ⏳ gh secondary rate limit hit — broadcast queued. Drain loop will retry once the burst window clears (60-180s typical)." >&2
           echo "  Avoid sending more for ~2 minutes to let the throttle clear." >&2
           echo "  Bearer: ${_host_detail:-<none>}" >&2
+          _airc_delivery_state="queued"
           ;;
         transient_failure|"")
           # Mirror joiner-side queue/drain symmetry (#381 layer B). Pre-fix
@@ -668,12 +680,14 @@ cmd_send() {
           echo "$_host_queue_marker" >> "$MESSAGES"
           echo "  Network error reaching gist — broadcast queued for retry. Monitor will flush when gist returns." >&2
           echo "  Bearer: ${_host_detail:-<none>}" >&2
+          _airc_delivery_state="queued"
           ;;
         *)
           # Unknown kind — bearer_cli added an outcome without updating
           # callers. Queue defensively + log loudly so it gets caught.
           echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
           echo "  Unknown bearer outcome kind '${_host_kind}' on host send (detail: ${_host_detail}). Queued defensively. Update cmd_send.sh." >&2
+          _airc_delivery_state="queued"
           ;;
       esac
     else
@@ -693,7 +707,13 @@ cmd_send() {
   # propagation, etc.) stay silent on purpose; the user-invoked surface
   # gets the confirmation.
   if [ "$internal" != "1" ]; then
-    if [ "$peer_name" = "all" ]; then
+    if [ "$_airc_delivery_state" = "queued" ]; then
+      if [ "$peer_name" = "all" ]; then
+        echo "  ↻ queued for #${active_channel}"
+      else
+        echo "  ↻ queued for @${peer_name} on #${active_channel}"
+      fi
+    elif [ "$peer_name" = "all" ]; then
       echo "  → #${active_channel} (broadcast)"
     else
       echo "  → @${peer_name} on #${active_channel}"

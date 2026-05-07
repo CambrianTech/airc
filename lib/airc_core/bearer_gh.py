@@ -11,11 +11,13 @@ mutation, polling cadence, rate-limit handling. The room-registry role
 of gh (cmd_rooms, gistparse) lives elsewhere and is a separate concern.
 
 Why polling rather than push: gh has no streaming API for gist updates.
-Polling at a sane cadence (15s default) costs ~240 requests/hour/peer,
-well under gh's 5000/hour authenticated rate limit. ETag conditional
-GETs are a future optimization (saves bytes, still counts toward primary
-rate limit per gh docs); deferred until rotation pressure makes the
-read payload large enough that bandwidth matters.
+Polling at a sane cadence (15s default) costs ~240 requests/hour/peer
+before same-machine coalescing. A short per-user cache merges concurrent
+monitor reads for the same gist so four local agents do not all spend a
+GitHub request on the same payload. ETag conditional GETs are a future
+optimization (saves bytes, still counts toward primary rate limit per gh
+docs); deferred until rotation pressure makes the read payload large
+enough that bandwidth matters.
 
 Why subprocess `gh api` rather than direct HTTPS: gh CLI handles auth
 (token discovery, refresh, GHE detection), retry on transient errors,
@@ -64,6 +66,8 @@ _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
 _LOCAL_BUS_ROOT_ENV = "AIRC_LOCAL_BUS_DIR"
 _DISABLE_LOCAL_BUS_ENV = "AIRC_DISABLE_LOCAL_BUS"
+_GET_CACHE_DIR_ENV = "AIRC_GH_GET_CACHE_DIR"
+_GET_CACHE_SEC_ENV = "AIRC_GH_GET_CACHE_SEC"
 _SEEN_PAYLOAD_MAX = 5000
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -162,6 +166,79 @@ def _local_bus_read_from(gist_id: str, byte_offset: int, peer_meta: Optional[dic
     return (text.splitlines(), new_offset)
 
 
+def _get_cache_ttl(poll_interval: float) -> float:
+    raw = os.environ.get(_GET_CACHE_SEC_ENV)
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
+    if poll_interval <= 0:
+        return 0.0
+    # Coalesce same-machine monitor polls without materially delaying
+    # cross-machine delivery. Send/patch paths do not use this cache.
+    return min(2.0, max(0.0, poll_interval / 3.0))
+
+
+def _get_cache_path(gist_id: str) -> str:
+    root = os.environ.get(_GET_CACHE_DIR_ENV)
+    if not root:
+        uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+        root = os.path.join(tempfile.gettempdir(), f"airc-gh-get-cache-{uid}")
+    return os.path.join(root, f"{_safe_gist_id(gist_id)}.json")
+
+
+def _load_cached_get(gist_id: str, max_age: float) -> Optional[dict]:
+    if max_age <= 0:
+        return None
+    path = _get_cache_path(gist_id)
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > max_age:
+            return None
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict) and isinstance(loaded.get("gist"), dict):
+            return loaded["gist"]
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _save_cached_get(gist_id: str, gist: dict) -> None:
+    path = _get_cache_path(gist_id)
+    directory = os.path.dirname(path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"gist": gist}, f)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _gh_api_get_for_recv(gist_id: str, max_age: float) -> Tuple[Optional[dict], str]:
+    cached = _load_cached_get(gist_id, max_age)
+    if cached is not None:
+        return (cached, "delivered")
+    gist, kind = _gh_api_get_classified(gist_id)
+    if gist is not None:
+        _save_cached_get(gist_id, gist)
+    return (gist, kind)
+
+
 def _resolve_gh_bin() -> str:
     """Locate gh CLI on PATH. Returns the path or raises GhBearerError.
 
@@ -189,8 +266,9 @@ def _has_gh_auth() -> bool:
     except GhBearerError:
         return False
     try:
-        r = subprocess.run(
-            [gh, "auth", "status"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["auth", "status"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -290,8 +368,9 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         _gh_api_get._last_err = "secondary rate limit backoff active"  # type: ignore[attr-defined]
         return None
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", f"gists/{gist_id}"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", f"gists/{gist_id}"],
             capture_output=True,
             text=True,
             timeout=_GH_API_TIMEOUT,
@@ -381,8 +460,9 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
         return (False, "secondary rate limit backoff active")
     body = json.dumps({"files": {_MESSAGES_FILE: {"content": content}}})
     try:
-        r = subprocess.run(
-            [gh, "api", "--include", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
+        r = gh_backoff.run_gh(
+            gh,
+            ["api", "--include", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
             input=body,
             capture_output=True,
             text=True,
@@ -592,8 +672,8 @@ def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
         else:
             argv = [gh, "gist", "edit", gist_id, "-a", path]    # add new
         try:
-            r = subprocess.run(
-                argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
+            r = gh_backoff.run_gh(
+                gh, argv[1:], capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return (False, f"gh gist edit failed: {e}")
@@ -607,8 +687,8 @@ def _gh_gist_write_file(gist_id: str, content: str) -> tuple[bool, str]:
             else [gh, "gist", "edit", gist_id, "-a", path]
         )
         try:
-            r2 = subprocess.run(
-                alt_argv, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
+            r2 = gh_backoff.run_gh(
+                gh, alt_argv[1:], capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return (False, f"gh gist edit retry failed: {e}")
@@ -819,6 +899,100 @@ class GhBearer(Bearer):
             detail=f"concurrent-write conflict after {RETRIES} retries; last: {last_detail}; local bus: {local_detail}",
         )
 
+    def send_many(self, peer_id: str, channel: str, payloads: list[bytes]) -> SendOutcome:
+        """Append a queued batch to the room gist with one GET/PATCH cycle.
+
+        The queue flusher may have many pending lines after a network or
+        GitHub throttle window. Replaying them through send() one at a
+        time turns recovery into another burst of API calls. Gh gist is an
+        append surface, so batch the queued JSONL into a single content
+        update and verify every payload landed.
+        """
+        self._check_alive()
+        if not payloads:
+            return SendOutcome(kind="delivered", detail="0 payload(s)")
+
+        gist_id = self._peer_meta.get("room_gist_id")
+        if not gist_id:
+            raise GhBearerError(
+                f"GhBearer.send_many called for peer_id={peer_id!r} with no room_gist_id"
+            )
+
+        framed_lines: list[str] = []
+        for payload in payloads:
+            framed = payload if payload.endswith(b"\n") else payload + b"\n"
+            try:
+                framed_lines.append(framed.decode("utf-8"))
+            except UnicodeDecodeError:
+                return SendOutcome(
+                    kind="transient_failure",
+                    detail="payload is not utf-8; gh-bearer requires text envelopes",
+                )
+        batch_content = "".join(framed_lines)
+
+        local_ok = True
+        local_detail = ""
+        for line in framed_lines:
+            ok, detail = _local_bus_append(gist_id, line, self._peer_meta)
+            if not ok:
+                local_ok = False
+                local_detail = detail
+
+        RETRIES = 8
+        last_detail = ""
+        for attempt in range(RETRIES):
+            gist, get_kind = _gh_api_get_classified(gist_id)
+            if gist is None:
+                if local_ok and get_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered batch via local bus; gh publish deferred ({get_kind})",
+                    )
+                if get_kind in ("gone", "secondary_rate_limit", "auth_failure"):
+                    return SendOutcome(
+                        kind=get_kind,
+                        detail=f"GET gists/{gist_id} failed: {get_kind}",
+                    )
+                return SendOutcome(
+                    kind="transient_failure",
+                    detail=f"could not fetch gist {gist_id} (network/5xx/timeout)",
+                )
+
+            existing = _read_messages_content(gist)
+            new_content = _rotate_if_needed(_rotate_if_needed(existing) + batch_content)
+
+            ok, detail, patch_kind = _gh_api_patch_classified(gist_id, new_content)
+            if not ok:
+                last_detail = detail
+                if patch_kind == "conflict":
+                    _time.sleep(_jittered_backoff(attempt))
+                    continue
+                if local_ok and patch_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered batch via local bus; gh publish deferred ({patch_kind})",
+                    )
+                return SendOutcome(kind=patch_kind, detail=detail)
+
+            verify, _verify_kind = _gh_api_get_classified(gist_id)
+            if verify is None:
+                return SendOutcome(kind="delivered", detail=f"{len(framed_lines)} payload(s)")
+            content = _read_messages_content(verify)
+            if all(line.rstrip("\n") in content for line in framed_lines):
+                return SendOutcome(kind="delivered", detail=f"{len(framed_lines)} payload(s)")
+            last_detail = "verify-after-write: one or more batch lines missing post-PATCH"
+            _time.sleep(_jittered_backoff(attempt))
+
+        if local_ok:
+            return SendOutcome(
+                kind="delivered",
+                detail=f"delivered batch via local bus; gh conflict after {RETRIES} retries; last: {last_detail}",
+            )
+        return SendOutcome(
+            kind="transient_failure",
+            detail=f"batch conflict after {RETRIES} retries; last: {last_detail}; local bus: {local_detail}",
+        )
+
     def recv_stream(self) -> Iterator[ReceivedMessage]:
         """Poll the room gist on a cadence; yield new envelopes.
 
@@ -847,8 +1021,15 @@ class GhBearer(Bearer):
                 yield msg
                 if self._closed:
                     return
-            gist, get_kind = _gh_api_get_classified(gist_id)
+            gist, get_kind = _gh_api_get_for_recv(
+                gist_id,
+                _get_cache_ttl(self._poll_interval),
+            )
             if gist is None:
+                if get_kind == "gone":
+                    raise GhBearerError(
+                        f"room gist {gist_id} returned 404 (gone)"
+                    )
                 if get_kind == "secondary_rate_limit":
                     delay = max(self._poll_interval, gh_backoff.backoff_until() - _time.time(), 60.0)
                     self._sleep_or_break(delay)
