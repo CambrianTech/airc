@@ -165,17 +165,70 @@ _join_transport_in_startup_grace() {
 }
 
 _join_restart_scope_processes() {
+  # This is a best-effort cleanup function. Pipefail + set -e applied
+  # to its multi-source PID assembly is fatal: pgrep (via
+  # proc_airc_pids_matching) returns 1 when no matches, the pipefail
+  # pipeline propagates the 1, and the simple var assignment then
+  # triggers set -e — killing the whole airc process partway through
+  # cleanup. The fix is per-line `|| true` shielding around each
+  # substitution that may legitimately exit non-zero on a clean tree
+  # (no formatters, no bearer pidfiles, no transport pids).
   local _pids=""
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
-    _pids="$_pids $(cat "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null | tr '\n' ' ')"
+    _pids="$_pids $(cat "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null | tr '\n' ' ' || true)"
   fi
-  _pids="$_pids $(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | tr '\n' ' ')"
+  _pids="$_pids $(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | tr '\n' ' ' || true)"
   local _pidfile
   for _pidfile in "$AIRC_WRITE_DIR"/bearer_gist.*.pid; do
     [ -f "$_pidfile" ] || continue
-    _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || true)"
   done
-  _pids="$_pids $(_join_scope_transport_pids 2>/dev/null | tr '\n' ' ')"
+  _pids="$_pids $(_join_scope_transport_pids 2>/dev/null | tr '\n' ' ' || true)"
+  # Self-kill guard with cmdline verification. Two failure shapes
+  # combine to make this function lethal-to-self otherwise:
+  #
+  #   (1) After `_reexec_into host` the new airc inherits the same
+  #       PID as the pre-exec instance, so airc.pid (written by the
+  #       pre-exec airc with $$) names US. Filtering $$/$PPID handles
+  #       this — same defense already used by _join_scope_transport_pids
+  #       at line 211-212.
+  #
+  #   (2) OS PID recycling. The other PID sources (airc.pid contents
+  #       from a crashed predecessor, bearer_gist.*.pid stragglers)
+  #       can name a slot the kernel has since reassigned to an
+  #       unrelated process — including, on Windows WSL2, the parent
+  #       wsl.exe / cmd.exe shell in our launcher chain. Killing one
+  #       of those takes Claude Code's Monitor down with us. Joel hit
+  #       this exact shape in #97 / #446 in a different code path; the
+  #       fix there ("verify cmdline before treating PID as ours") was
+  #       never propagated here. Without this guard, _join_restart_scope_processes
+  #       was the last self-killer left in the join cold-start path.
+  #
+  # Filter rules:
+  #   - drop non-numeric / empty entries (already a no-op)
+  #   - drop $$ and $PPID (case 1)
+  #   - drop any PID whose cmdline doesn't look like airc/airc_core
+  #     (case 2). Same regex shape as the stale-pidfile check at
+  #     ~line 971 and cmd_teardown's parent-chain reaper.
+  local _self_filtered_pids="" _candidate _candidate_cmd
+  for _candidate in $_pids; do
+    case "$_candidate" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$_candidate" = "$$" ] && continue
+    [ "$_candidate" = "$PPID" ] && continue
+    # Live PID? If the slot is empty the candidate is already gone —
+    # nothing to kill, no risk of misidentification.
+    kill -0 "$_candidate" 2>/dev/null || continue
+    _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
+    case "$_candidate_cmd" in
+      *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
+      *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
+      *) continue ;;
+    esac
+    _self_filtered_pids="$_self_filtered_pids $_candidate"
+  done
+  _pids="$_self_filtered_pids"
   local _p _c
   for _p in $_pids; do
     case "$_p" in ''|*[!0-9]*) continue ;; esac
