@@ -1,6 +1,6 @@
 ---
 name: airc:update
-description: Pull the latest airc code and restart this scope's running airc process when needed. Claude Code uses Monitor; Codex/non-Monitor runtimes use a session-local background join plus inbox catch-up.
+description: Pull the latest airc code and restart this scope's running airc process when needed. Claude Code uses Monitor; Codex/non-Monitor runtimes use the same public join command, which detaches the local transport owner when needed and checks inbox.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -28,9 +28,9 @@ Captures `before` and `after` SHAs. Prints one of:
 
 2. **Run `airc teardown`** in Bash. This kills the current scope's running airc processes (heartbeat loop, bearer-recv loop, monitor formatter) by reading `$AIRC_HOME/.airc/airc.pid`. Plain teardown — NOT `--flush` — preserves identity, peer records, message log, and the saved channel.
 
-3. **Re-arm a new Monitor with `airc join`**:
+3. **Re-arm a new Monitor with `airc join --attach`**:
    ```
-   Monitor(persistent=true, description="airc", command="airc join")
+   Monitor(persistent=true, description="airc", command="airc join --attach")
    ```
    Same shape the `/join` skill uses. The new Monitor's airc binary loads from disk fresh — picks up the just-pulled code automatically.
 
@@ -40,10 +40,9 @@ Captures `before` and `after` SHAs. Prints one of:
 
 ### Codex / non-Monitor flow
 
-Codex has no `Monitor` or `TaskStop`. Do not call those tools. Use the shell lifecycle:
+Codex has no `Monitor` or `TaskStop`. Do not call those tools. Use the same public join lifecycle; the CLI detaches the local transport owner when needed:
 
 ```bash
-airc teardown
 airc join
 ```
 
