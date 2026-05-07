@@ -22,6 +22,57 @@
 # heartbeat are clearly separable), but step 1 is splitting it out of
 # the top-level monolith without changing behavior.
 
+# ── Cold-start phase telemetry ─────────────────────────────────────────
+# Codex/Joel-spec'd UX follow-up to #545/#546: emit "→ [t+Ns] phase…"
+# lines at the top of slow operations so a user staring at a Monitor
+# task can tell "still working" from "hung." Without this, Windows
+# Monitor cold-starts produced 30-60s of total silence followed by a
+# flood of host-setup output — indistinguishable from a hang.
+#
+# Design: t0 is anchored via $AIRC_WRITE_DIR/.cold_start_t0 (a unix
+# timestamp). The file is created on first phase emission and survives
+# across `_reexec_into host` (same scope, no env passing required).
+# The end-of-cold-start cleanup ("monitor stream attached") removes
+# the marker so the next `airc join` against an already-warm scope
+# starts from t0=0 again, not "minutes since the laptop's last boot."
+#
+# Output goes to BOTH stdout (so Monitor surfaces it as user-facing
+# events) AND $AIRC_WRITE_DIR/airc-transport.log (so post-mortem
+# traces show where the time went, even if the user closed the tab).
+_join_phase() {
+  local _t0_file="${AIRC_WRITE_DIR:-}/.cold_start_t0"
+  local _now _t0 _elapsed
+  _now=$(date +%s 2>/dev/null) || _now=0
+  if [ -n "${AIRC_WRITE_DIR:-}" ] && [ ! -f "$_t0_file" ]; then
+    mkdir -p "$AIRC_WRITE_DIR" 2>/dev/null || true
+    printf '%s\n' "$_now" > "$_t0_file" 2>/dev/null || true
+    _t0="$_now"
+  elif [ -f "$_t0_file" ]; then
+    _t0=$(cat "$_t0_file" 2>/dev/null || echo "$_now")
+  else
+    _t0="$_now"
+  fi
+  case "$_t0" in ''|*[!0-9]*) _t0="$_now" ;; esac
+  _elapsed=$(( _now - _t0 ))
+  [ "$_elapsed" -lt 0 ] 2>/dev/null && _elapsed=0
+  printf '  → [t+%ds] %s\n' "$_elapsed" "$*"
+  if [ -n "${AIRC_WRITE_DIR:-}" ] && [ -d "$AIRC_WRITE_DIR" ]; then
+    printf '%s [t+%ds phase] %s\n' \
+      "$(date -u +%FT%TZ 2>/dev/null || echo "?")" \
+      "$_elapsed" "$*" \
+      >> "$AIRC_WRITE_DIR/airc-transport.log" 2>/dev/null || true
+  fi
+}
+
+# Clear the cold-start anchor — call once monitor stream is attached
+# and the scope is in steady state. Without this, every subsequent
+# `airc join` (which re-enters cmd_connect on each tab restart) would
+# show "[t+86400s]" instead of fresh phase numbers.
+_join_phase_done() {
+  local _t0_file="${AIRC_WRITE_DIR:-}/.cold_start_t0"
+  [ -f "$_t0_file" ] && rm -f "$_t0_file" 2>/dev/null || true
+}
+
 # ensure_channel_subscribed_with_gist <channel> [--first]
 #
 # Single-concern helper: make this scope a fully-functional subscriber
@@ -478,6 +529,19 @@ _join_parent_chain_looks_like_claude_monitor() {
 
 cmd_connect() {
   local _orig_args=("$@")
+  # Stale cold-start anchor cleanup. If a previous airc join crashed
+  # before _join_phase_done could run, the .cold_start_t0 marker
+  # would linger forever and `airc status` would show a perpetually-
+  # rising "starting (t+86400s)". Clear stale (>10min) anchors at the
+  # top of each new cmd_connect so a fresh phase clock starts cleanly.
+  if [ -n "${AIRC_WRITE_DIR:-}" ] && [ -f "$AIRC_WRITE_DIR/.cold_start_t0" ]; then
+    local _stale_t0; _stale_t0=$(cat "$AIRC_WRITE_DIR/.cold_start_t0" 2>/dev/null || echo 0)
+    case "$_stale_t0" in ''|*[!0-9]*) _stale_t0=0 ;; esac
+    local _stale_now; _stale_now=$(date +%s 2>/dev/null) || _stale_now=0
+    if [ $((_stale_now - _stale_t0)) -gt 600 ] 2>/dev/null; then
+      rm -f "$AIRC_WRITE_DIR/.cold_start_t0" 2>/dev/null || true
+    fi
+  fi
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
   #   default (no gh OR gh not authed): long invite only (today's behavior)
@@ -1110,6 +1174,7 @@ cmd_connect() {
     # no longer drives gist discovery — every subscriber on the account
     # converges on the same host.
     _did_room_discovery=1
+    _join_phase "querying gh for mesh on this account (#${room_name})"
     local _mesh_id; _mesh_id=$(_mesh_find_any "$room_name")
     if [ -n "$_mesh_id" ]; then
       local _mesh_invite_id; _mesh_invite_id=$(_mesh_find "$room_name")
@@ -1234,6 +1299,7 @@ cmd_connect() {
     # Gist IDs are hex strings, typically 20-32 chars but accept any
     # plausible length so future GH ID schemes don't break us.
     if echo "$gist_id" | grep -qE '^[a-zA-Z0-9]{6,40}$'; then
+      _join_phase "resolving room gist contents ($gist_id)"
       echo "  Resolving gist $gist_id ..."
       local raw_content=""
       # Each path's `raw_content=$(cmd | filter)` is protected with
@@ -1444,6 +1510,7 @@ cmd_connect() {
     if [ "$_resolved_heartbeat_stale" = "1" ] && [ -n "$resolved_room_name" ] \
        && [ -n "$_resolved_gist_id" ]; then
       echo ""
+      _join_phase "taking over stale host (re-exec into host mode)"
       echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over existing mesh..."
       echo "     (prior host's gist: $_resolved_gist_id)"
       _self_heal_stale_host "$_resolved_gist_id"
@@ -1849,8 +1916,11 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       for p in $(proc_children $$); do kill $p 2>/dev/null; done
     ' EXIT INT TERM
 
+    _join_phase "subscribing to #general (sidecar)"
     spawn_general_sidecar_if_wanted
     _join_emit_join_events "$my_name"
+    _join_phase "monitor stream attached — cold start complete"
+    _join_phase_done
     echo "  Monitoring for messages..."
     monitor
 
@@ -1902,6 +1972,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
 
     echo ""
     [ "$host_port" != "$original_port" ] && echo "  Port $original_port was taken; using $host_port."
+    _join_phase "hosting as '$name' — bootstrapping room gist"
     echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
     local _invite_long="${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
@@ -2121,6 +2192,11 @@ JSON
         # ID itself is the secret. Same threat model as the long invite:
         # whoever holds the string can pair. Room gists persist; invite
         # gists should be deleted by the host after the first joiner.
+        if [ -n "${_existing_room_gid:-}" ] && [ "$use_room" = "1" ]; then
+          _join_phase "publishing host lease to existing room gist"
+        else
+          _join_phase "creating new room gist on this gh account"
+        fi
         local _gist_url=""
         if [ -n "${_existing_room_gid:-}" ] && [ "$use_room" = "1" ]; then
           if gh gist edit "$_existing_room_gid" "$_gist_tmp" >/dev/null 2>/dev/null \
@@ -2475,8 +2551,11 @@ JSON
       [ "$_exit_restart" = "99" ] && exit 99
     ' EXIT INT TERM
 
+    _join_phase "subscribing to #general (host-mode sidecar)"
     spawn_general_sidecar_if_wanted
     _join_emit_join_events "$name"
+    _join_phase "monitor stream attached — cold start complete"
+    _join_phase_done
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null

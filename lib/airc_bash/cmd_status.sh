@@ -254,6 +254,24 @@ cmd_status() {
     fi
   elif [ -f "$pidfile" ]; then
     monitor_state="stale pidfile (no live PIDs — run 'airc join' to self-heal)"
+  elif [ -f "$AIRC_WRITE_DIR/.cold_start_t0" ]; then
+    # Cold-start anchor exists but no airc.pid yet — airc join is
+    # still in the slow-discovery / handshake / takeover phase. Tell
+    # the user that explicitly so "not running" doesn't read as
+    # "broken." Cleared by _join_phase_done once monitor stream
+    # attaches. Stale-marker guard: if the anchor is >10min old we
+    # treat it as orphaned (a join crashed without cleanup); fall
+    # back to "not running" so the user gets the actionable message
+    # instead of a perpetually-rising "starting (t+50000s)".
+    local _t0; _t0=$(cat "$AIRC_WRITE_DIR/.cold_start_t0" 2>/dev/null || echo 0)
+    case "$_t0" in ''|*[!0-9]*) _t0=0 ;; esac
+    local _now _elapsed
+    _now=$(date +%s 2>/dev/null) || _now=0
+    _elapsed=$(( _now - _t0 ))
+    [ "$_elapsed" -lt 0 ] 2>/dev/null && _elapsed=0
+    if [ "$_elapsed" -le 600 ] 2>/dev/null; then
+      monitor_state="starting (airc join cold-start in progress, t+${_elapsed}s)"
+    fi
   fi
   echo "  airc process: $monitor_state"
   _airc_monitor_health_report all
