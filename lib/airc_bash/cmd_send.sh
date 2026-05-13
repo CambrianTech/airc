@@ -244,6 +244,22 @@ cmd_send() {
     fi
   }
 
+  _airc_codex_poll_after_user_send() {
+    [ -n "${CODEX_THREAD_ID:-}${CODEX_CI:-}${CODEX_MANAGED_BY_NPM:-}" ] || return 0
+    [ "${AIRC_CODEX_POLL_AFTER_SEND:-1}" != "0" ] || return 0
+
+    local _poll_count="${AIRC_CODEX_SEND_POLL_COUNT:-50}"
+    case "$_poll_count" in
+      ''|*[!0-9]*|0) _poll_count=50 ;;
+    esac
+    local _poll_since="${AIRC_CODEX_SEND_POLL_SINCE:-10m}"
+
+    local _poll_out
+    _poll_out=$(AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --since "$_poll_since" --count "$_poll_count" 2>&1) || return 0
+    [ -n "$_poll_out" ] && printf '%s\n' "$_poll_out"
+    return 0
+  }
+
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)
@@ -726,6 +742,7 @@ cmd_send() {
       "$AIRC_PYTHON" -m airc_core.collaboration send-warning \
         --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" 2>/dev/null || true
     fi
+    _airc_codex_poll_after_user_send
   fi
 }
 

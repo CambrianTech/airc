@@ -119,9 +119,13 @@ def cmd_read(args: argparse.Namespace) -> int:
                 except Exception:
                     last_offset = next_offset
                     continue
-                if args.exclude_self and args.client_id and line.get("client_id") == args.client_id:
-                    last_offset = next_offset
-                    continue
+                if args.exclude_self:
+                    if args.client_id and line.get("client_id") == args.client_id:
+                        last_offset = next_offset
+                        continue
+                    if not args.client_id and args.my_name and line.get("from") == args.my_name:
+                        last_offset = next_offset
+                        continue
                 if since_dt is not None:
                     dt = _msg_dt(line)
                     if dt is None or dt <= since_dt:

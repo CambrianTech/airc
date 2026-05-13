@@ -75,6 +75,44 @@ class InboxTests(unittest.TestCase):
             self.assertNotIn("old", text)
             self.assertIn("new", text)
 
+    def test_exclude_self_uses_sender_fallback_only_without_client_id(self):
+        tmp, home, cursor = self._scope()
+        with tmp:
+            log = home / "messages.jsonl"
+            log.write_text(
+                self._line("me", "2099-05-04T20:00:00Z", "legacy self")
+                + self._line("me", "2099-05-04T20:00:01Z", "same-name peer")
+                + self._line("peer", "2099-05-04T20:00:02Z", "visible"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with redirect_stdout(out):
+                inbox.main(["read", "--home", str(home), "--cursor-file", str(cursor), "--exclude-self", "--my-name", "me"])
+            text = out.getvalue()
+            self.assertNotIn("legacy self", text)
+            self.assertNotIn("same-name peer", text)
+            self.assertIn("visible", text)
+
+            cursor.unlink()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                inbox.main([
+                    "read",
+                    "--home",
+                    str(home),
+                    "--cursor-file",
+                    str(cursor),
+                    "--exclude-self",
+                    "--my-name",
+                    "me",
+                    "--client-id",
+                    "self-client",
+                ])
+            text = out.getvalue()
+            self.assertIn("legacy self", text)
+            self.assertIn("same-name peer", text)
+            self.assertIn("visible", text)
+
 
 if __name__ == "__main__":
     unittest.main()
