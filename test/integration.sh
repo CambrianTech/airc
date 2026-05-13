@@ -4041,6 +4041,45 @@ scenario_inbox() {
     && printf '%s' "$out" | grep -q 'hook-visible' \
     && pass "codex-hook emits UserPromptSubmit context for unread local messages" \
     || fail "codex-hook did not emit expected UserPromptSubmit JSON: $out"
+
+  local send_root=/tmp/airc-it-inbox-send
+  local send_home="$send_root/state"
+  rm -rf "$send_root"
+  mkdir -p "$send_home" "$send_root/bin"
+  echo '{"name":"send-poll-test","subscribed_channels":["general"]}' > "$send_home/config.json"
+  scaffold_identity "$send_home/identity" "send-poll-test" || fail "codex send-poll identity scaffold failed"
+  {
+    printf '%s\n' '{"ts":"2026-05-04T10:04:00Z","from":"peer-test","client_id":"peer-client","msg":"old-backlog-hidden"}'
+    printf '%s\n' '{"ts":"2099-05-04T10:04:00Z","from":"peer-test","client_id":"peer-client","msg":"send-trigger-visible"}'
+  } > "$send_home/messages.jsonl"
+  printf '#!/bin/sh\nsleep 60\n' > "$send_root/bin/airc"
+  chmod +x "$send_root/bin/airc"
+  "$send_root/bin/airc" connect >/dev/null 2>&1 &
+  local dummy_pid=$!
+  echo "$dummy_pid" > "$send_home/airc.pid"
+  out=$(AIRC_CLIENT_ID=test-client CODEX_THREAD_ID=test-thread AIRC_HOME="$send_home" "$AIRC" msg "self send should be filtered" 2>&1)
+  cursor=$(cat "$send_home/inbox_cursor" 2>/dev/null || true)
+  kill "$dummy_pid" 2>/dev/null || true
+  wait "$dummy_pid" 2>/dev/null || true
+  printf '%s' "$out" | grep -q 'send-trigger-visible' \
+    && ! printf '%s' "$out" | grep -q 'self send should be filtered' \
+    && ! printf '%s' "$out" | grep -q 'old-backlog-hidden' \
+    && printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
+    && pass "codex airc msg triggers recent quiet self-filtered inbox poll" \
+    || fail "codex airc msg did not poll unread messages; cursor='$cursor' output: $out"
+
+  "$send_root/bin/airc" connect >/dev/null 2>&1 &
+  dummy_pid=$!
+  echo "$dummy_pid" > "$send_home/airc.pid"
+  if out=$(AIRC_CLIENT_ID=test-client CODEX_THREAD_ID=test-thread AIRC_HOME="$send_home" "$AIRC" msg "second self send should stay quiet" 2>&1); then
+    ! printf '%s' "$out" | grep -q 'second self send should stay quiet' \
+      && pass "codex airc msg exits zero when post-send poll is empty" \
+      || fail "empty post-send poll echoed self message: $out"
+  else
+    fail "codex airc msg returned nonzero when post-send poll was empty: $out"
+  fi
+  kill "$dummy_pid" 2>/dev/null || true
+  wait "$dummy_pid" 2>/dev/null || true
 }
 
 scenario_host_msg_publishes_to_gist() {

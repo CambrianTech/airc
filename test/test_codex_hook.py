@@ -115,6 +115,35 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(out.getvalue(), "")
 
+    def test_user_prompt_hook_filters_own_rows_when_client_id_missing(self):
+        tmp, home, cursor = self._scope()
+        with tmp:
+            (home / "messages.jsonl").write_text(
+                self._line("me", "2099-05-04T20:00:00Z", "own fallback")
+                + self._line("peer", "2099-05-04T20:00:01Z", "peer visible", "peer-client"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO("{}")):
+                with redirect_stdout(out):
+                    rc = codex_hook.main(
+                        [
+                            "user-prompt-submit",
+                            "--home",
+                            str(home),
+                            "--cursor-file",
+                            str(cursor),
+                            "--my-name",
+                            "me",
+                            "--client-id",
+                            "",
+                        ]
+                    )
+            self.assertEqual(rc, 0)
+            context = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("peer: peer visible", context)
+            self.assertNotIn("me: own fallback", context)
+
     def test_codex_hook_installer_preserves_existing_hooks(self):
         tmp = tempfile.TemporaryDirectory()
         with tmp:
