@@ -49,6 +49,7 @@ def _make_recording_gh(tmp: str, exit_code: int = 0,
       - records every --body argument text to record_dir/body-arg.txt
         (so the test can assert it's NEVER touched)
       - records the full argv to record_dir/argv.txt
+      - records `issue close` argv to record_dir/close-argv.txt
       - exits with `exit_code` after printing stdout/stderr
     Returns (gh_path, record_dir).
     """
@@ -67,6 +68,7 @@ def _make_recording_gh(tmp: str, exit_code: int = 0,
         '  case "$1" in\n'
         '    --body-file)\n'
         '      shift\n'
+        '      cat "$RECORD_DIR/argv.txt" > "$RECORD_DIR/body-argv.txt"\n'
         '      cp "$1" "$RECORD_DIR/body.txt" 2>/dev/null || true\n'
         '      shift\n'
         '      ;;\n'
@@ -78,6 +80,9 @@ def _make_recording_gh(tmp: str, exit_code: int = 0,
         '    *) shift ;;\n'
         '  esac\n'
         'done\n'
+        'case "$(cat "$RECORD_DIR/argv.txt" 2>/dev/null | head -2 | tr "\\n" " ")" in\n'
+        '  "issue close "*) cat "$RECORD_DIR/argv.txt" > "$RECORD_DIR/close-argv.txt" ;;\n'
+        'esac\n'
         f'printf "%s" {repr(stdout_text)}\n'
         + (f'printf "%s" {repr(stderr_text)} >&2\n' if stderr_text else '')
         + 'exit $EXIT_CODE\n',
@@ -135,6 +140,39 @@ def _run_helper_directly(body: str, gh_args: list[str], tmp: str,
         '  BODY="$BODY"$\'\\n\'\n'
         'fi\n'
         f'_airc_gh_safe_body "$BODY" {inline_args}\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", bash_script],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    return result, record_dir
+
+
+def _run_safe_close_directly(comment: str, tmp: str,
+                             exit_code: int = 0,
+                             stdout_text: str = "ok\n",
+                             stderr_text: str = "",
+                             issue_num: str = "9",
+                             repo: str = "owner/repo"
+                             ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
+    """Call _airc_gh_safe_issue_close with a recording fake gh."""
+    gh, record_dir = _make_recording_gh(tmp, exit_code=exit_code,
+                                        stdout_text=stdout_text,
+                                        stderr_text=stderr_text)
+    env = _isolated_env(tmp)
+    env["PATH"] = f"{gh.parent}:/usr/bin:/bin"
+    comment_file = pathlib.Path(tmp) / "close-comment.txt"
+    comment_file.write_text(comment, encoding="utf-8")
+    env["COMMENT_FILE"] = str(comment_file)
+    env["ISSUE_NUM"] = issue_num
+    env["REPO"] = repo
+    bash_script = (
+        f'source "{LIB_GH}"\n'
+        'COMMENT=$(cat -- "$COMMENT_FILE")\n'
+        'if [ "$(tail -c 1 -- "$COMMENT_FILE" | od -An -c | tr -d " ")" = "\\n" ]; then\n'
+        '  COMMENT="$COMMENT"$\'\\n\'\n'
+        'fi\n'
+        '_airc_gh_safe_issue_close "$ISSUE_NUM" "$REPO" "$COMMENT"\n'
     )
     result = subprocess.run(
         ["bash", "-c", bash_script],
@@ -272,6 +310,48 @@ class HelperErrorPathTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2,
                          "missing args must return 2, not silently call gh")
         self.assertIn("_airc_gh_safe_body", result.stderr)
+
+
+class SafeIssueCloseTests(unittest.TestCase):
+    """Closeout comments use body-file, then close without inline comment."""
+
+    def test_close_comment_uses_body_file_then_plain_close(self) -> None:
+        comment = (
+            "Closed after PR #1.\n\n"
+            "Literal markdown must survive: `airc queue nudge owner/repo` and $(date).\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, record_dir = _run_safe_close_directly(comment, tmp)
+            round_tripped = (record_dir / "body.txt").read_text(encoding="utf-8")
+            body_argv = (record_dir / "body-argv.txt").read_text(encoding="utf-8").splitlines()
+            close_argv = (record_dir / "close-argv.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(round_tripped, comment)
+        self.assertIn("--body-file", body_argv)
+        self.assertNotIn("--body", body_argv)
+        self.assertEqual(close_argv[:3], ["issue", "close", "9"])
+        self.assertNotIn("--comment", close_argv,
+                         "issue close must not receive inline Markdown comment")
+
+    def test_close_without_comment_does_not_post_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, record_dir = _run_safe_close_directly("", tmp)
+            body_file_seen = (record_dir / "body.txt").exists()
+            close_argv = (record_dir / "close-argv.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(body_file_seen, "empty comment must not call issue comment")
+        self.assertEqual(close_argv[:3], ["issue", "close", "9"])
+
+    def test_safe_close_missing_args_returns_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'source "{LIB_GH}"; _airc_gh_safe_issue_close'],
+                capture_output=True, text=True, env=env, timeout=5,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("_airc_gh_safe_issue_close", result.stderr)
 
 
 class CallSiteWiringTests(unittest.TestCase):

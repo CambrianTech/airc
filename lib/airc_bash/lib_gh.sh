@@ -33,6 +33,9 @@
 # Functions exported:
 #   _airc_gh_safe_body — write a body to a temp file and call gh with
 #                        --body-file. See doc-comment on the function.
+#   _airc_gh_safe_issue_close — close an issue with an optional Markdown
+#                               comment without ever passing that comment
+#                               through `gh issue close --comment`.
 # ----------------------------------------------------------------------
 
 _airc_gh_safe_body() {
@@ -103,4 +106,55 @@ _airc_gh_safe_body() {
   # contract as $(gh ... 2>&1) which the call sites previously used.
   printf '%s' "$out"
   return $rc
+}
+
+_airc_gh_safe_issue_close() {
+  # Close a GitHub issue safely when the closeout comment is Markdown.
+  #
+  # USAGE
+  #   _airc_gh_safe_issue_close <issue-number> <repo> [comment]
+  #
+  # WHY not `gh issue close --comment "$comment"`
+  #   GitHub CLI does not provide --comment-file for issue close. Passing
+  #   Markdown with backticks through inline shell command strings has
+  #   repeatedly triggered command substitution in agent-written closeout
+  #   commands. This helper avoids that class by posting the comment through
+  #   _airc_gh_safe_body (`gh issue comment --body-file`) and then closing
+  #   the issue with no inline body.
+  #
+  # CONTRACT
+  #   - If comment is non-empty: posts it first via safe body-file path.
+  #   - Then runs `gh issue close <issue> --repo <repo>`.
+  #   - Stdout/stderr from both operations is folded to stdout.
+  #   - Return code is non-zero if either operation fails.
+  if [ "$#" -lt 2 ]; then
+    printf 'airc: _airc_gh_safe_issue_close needs <issue-number> <repo> [comment]\n' >&2
+    return 2
+  fi
+
+  local issue_num="$1"
+  local repo="$2"
+  local comment="${3:-}"
+  local out=""
+  local close_out=""
+
+  if [ -n "$comment" ]; then
+    if ! out=$(_airc_gh_safe_body "$comment" issue comment "$issue_num" --repo "$repo"); then
+      printf '%s' "$out"
+      return 1
+    fi
+  fi
+
+  if ! close_out=$(gh issue close "$issue_num" --repo "$repo" 2>&1); then
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+    fi
+    printf '%s' "$close_out"
+    return 1
+  fi
+
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
+  printf '%s' "$close_out"
 }
