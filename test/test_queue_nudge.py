@@ -68,6 +68,20 @@ Sample card for nudge tests.
 Close this issue when the work is done.
 '''
 
+SECOND_CARD_BODY = '''**airc-queue card**
+
+Second sample card.
+
+```json
+{
+  "kind": "airc-queue-card-v1",
+  "owner": "codex",
+  "status": "review",
+  "branch": "feat/repo-nudge"
+}
+```
+'''
+
 NON_CARD_BODY = '''Plain issue body with no airc-queue-card-v1 envelope.
 
 Just markdown, no JSON code block matching the kind we want.
@@ -87,17 +101,38 @@ def _isolated_env_with_fake_gh(tmp: str, body_response: str | None = None) -> di
     # Wrap in a JSON envelope so `gh issue view --json title,body` returns
     # a parseable shape — _cmd_queue_nudge consumes title+body together.
     import json
-    issue_blob = json.dumps({
+    issue = {
         "title": "Sample card for nudge tests",
         "body": body,
-    })
+    }
+    issue_blob = json.dumps(issue)
     issue_file = pathlib.Path(tmp) / "fake_issue.json"
     issue_file.write_text(issue_blob, encoding="utf-8")
+    issue_list = [
+        {
+            "number": 1,
+            "title": "airc-queue: Sample card for nudge tests",
+            "url": "https://github.com/owner/repo/issues/1",
+            "body": body,
+            "updatedAt": "2026-05-13T21:00:00Z",
+        },
+        {
+            "number": 2,
+            "title": "airc-queue: Repo nudge followup",
+            "url": "https://github.com/owner/repo/issues/2",
+            "body": SECOND_CARD_BODY,
+            "updatedAt": "2026-05-13T21:01:00Z",
+        },
+    ]
+    issue_list_file = pathlib.Path(tmp) / "fake_issue_list.json"
+    issue_list_file.write_text(json.dumps(issue_list), encoding="utf-8")
     gh_script = (
         "#!/bin/sh\n"
         f'ISSUE_FILE="{issue_file}"\n'
+        f'ISSUE_LIST_FILE="{issue_list_file}"\n'
         f'BODY_FILE="{body_file}"\n'
         "case \"$1 $2\" in\n"
+        "  'issue list') cat \"$ISSUE_LIST_FILE\" ;;\n"
         "  'issue view')\n"
         # If --json present (nudge calls), return the issue blob; else body.
         "    case \" $* \" in\n"
@@ -286,6 +321,56 @@ class QueueNudgeDryRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("owner/repo#1", result.stdout)
         self.assertNotIn("local: -n", result.stderr)
+
+
+class QueueRepoNudgeDryRunTests(unittest.TestCase):
+    def test_repo_scoped_nudge_sends_status_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "nudge", "owner/repo", "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn("repo-nudge:", out)
+        self.assertIn("owner/repo", out)
+        self.assertIn("#1 in-progress owner=claude-tab-1", out)
+        self.assertIn("#2 review owner=codex", out)
+        self.assertIn("pong with:", out)
+        self.assertIn("card=<owner/repo#N|idle>", out)
+        self.assertIn("claim=<keep|release|none>", out)
+
+    def test_repo_scoped_nudge_with_message_appends_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "nudge", "owner/repo",
+                 "--message", "Bueller status sweep",
+                 "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Bueller status sweep", result.stdout)
+
+    def test_repo_scoped_nudge_limit_must_be_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "nudge", "owner/repo", "--limit", "many", "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--limit", result.stdout + result.stderr)
+
+    def test_repo_scoped_nudge_does_not_require_queue_card_envelope_on_target(self) -> None:
+        # owner/repo is a repo scope, not a malformed issue URL. It should
+        # list cards and broadcast a sweep, not look for an envelope on
+        # a non-existent "repo issue".
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "nudge", "owner/repo", "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp, body_response=NON_CARD_BODY),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repo-nudge:", result.stdout)
 
 
 if __name__ == "__main__":
