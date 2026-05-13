@@ -10,6 +10,7 @@
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
 #                 pongs      — summarize repo-nudge pong replies.
+#                 close-merged — auto-close cards referenced by a merged PR.
 #
 # Verbs deferred to later PRs under airc#562:
 #   - heartbeat + stall detection (PR-4)
@@ -76,8 +77,11 @@ cmd_queue() {
     pongs|pong-summary)
       _cmd_queue_pongs "$@"
       ;;
+    close-merged)
+      _cmd_queue_close_merged "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, pongs)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, pongs, close-merged)"
       ;;
   esac
 }
@@ -357,6 +361,7 @@ USAGE
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
   airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID]
+  airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
 
 DESCRIPTION
   Adds, lists, or mutates queue cards (GitHub issues with airc-queue
@@ -369,6 +374,7 @@ VERB SCOPE
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
   pongs / pong-summary          Repo-nudge response collection (airc#579)
+  close-merged                 airc#576 — auto-close on PR merge to canary
   heartbeat / stall detection  PR-4 (deferred)
 
 EOF
@@ -1361,6 +1367,242 @@ PYEOF
   return "$py_status"
 }
 
+_cmd_queue_close_merged() {
+  # Auto-close queue cards referenced by a merged PR.
+  #
+  # Args:
+  #   airc queue close-merged <pr-url|owner/repo#PR> [--merge-sha SHA] [--actor X] [--dry-run]
+  #
+  # GitHub's native "Closes #N" only triggers when the PR merges into the
+  # default branch. AIRC uses canary first, so queue cards need a canary-time
+  # close path.
+  local pr_url=""
+  local merge_sha=""
+  local actor=""
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_close_merged_help
+        return 0
+        ;;
+      --merge-sha) shift; merge_sha="${1:-}" ;;
+      --actor)     shift; actor="${1:-}" ;;
+      --dry-run)   dry_run=1 ;;
+      -*) die "queue close-merged: unknown flag: $1" ;;
+      *)
+        if [ -z "$pr_url" ]; then
+          pr_url="$1"
+        else
+          die "queue close-merged: too many positional args (use: queue close-merged <pr-url> [--merge-sha SHA])"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$pr_url" ]; then
+    _airc_queue_close_merged_help >&2
+    return 1
+  fi
+
+  local pr_repo pr_num
+  if [[ "$pr_url" =~ ^https://github\.com/([^/]+/[^/]+)/(pull|pulls|issues)/([0-9]+) ]]; then
+    pr_repo="${BASH_REMATCH[1]}"
+    pr_num="${BASH_REMATCH[3]}"
+  elif [[ "$pr_url" =~ ^([^/]+/[^/]+)#([0-9]+)$ ]]; then
+    pr_repo="${BASH_REMATCH[1]}"
+    pr_num="${BASH_REMATCH[2]}"
+  else
+    die "queue close-merged: <pr-url> must be a GitHub PR URL or owner/repo#N (got: $pr_url)"
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue close-merged: 'gh' CLI is required."
+  fi
+
+  local pr_blob
+  if ! pr_blob=$(gh pr view "$pr_num" --repo "$pr_repo" --json body,mergedAt,mergeCommit,baseRefName,url 2>&1); then
+    die "queue close-merged: gh pr view failed for $pr_repo#$pr_num: $pr_blob"
+  fi
+
+  local pr_file
+  pr_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pr.XXXXXX") || die "queue close-merged: mktemp failed"
+  printf '%s' "$pr_blob" >"$pr_file"
+
+  local pr_meta
+  if ! pr_meta=$("$AIRC_PYTHON" - "$pr_file" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    pr = json.load(f)
+merged_at = pr.get("mergedAt") or ""
+base_ref = pr.get("baseRefName") or ""
+merge_commit = pr.get("mergeCommit") or {}
+sha = (merge_commit.get("oid") if isinstance(merge_commit, dict) else "") or ""
+body = pr.get("body") or ""
+url = pr.get("url") or ""
+print(f"{merged_at}\t{base_ref}\t{sha}\t{url}\t{len(body)}")
+PYEOF
+  ); then
+    rm -f "$pr_file"
+    die "queue close-merged: PR JSON parse failed"
+  fi
+
+  local pr_merged_at pr_base_ref pr_sha pr_canonical_url pr_body_len
+  pr_merged_at=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $1}')
+  pr_base_ref=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $2}')
+  pr_sha=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $3}')
+  pr_canonical_url=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $4}')
+  pr_body_len=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $5}')
+
+  if [ -z "$pr_merged_at" ]; then
+    rm -f "$pr_file"
+    die "queue close-merged: PR $pr_repo#$pr_num is not merged (mergedAt empty). Refusing to close cards from an unmerged PR."
+  fi
+
+  if [ -z "$merge_sha" ]; then
+    merge_sha="$pr_sha"
+  fi
+  if [ -z "$merge_sha" ]; then
+    rm -f "$pr_file"
+    die "queue close-merged: no merge SHA available (passed nor in PR metadata). Refusing to close — status-log entry would have no anchor."
+  fi
+
+  if [ -z "$actor" ]; then
+    actor=$(_airc_queue_resolve_name)
+  fi
+
+  local refs_file
+  refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-refs.XXXXXX") || die "queue close-merged: mktemp failed"
+  if ! "$AIRC_PYTHON" - "$pr_file" "$pr_repo" >"$refs_file" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    pr = json.load(f)
+default_repo = sys.argv[2]
+body = pr.get("body") or ""
+
+CROSS_RE = re.compile(r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b')
+SAME_RE = re.compile(r'(?<![A-Za-z0-9_/])#(\d+)\b')
+
+seen = set()
+for m in CROSS_RE.finditer(body):
+    owner, repo, num = m.group(1), m.group(2), m.group(3)
+    key = f"{owner}/{repo}#{num}"
+    if key not in seen:
+        seen.add(key)
+        print(key)
+for m in SAME_RE.finditer(body):
+    num = m.group(1)
+    key = f"{default_repo}#{num}"
+    if key not in seen:
+        seen.add(key)
+        print(key)
+PYEOF
+  then
+    rm -f "$pr_file" "$refs_file"
+    die "queue close-merged: ref-parser failed"
+  fi
+  rm -f "$pr_file"
+
+  local refs=()
+  if [ -s "$refs_file" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && refs+=("$line")
+    done <"$refs_file"
+  fi
+  rm -f "$refs_file"
+
+  printf 'queue close-merged: PR %s merged into %s @ %s\n' "$pr_canonical_url" "$pr_base_ref" "${merge_sha:0:8}"
+  printf 'queue close-merged: scanned %d body refs (PR body %d chars)\n' "${#refs[@]}" "$pr_body_len"
+
+  if [ "${#refs[@]}" -eq 0 ]; then
+    printf 'queue close-merged: no queue-card refs in PR body — nothing to close.\n'
+    return 0
+  fi
+
+  local closed_count=0 skipped_count=0 errored_count=0 cross_repo_count=0
+  local ref ref_repo ref_num
+  for ref in "${refs[@]}"; do
+    ref_repo="${ref%#*}"
+    ref_num="${ref##*#}"
+
+    if [ "$ref_repo" != "$pr_repo" ]; then
+      printf '  [cross-repo] %s — skipped (workflow GITHUB_TOKEN is repo-scoped)\n' "$ref"
+      cross_repo_count=$((cross_repo_count + 1))
+      continue
+    fi
+
+    local issue_body
+    if ! issue_body=$(gh issue view "$ref_num" --repo "$ref_repo" --json body --jq .body 2>&1); then
+      printf '  [skip]       %s — gh issue view failed (likely a PR ref, not an issue)\n' "$ref"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    local envelope_status
+    envelope_status=$(printf '%s' "$issue_body" | "$AIRC_PYTHON" -c '
+import json, re, sys
+body = sys.stdin.read()
+CARD_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL)
+for m in CARD_BLOCK_RE.finditer(body):
+    try:
+        parsed = json.loads(m.group(1).strip())
+    except Exception:
+        continue
+    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+        print((parsed.get("status") or "").strip() or "unknown")
+        sys.exit(0)
+print("not-a-card")
+')
+
+    case "$envelope_status" in
+      not-a-card)
+        printf '  [skip]       %s — not an airc-queue card (no envelope)\n' "$ref"
+        skipped_count=$((skipped_count + 1))
+        continue
+        ;;
+      merged)
+        printf '  [skip]       %s — already status=merged (idempotent)\n' "$ref"
+        skipped_count=$((skipped_count + 1))
+        continue
+        ;;
+    esac
+
+    local log_msg="merged via PR ${pr_canonical_url} @ ${merge_sha:0:8} (closed by ${actor})"
+
+    if [ "$dry_run" -eq 1 ]; then
+      printf '  [dry-run]    %s — would set status=merged + close (was: %s)\n' "$ref" "$envelope_status"
+      closed_count=$((closed_count + 1))
+      continue
+    fi
+
+    if ! _airc_queue_mutate_card "$ref" 0 "$log_msg" --set "status=merged" >/dev/null 2>&1; then
+      printf '  [error]      %s — status mutation failed\n' "$ref"
+      errored_count=$((errored_count + 1))
+      continue
+    fi
+
+    local close_out
+    if ! close_out=$(gh issue close "$ref_num" --repo "$ref_repo" --reason completed 2>&1); then
+      printf '  [error]      %s — gh issue close failed: %s\n' "$ref" "$close_out"
+      errored_count=$((errored_count + 1))
+      continue
+    fi
+
+    printf '  [closed]     %s — status=merged, issue closed (was: %s)\n' "$ref" "$envelope_status"
+    closed_count=$((closed_count + 1))
+  done
+
+  printf 'queue close-merged: %d closed, %d skipped, %d errored, %d cross-repo (out of %d refs)\n' \
+    "$closed_count" "$skipped_count" "$errored_count" "$cross_repo_count" "${#refs[@]}"
+
+  if [ "$errored_count" -gt 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
 _airc_queue_mutate_card() {
   # Update an existing card body in place.
   # Args: <issue_url> <dry_run> <log_msg> [--set field=value | --clear field]...
@@ -1711,5 +1953,35 @@ EXPECTED PONG
   pong: owner/repo — sweep=ID — <nick> — card=<owner/repo#N|idle>
     state=<idle|coding|testing|reviewing|blocked> blocker=<none|...>
     next=<...> claim=<keep|release|none>
+EOF
+}
+
+_airc_queue_close_merged_help() {
+  cat <<'EOF'
+airc queue close-merged — auto-close queue cards referenced by a merged PR
+
+USAGE
+  airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
+  airc queue close-merged owner/repo#PR [--merge-sha SHA] [--actor X] [--dry-run]
+
+ARGUMENTS
+  <pr-url>           GitHub PR URL (https://github.com/.../pull/N) OR
+                     owner/repo#N short form. PR must already be merged.
+
+OPTIONS
+  --merge-sha SHA    Merge commit SHA for the audit trail. If omitted,
+                     pulled from PR metadata (mergeCommit.oid).
+  --actor X          Identity recorded in the status-log entry. Defaults
+                     to this scope's resolve_name. CI passes
+                     "github-actions" so the audit trail names the system.
+  --dry-run          Show what WOULD be closed; don't mutate or close.
+  -h, --help         This help.
+
+WHAT IT DOES
+  1. Fetches the PR body via gh.
+  2. Validates the PR is actually merged.
+  3. Parses the body for same-repo and cross-repo queue-card refs.
+  4. For same-repo queue cards: sets status=merged and closes the issue.
+  5. Cross-repo refs are reported but not closed with repo-scoped tokens.
 EOF
 }
