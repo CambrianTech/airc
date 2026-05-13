@@ -241,5 +241,73 @@ class KnockEnvelopeShapeTests(unittest.TestCase):
                         f"got blocks: {blocks}")
 
 
+class ApproveGhParsingTests(unittest.TestCase):
+    """Exercise the shell parser helpers used by the gh-backed paths.
+
+    These catch the shell/heredoc class of bugs where markdown or
+    comments JSON is piped toward Python but the heredoc itself consumes
+    stdin before sys.stdin can read the payload.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        result = run_knock_crypto(["gen-knock-keys"])
+        if result.returncode != 0:
+            raise unittest.SkipTest(
+                f"knock_crypto unavailable (cryptography not installed?): "
+                f"{result.stderr.strip()}"
+            )
+
+    def _run_helper(self, helper: str, payload: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["AIRC_PYTHON"] = _python_with_crypto()
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                (
+                    "set -euo pipefail; "
+                    "source lib/airc_bash/cmd_approve.sh; "
+                    f"{helper} \"$PAYLOAD\""
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            env={**env, "PAYLOAD": payload},
+            timeout=15,
+        )
+
+    def test_extract_knocker_pub_reads_issue_body(self) -> None:
+        keys = json.loads(run_knock_crypto(["gen-knock-keys"]).stdout)
+        issue_body = (
+            "**airc knock**\n\n"
+            "```json\n"
+            f"{json.dumps({'ver': 'v1', 'knocker_pub': keys['pub']})}\n"
+            "```\n"
+        )
+        result = self._run_helper("_airc_approve_extract_knocker_pub", issue_body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), keys["pub"])
+
+    def test_extract_approval_reads_latest_approval_from_comments(self) -> None:
+        keys = json.loads(run_knock_crypto(["gen-knock-keys"]).stdout)
+        secret = "private-room://approved"
+        approval = json.loads(run_knock_crypto([
+            "encrypt-for-knocker",
+            "--knocker-pub", keys["pub"],
+            "--plaintext", secret,
+        ]).stdout)
+        comments = {
+            "comments": [
+                {"body": "noise"},
+                {"body": "```json\n" + json.dumps(approval) + "\n```"},
+            ]
+        }
+        result = self._run_helper("_airc_decrypt_extract_approval", json.dumps(comments))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), approval)
+
+
 if __name__ == "__main__":
     unittest.main()

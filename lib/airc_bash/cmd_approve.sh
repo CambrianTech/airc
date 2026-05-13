@@ -309,9 +309,9 @@ _airc_approve_extract_knocker_pub() {
   # Body comes in via $1 as raw markdown; we look for the first JSON
   # block with a "knocker_pub" field.
   local body="$1"
-  printf '%s' "$body" | "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
-import json, re, sys
-body = sys.stdin.read()
+  AIRC_APPROVE_BODY="$body" "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
+import json, os, re, sys
+body = os.environ.get("AIRC_APPROVE_BODY", "")
 # Match ```json ... ``` blocks; check each for knocker_pub.
 for match in re.finditer(r'```json\s*\n(.*?)\n```', body, re.DOTALL):
     blob = match.group(1).strip()
@@ -333,9 +333,9 @@ _airc_decrypt_extract_approval() {
   # Returns the most recent envelope (last comment with one), so a
   # repost or correction wins over the original.
   local comments_json="$1"
-  printf '%s' "$comments_json" | "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
-import json, re, sys
-data = json.loads(sys.stdin.read())
+  AIRC_APPROVE_COMMENTS_JSON="$comments_json" "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
+import json, os, re, sys
+data = json.loads(os.environ.get("AIRC_APPROVE_COMMENTS_JSON", "{}"))
 comments = data.get("comments", [])
 found = None
 for comment in comments:

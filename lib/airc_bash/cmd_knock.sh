@@ -15,8 +15,7 @@
 #      `airc approve` flow + the kanban work in #559) can read it.
 #   4. `gh` is already a hard dependency for the rest of airc.
 #
-# What this PR does NOT do (later PR-2/PR-3 under airc#559):
-#   - Approval flow (`airc approve <peer>` → sends private-room invite)
+# What this PR does NOT do (later PR-3 under airc#559):
 #   - Private-room rotation when a peer becomes abusive
 #   - Shared sprint/kanban queue primitives
 #   - Repo-local `.airc/` discovery manifest (continuum#1109 pilots that)
@@ -200,8 +199,8 @@ DESCRIPTION
   Opens a GitHub issue on the target repo with title "airc-knock: <msg>"
   and a structured envelope body containing your airc identity (name,
   role, bio) + the message. Repo owners use GitHub's native moderation
-  tools (labels, close, spam, block) and the future `airc approve` flow
-  to send approved peers the private room invite.
+  tools (labels, close, spam, block) and `airc approve` to send approved
+  peers the private room invite.
 
 OPTIONS
   -m, --message <text>   Provide the message via flag (vs trailing args).
@@ -218,8 +217,8 @@ NOTES
   - The 'airc-knock' label is auto-applied if it exists on the target
     repo; otherwise the issue posts without a label and a hint suggests
     creating it.
-  - PR-1 scope (airc#559): just the public entrypoint. Approval flow,
-    private-room handoff, and sprint/kanban queue come in PR-2/PR-3.
+  - Approval handoff uses per-knock crypto. Private-room rotation and
+    sprint/kanban queue primitives come in later airc#559 slices.
 EOF
 }
 
@@ -339,7 +338,7 @@ $identity_json
 ### Next step
 
 Repo owners can:
-- Approve by running \`airc approve $knocker_name\` (Phase 2 of [airc#559](https://github.com/CambrianTech/airc/issues/559)). The approval encrypts the private-room invite to the \`knocker_pub\` above and posts it as a comment on this issue.
+- Approve by running \`airc approve <this issue URL>\` (Phase 2 of [airc#559](https://github.com/CambrianTech/airc/issues/559)). The approval encrypts the private-room invite to the \`knocker_pub\` above and posts it as a comment on this issue.
 - Reject by closing this issue, optionally with a comment.
 - Mark as spam via GitHub's spam tools.
 
