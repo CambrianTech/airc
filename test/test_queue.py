@@ -68,6 +68,57 @@ def _isolated_env_with_fake_gh(tmp: str) -> dict[str, str]:
     return env
 
 
+def _isolated_env_with_adopt_fake_gh(
+    tmp: str, issue: dict[str, object]
+) -> tuple[dict[str, str], pathlib.Path]:
+    fakebin = pathlib.Path(tmp) / "bin"
+    fakebin.mkdir()
+    record_dir = pathlib.Path(tmp) / "gh-record"
+    record_dir.mkdir()
+    issue_json = record_dir / "issue.json"
+    issue_json.write_text(json.dumps(issue), encoding="utf-8")
+    gh = fakebin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'ISSUE_JSON="{issue_json}"\n'
+        f'RECORD_DIR="{record_dir}"\n'
+        'if [ "$1 $2" = "issue view" ]; then\n'
+        '  cat "$ISSUE_JSON"\n'
+        '  exit 0\n'
+        'fi\n'
+        'for a in "$@"; do printf "%s\\n" "$a"; done > "$RECORD_DIR/argv.txt"\n'
+        'if [ "$1 $2" = "issue edit" ]; then\n'
+        '  saw_body=0\n'
+        '  saw_label=0\n'
+        '  while [ $# -gt 0 ]; do\n'
+        '    case "$1" in\n'
+        '      --body-file)\n'
+        '        shift\n'
+        '        cp "$1" "$RECORD_DIR/edited-body.txt"\n'
+        '        saw_body=1\n'
+        '        ;;\n'
+        '      --add-label)\n'
+        '        saw_label=1\n'
+        '        ;;\n'
+        '    esac\n'
+        '    shift || true\n'
+        '  done\n'
+        '  if [ "$saw_body" = "1" ]; then cp "$RECORD_DIR/argv.txt" "$RECORD_DIR/body-edit-argv.txt"; fi\n'
+        '  if [ "$saw_label" = "1" ]; then cp "$RECORD_DIR/argv.txt" "$RECORD_DIR/label-edit-argv.txt"; fi\n'
+        "  printf '%s\\n' 'ok'\n"
+        '  exit 0\n'
+        'fi\n'
+        "printf '%s\\n' 'unexpected gh call' >&2\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = _isolated_env(tmp)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["AIRC_GH_BIN"] = str(gh)
+    return env, record_dir
+
+
 class QueueDispatchTests(unittest.TestCase):
     def test_queue_no_subcommand_prints_help(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +148,13 @@ class QueueDispatchTests(unittest.TestCase):
                               env_overrides=_isolated_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--owner", result.stdout)
+
+    def test_queue_adopt_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "adopt", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Original issue body", result.stdout)
 
     def test_unknown_subcommand_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,6 +313,76 @@ class QueueListAutoDetectTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("now_utc:", result.stdout)
         self.assertIn("No open airc-queue cards", result.stdout)
+
+
+class QueueAdoptTests(unittest.TestCase):
+    def test_adopt_dry_run_prepends_queue_envelope_and_preserves_body(self) -> None:
+        issue = {
+            "title": "old backlog item",
+            "body": "Existing issue text with `markdown` and $(literal).",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _record_dir = _isolated_env_with_adopt_fake_gh(tmp, issue)
+            result = run_airc(
+                ["queue", "adopt", "owner/repo#7",
+                 "--owner", "codex",
+                 "--env", "triage",
+                 "--next-action", "Decide whether this stale issue still applies.",
+                 "--dry-run"],
+                env_overrides=env,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DRY RUN", result.stdout)
+        self.assertIn("Original issue body", result.stdout)
+        self.assertIn("Existing issue text", result.stdout)
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          result.stdout, re.DOTALL)
+        self.assertIsNotNone(match)
+        card = json.loads(match.group(1))  # type: ignore[union-attr]
+        self.assertEqual(card["kind"], "airc-queue-card-v1")
+        self.assertEqual(card["id"], "#7")
+        self.assertEqual(card["owner"], "codex")
+        self.assertEqual(card["status"], "claimed")
+        self.assertEqual(card["env"], "triage")
+
+    def test_adopt_posts_body_via_body_file_and_adds_label(self) -> None:
+        issue = {"title": "old backlog item", "body": "Original body"}
+        with tempfile.TemporaryDirectory() as tmp:
+            env, record_dir = _isolated_env_with_adopt_fake_gh(tmp, issue)
+            result = run_airc(
+                ["queue", "adopt", "owner/repo#7",
+                 "--owner", "codex",
+                 "--next-action", "Pick this up."],
+                env_overrides=env,
+            )
+            edited_body = (record_dir / "edited-body.txt").read_text(encoding="utf-8")
+            body_argv = (record_dir / "body-edit-argv.txt").read_text(encoding="utf-8").splitlines()
+            label_argv = (record_dir / "label-edit-argv.txt").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Adopted owner/repo#7", result.stdout)
+        self.assertIn("--body-file", body_argv)
+        self.assertNotIn("--body", body_argv)
+        self.assertIn("--add-label", label_argv)
+        self.assertIn("airc-queue-card-v1", edited_body)
+        self.assertIn("Original body", edited_body)
+
+    def test_adopt_rejects_existing_queue_card_without_force(self) -> None:
+        issue = {
+            "title": "already adopted",
+            "body": "```json\n{\"kind\":\"airc-queue-card-v1\"}\n```",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _record_dir = _isolated_env_with_adopt_fake_gh(tmp, issue)
+            result = run_airc(
+                ["queue", "adopt", "owner/repo#7", "--dry-run"],
+                env_overrides=env,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has an airc-queue-card-v1 envelope",
+                      result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

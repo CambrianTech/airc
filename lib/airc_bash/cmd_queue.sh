@@ -8,6 +8,7 @@
 #                 release    — clear owner (back to claimable pool).                     [PR-2]
 #                 set-status — change status field with enum validation.                 [PR-2]
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
+#                 adopt      — convert an existing issue into a queue card.
 #
 # Verbs deferred to later PRs under airc#562:
 #   - heartbeat + stall detection (PR-4)
@@ -68,8 +69,11 @@ cmd_queue() {
     nudge)
       _cmd_queue_nudge "$@"
       ;;
+    adopt|import)
+      _cmd_queue_adopt "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt)"
       ;;
   esac
 }
@@ -347,6 +351,7 @@ USAGE
   airc queue set-status <issue-url> <state>
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
+  airc queue adopt <issue-url> [card-fields...] [--force]
 
 DESCRIPTION
   Adds, lists, or mutates queue cards (GitHub issues with airc-queue
@@ -357,6 +362,7 @@ VERB SCOPE
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
+  adopt / import               Backlog migration (airc#575)
   heartbeat / stall detection  PR-4 (deferred)
 
 EOF
@@ -668,6 +674,168 @@ _cmd_queue_set_status() {
   _airc_queue_mutate_card "$issue_url" "$dry_run" \
     "$actor -> status=$new_status" \
     --set "status=$new_status"
+}
+
+_cmd_queue_adopt() {
+  # Convert an existing GitHub issue into an airc-queue card in place.
+  # This is the backlog migration path: no duplicate card, no lost issue
+  # context. The queue envelope is prepended and the original body is kept
+  # under a details block for humans and future tooling.
+  local issue_url=""
+  local card_id=""
+  local card_branch=""
+  local card_owner=""
+  local card_status="claimed"
+  local card_blockers=""
+  local card_env=""
+  local card_evidence=""
+  local card_next_action=""
+  local card_last_heartbeat=""
+  local dry_run=0
+  local force=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_adopt_help
+        return 0
+        ;;
+      --id)             shift; card_id="${1:-}" ;;
+      --branch)         shift; card_branch="${1:-}" ;;
+      --owner)          shift; card_owner="${1:-}" ;;
+      --status)         shift; card_status="${1:-}" ;;
+      --blockers)       shift; card_blockers="${1:-}" ;;
+      --env)            shift; card_env="${1:-}" ;;
+      --evidence)       shift; card_evidence="${1:-}" ;;
+      --next-action)    shift; card_next_action="${1:-}" ;;
+      --last-heartbeat) shift; card_last_heartbeat="${1:-}" ;;
+      --force)          force=1 ;;
+      --dry-run)        dry_run=1 ;;
+      -*) die "queue adopt: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        else
+          die "queue adopt: too many positional args. Got extra: $1"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ]; then
+    _airc_queue_adopt_help >&2
+    return 1
+  fi
+
+  case "$card_status" in
+    claimed|in-progress|blocked|review|merged) : ;;
+    *) die "queue adopt: --status must be one of: claimed, in-progress, blocked, review, merged (got: $card_status)" ;;
+  esac
+
+  local parsed_issue repo issue_num
+  if ! parsed_issue=$(_airc_queue_parse_issue_url "$issue_url"); then
+    die "queue adopt: <issue-url> must be a GitHub issue URL or owner/repo#N (got: $issue_url)"
+  fi
+  repo="${parsed_issue%#*}"
+  issue_num="${parsed_issue##*#}"
+
+  if [ -z "$card_id" ]; then
+    card_id="#$issue_num"
+  fi
+  if [ -z "$card_owner" ]; then
+    card_owner=$(_airc_queue_resolve_name)
+  fi
+  if [ -z "$card_evidence" ]; then
+    card_evidence="Adopted existing GitHub issue into airc queue."
+  fi
+  if [ -z "$card_next_action" ]; then
+    card_next_action="Triage, claim, or close this adopted backlog card."
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue adopt: 'gh' CLI is required."
+  fi
+
+  local issue_json
+  if ! issue_json=$(gh issue view "$issue_num" --repo "$repo" --json title,body 2>&1); then
+    die "queue adopt: gh issue view failed for $repo#$issue_num: $issue_json"
+  fi
+
+  local issue_json_file body_file
+  issue_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-adopt-json.XXXXXX") || die "queue adopt: mktemp failed"
+  body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-adopt-body.XXXXXX") || die "queue adopt: mktemp failed"
+  printf '%s' "$issue_json" >"$issue_json_file"
+
+  local queue_body
+  queue_body=$(_airc_queue_card_body \
+    "$card_id" "$card_branch" "$card_owner" "$card_status" \
+    "$card_blockers" "$card_env" "$card_evidence" \
+    "$card_next_action" "$card_last_heartbeat")
+  printf '%s' "$queue_body" >"$body_file"
+
+  local adopted_body
+  adopted_body=$("$AIRC_PYTHON" - "$issue_json_file" "$body_file" "$force" <<'PYEOF'
+import json, re, sys
+issue_json_path, queue_body_path, force_raw = sys.argv[1:4]
+force = force_raw == "1"
+
+with open(issue_json_path, "r", encoding="utf-8") as f:
+    issue = json.loads(f.read())
+with open(queue_body_path, "r", encoding="utf-8") as f:
+    queue_body = f.read().rstrip()
+
+old_body = issue.get("body") or ""
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+for m in CARD_BLOCK_RE.finditer(old_body):
+    try:
+        parsed = json.loads(m.group(1).strip())
+    except Exception:
+        continue
+    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+        if not force:
+            print("queue adopt: issue already has an airc-queue-card-v1 envelope; pass --force to rewrite", file=sys.stderr)
+            sys.exit(3)
+        break
+
+if old_body.strip():
+    original = "\n\n## Original issue body\n\n<details>\n<summary>Pre-adoption body</summary>\n\n" + old_body.rstrip() + "\n\n</details>\n"
+else:
+    original = "\n\n## Original issue body\n\n_No pre-adoption body._\n"
+
+print(queue_body + original, end="")
+PYEOF
+)
+  local adopt_rc=$?
+  if [ "$adopt_rc" -ne 0 ]; then
+    rm -f "$issue_json_file" "$body_file"
+    printf '%s\n' "$adopted_body" >&2
+    return "$adopt_rc"
+  fi
+  rm -f "$issue_json_file" "$body_file"
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'DRY RUN — would adopt %s#%s into airc queue:\n' "$repo" "$issue_num"
+    printf '  id:      %s\n' "$card_id"
+    printf '  owner:   %s\n' "$card_owner"
+    printf '  status:  %s\n' "$card_status"
+    printf '  new body:\n'
+    printf '%s\n' "$adopted_body" | sed 's/^/    /'
+    return 0
+  fi
+
+  local edit_out
+  if ! edit_out=$(_airc_gh_safe_body "$adopted_body" issue edit "$issue_num" \
+    --repo "$repo"); then
+    die "queue adopt: gh issue edit failed for $repo#$issue_num: $edit_out"
+  fi
+
+  local label_out
+  if ! label_out=$(gh issue edit "$issue_num" --repo "$repo" --add-label "airc-queue" 2>&1); then
+    printf 'note: could not add "airc-queue" label to %s#%s: %s\n' "$repo" "$issue_num" "$label_out" >&2
+  fi
+
+  printf 'Adopted %s#%s into airc queue.\n' "$repo" "$issue_num"
 }
 
 _cmd_queue_nudge() {
@@ -1199,6 +1367,46 @@ OPTIONS
 NOTES
   - Does NOT close the issue automatically when set to merged. Operators
     close manually so the queue tracks closure events explicitly.
+EOF
+}
+
+_airc_queue_adopt_help() {
+  cat <<'EOF'
+airc queue adopt — convert an existing issue into a queue card
+
+USAGE
+  airc queue adopt <issue-url> [card-fields...] [--force] [--dry-run]
+  airc queue adopt owner/repo#N [card-fields...] [--force] [--dry-run]
+
+DESCRIPTION
+  Prepends the standard airc-queue JSON envelope to an existing GitHub issue,
+  preserves the original issue body under "Original issue body", and applies
+  the airc-queue label when possible. This is the backlog migration path:
+  existing issues become queue-managed cards without creating duplicates.
+
+CARD FIELDS (all optional; defaults shown)
+  --id <ref>             Issue/PR this card coordinates (default: #N)
+  --branch <name>        Branch name, if known.
+  --owner <handle>       AIRC handle (default: this scope's resolve_name)
+  --status <state>       claimed | in-progress | blocked | review | merged
+                         (default: claimed)
+  --blockers <list>      Comma-separated blockers.
+  --env <tag>            Environment/capability tag.
+  --evidence <text>      Why this was adopted or what proof exists.
+  --next-action <text>   One sentence on the next step.
+  --last-heartbeat <ts>  ISO timestamp + sha, if known.
+
+OPTIONS
+  --force                Rewrite even if a queue envelope already exists.
+  --dry-run              Print the adopted body that WOULD be posted.
+  -h, --help             This help.
+
+EXAMPLES
+  airc queue adopt CambrianTech/continuum#914 \\
+    --owner codex \\
+    --status claimed \\
+    --env ui/browser \\
+    --next-action "Decide whether this stale UI issue still applies."
 EOF
 }
 
