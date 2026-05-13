@@ -2652,6 +2652,7 @@ case "${1:-help}" in
     echo "  airc queue release <issue-url> [--reason \"…\"]            Clear ownership (back to pool)"
     echo "  airc queue set-status <issue-url> <state>                Change card status field"
     echo "  airc queue nudge <issue-url|owner/repo> [--peer @handle] Surface a card or repo status sweep"
+    echo "  airc queue adopt <issue-url> [card-fields…]              Convert an existing issue into a queue card"
     echo "  airc msg / send <text>          Broadcast to the default channel"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc msg / send @a @b <text>    DM multiple peers (also: @a,b,c)"
