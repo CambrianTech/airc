@@ -65,8 +65,11 @@ cmd_queue() {
     set-status)
       _cmd_queue_set_status "$@"
       ;;
+    nudge)
+      _cmd_queue_nudge "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge)"
       ;;
   esac
 }
@@ -342,6 +345,7 @@ USAGE
   airc queue claim <issue-url> [--owner X] [--status Y]
   airc queue release <issue-url> [--reason "..."] [--status claimed|blocked]
   airc queue set-status <issue-url> <state>
+  airc queue nudge <issue-url> [--peer @handle] [--message "..."]
 
 DESCRIPTION
   Adds, lists, or mutates queue cards (GitHub issues with airc-queue
@@ -350,8 +354,8 @@ DESCRIPTION
 
 VERB SCOPE
   add / list                   PR-1 (airc#566, merged)
-  claim / release / set-status PR-2 (this PR)
-  nudge                        PR-3 (deferred)
+  claim / release / set-status PR-2 (airc#568, merged)
+  nudge                        PR-3 (this PR)
   heartbeat / stall detection  PR-4 (deferred)
 
 EOF
@@ -665,6 +669,180 @@ _cmd_queue_set_status() {
     --set "status=$new_status"
 }
 
+_cmd_queue_nudge() {
+  # Surface a queue card to peers via airc msg (broadcast or DM), and
+  # annotate the card's status log with the nudge event. NO status mutation.
+  #
+  # Args:
+  #   airc queue nudge <issue-url> [--peer @handle] [--message "..."] [--dry-run]
+  #
+  # The nudge IS an action, not a WHO-is-idle decision. Recipients filter +
+  # decide whether to claim. Heartbeat/stall-driven auto-pickup stays out of
+  # scope for PR-3 (PR-4 territory per airc#562).
+
+  local issue_url=""
+  local target_peer=""
+  local extra_message=""
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_nudge_help
+        return 0
+        ;;
+      --peer)     shift; target_peer="${1:-}" ;;
+      --message)  shift; extra_message="${1:-}" ;;
+      --dry-run)  dry_run=1 ;;
+      -*) die "queue nudge: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        else
+          die "queue nudge: too many positional args (use: queue nudge <url> [--peer @h] [--message ...])"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ]; then
+    _airc_queue_nudge_help >&2
+    return 1
+  fi
+
+  # Normalize --peer: strip a single leading '@' if present, validate non-empty.
+  # Joel's protocol-not-client + handle convention: peers identified by AIRC
+  # whois name (claude-tab-#1, codex, continuum-8e97, etc.). NOT gh login.
+  if [ -n "$target_peer" ]; then
+    target_peer="${target_peer#@}"
+    if [ -z "$target_peer" ]; then
+      die "queue nudge: --peer expects a handle (got empty after stripping @)"
+    fi
+  fi
+
+  local parsed_issue repo issue_num
+  if ! parsed_issue=$(_airc_queue_parse_issue_url "$issue_url"); then
+    die "queue nudge: <issue-url> must be a GitHub issue URL or owner/repo#N (got: $issue_url)"
+  fi
+  repo="${parsed_issue%#*}"
+  issue_num="${parsed_issue##*#}"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue nudge: 'gh' CLI is required."
+  fi
+
+  # Verify the issue exists + has a kind=airc-queue-card-v1 envelope. Pull
+  # title + current status for the broadcast text. Use temp file to dodge
+  # stdin contention with the python heredoc (standard idiom in this module
+  # per Codex's review fixes on PR-1+PR-2).
+  local issue_blob
+  if ! issue_blob=$(gh issue view "$issue_num" --repo "$repo" --json title,body 2>&1); then
+    die "queue nudge: gh issue view failed for $repo#$issue_num: $issue_blob"
+  fi
+
+  local issue_file
+  issue_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-nudge-issue.XXXXXX") || die "queue nudge: mktemp failed"
+  printf '%s' "$issue_blob" >"$issue_file"
+
+  local card_meta
+  if ! card_meta=$("$AIRC_PYTHON" - "$issue_file" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    issue = json.load(f)
+title = issue.get("title", "(no title)")
+body = issue.get("body", "") or ""
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+card = None
+for m in CARD_BLOCK_RE.finditer(body):
+    try:
+        parsed = json.loads(m.group(1).strip())
+    except Exception:
+        continue
+    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+        card = parsed
+        break
+if card is None:
+    print("ERR:no-envelope", file=sys.stderr)
+    sys.exit(2)
+status = (card.get("status") or "").strip() or "unknown"
+owner = (card.get("owner") or "").strip()
+# Tab-separated for shell-friendly parse.
+print(f"{title}\t{status}\t{owner}")
+PYEOF
+  ); then
+    rm -f "$issue_file"
+    die "queue nudge: $repo#$issue_num is not a valid airc-queue-card-v1 envelope"
+  fi
+  rm -f "$issue_file"
+
+  local card_title card_status card_owner
+  card_title=$(printf '%s' "$card_meta" | awk -F'\t' '{print $1}')
+  card_status=$(printf '%s' "$card_meta" | awk -F'\t' '{print $2}')
+  card_owner=$(printf '%s' "$card_meta" | awk -F'\t' '{print $3}')
+
+  local actor
+  actor=$(_airc_queue_resolve_name)
+
+  # Compose nudge broadcast text. One-line, prefixed with "nudge:" so peers
+  # can filter (per QUEUE.md broadcast hooks in continuum#1110 .airc/).
+  local nudge_text
+  if [ -n "$target_peer" ]; then
+    nudge_text="nudge: ${repo}#${issue_num} → @${target_peer} — ${card_title} (status=${card_status}"
+  else
+    nudge_text="nudge: ${repo}#${issue_num} — ${card_title} (status=${card_status}"
+  fi
+  if [ -n "$card_owner" ]; then
+    nudge_text="${nudge_text}, owner=${card_owner}"
+  fi
+  nudge_text="${nudge_text})"
+  if [ -n "$extra_message" ]; then
+    nudge_text="${nudge_text} — ${extra_message}"
+  fi
+  nudge_text="${nudge_text} — claim with: airc queue claim ${repo}#${issue_num}"
+
+  # Status log message for the card body annotation.
+  local log_msg
+  if [ -n "$target_peer" ]; then
+    log_msg="$actor nudged @${target_peer}"
+  else
+    log_msg="$actor nudged (broadcast)"
+  fi
+  if [ -n "$extra_message" ]; then
+    log_msg="${log_msg}: ${extra_message}"
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    echo "  [dry-run] would broadcast: ${nudge_text}"
+    echo "  [dry-run] would annotate ${repo}#${issue_num} status log: ${log_msg}"
+    return 0
+  fi
+
+  # Send the nudge. DM if --peer set, broadcast otherwise. Use --internal so
+  # the nudge doesn't trigger the post-send-poll loop on the sender's side
+  # (Codex/non-Monitor runtimes already have their own inbox poll cadence;
+  # we don't want every nudge to also dump the sender's inbox to stdout).
+  # Actually NOT --internal — recipients should see the broadcast in their
+  # inbox stream like normal traffic. The post-send-poll fires on sender
+  # side, not on receiver side, so it's a sender-side ergonomic that
+  # nudge senders probably want. Leave it as a normal send.
+  if [ -n "$target_peer" ]; then
+    if ! cmd_send "@${target_peer}" "$nudge_text"; then
+      die "queue nudge: cmd_send to @${target_peer} failed"
+    fi
+  else
+    if ! cmd_send "$nudge_text"; then
+      die "queue nudge: cmd_send broadcast failed"
+    fi
+  fi
+
+  # Annotate the card body via the same mutate path used by claim/release/
+  # set-status. NO actual field changes — log_msg-only entry to the status
+  # log. The mutate helper appends the entry; absence of --set/--clear
+  # leaves field values untouched.
+  _airc_queue_mutate_card "$issue_url" 0 "$log_msg"
+}
+
 _airc_queue_mutate_card() {
   # Update an existing card body in place.
   # Args: <issue_url> <dry_run> <log_msg> [--set field=value | --clear field]...
@@ -889,5 +1067,47 @@ OPTIONS
 NOTES
   - Does NOT close the issue automatically when set to merged. Operators
     close manually so the queue tracks closure events explicitly.
+EOF
+}
+
+_airc_queue_nudge_help() {
+  cat <<'EOF'
+airc queue nudge — surface a queue card to peers (broadcast or DM)
+
+USAGE
+  airc queue nudge <issue-url> [--peer @handle] [--message "..."] [--dry-run]
+  airc queue nudge owner/repo#N [--peer @handle] [--message "..."] [--dry-run]
+
+ARGUMENTS
+  <issue-url>        GitHub issue URL OR owner/repo#N reference. The issue
+                     must contain a valid kind=airc-queue-card-v1 envelope.
+
+OPTIONS
+  --peer @handle     DM the nudge to a specific peer. Default: broadcast to
+                     the current scope's room.
+  --message "..."    Optional one-line explanation appended to the nudge
+                     ("nudge: #1125 — pickup needed before EOD" etc.).
+  --dry-run          Print the broadcast text + status-log entry that
+                     WOULD be written; don't send or edit.
+  -h, --help         This help.
+
+WHAT IT DOES
+  1. Verifies the issue is a real airc-queue card (envelope exists).
+  2. Composes a one-line nudge: "nudge:<repo>#<N> [→ @peer] — <title> (<status>)
+     [— <message>]"
+  3. Sends via airc msg (broadcast OR DM if --peer), so peers see it in
+     their inbox stream alongside other AIRC traffic.
+  4. Appends a status-log entry to the card body recording who nudged + when
+     + target peer (if any). Same _airc_queue_mutate_card path as
+     claim/release/set-status — no new wire format.
+
+NOTES
+  - Nudge is the ACTION; the WHO-is-idle decision lives upstream. Peers
+    receiving a nudge decide for themselves whether to claim the card.
+  - Heartbeat / stall-detection (auto-pickup of cards whose owner went
+    silent) is intentionally out of scope here — see airc#562 PR-4
+    backlog and `.airc/ASSEMBLY-LINE.md` in continuum#1110.
+  - Status field is NOT changed by nudge. Use airc queue set-status if you
+    need to mark the card differently.
 EOF
 }
