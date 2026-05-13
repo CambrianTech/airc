@@ -1218,6 +1218,20 @@ else
   echo "ERROR: airc_bash/lib_daemon_detect.sh not found via lib-dir resolver." >&2
   exit 1
 fi
+
+# ── gh wrapper helpers ──────────────────────────────────────────────────
+# _airc_gh_safe_body — wrap every gh invocation that posts a Markdown
+# body so it goes through --body-file (temp file) instead of --body
+# (argv). See doc-comment in lib_gh.sh for the rationale (airc#571).
+# Sourced unconditionally so cmd_knock / cmd_approve / cmd_queue (and
+# any future module that posts to GitHub) get it for free.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/lib_gh.sh" ]; then
+  # shellcheck source=lib/airc_bash/lib_gh.sh
+  source "$_airc_lib_dir/airc_bash/lib_gh.sh"
+else
+  echo "ERROR: airc_bash/lib_gh.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
 # ── End daemon-installed detector ───────────────────────────────────────
 
 relay_ssh() {

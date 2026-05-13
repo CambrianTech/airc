@@ -149,7 +149,11 @@ cmd_approve() {
   fi
 
   local comment_url
-  if ! comment_url=$(gh issue comment "$issue_num" --repo "$repo" --body "$comment_body" 2>&1); then
+  # --body-file via lib_gh.sh — approval comments embed an ```json``` AEAD
+  # envelope and prose around it; backticks must NOT trigger command
+  # substitution at any layer (airc#571).
+  if ! comment_url=$(_airc_gh_safe_body "$comment_body" issue comment "$issue_num" \
+    --repo "$repo"); then
     die "approve: gh issue comment failed: $comment_url"
   fi
 
