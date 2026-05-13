@@ -7,6 +7,8 @@
 #                 claim      — set owner+status on an existing card.                     [PR-2]
 #                 release    — clear owner (back to claimable pool).                     [PR-2]
 #                 set-status — change status field with enum validation.                 [PR-2]
+#                 heartbeat  — stamp liveness on an owned card.
+#                 stale      — list owned cards with missing/old heartbeats.
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
 #                 pongs      — summarize repo-nudge pong replies.
@@ -68,6 +70,12 @@ cmd_queue() {
     set-status)
       _cmd_queue_set_status "$@"
       ;;
+    heartbeat|touch)
+      _cmd_queue_heartbeat "$@"
+      ;;
+    stale|stalled)
+      _cmd_queue_stale "$@"
+      ;;
     nudge)
       _cmd_queue_nudge "$@"
       ;;
@@ -81,7 +89,7 @@ cmd_queue() {
       _cmd_queue_close_merged "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, pongs, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, nudge, adopt, pongs, close-merged)"
       ;;
   esac
 }
@@ -357,6 +365,8 @@ USAGE
   airc queue claim <issue-url> [--owner X] [--status Y]
   airc queue release <issue-url> [--reason "..."] [--status claimed|blocked]
   airc queue set-status <issue-url> <state>
+  airc queue heartbeat <issue-url> [--owner X] [--status Y] [--note "..."]
+  airc queue stale <owner/repo> [--stale-after 30m]
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
@@ -371,11 +381,12 @@ DESCRIPTION
 VERB SCOPE
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
+  heartbeat / stale            Stale-claim liveness primitives (airc#572)
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
   pongs / pong-summary          Repo-nudge response collection (airc#579)
   close-merged                 airc#576 — auto-close on PR merge to canary
-  heartbeat / stall detection  PR-4 (deferred)
+  auto-release policy          Deferred; stale is read-only first
 
 EOF
 }
@@ -462,6 +473,17 @@ _airc_queue_resolve_name() {
     resolve_name
   else
     echo "anonymous"
+  fi
+}
+
+_airc_queue_heartbeat_value() {
+  local ts sha
+  ts=$(date -u +"%Y-%m-%dT%H:%MZ")
+  sha=$(git rev-parse --short HEAD 2>/dev/null || true)
+  if [ -n "$sha" ]; then
+    printf '%s @ %s\n' "$ts" "$sha"
+  else
+    printf '%s\n' "$ts"
   fi
 }
 
@@ -588,10 +610,14 @@ _cmd_queue_claim() {
     *) die "queue claim: --status must be one of: claimed, in-progress, blocked, review, merged (got: $new_status)" ;;
   esac
 
+  local heartbeat
+  heartbeat=$(_airc_queue_heartbeat_value)
+
   _airc_queue_mutate_card "$issue_url" "$dry_run" \
     "claim by $new_owner -> status=$new_status" \
     --set "owner=$new_owner" \
-    --set "status=$new_status"
+    --set "status=$new_status" \
+    --set "last_heartbeat=$heartbeat"
 }
 
 _cmd_queue_release() {
@@ -686,6 +712,245 @@ _cmd_queue_set_status() {
   _airc_queue_mutate_card "$issue_url" "$dry_run" \
     "$actor -> status=$new_status" \
     --set "status=$new_status"
+}
+
+_cmd_queue_heartbeat() {
+  local issue_url=""
+  local owner=""
+  local status=""
+  local note=""
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_heartbeat_help
+        return 0
+        ;;
+      --owner)   shift; owner="${1:-}" ;;
+      --status)  shift; status="${1:-}" ;;
+      --note)    shift; note="${1:-}" ;;
+      --dry-run) dry_run=1 ;;
+      -*) die "queue heartbeat: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        else
+          die "queue heartbeat: too many positional args. Got extra: $1"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ]; then
+    _airc_queue_heartbeat_help >&2
+    return 1
+  fi
+
+  if [ -z "$owner" ]; then
+    owner=$(_airc_queue_resolve_name)
+  fi
+
+  if [ -n "$status" ]; then
+    case "$status" in
+      claimed|in-progress|blocked|review|merged) : ;;
+      *) die "queue heartbeat: --status must be one of: claimed, in-progress, blocked, review, merged (got: $status)" ;;
+    esac
+  fi
+
+  local heartbeat log_msg
+  heartbeat=$(_airc_queue_heartbeat_value)
+  log_msg="heartbeat by $owner"
+  if [ -n "$status" ]; then
+    log_msg="$log_msg -> status=$status"
+  fi
+  if [ -n "$note" ]; then
+    log_msg="$log_msg ($note)"
+  fi
+
+  if [ -n "$status" ]; then
+    _airc_queue_mutate_card "$issue_url" "$dry_run" \
+      "$log_msg" \
+      --set "owner=$owner" \
+      --set "last_heartbeat=$heartbeat" \
+      --set "status=$status"
+  else
+    _airc_queue_mutate_card "$issue_url" "$dry_run" \
+      "$log_msg" \
+      --set "owner=$owner" \
+      --set "last_heartbeat=$heartbeat"
+  fi
+}
+
+_cmd_queue_stale() {
+  local target_repo=""
+  local stale_after="30m"
+  local limit=50
+  local output_json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_stale_help
+        return 0
+        ;;
+      --repo)        shift; target_repo="${1:-}" ;;
+      --stale-after) shift; stale_after="${1:-}" ;;
+      --limit)       shift; limit="${1:-}" ;;
+      --json)        output_json=1 ;;
+      -*) die "queue stale: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue stale: too many positional args (use: queue stale <owner/repo> [--stale-after 30m])"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_repo" ]; then
+    target_repo=$(_airc_queue_detect_repo_from_cwd || true)
+  fi
+  if [ -z "$target_repo" ]; then
+    die "queue stale: no <owner/repo> given and could not detect one from \$PWD's git remote. Pass --repo owner/repo."
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue stale: target must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue stale: --limit must be a positive integer (got: $limit)" ;;
+  esac
+  if [ "$limit" -lt 1 ]; then
+    die "queue stale: --limit must be >= 1 (got: $limit)"
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue stale: 'gh' CLI is required."
+  fi
+
+  local raw_json
+  if ! raw_json=$(gh issue list --repo "$target_repo" --label airc-queue --state open --limit "$limit" \
+    --json number,title,url,body,updatedAt 2>&1); then
+    die "queue stale: gh issue list failed for $target_repo: $raw_json"
+  fi
+
+  local raw_json_file
+  raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-stale.XXXXXX") || die "queue stale: mktemp failed"
+  printf '%s' "$raw_json" >"$raw_json_file"
+
+  "$AIRC_PYTHON" - "$target_repo" "$stale_after" "$output_json" "$raw_json_file" <<'PYEOF'
+import json, re, sys
+from datetime import datetime, timezone, timedelta
+
+repo, stale_after, output_json_s, path = sys.argv[1:5]
+output_json = output_json_s == "1"
+
+def parse_duration(value: str) -> timedelta:
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", value or "")
+    if not m:
+        print(f"queue stale: cannot parse --stale-after '{value}' (use 30m, 2h, 1d)", file=sys.stderr)
+        sys.exit(2)
+    amount = int(m.group(1))
+    unit = m.group(2)
+    if unit == "s":
+        return timedelta(seconds=amount)
+    if unit == "m":
+        return timedelta(minutes=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    return timedelta(days=amount)
+
+def parse_card(body: str):
+    for m in re.finditer(r"```json\s*\n(.*?)\n\s*```", body or "", re.DOTALL):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            return parsed
+    return None
+
+def parse_heartbeat(value: str):
+    if not value:
+        return None
+    m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)", value)
+    if not m:
+        return None
+    raw = m.group(1)
+    fmt = "%Y-%m-%dT%H:%M:%SZ" if raw.count(":") == 2 else "%Y-%m-%dT%H:%MZ"
+    return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+
+with open(path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+
+threshold = parse_duration(stale_after)
+now = datetime.now(timezone.utc)
+rows = []
+for issue in issues:
+    card = parse_card(issue.get("body", ""))
+    if not card:
+        continue
+    status = (card.get("status") or "").strip()
+    owner = (card.get("owner") or "").strip()
+    if status not in {"claimed", "in-progress", "review"}:
+        continue
+    reason = ""
+    heartbeat = (card.get("last_heartbeat") or "").strip()
+    hb_dt = parse_heartbeat(heartbeat)
+    age_seconds = None
+    if not owner:
+        reason = "missing-owner"
+    elif not hb_dt:
+        reason = "missing-heartbeat"
+    else:
+        age = now - hb_dt
+        age_seconds = int(age.total_seconds())
+        if age > threshold:
+            reason = "stale-heartbeat"
+    if not reason:
+        continue
+    rows.append({
+        "number": issue.get("number"),
+        "title": issue.get("title") or "",
+        "url": issue.get("url") or "",
+        "status": status or "unknown",
+        "owner": owner,
+        "last_heartbeat": heartbeat,
+        "age_seconds": age_seconds,
+        "reason": reason,
+        "next_action": card.get("next_action") or "",
+    })
+
+if output_json:
+    print(json.dumps({"repo": repo, "now": now.isoformat().replace("+00:00", "Z"), "stale_after": stale_after, "cards": rows}, indent=2))
+else:
+    print(f"# airc-queue stale — {repo}")
+    print(f"now_utc: {now.isoformat().replace('+00:00', 'Z')}")
+    print(f"stale_after: {stale_after}")
+    if not rows:
+        print("No stale owned cards found.")
+    for row in rows:
+        print()
+        print(f"## #{row['number']} — {row['title']}")
+        print(f"  url:            {row['url']}")
+        print(f"  status:         {row['status']}")
+        if row["owner"]:
+            print(f"  owner:          {row['owner']}")
+        if row["last_heartbeat"]:
+            print(f"  last heartbeat: {row['last_heartbeat']}")
+        if row["age_seconds"] is not None:
+            print(f"  heartbeat age:  {row['age_seconds']}s")
+        print(f"  reason:         {row['reason']}")
+        if row["next_action"]:
+            print(f"  next:           {row['next_action']}")
+PYEOF
+  local py_status=$?
+  rm -f "$raw_json_file"
+  return "$py_status"
 }
 
 _cmd_queue_adopt() {
@@ -1835,6 +2100,51 @@ OPTIONS
 NOTES
   - Does NOT close the issue automatically when set to merged. Operators
     close manually so the queue tracks closure events explicitly.
+EOF
+}
+
+_airc_queue_heartbeat_help() {
+  cat <<'EOF'
+airc queue heartbeat — stamp liveness on a queue card
+
+USAGE
+  airc queue heartbeat <issue-url> [--owner X] [--status Y] [--note "..."] [--dry-run]
+  airc queue heartbeat owner/repo#N [--owner X] [--status Y] [--note "..."] [--dry-run]
+
+DESCRIPTION
+  Sets owner (default: this AIRC identity) and last_heartbeat to the
+  current UTC timestamp plus git SHA when available. Optionally updates
+  status. Appends a Status log line so humans can see that work is alive.
+
+OPTIONS
+  --owner <handle>   AIRC handle to record (default: this scope).
+  --status <state>   Optional status update: claimed, in-progress, blocked,
+                     review, or merged.
+  --note "<text>"    Short context appended to the status log.
+  --dry-run          Print what WOULD be written; don't edit.
+  -h, --help         This help.
+EOF
+}
+
+_airc_queue_stale_help() {
+  cat <<'EOF'
+airc queue stale — list owned queue cards with missing/old heartbeats
+
+USAGE
+  airc queue stale [<owner/repo>] [--stale-after 30m] [--limit N] [--json]
+
+DESCRIPTION
+  Read-only stale-claim scan. It lists open airc-queue cards in claimed,
+  in-progress, or review state when they have an owner but no heartbeat,
+  no owner, or a last_heartbeat older than --stale-after. It does not
+  release or mutate cards; humans/agents can nudge, heartbeat, or release.
+
+OPTIONS
+  --repo <owner/repo>      Alternative way to specify repo.
+  --stale-after <dur>      Duration threshold: 30m, 2h, 1d (default: 30m).
+  --limit <N>              Max issues to fetch (default 50).
+  --json                   Emit machine-readable JSON.
+  -h, --help               This help.
 EOF
 }
 

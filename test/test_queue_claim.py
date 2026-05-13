@@ -1,12 +1,13 @@
-"""Tests for `airc queue claim/release/set-status` (airc#562 PR-2).
+"""Tests for `airc queue claim/release/set-status/heartbeat` (airc#562).
 
 Coverage:
-  - dispatch: claim/release/set-status reach the right cmd functions + --help
+  - dispatch: claim/release/set-status/heartbeat reach the right cmd functions + --help
   - validation: malformed URLs / missing args / bad status enum
   - mutate-card python helper: applies --set/--clear correctly to a fixture
   - dry-run: prints the would-be body, doesn't call gh
   - status log: appends a chronological entry on every mutation
   - claim defaults: owner=resolve_name, status=in-progress
+  - claim/heartbeat stamp last_heartbeat
   - release defaults: clears owner, sets status=claimed
   - release --status blocked allowed; in-progress/review/merged rejected
 
@@ -118,12 +119,20 @@ class QueueDispatchPR2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("claimed", result.stdout)
 
+    def test_heartbeat_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "heartbeat", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--note", result.stdout)
+        self.assertIn("last_heartbeat", result.stdout)
+
     def test_top_help_lists_pr2_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(["queue", "--help"],
                               env_overrides=_isolated_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
-        for verb in ("claim", "release", "set-status"):
+        for verb in ("claim", "release", "set-status", "heartbeat"):
             self.assertIn(verb, result.stdout,
                           f"top-level help must list '{verb}' verb")
 
@@ -248,11 +257,36 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
         envelope = self._extract_envelope(body)
         self.assertEqual(envelope["owner"], "claude-tab-2")
         self.assertEqual(envelope["status"], "in-progress")
+        self.assertRegex(envelope["last_heartbeat"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
         # Other pre-existing fields preserved.
         self.assertEqual(envelope["branch"], "feat/x")
         # Status log appended.
         self.assertIn("## Status log", body)
         self.assertIn("claim by claude-tab-2", body)
+
+    def test_heartbeat_sets_owner_and_last_heartbeat(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "heartbeat", "owner/repo#1",
+             "--owner", "codex",
+             "--note", "still testing"]
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "codex")
+        self.assertEqual(envelope["status"], "claimed",
+                         "heartbeat without --status must preserve status")
+        self.assertRegex(envelope["last_heartbeat"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
+        self.assertIn("heartbeat by codex", body)
+        self.assertIn("still testing", body)
+
+    def test_heartbeat_can_update_status(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "heartbeat", "owner/repo#1",
+             "--owner", "codex",
+             "--status", "in-progress"]
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "codex")
+        self.assertEqual(envelope["status"], "in-progress")
 
     def test_release_clears_owner_and_reverts_status(self) -> None:
         body = self._dry_run_extract_body(
