@@ -136,6 +136,12 @@ class QueueNudgeDispatchTests(unittest.TestCase):
         self.assertIn("nudge", result.stdout,
                       "top-level help must list 'nudge' verb")
 
+    def test_global_help_lists_nudge_verb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["help"], env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("airc queue nudge", result.stdout)
+
 
 class QueueNudgeValidationTests(unittest.TestCase):
     def test_missing_url_fails(self) -> None:
