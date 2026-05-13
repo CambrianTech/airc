@@ -159,16 +159,17 @@ cmd_knock() {
   # doesn't exist, fall back to no-label (still a valid issue, just
   # less filterable).
   local issue_url
-  if issue_url=$(gh issue create \
+  # Body goes via --body-file (lib_gh.sh) so embedded backticks / fenced
+  # code blocks / $-vars in the knock message can't trigger shell
+  # command substitution and can't blow argv length limits (airc#571).
+  if issue_url=$(_airc_gh_safe_body "$issue_body" issue create \
     --repo "$target_repo" \
     --title "$issue_title" \
-    --body "$issue_body" \
-    --label "airc-knock" 2>&1); then
+    --label "airc-knock"); then
     :
-  elif issue_url=$(gh issue create \
+  elif issue_url=$(_airc_gh_safe_body "$issue_body" issue create \
     --repo "$target_repo" \
-    --title "$issue_title" \
-    --body "$issue_body" 2>&1); then
+    --title "$issue_title"); then
     # Owner repo doesn't have the airc-knock label yet — issue still
     # posts. Surface a note so the operator knows to add the label.
     printf 'note: %s does not have an "airc-knock" label yet. The issue posted without one — repo owner may want to add the label for filtering.\n' "$target_repo" >&2

@@ -169,17 +169,17 @@ _cmd_queue_add() {
 
   # Try with airc-queue label first; fall back to no label if it doesn't
   # exist yet on the target repo (same pattern as cmd_knock).
+  # Body goes via --body-file (lib_gh.sh) — card bodies routinely embed
+  # ```json``` fences and a status log of backticked refs (airc#571).
   local issue_url
-  if issue_url=$(gh issue create \
+  if issue_url=$(_airc_gh_safe_body "$issue_body" issue create \
     --repo "$target_repo" \
     --title "$issue_title" \
-    --body "$issue_body" \
-    --label "airc-queue" 2>&1); then
+    --label "airc-queue"); then
     :
-  elif issue_url=$(gh issue create \
+  elif issue_url=$(_airc_gh_safe_body "$issue_body" issue create \
     --repo "$target_repo" \
-    --title "$issue_title" \
-    --body "$issue_body" 2>&1); then
+    --title "$issue_title"); then
     printf 'note: %s does not have an "airc-queue" label yet. Card posted without one.\n' "$target_repo" >&2
   else
     die "queue add: gh issue create failed: $issue_url"
@@ -984,8 +984,12 @@ PYEOF
     return 0
   fi
 
-  if ! gh issue edit "$issue_num" --repo "$repo" --body "$new_body" >/dev/null 2>&1; then
-    die "queue mutate: gh issue edit failed for $repo#$issue_num"
+  # --body-file via lib_gh.sh — mutated card bodies always contain a
+  # ```json``` fence and a Status log of backticked refs (airc#571).
+  local edit_out
+  if ! edit_out=$(_airc_gh_safe_body "$new_body" issue edit "$issue_num" \
+    --repo "$repo"); then
+    die "queue mutate: gh issue edit failed for $repo#$issue_num: $edit_out"
   fi
 
   printf 'Updated %s#%s: %s\n' "$repo" "$issue_num" "$log_msg"
