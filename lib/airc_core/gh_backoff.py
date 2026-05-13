@@ -525,7 +525,7 @@ def _main(argv: list[str] | None = None) -> int:
     gh_args = list(args.gh_args)
     if gh_args and gh_args[0] == "--":
         gh_args = gh_args[1:]
-    gh = shutil.which("gh") or shutil.which("gh.exe")
+    gh = os.environ.get("AIRC_GH_BIN") or shutil.which("gh") or shutil.which("gh.exe")
     if not gh:
         print("airc gh guard: gh CLI not found on PATH", file=sys.stderr)
         return 127

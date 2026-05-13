@@ -380,6 +380,10 @@ infer_default_room() {
 # invite-string flow with no auto-discovery. Issue #85.
 # Defined here (before script-init) so the PATH-fixup below can use it.
 resolve_gh_bin() {
+  if [ -n "${AIRC_GH_BIN:-}" ] && [ -x "$AIRC_GH_BIN" ]; then
+    echo "$AIRC_GH_BIN"
+    return 0
+  fi
   if command -v gh >/dev/null 2>&1; then
     echo "gh"
     return 0
@@ -2507,6 +2511,17 @@ else
   exit 1
 fi
 
+# cmd_queue — issue-backed work queue primitives (airc#562 PR-1).
+# Subcommands: add, list. claim/release/state-transitions in PR-2;
+# nudge in PR-3; heartbeat/stall detection in PR-4.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_queue.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_queue.sh
+  source "$_airc_lib_dir/airc_bash/cmd_queue.sh"
+else
+  echo "ERROR: airc_bash/cmd_queue.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+
 
 # ── Dispatch ────────────────────────────────────────────────────────────
 
@@ -2564,6 +2579,7 @@ case "${1:-help}" in
   knock)     shift; cmd_knock "$@" ;;
   approve)   shift; cmd_approve "$@" ;;
   decrypt-approval) shift; cmd_decrypt_approval "$@" ;;
+  queue)     shift; cmd_queue "$@" ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
   version|--version|-v) shift; cmd_version "$@" ;;
@@ -2616,6 +2632,8 @@ case "${1:-help}" in
     echo "  airc knock <owner/repo> <msg>   Request collaboration access to a project repo (opens an issue)"
     echo "  airc approve <issue-url>        Encrypt a private-room invite to the knocker (replies on the issue)"
     echo "  airc decrypt-approval <url> --knocker-priv <hex>   Decrypt an approval comment (knocker side)"
+    echo "  airc queue add <owner/repo> --title \"…\" [--owner…]   Create an airc-queue work card"
+    echo "  airc queue list [<owner/repo>] [--owner…] [--status…]  List open airc-queue cards"
     echo "  airc msg / send <text>          Broadcast to the default channel"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc msg / send @a @b <text>    DM multiple peers (also: @a,b,c)"
