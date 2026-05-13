@@ -142,6 +142,17 @@ class QueueClaimValidationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("owner/repo", result.stdout + result.stderr)
 
+    def test_short_issue_ref_parses_on_macos_bash3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "claim", "owner/repo#1", "--owner", "codex", "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DRY RUN", result.stdout)
+        self.assertIn("owner/repo#1", result.stdout)
+        self.assertNotIn("local: -n", result.stderr)
+
     def test_bad_status_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(

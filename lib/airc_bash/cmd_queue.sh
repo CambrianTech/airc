@@ -696,10 +696,12 @@ _airc_queue_mutate_card() {
     shift || true
   done
 
-  local repo issue_num
-  if ! _airc_queue_parse_issue_url "$issue_url" repo issue_num; then
+  local parsed_issue repo issue_num
+  if ! parsed_issue=$(_airc_queue_parse_issue_url "$issue_url"); then
     die "queue: <issue-url> must be a GitHub issue URL or owner/repo#N (got: $issue_url)"
   fi
+  repo="${parsed_issue%#*}"
+  issue_num="${parsed_issue##*#}"
 
   if ! command -v gh >/dev/null 2>&1; then
     die "queue: 'gh' CLI is required."
@@ -812,18 +814,15 @@ PYEOF
 }
 
 _airc_queue_parse_issue_url() {
-  # Parse a github issue URL or owner/repo#N short form into repo +
-  # issue_num via name references (bash 4.3+). Returns 0 on success.
+  # Parse a GitHub issue URL or owner/repo#N short form. Prints
+  # owner/repo#N on success. Avoid bash namerefs here: macOS still ships
+  # bash 3.x, and `local -n` breaks exactly where Codex runs.
   local url="$1"
-  local -n out_repo="$2"
-  local -n out_num="$3"
   if [[ "$url" =~ ^https://github\.com/([^/]+/[^/]+)/issues/([0-9]+) ]]; then
-    out_repo="${BASH_REMATCH[1]}"
-    out_num="${BASH_REMATCH[2]}"
+    printf '%s#%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
     return 0
   elif [[ "$url" =~ ^([^/]+/[^/]+)#([0-9]+)$ ]]; then
-    out_repo="${BASH_REMATCH[1]}"
-    out_num="${BASH_REMATCH[2]}"
+    printf '%s#%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
     return 0
   fi
   return 1
