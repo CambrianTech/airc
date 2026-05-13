@@ -1423,7 +1423,7 @@ _cmd_queue_close_merged() {
   fi
 
   local pr_blob
-  if ! pr_blob=$(gh pr view "$pr_num" --repo "$pr_repo" --json body,mergedAt,mergeCommit,baseRefName,url 2>&1); then
+  if ! pr_blob=$(gh pr view "$pr_num" --repo "$pr_repo" --json title,body,mergedAt,mergeCommit,baseRefName,url 2>&1); then
     die "queue close-merged: gh pr view failed for $pr_repo#$pr_num: $pr_blob"
   fi
 
@@ -1441,20 +1441,22 @@ base_ref = pr.get("baseRefName") or ""
 merge_commit = pr.get("mergeCommit") or {}
 sha = (merge_commit.get("oid") if isinstance(merge_commit, dict) else "") or ""
 body = pr.get("body") or ""
+title = pr.get("title") or ""
 url = pr.get("url") or ""
-print(f"{merged_at}\t{base_ref}\t{sha}\t{url}\t{len(body)}")
+print(f"{merged_at}\t{base_ref}\t{sha}\t{url}\t{len(title)}\t{len(body)}")
 PYEOF
   ); then
     rm -f "$pr_file"
     die "queue close-merged: PR JSON parse failed"
   fi
 
-  local pr_merged_at pr_base_ref pr_sha pr_canonical_url pr_body_len
+  local pr_merged_at pr_base_ref pr_sha pr_canonical_url pr_title_len pr_body_len
   pr_merged_at=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $1}')
   pr_base_ref=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $2}')
   pr_sha=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $3}')
   pr_canonical_url=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $4}')
-  pr_body_len=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $5}')
+  pr_title_len=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $5}')
+  pr_body_len=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $6}')
 
   if [ -z "$pr_merged_at" ]; then
     rm -f "$pr_file"
@@ -1481,18 +1483,20 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
     pr = json.load(f)
 default_repo = sys.argv[2]
 body = pr.get("body") or ""
+title = pr.get("title") or ""
+text = f"{title}\n{body}"
 
 CROSS_RE = re.compile(r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b')
 SAME_RE = re.compile(r'(?<![A-Za-z0-9_/])#(\d+)\b')
 
 seen = set()
-for m in CROSS_RE.finditer(body):
+for m in CROSS_RE.finditer(text):
     owner, repo, num = m.group(1), m.group(2), m.group(3)
     key = f"{owner}/{repo}#{num}"
     if key not in seen:
         seen.add(key)
         print(key)
-for m in SAME_RE.finditer(body):
+for m in SAME_RE.finditer(text):
     num = m.group(1)
     key = f"{default_repo}#{num}"
     if key not in seen:
@@ -1514,10 +1518,10 @@ PYEOF
   rm -f "$refs_file"
 
   printf 'queue close-merged: PR %s merged into %s @ %s\n' "$pr_canonical_url" "$pr_base_ref" "${merge_sha:0:8}"
-  printf 'queue close-merged: scanned %d body refs (PR body %d chars)\n' "${#refs[@]}" "$pr_body_len"
+  printf 'queue close-merged: scanned %d title/body refs (PR title %d chars, body %d chars)\n' "${#refs[@]}" "$pr_title_len" "$pr_body_len"
 
   if [ "${#refs[@]}" -eq 0 ]; then
-    printf 'queue close-merged: no queue-card refs in PR body — nothing to close.\n'
+    printf 'queue close-merged: no queue-card refs in PR title/body — nothing to close.\n'
     return 0
   fi
 

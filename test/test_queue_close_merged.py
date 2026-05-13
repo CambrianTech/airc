@@ -52,6 +52,7 @@ def _isolated_env(tmp: str) -> dict[str, str]:
 
 
 def _fake_gh(tmp: str,
+             pr_title: str = "",
              pr_body: str = "",
              pr_merged_at: str = "2026-05-13T20:00:00Z",
              pr_base_ref: str = "canary",
@@ -75,6 +76,7 @@ def _fake_gh(tmp: str,
 
     # PR JSON file the fake gh streams on `gh pr view`.
     pr_json = {
+        "title": pr_title,
         "body": pr_body,
         "mergedAt": pr_merged_at,
         "mergeCommit": {"oid": pr_merge_sha} if pr_merge_sha else None,
@@ -309,6 +311,28 @@ class CloseMergedRefParserTests(unittest.TestCase):
             env_overrides=env,
         )
         return result, pathlib.Path(tmp)
+
+    def test_title_ref_detected(self) -> None:
+        tmp = tempfile.mkdtemp()
+        env = _fake_gh(
+            tmp,
+            pr_title="feat(#576): auto-close queue cards when PRs merge into canary",
+            pr_body="Body has unrelated #561.\n",
+            issue_bodies={
+                "576": _card_body(),
+                "561": "Plain issue, not a queue card.\n",
+            },
+        )
+        result = run_airc(
+            ["queue", "close-merged",
+             "https://github.com/CambrianTech/airc/pull/581",
+             "--dry-run"],
+            env_overrides=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("title/body refs", result.stdout)
+        self.assertIn("CambrianTech/airc#576", result.stdout)
+        self.assertIn("[dry-run]", result.stdout)
 
     def test_no_refs_clean_exit(self) -> None:
         body = "Just a PR body with no issue refs.\n"
