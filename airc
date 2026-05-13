@@ -2483,6 +2483,18 @@ else
   exit 1
 fi
 
+# cmd_knock — public collaboration knock entrypoint (airc#559 PR-1).
+# Opens a GitHub issue on a target project's repo with a structured
+# airc-knock envelope. Approval flow + private-room handoff land in
+# future PRs.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_knock.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_knock.sh
+  source "$_airc_lib_dir/airc_bash/cmd_knock.sh"
+else
+  echo "ERROR: airc_bash/cmd_knock.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+
 
 # ── Dispatch ────────────────────────────────────────────────────────────
 
@@ -2537,6 +2549,7 @@ case "${1:-help}" in
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) shift; cmd_invite "$@" ;;
+  knock)     shift; cmd_knock "$@" ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
   version|--version|-v) shift; cmd_version "$@" ;;
@@ -2586,6 +2599,7 @@ case "${1:-help}" in
     echo "  airc join <mnemonic>            Enter via humanhash like oregon-uncle-bravo-eleven (same gh account)"
     echo "  airc list / rooms / ls          List open rooms + invites on your gh account"
     echo "  airc part                       Leave the current room"
+    echo "  airc knock <owner/repo> <msg>   Request collaboration access to a project repo (opens an issue)"
     echo "  airc msg / send <text>          Broadcast to the default channel"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc msg / send @a @b <text>    DM multiple peers (also: @a,b,c)"
