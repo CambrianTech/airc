@@ -111,15 +111,42 @@ cmd_knock() {
   local knocker_identity_json
   knocker_identity_json=$(_airc_knock_identity_json "$knocker_name")
 
+  # Generate a per-knock ephemeral X25519 keypair for the approve flow
+  # (airc#559 PR-2). The approver derives a forward-secret shared key
+  # via ECDH(approver_ephemeral, knocker_ephemeral) and posts the
+  # encrypted private-room invite as a comment. Both ephemerals are
+  # per-message — even if either party's long-term key leaks years
+  # later, every prior approval's join string is unrecoverable.
+  #
+  # The PRIVATE half is printed at the end of the success message so the
+  # operator can save it. PR-2c will manage state automatically; for now
+  # state surface stays minimal.
+  local knock_keys_json knocker_pub knocker_priv
+  knock_keys_json=$(_airc_knock_gen_keys 2>/dev/null || echo "")
+  if [ -n "$knock_keys_json" ]; then
+    knocker_pub=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("pub",""))' <<< "$knock_keys_json" 2>/dev/null || echo "")
+    knocker_priv=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("priv",""))' <<< "$knock_keys_json" 2>/dev/null || echo "")
+  else
+    # Crypto path unavailable (no python venv with cryptography). Knock
+    # still posts but without an approval pubkey — cmd_approve will
+    # hard-fail with a clear "no knocker pubkey, can't encrypt" error
+    # rather than silently shipping plaintext.
+    knocker_pub=""
+    knocker_priv=""
+  fi
+
   local issue_title="airc-knock: $title_slice"
   local issue_body
-  issue_body=$(_airc_knock_issue_body "$knocker_name" "$knocker_identity_json" "$message")
+  issue_body=$(_airc_knock_issue_body "$knocker_name" "$knocker_identity_json" "$message" "$knocker_pub")
 
   if [ "$dry_run" -eq 1 ]; then
     printf 'DRY RUN — would post knock issue:\n'
     printf '  repo:   %s\n' "$target_repo"
     printf '  title:  %s\n' "$issue_title"
     printf '  body:\n%s\n' "$issue_body" | sed 's/^/    /'
+    if [ -n "$knocker_priv" ]; then
+      printf '\n  knocker priv key (SAVE THIS — needed to decrypt approval):\n    %s\n' "$knocker_priv"
+    fi
     return 0
   fi
 
@@ -151,7 +178,13 @@ cmd_knock() {
   fi
 
   printf 'Knock sent: %s\n' "$issue_url"
-  printf 'Awaiting approval. Approved peers receive the private room invite via airc DM (Phase 2 of airc#559).\n'
+  if [ -n "$knocker_priv" ]; then
+    printf '\nSAVE THIS PRIVATE KEY — needed to decrypt the approval comment:\n  %s\n\n' "$knocker_priv"
+    printf 'When approved, run:\n  airc decrypt-approval %s --knocker-priv <the key above>\n' "$issue_url"
+  else
+    printf 'WARNING: no crypto pubkey embedded — cmd_approve cannot encrypt for this knock.\n' >&2
+    printf '         Approval will require an out-of-band channel (DM, email).\n' >&2
+  fi
 }
 
 _airc_knock_help() {
@@ -257,14 +290,33 @@ _airc_knock_json_str() {
   printf '"%s"' "$s"
 }
 
+_airc_knock_gen_keys() {
+  # Generate per-knock ephemeral X25519 keypair via the python venv.
+  # Returns JSON {"priv": "<hex>", "pub": "<hex>"} on stdout.
+  # Returns non-zero (caller falls back to no-pubkey envelope) when the
+  # python crypto path isn't available — typically a fresh checkout
+  # without `pip install cryptography` in the venv.
+  if [ -z "${AIRC_PYTHON:-}" ]; then
+    return 1
+  fi
+  "$AIRC_PYTHON" -m airc_core.knock_crypto gen-knock-keys
+}
+
 _airc_knock_issue_body() {
   local knocker_name="$1"
   local identity_json="$2"
   local message="$3"
+  local knocker_pub="${4:-}"
 
-  # The body is human-readable markdown PLUS a machine-readable JSON
-  # envelope inside a fenced block. Future tooling (`airc approve`,
-  # sprint/kanban) parses the JSON; humans read the markdown.
+  # The body is human-readable markdown PLUS machine-readable JSON
+  # blocks. Future tooling (`airc approve`, sprint/kanban) parses the
+  # JSON; humans read the markdown.
+  #
+  # The Approval crypto block (PR-2) carries the per-knock ephemeral
+  # X25519 pubkey. cmd_approve parses this, generates its own ephemeral,
+  # ECDH-derives a shared key, and posts an encrypted comment. Both
+  # ephemerals are per-message — even a long-term-key leak years later
+  # cannot recover any prior approval's join string.
   cat <<EOF
 **airc knock from \`$knocker_name\`**
 
@@ -278,13 +330,19 @@ $message
 $identity_json
 \`\`\`
 
+### Approval crypto
+
+\`\`\`json
+{"ver":"v1","knocker_pub":"$knocker_pub"}
+\`\`\`
+
 ### Next step
 
 Repo owners can:
-- Approve by running \`airc approve $knocker_name\` (Phase 2 of [airc#559](https://github.com/CambrianTech/airc/issues/559)). The approval sends $knocker_name a private-room invite via airc DM.
+- Approve by running \`airc approve $knocker_name\` (Phase 2 of [airc#559](https://github.com/CambrianTech/airc/issues/559)). The approval encrypts the private-room invite to the \`knocker_pub\` above and posts it as a comment on this issue.
 - Reject by closing this issue, optionally with a comment.
 - Mark as spam via GitHub's spam tools.
 
-This issue was opened by \`airc knock\`. The structured JSON envelope above is parsed by future approval tooling.
+This issue was opened by \`airc knock\`. The structured JSON envelopes above are parsed by future approval tooling.
 EOF
 }
