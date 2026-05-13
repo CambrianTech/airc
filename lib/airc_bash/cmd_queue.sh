@@ -1,12 +1,14 @@
-# Sourced by airc. cmd_queue — issue-backed work queue primitives (airc#562 PR-1).
+# Sourced by airc. cmd_queue — issue-backed work queue primitives (airc#562).
 #
 # Function exported back to airc's dispatch:
-#   cmd_queue — subcommand router. Verbs in PR-1:
-#                 add    — create a new queue card (GitHub issue, airc-queue label).
-#                 list   — list open queue cards on a repo (or auto-detected).
+#   cmd_queue — subcommand router. Verbs:
+#                 add        — create a new queue card (GitHub issue, airc-queue label). [PR-1]
+#                 list       — list open queue cards on a repo (or auto-detected).       [PR-1]
+#                 claim      — set owner+status on an existing card.                     [PR-2]
+#                 release    — clear owner (back to claimable pool).                     [PR-2]
+#                 set-status — change status field with enum validation.                 [PR-2]
 #
 # Verbs deferred to later PRs under airc#562:
-#   - claim / release / state transitions (PR-2)
 #   - nudge (broadcast to idle peers) (PR-3)
 #   - heartbeat + stall detection (PR-4)
 #
@@ -54,8 +56,17 @@ cmd_queue() {
     list|ls)
       _cmd_queue_list "$@"
       ;;
+    claim)
+      _cmd_queue_claim "$@"
+      ;;
+    release)
+      _cmd_queue_release "$@"
+      ;;
+    set-status)
+      _cmd_queue_set_status "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status)"
       ;;
   esac
 }
@@ -328,17 +339,20 @@ airc queue — issue-backed work queue primitives (airc#562)
 USAGE
   airc queue add <owner/repo> --title "<one-line>" [card-fields...]
   airc queue list [<owner/repo>] [--owner X] [--status Y] [--limit N] [--json]
+  airc queue claim <issue-url> [--owner X] [--status Y]
+  airc queue release <issue-url> [--reason "..."] [--status claimed|blocked]
+  airc queue set-status <issue-url> <state>
 
 DESCRIPTION
-  Adds a queue card (GitHub issue with airc-queue label) or lists open
-  cards filtered by owner / status. Card fields follow the spec in
-  continuum/.airc/QUEUE.md (sibling claude tab #1's continuum#1110).
+  Adds, lists, or mutates queue cards (GitHub issues with airc-queue
+  label). Card fields follow the spec in continuum/.airc/QUEUE.md
+  (sibling claude tab #1's continuum#1110).
 
-PR-1 SCOPE
-  Only `add` + `list`. Coming in later PRs under airc#562:
-    - claim / release / state transitions (PR-2)
-    - nudge — broadcast to idle peers (PR-3)
-    - heartbeat / stall detection (PR-4)
+VERB SCOPE
+  add / list                   PR-1 (airc#566, merged)
+  claim / release / set-status PR-2 (this PR)
+  nudge                        PR-3 (deferred)
+  heartbeat / stall detection  PR-4 (deferred)
 
 EOF
 }
@@ -476,4 +490,404 @@ PYEOF
     'Coordinates work via the AIRC queue substrate (airc#562). Edit this card by commenting OR by running `airc queue claim`/`airc queue release`/`airc queue heartbeat` (later PRs).' \
     "$card_json" \
     'Close this issue when the work is done (status=merged/abandoned).'
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# PR-2: claim / release / set-status
+# ──────────────────────────────────────────────────────────────────────
+#
+# These verbs MUTATE an existing card body in place. The shape of the
+# operation is the same in all three:
+#   1. Resolve <issue-url> to (repo, issue_num).
+#   2. Fetch the current body via gh issue view.
+#   3. Parse the JSON envelope (kind=airc-queue-card-v1) out of the body.
+#   4. Mutate one or more fields (owner, status, possibly others later).
+#   5. Append a one-line entry to the body's "## Status log" section so
+#      the card carries chronological history readable to humans + tools.
+#   6. Write the updated body back via gh issue edit.
+#
+# Why update-in-place (vs comments): tooling (`airc queue list`) reads
+# the JSON envelope from the body; cards stay scannable at a glance
+# without parsing every comment. The status log preserves history for
+# operators reading the issue page.
+#
+# Design notes:
+#   - All three verbs accept --dry-run for envelope preview.
+#   - Owner defaults to current scope's resolve_name on `claim` (no flag
+#     needed for self-claim — the common case).
+#   - `release` clears owner field entirely (signals "unclaimed pool")
+#     and sets status to "claimed" if it was "in-progress" (the only
+#     status that implies someone is actively working).
+#   - `set-status merged` is the natural "I'm done" signal but does NOT
+#     close the issue automatically — operators close manually so the
+#     queue tracks the closure event explicitly.
+
+_cmd_queue_claim() {
+  local issue_url=""
+  local new_owner=""
+  local new_status="in-progress"
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_claim_help
+        return 0
+        ;;
+      --owner)    shift; new_owner="${1:-}" ;;
+      --status)   shift; new_status="${1:-}" ;;
+      --dry-run)  dry_run=1 ;;
+      -*) die "queue claim: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        else
+          die "queue claim: too many positional args. Got extra: $1"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ]; then
+    _airc_queue_claim_help >&2
+    return 1
+  fi
+
+  # Default owner = current scope's airc handle. Sub-tab disambiguation
+  # is the operator's job (claude tab #1 vs claude tab #2 today).
+  if [ -z "$new_owner" ]; then
+    new_owner=$(_airc_queue_resolve_name)
+  fi
+
+  case "$new_status" in
+    claimed|in-progress|blocked|review|merged) : ;;
+    *) die "queue claim: --status must be one of: claimed, in-progress, blocked, review, merged (got: $new_status)" ;;
+  esac
+
+  _airc_queue_mutate_card "$issue_url" "$dry_run" \
+    "claim by $new_owner -> status=$new_status" \
+    --set "owner=$new_owner" \
+    --set "status=$new_status"
+}
+
+_cmd_queue_release() {
+  local issue_url=""
+  local reason=""
+  local revert_to_status="claimed"
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_release_help
+        return 0
+        ;;
+      --reason)   shift; reason="${1:-}" ;;
+      --status)   shift; revert_to_status="${1:-}" ;;
+      --dry-run)  dry_run=1 ;;
+      -*) die "queue release: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        else
+          die "queue release: too many positional args. Got extra: $1"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ]; then
+    _airc_queue_release_help >&2
+    return 1
+  fi
+
+  case "$revert_to_status" in
+    claimed|blocked) : ;;
+    *) die "queue release: --status on release must be one of: claimed, blocked (got: $revert_to_status). Use set-status for in-progress/review/merged." ;;
+  esac
+
+  local releaser
+  releaser=$(_airc_queue_resolve_name)
+  local log_msg="released by $releaser -> status=$revert_to_status"
+  if [ -n "$reason" ]; then
+    log_msg="$log_msg ($reason)"
+  fi
+
+  _airc_queue_mutate_card "$issue_url" "$dry_run" \
+    "$log_msg" \
+    --clear owner \
+    --set "status=$revert_to_status"
+}
+
+_cmd_queue_set_status() {
+  local issue_url=""
+  local new_status=""
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_set_status_help
+        return 0
+        ;;
+      --dry-run)  dry_run=1 ;;
+      -*) die "queue set-status: unknown flag: $1" ;;
+      *)
+        if [ -z "$issue_url" ]; then
+          issue_url="$1"
+        elif [ -z "$new_status" ]; then
+          new_status="$1"
+        else
+          die "queue set-status: too many positional args (use: queue set-status <url> <state>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$issue_url" ] || [ -z "$new_status" ]; then
+    _airc_queue_set_status_help >&2
+    return 1
+  fi
+
+  case "$new_status" in
+    claimed|in-progress|blocked|review|merged) : ;;
+    *) die "queue set-status: <state> must be one of: claimed, in-progress, blocked, review, merged (got: $new_status)" ;;
+  esac
+
+  local actor
+  actor=$(_airc_queue_resolve_name)
+
+  _airc_queue_mutate_card "$issue_url" "$dry_run" \
+    "$actor -> status=$new_status" \
+    --set "status=$new_status"
+}
+
+_airc_queue_mutate_card() {
+  # Update an existing card body in place.
+  # Args: <issue_url> <dry_run> <log_msg> [--set field=value | --clear field]...
+  #
+  # Fetches the current body, parses the kind=airc-queue-card-v1 envelope,
+  # mutates per the --set/--clear flags, appends a "## Status log" entry,
+  # and writes the new body via gh issue edit.
+
+  local issue_url="$1"; shift
+  local dry_run="$1"; shift
+  local log_msg="$1"; shift
+
+  # Remaining args are --set field=value / --clear field pairs. We pass
+  # them as a single space-separated string to the python helper because
+  # bash arrays don't survive a heredoc cleanly.
+  local mutations=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set)
+        shift
+        mutations="${mutations}set:$1"$'\n'
+        ;;
+      --clear)
+        shift
+        mutations="${mutations}clear:$1"$'\n'
+        ;;
+      *) die "queue mutate: unknown internal mutation arg: $1" ;;
+    esac
+    shift || true
+  done
+
+  local parsed_issue repo issue_num
+  if ! parsed_issue=$(_airc_queue_parse_issue_url "$issue_url"); then
+    die "queue: <issue-url> must be a GitHub issue URL or owner/repo#N (got: $issue_url)"
+  fi
+  repo="${parsed_issue%#*}"
+  issue_num="${parsed_issue##*#}"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue: 'gh' CLI is required."
+  fi
+
+  local current_body
+  if ! current_body=$(gh issue view "$issue_num" --repo "$repo" --json body --jq .body 2>&1); then
+    die "queue: gh issue view failed for $repo#$issue_num: $current_body"
+  fi
+
+  # Hand to python: parse envelope, apply mutations, rewrite body with
+  # status-log entry. Python heredoc handles edge cases (escaping, regex)
+  # better than bash here. Body + mutations passed via temp files to
+  # dodge stdin contention with the heredoc.
+  local body_file mut_file
+  body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-body.XXXXXX") || die "queue: mktemp failed"
+  mut_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-muts.XXXXXX") || die "queue: mktemp failed"
+  printf '%s' "$current_body" >"$body_file"
+  printf '%s' "$mutations" >"$mut_file"
+
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%MZ")
+
+  local new_body
+  if ! new_body=$("$AIRC_PYTHON" - "$body_file" "$mut_file" "$log_msg" "$timestamp" <<'PYEOF'
+import json, re, sys
+body_path, mut_path, log_msg, timestamp = sys.argv[1:5]
+
+with open(body_path, "r", encoding="utf-8") as f:
+    body = f.read()
+with open(mut_path, "r", encoding="utf-8") as f:
+    mutations_raw = f.read().strip().splitlines()
+
+# Find the kind=airc-queue-card-v1 JSON block.
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+match = None
+for m in CARD_BLOCK_RE.finditer(body):
+    try:
+        parsed = json.loads(m.group(1).strip())
+    except Exception:
+        continue
+    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+        match = m
+        card = parsed
+        break
+if match is None:
+    print("queue mutate: no kind=airc-queue-card-v1 envelope found in body", file=sys.stderr)
+    sys.exit(2)
+
+# Apply mutations.
+for raw in mutations_raw:
+    if raw.startswith("set:"):
+        keyval = raw[4:]
+        if "=" not in keyval:
+            print(f"queue mutate: malformed --set: {keyval}", file=sys.stderr)
+            sys.exit(2)
+        k, v = keyval.split("=", 1)
+        card[k.strip()] = v.strip()
+    elif raw.startswith("clear:"):
+        k = raw[6:].strip()
+        if k in card:
+            del card[k]
+    else:
+        # Empty line from trailing newline; ignore.
+        if raw.strip():
+            print(f"queue mutate: malformed mutation: {raw}", file=sys.stderr)
+            sys.exit(2)
+
+new_envelope = json.dumps(card, indent=2)
+new_block = "```json\n" + new_envelope + "\n```"
+
+# Replace the original block with the new one.
+body_with_new_envelope = body[:match.start()] + new_block + body[match.end():]
+
+# Append to ## Status log section. If it doesn't exist yet, create it.
+log_line = f"- {timestamp} — {log_msg}"
+LOG_HEADER = "## Status log"
+if LOG_HEADER in body_with_new_envelope:
+    # Append to existing section: insert after the header line.
+    body_with_log = body_with_new_envelope.replace(
+        LOG_HEADER, LOG_HEADER + "\n\n" + log_line, 1
+    )
+    # Above replaces the FIRST match; entries pile in reverse-chrono
+    # at the top of the section. Newest-first reads better at a glance.
+else:
+    # Create the section at the end of the body.
+    body_with_log = body_with_new_envelope.rstrip() + "\n\n" + LOG_HEADER + "\n\n" + log_line + "\n"
+
+print(body_with_log, end="")
+PYEOF
+); then
+    rm -f "$body_file" "$mut_file"
+    die "queue mutate: python helper failed: $new_body"
+  fi
+  rm -f "$body_file" "$mut_file"
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'DRY RUN — would update %s#%s:\n' "$repo" "$issue_num"
+    printf '  log:  %s\n' "$log_msg"
+    printf '  new body:\n'
+    printf '%s\n' "$new_body" | sed 's/^/    /'
+    return 0
+  fi
+
+  if ! gh issue edit "$issue_num" --repo "$repo" --body "$new_body" >/dev/null 2>&1; then
+    die "queue mutate: gh issue edit failed for $repo#$issue_num"
+  fi
+
+  printf 'Updated %s#%s: %s\n' "$repo" "$issue_num" "$log_msg"
+}
+
+_airc_queue_parse_issue_url() {
+  # Parse a GitHub issue URL or owner/repo#N short form. Prints
+  # owner/repo#N on success. Avoid bash namerefs here: macOS still ships
+  # bash 3.x, and `local -n` breaks exactly where Codex runs.
+  local url="$1"
+  if [[ "$url" =~ ^https://github\.com/([^/]+/[^/]+)/issues/([0-9]+) ]]; then
+    printf '%s#%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  elif [[ "$url" =~ ^([^/]+/[^/]+)#([0-9]+)$ ]]; then
+    printf '%s#%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+_airc_queue_claim_help() {
+  cat <<'EOF'
+airc queue claim — take ownership of a queue card
+
+USAGE
+  airc queue claim <issue-url> [--owner X] [--status Y] [--dry-run]
+  airc queue claim owner/repo#N [--owner X] [--status Y] [--dry-run]
+
+DESCRIPTION
+  Sets the card's owner field and status to indicate active work. Default
+  owner = current scope's resolve_name; default status = in-progress.
+  Appends a "## Status log" line with timestamp + actor.
+
+OPTIONS
+  --owner <handle>   AIRC handle to set as owner (default: this scope).
+  --status <state>   New status (default: in-progress).
+  --dry-run          Print the new body that WOULD be written; don't edit.
+  -h, --help         This help.
+EOF
+}
+
+_airc_queue_release_help() {
+  cat <<'EOF'
+airc queue release — give up ownership of a queue card
+
+USAGE
+  airc queue release <issue-url> [--reason "..."] [--status claimed|blocked] [--dry-run]
+  airc queue release owner/repo#N [--reason "..."] [--status claimed|blocked] [--dry-run]
+
+DESCRIPTION
+  Clears the owner field (back to the unclaimed pool) and sets status to
+  "claimed" (default) or "blocked" if --status blocked. Appends a status
+  log line with timestamp, actor, and optional reason.
+
+OPTIONS
+  --reason "<text>"  Brief explanation logged with the release.
+  --status <state>   New status: claimed or blocked (default: claimed).
+                     For in-progress/review/merged use `airc queue set-status`.
+  --dry-run          Print what WOULD be written; don't edit.
+  -h, --help         This help.
+EOF
+}
+
+_airc_queue_set_status_help() {
+  cat <<'EOF'
+airc queue set-status — change the status field on a queue card
+
+USAGE
+  airc queue set-status <issue-url> <state> [--dry-run]
+  airc queue set-status owner/repo#N <state> [--dry-run]
+
+ARGUMENTS
+  <state>            One of: claimed, in-progress, blocked, review, merged.
+
+OPTIONS
+  --dry-run          Print what WOULD be written; don't edit.
+  -h, --help         This help.
+
+NOTES
+  - Does NOT close the issue automatically when set to merged. Operators
+    close manually so the queue tracks closure events explicitly.
+EOF
 }
