@@ -727,6 +727,19 @@ cmd_send() {
         --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" 2>/dev/null || true
     fi
   fi
+
+  # Codex/non-Monitor runtime ergonomics. With AIRC_SEND_TRIGGERS_POLL=1
+  # set, fire cmd_inbox quietly after a successful send so the runtime
+  # sees any new peer responses inline instead of waiting for separate
+  # user traffic. Mirrors the codex-poll dispatcher defaults
+  # (QUIET_EMPTY + EXCLUDE_SELF). Opt-in env-gate so existing Monitor-
+  # driven flows are unchanged. cmd_codex_start sets the env var for
+  # processes it spawns. --internal callers (rename propagation, etc.)
+  # stay silent — they're internal traffic, not Codex's user-visible
+  # send surface.
+  if [ "$internal" != "1" ] && [ "${AIRC_SEND_TRIGGERS_POLL:-0}" = "1" ]; then
+    AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 || true
+  fi
 }
 
 # Ping a peer to verify their monitor is alive AND processing traffic.

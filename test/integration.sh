@@ -4043,6 +4043,68 @@ scenario_inbox() {
     || fail "codex-hook did not emit expected UserPromptSubmit JSON: $out"
 }
 
+scenario_send_triggers_poll() {
+  # Codex/non-Monitor runtime ergonomic: AIRC_SEND_TRIGGERS_POLL=1 makes
+  # cmd_send fire cmd_inbox after a successful delivery so the runtime
+  # sees inbound peer responses inline instead of waiting for the next
+  # user-prompt-submit hook fire.
+  section "send_triggers_poll: AIRC_SEND_TRIGGERS_POLL=1 wires post-send inbox poll for codex runtime"
+  cleanup_all
+
+  local repo_root; repo_root=$(cd "$(dirname "$AIRC")" && pwd)
+  local home=/tmp/airc-it-stp/state
+  rm -rf /tmp/airc-it-stp; mkdir -p "$home"
+  scaffold_identity "$home/identity" 'airc-test-stp'
+  echo '{"name":"stp-test"}' > "$home/config.json"
+
+  # Seed an unread peer message — the codex-poll path should surface it
+  # whenever invoked (which is what the post-send wiring will invoke).
+  printf '%s\n' '{"ts":"2099-05-04T11:00:00Z","from":"peer-stp","client_id":"peer-stp-client","msg":"unread-before-send"}' > "$home/messages.jsonl"
+
+  # ── Wiring assertions: the env-gate + cmd_inbox call are present in
+  # cmd_send.sh, and cmd_codex_start exports the env var so spawned
+  # codex processes auto-opt-in. These greps catch refactors that
+  # accidentally remove either half of the wiring.
+  grep -q 'AIRC_SEND_TRIGGERS_POLL' "$repo_root/lib/airc_bash/cmd_send.sh" \
+    && pass "cmd_send.sh references AIRC_SEND_TRIGGERS_POLL (post-send wiring present)" \
+    || fail "cmd_send.sh missing AIRC_SEND_TRIGGERS_POLL wiring"
+  grep -qE 'AIRC_SEND_TRIGGERS_POLL.*=.*1.*\]' "$repo_root/lib/airc_bash/cmd_send.sh" \
+    && pass "cmd_send.sh gates post-send poll on AIRC_SEND_TRIGGERS_POLL=1 (opt-in only)" \
+    || fail "cmd_send.sh does not gate on '=1' — would fire unconditionally or on wrong value"
+  grep -q 'export AIRC_SEND_TRIGGERS_POLL' "$repo_root/lib/airc_bash/cmd_status.sh" \
+    && pass "cmd_codex_start exports AIRC_SEND_TRIGGERS_POLL for codex-spawned children" \
+    || fail "cmd_codex_start does not export AIRC_SEND_TRIGGERS_POLL — codex children miss auto-opt-in"
+
+  # ── Behavioral: codex-poll itself surfaces the unread peer message.
+  # cmd_send.sh's post-send wiring invokes the same code path, with the
+  # same env defaults (AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1).
+  # Proving codex-poll surfaces the message proves the call cmd_send
+  # wires actually does what cmd_send needs.
+  local out
+  out=$(AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  printf '%s' "$out" | grep -q 'unread-before-send' \
+    && pass "codex-poll surfaces unread peer message (the call cmd_send wires for codex runtime)" \
+    || fail "codex-poll did not surface unread peer message (got: $out)"
+
+  # ── Negative control: post-send poll must NOT fire on send FAILURE.
+  # The wiring is at the success path tail; if cmd_send returns early
+  # (dead monitor, queueing, etc.) the post-send poll never runs. Using
+  # the stale-pidfile shape from scenario_send_dead_monitor_dies.
+  if kill -0 99999 2>/dev/null; then
+    fail "PID 99999 unexpectedly alive on this system — pick a different stale PID"
+    cleanup_all; return
+  fi
+  echo "99999" > "$home/airc.pid"
+
+  # Reset cursor so a stray fire would surface 'unread-before-send'.
+  rm -f "$home/inbox_cursor"
+
+  out=$(AIRC_HOME="$home" AIRC_SEND_TRIGGERS_POLL=1 "$AIRC" msg "send into the void" 2>&1)
+  printf '%s' "$out" | grep -q 'unread-before-send' \
+    && fail "post-send poll fired on send-failure path (should only fire after successful delivery); got: $out" \
+    || pass "post-send poll correctly does NOT fire on send-failure path (gate is past success branch)"
+}
+
 scenario_host_msg_publishes_to_gist() {
   requires_gh_auth_or_skip "host_msg_publishes_to_gist" || return
   # End-to-end: full `airc msg` from a host actually publishes to the
@@ -5163,6 +5225,7 @@ case "$MODE" in
   bearer_gh) scenario_bearer_gh ;;
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
   inbox) scenario_inbox ;;
+  send_triggers_poll) scenario_send_triggers_poll ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   general_has_shared_gist) scenario_general_has_shared_gist ;;
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
@@ -5195,10 +5258,11 @@ case "$MODE" in
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
     scenario_inbox
+    scenario_send_triggers_poll
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|send_triggers_poll|invite_human|all]"; exit 2 ;;
 esac
 
 echo

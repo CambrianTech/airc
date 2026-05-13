@@ -617,6 +617,11 @@ cmd_codex_start() {
 
   local _started_at
   _started_at=$(date +%s)
+  # Codex/non-Monitor runtime ergonomics: any subsequent `airc msg` from
+  # this scope auto-fires cmd_inbox post-send so peer responses surface
+  # inline instead of waiting for separate user traffic. Honors the
+  # caller's existing setting (allow override to 0 for opt-out).
+  export AIRC_SEND_TRIGGERS_POLL="${AIRC_SEND_TRIGGERS_POLL:-1}"
   "$AIRC_PYTHON" -m airc_core.codex_start \
     --airc "$0" \
     --home "$AIRC_WRITE_DIR" \
