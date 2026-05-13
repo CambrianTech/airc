@@ -1,0 +1,224 @@
+.airc-q-board {
+  color: #e7ecf3;
+  background: #0e1116;
+  border: 1px solid #2b3440;
+  border-radius: 8px;
+  font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: 16px;
+}
+
+.airc-q-header {
+  align-items: center;
+  border-bottom: 1px solid #2b3440;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+}
+
+.airc-q-header h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.airc-q-header a,
+.airc-q-card-title {
+  color: #69a7ff;
+  text-decoration: none;
+}
+
+.airc-q-header a:hover,
+.airc-q-card-title:hover {
+  text-decoration: underline;
+}
+
+.airc-q-columns {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.airc-q-column {
+  min-width: 0;
+}
+
+.airc-q-column > header {
+  align-items: center;
+  color: #b6c2d0;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.airc-q-column h3 {
+  font-size: 13px;
+  letter-spacing: 0;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.airc-q-column header span {
+  background: #202833;
+  border: 1px solid #344152;
+  border-radius: 999px;
+  color: #d7e0ea;
+  min-width: 22px;
+  padding: 1px 7px;
+  text-align: center;
+}
+
+.airc-q-list {
+  display: grid;
+  gap: 8px;
+}
+
+.airc-q-card {
+  background: #151a22;
+  border: 1px solid #2b3440;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.airc-q-card-title {
+  display: block;
+  font-weight: 650;
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+
+.airc-q-fields {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.airc-q-fields div {
+  display: grid;
+  gap: 4px;
+  grid-template-columns: 52px minmax(0, 1fr);
+}
+
+.airc-q-fields dt {
+  color: #8e9bad;
+}
+
+.airc-q-fields dd {
+  color: #d7e0ea;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.airc-q-meta {
+  border-top: 1px solid #2b3440;
+  color: #9ba8b8;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+}
+
+.airc-q-empty,
+.airc-q-loading,
+.airc-q-error {
+  color: #9ba8b8;
+  margin: 0;
+  padding: 10px;
+}
+
+.airc-q-error {
+  color: #ffb4a8;
+}
+
+.airc-room-directory {
+  background: #0e1116;
+  border: 1px solid #2b3440;
+  border-radius: 8px;
+  color: #e7ecf3;
+  font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.airc-room-directory > header {
+  align-items: center;
+  border-bottom: 1px solid #2b3440;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+}
+
+.airc-room-directory h2,
+.airc-room h3 {
+  margin: 0;
+}
+
+.airc-room-directory h2 {
+  font-size: 18px;
+}
+
+.airc-room-directory > header span {
+  background: #202833;
+  border: 1px solid #344152;
+  border-radius: 999px;
+  color: #d7e0ea;
+  min-width: 22px;
+  padding: 1px 7px;
+  text-align: center;
+}
+
+.airc-room-list {
+  display: grid;
+  gap: 8px;
+}
+
+.airc-room {
+  background: #151a22;
+  border: 1px solid #2b3440;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 260px);
+  padding: 10px;
+}
+
+.airc-room-main p {
+  color: #b6c2d0;
+  margin: 6px 0 0;
+}
+
+.airc-room dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.airc-room dl div {
+  display: grid;
+  gap: 4px;
+  grid-template-columns: 68px minmax(0, 1fr);
+}
+
+.airc-room dt {
+  color: #8e9bad;
+}
+
+.airc-room dd {
+  color: #d7e0ea;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.airc-room code {
+  background: #202833;
+  border: 1px solid #344152;
+  border-radius: 5px;
+  padding: 1px 4px;
+}
+
+@media (max-width: 720px) {
+  .airc-room {
+    grid-template-columns: 1fr;
+  }
+}

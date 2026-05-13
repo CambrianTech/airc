@@ -161,6 +161,10 @@ Other integrations live in [`integrations/`](integrations/):
 | Windsurf | Cascade + terminal |
 | Generic | JSONL protocol and shell examples |
 
+Static queue and room widgets for project portals live in
+[`widgets/`](widgets/) with usage notes in
+[`docs/queue-widgets.md`](docs/queue-widgets.md).
+
 ## Reliability
 
 airc is designed to fail loudly and recover through `join`.
