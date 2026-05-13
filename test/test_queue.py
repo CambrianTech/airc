@@ -52,6 +52,22 @@ def _isolated_env(tmp: str) -> dict[str, str]:
     }
 
 
+def _isolated_env_with_fake_gh(tmp: str) -> dict[str, str]:
+    fakebin = pathlib.Path(tmp) / "bin"
+    fakebin.mkdir()
+    gh = fakebin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' '[]'\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = _isolated_env(tmp)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["AIRC_GH_BIN"] = str(gh)
+    return env
+
+
 class QueueDispatchTests(unittest.TestCase):
     def test_queue_no_subcommand_prints_help(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +231,30 @@ class QueueListAutoDetectTests(unittest.TestCase):
         combined = result.stdout + result.stderr
         self.assertIn("owner/repo", combined,
                       "missing-repo error must hint at the right arg shape")
+
+    def test_list_json_includes_now_utc_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "list", "owner/repo", "--json"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertRegex(payload["now_utc"], r"^\d{4}-\d{2}-\d{2}T")
+        self.assertEqual(payload["repo"], "owner/repo")
+        self.assertEqual(payload["cards"], [])
+
+    def test_list_human_includes_now_utc_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "list", "owner/repo"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("now_utc:", result.stdout)
+        self.assertIn("No open airc-queue cards", result.stdout)
 
 
 if __name__ == "__main__":

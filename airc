@@ -380,6 +380,10 @@ infer_default_room() {
 # invite-string flow with no auto-discovery. Issue #85.
 # Defined here (before script-init) so the PATH-fixup below can use it.
 resolve_gh_bin() {
+  if [ -n "${AIRC_GH_BIN:-}" ] && [ -x "$AIRC_GH_BIN" ]; then
+    echo "$AIRC_GH_BIN"
+    return 0
+  fi
   if command -v gh >/dev/null 2>&1; then
     echo "gh"
     return 0

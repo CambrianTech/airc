@@ -239,16 +239,25 @@ _cmd_queue_list() {
   fi
 
   # Parse + filter + render via python (more robust than bash jq + grep
-  # gymnastics on multi-line bodies).
-  printf '%s' "$raw_json" | "$AIRC_PYTHON" - \
-      "$target_repo" "$filter_owner" "$filter_status" "$output_json" \
+  # gymnastics on multi-line bodies). The issue JSON goes through a temp
+  # file because `python - <<'PYEOF'` already consumes stdin for the script.
+  local raw_json_file
+  raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list.XXXXXX") || die "queue list: mktemp failed"
+  printf '%s' "$raw_json" >"$raw_json_file"
+
+  "$AIRC_PYTHON" - \
+      "$target_repo" "$filter_owner" "$filter_status" "$output_json" "$raw_json_file" \
       <<'PYEOF'
-import json, re, sys
-data = json.loads(sys.stdin.read())
+import datetime, json, re, sys
 repo = sys.argv[1]
 filter_owner = sys.argv[2]
 filter_status = sys.argv[3]
 output_json = sys.argv[4] == "1"
+raw_json_file = sys.argv[5]
+now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+with open(raw_json_file, "r", encoding="utf-8") as f:
+    data = json.loads(f.read())
 
 CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
 
@@ -280,15 +289,18 @@ for issue in data:
     })
 
 if output_json:
-    print(json.dumps(cards, indent=2))
+    print(json.dumps({"now_utc": now_utc, "repo": repo, "cards": cards}, indent=2))
 else:
     if not cards:
         suffix = ""
         if filter_owner: suffix += f" owner={filter_owner}"
         if filter_status: suffix += f" status={filter_status}"
+        print(f"# airc-queue — {repo}")
+        print(f"now_utc: {now_utc}")
         print(f"No open airc-queue cards on {repo}{suffix}.")
         sys.exit(0)
     print(f"# airc-queue — {repo} ({len(cards)} open)")
+    print(f"now_utc: {now_utc}")
     for entry in cards:
         c = entry["card"]
         print()
@@ -304,6 +316,9 @@ else:
         if c.get("next_action"):     print(f"  next:          {c['next_action']}")
         if c.get("last_heartbeat"):  print(f"  last heartbeat:{c['last_heartbeat']}")
 PYEOF
+  local py_status=$?
+  rm -f "$raw_json_file"
+  return "$py_status"
 }
 
 _airc_queue_help() {
