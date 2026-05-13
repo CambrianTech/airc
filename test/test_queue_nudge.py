@@ -20,6 +20,7 @@ without hitting transport.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
@@ -100,7 +101,6 @@ def _isolated_env_with_fake_gh(tmp: str, body_response: str | None = None) -> di
     body_file.write_text(body, encoding="utf-8")
     # Wrap in a JSON envelope so `gh issue view --json title,body` returns
     # a parseable shape — _cmd_queue_nudge consumes title+body together.
-    import json
     issue = {
         "title": "Sample card for nudge tests",
         "body": body,
@@ -176,6 +176,7 @@ class QueueNudgeDispatchTests(unittest.TestCase):
             result = run_airc(["help"], env_overrides=_isolated_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("airc queue nudge", result.stdout)
+        self.assertIn("airc queue pongs", result.stdout)
 
 
 class QueueNudgeValidationTests(unittest.TestCase):
@@ -340,6 +341,18 @@ class QueueRepoNudgeDryRunTests(unittest.TestCase):
         self.assertIn("card=<owner/repo#N|idle>", out)
         self.assertIn("claim=<keep|release|none>", out)
 
+    def test_repo_scoped_nudge_accepts_explicit_sweep_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "nudge", "owner/repo",
+                 "--sweep-id", "sweep-123",
+                 "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sweep=sweep-123", result.stdout)
+        self.assertIn("pong: owner/repo — sweep=sweep-123", result.stdout)
+
     def test_repo_scoped_nudge_with_message_appends_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(
@@ -371,6 +384,91 @@ class QueueRepoNudgeDryRunTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("repo-nudge:", result.stdout)
+
+
+class QueuePongsTests(unittest.TestCase):
+    def test_pongs_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "pongs", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("summarize repo-nudge replies", result.stdout)
+        self.assertIn("--sweep-id", result.stdout)
+
+    def test_pongs_summarizes_responders_and_missing_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(tmp)
+            airc_home = pathlib.Path(env["AIRC_HOME"])
+            airc_home.mkdir(parents=True, exist_ok=True)
+            messages = airc_home / "messages.jsonl"
+            messages.write_text(
+                "\n".join([
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:01Z",
+                        "from": "claude-tab-1",
+                        "msg": (
+                            "pong: owner/repo — sweep=sweep-123 — claude-tab-1 — "
+                            "card=<owner/repo#1> state=<coding> blocker=<none> "
+                            "next=<finish tests> claim=<keep>"
+                        ),
+                    }),
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:02Z",
+                        "from": "someone-else",
+                        "msg": "unrelated message",
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_airc(
+                ["queue", "pongs", "owner/repo",
+                 "--sweep-id", "sweep-123",
+                 "--since", "2000-01-01T00:00:00Z"],
+                env_overrides=env,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("responders (1)", result.stdout)
+        self.assertIn("claude-tab-1", result.stdout)
+        self.assertIn("card=owner/repo#1", result.stdout)
+        self.assertIn("state=coding", result.stdout)
+        self.assertIn("missing owners (1): codex", result.stdout)
+
+    def test_pongs_json_filters_by_sweep_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(tmp)
+            airc_home = pathlib.Path(env["AIRC_HOME"])
+            airc_home.mkdir(parents=True, exist_ok=True)
+            (airc_home / "messages.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:01Z",
+                        "from": "claude-tab-1",
+                        "msg": "pong: owner/repo — sweep=old — claude-tab-1 — card=<owner/repo#1> state=<coding> blocker=<none> next=<x> claim=<keep>",
+                    }),
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:02Z",
+                        "from": "codex",
+                        "msg": "pong: owner/repo — sweep=new — codex — card=<owner/repo#2> state=<reviewing> blocker=<none> next=<merge> claim=<keep>",
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_airc(
+                ["queue", "pongs", "owner/repo",
+                 "--sweep-id", "new",
+                 "--since", "2000-01-01T00:00:00Z",
+                 "--json"],
+                env_overrides=env,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["sweep_id"], "new")
+        self.assertEqual([r["nick"] for r in payload["responders"]], ["codex"])
+        self.assertEqual(payload["missing_owners"], ["claude-tab-1"])
 
 
 if __name__ == "__main__":

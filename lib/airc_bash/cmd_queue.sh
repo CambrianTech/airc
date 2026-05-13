@@ -9,6 +9,7 @@
 #                 set-status — change status field with enum validation.                 [PR-2]
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
+#                 pongs      — summarize repo-nudge pong replies.
 #
 # Verbs deferred to later PRs under airc#562:
 #   - heartbeat + stall detection (PR-4)
@@ -72,8 +73,11 @@ cmd_queue() {
     adopt|import)
       _cmd_queue_adopt "$@"
       ;;
+    pongs|pong-summary)
+      _cmd_queue_pongs "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, pongs)"
       ;;
   esac
 }
@@ -352,6 +356,7 @@ USAGE
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
+  airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID]
 
 DESCRIPTION
   Adds, lists, or mutates queue cards (GitHub issues with airc-queue
@@ -363,6 +368,7 @@ VERB SCOPE
   claim / release / set-status PR-2 (airc#568, merged)
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
+  pongs / pong-summary          Repo-nudge response collection (airc#579)
   heartbeat / stall detection  PR-4 (deferred)
 
 EOF
@@ -856,6 +862,7 @@ _cmd_queue_nudge() {
   local extra_message=""
   local dry_run=0
   local limit=20
+  local sweep_id=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -866,6 +873,7 @@ _cmd_queue_nudge() {
       --peer)     shift; target_peer="${1:-}" ;;
       --message)  shift; extra_message="${1:-}" ;;
       --limit)    shift; limit="${1:-20}" ;;
+      --sweep-id) shift; sweep_id="${1:-}" ;;
       --dry-run)  dry_run=1 ;;
       -*) die "queue nudge: unknown flag: $1" ;;
       *)
@@ -897,7 +905,7 @@ _cmd_queue_nudge() {
   # owner/repo with no # means repo-scoped status sweep. Keep this before
   # issue parsing so "CambrianTech/continuum" is valid nudge input.
   if [[ "$target" =~ ^[^/]+/[^#]+$ ]]; then
-    _cmd_queue_nudge_repo "$target" "$target_peer" "$extra_message" "$limit" "$dry_run"
+    _cmd_queue_nudge_repo "$target" "$target_peer" "$extra_message" "$limit" "$sweep_id" "$dry_run"
     return $?
   fi
 
@@ -912,7 +920,8 @@ _cmd_queue_nudge_repo() {
   local target_peer="$2"
   local extra_message="$3"
   local limit="$4"
-  local dry_run="$5"
+  local sweep_id="$5"
+  local dry_run="$6"
 
   case "$target_repo" in
     */*) : ;;
@@ -988,12 +997,15 @@ PYEOF
 
   local actor
   actor=$(_airc_queue_resolve_name)
+  if [ -z "$sweep_id" ]; then
+    sweep_id=$(date -u +"%Y%m%dT%H%M%SZ")
+  fi
 
-  local nudge_text="repo-nudge: ${target_repo} — status sweep requested by ${actor}; open=${summary}"
+  local nudge_text="repo-nudge: ${target_repo} — sweep=${sweep_id} — status sweep requested by ${actor}; open=${summary}"
   if [ -n "$extra_message" ]; then
     nudge_text="${nudge_text} — ${extra_message}"
   fi
-  nudge_text="${nudge_text} — pong with: pong: ${target_repo} — <nick> — card=<${target_repo}#N|idle> state=<idle|coding|testing|reviewing|blocked> blocker=<none|...> next=<...> claim=<keep|release|none>"
+  nudge_text="${nudge_text} — pong with: pong: ${target_repo} — sweep=${sweep_id} — <nick> — card=<${target_repo}#N|idle> state=<idle|coding|testing|reviewing|blocked> blocker=<none|...> next=<...> claim=<keep|release|none>"
 
   if [ "$dry_run" = "1" ]; then
     echo "  [dry-run] would broadcast repo status sweep: ${nudge_text}"
@@ -1137,6 +1149,216 @@ PYEOF
   # log. The mutate helper appends the entry; absence of --set/--clear
   # leaves field values untouched.
   _airc_queue_mutate_card "$issue_url" 0 "$log_msg"
+}
+
+_cmd_queue_pongs() {
+  # Summarize repo-nudge replies already present in the local AIRC log.
+  # This intentionally reads messages.jsonl directly rather than sending
+  # more traffic: repo-nudge is the wakeup, pongs is the audit pass.
+  local target_repo=""
+  local since="30m"
+  local sweep_id=""
+  local limit=200
+  local output_json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_pongs_help
+        return 0
+        ;;
+      --since)    shift; since="${1:-}" ;;
+      --sweep-id) shift; sweep_id="${1:-}" ;;
+      --limit)    shift; limit="${1:-200}" ;;
+      --json)     output_json=1 ;;
+      -*) die "queue pongs: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue pongs: too many positional args (use: queue pongs <owner/repo>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_repo" ]; then
+    _airc_queue_pongs_help >&2
+    return 1
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue pongs: target repo must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue pongs: --limit must be a positive integer (got: $limit)" ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue pongs: 'gh' CLI is required."
+  fi
+
+  local raw_json
+  if ! raw_json=$(gh issue list \
+    --repo "$target_repo" \
+    --label "airc-queue" \
+    --state open \
+    --limit "$limit" \
+    --json number,title,url,body,updatedAt 2>&1); then
+    die "queue pongs: gh issue list failed for $target_repo: $raw_json"
+  fi
+
+  local cards_file messages_file
+  cards_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pongs-cards.XXXXXX") || die "queue pongs: mktemp failed"
+  messages_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pongs-log.XXXXXX") || die "queue pongs: mktemp failed"
+  printf '%s' "$raw_json" >"$cards_file"
+  if [ -f "$MESSAGES" ]; then
+    tail -"$limit" "$MESSAGES" >"$messages_file" 2>/dev/null || true
+  else
+    : >"$messages_file"
+  fi
+
+  AIRC_QUEUE_PONGS_SINCE="$since" "$AIRC_PYTHON" - \
+      "$target_repo" "$sweep_id" "$output_json" "$cards_file" "$messages_file" \
+      <<'PYEOF'
+import datetime, json, os, re, sys
+
+repo, sweep_id, output_json_raw, cards_path, messages_path = sys.argv[1:6]
+output_json = output_json_raw == "1"
+since_arg = os.environ.get("AIRC_QUEUE_PONGS_SINCE", "30m")
+
+def parse_since(value: str):
+    if not value:
+        return None
+    m = re.fullmatch(r"(\d+)([smhd])", value)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = {
+            "s": datetime.timedelta(seconds=n),
+            "m": datetime.timedelta(minutes=n),
+            "h": datetime.timedelta(hours=n),
+            "d": datetime.timedelta(days=n),
+        }[unit]
+        return datetime.datetime.now(datetime.timezone.utc) - delta
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        print(f"queue pongs: cannot parse --since '{value}'", file=sys.stderr)
+        sys.exit(2)
+
+since_dt = parse_since(since_arg)
+
+with open(cards_path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+owners = {}
+cards = []
+for issue in issues:
+    card = {}
+    for m in CARD_BLOCK_RE.finditer(issue.get("body", "") or ""):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            card = parsed
+            break
+    if not card:
+        continue
+    owner = (card.get("owner") or "").strip()
+    number = issue.get("number")
+    if owner:
+        owners.setdefault(owner, []).append(f"{repo}#{number}")
+    cards.append({"number": number, "owner": owner, "status": card.get("status", "")})
+
+PONG_RE = re.compile(rf"\bpong:\s*{re.escape(repo)}\b(?P<body>.*)", re.IGNORECASE)
+FIELD_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_-]*)=<([^>]*)>|\b([a-zA-Z_][a-zA-Z0-9_-]*)=([^\s—]+)")
+
+responders = {}
+with open(messages_path, "r", encoding="utf-8") as f:
+    for line in f:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        ts = msg.get("ts") or ""
+        if since_dt is not None:
+            try:
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+            if dt <= since_dt:
+                continue
+        text = msg.get("msg") or ""
+        m = PONG_RE.search(text)
+        if not m:
+            continue
+        fields = {}
+        for fm in FIELD_RE.finditer(text):
+            key = fm.group(1) or fm.group(3)
+            value = fm.group(2) if fm.group(1) else fm.group(4)
+            fields[key] = value
+        if sweep_id and fields.get("sweep") != sweep_id:
+            continue
+        sender = msg.get("from") or "?"
+        nick = sender
+        # Expected text has: pong: repo — sweep=X — <nick> — card=...
+        parts = [p.strip() for p in text.split("—")]
+        for part in parts:
+            if part and not part.startswith("pong:") and "=" not in part:
+                nick = part
+                break
+        responders[nick] = {
+            "nick": nick,
+            "sender": sender,
+            "ts": ts,
+            "card": fields.get("card", ""),
+            "state": fields.get("state", ""),
+            "blocker": fields.get("blocker", ""),
+            "next": fields.get("next", ""),
+            "claim": fields.get("claim", ""),
+            "sweep": fields.get("sweep", ""),
+        }
+
+missing = sorted([owner for owner in owners if owner not in responders])
+payload = {
+    "repo": repo,
+    "sweep_id": sweep_id,
+    "since": since_arg,
+    "responders": list(responders.values()),
+    "missing_owners": missing,
+    "open_owner_cards": owners,
+    "open_cards": cards,
+}
+
+if output_json:
+    print(json.dumps(payload, indent=2))
+else:
+    label = f" sweep={sweep_id}" if sweep_id else ""
+    print(f"# airc-queue pongs — {repo}{label}")
+    print(f"since: {since_arg}")
+    if responders:
+        print(f"responders ({len(responders)}):")
+        for item in payload["responders"]:
+            print(f"  - {item['nick']}: card={item['card'] or '?'} state={item['state'] or '?'} blocker={item['blocker'] or '?'} next={item['next'] or '?'} claim={item['claim'] or '?'}")
+    else:
+        print("responders: none")
+    if missing:
+        print(f"missing owners ({len(missing)}): {', '.join(missing)}")
+    else:
+        print("missing owners: none")
+PYEOF
+  local py_status=$?
+  rm -f "$cards_file" "$messages_file"
+  return "$py_status"
 }
 
 _airc_queue_mutate_card() {
@@ -1417,7 +1639,7 @@ airc queue nudge — surface a queue card OR run a repo status sweep
 USAGE
   airc queue nudge <issue-url> [--peer @handle] [--message "..."] [--dry-run]
   airc queue nudge owner/repo#N [--peer @handle] [--message "..."] [--dry-run]
-  airc queue nudge owner/repo [--peer @handle] [--message "..."] [--limit N] [--dry-run]
+  airc queue nudge owner/repo [--peer @handle] [--message "..."] [--limit N] [--sweep-id ID] [--dry-run]
 
 ARGUMENTS
   <issue-url>        GitHub issue URL OR owner/repo#N reference. Card-scoped
@@ -1432,6 +1654,8 @@ OPTIONS
                      ("nudge: #1125 — pickup needed before EOD" etc.).
   --limit N          Repo-scoped mode only: max queue cards to summarize
                      from the repo (default: 20).
+  --sweep-id ID      Repo-scoped mode only: explicit sweep id. Default is
+                     current UTC timestamp; replies should include sweep=ID.
   --dry-run          Print the broadcast text + status-log entry that
                      WOULD be written; don't send or edit.
   -h, --help         This help.
@@ -1459,5 +1683,33 @@ NOTES
     backlog and `.airc/ASSEMBLY-LINE.md` in continuum#1110.
   - Status fields are NOT changed by nudge. Use airc queue set-status if
     you need to mark a card differently.
+EOF
+}
+
+_airc_queue_pongs_help() {
+  cat <<'EOF'
+airc queue pongs — summarize repo-nudge replies from the AIRC log
+
+USAGE
+  airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID] [--limit N] [--json]
+  airc queue pong-summary <owner/repo> [--since 30m] [--sweep-id ID]
+
+DESCRIPTION
+  Reads local AIRC messages.jsonl for `pong: owner/repo ...` replies,
+  summarizes responders, and compares them to owners of open airc-queue
+  cards. This is the audit half of `airc queue nudge owner/repo`.
+
+OPTIONS
+  --since <when>      ISO timestamp or relative window: 60s, 5m, 1h, 2d.
+                      Default: 30m.
+  --sweep-id <ID>     Only include pongs with sweep=<ID>.
+  --limit <N>         Max queue cards and log lines to inspect (default 200).
+  --json              Emit machine-readable summary.
+  -h, --help          This help.
+
+EXPECTED PONG
+  pong: owner/repo — sweep=ID — <nick> — card=<owner/repo#N|idle>
+    state=<idle|coding|testing|reviewing|blocked> blocker=<none|...>
+    next=<...> claim=<keep|release|none>
 EOF
 }
