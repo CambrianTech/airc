@@ -2,14 +2,15 @@
 #
 # Function exported back to airc's dispatch:
 #   cmd_queue — subcommand router. Verbs:
-#                 add          — create a new queue card (GitHub issue, airc-queue label). [PR-1]
-#                 list         — list open queue cards on a repo (or auto-detected).       [PR-1]
-#                 claim        — set owner+status on an existing card.                     [PR-2]
-#                 release      — clear owner (back to claimable pool).                     [PR-2]
-#                 set-status   — change status field with enum validation.                 [PR-2]
-#                 nudge        — surface a card OR repo-scoped status sweep.               [PR-3+]
-#                 adopt        — convert an existing issue into a queue card.              [#575]
-#                 close-merged — auto-close cards referenced by a merged PR.               [#576]
+#                 add        — create a new queue card (GitHub issue, airc-queue label). [PR-1]
+#                 list       — list open queue cards on a repo (or auto-detected).       [PR-1]
+#                 claim      — set owner+status on an existing card.                     [PR-2]
+#                 release    — clear owner (back to claimable pool).                     [PR-2]
+#                 set-status — change status field with enum validation.                 [PR-2]
+#                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
+#                 adopt      — convert an existing issue into a queue card.
+#                 pongs      — summarize repo-nudge pong replies.
+#                 close-merged — auto-close cards referenced by a merged PR.
 #
 # Verbs deferred to later PRs under airc#562:
 #   - heartbeat + stall detection (PR-4)
@@ -73,11 +74,14 @@ cmd_queue() {
     adopt|import)
       _cmd_queue_adopt "$@"
       ;;
+    pongs|pong-summary)
+      _cmd_queue_pongs "$@"
+      ;;
     close-merged)
       _cmd_queue_close_merged "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, nudge, adopt, pongs, close-merged)"
       ;;
   esac
 }
@@ -356,6 +360,7 @@ USAGE
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
+  airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID]
   airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
 
 DESCRIPTION
@@ -366,8 +371,9 @@ DESCRIPTION
 VERB SCOPE
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
-  nudge                        PR-3 (card, airc#573) + PR-4a (repo ping/pong sweep, airc#578)
+  nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
+  pongs / pong-summary          Repo-nudge response collection (airc#579)
   close-merged                 airc#576 — auto-close on PR merge to canary
   heartbeat / stall detection  PR-4 (deferred)
 
@@ -862,6 +868,7 @@ _cmd_queue_nudge() {
   local extra_message=""
   local dry_run=0
   local limit=20
+  local sweep_id=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -872,6 +879,7 @@ _cmd_queue_nudge() {
       --peer)     shift; target_peer="${1:-}" ;;
       --message)  shift; extra_message="${1:-}" ;;
       --limit)    shift; limit="${1:-20}" ;;
+      --sweep-id) shift; sweep_id="${1:-}" ;;
       --dry-run)  dry_run=1 ;;
       -*) die "queue nudge: unknown flag: $1" ;;
       *)
@@ -903,7 +911,7 @@ _cmd_queue_nudge() {
   # owner/repo with no # means repo-scoped status sweep. Keep this before
   # issue parsing so "CambrianTech/continuum" is valid nudge input.
   if [[ "$target" =~ ^[^/]+/[^#]+$ ]]; then
-    _cmd_queue_nudge_repo "$target" "$target_peer" "$extra_message" "$limit" "$dry_run"
+    _cmd_queue_nudge_repo "$target" "$target_peer" "$extra_message" "$limit" "$sweep_id" "$dry_run"
     return $?
   fi
 
@@ -918,7 +926,8 @@ _cmd_queue_nudge_repo() {
   local target_peer="$2"
   local extra_message="$3"
   local limit="$4"
-  local dry_run="$5"
+  local sweep_id="$5"
+  local dry_run="$6"
 
   case "$target_repo" in
     */*) : ;;
@@ -994,12 +1003,15 @@ PYEOF
 
   local actor
   actor=$(_airc_queue_resolve_name)
+  if [ -z "$sweep_id" ]; then
+    sweep_id=$(date -u +"%Y%m%dT%H%M%SZ")
+  fi
 
-  local nudge_text="repo-nudge: ${target_repo} — status sweep requested by ${actor}; open=${summary}"
+  local nudge_text="repo-nudge: ${target_repo} — sweep=${sweep_id} — status sweep requested by ${actor}; open=${summary}"
   if [ -n "$extra_message" ]; then
     nudge_text="${nudge_text} — ${extra_message}"
   fi
-  nudge_text="${nudge_text} — pong with: pong: ${target_repo} — <nick> — card=<${target_repo}#N|idle> state=<idle|coding|testing|reviewing|blocked> blocker=<none|...> next=<...> claim=<keep|release|none>"
+  nudge_text="${nudge_text} — pong with: pong: ${target_repo} — sweep=${sweep_id} — <nick> — card=<${target_repo}#N|idle> state=<idle|coding|testing|reviewing|blocked> blocker=<none|...> next=<...> claim=<keep|release|none>"
 
   if [ "$dry_run" = "1" ]; then
     echo "  [dry-run] would broadcast repo status sweep: ${nudge_text}"
@@ -1145,34 +1157,225 @@ PYEOF
   _airc_queue_mutate_card "$issue_url" 0 "$log_msg"
 }
 
+_cmd_queue_pongs() {
+  # Summarize repo-nudge replies already present in the local AIRC log.
+  # This intentionally reads messages.jsonl directly rather than sending
+  # more traffic: repo-nudge is the wakeup, pongs is the audit pass.
+  local target_repo=""
+  local since="30m"
+  local sweep_id=""
+  local limit=200
+  local output_json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_pongs_help
+        return 0
+        ;;
+      --since)    shift; since="${1:-}" ;;
+      --sweep-id) shift; sweep_id="${1:-}" ;;
+      --limit)    shift; limit="${1:-200}" ;;
+      --json)     output_json=1 ;;
+      -*) die "queue pongs: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue pongs: too many positional args (use: queue pongs <owner/repo>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_repo" ]; then
+    _airc_queue_pongs_help >&2
+    return 1
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue pongs: target repo must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue pongs: --limit must be a positive integer (got: $limit)" ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue pongs: 'gh' CLI is required."
+  fi
+
+  local raw_json
+  if ! raw_json=$(gh issue list \
+    --repo "$target_repo" \
+    --label "airc-queue" \
+    --state open \
+    --limit "$limit" \
+    --json number,title,url,body,updatedAt 2>&1); then
+    die "queue pongs: gh issue list failed for $target_repo: $raw_json"
+  fi
+
+  local cards_file messages_file
+  cards_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pongs-cards.XXXXXX") || die "queue pongs: mktemp failed"
+  messages_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pongs-log.XXXXXX") || die "queue pongs: mktemp failed"
+  printf '%s' "$raw_json" >"$cards_file"
+  if [ -f "$MESSAGES" ]; then
+    tail -"$limit" "$MESSAGES" >"$messages_file" 2>/dev/null || true
+  else
+    : >"$messages_file"
+  fi
+
+  AIRC_QUEUE_PONGS_SINCE="$since" "$AIRC_PYTHON" - \
+      "$target_repo" "$sweep_id" "$output_json" "$cards_file" "$messages_file" \
+      <<'PYEOF'
+import datetime, json, os, re, sys
+
+repo, sweep_id, output_json_raw, cards_path, messages_path = sys.argv[1:6]
+output_json = output_json_raw == "1"
+since_arg = os.environ.get("AIRC_QUEUE_PONGS_SINCE", "30m")
+
+def parse_since(value: str):
+    if not value:
+        return None
+    m = re.fullmatch(r"(\d+)([smhd])", value)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = {
+            "s": datetime.timedelta(seconds=n),
+            "m": datetime.timedelta(minutes=n),
+            "h": datetime.timedelta(hours=n),
+            "d": datetime.timedelta(days=n),
+        }[unit]
+        return datetime.datetime.now(datetime.timezone.utc) - delta
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        print(f"queue pongs: cannot parse --since '{value}'", file=sys.stderr)
+        sys.exit(2)
+
+since_dt = parse_since(since_arg)
+
+with open(cards_path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+owners = {}
+cards = []
+for issue in issues:
+    card = {}
+    for m in CARD_BLOCK_RE.finditer(issue.get("body", "") or ""):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            card = parsed
+            break
+    if not card:
+        continue
+    owner = (card.get("owner") or "").strip()
+    number = issue.get("number")
+    if owner:
+        owners.setdefault(owner, []).append(f"{repo}#{number}")
+    cards.append({"number": number, "owner": owner, "status": card.get("status", "")})
+
+PONG_RE = re.compile(rf"\bpong:\s*{re.escape(repo)}\b(?P<body>.*)", re.IGNORECASE)
+FIELD_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_-]*)=<([^>]*)>|\b([a-zA-Z_][a-zA-Z0-9_-]*)=([^\s—]+)")
+
+responders = {}
+with open(messages_path, "r", encoding="utf-8") as f:
+    for line in f:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        ts = msg.get("ts") or ""
+        if since_dt is not None:
+            try:
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+            if dt <= since_dt:
+                continue
+        text = msg.get("msg") or ""
+        m = PONG_RE.search(text)
+        if not m:
+            continue
+        fields = {}
+        for fm in FIELD_RE.finditer(text):
+            key = fm.group(1) or fm.group(3)
+            value = fm.group(2) if fm.group(1) else fm.group(4)
+            fields[key] = value
+        if sweep_id and fields.get("sweep") != sweep_id:
+            continue
+        sender = msg.get("from") or "?"
+        nick = sender
+        # Expected text has: pong: repo — sweep=X — <nick> — card=...
+        parts = [p.strip() for p in text.split("—")]
+        for part in parts:
+            if part and not part.startswith("pong:") and "=" not in part:
+                nick = part
+                break
+        responders[nick] = {
+            "nick": nick,
+            "sender": sender,
+            "ts": ts,
+            "card": fields.get("card", ""),
+            "state": fields.get("state", ""),
+            "blocker": fields.get("blocker", ""),
+            "next": fields.get("next", ""),
+            "claim": fields.get("claim", ""),
+            "sweep": fields.get("sweep", ""),
+        }
+
+missing = sorted([owner for owner in owners if owner not in responders])
+payload = {
+    "repo": repo,
+    "sweep_id": sweep_id,
+    "since": since_arg,
+    "responders": list(responders.values()),
+    "missing_owners": missing,
+    "open_owner_cards": owners,
+    "open_cards": cards,
+}
+
+if output_json:
+    print(json.dumps(payload, indent=2))
+else:
+    label = f" sweep={sweep_id}" if sweep_id else ""
+    print(f"# airc-queue pongs — {repo}{label}")
+    print(f"since: {since_arg}")
+    if responders:
+        print(f"responders ({len(responders)}):")
+        for item in payload["responders"]:
+            print(f"  - {item['nick']}: card={item['card'] or '?'} state={item['state'] or '?'} blocker={item['blocker'] or '?'} next={item['next'] or '?'} claim={item['claim'] or '?'}")
+    else:
+        print("responders: none")
+    if missing:
+        print(f"missing owners ({len(missing)}): {', '.join(missing)}")
+    else:
+        print("missing owners: none")
+PYEOF
+  local py_status=$?
+  rm -f "$cards_file" "$messages_file"
+  return "$py_status"
+}
+
 _cmd_queue_close_merged() {
   # Auto-close queue cards referenced by a merged PR.
   #
   # Args:
   #   airc queue close-merged <pr-url|owner/repo#PR> [--merge-sha SHA] [--actor X] [--dry-run]
   #
-  # The driver use case is the .github/workflows/auto-close-queue-cards.yml
-  # workflow that fires on pull_request.closed{merged=true,base=canary}.
-  # GitHub's native "Closes #N" only triggers an issue auto-close when the PR
-  # merges into the DEFAULT branch (main). Our protected workflow merges PRs
-  # into canary first, so queue cards stay open until the canary→main bundle
-  # promote — which is too late, and produces the litter Codex called out:
-  # airc#571, airc#567, continuum#1125 all sat open after their PR merged.
-  #
-  # This subcommand runs the close-on-merge cycle at canary-merge time:
-  #   1. Fetch PR body via gh.
-  #   2. Parse for queue-card references — same-repo (#N, Closes #N) and
-  #      cross-repo (owner/repo#N).
-  #   3. For each candidate: verify it's a kind=airc-queue-card-v1 issue,
-  #      skip if already status=merged (idempotent), set status=merged with
-  #      a status-log entry citing the PR + merge SHA, then close the issue.
-  #   4. Print one-line summary: scanned/closed/skipped/errored.
-  #
-  # Same-repo only in this PR — cross-repo close-from-merge needs an
-  # org-scoped token (the workflow's GITHUB_TOKEN can't write to other
-  # repos), and the auth pattern is a follow-up. Cross-repo refs DO get
-  # detected and reported in the summary; they just don't get closed.
-
+  # GitHub's native "Closes #N" only triggers when the PR merges into the
+  # default branch. AIRC uses canary first, so queue cards need a canary-time
+  # close path.
   local pr_url=""
   local merge_sha=""
   local actor=""
@@ -1204,11 +1407,6 @@ _cmd_queue_close_merged() {
     return 1
   fi
 
-  # Parse PR URL/short-form into repo + number. The existing
-  # _airc_queue_parse_issue_url handles /issues/N + owner/repo#N; we
-  # extend it locally to also accept /pull/N for PR URLs since gh
-  # accepts the number against either subcommand (`gh pr view N` or
-  # `gh issue view N`).
   local pr_repo pr_num
   if [[ "$pr_url" =~ ^https://github\.com/([^/]+/[^/]+)/(pull|pulls|issues)/([0-9]+) ]]; then
     pr_repo="${BASH_REMATCH[1]}"
@@ -1224,9 +1422,6 @@ _cmd_queue_close_merged() {
     die "queue close-merged: 'gh' CLI is required."
   fi
 
-  # Fetch PR body + the merge metadata. Authoritative source for both
-  # "what was closed" (body) and the SHA (in case --merge-sha wasn't
-  # passed by the workflow).
   local pr_blob
   if ! pr_blob=$(gh pr view "$pr_num" --repo "$pr_repo" --json body,mergedAt,mergeCommit,baseRefName,url 2>&1); then
     die "queue close-merged: gh pr view failed for $pr_repo#$pr_num: $pr_blob"
@@ -1236,8 +1431,6 @@ _cmd_queue_close_merged() {
   pr_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-pr.XXXXXX") || die "queue close-merged: mktemp failed"
   printf '%s' "$pr_blob" >"$pr_file"
 
-  # Extract merged + base ref + sha + body via python (jq variants are
-  # fussy about absent fields).
   local pr_meta
   if ! pr_meta=$("$AIRC_PYTHON" - "$pr_file" <<'PYEOF'
 import json, sys
@@ -1249,8 +1442,6 @@ merge_commit = pr.get("mergeCommit") or {}
 sha = (merge_commit.get("oid") if isinstance(merge_commit, dict) else "") or ""
 body = pr.get("body") or ""
 url = pr.get("url") or ""
-# Tab-separated: merged_at \t base_ref \t sha \t url \t body-len
-# (body itself goes via the same temp file, read again below)
 print(f"{merged_at}\t{base_ref}\t{sha}\t{url}\t{len(body)}")
 PYEOF
   ); then
@@ -1265,18 +1456,11 @@ PYEOF
   pr_canonical_url=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $4}')
   pr_body_len=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $5}')
 
-  # Sanity: PR must be merged. Workflow filters this already but we
-  # guard for the manual-invocation case (developer running close-merged
-  # from a CI re-run, etc.).
   if [ -z "$pr_merged_at" ]; then
     rm -f "$pr_file"
     die "queue close-merged: PR $pr_repo#$pr_num is not merged (mergedAt empty). Refusing to close cards from an unmerged PR."
   fi
 
-  # Prefer caller-supplied --merge-sha (the workflow passes
-  # github.event.pull_request.merge_commit_sha). Fall back to the
-  # mergeCommit.oid we fetched. If both empty, abort — we'd lose the
-  # audit anchor.
   if [ -z "$merge_sha" ]; then
     merge_sha="$pr_sha"
   fi
@@ -1285,19 +1469,10 @@ PYEOF
     die "queue close-merged: no merge SHA available (passed nor in PR metadata). Refusing to close — status-log entry would have no anchor."
   fi
 
-  # Default actor for the status-log line. CI passes --actor github-actions;
-  # interactive use falls through to the standard resolve_name.
   if [ -z "$actor" ]; then
     actor=$(_airc_queue_resolve_name)
   fi
 
-  # Detect candidate queue-card refs in the PR body. Recognized shapes
-  # (case-insensitive on close-keywords):
-  #   Closes #N / Resolves #N / Fixes #N            (GitHub native)
-  #   Closes owner/repo#N                            (cross-repo native)
-  #   queue card #N / airc-queue: #N                 (airc-specific prose)
-  #   #N at start of line                            (loose mention; gated by envelope-verify)
-  #   owner/repo#N (anywhere)                        (cross-repo loose)
   local refs_file
   refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-refs.XXXXXX") || die "queue close-merged: mktemp failed"
   if ! "$AIRC_PYTHON" - "$pr_file" "$pr_repo" >"$refs_file" <<'PYEOF'
@@ -1307,12 +1482,10 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
 default_repo = sys.argv[2]
 body = pr.get("body") or ""
 
-# Cross-repo: owner/repo#N (matches Closes owner/repo#N and bare mentions).
 CROSS_RE = re.compile(r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b')
-# Same-repo: #N (matches Closes #N, queue card #N, plain #N mentions).
 SAME_RE = re.compile(r'(?<![A-Za-z0-9_/])#(\d+)\b')
 
-seen = set()  # dedupe — body may name the same card twice
+seen = set()
 for m in CROSS_RE.finditer(body):
     owner, repo, num = m.group(1), m.group(2), m.group(3)
     key = f"{owner}/{repo}#{num}"
@@ -1332,8 +1505,6 @@ PYEOF
   fi
   rm -f "$pr_file"
 
-  # Read refs into an array. Empty file = no candidates; that's a valid
-  # outcome (the PR may not reference any queue cards), report it cleanly.
   local refs=()
   if [ -s "$refs_file" ]; then
     while IFS= read -r line; do
@@ -1350,36 +1521,25 @@ PYEOF
     return 0
   fi
 
-  # Process each ref. Track outcomes for the summary.
   local closed_count=0 skipped_count=0 errored_count=0 cross_repo_count=0
   local ref ref_repo ref_num
   for ref in "${refs[@]}"; do
     ref_repo="${ref%#*}"
     ref_num="${ref##*#}"
 
-    # Cross-repo refs: report and skip the close (auth scope limitation).
-    # Status-log mutation also requires write access to the OTHER repo's
-    # issues, so we can't even leave a breadcrumb there. PR body itself
-    # serves as the audit trail for cross-repo intent.
     if [ "$ref_repo" != "$pr_repo" ]; then
       printf '  [cross-repo] %s — skipped (workflow GITHUB_TOKEN is repo-scoped)\n' "$ref"
       cross_repo_count=$((cross_repo_count + 1))
       continue
     fi
 
-    # Verify this is a queue-card issue (envelope present). Loose
-    # body refs like "see #42" can match arbitrary issues; we only
-    # close real airc-queue cards.
     local issue_body
     if ! issue_body=$(gh issue view "$ref_num" --repo "$ref_repo" --json body --jq .body 2>&1); then
-      # Likely the number doesn't exist as an issue (could be a PR ref).
       printf '  [skip]       %s — gh issue view failed (likely a PR ref, not an issue)\n' "$ref"
       skipped_count=$((skipped_count + 1))
       continue
     fi
 
-    # Inspect envelope: kind, current status. Skip non-cards. Skip
-    # already-merged cards (idempotent re-run protection).
     local envelope_status
     envelope_status=$(printf '%s' "$issue_body" | "$AIRC_PYTHON" -c '
 import json, re, sys
@@ -1409,7 +1569,6 @@ print("not-a-card")
         ;;
     esac
 
-    # All systems go: set status=merged with audit anchor, then close.
     local log_msg="merged via PR ${pr_canonical_url} @ ${merge_sha:0:8} (closed by ${actor})"
 
     if [ "$dry_run" -eq 1 ]; then
@@ -1418,15 +1577,12 @@ print("not-a-card")
       continue
     fi
 
-    # Mutate first (preserves audit trail even if the close call fails).
     if ! _airc_queue_mutate_card "$ref" 0 "$log_msg" --set "status=merged" >/dev/null 2>&1; then
       printf '  [error]      %s — status mutation failed\n' "$ref"
       errored_count=$((errored_count + 1))
       continue
     fi
 
-    # Close the issue. gh exits 0 even if already closed; treat any
-    # non-zero as a real error worth reporting.
     local close_out
     if ! close_out=$(gh issue close "$ref_num" --repo "$ref_repo" --reason completed 2>&1); then
       printf '  [error]      %s — gh issue close failed: %s\n' "$ref" "$close_out"
@@ -1441,7 +1597,6 @@ print("not-a-card")
   printf 'queue close-merged: %d closed, %d skipped, %d errored, %d cross-repo (out of %d refs)\n' \
     "$closed_count" "$skipped_count" "$errored_count" "$cross_repo_count" "${#refs[@]}"
 
-  # Return non-zero if any errors so CI surfaces the failure.
   if [ "$errored_count" -gt 0 ]; then
     return 1
   fi
@@ -1726,7 +1881,7 @@ airc queue nudge — surface a queue card OR run a repo status sweep
 USAGE
   airc queue nudge <issue-url> [--peer @handle] [--message "..."] [--dry-run]
   airc queue nudge owner/repo#N [--peer @handle] [--message "..."] [--dry-run]
-  airc queue nudge owner/repo [--peer @handle] [--message "..."] [--limit N] [--dry-run]
+  airc queue nudge owner/repo [--peer @handle] [--message "..."] [--limit N] [--sweep-id ID] [--dry-run]
 
 ARGUMENTS
   <issue-url>        GitHub issue URL OR owner/repo#N reference. Card-scoped
@@ -1741,6 +1896,8 @@ OPTIONS
                      ("nudge: #1125 — pickup needed before EOD" etc.).
   --limit N          Repo-scoped mode only: max queue cards to summarize
                      from the repo (default: 20).
+  --sweep-id ID      Repo-scoped mode only: explicit sweep id. Default is
+                     current UTC timestamp; replies should include sweep=ID.
   --dry-run          Print the broadcast text + status-log entry that
                      WOULD be written; don't send or edit.
   -h, --help         This help.
@@ -1771,6 +1928,34 @@ NOTES
 EOF
 }
 
+_airc_queue_pongs_help() {
+  cat <<'EOF'
+airc queue pongs — summarize repo-nudge replies from the AIRC log
+
+USAGE
+  airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID] [--limit N] [--json]
+  airc queue pong-summary <owner/repo> [--since 30m] [--sweep-id ID]
+
+DESCRIPTION
+  Reads local AIRC messages.jsonl for `pong: owner/repo ...` replies,
+  summarizes responders, and compares them to owners of open airc-queue
+  cards. This is the audit half of `airc queue nudge owner/repo`.
+
+OPTIONS
+  --since <when>      ISO timestamp or relative window: 60s, 5m, 1h, 2d.
+                      Default: 30m.
+  --sweep-id <ID>     Only include pongs with sweep=<ID>.
+  --limit <N>         Max queue cards and log lines to inspect (default 200).
+  --json              Emit machine-readable summary.
+  -h, --help          This help.
+
+EXPECTED PONG
+  pong: owner/repo — sweep=ID — <nick> — card=<owner/repo#N|idle>
+    state=<idle|coding|testing|reviewing|blocked> blocker=<none|...>
+    next=<...> claim=<keep|release|none>
+EOF
+}
+
 _airc_queue_close_merged_help() {
   cat <<'EOF'
 airc queue close-merged — auto-close queue cards referenced by a merged PR
@@ -1794,43 +1979,9 @@ OPTIONS
 
 WHAT IT DOES
   1. Fetches the PR body via gh.
-  2. Validates the PR is actually merged (mergedAt non-empty).
-  3. Parses the body for queue-card refs:
-       - same-repo: #N, Closes #N, Resolves #N, Fixes #N, queue card #N
-       - cross-repo: owner/repo#N (Closes owner/repo#N etc.)
-  4. For each candidate:
-       - Skips refs that aren't airc-queue cards (no envelope) — silent.
-       - Skips refs that are already status=merged (idempotent re-runs).
-       - Sets status=merged with a status-log line citing the PR URL +
-         merge SHA + actor.
-       - Closes the issue via gh.
-  5. Cross-repo refs are detected and reported in the summary but NOT
-     closed — the workflow's GITHUB_TOKEN is repo-scoped. Cross-repo
-     auto-close is a follow-up (needs an org-scoped token).
-  6. Returns 0 on success, 1 if any card errored. Idempotent — safe to
-     re-run on the same PR.
-
-WHY THIS EXISTS
-  GitHub's native "Closes #N" only auto-closes when a PR merges into the
-  default branch (main). Our protected workflow merges PRs into canary
-  first; the canary→main bundle promote is what triggers GitHub's native
-  close — and that's typically days later. In the meantime, queue cards
-  stay open, get nudged, look idle. Codex called this out as the litter
-  pattern (airc#571, airc#567, continuum#1125 all sat open after merge).
-
-  This subcommand runs the close cycle at canary-merge time so cards
-  close promptly. Manual `gh issue close` remains the fallback for any
-  PR/card the workflow doesn't catch.
-
-EXAMPLES
-  # Manual: close cards from a specific merged PR
-  airc queue close-merged https://github.com/CambrianTech/airc/pull/574
-
-  # Manual with explicit SHA + actor (CI invocation pattern)
-  airc queue close-merged CambrianTech/airc#574 \\
-    --merge-sha 168c666abc1234 --actor github-actions
-
-  # Dry-run: see what would close without touching anything
-  airc queue close-merged https://github.com/CambrianTech/airc/pull/574 --dry-run
+  2. Validates the PR is actually merged.
+  3. Parses the body for same-repo and cross-repo queue-card refs.
+  4. For same-repo queue cards: sets status=merged and closes the issue.
+  5. Cross-repo refs are reported but not closed with repo-scoped tokens.
 EOF
 }

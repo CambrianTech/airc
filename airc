@@ -2536,6 +2536,15 @@ else
   exit 1
 fi
 
+# cmd_lane — git worktree lanes for multi-agent checkout isolation.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_lane.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_lane.sh
+  source "$_airc_lib_dir/airc_bash/cmd_lane.sh"
+else
+  echo "ERROR: airc_bash/cmd_lane.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+
 
 # ── Dispatch ────────────────────────────────────────────────────────────
 
@@ -2594,6 +2603,7 @@ case "${1:-help}" in
   approve)   shift; cmd_approve "$@" ;;
   decrypt-approval) shift; cmd_decrypt_approval "$@" ;;
   queue)     shift; cmd_queue "$@" ;;
+  lane|lanes|worktree|worktrees) shift; cmd_lane "$@" ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
   version|--version|-v) shift; cmd_version "$@" ;;
@@ -2652,7 +2662,9 @@ case "${1:-help}" in
     echo "  airc queue release <issue-url> [--reason \"…\"]            Clear ownership (back to pool)"
     echo "  airc queue set-status <issue-url> <state>                Change card status field"
     echo "  airc queue nudge <issue-url|owner/repo> [--peer @handle] Surface a card or repo status sweep"
+    echo "  airc queue pongs <owner/repo> [--sweep-id ID]            Summarize repo-nudge replies"
     echo "  airc queue adopt <issue-url> [card-fields…]              Convert an existing issue into a queue card"
+    echo "  airc lane create <issue-ref> [--base canary]             Create isolated worktree lane"
     echo "  airc msg / send <text>          Broadcast to the default channel"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc msg / send @a @b <text>    DM multiple peers (also: @a,b,c)"
