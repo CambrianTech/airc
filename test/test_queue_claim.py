@@ -52,21 +52,26 @@ def _isolated_env(tmp: str) -> dict[str, str]:
     }
 
 
-SYNTHETIC_CARD_BODY = '''**airc-queue card**
+def _card_body(owner: str | None = "previous-owner",
+               status: str = "claimed") -> str:
+    owner_line = f'  "owner": "{owner}",\n' if owner is not None else ""
+    return f'''**airc-queue card**
 
 Coordinates work via the AIRC queue substrate (airc#562). Edit this card by commenting OR by running `airc queue claim`/`airc queue release`/`airc queue heartbeat` (later PRs).
 
 ```json
-{
+{{
   "kind": "airc-queue-card-v1",
-  "owner": "previous-owner",
-  "status": "claimed",
+{owner_line}  "status": "{status}",
   "branch": "feat/x"
-}
+}}
 ```
 
 Close this issue when the work is done (status=merged/abandoned).
 '''
+
+
+SYNTHETIC_CARD_BODY = _card_body()
 
 
 def _isolated_env_with_fake_gh(tmp: str, body_response: str | None = None) -> dict[str, str]:
@@ -155,7 +160,10 @@ class QueueClaimValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(
                 ["queue", "claim", "owner/repo#1", "--owner", "codex", "--dry-run"],
-                env_overrides=_isolated_env_with_fake_gh(tmp),
+                env_overrides=_isolated_env_with_fake_gh(
+                    tmp,
+                    body_response=_card_body(owner=None),
+                ),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DRY RUN", result.stdout)
@@ -252,7 +260,7 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
 
     def test_claim_sets_owner_and_status(self) -> None:
         body = self._dry_run_extract_body(
-            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2"]
+            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2", "--force"]
         )
         envelope = self._extract_envelope(body)
         self.assertEqual(envelope["owner"], "claude-tab-2")
@@ -266,7 +274,7 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
 
     def test_claim_default_owner_prefers_queue_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = _isolated_env_with_fake_gh(tmp)
+            env = _isolated_env_with_fake_gh(tmp, body_response=_card_body(owner=None))
             env["AIRC_QUEUE_OWNER"] = "codex-main"
             result = run_airc(
                 ["queue", "claim", "owner/repo#1", "--dry-run"],
@@ -278,7 +286,7 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
 
     def test_claim_default_owner_prefers_registered_work_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = _isolated_env_with_fake_gh(tmp)
+            env = _isolated_env_with_fake_gh(tmp, body_response=_card_body(owner=None))
             registered = run_airc(
                 ["identity", "register", "--name", "banach"],
                 env_overrides=env,
@@ -291,6 +299,62 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"owner": "banach"', result.stdout)
         self.assertIn("claim by banach", result.stdout)
+
+    def test_claim_rejects_different_active_owner_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(
+                tmp,
+                body_response=_card_body(owner="claude-tab-1", status="in-progress"),
+            )
+            result = run_airc(
+                ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2", "--dry-run"],
+                env_overrides=env,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("already claimed by 'claude-tab-1'", combined)
+        self.assertIn("Use --force", combined)
+        self.assertNotIn("DRY RUN", result.stdout)
+
+    def test_claim_force_allows_handoff_from_different_owner(self) -> None:
+        body = self._dry_run_extract_body(
+            [
+                "queue", "claim", "owner/repo#1",
+                "--owner", "claude-tab-2",
+                "--force",
+            ],
+            body=_card_body(owner="claude-tab-1", status="in-progress"),
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "claude-tab-2")
+        self.assertEqual(envelope["status"], "in-progress")
+
+    def test_claim_allows_same_owner_without_force(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-1"],
+            body=_card_body(owner="claude-tab-1", status="in-progress"),
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "claude-tab-1")
+        self.assertEqual(envelope["status"], "in-progress")
+
+    def test_claim_allows_unclaimed_card_without_force(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2"],
+            body=_card_body(owner=None, status="claimed"),
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "claude-tab-2")
+        self.assertEqual(envelope["status"], "in-progress")
+
+    def test_claim_allows_merged_card_without_force(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2"],
+            body=_card_body(owner="claude-tab-1", status="merged"),
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "claude-tab-2")
+        self.assertEqual(envelope["status"], "in-progress")
 
     def test_heartbeat_sets_owner_and_last_heartbeat(self) -> None:
         body = self._dry_run_extract_body(

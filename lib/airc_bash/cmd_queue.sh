@@ -606,6 +606,7 @@ _cmd_queue_claim() {
   local new_owner=""
   local new_status="in-progress"
   local dry_run=0
+  local force=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -616,6 +617,7 @@ _cmd_queue_claim() {
       --owner)    shift; new_owner="${1:-}" ;;
       --status)   shift; new_status="${1:-}" ;;
       --dry-run)  dry_run=1 ;;
+      --force)    force=1 ;;
       -*) die "queue claim: unknown flag: $1" ;;
       *)
         if [ -z "$issue_url" ]; then
@@ -647,11 +649,78 @@ _cmd_queue_claim() {
   local heartbeat
   heartbeat=$(_airc_queue_heartbeat_value)
 
+  _airc_queue_claim_guard "$issue_url" "$new_owner" "$force"
+
   _airc_queue_mutate_card "$issue_url" "$dry_run" \
     "claim by $new_owner -> status=$new_status" \
     --set "owner=$new_owner" \
     --set "status=$new_status" \
     --set "last_heartbeat=$heartbeat"
+}
+
+_airc_queue_claim_guard() {
+  local issue_url="$1" new_owner="$2" force="$3"
+
+  local parsed_issue repo issue_num
+  if ! parsed_issue=$(_airc_queue_parse_issue_url "$issue_url"); then
+    die "queue: <issue-url> must be a GitHub issue URL or owner/repo#N (got: $issue_url)"
+  fi
+  repo="${parsed_issue%#*}"
+  issue_num="${parsed_issue##*#}"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue: 'gh' CLI is required."
+  fi
+
+  local current_body
+  if ! current_body=$(gh issue view "$issue_num" --repo "$repo" --json body --jq .body 2>&1); then
+    die "queue: gh issue view failed for $repo#$issue_num: $current_body"
+  fi
+
+  local body_file
+  body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-claim.XXXXXX") || die "queue: mktemp failed"
+  printf '%s' "$current_body" >"$body_file"
+
+  local fields
+  if ! fields=$("$AIRC_PYTHON" - "$body_file" <<'PYEOF'
+import json, re, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    body = f.read()
+
+card = None
+for match in re.finditer(r'```json\s*\n(.*?)\n\s*```', body, re.DOTALL):
+    try:
+        parsed = json.loads(match.group(1).strip())
+    except Exception:
+        continue
+    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+        card = parsed
+        break
+
+if card is None:
+    print("queue claim: no kind=airc-queue-card-v1 envelope found in body", file=sys.stderr)
+    sys.exit(2)
+
+print((card.get("owner") or "").strip())
+print((card.get("status") or "").strip())
+PYEOF
+  ); then
+    rm -f "$body_file"
+    die "$fields"
+  fi
+  rm -f "$body_file"
+
+  local current_owner current_status
+  current_owner=$(printf '%s\n' "$fields" | sed -n '1p')
+  current_status=$(printf '%s\n' "$fields" | sed -n '2p')
+
+  if [ "$force" -eq 0 ] \
+    && [ -n "$current_owner" ] \
+    && [ "$current_owner" != "$new_owner" ] \
+    && [ "$current_status" != "merged" ]; then
+    die "queue claim: card already claimed by '$current_owner' (status=${current_status:-unknown}). Use --force to take over, or pick a different card via airc queue next."
+  fi
 }
 
 _cmd_queue_release() {
@@ -2733,17 +2802,22 @@ _airc_queue_claim_help() {
 airc queue claim — take ownership of a queue card
 
 USAGE
-  airc queue claim <issue-url> [--owner X] [--status Y] [--dry-run]
-  airc queue claim owner/repo#N [--owner X] [--status Y] [--dry-run]
+  airc queue claim <issue-url> [--owner X] [--status Y] [--force] [--dry-run]
+  airc queue claim owner/repo#N [--owner X] [--status Y] [--force] [--dry-run]
 
 DESCRIPTION
   Sets the card's owner field and status to indicate active work. Default
   owner = current work identity from `airc identity whoami`; default status = in-progress.
   Appends a "## Status log" line with timestamp + actor.
 
+  Collision protection is automatic: claiming a card already owned by a
+  different active owner fails before mutation. Use --force only for an
+  intentional handoff or stale-owner takeover.
+
 OPTIONS
   --owner <handle>   Queue owner to set (default: current work identity).
   --status <state>   New status (default: in-progress).
+  --force            Override a different active owner.
   --dry-run          Print the new body that WOULD be written; don't edit.
   -h, --help         This help.
 EOF
