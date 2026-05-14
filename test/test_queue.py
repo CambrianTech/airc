@@ -68,6 +68,38 @@ def _isolated_env_with_fake_gh(tmp: str) -> dict[str, str]:
     return env
 
 
+def _isolated_env_with_create_fake_gh(tmp: str) -> tuple[dict[str, str], pathlib.Path]:
+    fakebin = pathlib.Path(tmp) / "bin"
+    fakebin.mkdir()
+    record_dir = pathlib.Path(tmp) / "gh-record"
+    record_dir.mkdir()
+    gh = fakebin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'RECORD_DIR="{record_dir}"\n'
+        'for a in "$@"; do printf "%s\\n" "$a"; done > "$RECORD_DIR/create-argv.txt"\n'
+        'if [ "$1 $2" = "issue create" ]; then\n'
+        '  while [ $# -gt 0 ]; do\n'
+        '    case "$1" in\n'
+        '      --title) shift; printf "%s\\n" "$1" > "$RECORD_DIR/create-title.txt" ;;\n'
+        '      --body-file) shift; cp "$1" "$RECORD_DIR/create-body.txt" ;;\n'
+        '    esac\n'
+        '    shift || true\n'
+        '  done\n'
+        "  printf '%s\\n' 'https://github.com/owner/repo/issues/99'\n"
+        '  exit 0\n'
+        'fi\n'
+        "printf '%s\\n' 'unexpected gh call' >&2\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = _isolated_env(tmp)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["AIRC_GH_BIN"] = str(gh)
+    return env, record_dir
+
+
 def _isolated_env_with_adopt_fake_gh(
     tmp: str, issue: dict[str, object]
 ) -> tuple[dict[str, str], pathlib.Path]:
@@ -219,6 +251,8 @@ class QueueAddCardBodyTests(unittest.TestCase):
 
     def test_dry_run_emits_kind_envelope(self) -> None:
         out = self._dry_run("--owner", "claude-tab-2", "--branch", "feat/x")
+        self.assertIn("  title:   test card\n", out)
+        self.assertNotIn("airc-queue: test card", out)
         match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
                           out, re.DOTALL)
         self.assertIsNotNone(match, f"expected JSON card block; got:\n{out}")
@@ -226,6 +260,23 @@ class QueueAddCardBodyTests(unittest.TestCase):
         self.assertEqual(card.get("kind"), "airc-queue-card-v1")
         self.assertEqual(card.get("owner"), "claude-tab-2")
         self.assertEqual(card.get("branch"), "feat/x")
+
+    def test_create_preserves_title_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, record_dir = _isolated_env_with_create_fake_gh(tmp)
+            result = run_airc(
+                ["queue", "add", "owner/repo",
+                 "--title", "queue: stop prefixing issue titles",
+                 "--owner", "codex-main"],
+                env_overrides=env,
+            )
+            created_title = (record_dir / "create-title.txt").read_text(encoding="utf-8").strip()
+            create_argv = (record_dir / "create-argv.txt").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(created_title, "queue: stop prefixing issue titles")
+        self.assertIn("--label", create_argv)
+        self.assertIn("airc-queue", create_argv)
 
     def test_dry_run_threads_all_fields(self) -> None:
         out = self._dry_run(

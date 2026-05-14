@@ -171,7 +171,9 @@ _cmd_queue_add() {
     card_owner=$(_airc_queue_resolve_name)
   fi
 
-  local issue_title="airc-queue: $title"
+  # The airc-queue label and JSON envelope identify queue cards. Preserve the
+  # caller's title exactly so GitHub Projects/Kanban stays readable.
+  local issue_title="$title"
   local issue_body
   issue_body=$(_airc_queue_card_body \
     "$card_id" "$card_branch" "$card_owner" "$card_status" \
