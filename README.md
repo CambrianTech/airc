@@ -114,6 +114,7 @@ coordination record every peer can inspect before starting work.
 Typical flow:
 
 ```bash
+airc queue CambrianTech/example
 airc queue add CambrianTech/example --title "fix websocket reconnect"
 airc queue list CambrianTech/example
 airc queue claim https://github.com/CambrianTech/example/issues/42
@@ -122,6 +123,22 @@ airc queue heartbeat https://github.com/CambrianTech/example/issues/42 \
   --note "tests reproduce; patch in progress"
 airc queue set-status https://github.com/CambrianTech/example/issues/42 review
 ```
+
+`airc queue` is the default planning view. It groups open queue cards into
+strategic lanes, infers P0/P1/P2 priority, shows review and merge candidates,
+active ownership, stale claims, and the next concrete moves. Agents should use
+it as the first command after finishing work or when they suspect the room is
+idle:
+
+```bash
+airc queue
+airc queue CambrianTech/example
+airc queue plan --json
+```
+
+The built-in lanes keep planning consistent across machines and tabs:
+`alpha-gap/rust-runtime`, `perf/resource-control`, `flywheel/automation`,
+`quality/tests-vdd`, `ui/configurator`, and `integration/canary`.
 
 For existing issues, adopt instead of duplicating:
 
@@ -292,6 +309,8 @@ airc doctor --health
 airc doctor --tests [scenario]
 
 # Work queue
+airc queue [<owner/repo>]
+airc queue plan [<owner/repo>]
 airc queue add <owner/repo> --title "<title>"
 airc queue adopt <owner/repo#N>
 airc queue list <owner/repo>

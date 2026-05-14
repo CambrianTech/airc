@@ -68,6 +68,92 @@ def _isolated_env_with_fake_gh(tmp: str) -> dict[str, str]:
     return env
 
 
+def _queue_card_body(**fields: str) -> str:
+    card = {"kind": "airc-queue-card-v1", **fields}
+    return (
+        "**airc-queue card**\n\n"
+        "```json\n"
+        f"{json.dumps(card, indent=2)}\n"
+        "```\n"
+    )
+
+
+def _isolated_env_with_plan_fake_gh(tmp: str) -> dict[str, str]:
+    fakebin = pathlib.Path(tmp) / "bin"
+    fakebin.mkdir()
+    issue_list = [
+        {
+            "number": 11,
+            "title": "Move persona cognition planner into Rust",
+            "url": "https://github.com/owner/repo/issues/11",
+            "body": _queue_card_body(
+                status="claimed",
+                next_action="Define Rust trait boundary and ts-rs export.",
+                env="any",
+            ),
+            "createdAt": "2026-05-14T10:00:00Z",
+            "updatedAt": "2026-05-14T10:05:00Z",
+        },
+        {
+            "number": 12,
+            "title": "Review canary PR for queue automation",
+            "url": "https://github.com/owner/repo/issues/12",
+            "body": _queue_card_body(
+                status="review",
+                owner="claude-tab-2",
+                branch="feat/queue-plan",
+                next_action="Review PR and merge to canary if checks are green.",
+            ),
+            "createdAt": "2026-05-14T10:10:00Z",
+            "updatedAt": "2026-05-14T10:20:00Z",
+        },
+        {
+            "number": 13,
+            "title": "Optimize qwen GPU memory path",
+            "url": "https://github.com/owner/repo/issues/13",
+            "body": _queue_card_body(
+                status="in-progress",
+                owner="codex-main",
+                last_heartbeat="2026-05-14T09:00Z @ abc123",
+                next_action="Measure CPU copies and move feasible path to Metal/CUDA.",
+            ),
+            "createdAt": "2026-05-14T10:15:00Z",
+            "updatedAt": "2026-05-14T10:25:00Z",
+        },
+        {
+            "number": 14,
+            "title": "Available queue card should be claimable",
+            "url": "https://github.com/owner/repo/issues/14",
+            "body": _queue_card_body(
+                status="claimed",
+                owner="unclaimed",
+                next_action="Claim and replace the legacy sentinel owner.",
+            ),
+            "createdAt": "2026-05-14T10:30:00Z",
+            "updatedAt": "2026-05-14T10:35:00Z",
+        },
+    ]
+    issue_list_file = pathlib.Path(tmp) / "fake_issue_list.json"
+    issue_list_file.write_text(json.dumps(issue_list), encoding="utf-8")
+    gh = fakebin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'ISSUE_LIST_FILE="{issue_list_file}"\n'
+        "if [ \"$1 $2\" = \"issue list\" ]; then\n"
+        "  cat \"$ISSUE_LIST_FILE\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' 'unexpected gh call' >&2\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = _isolated_env(tmp)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["AIRC_GH_BIN"] = str(gh)
+    return env
+
+
 def _isolated_env_with_create_fake_gh(tmp: str) -> tuple[dict[str, str], pathlib.Path]:
     fakebin = pathlib.Path(tmp) / "bin"
     fakebin.mkdir()
@@ -152,19 +238,25 @@ def _isolated_env_with_adopt_fake_gh(
 
 
 class QueueDispatchTests(unittest.TestCase):
-    def test_queue_no_subcommand_prints_help(self) -> None:
+    def test_queue_no_subcommand_defaults_to_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            result = run_airc(["queue"], env_overrides=_isolated_env(tmp))
-        # No subcommand → returncode 1 (caller needed help, didn't ask explicitly).
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("queue add", result.stdout + result.stderr)
-        self.assertIn("queue list", result.stdout + result.stderr)
+            result = run_airc(
+                ["queue", "owner/repo", "--owner", "codex-main"],
+                env_overrides=_isolated_env_with_plan_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("# airc queue plan — owner/repo", result.stdout)
+        self.assertIn("summary:", result.stdout)
+        self.assertIn("## Strategic lanes", result.stdout)
+        self.assertIn("alpha-gap/rust-runtime", result.stdout)
+        self.assertIn("perf/resource-control", result.stdout)
 
     def test_queue_help_returns_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(["queue", "--help"], env_overrides=_isolated_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PR-1", result.stdout)
+        self.assertIn("queue plan", result.stdout)
 
     def test_queue_add_help_returns_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,6 +273,14 @@ class QueueDispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--owner", result.stdout)
 
+    def test_queue_plan_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "plan", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cohesive prioritized kanban", result.stdout)
+        self.assertIn("alpha-gap/rust-runtime", result.stdout)
+
     def test_queue_adopt_help_returns_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(["queue", "adopt", "--help"],
@@ -194,6 +294,48 @@ class QueueDispatchTests(unittest.TestCase):
                               env_overrides=_isolated_env(tmp))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown subcommand", result.stdout + result.stderr)
+
+
+class QueuePlanTests(unittest.TestCase):
+    def test_plan_json_groups_lanes_and_priorities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "plan", "owner/repo", "--owner", "codex-main", "--json"],
+                env_overrides=_isolated_env_with_plan_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["repo"], "owner/repo")
+        self.assertEqual(payload["summary"]["open"], 4)
+        self.assertEqual(payload["summary"]["unowned"], 2)
+        self.assertGreaterEqual(payload["summary"]["priorities"]["P0"], 1)
+        self.assertIn("alpha-gap/rust-runtime", payload["lanes"])
+        self.assertIn("perf/resource-control", payload["lanes"])
+        self.assertIn("flywheel/automation", payload["lanes"])
+        self.assertIn("owner/repo#11", payload["lanes"]["alpha-gap/rust-runtime"])
+        self.assertIn("codex-main", payload["owners"])
+        rust_card = next(card for card in payload["cards"] if card["ref"] == "owner/repo#11")
+        self.assertIn("airc queue claim 'owner/repo#11'", rust_card["claim_command"])
+        sentinel_card = next(card for card in payload["cards"] if card["ref"] == "owner/repo#14")
+        self.assertEqual(sentinel_card["owner"], "")
+        self.assertEqual(sentinel_card["stale_reason"], "")
+
+    def test_plan_human_includes_action_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "kanban", "owner/repo", "--owner", "codex-main"],
+                env_overrides=_isolated_env_with_plan_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn("## P0 now", out)
+        self.assertIn("## Review / merge candidates", out)
+        self.assertIn("## Active ownership", out)
+        self.assertIn("## Stale / needs nudge", out)
+        self.assertIn("## Next actions", out)
+        self.assertIn("Review/merge owner/repo#12", out)
 
 
 class QueueAddValidationTests(unittest.TestCase):
@@ -393,6 +535,14 @@ class QueueAddCardBodyTests(unittest.TestCase):
         self.assertIsNotNone(match)
         card = json.loads(match.group(1))  # type: ignore[union-attr]
         self.assertEqual(card["owner"], "claude-tab-2")
+
+    def test_add_with_owner_unclaimed_omits_owner_field(self) -> None:
+        out = self._dry_run("--owner", "unclaimed")
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          out, re.DOTALL)
+        self.assertIsNotNone(match)
+        card = json.loads(match.group(1))  # type: ignore[union-attr]
+        self.assertNotIn("owner", card)
 
 
 class QueueListAutoDetectTests(unittest.TestCase):

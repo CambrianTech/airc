@@ -75,19 +75,40 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
+# plan is the cohesive queue dashboard: priorities, lanes, active owners,
+# stale claims, and concrete next actions.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_queue_plan.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_queue_plan.sh
+  source "$_airc_lib_dir/airc_bash/cmd_queue_plan.sh"
+else
+  echo "ERROR: airc_bash/cmd_queue_plan.sh not found via lib-dir resolver." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 cmd_queue() {
   # Top-level router. Validate + dispatch to _cmd_queue_<subcommand>.
   local subcmd="${1:-}"
   shift || true
 
   case "$subcmd" in
-    -h|--help|"")
+    -h|--help)
       _airc_queue_help
-      [ -z "$subcmd" ] && return 1
       return 0
+      ;;
+    "")
+      _cmd_queue_plan "$@"
+      ;;
+    --repo|--limit|--stale-after|--owner|--json)
+      _cmd_queue_plan "$subcmd" "$@"
+      ;;
+    */*)
+      _cmd_queue_plan "$subcmd" "$@"
       ;;
     add)
       _cmd_queue_add "$@"
+      ;;
+    plan|priorities|kanban)
+      _cmd_queue_plan "$@"
       ;;
     list|ls)
       _cmd_queue_list "$@"
@@ -132,7 +153,7 @@ cmd_queue() {
       _cmd_queue_staleness "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged, staleness)"
+      die "queue: unknown subcommand: $subcmd (try: plan, add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged, staleness)"
       ;;
   esac
 }
@@ -148,6 +169,7 @@ _cmd_queue_add() {
   local card_id=""
   local card_branch=""
   local card_owner=""
+  local owner_explicit=0
   local card_status="claimed"
   local card_blockers=""
   local card_env=""
@@ -165,7 +187,7 @@ _cmd_queue_add() {
       --title)         shift; title="${1:-}" ;;
       --id)            shift; card_id="${1:-}" ;;
       --branch)        shift; card_branch="${1:-}" ;;
-      --owner)         shift; card_owner="${1:-}" ;;
+      --owner)         shift; card_owner="${1:-}"; owner_explicit=1 ;;
       --status)        shift; card_status="${1:-}" ;;
       --blockers)      shift; card_blockers="${1:-}" ;;
       --env)           shift; card_env="${1:-}" ;;
@@ -205,7 +227,10 @@ _cmd_queue_add() {
   # Default owner = the airc handle running this command. Sub-tab
   # disambiguation belongs to the operator if they share an airc handle
   # across multiple agents (today's pattern: claude tab #1 vs claude tab #2).
-  if [ -z "$card_owner" ]; then
+  if [ "$card_owner" = "unclaimed" ]; then
+    card_owner=""
+  fi
+  if [ -z "$card_owner" ] && [ "$owner_explicit" -eq 0 ]; then
     card_owner=$(_airc_queue_resolve_name)
   fi
 
@@ -711,7 +736,10 @@ if card is None:
     print("queue claim: no kind=airc-queue-card-v1 envelope found in body", file=sys.stderr)
     sys.exit(2)
 
-print((card.get("owner") or "").strip())
+owner = (card.get("owner") or "").strip()
+if owner == "unclaimed":
+    owner = ""
+print(owner)
 print((card.get("status") or "").strip())
 PYEOF
   ); then
@@ -1008,6 +1036,8 @@ for issue in issues:
         continue
     status = (card.get("status") or "").strip()
     owner = (card.get("owner") or "").strip()
+    if owner == "unclaimed":
+        owner = ""
     if status not in {"claimed", "in-progress", "review"}:
         continue
     reason = ""
@@ -1191,6 +1221,8 @@ for issue in issues:
         continue
     status = (card.get("status") or "claimed").strip()
     card_owner = (card.get("owner") or "").strip()
+    if card_owner == "unclaimed":
+        card_owner = ""
     rank = score(status, card_owner)
     if rank >= 9:
         continue
@@ -1674,6 +1706,8 @@ for issue in data:
     title = (issue.get("title", "") or "").replace("airc-queue: ", "", 1)
     status = (card.get("status") or "unknown").strip()
     owner = (card.get("owner") or "").strip()
+    if owner == "unclaimed":
+        owner = ""
     branch = (card.get("branch") or "").strip()
     bit = f"#{issue.get('number')} {status}"
     if owner:
@@ -1774,6 +1808,8 @@ if card is None:
     sys.exit(2)
 status = (card.get("status") or "").strip() or "unknown"
 owner = (card.get("owner") or "").strip()
+if owner == "unclaimed":
+    owner = ""
 # Tab-separated for shell-friendly parse.
 print(f"{title}\t{status}\t{owner}")
 PYEOF
@@ -1971,6 +2007,8 @@ for issue in issues:
     if not card:
         continue
     owner = (card.get("owner") or "").strip()
+    if owner == "unclaimed":
+        owner = ""
     number = issue.get("number")
     if owner:
         owners.setdefault(owner, []).append(f"{repo}#{number}")
@@ -2225,6 +2263,8 @@ for issue in issues:
         continue
     status = (card.get("status") or "unknown").strip()
     owner = (card.get("owner") or "").strip()
+    if owner == "unclaimed":
+        owner = ""
     hb = (card.get("last_heartbeat") or "").strip()
     hb_dt = parse_ts(hb)
     hb_age = int((now - hb_dt).total_seconds()) if hb_dt else None

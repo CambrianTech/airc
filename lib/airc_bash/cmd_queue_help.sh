@@ -6,6 +6,8 @@ _airc_queue_help() {
 airc queue — issue-backed work queue primitives (airc#562)
 
 USAGE
+  airc queue [<owner/repo>] [--limit N] [--json]
+  airc queue plan [<owner/repo>] [--limit N] [--json]
   airc queue add <owner/repo> --title "<one-line>" [card-fields...]
   airc queue list [<owner/repo>] [--owner X] [--status Y] [--limit N] [--json]
   airc queue claim <issue-url> [--owner X] [--status Y]
@@ -24,11 +26,14 @@ USAGE
   airc queue staleness <pr-url|owner/repo#PR> [--repo-root PATH] [--json]
 
 DESCRIPTION
-  Adds, lists, or mutates queue cards (GitHub issues with airc-queue
-  label). Card fields follow the spec in continuum/.airc/QUEUE.md
+  Plans, adds, lists, or mutates queue cards (GitHub issues with
+  airc-queue label). Bare `airc queue` defaults to the cohesive planning
+  view: priorities, lanes, active owners, stale claims, review blockers,
+  and next actions. Card fields follow the spec in continuum/.airc/QUEUE.md
   (sibling claude tab #1's continuum#1110).
 
 VERB SCOPE
+  plan / priorities / kanban  Cohesive prioritized kanban for agents
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
   heartbeat / stale            Stale-claim liveness primitives (airc#572)
@@ -42,6 +47,47 @@ VERB SCOPE
   staleness / stale-pr          airc#615 — warn on PR branch/base drift
   auto-release policy          Deferred; stale is read-only first
 
+EOF
+}
+
+_airc_queue_plan_help() {
+  cat <<'EOF'
+airc queue plan — cohesive prioritized kanban for agents
+
+USAGE
+  airc queue [<owner/repo>] [--limit N] [--json]
+  airc queue plan [<owner/repo>] [--limit N] [--json]
+  airc queue priorities [<owner/repo>]
+  airc queue kanban [<owner/repo>]
+
+DESCRIPTION
+  One-command coordination view. It fetches open airc-queue cards and
+  automatically groups them into strategic lanes, infers P0/P1/P2 priority,
+  shows review/merge candidates, stale ownership, active owners, and concrete
+  next actions. This is the default agent check-in command; use `--json` for
+  tooling.
+
+OPTIONS
+  --repo <owner/repo>      Alternative way to specify repo.
+  --limit <N>              Max cards to fetch (default 100).
+  --stale-after <dur>      Heartbeat threshold for stale claims: 30m, 2h, 1d
+                           (default: 30m).
+  --owner <handle>         Owner used in generated claim commands.
+  --json                   Emit machine-readable JSON.
+  -h, --help               This help.
+
+LANES
+  alpha-gap/rust-runtime   Rust-owned cognition/runtime, ts-rs, provider/model logic.
+  perf/resource-control    CPU/GPU/memory/docker/throughput/latency work.
+  flywheel/automation      AIRC, queue, kanban, canary, PR/issue automation.
+  quality/tests-vdd        Tests, lint, clippy, VDD/TDD, validation hygiene.
+  ui/configurator          UI/browser/configurator-specific work.
+  integration/canary       Merge/release/install/image integration.
+
+EXAMPLES
+  airc queue
+  airc queue plan CambrianTech/continuum
+  airc queue plan --json | jq '.summary'
 EOF
 }
 
