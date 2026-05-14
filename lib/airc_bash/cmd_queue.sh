@@ -10,6 +10,7 @@
 #                 heartbeat  — stamp liveness on an owned card.
 #                 stale      — list owned cards with missing/old heartbeats.
 #                 next       — recommend claimable next work for idle agents.
+#                 metronome  — configure automatic queue-next idle pulses.
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
 #                 pongs      — summarize repo-nudge pong replies.
@@ -81,6 +82,9 @@ cmd_queue() {
     next|pick)
       _cmd_queue_next "$@"
       ;;
+    metronome|pulse)
+      _cmd_queue_metronome "$@"
+      ;;
     nudge)
       _cmd_queue_nudge "$@"
       ;;
@@ -97,7 +101,7 @@ cmd_queue() {
       _cmd_queue_close_merged "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, nudge, adopt, pongs, availability, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged)"
       ;;
   esac
 }
@@ -378,6 +382,7 @@ USAGE
   airc queue heartbeat <issue-url> [--owner X] [--status Y] [--note "..."]
   airc queue stale <owner/repo> [--stale-after 30m]
   airc queue next [<owner/repo>] [--limit N] [--json]
+  airc queue metronome <owner/repo> [--interval 300]
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
@@ -395,6 +400,7 @@ VERB SCOPE
   claim / release / set-status PR-2 (airc#568, merged)
   heartbeat / stale            Stale-claim liveness primitives (airc#572)
   next / pick                  Idle-agent next-work recommendations
+  metronome / pulse            Automatic queue-next idle pulse config
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
   pongs / pong-summary          Repo-nudge response collection (airc#579)
@@ -1173,6 +1179,104 @@ PYEOF
       die "queue next: idle ping failed"
     fi
   fi
+}
+
+_cmd_queue_metronome() {
+  # Configure monitor-loop queue-next pulses. This is the automated half of
+  # `queue next`: monitor can periodically call the same primitive and
+  # broadcast candidates when an agent/session is quiet.
+  local target_repo=""
+  local interval=300
+  local owner=""
+  local limit=10
+  local repo_root=""
+  local off=0
+  local status=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_metronome_help
+        return 0
+        ;;
+      off|disable)
+        off=1
+        ;;
+      status)
+        status=1
+        ;;
+      --interval)  shift; interval="${1:-300}" ;;
+      --owner)     shift; owner="${1:-}" ;;
+      --limit)     shift; limit="${1:-10}" ;;
+      --repo-root) shift; repo_root="${1:-}" ;;
+      -*) die "queue metronome: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue metronome: too many positional args (use: queue metronome <owner/repo>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  local config_file="$AIRC_WRITE_DIR/queue_metronome"
+
+  if [ "$off" -eq 1 ]; then
+    rm -f "$config_file" "$AIRC_WRITE_DIR/queue_metronome_last"
+    echo "  Queue metronome off."
+    return 0
+  fi
+
+  if [ "$status" -eq 1 ] || { [ -z "$target_repo" ] && [ -f "$config_file" ]; }; then
+    if [ -f "$config_file" ]; then
+      echo "  Queue metronome on:"
+      sed 's/^/    /' "$config_file"
+    else
+      echo "  Queue metronome off."
+    fi
+    return 0
+  fi
+
+  if [ -z "$target_repo" ]; then
+    target_repo=$(_airc_queue_detect_repo_from_cwd || true)
+  fi
+  if [ -z "$target_repo" ]; then
+    die "queue metronome: pass <owner/repo> or run inside a GitHub-backed checkout"
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue metronome: target must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$interval" in
+    ''|*[!0-9]*) die "queue metronome: --interval must be a positive integer seconds value (got: $interval)" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue metronome: --limit must be a positive integer (got: $limit)" ;;
+  esac
+  if [ "$interval" -lt 30 ]; then
+    die "queue metronome: --interval must be >= 30 seconds to avoid spam (got: $interval)"
+  fi
+  if [ "$limit" -lt 1 ]; then
+    die "queue metronome: --limit must be >= 1 (got: $limit)"
+  fi
+  if [ -z "$owner" ]; then
+    owner=$(_airc_queue_resolve_name)
+  fi
+
+  mkdir -p "$AIRC_WRITE_DIR"
+  {
+    printf 'repo=%s\n' "$target_repo"
+    printf 'interval=%s\n' "$interval"
+    printf 'owner=%s\n' "$owner"
+    printf 'limit=%s\n' "$limit"
+    printf 'repo_root=%s\n' "$repo_root"
+  } > "$config_file"
+  rm -f "$AIRC_WRITE_DIR/queue_metronome_last"
+
+  echo "  Queue metronome every ${interval}s for ${target_repo} as ${owner}."
+  echo "  Monitor will run: airc queue next ${target_repo} --owner ${owner} --limit ${limit} --idle-ping"
 }
 
 _cmd_queue_adopt() {
@@ -2772,6 +2876,42 @@ NOTES
     claim/lane commands, then heartbeat while working.
   - Monitor/automation layers should call this after a merge, release, or
     idle timeout; humans should not need to manually wake agents.
+EOF
+}
+
+_airc_queue_metronome_help() {
+  cat <<'EOF'
+airc queue metronome — configure automatic queue-next idle pulses
+
+USAGE
+  airc queue metronome <owner/repo> [--interval 300] [--owner HANDLE] [--limit N]
+  airc queue metronome status
+  airc queue metronome off
+
+DESCRIPTION
+  Stores a monitor-loop metronome config. While `airc join`/monitor is
+  running, the monitor periodically runs:
+
+    airc queue next <owner/repo> --owner <handle> --limit <N> --idle-ping
+
+  That makes claimable work loud without waiting for a human to ask why
+  agents are idle.
+
+OPTIONS
+  --interval <seconds>   Pulse cadence. Minimum 30s; default 300s.
+  --owner <handle>       Agent/work identity used for claim suggestions.
+                         Default: current AIRC work identity.
+  --limit <N>            Max queue cards to scan per pulse (default 10).
+  --repo-root <path>     Optional repo path for suggested lane commands.
+  status                 Show current config.
+  off                    Disable metronome and clear last pulse timestamp.
+  -h, --help             This help.
+
+NOTES
+  - The metronome does not claim work by itself. It publishes exact next
+    commands so agents can claim deliberately.
+  - This is intentionally separate from plain `airc reminder`: reminders
+    only say "you are silent"; metronome says "here is what to do next."
 EOF
 }
 

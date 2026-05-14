@@ -2134,6 +2134,42 @@ reminder_timer_loop() {
       fi
     fi
 
+    # Queue metronome: action-oriented idle pulse for AI agents. Reminder
+    # only says "you have been silent"; metronome says "here are claimable
+    # cards and the exact claim/lane commands." It runs on monitor cadence
+    # and never exits the monitor if GitHub/network is temporarily down.
+    local queue_metronome_file="$AIRC_WRITE_DIR/queue_metronome"
+    if [ -f "$queue_metronome_file" ]; then
+      local qm_repo="" qm_owner="" qm_interval=300 qm_limit=10 qm_repo_root=""
+      while IFS='=' read -r key value; do
+        case "$key" in
+          repo) qm_repo="$value" ;;
+          owner) qm_owner="$value" ;;
+          interval) qm_interval="$value" ;;
+          limit) qm_limit="$value" ;;
+          repo_root) qm_repo_root="$value" ;;
+        esac
+      done < "$queue_metronome_file"
+      if [ -n "$qm_repo" ] && [ -n "$qm_interval" ] && [ "$qm_interval" -gt 0 ] 2>/dev/null; then
+        local qm_last_file="$AIRC_WRITE_DIR/queue_metronome_last"
+        local qm_last=0
+        [ -f "$qm_last_file" ] && qm_last=$(cat "$qm_last_file" 2>/dev/null)
+        local qm_elapsed=$(( now - qm_last ))
+        if [ "$qm_elapsed" -ge "$qm_interval" ]; then
+          printf '%s\n' "$now" > "$qm_last_file"
+          local qm_args=(next "$qm_repo" --limit "$qm_limit" --idle-ping)
+          if [ -n "$qm_owner" ]; then
+            qm_args+=(--owner "$qm_owner")
+          fi
+          if [ -n "$qm_repo_root" ]; then
+            qm_args+=(--repo-root "$qm_repo_root")
+          fi
+          printf '[%s] airc: Queue metronome pulse — checking next work for %s\n' "$(timestamp)" "$qm_repo"
+          cmd_queue "${qm_args[@]}" || printf '[%s] airc: Queue metronome pulse failed; will retry on next interval.\n' "$(timestamp)"
+        fi
+      fi
+    fi
+
     # Receive-side silence beacon. If we have ANY bearer_state file at
     # all and its last_recv_ts is older than recv_threshold (or null
     # since process start), emit a stdout warning the user's Monitor
