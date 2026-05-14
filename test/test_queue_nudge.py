@@ -405,6 +405,16 @@ class QueuePongsTests(unittest.TestCase):
             messages.write_text(
                 "\n".join([
                     json.dumps({
+                        "ts": "2099-01-01T00:00:00Z",
+                        "from": "airc-8a5e",
+                        "msg": (
+                            "repo-nudge: owner/repo — sweep=sweep-123 — "
+                            "pong with: pong: owner/repo — sweep=sweep-123 — "
+                            "<nick> — card=<owner/repo#N|idle> "
+                            "state=<idle|coding|testing|reviewing|blocked>"
+                        ),
+                    }),
+                    json.dumps({
                         "ts": "2099-01-01T00:00:01Z",
                         "from": "claude-tab-1",
                         "msg": (
@@ -432,6 +442,7 @@ class QueuePongsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("responders (1)", result.stdout)
         self.assertIn("claude-tab-1", result.stdout)
+        self.assertNotIn("repo-nudge:", result.stdout)
         self.assertIn("card=owner/repo#1", result.stdout)
         self.assertIn("state=coding", result.stdout)
         self.assertIn("missing owners (1): codex", result.stdout)
@@ -443,6 +454,16 @@ class QueuePongsTests(unittest.TestCase):
             airc_home.mkdir(parents=True, exist_ok=True)
             (airc_home / "messages.jsonl").write_text(
                 "\n".join([
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:00Z",
+                        "from": "airc-8a5e",
+                        "msg": (
+                            "repo-nudge: owner/repo — sweep=sweep-next — "
+                            "pong with: pong: owner/repo — sweep=sweep-next — "
+                            "<nick> — card=<owner/repo#N|idle> "
+                            "state=<idle|coding|testing|reviewing|blocked>"
+                        ),
+                    }),
                     json.dumps({
                         "ts": "2099-01-01T00:00:01Z",
                         "from": "claude-tab-1",
@@ -518,6 +539,7 @@ class QueueAvailabilityTests(unittest.TestCase):
         self.assertIn("# airc-queue availability — owner/repo", out)
         self.assertIn("repo-nudge responders (1)", out)
         self.assertIn("codex: card=owner/repo#2 state=reviewing", out)
+        self.assertNotIn("airc-8a5e: card=owner/repo#N|idle", out)
         self.assertIn("recent room activity (2)", out)
         self.assertIn("claude-tab-1", out)
         self.assertIn("attention needed (2)", out)
