@@ -411,8 +411,8 @@ REQUIRED
 CARD FIELDS (all optional; defaults shown)
   --id <ref>             Issue/PR this card coordinates (e.g. #1085, airc#562)
   --branch <name>        Branch name (e.g. fix/install-tier-name)
-  --owner <handle>       Queue owner (default: AIRC_QUEUE_OWNER, then
-                         AIRC_AGENT_NAME/AIRC_AGENT_NICK, then this scope)
+  --owner <handle>       Queue owner (default: current work identity from
+                         `airc identity whoami`)
   --status <state>       claimed | in-progress | blocked | review | merged
                          (default: claimed)
   --blockers <list>      Comma-separated #NNNN (e.g. "#1085, airc#559")
@@ -426,8 +426,8 @@ OPTIONS
   -h, --help             This help.
 
 ENVIRONMENT
-  AIRC_QUEUE_OWNER        Per-agent queue identity used when --owner is absent.
-  AIRC_AGENT_NAME/NICK    Secondary per-agent identity fallbacks.
+  AIRC_QUEUE_OWNER        Compatibility fallback for older launchers.
+  AIRC_AGENT_NAME/NICK    Compatibility fallback for older launchers.
 
 EXAMPLES
   airc queue add CambrianTech/continuum \\
@@ -479,18 +479,11 @@ EOF
 _airc_queue_resolve_name() {
   # Best-effort queue owner for the current agent/session. Queue ownership
   # is not always identical to transport identity: multiple local agents may
-  # share one AIRC scope/room handle while working separate cards. Prefer an
-  # explicit queue/session override, then fall back to the room identity.
-  if [ -n "${AIRC_QUEUE_OWNER:-}" ]; then
-    printf '%s\n' "$AIRC_QUEUE_OWNER"
-    return 0
-  fi
-  if [ -n "${AIRC_AGENT_NAME:-}" ]; then
-    printf '%s\n' "$AIRC_AGENT_NAME"
-    return 0
-  fi
-  if [ -n "${AIRC_AGENT_NICK:-}" ]; then
-    printf '%s\n' "$AIRC_AGENT_NICK"
+  # share one AIRC scope/room handle while working separate cards. The
+  # first-class session identity owns product behavior; env names remain
+  # a compatibility path inside the identity resolver.
+  if declare -F _identity_resolve_work_name >/dev/null 2>&1; then
+    _identity_resolve_work_name
     return 0
   fi
 
@@ -2383,12 +2376,11 @@ USAGE
 
 DESCRIPTION
   Sets the card's owner field and status to indicate active work. Default
-  owner = AIRC_QUEUE_OWNER, then AIRC_AGENT_NAME/AIRC_AGENT_NICK, then
-  current scope's resolve_name; default status = in-progress.
+  owner = current work identity from `airc identity whoami`; default status = in-progress.
   Appends a "## Status log" line with timestamp + actor.
 
 OPTIONS
-  --owner <handle>   Queue owner to set (default: per-agent env, then scope).
+  --owner <handle>   Queue owner to set (default: current work identity).
   --status <state>   New status (default: in-progress).
   --dry-run          Print the new body that WOULD be written; don't edit.
   -h, --help         This help.
@@ -2447,12 +2439,12 @@ USAGE
   airc queue heartbeat owner/repo#N [--owner X] [--status Y] [--note "..."] [--dry-run]
 
 DESCRIPTION
-  Sets owner (default: per-agent env, then this AIRC identity) and last_heartbeat to the
+  Sets owner (default: current work identity) and last_heartbeat to the
   current UTC timestamp plus git SHA when available. Optionally updates
   status. Appends a Status log line so humans can see that work is alive.
 
 OPTIONS
-  --owner <handle>   Queue owner to record (default: per-agent env, then scope).
+  --owner <handle>   Queue owner to record (default: current work identity).
   --status <state>   Optional status update: claimed, in-progress, blocked,
                      review, or merged.
   --note "<text>"    Short context appended to the status log.
@@ -2500,8 +2492,7 @@ DESCRIPTION
 CARD FIELDS (all optional; defaults shown)
   --id <ref>             Issue/PR this card coordinates (default: #N)
   --branch <name>        Branch name, if known.
-  --owner <handle>       Queue owner (default: AIRC_QUEUE_OWNER, then
-                         AIRC_AGENT_NAME/AIRC_AGENT_NICK, then this scope)
+  --owner <handle>       Queue owner (default: current work identity)
   --status <state>       claimed | in-progress | blocked | review | merged
                          (default: claimed)
   --blockers <list>      Comma-separated blockers.
@@ -2652,7 +2643,7 @@ OPTIONS
   --merge-sha SHA    Merge commit SHA for the audit trail. If omitted,
                      pulled from PR metadata (mergeCommit.oid).
   --actor X          Identity recorded in the status-log entry. Defaults
-                     to this scope's resolve_name. CI passes
+                     to current work identity. CI passes
                      "github-actions" so the audit trail names the system.
   --dry-run          Show what WOULD be closed; don't mutate or close.
   -h, --help         This help.

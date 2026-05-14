@@ -4,7 +4,7 @@ Coverage:
   - dispatch: subcommand router + add/list reach the right functions + --help paths work
   - validation: missing args / bad status enum / malformed repo all fail loud
   - card body shape: dry-run output embeds a JSON envelope with kind=airc-queue-card-v1
-  - default owner: per-agent env override, then resolve_name when --owner omitted
+  - default owner: session/work identity, then compatibility env fallback
   - field threading: every --flag ends up in the card JSON
   - auto-detect: queue list with no <owner/repo> uses git remote
   - status enum: only canonical states accepted
@@ -263,8 +263,8 @@ class QueueAddCardBodyTests(unittest.TestCase):
                          "queue add must default to status=claimed")
 
     def test_dry_run_default_owner_is_resolved_name(self) -> None:
-        # No --owner → owner field falls back to resolve_name (which
-        # falls back to derive_name → hostname). Must be non-empty.
+        # No --owner → owner field comes from the first-class session/work
+        # identity. Must be non-empty even before `airc join`.
         out = self._dry_run()
         match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
                           out, re.DOTALL)
@@ -273,6 +273,41 @@ class QueueAddCardBodyTests(unittest.TestCase):
         self.assertIn("owner", card)
         self.assertGreater(len(card["owner"]), 0,
                            "default owner must resolve to SOMETHING")
+
+    def test_dry_run_default_owner_prefers_registered_work_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            registered = run_airc(
+                ["identity", "register", "--name", "codex-main"],
+                env_overrides=env,
+            )
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            result = run_airc(
+                ["queue", "add", "owner/repo",
+                 "--title", "test card",
+                 "--dry-run"],
+                env_overrides=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          result.stdout, re.DOTALL)
+        self.assertIsNotNone(match)
+        card = json.loads(match.group(1))  # type: ignore[union-attr]
+        self.assertEqual(card["owner"], "codex-main")
+
+    def test_whoami_prints_transport_and_work_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            registered = run_airc(
+                ["identity", "register", "--name", "claude-tab-1"],
+                env_overrides=env,
+            )
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            result = run_airc(["whoami"], env_overrides=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("transport:", result.stdout)
+        self.assertIn("work:", result.stdout)
+        self.assertIn("claude-tab-1", result.stdout)
 
     def test_dry_run_default_owner_prefers_queue_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
