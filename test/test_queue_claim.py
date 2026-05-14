@@ -6,7 +6,7 @@ Coverage:
   - mutate-card python helper: applies --set/--clear correctly to a fixture
   - dry-run: prints the would-be body, doesn't call gh
   - status log: appends a chronological entry on every mutation
-  - claim defaults: per-agent env owner, then resolve_name; status=in-progress
+  - claim defaults: session/work identity, then compatibility env fallback; status=in-progress
   - claim/heartbeat stamp last_heartbeat
   - release defaults: clears owner, sets status=claimed
   - release --status blocked allowed; in-progress/review/merged rejected
@@ -275,6 +275,22 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"owner": "codex-main"', result.stdout)
         self.assertIn("claim by codex-main", result.stdout)
+
+    def test_claim_default_owner_prefers_registered_work_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(tmp)
+            registered = run_airc(
+                ["identity", "register", "--name", "banach"],
+                env_overrides=env,
+            )
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            result = run_airc(
+                ["queue", "claim", "owner/repo#1", "--dry-run"],
+                env_overrides=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"owner": "banach"', result.stdout)
+        self.assertIn("claim by banach", result.stdout)
 
     def test_heartbeat_sets_owner_and_last_heartbeat(self) -> None:
         body = self._dry_run_extract_body(

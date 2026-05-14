@@ -71,11 +71,16 @@ cmd_away() {
 }
 
 cmd_identity() {
-  ensure_init
   local sub="${1:-show}"
   shift 2>/dev/null || true
   case "$sub" in
+    whoami|register|adopt|-h|--help|help) ;;
+    *) ensure_init ;;
+  esac
+  case "$sub" in
     show|"") _identity_show ;;
+    whoami)  _identity_whoami ;;
+    register|adopt) _identity_register "$@" ;;
     set)     _identity_set "$@" ;;
     link)    _identity_link "$@" ;;
     import)  _identity_import "$@" ;;
@@ -83,13 +88,201 @@ cmd_identity() {
     -h|--help|help)
       echo "Usage:"
       echo "  airc identity show                            Print own identity"
+      echo "  airc identity whoami                          Print transport + work identity"
+      echo "  airc identity register --name <handle>        Set this session's queue/work identity"
       echo "  airc identity set [--pronouns X] [--role Y] [--bio \"…\"] [--status \"…\"]"
       echo "  airc identity link <platform> [handle]        Map this identity to a platform persona (omit handle to unlink)"
       echo "  airc identity import <platform>:<id>          Pull persona from platform (continuum)"
       echo "  airc identity push <platform>                 Send local fields to platform (continuum)"
       ;;
-    *) die "Unknown identity subcommand: $sub (try: show, set, link, import, push)" ;;
+    *) die "Unknown identity subcommand: $sub (try: show, whoami, register, set, link, import, push)" ;;
   esac
+}
+
+_identity_session_file() {
+  local transport_name="${1:-}"
+  [ -z "$transport_name" ] && transport_name="anonymous"
+  mkdir -p "$AIRC_WRITE_DIR/sessions" 2>/dev/null || true
+  AIRC_WRITE_DIR="$AIRC_WRITE_DIR" \
+    TRANSPORT_NAME="$transport_name" \
+    "$AIRC_PYTHON" -c '
+import hashlib, os, pathlib, re, subprocess
+
+def first_env(*names):
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return name, value
+    return "", ""
+
+source, value = first_env(
+    "AIRC_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "TERM_SESSION_ID",
+    "TMUX_PANE",
+)
+if not value:
+    tty = ""
+    try:
+        tty = subprocess.check_output(["tty"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        tty = ""
+    if tty and tty != "not a tty":
+        source, value = "tty", tty
+if not value:
+    source = "cwd"
+    value = os.getcwd()
+
+raw = f"{source}:{value}"
+digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+base = os.environ["AIRC_WRITE_DIR"]
+path = pathlib.Path(base) / "sessions" / f"{digest}.json"
+print(path)
+'
+}
+
+_identity_default_work_name() {
+  local transport_name="${1:-anonymous}"
+  local session_file="${2:-}"
+  SESSION_FILE="$session_file" TRANSPORT_NAME="$transport_name" "$AIRC_PYTHON" -c '
+import hashlib, os, re
+name = os.environ.get("TRANSPORT_NAME", "anonymous") or "anonymous"
+session_file = os.environ.get("SESSION_FILE", "")
+suffix = hashlib.sha256(session_file.encode("utf-8")).hexdigest()[:4]
+base = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "agent"
+print(f"{base}-{suffix}")
+'
+}
+
+_identity_read_work_name() {
+  local session_file="$1"
+  [ -f "$session_file" ] || return 1
+  SESSION_FILE="$session_file" "$AIRC_PYTHON" -c '
+import json, os, sys
+try:
+    data = json.load(open(os.environ["SESSION_FILE"]))
+except Exception:
+    sys.exit(1)
+name = str(data.get("name", "")).strip()
+if not name:
+    sys.exit(1)
+print(name)
+'
+}
+
+_identity_write_work_session() {
+  local session_file="$1" name="$2" transport_name="$3"
+  _validate_peer_name "$name"
+  SESSION_FILE="$session_file" \
+    NAME="$name" \
+    TRANSPORT_NAME="$transport_name" \
+    "$AIRC_PYTHON" -c '
+import json, os, pathlib, subprocess, time
+path = pathlib.Path(os.environ["SESSION_FILE"])
+path.parent.mkdir(parents=True, exist_ok=True)
+source = ""
+value = ""
+for key in ("AIRC_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "TERM_SESSION_ID", "TMUX_PANE"):
+    candidate = os.environ.get(key, "").strip()
+    if candidate:
+        source, value = key, candidate
+        break
+if not value:
+    try:
+        tty = subprocess.check_output(["tty"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        tty = ""
+    if tty and tty != "not a tty":
+        source, value = "tty", tty
+if not value:
+    source, value = "cwd", os.getcwd()
+data = {}
+if path.exists():
+    try:
+        data = json.load(open(path))
+    except Exception:
+        data = {}
+data.update({
+    "name": os.environ["NAME"],
+    "transport_name": os.environ.get("TRANSPORT_NAME", ""),
+    "session_source": source,
+    "session_hint": value,
+    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+})
+json.dump(data, open(path, "w"), indent=2, sort_keys=True)
+'
+}
+
+_identity_resolve_work_name() {
+  local transport_name session_file saved_name default_name
+  if declare -F resolve_name >/dev/null 2>&1; then
+    transport_name=$(resolve_name)
+  else
+    transport_name="anonymous"
+  fi
+
+  session_file=$(_identity_session_file "$transport_name")
+  if saved_name=$(_identity_read_work_name "$session_file" 2>/dev/null); then
+    printf '%s\n' "$saved_name"
+    return 0
+  fi
+
+  # Compatibility shim for existing automation. This is no longer the
+  # product path; first-class session state is written immediately below.
+  if [ -n "${AIRC_QUEUE_OWNER:-}" ]; then
+    _identity_write_work_session "$session_file" "$AIRC_QUEUE_OWNER" "$transport_name"
+    printf '%s\n' "$AIRC_QUEUE_OWNER"
+    return 0
+  fi
+  if [ -n "${AIRC_AGENT_NAME:-}" ]; then
+    _identity_write_work_session "$session_file" "$AIRC_AGENT_NAME" "$transport_name"
+    printf '%s\n' "$AIRC_AGENT_NAME"
+    return 0
+  fi
+  if [ -n "${AIRC_AGENT_NICK:-}" ]; then
+    _identity_write_work_session "$session_file" "$AIRC_AGENT_NICK" "$transport_name"
+    printf '%s\n' "$AIRC_AGENT_NICK"
+    return 0
+  fi
+
+  default_name=$(_identity_default_work_name "$transport_name" "$session_file")
+  _identity_write_work_session "$session_file" "$default_name" "$transport_name"
+  printf '%s\n' "$default_name"
+}
+
+_identity_whoami() {
+  local transport_name session_file work_name
+  transport_name=$(resolve_name)
+  session_file=$(_identity_session_file "$transport_name")
+  work_name=$(_identity_resolve_work_name)
+  printf '  transport:  %s\n' "$transport_name"
+  printf '  work:       %s\n' "$work_name"
+  printf '  session:    %s\n' "$session_file"
+}
+
+_identity_register() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      -h|--help)
+        echo "Usage:"
+        echo "  airc identity register --name <handle>"
+        echo "  airc identity adopt <handle>"
+        return 0 ;;
+      --*) die "Unknown flag: $1" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Usage: airc identity register --name <handle>"
+  local transport_name session_file
+  transport_name=$(resolve_name)
+  session_file=$(_identity_session_file "$transport_name")
+  _identity_write_work_session "$session_file" "$name" "$transport_name"
+  printf '  work identity: %s\n' "$name"
+  printf '  session: %s\n' "$session_file"
 }
 
 # Identity bootstrap nudge (#146). Called once after a successful

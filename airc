@@ -2592,7 +2592,8 @@ case "${1:-help}" in
   send-file) shift; cmd_send_file "$@" ;;
   ping)      shift; cmd_ping "$@" ;;
   rename|nick) shift; cmd_rename "$@" ;;
-  identity|whoami) shift; cmd_identity "$@" ;;
+  identity)   shift; cmd_identity "$@" ;;
+  whoami)     shift; cmd_identity whoami "$@" ;;
   away|back) shift; cmd_away "$@" ;;
   whois)     shift; cmd_whois "$@" ;;
   kick)      shift; cmd_kick "$@" ;;
