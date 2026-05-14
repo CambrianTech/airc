@@ -16,6 +16,7 @@
 #                 pongs      — summarize repo-nudge pong replies.
 #                 availability — summarize queue owners + recent peer activity.
 #                 close-merged — auto-close cards referenced by a merged PR.
+#                 staleness — warn when a PR branch would revert base work.
 #
 # Verbs deferred to later PRs under airc#562:
 #   - heartbeat + stall detection (PR-4)
@@ -100,8 +101,11 @@ cmd_queue() {
     close-merged)
       _cmd_queue_close_merged "$@"
       ;;
+    staleness|stale-pr)
+      _cmd_queue_staleness "$@"
+      ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged, staleness)"
       ;;
   esac
 }
@@ -231,6 +235,9 @@ _cmd_queue_list() {
   local filter_status=""
   local output_json=0
   local limit=30
+  local check_staleness=0
+  local no_fetch_staleness=0
+  local repo_root=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -242,6 +249,9 @@ _cmd_queue_list() {
       --owner)    shift; filter_owner="${1:-}" ;;
       --status)   shift; filter_status="${1:-}" ;;
       --limit)    shift; limit="${1:-30}" ;;
+      --check-staleness) check_staleness=1 ;;
+      --no-fetch-staleness) no_fetch_staleness=1 ;;
+      --repo-root) shift; repo_root="${1:-}" ;;
       --json)     output_json=1 ;;
       -*) die "queue list: unknown flag: $1" ;;
       *)
@@ -366,7 +376,101 @@ else:
 PYEOF
   local py_status=$?
   rm -f "$raw_json_file"
+  if [ "$py_status" -eq 0 ] && [ "$output_json" -eq 0 ] && [ "$check_staleness" -eq 1 ]; then
+    _airc_queue_list_staleness_sweep "$target_repo" "$filter_status" "$repo_root" "$limit" "$no_fetch_staleness"
+    py_status=$?
+  fi
   return "$py_status"
+}
+
+_airc_queue_list_staleness_sweep() {
+  local target_repo="$1"
+  local filter_status="$2"
+  local repo_root="$3"
+  local limit="$4"
+  local no_fetch="$5"
+
+  if [ -n "$filter_status" ] && [ "$filter_status" != "review" ]; then
+    return 0
+  fi
+  if [ -z "$repo_root" ]; then
+    repo_root="."
+  fi
+  if ! git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '\nstaleness: skipped (repo root not a git checkout: %s)\n' "$repo_root" >&2
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    printf '\nstaleness: skipped (gh CLI unavailable)\n' >&2
+    return 0
+  fi
+
+  local raw_json raw_json_file refs_file
+  if ! raw_json=$(gh issue list \
+    --repo "$target_repo" \
+    --label "airc-queue" \
+    --state open \
+    --limit "$limit" \
+    --json number,title,url,body 2>&1); then
+    printf '\nstaleness: skipped (gh issue list failed: %s)\n' "$raw_json" >&2
+    return 0
+  fi
+
+  raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list-stale-json.XXXXXX") || return 1
+  refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list-stale-refs.XXXXXX") || { rm -f "$raw_json_file"; return 1; }
+  printf '%s' "$raw_json" >"$raw_json_file"
+
+  "$AIRC_PYTHON" - "$target_repo" "$raw_json_file" >"$refs_file" <<'PYEOF'
+import json, re, sys
+repo, path = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+card_re = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+for issue in issues:
+    card = {}
+    for m in card_re.finditer(issue.get("body", "") or ""):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            card = parsed
+            break
+    if (card.get("status") or "").strip() != "review":
+        continue
+    text = "\n".join([
+        str(issue.get("title") or ""),
+        str(issue.get("body") or ""),
+        str(card.get("next_action") or ""),
+        str(card.get("evidence") or ""),
+    ])
+    refs = []
+    for m in re.finditer(r'https://github\.com/([^/]+/[^/]+)/(?:pull|pulls)/(\d+)|\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b|(?<![A-Za-z0-9_/])#(\d+)\b', text):
+        if m.group(1):
+            refs.append(f"{m.group(1)}#{m.group(2)}")
+        elif m.group(3):
+            refs.append(f"{m.group(3)}/{m.group(4)}#{m.group(5)}")
+        elif m.group(6):
+            refs.append(f"{repo}#{m.group(6)}")
+    for ref in dict.fromkeys(refs):
+        print(ref)
+        break
+PYEOF
+
+  if [ -s "$refs_file" ]; then
+    printf '\n# staleness sweep — review cards\n'
+    while IFS= read -r ref; do
+      [ -z "$ref" ] && continue
+      if [ "$no_fetch" = "1" ]; then
+        _cmd_queue_staleness "$ref" --repo-root "$repo_root" --limit-lines 12 --no-fetch || true
+      else
+        _cmd_queue_staleness "$ref" --repo-root "$repo_root" --limit-lines 12 || true
+      fi
+    done <"$refs_file"
+  fi
+
+  rm -f "$raw_json_file" "$refs_file"
+  return 0
 }
 
 _airc_queue_help() {
@@ -389,6 +493,7 @@ USAGE
   airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID]
   airc queue availability <owner/repo> [--since 30m] [--stale-after 30m]
   airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
+  airc queue staleness <pr-url|owner/repo#PR> [--repo-root PATH] [--json]
 
 DESCRIPTION
   Adds, lists, or mutates queue cards (GitHub issues with airc-queue
@@ -406,6 +511,7 @@ VERB SCOPE
   pongs / pong-summary          Repo-nudge response collection (airc#579)
   availability / avail          Live peer + stale-claim summary (airc#591)
   close-merged                 airc#576 — auto-close on PR merge to canary
+  staleness / stale-pr          airc#615 — warn on PR branch/base drift
   auto-release policy          Deferred; stale is read-only first
 
 EOF
@@ -476,6 +582,11 @@ OPTIONS
   --owner <handle>       Filter to cards owned by this handle.
   --status <state>       Filter to cards in this state.
   --limit <N>            Max cards to fetch (default 30; gh hard cap 100).
+  --check-staleness      For review cards, run `airc queue staleness` on the
+                         first linked PR ref and print warnings inline.
+  --repo-root <path>     Git checkout used by --check-staleness.
+  --no-fetch-staleness   Pass --no-fetch to the staleness sweep; useful for
+                         local/offline validation with already-present refs.
   --json                 Emit JSON instead of human-readable text.
   -h, --help             This help.
 
@@ -2630,6 +2741,264 @@ print("not-a-card")
   return 0
 }
 
+_cmd_queue_staleness() {
+  # Detect stale PR branches that would erase already-merged base work.
+  #
+  # This is intentionally git-side and read-only. GitHub's mergeability and
+  # CI can both be green while the PR head lacks recent base commits; this
+  # command answers the reviewer question: "what current-base lines in files
+  # touched by this PR are absent from the PR head?"
+  local pr_url=""
+  local repo_root=""
+  local base_ref=""
+  local head_ref=""
+  local pr_repo=""
+  local pr_num=""
+  local output_json=0
+  local no_fetch=0
+  local limit_lines=40
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_staleness_help
+        return 0
+        ;;
+      --repo-root)   shift; repo_root="${1:-}" ;;
+      --base)        shift; base_ref="${1:-}" ;;
+      --head)        shift; head_ref="${1:-}" ;;
+      --repo)        shift; pr_repo="${1:-}" ;;
+      --pr)          shift; pr_num="${1:-}" ;;
+      --limit-lines) shift; limit_lines="${1:-40}" ;;
+      --no-fetch)    no_fetch=1 ;;
+      --json)        output_json=1 ;;
+      -*) die "queue staleness: unknown flag: $1" ;;
+      *)
+        if [ -z "$pr_url" ]; then
+          pr_url="$1"
+        else
+          die "queue staleness: too many positional args (use: queue staleness <pr-url|owner/repo#PR>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  case "$limit_lines" in
+    ''|*[!0-9]*) die "queue staleness: --limit-lines must be a positive integer (got: $limit_lines)" ;;
+  esac
+  if [ "$limit_lines" -lt 1 ]; then
+    die "queue staleness: --limit-lines must be >= 1 (got: $limit_lines)"
+  fi
+
+  if [ -n "$pr_url" ]; then
+    if [[ "$pr_url" =~ ^https://github\.com/([^/]+/[^/]+)/(pull|pulls|issues)/([0-9]+) ]]; then
+      pr_repo="${BASH_REMATCH[1]}"
+      pr_num="${BASH_REMATCH[3]}"
+    elif [[ "$pr_url" =~ ^([^/]+/[^/]+)#([0-9]+)$ ]]; then
+      pr_repo="${BASH_REMATCH[1]}"
+      pr_num="${BASH_REMATCH[2]}"
+    else
+      die "queue staleness: <pr-url> must be a GitHub PR URL or owner/repo#N (got: $pr_url)"
+    fi
+  fi
+
+  if [ -z "$repo_root" ]; then
+    repo_root="."
+  fi
+  if ! git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+    die "queue staleness: --repo-root must point at a git checkout (got: $repo_root)"
+  fi
+
+  local pr_canonical_url=""
+  if [ -n "$pr_repo" ] && [ -n "$pr_num" ] && { [ -z "$base_ref" ] || [ -z "$head_ref" ]; }; then
+    if ! command -v gh >/dev/null 2>&1; then
+      die "queue staleness: 'gh' CLI is required when --base/--head are not supplied."
+    fi
+    local pr_blob
+    if ! pr_blob=$(gh pr view "$pr_num" --repo "$pr_repo" --json baseRefName,headRefName,url,title 2>&1); then
+      die "queue staleness: gh pr view failed for $pr_repo#$pr_num: $pr_blob"
+    fi
+    local pr_file pr_meta
+    pr_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-pr.XXXXXX") || die "queue staleness: mktemp failed"
+    printf '%s' "$pr_blob" >"$pr_file"
+    if ! pr_meta=$("$AIRC_PYTHON" - "$pr_file" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    pr = json.load(f)
+print(f"{pr.get('baseRefName') or ''}\t{pr.get('headRefName') or ''}\t{pr.get('url') or ''}")
+PYEOF
+    ); then
+      rm -f "$pr_file"
+      die "queue staleness: PR JSON parse failed"
+    fi
+    rm -f "$pr_file"
+    [ -z "$base_ref" ] && base_ref=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $1}')
+    [ -z "$head_ref" ] && head_ref=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $2}')
+    pr_canonical_url=$(printf '%s' "$pr_meta" | awk -F'\t' '{print $3}')
+  fi
+
+  if [ -z "$base_ref" ] || [ -z "$head_ref" ]; then
+    die "queue staleness: need a PR ref or explicit --base <ref> --head <ref>"
+  fi
+
+  local base_git_ref="$base_ref"
+  local head_git_ref="$head_ref"
+  local temp_head_ref=""
+  if [ "$no_fetch" -eq 0 ]; then
+    if [ -n "$pr_repo" ] && [ -n "$pr_num" ]; then
+      temp_head_ref="refs/remotes/origin/airc-staleness-pr-$pr_num"
+      git -C "$repo_root" fetch --quiet origin "$base_ref" "pull/$pr_num/head:$temp_head_ref" \
+        || die "queue staleness: git fetch failed for origin $base_ref and pull/$pr_num/head"
+      base_git_ref="origin/$base_ref"
+      head_git_ref="$temp_head_ref"
+    else
+      git -C "$repo_root" fetch --quiet origin "$base_ref" "$head_ref" \
+        || die "queue staleness: git fetch failed for origin $base_ref $head_ref"
+      base_git_ref="origin/$base_ref"
+      head_git_ref="origin/$head_ref"
+    fi
+  fi
+
+  local merge_base
+  if ! merge_base=$(git -C "$repo_root" merge-base "$base_git_ref" "$head_git_ref" 2>/dev/null); then
+    die "queue staleness: could not compute merge-base for $base_git_ref and $head_git_ref"
+  fi
+
+  local files_file diff_file base_new_file
+  files_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-files.XXXXXX") || die "queue staleness: mktemp failed"
+  diff_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-diff.XXXXXX") || die "queue staleness: mktemp failed"
+  base_new_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-base.XXXXXX") || die "queue staleness: mktemp failed"
+
+  git -C "$repo_root" diff --name-only "$merge_base..$head_git_ref" >"$files_file" \
+    || { rm -f "$files_file" "$diff_file" "$base_new_file"; die "queue staleness: git diff --name-only failed"; }
+
+  if [ ! -s "$files_file" ]; then
+    if [ "$output_json" -eq 1 ]; then
+      printf '{"status":"ok","warnings":[],"message":"OK: PR has no changed files relative to merge-base"}\n'
+    else
+      printf 'OK: PR has no changed files relative to merge-base.\n'
+    fi
+    rm -f "$files_file" "$diff_file" "$base_new_file"
+    return 0
+  fi
+
+  git -C "$repo_root" diff --unified=0 "$merge_base..$base_git_ref" -- $(cat "$files_file") >"$base_new_file" \
+    || { rm -f "$files_file" "$diff_file" "$base_new_file"; die "queue staleness: git diff merge-base..base failed"; }
+
+  git -C "$repo_root" diff --unified=0 "$head_git_ref..$base_git_ref" -- $(cat "$files_file") >"$diff_file" \
+    || { rm -f "$files_file" "$diff_file" "$base_new_file"; die "queue staleness: git diff head..base failed"; }
+
+  AIRC_QUEUE_STALENESS_LIMIT="$limit_lines" "$AIRC_PYTHON" - \
+      "$repo_root" "$pr_repo" "$pr_num" "$base_ref" "$head_ref" "$base_git_ref" "$head_git_ref" \
+      "$merge_base" "$pr_canonical_url" "$output_json" "$files_file" "$diff_file" "$base_new_file" <<'PYEOF'
+import json, os, re, subprocess, sys
+
+(
+    repo_root,
+    pr_repo,
+    pr_num,
+    base_ref,
+    head_ref,
+    base_git_ref,
+    head_git_ref,
+    merge_base,
+    pr_url,
+    output_json_raw,
+    files_path,
+    diff_path,
+    base_new_path,
+) = sys.argv[1:14]
+output_json = output_json_raw == "1"
+limit = int(os.environ.get("AIRC_QUEUE_STALENESS_LIMIT", "40"))
+
+with open(files_path, "r", encoding="utf-8") as f:
+    touched_files = [line.strip() for line in f if line.strip()]
+with open(diff_path, "r", encoding="utf-8", errors="replace") as f:
+    diff_lines = f.read().splitlines()
+with open(base_new_path, "r", encoding="utf-8", errors="replace") as f:
+    base_new_lines = f.read().splitlines()
+
+def plus_lines_by_file(lines):
+    out = {}
+    current = ""
+    for raw in lines:
+        if raw.startswith("+++ b/"):
+            current = raw[6:]
+            continue
+        if not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        content = raw[1:]
+        if not content.strip():
+            continue
+        out.setdefault(current, set()).add(content)
+    return out
+
+base_added = plus_lines_by_file(base_new_lines)
+
+warnings = []
+current_file = ""
+for line in diff_lines:
+    if line.startswith("+++ b/"):
+        current_file = line[6:]
+        continue
+    if not line.startswith("+") or line.startswith("+++"):
+        continue
+    content = line[1:]
+    if not content.strip():
+        continue
+    if content not in base_added.get(current_file, set()):
+        continue
+    if len(content) > 240:
+        content = content[:240] + "..."
+    origin = ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "log", "--format=%h %s", "-n", "1", "-S", content, base_git_ref, "--", current_file],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        origin = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    except Exception:
+        origin = ""
+    warnings.append({"file": current_file, "line": content, "origin": origin})
+    if len(warnings) >= limit:
+        break
+
+payload = {
+    "repo": pr_repo,
+    "pr": pr_num,
+    "url": pr_url,
+    "base": base_ref,
+    "head": head_ref,
+    "base_git_ref": base_git_ref,
+    "head_git_ref": head_git_ref,
+    "merge_base": merge_base,
+    "touched_files": touched_files,
+    "warning_count": len(warnings),
+    "warnings": warnings,
+}
+
+if output_json:
+    print(json.dumps(payload, indent=2))
+elif not warnings:
+    print(f"OK: no stale conflicts detected for {pr_repo + '#' + pr_num if pr_repo and pr_num else head_ref}.")
+    print(f"base={base_ref} head={head_ref} files_touched={len(touched_files)}")
+else:
+    label = f"{pr_repo}#{pr_num}" if pr_repo and pr_num else head_ref
+    print(f"WARN: {label} branch may erase current-base work.")
+    print(f"base={base_ref} head={head_ref} files_touched={len(touched_files)} missing_base_lines_sample={len(warnings)}")
+    print("Rebase the PR branch onto the current base before merge, then rerun this command.")
+    for item in warnings:
+        origin = f" ({item['origin']})" if item["origin"] else ""
+        print(f"  - {item['file']}: {item['line']}{origin}")
+PYEOF
+  local py_status=$?
+  rm -f "$files_file" "$diff_file" "$base_new_file"
+  return "$py_status"
+}
+
 _airc_queue_mutate_card() {
   # Update an existing card body in place.
   # Args: <issue_url> <dry_run> <log_msg> [--set field=value | --clear field]...
@@ -3183,5 +3552,41 @@ WHAT IT DOES
      are skipped with a count in the summary.
   Plain mentions like "Refs #N" are ignored so doc-only PRs do not close
   implementation cards.
+EOF
+}
+
+_airc_queue_staleness_help() {
+  cat <<'EOF'
+airc queue staleness — warn when a PR branch would revert current-base work
+
+USAGE
+  airc queue staleness <pr-url|owner/repo#PR> [--repo-root PATH] [--json]
+  airc queue stale-pr <pr-url|owner/repo#PR> [--repo-root PATH]
+  airc queue staleness --base canary --head feat/x [--repo-root PATH] [--no-fetch]
+
+DESCRIPTION
+  Read-only PR freshness guard for queue review. It compares the PR head
+  against the current base branch, limited to files touched by the PR, and
+  reports base-side lines that are absent from the PR head. Those lines are
+  the practical "this merge would erase already-merged work" signal that CI
+  and GitHub's generic out-of-date warning do not explain.
+
+OPTIONS
+  --repo-root PATH    Git checkout to inspect. Default: current directory.
+  --base REF          Base branch/ref when not using gh PR metadata.
+  --head REF          Head branch/ref when not using gh PR metadata.
+  --repo owner/repo   Repo for --pr mode.
+  --pr N              PR number for --repo mode.
+  --limit-lines N     Max missing base lines to print (default: 40).
+  --no-fetch          Do not fetch; treat --base/--head as local git refs.
+  --json              Emit machine-readable JSON.
+  -h, --help          This help.
+
+NOTES
+  - With a PR URL or owner/repo#N, the command fetches origin/<base> and
+    refs/pull/N/head before diffing.
+  - Exit status is currently 0 for both OK and WARN so this can be used in
+    queue/listing surfaces without breaking scripts. Callers should inspect
+    the printed status or JSON warning_count.
 EOF
 }
