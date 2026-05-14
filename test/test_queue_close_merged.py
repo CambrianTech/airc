@@ -416,15 +416,16 @@ class CloseMergedRefParserTests(unittest.TestCase):
         self.assertIn("CambrianTech/airc#102", result.stdout)
 
     def test_cross_repo_ref_detected_not_closed(self) -> None:
-        # Cross-repo ref must surface in summary as cross-repo, not closed.
+        # Cross-repo ref must surface in summary as cross-repo, not closed
+        # by default. (--allow-cross-repo flag opt-in is tested separately.)
         body = "Closes CambrianTech/continuum#1130.\n"
         result, _ = self._run_dry(body)
         self.assertEqual(result.returncode, 0)
         self.assertIn("CambrianTech/continuum#1130", result.stdout)
         self.assertIn("[cross-repo]", result.stdout,
                       "cross-repo refs must be marked, not closed")
-        self.assertIn("workflow GITHUB_TOKEN is repo-scoped",
-                      result.stdout)
+        self.assertIn("--allow-cross-repo not set", result.stdout,
+                      "skip message must explain how to enable cross-repo close")
 
     def test_dedup_repeated_ref(self) -> None:
         # Same #N referenced twice → process once.
@@ -594,6 +595,71 @@ class CloseMergedE2ETests(unittest.TestCase):
                          "dry-run MUST NOT call gh issue edit")
         self.assertFalse(close_file.exists(),
                          "dry-run MUST NOT call gh issue close")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Cross-repo close (--allow-cross-repo flag, continuum#1174)
+# ─────────────────────────────────────────────────────────────────
+
+class CloseMergedCrossRepoTests(unittest.TestCase):
+    """The --allow-cross-repo flag opts in to attempting close calls
+    against issues in OTHER repos. Without the flag (default), cross-
+    repo refs are detected + reported but not closed. With the flag,
+    the close call is attempted and gh's auth context decides whether
+    it actually succeeds.
+
+    These tests use --dry-run so no real gh close happens; they verify
+    the dispatch + reporting path differs based on the flag."""
+
+    def _run(self, body: str, extra_args: list[str]
+             ) -> subprocess.CompletedProcess[str]:
+        tmp = tempfile.mkdtemp()
+        env = _fake_gh(tmp, pr_body=body)
+        return run_airc(
+            ["queue", "close-merged",
+             "https://github.com/CambrianTech/airc/pull/574"] + extra_args,
+            env_overrides=env,
+        )
+
+    def test_default_skips_cross_repo_with_recovery_hint(self) -> None:
+        """Default (no flag): cross-repo refs are skipped, message names
+        the flag operators need to enable cross-repo close. Backward-
+        compat with existing repo-scoped workflows."""
+        body = "Closes CambrianTech/continuum#1130.\n"
+        result = self._run(body, ["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[cross-repo]", result.stdout)
+        self.assertIn("CambrianTech/continuum#1130", result.stdout)
+        self.assertIn("--allow-cross-repo not set", result.stdout,
+                      "skip message must explain how to enable cross-repo")
+        self.assertIn("1 cross-repo", result.stdout,
+                      "summary must count the cross-repo skip")
+
+    def test_allow_cross_repo_attempts_close(self) -> None:
+        """With --allow-cross-repo + --dry-run: cross-repo ref reaches
+        the dry-run [dry-run] line instead of the [cross-repo] skip
+        line. Proves the flag changes the dispatch path."""
+        body = "Closes CambrianTech/continuum#1130.\n"
+        result = self._run(body, ["--allow-cross-repo", "--dry-run"])
+        self.assertEqual(result.returncode, 0,
+                         f"dry-run with --allow-cross-repo must succeed; "
+                         f"stderr={result.stderr}")
+        # The [cross-repo] line still appears (announcing the attempt),
+        # but the ref ALSO reaches the dry-run path (would-close summary).
+        self.assertIn("[cross-repo]", result.stdout,
+                      "cross-repo refs are still announced for visibility")
+        self.assertIn("attempting close", result.stdout,
+                      "with --allow-cross-repo, message must say attempting")
+        self.assertIn("1 cross-repo", result.stdout,
+                      "summary still counts the cross-repo ref")
+
+    def test_unknown_flag_still_rejected(self) -> None:
+        """Smoke: --allow-cross-repo doesn't disable the unknown-flag
+        guard. A typo of the new flag is rejected loudly."""
+        body = "Closes #100.\n"
+        result = self._run(body, ["--allow-x-repo", "--dry-run"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown flag", result.stdout + result.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────

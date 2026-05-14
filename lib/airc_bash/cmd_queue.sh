@@ -2165,16 +2165,25 @@ _cmd_queue_close_merged() {
   # Auto-close queue cards explicitly completed by a merged PR.
   #
   # Args:
-  #   airc queue close-merged <pr-url|owner/repo#PR> [--merge-sha SHA] [--actor X] [--dry-run]
+  #   airc queue close-merged <pr-url|owner/repo#PR> [--merge-sha SHA] [--actor X] [--allow-cross-repo] [--dry-run]
   #
   # GitHub's native "Closes #N" only triggers when the PR merges into the
   # default branch. AIRC uses canary first, so queue cards need a canary-time
   # close path. Plain mentions ("Refs #N", "See #N") are intentionally not
   # close targets; they may describe related work that remains open.
+  #
+  # Cross-repo close (--allow-cross-repo) requires gh to be authenticated
+  # with a token that has issues:write on the OTHER repo (continuum#1174):
+  # the workflow's auto-issued GITHUB_TOKEN is repo-scoped and can't close
+  # cross-repo refs. Operator supplies a fine-grained PAT or GitHub App
+  # installation token via the workflow's GH_TOKEN env. Without the flag
+  # (default), cross-repo refs are detected + reported but NOT closed —
+  # preserves backward compatibility with existing repo-scoped workflows.
   local pr_url=""
   local merge_sha=""
   local actor=""
   local dry_run=0
+  local allow_cross_repo=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2182,9 +2191,10 @@ _cmd_queue_close_merged() {
         _airc_queue_close_merged_help
         return 0
         ;;
-      --merge-sha) shift; merge_sha="${1:-}" ;;
-      --actor)     shift; actor="${1:-}" ;;
-      --dry-run)   dry_run=1 ;;
+      --merge-sha)        shift; merge_sha="${1:-}" ;;
+      --actor)            shift; actor="${1:-}" ;;
+      --dry-run)          dry_run=1 ;;
+      --allow-cross-repo) allow_cross_repo=1 ;;
       -*) die "queue close-merged: unknown flag: $1" ;;
       *)
         if [ -z "$pr_url" ]; then
@@ -2347,9 +2357,19 @@ PYEOF
     ref_num="${ref##*#}"
 
     if [ "$ref_repo" != "$pr_repo" ]; then
-      printf '  [cross-repo] %s — skipped (workflow GITHUB_TOKEN is repo-scoped)\n' "$ref"
+      if [ "$allow_cross_repo" -eq 0 ]; then
+        printf '  [cross-repo] %s — skipped (--allow-cross-repo not set; default GITHUB_TOKEN is repo-scoped)\n' "$ref"
+        cross_repo_count=$((cross_repo_count + 1))
+        continue
+      fi
+      # Fall through to normal close path. gh's auth context (GH_TOKEN
+      # env or `gh auth login`) decides whether the close actually
+      # succeeds — if the token doesn't have issues:write on $ref_repo,
+      # the close call fails loudly with the gh API error and we count
+      # it as errored (NOT a silent skip). Operator supplies the
+      # broader-scoped token via the workflow's GH_TOKEN secret.
+      printf '  [cross-repo] %s — attempting close (--allow-cross-repo set; relying on gh auth scope)\n' "$ref"
       cross_repo_count=$((cross_repo_count + 1))
-      continue
     fi
 
     local issue_body
@@ -2912,21 +2932,30 @@ _airc_queue_close_merged_help() {
 airc queue close-merged — auto-close queue cards completed by a merged PR
 
 USAGE
-  airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
-  airc queue close-merged owner/repo#PR [--merge-sha SHA] [--actor X] [--dry-run]
+  airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--allow-cross-repo] [--dry-run]
+  airc queue close-merged owner/repo#PR [--merge-sha SHA] [--actor X] [--allow-cross-repo] [--dry-run]
 
 ARGUMENTS
-  <pr-url>           GitHub PR URL (https://github.com/.../pull/N) OR
-                     owner/repo#N short form. PR must already be merged.
+  <pr-url>            GitHub PR URL (https://github.com/.../pull/N) OR
+                      owner/repo#N short form. PR must already be merged.
 
 OPTIONS
-  --merge-sha SHA    Merge commit SHA for the audit trail. If omitted,
-                     pulled from PR metadata (mergeCommit.oid).
-  --actor X          Identity recorded in the status-log entry. Defaults
-                     to current work identity. CI passes
-                     "github-actions" so the audit trail names the system.
-  --dry-run          Show what WOULD be closed; don't mutate or close.
-  -h, --help         This help.
+  --merge-sha SHA     Merge commit SHA for the audit trail. If omitted,
+                      pulled from PR metadata (mergeCommit.oid).
+  --actor X           Identity recorded in the status-log entry. Defaults
+                      to current work identity. CI passes
+                      "github-actions" so the audit trail names the system.
+  --allow-cross-repo  Attempt to close cross-repo queue-card refs (default:
+                      report-only). Requires gh to be authenticated with a
+                      token that has issues:write on the OTHER repo —
+                      typically a fine-grained PAT or GitHub App
+                      installation token, supplied via the workflow's
+                      GH_TOKEN secret. Without this flag, cross-repo refs
+                      are detected + reported but NOT closed (preserves
+                      backward compat with existing repo-scoped workflows).
+                      See continuum#1174 for the design rationale.
+  --dry-run           Show what WOULD be closed; don't mutate or close.
+  -h, --help          This help.
 
 WHAT IT DOES
   1. Fetches the PR body via gh.
@@ -2934,7 +2963,10 @@ WHAT IT DOES
   3. Parses the body for same-repo and cross-repo queue-card closing refs
      with GitHub-style closing keywords (Closes/Fixes/Resolves).
   4. For same-repo queue cards: sets status=merged and closes the issue.
-  5. Cross-repo closing refs are reported but not closed with repo-scoped tokens.
+  5. Cross-repo closing refs are reported. With --allow-cross-repo set,
+     attempts the close (gh's auth scope decides if it actually succeeds —
+     failures count as errored, not silent skips). Without the flag, they
+     are skipped with a count in the summary.
   Plain mentions like "Refs #N" are ignored so doc-only PRs do not close
   implementation cards.
 EOF
