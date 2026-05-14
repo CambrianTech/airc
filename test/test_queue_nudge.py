@@ -177,6 +177,7 @@ class QueueNudgeDispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("airc queue nudge", result.stdout)
         self.assertIn("airc queue pongs", result.stdout)
+        self.assertIn("airc queue availability", result.stdout)
 
 
 class QueueNudgeValidationTests(unittest.TestCase):
@@ -469,6 +470,91 @@ class QueuePongsTests(unittest.TestCase):
         self.assertEqual(payload["sweep_id"], "new")
         self.assertEqual([r["nick"] for r in payload["responders"]], ["codex"])
         self.assertEqual(payload["missing_owners"], ["claude-tab-1"])
+
+
+class QueueAvailabilityTests(unittest.TestCase):
+    def test_availability_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "availability", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stale-claim", result.stdout)
+        self.assertIn("--stale-after", result.stdout)
+
+    def test_availability_summarizes_activity_and_stale_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(tmp)
+            airc_home = pathlib.Path(env["AIRC_HOME"])
+            airc_home.mkdir(parents=True, exist_ok=True)
+            (airc_home / "messages.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:01Z",
+                        "from": "claude-tab-1",
+                        "msg": "working on owner/repo#1",
+                    }),
+                    json.dumps({
+                        "ts": "2099-01-01T00:00:02Z",
+                        "from": "codex",
+                        "msg": (
+                            "pong: owner/repo — sweep=sweep-123 — codex — "
+                            "card=<owner/repo#2> state=<reviewing> "
+                            "blocker=<none> next=<merge> claim=<keep>"
+                        ),
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_airc(
+                ["queue", "availability", "owner/repo",
+                 "--since", "2000-01-01T00:00:00Z",
+                 "--sweep-id", "sweep-next"],
+                env_overrides=env,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn("# airc-queue availability — owner/repo", out)
+        self.assertIn("repo-nudge responders (1)", out)
+        self.assertIn("codex: card=owner/repo#2 state=reviewing", out)
+        self.assertIn("recent room activity (2)", out)
+        self.assertIn("claude-tab-1", out)
+        self.assertIn("attention needed (2)", out)
+        self.assertIn("reason=missing-heartbeat", out)
+        self.assertIn("missing owners: none", out)
+        self.assertIn("airc queue nudge owner/repo --sweep-id sweep-next", out)
+        self.assertIn("airc queue pongs owner/repo --sweep-id sweep-next", out)
+
+    def test_availability_json_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env_with_fake_gh(tmp)
+            airc_home = pathlib.Path(env["AIRC_HOME"])
+            airc_home.mkdir(parents=True, exist_ok=True)
+            (airc_home / "messages.jsonl").write_text(
+                json.dumps({
+                    "ts": "2099-01-01T00:00:02Z",
+                    "from": "codex",
+                    "msg": "pong: owner/repo — sweep=s1 — codex — card=<owner/repo#2> state=<testing> blocker=<none> next=<ship> claim=<keep>",
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_airc(
+                ["queue", "avail", "owner/repo",
+                 "--since", "2000-01-01T00:00:00Z",
+                 "--json"],
+                env_overrides=env,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["repo"], "owner/repo")
+        self.assertEqual(len(payload["cards"]), 2)
+        self.assertEqual(len(payload["stale_cards"]), 2)
+        self.assertEqual(payload["responders"][0]["nick"], "codex")
+        self.assertIn("claude-tab-1", payload["missing_owners"])
+        self.assertIn("airc queue nudge owner/repo", payload["suggested_nudge"])
 
 
 if __name__ == "__main__":

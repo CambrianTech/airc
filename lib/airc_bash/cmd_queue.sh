@@ -12,6 +12,7 @@
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
 #                 pongs      — summarize repo-nudge pong replies.
+#                 availability — summarize queue owners + recent peer activity.
 #                 close-merged — auto-close cards referenced by a merged PR.
 #
 # Verbs deferred to later PRs under airc#562:
@@ -85,11 +86,14 @@ cmd_queue() {
     pongs|pong-summary)
       _cmd_queue_pongs "$@"
       ;;
+    availability|avail)
+      _cmd_queue_availability "$@"
+      ;;
     close-merged)
       _cmd_queue_close_merged "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, nudge, adopt, pongs, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, nudge, adopt, pongs, availability, close-merged)"
       ;;
   esac
 }
@@ -371,6 +375,7 @@ USAGE
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
   airc queue pongs <owner/repo> [--since 30m] [--sweep-id ID]
+  airc queue availability <owner/repo> [--since 30m] [--stale-after 30m]
   airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
 
 DESCRIPTION
@@ -385,6 +390,7 @@ VERB SCOPE
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
   pongs / pong-summary          Repo-nudge response collection (airc#579)
+  availability / avail          Live peer + stale-claim summary (airc#591)
   close-merged                 airc#576 — auto-close on PR merge to canary
   auto-release policy          Deferred; stale is read-only first
 
@@ -1632,6 +1638,309 @@ PYEOF
   return "$py_status"
 }
 
+_cmd_queue_availability() {
+  # Read-only queue-owner + live-room availability summary. This is the
+  # operator view for "who is awake, which claimed cards need a nudge, and
+  # what exact repo-nudge command should keep the flywheel moving?"
+  local target_repo=""
+  local since="30m"
+  local stale_after="30m"
+  local limit=200
+  local sweep_id=""
+  local output_json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_availability_help
+        return 0
+        ;;
+      --since)        shift; since="${1:-}" ;;
+      --stale-after)  shift; stale_after="${1:-}" ;;
+      --sweep-id)     shift; sweep_id="${1:-}" ;;
+      --limit)        shift; limit="${1:-200}" ;;
+      --json)         output_json=1 ;;
+      -*) die "queue availability: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue availability: too many positional args (use: queue availability <owner/repo>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_repo" ]; then
+    target_repo=$(_airc_queue_detect_repo_from_cwd || true)
+  fi
+  if [ -z "$target_repo" ]; then
+    _airc_queue_availability_help >&2
+    return 1
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue availability: target repo must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue availability: --limit must be a positive integer (got: $limit)" ;;
+  esac
+  if [ "$limit" -lt 1 ]; then
+    die "queue availability: --limit must be >= 1 (got: $limit)"
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue availability: 'gh' CLI is required."
+  fi
+
+  local raw_json
+  if ! raw_json=$(gh issue list \
+    --repo "$target_repo" \
+    --label "airc-queue" \
+    --state open \
+    --limit "$limit" \
+    --json number,title,url,body,updatedAt 2>&1); then
+    die "queue availability: gh issue list failed for $target_repo: $raw_json"
+  fi
+
+  local cards_file messages_file
+  cards_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-availability-cards.XXXXXX") || die "queue availability: mktemp failed"
+  messages_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-availability-log.XXXXXX") || die "queue availability: mktemp failed"
+  printf '%s' "$raw_json" >"$cards_file"
+  if [ -f "$MESSAGES" ]; then
+    tail -"$limit" "$MESSAGES" >"$messages_file" 2>/dev/null || true
+  else
+    : >"$messages_file"
+  fi
+
+  if [ -z "$sweep_id" ]; then
+    sweep_id=$(date -u +"%Y%m%dT%H%M%SZ")
+  fi
+
+  AIRC_QUEUE_AVAILABILITY_SINCE="$since" \
+  AIRC_QUEUE_AVAILABILITY_STALE_AFTER="$stale_after" \
+  "$AIRC_PYTHON" - "$target_repo" "$sweep_id" "$output_json" "$cards_file" "$messages_file" <<'PYEOF'
+import datetime, json, os, re, sys
+
+repo, sweep_id, output_json_raw, cards_path, messages_path = sys.argv[1:6]
+output_json = output_json_raw == "1"
+since_arg = os.environ.get("AIRC_QUEUE_AVAILABILITY_SINCE", "30m")
+stale_after_arg = os.environ.get("AIRC_QUEUE_AVAILABILITY_STALE_AFTER", "30m")
+
+def parse_duration(value: str) -> datetime.timedelta:
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", value or "")
+    if not m:
+        print(f"queue availability: cannot parse duration '{value}' (use 30m, 2h, 1d)", file=sys.stderr)
+        sys.exit(2)
+    n = int(m.group(1))
+    return {
+        "s": datetime.timedelta(seconds=n),
+        "m": datetime.timedelta(minutes=n),
+        "h": datetime.timedelta(hours=n),
+        "d": datetime.timedelta(days=n),
+    }[m.group(2)]
+
+def parse_since(value: str) -> datetime.datetime:
+    if re.fullmatch(r"\s*\d+\s*[smhd]\s*", value or ""):
+        return datetime.datetime.now(datetime.timezone.utc) - parse_duration(value)
+    try:
+        dt = datetime.datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        print(f"queue availability: cannot parse --since '{value}'", file=sys.stderr)
+        sys.exit(2)
+
+def parse_ts(value: str):
+    if not value:
+        return None
+    m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)", value)
+    if not m:
+        return None
+    raw = m.group(1)
+    fmt = "%Y-%m-%dT%H:%M:%SZ" if raw.count(":") == 2 else "%Y-%m-%dT%H:%MZ"
+    return datetime.datetime.strptime(raw, fmt).replace(tzinfo=datetime.timezone.utc)
+
+def age_label(seconds):
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+def parse_card(body: str):
+    for m in CARD_BLOCK_RE.finditer(body or ""):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            return parsed
+    return None
+
+now = datetime.datetime.now(datetime.timezone.utc)
+since_dt = parse_since(since_arg)
+stale_after = parse_duration(stale_after_arg)
+
+with open(cards_path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+
+cards = []
+owner_cards = {}
+for issue in issues:
+    card = parse_card(issue.get("body", "") or "")
+    if not card:
+        continue
+    status = (card.get("status") or "unknown").strip()
+    owner = (card.get("owner") or "").strip()
+    hb = (card.get("last_heartbeat") or "").strip()
+    hb_dt = parse_ts(hb)
+    hb_age = int((now - hb_dt).total_seconds()) if hb_dt else None
+    reason = ""
+    if status in {"claimed", "in-progress", "review"}:
+        if not owner:
+            reason = "missing-owner"
+        elif not hb_dt:
+            reason = "missing-heartbeat"
+        elif now - hb_dt > stale_after:
+            reason = "stale-heartbeat"
+    row = {
+        "number": issue.get("number"),
+        "title": (issue.get("title") or "").replace("airc-queue: ", "", 1),
+        "url": issue.get("url") or "",
+        "status": status,
+        "owner": owner,
+        "last_heartbeat": hb,
+        "heartbeat_age_seconds": hb_age,
+        "heartbeat_age": age_label(hb_age),
+        "availability_reason": reason,
+        "next_action": card.get("next_action") or "",
+    }
+    cards.append(row)
+    if owner and status in {"claimed", "in-progress", "review"}:
+        owner_cards.setdefault(owner, []).append(f"{repo}#{issue.get('number')}")
+
+PONG_RE = re.compile(rf"\bpong:\s*{re.escape(repo)}\b(?P<body>.*)", re.IGNORECASE)
+FIELD_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_-]*)=<([^>]*)>|\b([a-zA-Z_][a-zA-Z0-9_-]*)=([^\s—]+)")
+recent_activity = {}
+responders = {}
+with open(messages_path, "r", encoding="utf-8") as f:
+    for line in f:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        ts_raw = msg.get("ts") or ""
+        try:
+            ts = datetime.datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if ts <= since_dt:
+            continue
+        sender = msg.get("from") or "?"
+        if sender and sender != "airc":
+            prev = recent_activity.get(sender)
+            if prev is None or ts > prev["ts_dt"]:
+                recent_activity[sender] = {"peer": sender, "ts": ts_raw, "ts_dt": ts, "age": age_label((now - ts).total_seconds())}
+        text = msg.get("msg") or ""
+        m = PONG_RE.search(text)
+        if not m:
+            continue
+        fields = {}
+        for fm in FIELD_RE.finditer(text):
+            key = fm.group(1) or fm.group(3)
+            value = fm.group(2) if fm.group(1) else fm.group(4)
+            fields[key] = value
+        parts = [p.strip() for p in text.split("—")]
+        nick = sender
+        for part in parts:
+            if part and not part.startswith("pong:") and "=" not in part:
+                nick = part
+                break
+        responders[nick] = {
+            "nick": nick,
+            "sender": sender,
+            "ts": ts_raw,
+            "sweep": fields.get("sweep", ""),
+            "card": fields.get("card", ""),
+            "state": fields.get("state", ""),
+            "blocker": fields.get("blocker", ""),
+            "next": fields.get("next", ""),
+            "claim": fields.get("claim", ""),
+        }
+
+missing_owners = sorted([owner for owner in owner_cards if owner not in responders and owner not in recent_activity])
+stale_cards = [c for c in cards if c["availability_reason"]]
+recent = sorted(recent_activity.values(), key=lambda r: r["ts_dt"], reverse=True)
+for item in recent:
+    item.pop("ts_dt", None)
+
+payload = {
+    "repo": repo,
+    "now": now.isoformat().replace("+00:00", "Z"),
+    "since": since_arg,
+    "stale_after": stale_after_arg,
+    "sweep_id": sweep_id,
+    "cards": cards,
+    "stale_cards": stale_cards,
+    "responders": list(responders.values()),
+    "recent_activity": recent,
+    "missing_owners": missing_owners,
+    "owner_cards": owner_cards,
+    "suggested_nudge": f"airc queue nudge {repo} --sweep-id {sweep_id}",
+    "suggested_pongs": f"airc queue pongs {repo} --sweep-id {sweep_id} --since {since_arg}",
+}
+
+if output_json:
+    print(json.dumps(payload, indent=2))
+else:
+    print(f"# airc-queue availability — {repo}")
+    print(f"now_utc: {payload['now']}")
+    print(f"since: {since_arg}")
+    print(f"stale_after: {stale_after_arg}")
+    print(f"open_cards: {len(cards)}")
+    if responders:
+        print(f"repo-nudge responders ({len(responders)}):")
+        for item in payload["responders"]:
+            print(f"  - {item['nick']}: card={item['card'] or '?'} state={item['state'] or '?'} blocker={item['blocker'] or '?'} next={item['next'] or '?'}")
+    else:
+        print("repo-nudge responders: none")
+    if recent:
+        print(f"recent room activity ({len(recent)}):")
+        for item in recent[:10]:
+            print(f"  - {item['peer']}: last seen {item['age']} ago")
+    else:
+        print("recent room activity: none")
+    if stale_cards:
+        print(f"attention needed ({len(stale_cards)}):")
+        for card in stale_cards:
+            owner = card["owner"] or "(unowned)"
+            print(f"  - {repo}#{card['number']} {card['status']} owner={owner} reason={card['availability_reason']} heartbeat={card['heartbeat_age']}")
+    else:
+        print("attention needed: none")
+    if missing_owners:
+        print(f"missing owners ({len(missing_owners)}): {', '.join(missing_owners)}")
+    else:
+        print("missing owners: none")
+    print("next:")
+    print(f"  {payload['suggested_nudge']}")
+    print(f"  {payload['suggested_pongs']}")
+PYEOF
+  local py_status=$?
+  rm -f "$cards_file" "$messages_file"
+  return "$py_status"
+}
+
 _cmd_queue_close_merged() {
   # Auto-close queue cards referenced by a merged PR.
   #
@@ -2267,6 +2576,36 @@ EXPECTED PONG
   pong: owner/repo — sweep=ID — <nick> — card=<owner/repo#N|idle>
     state=<idle|coding|testing|reviewing|blocked> blocker=<none|...>
     next=<...> claim=<keep|release|none>
+EOF
+}
+
+_airc_queue_availability_help() {
+  cat <<'EOF'
+airc queue availability — summarize live queue ownership and peer activity
+
+USAGE
+  airc queue availability <owner/repo> [--since 30m] [--stale-after 30m] [--limit N] [--json]
+  airc queue avail <owner/repo> [--since 30m]
+
+DESCRIPTION
+  Read-only flywheel / stale-claim view. Combines open airc-queue cards, last heartbeat
+  fields, local AIRC messages, and repo-nudge pongs into one operator
+  summary so agents can see who appears active, which claims need attention,
+  and which nudge/pongs commands to run next.
+
+OPTIONS
+  --since <dur|ISO>       Recent-message window (default 30m).
+  --stale-after <dur>     Claim heartbeat age considered stale (default 30m).
+  --sweep-id <ID>         Suggested sweep id for the next repo nudge.
+                          Defaults to current UTC timestamp.
+  --limit <N>             Max queue cards / log lines to inspect (default 200).
+  --json                  Emit machine-readable JSON.
+  -h, --help              This help.
+
+NOTES
+  - Does not mutate cards or send messages.
+  - For stale/missing owners, run the printed `airc queue nudge ...` command,
+    then later run the printed `airc queue pongs ...` command.
 EOF
 }
 
