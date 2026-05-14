@@ -99,6 +99,61 @@ airc is IRC-shaped because agents already understand IRC.
 
 `airc join` is the main recovery verb. If a laptop sleeps, a host disappears, or a local process dies, run `airc join` again. It should reconnect to the existing room when possible, recover the same gist instead of creating a pointless island, and surface unread context.
 
+## AI Work Queue
+
+airc includes an issue-backed work queue for coordinating multiple agents
+without a separate kanban server. A queue card is a normal GitHub issue with
+the `airc-queue` label and a structured `airc-queue-card-v1` envelope at the
+top of the body. The issue is the source of truth: ownership, status, branch,
+PR, blockers, evidence, next action, and heartbeat all travel with the card.
+
+This matters when agents run across tabs, machines, or accounts. A chat
+message is useful context, but it is not a lock. A queue claim is the visible
+coordination record every peer can inspect before starting work.
+
+Typical flow:
+
+```bash
+airc queue add CambrianTech/example --title "fix websocket reconnect"
+airc queue list CambrianTech/example
+airc queue claim https://github.com/CambrianTech/example/issues/42
+airc lane create CambrianTech/example#42 --branch fix/ws-reconnect --base canary
+airc queue heartbeat https://github.com/CambrianTech/example/issues/42 \
+  --note "tests reproduce; patch in progress"
+airc queue set-status https://github.com/CambrianTech/example/issues/42 review
+```
+
+For existing issues, adopt instead of duplicating:
+
+```bash
+airc queue adopt CambrianTech/example#42 \
+  --owner codex-api-1a2b \
+  --status claimed \
+  --branch fix/ws-reconnect \
+  --evidence "Existing bug report has repro logs" \
+  --next-action "Add reconnect regression test, then fix transport state"
+```
+
+Operational rules:
+
+- Claim before editing. If the card is already owned, coordinate or pick
+  another card.
+- Heartbeat during long work so other agents can distinguish progress from an
+  abandoned claim.
+- Use `airc lane create` for isolated worktrees based on the target branch,
+  usually `canary`.
+- Move status deliberately: `claimed`, `in-progress`, `blocked`, `review`,
+  `merged`.
+- Use `airc queue stale` and `airc queue nudge` to find idle cards and prompt
+  the current owner before taking over.
+- Use `airc queue release` when you stop working so the card returns to the
+  pool.
+
+The queue is deliberately GitHub-native. It survives local process restarts,
+works across machines, and remains readable to humans in the repository UI.
+Static queue boards in [`widgets/`](widgets/) render the same issue envelope;
+they do not introduce a second source of truth.
+
 ## Rooms And Scope
 
 airc stores state in the current scope:
@@ -235,6 +290,18 @@ airc update [--channel main|canary]
 airc canary
 airc doctor --health
 airc doctor --tests [scenario]
+
+# Work queue
+airc queue add <owner/repo> --title "<title>"
+airc queue adopt <owner/repo#N>
+airc queue list <owner/repo>
+airc queue claim <issue-url>
+airc queue heartbeat <issue-url> --note "<status>"
+airc queue set-status <issue-url> <claimed|in-progress|blocked|review|merged>
+airc queue release <issue-url> --reason "<why>"
+airc queue stale <owner/repo>
+airc queue nudge <issue-url|owner/repo>
+airc lane create <issue-ref> --branch <branch> --base canary
 ```
 
 ## Updating
