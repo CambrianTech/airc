@@ -1575,6 +1575,8 @@ with open(messages_path, "r", encoding="utf-8") as f:
             if dt <= since_dt:
                 continue
         text = msg.get("msg") or ""
+        if "repo-nudge:" in text and "pong with:" in text:
+            continue
         m = PONG_RE.search(text)
         if not m:
             continue
@@ -1853,6 +1855,8 @@ with open(messages_path, "r", encoding="utf-8") as f:
             if prev is None or ts > prev["ts_dt"]:
                 recent_activity[sender] = {"peer": sender, "ts": ts_raw, "ts_dt": ts, "age": age_label((now - ts).total_seconds())}
         text = msg.get("msg") or ""
+        if "repo-nudge:" in text and "pong with:" in text:
+            continue
         m = PONG_RE.search(text)
         if not m:
             continue
