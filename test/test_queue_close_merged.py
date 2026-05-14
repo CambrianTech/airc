@@ -6,7 +6,7 @@ Coverage:
   - PR-not-merged guard: refuses to close cards from an unmerged PR
   - ref parsing: same-repo (#N, Closes #N), cross-repo (owner/repo#N)
   - envelope verification: skips non-airc-queue issues silently
-  - idempotency: skips cards already at status=merged
+  - idempotency: closes open cards already at status=merged
   - cross-repo: detected + reported, NOT closed (workflow token scope)
   - dry-run: emits plan without mutating or closing
   - actor flag: shows up in status-log line
@@ -418,15 +418,16 @@ class CloseMergedEnvelopeTests(unittest.TestCase):
         # And the summary should reflect 0 closed.
         self.assertIn("0 closed", result.stdout)
 
-    def test_skips_already_merged_card(self) -> None:
-        # Idempotent: re-running on a card that's already status=merged
-        # is a skip, not an error.
+    def test_dry_run_closes_already_merged_card(self) -> None:
+        # Idempotent status mutation is not the same as issue closure:
+        # if the issue is still open, close-merged must still plan a close.
         body = "Closes #100.\n"
         issue_bodies = {"100": _card_body(status="merged")}
         result = self._run_dry(body, issue_bodies=issue_bodies)
         self.assertEqual(result.returncode, 0)
-        self.assertIn("already status=merged", result.stdout)
-        self.assertIn("[skip]", result.stdout)
+        self.assertIn("would close already status=merged card", result.stdout)
+        self.assertIn("[dry-run]", result.stdout)
+        self.assertIn("1 closed", result.stdout)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -476,6 +477,42 @@ class CloseMergedE2ETests(unittest.TestCase):
         self.assertIn("https://github.com/CambrianTech/airc/pull/574", edit_body,
                       "status-log entry must include the PR URL for audit")
 
+        self.assertTrue(close_recorded,
+                        "fake gh must have received an issue close call for #100")
+
+    def test_real_close_closes_already_merged_open_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _fake_gh(
+                tmp,
+                pr_body="Closes #100.\n",
+                pr_merge_sha="168c666abcdef0123456789",
+                issue_bodies={"100": _card_body(status="merged")},
+            )
+            result = run_airc(
+                ["queue", "close-merged",
+                 "https://github.com/CambrianTech/airc/pull/574",
+                 "--actor", "github-actions[airc#576]"],
+                env_overrides=env,
+            )
+            record_dir = pathlib.Path(tmp) / "gh-record"
+            edit_file = record_dir / "edit-100.txt"
+            close_file = record_dir / "close-100.txt"
+            edit_body = edit_file.read_text(encoding="utf-8") if edit_file.exists() else None
+            close_recorded = close_file.exists()
+
+        self.assertEqual(result.returncode, 0,
+                         f"expected success; stdout={result.stdout} stderr={result.stderr}")
+        self.assertIn("[closed]", result.stdout)
+        self.assertIn("already status=merged, issue closed", result.stdout)
+        self.assertIn("1 closed", result.stdout)
+
+        self.assertIsNotNone(edit_body,
+                             "already-merged close must still append audit log")
+        self.assertIn('"status": "merged"', edit_body,
+                      "status remains merged")
+        self.assertIn("Status log", edit_body)
+        self.assertIn("168c666a", edit_body,
+                      "audit log must include merge SHA prefix")
         self.assertTrue(close_recorded,
                         "fake gh must have received an issue close call for #100")
 

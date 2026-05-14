@@ -2159,21 +2159,32 @@ print("not-a-card")
         continue
         ;;
       merged)
-        printf '  [skip]       %s — already status=merged (idempotent)\n' "$ref"
-        skipped_count=$((skipped_count + 1))
-        continue
+        # Status mutation is idempotent, but closure is not. A prior
+        # heartbeat/set-status may have moved the card to merged before
+        # close-merged runs; if the GitHub issue is still open, this
+        # command must still close it so merged cards leave the live queue.
         ;;
     esac
 
     local log_msg="merged via PR ${pr_canonical_url} @ ${merge_sha:0:8} (closed by ${actor})"
 
     if [ "$dry_run" -eq 1 ]; then
-      printf '  [dry-run]    %s — would set status=merged + close (was: %s)\n' "$ref" "$envelope_status"
+      if [ "$envelope_status" = "merged" ]; then
+        printf '  [dry-run]    %s — would close already status=merged card\n' "$ref"
+      else
+        printf '  [dry-run]    %s — would set status=merged + close (was: %s)\n' "$ref" "$envelope_status"
+      fi
       closed_count=$((closed_count + 1))
       continue
     fi
 
-    if ! _airc_queue_mutate_card "$ref" 0 "$log_msg" --set "status=merged" >/dev/null 2>&1; then
+    if [ "$envelope_status" = "merged" ]; then
+      if ! _airc_queue_mutate_card "$ref" 0 "$log_msg" >/dev/null 2>&1; then
+        printf '  [error]      %s — status-log mutation failed\n' "$ref"
+        errored_count=$((errored_count + 1))
+        continue
+      fi
+    elif ! _airc_queue_mutate_card "$ref" 0 "$log_msg" --set "status=merged" >/dev/null 2>&1; then
       printf '  [error]      %s — status mutation failed\n' "$ref"
       errored_count=$((errored_count + 1))
       continue
@@ -2186,7 +2197,11 @@ print("not-a-card")
       continue
     fi
 
-    printf '  [closed]     %s — status=merged, issue closed (was: %s)\n' "$ref" "$envelope_status"
+    if [ "$envelope_status" = "merged" ]; then
+      printf '  [closed]     %s — already status=merged, issue closed\n' "$ref"
+    else
+      printf '  [closed]     %s — status=merged, issue closed (was: %s)\n' "$ref" "$envelope_status"
+    fi
     closed_count=$((closed_count + 1))
   done
 
