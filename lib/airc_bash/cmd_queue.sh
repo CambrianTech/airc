@@ -1960,14 +1960,15 @@ PYEOF
 }
 
 _cmd_queue_close_merged() {
-  # Auto-close queue cards referenced by a merged PR.
+  # Auto-close queue cards explicitly completed by a merged PR.
   #
   # Args:
   #   airc queue close-merged <pr-url|owner/repo#PR> [--merge-sha SHA] [--actor X] [--dry-run]
   #
   # GitHub's native "Closes #N" only triggers when the PR merges into the
   # default branch. AIRC uses canary first, so queue cards need a canary-time
-  # close path.
+  # close path. Plain mentions ("Refs #N", "See #N") are intentionally not
+  # close targets; they may describe related work that remains open.
   local pr_url=""
   local merge_sha=""
   local actor=""
@@ -2078,22 +2079,42 @@ body = pr.get("body") or ""
 title = pr.get("title") or ""
 text = f"{title}\n{body}"
 
-CROSS_RE = re.compile(r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b')
-SAME_RE = re.compile(r'(?<![A-Za-z0-9_/])#(\d+)\b')
+CLOSING_KEYWORD_RE = re.compile(
+    r'\b(?:close[sd]?|fix(?:e[sd]|ed)?|resolve[sd]?)\b\s*:?\s*',
+    re.IGNORECASE,
+)
+REF_RE = re.compile(
+    r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b'
+    r'|(?<![A-Za-z0-9_/])#(\d+)\b'
+)
 
 seen = set()
-for m in CROSS_RE.finditer(text):
-    owner, repo, num = m.group(1), m.group(2), m.group(3)
-    key = f"{owner}/{repo}#{num}"
-    if key not in seen:
-        seen.add(key)
-        print(key)
-for m in SAME_RE.finditer(text):
-    num = m.group(1)
-    key = f"{default_repo}#{num}"
-    if key not in seen:
-        seen.add(key)
-        print(key)
+for keyword in CLOSING_KEYWORD_RE.finditer(text):
+    # Match GitHub-style close intent. Refs must appear immediately after the
+    # closing keyword, with optional comma/"and" continuations. This avoids
+    # closing cards for prose like "Fix the UI. See #100 for follow-up."
+    pos = keyword.end()
+    first = True
+    while True:
+        tail = text[pos:]
+        if not first:
+            sep = re.match(r'\s*(?:,|and)\s+', tail, re.IGNORECASE)
+            if not sep:
+                break
+            pos += sep.end()
+            tail = text[pos:]
+        ref = REF_RE.match(tail)
+        if not ref:
+            break
+        if ref.group(4):
+            key = f"{default_repo}#{ref.group(4)}"
+        else:
+            key = f"{ref.group(1)}/{ref.group(2)}#{ref.group(3)}"
+        if key not in seen:
+            seen.add(key)
+            print(key)
+        pos += ref.end()
+        first = False
 PYEOF
   then
     rm -f "$pr_file" "$refs_file"
@@ -2110,10 +2131,10 @@ PYEOF
   rm -f "$refs_file"
 
   printf 'queue close-merged: PR %s merged into %s @ %s\n' "$pr_canonical_url" "$pr_base_ref" "${merge_sha:0:8}"
-  printf 'queue close-merged: scanned %d title/body refs (PR title %d chars, body %d chars)\n' "${#refs[@]}" "$pr_title_len" "$pr_body_len"
+  printf 'queue close-merged: scanned %d title/body closing refs (PR title %d chars, body %d chars)\n' "${#refs[@]}" "$pr_title_len" "$pr_body_len"
 
   if [ "${#refs[@]}" -eq 0 ]; then
-    printf 'queue close-merged: no queue-card refs in PR title/body — nothing to close.\n'
+    printf 'queue close-merged: no queue-card closing refs in PR title/body — nothing to close.\n'
     return 0
   fi
 
@@ -2644,7 +2665,7 @@ EOF
 
 _airc_queue_close_merged_help() {
   cat <<'EOF'
-airc queue close-merged — auto-close queue cards referenced by a merged PR
+airc queue close-merged — auto-close queue cards completed by a merged PR
 
 USAGE
   airc queue close-merged <pr-url> [--merge-sha SHA] [--actor X] [--dry-run]
@@ -2666,8 +2687,11 @@ OPTIONS
 WHAT IT DOES
   1. Fetches the PR body via gh.
   2. Validates the PR is actually merged.
-  3. Parses the body for same-repo and cross-repo queue-card refs.
+  3. Parses the body for same-repo and cross-repo queue-card closing refs
+     with GitHub-style closing keywords (Closes/Fixes/Resolves).
   4. For same-repo queue cards: sets status=merged and closes the issue.
-  5. Cross-repo refs are reported but not closed with repo-scoped tokens.
+  5. Cross-repo closing refs are reported but not closed with repo-scoped tokens.
+  Plain mentions like "Refs #N" are ignored so doc-only PRs do not close
+  implementation cards.
 EOF
 }

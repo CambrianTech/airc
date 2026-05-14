@@ -4,7 +4,7 @@ Coverage:
   - dispatch: close-merged subcommand reaches _cmd_queue_close_merged + --help works
   - validation: missing PR url, malformed url, --merge-sha sanity
   - PR-not-merged guard: refuses to close cards from an unmerged PR
-  - ref parsing: same-repo (#N, Closes #N), cross-repo (owner/repo#N)
+  - ref parsing: same-repo and cross-repo refs with explicit close keywords
   - envelope verification: skips non-airc-queue issues silently
   - idempotency: closes open cards already at status=merged
   - cross-repo: detected + reported, NOT closed (workflow token scope)
@@ -312,11 +312,11 @@ class CloseMergedRefParserTests(unittest.TestCase):
         )
         return result, pathlib.Path(tmp)
 
-    def test_title_ref_detected(self) -> None:
+    def test_title_closing_ref_detected(self) -> None:
         tmp = tempfile.mkdtemp()
         env = _fake_gh(
             tmp,
-            pr_title="feat(#576): auto-close queue cards when PRs merge into canary",
+            pr_title="fix: close queue card. Closes #576",
             pr_body="Body has unrelated #561.\n",
             issue_bodies={
                 "576": _card_body(),
@@ -330,9 +330,30 @@ class CloseMergedRefParserTests(unittest.TestCase):
             env_overrides=env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("title/body refs", result.stdout)
+        self.assertIn("title/body closing refs", result.stdout)
         self.assertIn("CambrianTech/airc#576", result.stdout)
         self.assertIn("[dry-run]", result.stdout)
+
+    def test_title_context_ref_is_not_close_target(self) -> None:
+        tmp = tempfile.mkdtemp()
+        env = _fake_gh(
+            tmp,
+            pr_title="feat(#576): document queue cards",
+            pr_body="Body has unrelated #561.\n",
+            issue_bodies={
+                "576": _card_body(),
+                "561": "Plain issue, not a queue card.\n",
+            },
+        )
+        result = run_airc(
+            ["queue", "close-merged",
+             "https://github.com/CambrianTech/airc/pull/581",
+             "--dry-run"],
+            env_overrides=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing to close", result.stdout)
+        self.assertNotIn("CambrianTech/airc#576", result.stdout)
 
     def test_no_refs_clean_exit(self) -> None:
         body = "Just a PR body with no issue refs.\n"
@@ -351,13 +372,48 @@ class CloseMergedRefParserTests(unittest.TestCase):
         self.assertIn("[dry-run]", result.stdout,
                       "dry-run path should mark as would-close")
 
-    def test_bare_hash_n_detected(self) -> None:
-        # #100 (no Closes keyword) — still detected via SAME_RE.
+    def test_bare_hash_n_is_not_a_close_target(self) -> None:
+        # #100 without a closing keyword is context only. It must not close
+        # implementation cards from docs-only PRs that say "Refs #N".
         body = "See #100 for context.\n"
         issue_bodies = {"100": _card_body()}
         result, _ = self._run_dry(body, issue_bodies=issue_bodies)
         self.assertEqual(result.returncode, 0)
+        self.assertIn("nothing to close", result.stdout)
+        self.assertNotIn("CambrianTech/airc#100", result.stdout)
+
+    def test_refs_keyword_is_not_a_close_target(self) -> None:
+        body = "Refs #100.\n"
+        issue_bodies = {"100": _card_body()}
+        result, _ = self._run_dry(body, issue_bodies=issue_bodies)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("nothing to close", result.stdout)
+        self.assertNotIn("CambrianTech/airc#100", result.stdout)
+
+    def test_fixes_keyword_closes_same_repo_ref(self) -> None:
+        body = "Fixes #100.\n"
+        issue_bodies = {"100": _card_body()}
+        result, _ = self._run_dry(body, issue_bodies=issue_bodies)
+        self.assertEqual(result.returncode, 0)
         self.assertIn("CambrianTech/airc#100", result.stdout)
+        self.assertIn("[dry-run]", result.stdout)
+
+    def test_closing_word_prose_does_not_close_later_ref(self) -> None:
+        body = "Fix the queue docs. See #100 for implementation.\n"
+        issue_bodies = {"100": _card_body()}
+        result, _ = self._run_dry(body, issue_bodies=issue_bodies)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("nothing to close", result.stdout)
+        self.assertNotIn("CambrianTech/airc#100", result.stdout)
+
+    def test_closing_keyword_accepts_comma_continuation(self) -> None:
+        body = "Closes #100, #101 and #102.\n"
+        issue_bodies = {"100": _card_body(), "101": _card_body(), "102": _card_body()}
+        result, _ = self._run_dry(body, issue_bodies=issue_bodies)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("CambrianTech/airc#100", result.stdout)
+        self.assertIn("CambrianTech/airc#101", result.stdout)
+        self.assertIn("CambrianTech/airc#102", result.stdout)
 
     def test_cross_repo_ref_detected_not_closed(self) -> None:
         # Cross-repo ref must surface in summary as cross-repo, not closed.
