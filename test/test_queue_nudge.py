@@ -154,6 +154,21 @@ def _isolated_env_with_fake_gh(tmp: str, body_response: str | None = None) -> di
 
 
 class QueueNudgeDispatchTests(unittest.TestCase):
+    def test_top_help_lists_next_verb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("queue next", result.stdout)
+
+    def test_next_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "next", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recommend next claimable work", result.stdout)
+        self.assertIn("--idle-ping", result.stdout)
+
     def test_nudge_help_returns_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(["queue", "nudge", "--help"],
@@ -326,6 +341,39 @@ class QueueNudgeDryRunTests(unittest.TestCase):
 
 
 class QueueRepoNudgeDryRunTests(unittest.TestCase):
+    def test_next_recommends_claimable_work_with_exact_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "next", "owner/repo",
+                 "--owner", "codex-main",
+                 "--repo-root", "/work/repo"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn("# airc-queue next — owner/repo", out)
+        self.assertIn("owner: codex-main", out)
+        self.assertIn("owner/repo#2", out)
+        self.assertIn("status: review owner=codex", out)
+        self.assertIn("airc queue claim 'owner/repo#2' --owner 'codex-main'", out)
+        self.assertIn("airc lane create 'owner/repo#2' --base 'canary' --branch 'feat/repo-nudge' --repo '/work/repo'", out)
+
+    def test_next_json_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "pick", "owner/repo",
+                 "--owner", "codex-main",
+                 "--json"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["repo"], "owner/repo")
+        self.assertEqual(payload["owner"], "codex-main")
+        self.assertEqual(payload["candidates"][0]["ref"], "owner/repo#2")
+        self.assertIn("claim_command", payload["candidates"][0])
+        self.assertIn("lane_command", payload["candidates"][0])
+
     def test_repo_scoped_nudge_sends_status_sweep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(

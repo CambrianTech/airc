@@ -9,6 +9,7 @@
 #                 set-status — change status field with enum validation.                 [PR-2]
 #                 heartbeat  — stamp liveness on an owned card.
 #                 stale      — list owned cards with missing/old heartbeats.
+#                 next       — recommend claimable next work for idle agents.
 #                 nudge      — surface a card OR repo-scoped status sweep.                [PR-3+]
 #                 adopt      — convert an existing issue into a queue card.
 #                 pongs      — summarize repo-nudge pong replies.
@@ -77,6 +78,9 @@ cmd_queue() {
     stale|stalled)
       _cmd_queue_stale "$@"
       ;;
+    next|pick)
+      _cmd_queue_next "$@"
+      ;;
     nudge)
       _cmd_queue_nudge "$@"
       ;;
@@ -93,7 +97,7 @@ cmd_queue() {
       _cmd_queue_close_merged "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, nudge, adopt, pongs, availability, close-merged)"
+      die "queue: unknown subcommand: $subcmd (try: add, list, claim, release, set-status, heartbeat, stale, next, nudge, adopt, pongs, availability, close-merged)"
       ;;
   esac
 }
@@ -373,6 +377,7 @@ USAGE
   airc queue set-status <issue-url> <state>
   airc queue heartbeat <issue-url> [--owner X] [--status Y] [--note "..."]
   airc queue stale <owner/repo> [--stale-after 30m]
+  airc queue next [<owner/repo>] [--limit N] [--json]
   airc queue nudge <issue-url> [--peer @handle] [--message "..."]
   airc queue nudge <owner/repo> [--message "..."] [--limit N]
   airc queue adopt <issue-url> [card-fields...] [--force]
@@ -389,6 +394,7 @@ VERB SCOPE
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
   heartbeat / stale            Stale-claim liveness primitives (airc#572)
+  next / pick                  Idle-agent next-work recommendations
   nudge                        PR-3 (card) + PR-4a (repo ping/pong sweep)
   adopt / import               Backlog migration (airc#575)
   pongs / pong-summary          Repo-nudge response collection (airc#579)
@@ -973,6 +979,200 @@ PYEOF
   local py_status=$?
   rm -f "$raw_json_file"
   return "$py_status"
+}
+
+_cmd_queue_next() {
+  # Recommend next claimable work for an idle agent. This is intentionally
+  # action-shaped rather than dashboard-shaped: every row includes the exact
+  # claim and lane commands an agent can run next.
+  local target_repo=""
+  local limit=30
+  local output_json=0
+  local idle_ping=0
+  local owner=""
+  local base="canary"
+  local repo_root=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _airc_queue_next_help
+        return 0
+        ;;
+      --repo)      shift; target_repo="${1:-}" ;;
+      --limit)     shift; limit="${1:-30}" ;;
+      --owner)     shift; owner="${1:-}" ;;
+      --base)      shift; base="${1:-canary}" ;;
+      --repo-root) shift; repo_root="${1:-}" ;;
+      --idle-ping) idle_ping=1 ;;
+      --json)      output_json=1 ;;
+      -*) die "queue next: unknown flag: $1" ;;
+      *)
+        if [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue next: too many positional args (use: queue next <owner/repo>)"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_repo" ]; then
+    target_repo=$(_airc_queue_detect_repo_from_cwd || true)
+  fi
+  if [ -z "$target_repo" ]; then
+    die "queue next: no <owner/repo> given and could not detect one from \$PWD's git remote. Pass --repo owner/repo."
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue next: target must be owner/repo, got: $target_repo" ;;
+  esac
+  case "$limit" in
+    ''|*[!0-9]*) die "queue next: --limit must be a positive integer (got: $limit)" ;;
+  esac
+  if [ "$limit" -lt 1 ]; then
+    die "queue next: --limit must be >= 1 (got: $limit)"
+  fi
+
+  if [ -z "$owner" ]; then
+    owner=$(_airc_queue_resolve_name)
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue next: 'gh' CLI is required."
+  fi
+
+  local raw_json
+  if ! raw_json=$(gh issue list \
+    --repo "$target_repo" \
+    --label "airc-queue" \
+    --state open \
+    --limit "$limit" \
+    --json number,title,url,body,updatedAt 2>&1); then
+    die "queue next: gh issue list failed for $target_repo: $raw_json"
+  fi
+
+  local raw_json_file
+  raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-next.XXXXXX") || die "queue next: mktemp failed"
+  printf '%s' "$raw_json" >"$raw_json_file"
+
+  AIRC_QUEUE_NEXT_OWNER="$owner" \
+  AIRC_QUEUE_NEXT_BASE="$base" \
+  AIRC_QUEUE_NEXT_REPO_ROOT="$repo_root" \
+  "$AIRC_PYTHON" - "$target_repo" "$output_json" "$raw_json_file" <<'PYEOF'
+import json, os, re, sys
+
+repo, output_json_raw, path = sys.argv[1:4]
+output_json = output_json_raw == "1"
+owner = os.environ.get("AIRC_QUEUE_NEXT_OWNER", "anonymous")
+base = os.environ.get("AIRC_QUEUE_NEXT_BASE", "canary")
+repo_root = os.environ.get("AIRC_QUEUE_NEXT_REPO_ROOT", "")
+
+CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
+
+def parse_card(body: str):
+    for m in CARD_BLOCK_RE.finditer(body or ""):
+        try:
+            parsed = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
+            return parsed
+    return None
+
+def shquote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+def score(status: str, card_owner: str) -> int:
+    if status == "claimed" and not card_owner:
+        return 0
+    if status == "claimed":
+        return 1
+    if status == "blocked" and not card_owner:
+        return 2
+    if status == "review":
+        return 3
+    if status == "in-progress" and card_owner == owner:
+        return 4
+    return 9
+
+with open(path, "r", encoding="utf-8") as f:
+    issues = json.load(f)
+
+rows = []
+for issue in issues:
+    card = parse_card(issue.get("body", "") or "")
+    if not card:
+        continue
+    status = (card.get("status") or "claimed").strip()
+    card_owner = (card.get("owner") or "").strip()
+    rank = score(status, card_owner)
+    if rank >= 9:
+        continue
+    ref = f"{repo}#{issue.get('number')}"
+    branch = (card.get("branch") or "").strip()
+    lane_cmd = f"airc lane create {shquote(ref)} --base {shquote(base)}"
+    if branch:
+        lane_cmd += f" --branch {shquote(branch)}"
+    if repo_root:
+        lane_cmd += f" --repo {shquote(repo_root)}"
+    claim_cmd = f"airc queue claim {shquote(ref)} --owner {shquote(owner)}"
+    rows.append({
+        "rank": rank,
+        "number": issue.get("number"),
+        "title": (issue.get("title") or "").replace("airc-queue: ", "", 1),
+        "url": issue.get("url") or "",
+        "ref": ref,
+        "status": status,
+        "owner": card_owner,
+        "branch": branch,
+        "env": card.get("env") or "",
+        "next_action": card.get("next_action") or "",
+        "claim_command": claim_cmd,
+        "lane_command": lane_cmd,
+    })
+
+rows.sort(key=lambda r: (r["rank"], r["number"] or 0))
+payload = {"repo": repo, "owner": owner, "candidates": rows}
+
+if output_json:
+    print(json.dumps(payload, indent=2))
+else:
+    print(f"# airc-queue next — {repo}")
+    print(f"owner: {owner}")
+    if not rows:
+        print("No claimable queue cards found.")
+        print(f"Try: airc queue nudge {repo} --message \"idle agent looking for work\"")
+    for idx, row in enumerate(rows[:10], start=1):
+        owner_label = row["owner"] or "(unowned)"
+        print()
+        print(f"## {idx}. {row['ref']} — {row['title']}")
+        print(f"  status: {row['status']} owner={owner_label}")
+        if row["env"]:
+            print(f"  env:    {row['env']}")
+        if row["branch"]:
+            print(f"  branch: {row['branch']}")
+        if row["next_action"]:
+            print(f"  next:   {row['next_action']}")
+        print(f"  claim:  {row['claim_command']}")
+        print(f"  lane:   {row['lane_command']}")
+PYEOF
+  local py_status=$?
+  rm -f "$raw_json_file"
+  if [ "$py_status" -ne 0 ]; then
+    return "$py_status"
+  fi
+
+  if [ "$idle_ping" -eq 1 ]; then
+    local ping_text="idle: ${owner} is looking for next work in ${target_repo}; ran airc queue next. Agents should claim a card or create one if they see missing work."
+    if [ "$output_json" -eq 1 ]; then
+      printf 'idle_ping: %s\n' "$ping_text" >&2
+    fi
+    if ! cmd_send "$ping_text"; then
+      die "queue next: idle ping failed"
+    fi
+  fi
 }
 
 _cmd_queue_adopt() {
@@ -2510,6 +2710,48 @@ OPTIONS
   --limit <N>              Max issues to fetch (default 50).
   --json                   Emit machine-readable JSON.
   -h, --help               This help.
+EOF
+}
+
+_airc_queue_next_help() {
+  cat <<'EOF'
+airc queue next — recommend next claimable work for idle agents
+
+USAGE
+  airc queue next [<owner/repo>] [--owner HANDLE] [--limit N] [--json]
+  airc queue pick [<owner/repo>] [--idle-ping]
+
+DESCRIPTION
+  Action-oriented flywheel primitive. Scans open airc-queue cards and ranks
+  claimable work so an agent that just finished a task can immediately pick
+  another one without waiting for a human. Every candidate includes exact
+  `airc queue claim ...` and `airc lane create ...` commands.
+
+OPTIONS
+  --repo <owner/repo>      Alternative way to specify repo.
+  --owner <handle>         Agent/work identity to use in claim commands.
+                           Default: current AIRC work identity.
+  --base <branch>          Base branch for suggested lane create commands
+                           (default: canary).
+  --repo-root <path>       Repo path for suggested lane create commands.
+  --limit <N>              Max issues to fetch (default 30).
+  --idle-ping              Broadcast that this agent is idle and looking
+                           for work after printing recommendations.
+  --json                   Emit machine-readable JSON.
+  -h, --help               This help.
+
+RANKING
+  1. unowned claimed cards
+  2. owned claimed cards
+  3. unowned blocked cards
+  4. review cards
+  5. this owner's in-progress cards
+
+NOTES
+  - This does not mutate cards by itself. Agents should run the printed
+    claim/lane commands, then heartbeat while working.
+  - Monitor/automation layers should call this after a merge, release, or
+    idle timeout; humans should not need to manually wake agents.
 EOF
 }
 
