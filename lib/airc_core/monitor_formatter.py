@@ -336,7 +336,8 @@ def run(my_name: str, peers_dir: str) -> int:
     # host_target set = we are a joiner (we poll the host's gist).
     is_joiner = False
     try:
-        is_joiner = bool(json.load(open(config_path)).get("host_target", ""))
+        with open(config_path, encoding="utf-8") as f:
+            is_joiner = bool(json.load(f).get("host_target", ""))
     except Exception:
         pass
 
@@ -376,7 +377,8 @@ def run(my_name: str, peers_dir: str) -> int:
         "subscribed to nothing → display nothing" footgun on a brand-
         new scope before cmd_join writes anything."""
         try:
-            v = json.load(open(config_path)).get("subscribed_channels")
+            with open(config_path, encoding="utf-8") as f:
+                v = json.load(f).get("subscribed_channels")
             if isinstance(v, list) and v:
                 return set(v)
         except Exception:
@@ -390,7 +392,8 @@ def run(my_name: str, peers_dir: str) -> int:
         to filter our own outbound rename markers, which can trigger the
         host-fallback chain-repair against other peers sharing our host."""
         try:
-            return json.load(open(config_path)).get("name", "")
+            with open(config_path, encoding="utf-8") as f:
+                return json.load(f).get("name", "")
         except Exception:
             return ""
 
