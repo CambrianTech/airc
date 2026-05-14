@@ -169,6 +169,14 @@ class QueueNudgeDispatchTests(unittest.TestCase):
         self.assertIn("recommend next claimable work", result.stdout)
         self.assertIn("--idle-ping", result.stdout)
 
+    def test_metronome_help_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(["queue", "metronome", "--help"],
+                              env_overrides=_isolated_env(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("automatic queue-next idle pulses", result.stdout)
+        self.assertIn("metronome off", result.stdout)
+
     def test_nudge_help_returns_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(["queue", "nudge", "--help"],
@@ -341,6 +349,48 @@ class QueueNudgeDryRunTests(unittest.TestCase):
 
 
 class QueueRepoNudgeDryRunTests(unittest.TestCase):
+    def test_metronome_writes_actionable_monitor_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            result = run_airc(
+                ["queue", "metronome", "owner/repo",
+                 "--interval", "60",
+                 "--owner", "codex-main",
+                 "--limit", "7",
+                 "--repo-root", "/work/repo"],
+                env_overrides=env,
+            )
+            config = pathlib.Path(env["AIRC_HOME"]) / "queue_metronome"
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Queue metronome every 60s", result.stdout)
+            text = config.read_text(encoding="utf-8")
+            self.assertIn("repo=owner/repo", text)
+            self.assertIn("interval=60", text)
+            self.assertIn("owner=codex-main", text)
+            self.assertIn("limit=7", text)
+            self.assertIn("repo_root=/work/repo", text)
+
+    def test_metronome_rejects_spammy_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "metronome", "owner/repo", "--interval", "5"],
+                env_overrides=_isolated_env(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--interval must be >= 30", result.stdout + result.stderr)
+
+    def test_metronome_off_removes_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            result = run_airc(
+                ["queue", "metronome", "owner/repo", "--interval", "60"],
+                env_overrides=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = run_airc(["queue", "metronome", "off"], env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((pathlib.Path(env["AIRC_HOME"]) / "queue_metronome").exists())
+
     def test_next_recommends_claimable_work_with_exact_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_airc(
