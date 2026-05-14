@@ -347,6 +347,15 @@ class QueueMutateBodyShapeTests(unittest.TestCase):
         self.assertEqual(envelope["owner"], "claude-tab-2")
         self.assertEqual(envelope["status"], "in-progress")
 
+    def test_claim_allows_legacy_unclaimed_sentinel_without_force(self) -> None:
+        body = self._dry_run_extract_body(
+            ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2"],
+            body=_card_body(owner="unclaimed", status="claimed"),
+        )
+        envelope = self._extract_envelope(body)
+        self.assertEqual(envelope["owner"], "claude-tab-2")
+        self.assertEqual(envelope["status"], "in-progress")
+
     def test_claim_allows_merged_card_without_force(self) -> None:
         body = self._dry_run_extract_body(
             ["queue", "claim", "owner/repo#1", "--owner", "claude-tab-2"],
