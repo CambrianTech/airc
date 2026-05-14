@@ -4,7 +4,7 @@ Coverage:
   - dispatch: subcommand router + add/list reach the right functions + --help paths work
   - validation: missing args / bad status enum / malformed repo all fail loud
   - card body shape: dry-run output embeds a JSON envelope with kind=airc-queue-card-v1
-  - default owner: falls back to resolve_name when --owner omitted
+  - default owner: per-agent env override, then resolve_name when --owner omitted
   - field threading: every --flag ends up in the card JSON
   - auto-detect: queue list with no <owner/repo> uses git remote
   - status enum: only canonical states accepted
@@ -273,6 +273,40 @@ class QueueAddCardBodyTests(unittest.TestCase):
         self.assertIn("owner", card)
         self.assertGreater(len(card["owner"]), 0,
                            "default owner must resolve to SOMETHING")
+
+    def test_dry_run_default_owner_prefers_queue_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            env["AIRC_QUEUE_OWNER"] = "codex-main"
+            result = run_airc(
+                ["queue", "add", "owner/repo",
+                 "--title", "test card",
+                 "--dry-run"],
+                env_overrides=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          result.stdout, re.DOTALL)
+        self.assertIsNotNone(match)
+        card = json.loads(match.group(1))  # type: ignore[union-attr]
+        self.assertEqual(card["owner"], "codex-main")
+
+    def test_dry_run_default_owner_accepts_agent_name_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _isolated_env(tmp)
+            env["AIRC_AGENT_NAME"] = "claude-tab-2"
+            result = run_airc(
+                ["queue", "add", "owner/repo",
+                 "--title", "test card",
+                 "--dry-run"],
+                env_overrides=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          result.stdout, re.DOTALL)
+        self.assertIsNotNone(match)
+        card = json.loads(match.group(1))  # type: ignore[union-attr]
+        self.assertEqual(card["owner"], "claude-tab-2")
 
 
 class QueueListAutoDetectTests(unittest.TestCase):

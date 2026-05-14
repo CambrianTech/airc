@@ -411,7 +411,8 @@ REQUIRED
 CARD FIELDS (all optional; defaults shown)
   --id <ref>             Issue/PR this card coordinates (e.g. #1085, airc#562)
   --branch <name>        Branch name (e.g. fix/install-tier-name)
-  --owner <handle>       AIRC handle (default: this scope's resolve_name)
+  --owner <handle>       Queue owner (default: AIRC_QUEUE_OWNER, then
+                         AIRC_AGENT_NAME/AIRC_AGENT_NICK, then this scope)
   --status <state>       claimed | in-progress | blocked | review | merged
                          (default: claimed)
   --blockers <list>      Comma-separated #NNNN (e.g. "#1085, airc#559")
@@ -423,6 +424,10 @@ CARD FIELDS (all optional; defaults shown)
 OPTIONS
   --dry-run              Print the card body that WOULD be posted; don't post.
   -h, --help             This help.
+
+ENVIRONMENT
+  AIRC_QUEUE_OWNER        Per-agent queue identity used when --owner is absent.
+  AIRC_AGENT_NAME/NICK    Secondary per-agent identity fallbacks.
 
 EXAMPLES
   airc queue add CambrianTech/continuum \\
@@ -472,8 +477,24 @@ EOF
 }
 
 _airc_queue_resolve_name() {
-  # Best-effort airc handle for the current scope. Falls back to
-  # "anonymous" if no scope (cmd_queue must work pre-init too —
+  # Best-effort queue owner for the current agent/session. Queue ownership
+  # is not always identical to transport identity: multiple local agents may
+  # share one AIRC scope/room handle while working separate cards. Prefer an
+  # explicit queue/session override, then fall back to the room identity.
+  if [ -n "${AIRC_QUEUE_OWNER:-}" ]; then
+    printf '%s\n' "$AIRC_QUEUE_OWNER"
+    return 0
+  fi
+  if [ -n "${AIRC_AGENT_NAME:-}" ]; then
+    printf '%s\n' "$AIRC_AGENT_NAME"
+    return 0
+  fi
+  if [ -n "${AIRC_AGENT_NICK:-}" ]; then
+    printf '%s\n' "$AIRC_AGENT_NICK"
+    return 0
+  fi
+
+  # Falls back to "anonymous" if no scope (cmd_queue must work pre-init too —
   # outsiders may want to query/add cards before joining).
   if declare -F resolve_name >/dev/null 2>&1; then
     resolve_name
@@ -2362,11 +2383,12 @@ USAGE
 
 DESCRIPTION
   Sets the card's owner field and status to indicate active work. Default
-  owner = current scope's resolve_name; default status = in-progress.
+  owner = AIRC_QUEUE_OWNER, then AIRC_AGENT_NAME/AIRC_AGENT_NICK, then
+  current scope's resolve_name; default status = in-progress.
   Appends a "## Status log" line with timestamp + actor.
 
 OPTIONS
-  --owner <handle>   AIRC handle to set as owner (default: this scope).
+  --owner <handle>   Queue owner to set (default: per-agent env, then scope).
   --status <state>   New status (default: in-progress).
   --dry-run          Print the new body that WOULD be written; don't edit.
   -h, --help         This help.
@@ -2425,12 +2447,12 @@ USAGE
   airc queue heartbeat owner/repo#N [--owner X] [--status Y] [--note "..."] [--dry-run]
 
 DESCRIPTION
-  Sets owner (default: this AIRC identity) and last_heartbeat to the
+  Sets owner (default: per-agent env, then this AIRC identity) and last_heartbeat to the
   current UTC timestamp plus git SHA when available. Optionally updates
   status. Appends a Status log line so humans can see that work is alive.
 
 OPTIONS
-  --owner <handle>   AIRC handle to record (default: this scope).
+  --owner <handle>   Queue owner to record (default: per-agent env, then scope).
   --status <state>   Optional status update: claimed, in-progress, blocked,
                      review, or merged.
   --note "<text>"    Short context appended to the status log.
@@ -2478,7 +2500,8 @@ DESCRIPTION
 CARD FIELDS (all optional; defaults shown)
   --id <ref>             Issue/PR this card coordinates (default: #N)
   --branch <name>        Branch name, if known.
-  --owner <handle>       AIRC handle (default: this scope's resolve_name)
+  --owner <handle>       Queue owner (default: AIRC_QUEUE_OWNER, then
+                         AIRC_AGENT_NAME/AIRC_AGENT_NICK, then this scope)
   --status <state>       claimed | in-progress | blocked | review | merged
                          (default: claimed)
   --blockers <list>      Comma-separated blockers.
