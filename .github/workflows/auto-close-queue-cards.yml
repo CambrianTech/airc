@@ -15,10 +15,12 @@ name: auto-close-queue-cards
 #   needed manual `gh issue close` cleanup.
 #
 # What it does:
-#   On PR merge into canary, parses the PR body for queue-card refs
-#   (Closes #N, queue card #N, owner/repo#N, etc.), verifies each is an
-#   airc-queue-card-v1 envelope, sets status=merged with a status-log
-#   line citing this PR + merge SHA, then closes the issue.
+#   On PR merge into canary, parses the PR body for explicit queue-card
+#   closing refs (Closes/Fixes/Resolves #N, or owner/repo#N with the same
+#   closing keywords), verifies each is an airc-queue-card-v1 envelope,
+#   sets status=merged with a status-log line citing this PR + merge SHA,
+#   then closes the issue. Plain mentions ("Refs #N", "See #N") do not
+#   close cards; they may point at follow-up implementation work.
 #
 #   Runs `airc queue close-merged` from the checkout — no install
 #   step required because the `./airc` dispatcher works from a clone
