@@ -504,6 +504,79 @@ class QueueAdoptTests(unittest.TestCase):
         self.assertIn("already has an airc-queue-card-v1 envelope",
                       result.stdout + result.stderr)
 
+    # ─── airc#613 — `--owner unclaimed` sentinel normalization ───────────
+
+    def _adopt_card_dry_run(self, owner_args: list[str]) -> dict:
+        """Run adopt --dry-run with the given --owner args and return the
+        parsed JSON envelope from the output. Helper for the airc#613
+        normalization tests below."""
+        issue = {"title": "fresh backlog", "body": "Plain body."}
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _record_dir = _isolated_env_with_adopt_fake_gh(tmp, issue)
+            result = run_airc(
+                ["queue", "adopt", "owner/repo#42", "--dry-run", *owner_args],
+                env_overrides=env,
+            )
+        self.assertEqual(result.returncode, 0,
+                         f"adopt dry-run must succeed; stderr={result.stderr}")
+        match = re.search(r'```json\s*\n\s*(\{.*?\})\s*\n\s*```',
+                          result.stdout, re.DOTALL)
+        self.assertIsNotNone(match,
+                             f"expected JSON envelope; got:\n{result.stdout}")
+        return json.loads(match.group(1))  # type: ignore[union-attr]
+
+    def test_adopt_with_owner_unclaimed_omits_owner_field(self) -> None:
+        """`--owner unclaimed` is a sentinel meaning "no owner / available
+        for claim" used during bulk adoption. Per airc#613, the sentinel
+        must be normalized to absence-of-owner rather than written as the
+        literal string "unclaimed" — otherwise the subsequent
+        `airc queue claim` fails airc#612 collision protection because
+        owner=unclaimed reads as an active owner.
+
+        Catches: regression where the literal "unclaimed" string ends up
+        in the envelope's owner field, blocking plain claim."""
+        card = self._adopt_card_dry_run(["--owner", "unclaimed"])
+        self.assertNotIn(
+            "owner", card,
+            f"--owner unclaimed should produce no owner field; got: {card}",
+        )
+
+    def test_adopt_with_empty_owner_omits_owner_field(self) -> None:
+        """`--owner ""` is the explicit "no owner" form. Per airc#613, the
+        explicit-empty signal must NOT be silently overwritten with the
+        running agent's resolve_name — that's only the default when
+        --owner wasn't passed at all.
+
+        Catches: regression where the auto-fill fallback fires even when
+        --owner was explicitly set to empty."""
+        card = self._adopt_card_dry_run(["--owner", ""])
+        self.assertNotIn(
+            "owner", card,
+            f'--owner "" should produce no owner field; got: {card}',
+        )
+
+    def test_adopt_default_owner_falls_back_to_resolve_name(self) -> None:
+        """When --owner is NOT passed, owner defaults to the running
+        agent's resolve_name (existing behavior, kept intact). This test
+        guards the fallback so the airc#613 fix doesn't accidentally
+        break the common path of `airc queue adopt <ref>` with no flags.
+
+        Catches: regression where the fallback gets disabled along with
+        the sentinel normalization."""
+        card = self._adopt_card_dry_run([])
+        self.assertIn(
+            "owner", card,
+            f"adopt with no --owner should auto-fill owner; got: {card}",
+        )
+        self.assertNotEqual(
+            card["owner"], "",
+            "auto-filled owner should be a non-empty resolve_name",
+        )
+        self.assertNotEqual(
+            card["owner"], "unclaimed",
+            "auto-filled owner should be a real handle, not the sentinel",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
