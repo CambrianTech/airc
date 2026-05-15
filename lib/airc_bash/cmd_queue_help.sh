@@ -342,12 +342,12 @@ USAGE
 
 DESCRIPTION
   Stores a monitor-loop metronome config. While `airc join`/monitor is
-  running, the monitor periodically runs:
+  running, the monitor periodically runs a personalized dispatch:
 
-    airc queue next <owner/repo> --owner <handle> --limit <N> --idle-ping
+    airc queue dispatch <handle> <owner/repo> --limit <N>
 
-  That makes claimable work loud without waiting for a human to ask why
-  agents are idle.
+  That makes claimable work loud and addressed without waiting for a human
+  to ask why agents are idle.
 
 OPTIONS
   --interval <seconds>   Pulse cadence. Minimum 30s; default 300s.
@@ -360,8 +360,8 @@ OPTIONS
   -h, --help             This help.
 
 NOTES
-  - The metronome does not claim work by itself. It publishes exact next
-    commands so agents can claim deliberately.
+  - The metronome does not claim work by itself. It DMs the target agent
+    exact next commands so agents can claim deliberately.
   - This is intentionally separate from plain `airc reminder`: reminders
     only say "you are silent"; metronome says "here is what to do next."
 EOF
