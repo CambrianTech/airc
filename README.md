@@ -200,6 +200,11 @@ call the same policy engine instead of relying on agents to remember cleanup.
 See [`docs/hygiene-policy.md`](docs/hygiene-policy.md) for the policy shape and
 default values.
 
+The long-term runtime target is a Rust-owned SQLite event store for chat, files,
+queue coordination, realtime subscriptions, and adapter cursors. See
+[`docs/rust-sqlite-substrate.md`](docs/rust-sqlite-substrate.md) for the schema,
+trait, migration, and benchmark contract.
+
 ## Rooms And Scope
 
 airc stores state in the current scope:
