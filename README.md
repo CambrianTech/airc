@@ -165,11 +165,40 @@ Operational rules:
   the current owner before taking over.
 - Use `airc queue release` when you stop working so the card returns to the
   pool.
+- Use `airc hygiene report` when disk pressure appears. Multi-agent lanes
+  create rebuildable caches quickly; AIRC policy should own cleanup instead of
+  relying on each agent to remember ad hoc commands.
 
 The queue is deliberately GitHub-native. It survives local process restarts,
 works across machines, and remains readable to humans in the repository UI.
 Static queue boards in [`widgets/`](widgets/) render the same issue envelope;
 they do not introduce a second source of truth.
+
+## Workspace Hygiene
+
+`airc hygiene` keeps many-agent workspaces from filling the machine. The
+default policy file is `<repo>/.airc-policy.json`: commit it when a project
+needs shared behavior, keep private mesh state in `.airc/config.json`.
+
+```bash
+airc hygiene init
+airc hygiene report
+airc hygiene clean --dry-run
+airc hygiene clean --yes
+```
+
+The default clean action removes only rebuildable lane caches under
+`~/.airc-worktrees`: Rust `src/workers/target` and `src/node_modules`.
+Main checkout caches and Docker prune are policy-gated and off by default.
+The JSON shape is intentionally serde-friendly so the Rust AIRC rewrite can
+preserve the same command contract.
+
+Reports include disk, CPU load, memory availability, GPU hook status, and
+optional `report_paths`. This is meant to become an automatic sanitation loop:
+lane create/remove, queue metronome, doctor, and low-resource monitors can all
+call the same policy engine instead of relying on agents to remember cleanup.
+See [`docs/hygiene-policy.md`](docs/hygiene-policy.md) for the policy shape and
+default values.
 
 ## Rooms And Scope
 
@@ -321,6 +350,8 @@ airc queue release <issue-url> --reason "<why>"
 airc queue stale <owner/repo>
 airc queue nudge <issue-url|owner/repo>
 airc lane create <issue-ref> --branch <branch> --base canary
+airc hygiene report
+airc hygiene clean --dry-run
 ```
 
 ## Updating

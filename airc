@@ -2581,6 +2581,15 @@ else
   exit 1
 fi
 
+# cmd_hygiene — project cache/worktree cleanup policy for many-agent lanes.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_hygiene.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_hygiene.sh
+  source "$_airc_lib_dir/airc_bash/cmd_hygiene.sh"
+else
+  echo "ERROR: airc_bash/cmd_hygiene.sh not found via lib-dir resolver." >&2
+  exit 1
+fi
+
 
 # ── Dispatch ────────────────────────────────────────────────────────────
 
@@ -2641,6 +2650,7 @@ case "${1:-help}" in
   decrypt-approval) shift; cmd_decrypt_approval "$@" ;;
   queue)     shift; cmd_queue "$@" ;;
   lane|lanes|worktree|worktrees) shift; cmd_lane "$@" ;;
+  hygiene|clean|cleanup) shift; cmd_hygiene "$@" ;;
   rooms|list|ls) shift; cmd_rooms "$@" ;;
   part) shift; cmd_part "$@" ;;
   version|--version|-v) shift; cmd_version "$@" ;;
@@ -2706,6 +2716,8 @@ case "${1:-help}" in
     echo "  airc queue availability <owner/repo> [--since 30m]       Show peer/activity + stale-claim summary"
     echo "  airc queue adopt <issue-url> [card-fields…]              Convert an existing issue into a queue card"
     echo "  airc lane create <issue-ref> [--base canary]             Create isolated worktree lane"
+    echo "  airc hygiene report                                      Show rebuildable worktree cache pressure"
+    echo "  airc hygiene clean --yes                                 Remove safe per-lane caches"
     echo "  airc msg / send <text>          Broadcast to the default channel"
     echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
     echo "  airc msg / send @a @b <text>    DM multiple peers (also: @a,b,c)"
