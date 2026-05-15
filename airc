@@ -2701,6 +2701,7 @@ case "${1:-help}" in
     echo "  airc queue heartbeat <issue-url> [--note \"…\"]            Stamp owned-card liveness"
     echo "  airc queue stale <owner/repo> [--stale-after 30m]        List stale/missing heartbeats"
     echo "  airc queue nudge <issue-url|owner/repo> [--peer @handle] Surface a card or repo status sweep"
+    echo "  airc queue dispatch <agent> [<owner/repo>]               DM agent the next claimable card (continuum#1192)"
     echo "  airc queue pongs <owner/repo> [--sweep-id ID]            Summarize repo-nudge replies"
     echo "  airc queue availability <owner/repo> [--since 30m]       Show peer/activity + stale-claim summary"
     echo "  airc queue adopt <issue-url> [card-fields…]              Convert an existing issue into a queue card"

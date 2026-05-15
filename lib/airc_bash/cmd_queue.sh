@@ -131,6 +131,9 @@ cmd_queue() {
     next|pick)
       _cmd_queue_next "$@"
       ;;
+    dispatch|handout)
+      _cmd_queue_dispatch "$@"
+      ;;
     metronome|pulse)
       _cmd_queue_metronome "$@"
       ;;
@@ -153,9 +156,196 @@ cmd_queue() {
       _cmd_queue_staleness "$@"
       ;;
     *)
-      die "queue: unknown subcommand: $subcmd (try: plan, add, list, claim, release, set-status, heartbeat, stale, next, metronome, nudge, adopt, pongs, availability, close-merged, staleness)"
+      die "queue: unknown subcommand: $subcmd (try: plan, add, list, claim, release, set-status, heartbeat, stale, next, dispatch, metronome, nudge, adopt, pongs, availability, close-merged, staleness)"
       ;;
   esac
+}
+
+# _cmd_queue_dispatch — personalized hand-out of the next claimable card
+# to a specific idle agent (continuum#1192).
+#
+# `airc queue metronome` already broadcasts a "queue is open" pulse to
+# the room, but a broadcast ≠ "for me" — agents see the pulse and stay
+# idle because nothing names them. This verb closes that loop by
+# computing the top candidate FOR a named agent and DM'ing them the
+# exact claim + lane commands.
+#
+# Usage:
+#   airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--dry-run]
+#
+#   <agent>      target peer (with or without leading @)
+#   <owner/repo> defaults to detected from $PWD (same rules as queue next)
+#   --message    optional one-line suffix to add to the DM
+#   --dry-run    print what would be sent, do not actually DM
+#
+# Behavior: runs `queue next --owner <agent> --json --limit 1` to get
+# the top candidate, then DMs the agent a one-line message containing:
+#   - card title
+#   - issue URL
+#   - the exact `airc queue claim` command they should run
+#   - the exact `airc lane create` command (if branch is suggested)
+_cmd_queue_dispatch() {
+  local target_agent=""
+  local target_repo=""
+  local extra_message=""
+  local dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<'EOF'
+airc queue dispatch — personalized hand-out of next claimable card
+
+USAGE
+  airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--dry-run]
+
+ARGS
+  <agent>           target peer name (with or without leading @)
+  <owner/repo>      default: detected from $PWD's git remote
+
+FLAGS
+  --message TEXT    extra context to append to the DM
+  --dry-run         print what would be sent, do not actually DM
+
+DESCRIPTION
+  Computes the top claimable card FOR the named agent (via the same
+  ranker as `queue next --owner <agent>`) and DMs them the one-line
+  hand-out with the exact `airc queue claim` + `airc lane create`
+  commands ready to copy. Closes the metronome's broadcast→personalized
+  gap (continuum#1192).
+
+EXAMPLES
+  airc queue dispatch @bigmama
+  airc queue dispatch claude-tab-2 CambrianTech/continuum
+  airc queue dispatch @codex-main --message "you've been idle 5min — pickup?"
+  airc queue dispatch @anvil --dry-run
+EOF
+        return 0
+        ;;
+      --message)
+        shift
+        extra_message="${1:-}"
+        ;;
+      --dry-run)
+        dry_run=1
+        ;;
+      -*)
+        die "queue dispatch: unknown flag: $1"
+        ;;
+      *)
+        if [ -z "$target_agent" ]; then
+          target_agent="$1"
+        elif [ -z "$target_repo" ]; then
+          target_repo="$1"
+        else
+          die "queue dispatch: too many positional args (expected: <agent> [<owner/repo>])"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$target_agent" ]; then
+    die "queue dispatch: missing <agent> (try: airc queue dispatch @<peer>)"
+  fi
+  # Strip leading '@' so the lookup name matches what queue uses internally.
+  target_agent="${target_agent#@}"
+
+  if [ -z "$target_repo" ]; then
+    target_repo=$(_airc_queue_detect_repo_from_cwd || true)
+  fi
+  if [ -z "$target_repo" ]; then
+    die "queue dispatch: no <owner/repo> given and could not detect from \$PWD's git remote. Pass owner/repo explicitly."
+  fi
+  case "$target_repo" in
+    */*) : ;;
+    *) die "queue dispatch: target must be owner/repo, got: $target_repo" ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "queue dispatch: 'gh' CLI is required."
+  fi
+
+  # Pull the top candidate via JSON output of the existing next ranker.
+  # Tee to a tempfile so the python parser can read structured input
+  # without having to re-shell to gh again. Use --limit 1 so the ranker
+  # picks the best single match for this agent.
+  local next_json
+  if ! next_json=$(_cmd_queue_next "$target_repo" --owner "$target_agent" --limit 1 --json); then
+    die "queue dispatch: queue next lookup failed for $target_agent on $target_repo"
+  fi
+  if [ -z "$next_json" ]; then
+    die "queue dispatch: queue next returned empty stdout. Try 'airc queue next $target_repo --owner $target_agent --limit 1 --json' directly to debug."
+  fi
+
+  # Write JSON to a tempfile and pass the path as argv. We can't use a
+  # stdin pipe here because the heredoc that carries the python source
+  # below also redirects stdin (only one fd 0).
+  local next_json_file
+  next_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-dispatch.XXXXXX") || die "queue dispatch: mktemp failed"
+  printf '%s' "$next_json" >"$next_json_file"
+
+  if [ -z "$next_json" ] || [ "$next_json" = "[]" ] || [ "$next_json" = "{}" ]; then
+    die "queue dispatch: no claimable cards for $target_agent on $target_repo (queue is empty for this agent)"
+  fi
+
+  # Extract the top candidate's fields. The next-ranker's JSON shape is
+  # `{ "candidates": [{ "number", "title", "url", "claim_command",
+  # "lane_command", ... }] }`.
+  #
+  # Read the JSON from a tempfile (not stdin) because the heredoc carrying
+  # the python source uses fd 0; can't redirect stdin twice.
+  local dm_text
+  dm_text=$("$AIRC_PYTHON" - "$target_agent" "$extra_message" "$next_json_file" <<'PYEOF'
+import json, sys
+target_agent, extra, path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        data = json.loads(f.read())
+except json.JSONDecodeError as e:
+    print(f"ERR:json:{e}", file=sys.stderr)
+    sys.exit(2)
+if isinstance(data, dict):
+    items = data.get("candidates") or data.get("items") or data.get("results") or []
+elif isinstance(data, list):
+    items = data
+else:
+    items = []
+if not items:
+    print("ERR:no-items", file=sys.stderr)
+    sys.exit(3)
+top = items[0]
+number = top.get("number") or "?"
+title = (top.get("title") or "").strip()
+url = top.get("url") or ""
+claim = top.get("claim_command") or top.get("claim") or ""
+lane = top.get("lane_command") or top.get("lane") or ""
+parts = [
+    f"📋 hand-out for @{target_agent}: #{number} — {title[:80]}",
+    f"   {url}" if url else "",
+    f"   claim: {claim}" if claim else "",
+    f"   lane:  {lane}" if lane else "",
+]
+if extra:
+    parts.append(f"   note: {extra}")
+print("\n".join(p for p in parts if p))
+PYEOF
+  )
+  rm -f "$next_json_file"
+  if [ -z "$dm_text" ]; then
+    die "queue dispatch: failed to format hand-out from queue-next output"
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    echo "[dry-run] would DM @${target_agent}:"
+    echo "${dm_text}"
+    return 0
+  fi
+
+  if ! cmd_send "@${target_agent}" "$dm_text"; then
+    die "queue dispatch: cmd_send to @${target_agent} failed"
+  fi
+  echo "Dispatched top card to @${target_agent} on ${target_repo}."
 }
 _cmd_queue_add() {
   # Create a new airc-queue card. Args:
