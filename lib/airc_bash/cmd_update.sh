@@ -34,6 +34,7 @@ cmd_update() {
   local channel_file="$dir/.channel"
   local requested_channel=""
   local force=0
+  local reset=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help)
@@ -43,6 +44,7 @@ cmd_update() {
         echo "  airc update --canary               shortcut for --channel canary"
         echo "  airc update --main                 shortcut for --channel main"
         echo "  airc update --force / -f           auto-stash local mods + pull"
+        echo "  airc update --reset                reset install dir to origin/<channel>"
         return 0 ;;
       --channel|-c)
         requested_channel="${2:-}"
@@ -52,6 +54,7 @@ cmd_update() {
       --canary) requested_channel="canary"; shift ;;
       --main)   requested_channel="main";   shift ;;
       --force|-f) force=1; shift ;;
+      --reset) reset=1; shift ;;
       *) shift ;;
     esac
   done
@@ -69,6 +72,23 @@ cmd_update() {
     [ -z "$channel" ] && channel="main"
   else
     channel="main"
+  fi
+
+  if _airc_update_has_unmerged "$dir"; then
+    if [ "$reset" = "1" ]; then
+      _airc_update_reset_to_origin "$dir" "$channel"
+    else
+      echo "  ❌ Unresolved git merge conflicts in install dir ($dir):" >&2
+      git -C "$dir" status --short 2>&1 | head -20 >&2
+      echo "" >&2
+      echo "  This install checkout cannot safely run airc until conflicts are removed." >&2
+      echo "  Recover with:" >&2
+      echo "    airc update --reset                  # reset install dir to origin/$channel" >&2
+      echo "    git -C $dir status                   # inspect manually" >&2
+      die "refusing to update over unresolved install-dir conflicts"
+    fi
+  elif [ "$reset" = "1" ]; then
+    _airc_update_reset_to_origin "$dir" "$channel"
   fi
 
   # Detect dirty tree BEFORE attempting branch switch / pull. Without this,
@@ -128,6 +148,7 @@ cmd_update() {
   echo "$channel" > "$channel_file"
 
   AIRC_DIR="$dir" bash "$dir/install.sh" || die "install.sh failed."
+  _airc_update_assert_clean_after_install "$dir" "$channel"
 
   local after; after=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
   if [ "$before" = "$after" ]; then
@@ -156,6 +177,54 @@ cmd_update() {
       echo ""
     fi
   fi
+}
+
+_airc_update_has_unmerged() {
+  local dir="$1"
+  git -C "$dir" status --porcelain -uall 2>/dev/null | grep -Eq '^(DD|AU|UD|UA|DU|AA|UU) '
+}
+
+_airc_update_has_tracked_changes() {
+  local dir="$1"
+  ! git -C "$dir" diff --quiet 2>/dev/null || ! git -C "$dir" diff --cached --quiet 2>/dev/null
+}
+
+_airc_update_assert_clean_after_install() {
+  local dir="$1"
+  local channel="$2"
+  if _airc_update_has_unmerged "$dir"; then
+    echo "  ❌ install.sh returned but install dir still has unresolved conflicts:" >&2
+    git -C "$dir" status --short 2>&1 | head -20 >&2
+    echo "" >&2
+    echo "  Recover with: airc update --reset  # reset install dir to origin/$channel" >&2
+    die "post-update install dir has unresolved conflicts"
+  fi
+  if _airc_update_has_tracked_changes "$dir"; then
+    echo "  ❌ install.sh returned but install dir has tracked local changes:" >&2
+    git -C "$dir" status --short 2>&1 | head -20 >&2
+    echo "" >&2
+    echo "  Recover with: airc update --reset  # reset install dir to origin/$channel" >&2
+    die "post-update install dir is not clean"
+  fi
+}
+
+_airc_update_reset_to_origin() {
+  local dir="$1"
+  local channel="$2"
+  echo "  ⚠  Resetting install dir to origin/$channel: $dir"
+  git -C "$dir" fetch --quiet origin "$channel" \
+    || die "reset failed: could not fetch origin/$channel"
+  local current_branch
+  current_branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [ "$current_branch" != "$channel" ]; then
+    git -C "$dir" checkout -q "$channel" 2>/dev/null \
+      || git -C "$dir" checkout -q -B "$channel" "origin/$channel" 2>/dev/null \
+      || die "reset failed: could not checkout '$channel'"
+  fi
+  git -C "$dir" reset --hard "origin/$channel" >/dev/null \
+    || die "reset failed: could not reset to origin/$channel"
+  git -C "$dir" clean -fd >/dev/null \
+    || die "reset failed: could not clean untracked files"
 }
 
 # ── cmd_channel: show or set the release channel without pulling ──────
