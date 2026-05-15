@@ -2935,6 +2935,23 @@ JSON
     && pass "airc peers falls back to recent broadcast-only traffic" \
     || fail "airc peers hid recent remote traffic when peer records were empty ($peers_out)"
 
+  printf '{"from":"solo-host","to":"all","ts":"%s","channel":"general","msg":"same nick remote proof","client_id":"agent:other"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$home/messages.jsonl"
+  status_out=$(AIRC_CLIENT_ID="agent:self" AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'solo-host \[agent:other\]' \
+    && pass "status distinguishes same-nick peers by client_id" \
+    || fail "status treated same-nick peer traffic as self ($status_out)"
+  doctor_out=$(AIRC_CLIENT_ID="agent:self" AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q 'recent broadcast peer' \
+    && pass "doctor distinguishes same-nick peers by client_id" \
+    || fail "doctor treated same-nick peer traffic as self ($doctor_out)"
+  peers_out=$(AIRC_CLIENT_ID="agent:self" AIRC_HOME="$home" "$AIRC" peers 2>&1)
+  echo "$peers_out" | grep -q 'solo-host \[agent:other\] → broadcast room' \
+    && pass "airc peers lists same-nick broadcast peer by client_id" \
+    || fail "airc peers hid same-nick broadcast peer ($peers_out)"
+
+  printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"recent remote proof"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$home/messages.jsonl"
   local whois_out
   whois_out=$(AIRC_HOME="$home" "$AIRC" whois remote-agent 2>&1)
   echo "$whois_out" | grep -q 'role: *broadcast peer' \

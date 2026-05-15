@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from airc_core.client_id import current_client_id
+
 
 RECENT_REMOTE_WINDOW_SEC = 600
 
@@ -24,6 +26,74 @@ RECENT_REMOTE_WINDOW_SEC = 600
 class RemoteActivity:
     name: str
     ts: int
+    client_id: str = ""
+
+
+@dataclass(frozen=True)
+class MessageActivity:
+    name: str
+    ts: int
+    client_id: str
+
+
+@dataclass(frozen=True)
+class CollaborationEvidence:
+    recent_speakers: dict[str, int]
+    recent_activity: Optional[RemoteActivity]
+    any_activity: Optional[RemoteActivity]
+
+
+def _display_name(sender: object, client_id: str, my_name: str) -> str:
+    name = str(sender)
+    if client_id and name == my_name:
+        return f"{name} [{client_id}]"
+    return name
+
+
+def _is_self_message(msg: dict, my_name: str, my_client_id: str) -> bool:
+    sender = msg.get("from")
+    if not sender or sender == "airc":
+        return True
+    msg_client_id = str(msg.get("client_id") or "")
+    if my_client_id and msg_client_id:
+        return msg_client_id == my_client_id
+    if sender != my_name:
+        return False
+    # Legacy messages did not carry client_id; same nick still means self.
+    # Modern multi-agent rooms may reuse a nick, so same nick plus client_id
+    # is peer evidence when this process lacks a local client_id.
+    return not msg_client_id
+
+
+def _remote_messages(
+    home: str,
+    my_name: str,
+    window_sec: Optional[int],
+    my_client_id: str,
+) -> list[MessageActivity]:
+    messages_log = os.path.join(home, "messages.jsonl")
+    now = int(time.time())
+    found: list[MessageActivity] = []
+    try:
+        with open(messages_log, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if _is_self_message(msg, my_name, my_client_id):
+                    continue
+                ts = _epoch(msg.get("ts"))
+                if ts is None:
+                    continue
+                if window_sec is not None and now - ts >= window_sec:
+                    continue
+                sender = msg.get("from")
+                client_id = str(msg.get("client_id") or "")
+                found.append(MessageActivity(_display_name(sender, client_id, my_name), ts, client_id))
+    except OSError:
+        pass
+    return found
 
 
 def _epoch(ts: object) -> Optional[int]:
@@ -67,68 +137,69 @@ def peer_record_count(home: str) -> int:
     return count
 
 
-def recent_remote_activity(home: str, my_name: str, window_sec: int = RECENT_REMOTE_WINDOW_SEC) -> Optional[RemoteActivity]:
-    return _remote_activity(home, my_name, window_sec=window_sec)
+def recent_remote_activity(
+    home: str,
+    my_name: str,
+    window_sec: int = RECENT_REMOTE_WINDOW_SEC,
+    my_client_id: str = "",
+) -> Optional[RemoteActivity]:
+    return _remote_activity(home, my_name, window_sec=window_sec, my_client_id=my_client_id)
 
 
-def any_remote_activity(home: str, my_name: str) -> Optional[RemoteActivity]:
-    return _remote_activity(home, my_name, window_sec=None)
+def any_remote_activity(home: str, my_name: str, my_client_id: str = "") -> Optional[RemoteActivity]:
+    return _remote_activity(home, my_name, window_sec=None, my_client_id=my_client_id)
 
 
-def _remote_activity(home: str, my_name: str, window_sec: Optional[int]) -> Optional[RemoteActivity]:
-    messages_log = os.path.join(home, "messages.jsonl")
+def _remote_activity(
+    home: str,
+    my_name: str,
+    window_sec: Optional[int],
+    my_client_id: str = "",
+) -> Optional[RemoteActivity]:
+    last = max(
+        _remote_messages(home, my_name, window_sec=window_sec, my_client_id=my_client_id),
+        key=lambda activity: activity.ts,
+        default=None,
+    )
+    if last is None:
+        return None
+    return RemoteActivity(last.name, last.ts, last.client_id)
+
+
+def collaboration_evidence(home: str, my_name: str, my_client_id: str = "") -> CollaborationEvidence:
+    any_messages = _remote_messages(home, my_name, window_sec=None, my_client_id=my_client_id)
     now = int(time.time())
-    last: Optional[RemoteActivity] = None
-    try:
-        with open(messages_log, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                except Exception:
-                    continue
-                sender = msg.get("from")
-                if not sender or sender in (my_name, "airc"):
-                    continue
-                ts = _epoch(msg.get("ts"))
-                if ts is None:
-                    continue
-                if window_sec is not None and now - ts >= window_sec:
-                    continue
-                if last is None or ts > last.ts:
-                    last = RemoteActivity(str(sender), ts)
-    except OSError:
-        pass
-    return last
+    recent_speakers: dict[str, int] = {}
+    recent_activity: Optional[RemoteActivity] = None
+    any_activity: Optional[RemoteActivity] = None
+    for activity in any_messages:
+        if any_activity is None or activity.ts > any_activity.ts:
+            any_activity = RemoteActivity(activity.name, activity.ts, activity.client_id)
+        if now - activity.ts >= RECENT_REMOTE_WINDOW_SEC:
+            continue
+        recent_speakers[activity.name] = max(recent_speakers.get(activity.name, 0), activity.ts)
+        if recent_activity is None or activity.ts > recent_activity.ts:
+            recent_activity = RemoteActivity(activity.name, activity.ts, activity.client_id)
+    return CollaborationEvidence(recent_speakers, recent_activity, any_activity)
 
 
-def recent_remote_speakers(home: str, my_name: str, window_sec: int = RECENT_REMOTE_WINDOW_SEC) -> dict[str, int]:
-    messages_log = os.path.join(home, "messages.jsonl")
-    now = int(time.time())
+def recent_remote_speakers(
+    home: str,
+    my_name: str,
+    window_sec: int = RECENT_REMOTE_WINDOW_SEC,
+    my_client_id: str = "",
+) -> dict[str, int]:
     speakers: dict[str, int] = {}
-    try:
-        with open(messages_log, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                except Exception:
-                    continue
-                sender = msg.get("from")
-                if not sender or sender in (my_name, "airc"):
-                    continue
-                ts = _epoch(msg.get("ts"))
-                if ts is None or now - ts >= window_sec:
-                    continue
-                speakers[str(sender)] = max(speakers.get(str(sender), 0), ts)
-    except OSError:
-        pass
+    for activity in _remote_messages(home, my_name, window_sec=window_sec, my_client_id=my_client_id):
+        speakers[activity.name] = max(speakers.get(activity.name, 0), activity.ts)
     return speakers
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
-    speakers = recent_remote_speakers(args.home, args.my_name)
-    recent = recent_remote_activity(args.home, args.my_name)
-    any_recent = recent if recent is not None else any_remote_activity(args.home, args.my_name)
+    evidence = collaboration_evidence(args.home, args.my_name, args.client_id)
+    speakers = evidence.recent_speakers
+    any_recent = evidence.recent_activity if evidence.recent_activity is not None else evidence.any_activity
     now = int(time.time())
     if any_recent is None:
         remote_desc = "no remote messages recorded"
@@ -153,9 +224,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
-    speakers = recent_remote_speakers(args.home, args.my_name)
-    recent = recent_remote_activity(args.home, args.my_name)
-    any_recent = recent if recent is not None else any_remote_activity(args.home, args.my_name)
+    evidence = collaboration_evidence(args.home, args.my_name, args.client_id)
+    speakers = evidence.recent_speakers
+    recent = evidence.recent_activity
+    any_recent = evidence.any_activity
     now = int(time.time())
     if count > 0:
         print(f"  [ok] collaboration mesh has {count} peer record(s)")
@@ -190,7 +262,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_send_warning(args: argparse.Namespace) -> int:
     if peer_record_count(args.home) > 0:
         return 0
-    if not recent_remote_speakers(args.home, args.my_name):
+    if not recent_remote_speakers(args.home, args.my_name, my_client_id=args.client_id):
         print(
             "  WARN: collaboration has no direct peer records or recent broadcast peers. "
             "Run 'airc peers' and verify others joined this gist.",
@@ -200,7 +272,7 @@ def cmd_send_warning(args: argparse.Namespace) -> int:
 
 
 def cmd_peers_fallback(args: argparse.Namespace) -> int:
-    speakers = recent_remote_speakers(args.home, args.my_name)
+    speakers = recent_remote_speakers(args.home, args.my_name, my_client_id=args.client_id)
     if not speakers:
         return 1
     print("  Recent broadcast peers:")
@@ -210,7 +282,7 @@ def cmd_peers_fallback(args: argparse.Namespace) -> int:
 
 
 def cmd_whois_fallback(args: argparse.Namespace) -> int:
-    speakers = recent_remote_speakers(args.home, args.my_name)
+    speakers = recent_remote_speakers(args.home, args.my_name, my_client_id=args.client_id)
     ts = speakers.get(args.peer_name)
     if ts is None:
         return 1
@@ -231,9 +303,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--home", required=True)
         p.add_argument("--my-name", default="")
+        p.add_argument("--client-id", default=current_client_id())
     p = sub.add_parser("whois-fallback")
     p.add_argument("--home", required=True)
     p.add_argument("--my-name", default="")
+    p.add_argument("--client-id", default=current_client_id())
     p.add_argument("--peer-name", required=True)
     args = parser.parse_args(argv)
     if args.cmd == "status":

@@ -178,8 +178,9 @@ _airc_collaboration_health_report() {
   # Local transport health is not the same as collaboration health. A
   # self-healed host can have fresh bearer heartbeats while nobody else is
   # paired to this mesh. Surface that split-brain shape explicitly.
+  local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
   "$AIRC_PYTHON" -m airc_core.collaboration status \
-    --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+    --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id"
 }
 
 cmd_status() {

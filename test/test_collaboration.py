@@ -28,13 +28,18 @@ class CollaborationHealthTests(unittest.TestCase):
         (home / "peers").mkdir()
         return tmp, home
 
-    def _remote_line(self, sender="remote-agent"):
-        return json.dumps({
+    def _remote_line(self, sender="remote-agent", client_id=None):
+        msg = {
             "from": sender,
             "to": "all",
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "channel": "general",
             "msg": "hello",
+        }
+        if client_id is not None:
+            msg["client_id"] = client_id
+        return json.dumps({
+            **msg,
         }) + "\n"
 
     def test_status_waiting_without_records_or_remote_traffic(self):
@@ -85,6 +90,45 @@ class CollaborationHealthTests(unittest.TestCase):
             self.assertIn("Presence is derived", text)
             self.assertNotIn("collaboration: SOLO", text)
 
+    def test_status_ok_when_same_name_different_client_id_exists(self):
+        tmp, home = self._scope()
+        with tmp:
+            (home / "messages.jsonl").write_text(
+                self._remote_line(sender="me", client_id="agent:other"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collaboration.main([
+                    "status",
+                    "--home", str(home),
+                    "--my-name", "me",
+                    "--client-id", "agent:self",
+                ])
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("collaboration: ok (1 broadcast peer", text)
+            self.assertIn("me [agent:other]", text)
+            self.assertNotIn("collaboration: SOLO", text)
+
+    def test_status_ignores_same_client_id_as_self(self):
+        tmp, home = self._scope()
+        with tmp:
+            (home / "messages.jsonl").write_text(
+                self._remote_line(sender="me", client_id="agent:self"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collaboration.main([
+                    "status",
+                    "--home", str(home),
+                    "--my-name", "me",
+                    "--client-id", "agent:self",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("collaboration: waiting for peers", out.getvalue())
+
     def test_doctor_ok_when_recent_remote_traffic_exists(self):
         tmp, home = self._scope()
         with tmp:
@@ -115,6 +159,26 @@ class CollaborationHealthTests(unittest.TestCase):
                 rc = collaboration.main(["peers-fallback", "--home", str(home), "--my-name", "me"])
             self.assertEqual(rc, 0)
             self.assertIn("remote-agent", out.getvalue())
+            self.assertIn("broadcast room", out.getvalue())
+
+    def test_peers_fallback_lists_same_name_broadcast_speaker_by_client_id(self):
+        tmp, home = self._scope()
+        with tmp:
+            os.rmdir(home / "peers")
+            (home / "messages.jsonl").write_text(
+                self._remote_line(sender="me", client_id="agent:other"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collaboration.main([
+                    "peers-fallback",
+                    "--home", str(home),
+                    "--my-name", "me",
+                    "--client-id", "agent:self",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("me [agent:other]", out.getvalue())
             self.assertIn("broadcast room", out.getvalue())
 
     def test_whois_fallback_describes_recent_broadcast_speaker(self):
