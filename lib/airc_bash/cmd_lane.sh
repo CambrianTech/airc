@@ -123,6 +123,20 @@ _cmd_lane_create() {
     git -C "$repo_root" worktree add -b "$branch" "$lane_dir" "$resolved_base"
   fi
 
+  # Hydrate submodules in the new lane (continuum#1252).
+  #
+  # `git worktree add` does NOT init submodules in the new working tree,
+  # so any repo with submodule deps (continuum has `vendor/llama.cpp` ~500MB)
+  # has empty submodule directories that fail Rust precommit/prepush hooks
+  # on first commit attempt with cryptic CMake errors. This step makes the
+  # lane self-sufficient: agents shouldn't have to learn the
+  # `git submodule update --init` ritual after every `airc lane create`.
+  #
+  # Fail loud (no `2>/dev/null`, no `|| true`): if submodule init fails the
+  # lane is broken anyway — the user needs to see the error, not have it
+  # swallowed. Repos with no submodules: this is a no-op and exits 0.
+  git -C "$lane_dir" submodule update --init --recursive
+
   _airc_lane_record "$issue_ref" "$repo_root" "$lane_dir" "$branch" "$resolved_base" "$owner"
 
   printf 'Lane created:\n'
