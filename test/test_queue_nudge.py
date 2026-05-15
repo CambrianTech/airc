@@ -175,6 +175,7 @@ class QueueNudgeDispatchTests(unittest.TestCase):
                               env_overrides=_isolated_env(tmp))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("automatic queue-next idle pulses", result.stdout)
+        self.assertIn("airc queue dispatch", result.stdout)
         self.assertIn("metronome off", result.stdout)
 
     def test_nudge_help_returns_zero(self) -> None:
@@ -369,6 +370,35 @@ class QueueRepoNudgeDryRunTests(unittest.TestCase):
             self.assertIn("owner=codex-main", text)
             self.assertIn("limit=7", text)
             self.assertIn("repo_root=/work/repo", text)
+            self.assertIn("airc queue dispatch codex-main owner/repo", result.stdout)
+
+    def test_dispatch_dry_run_hands_out_top_card_with_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "dispatch", "@codex-main", "owner/repo",
+                 "--limit", "7",
+                 "--repo-root", "/work/repo",
+                 "--message", "idle hand-out",
+                 "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would DM @codex-main", result.stdout)
+        self.assertIn("hand-out for @codex-main: #2", result.stdout)
+        self.assertIn("airc queue claim 'owner/repo#2' --owner 'codex-main'", result.stdout)
+        self.assertIn("airc lane create 'owner/repo#2' --base 'canary' --branch 'feat/repo-nudge' --repo '/work/repo'", result.stdout)
+        self.assertIn("idle hand-out", result.stdout)
+
+    def test_dispatch_rejects_invalid_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "dispatch", "@codex-main", "owner/repo",
+                 "--limit", "0",
+                 "--dry-run"],
+                env_overrides=_isolated_env_with_fake_gh(tmp),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--limit must be >= 1", result.stdout + result.stderr)
 
     def test_metronome_rejects_spammy_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

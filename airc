@@ -2157,14 +2157,19 @@ reminder_timer_loop() {
         local qm_elapsed=$(( now - qm_last ))
         if [ "$qm_elapsed" -ge "$qm_interval" ]; then
           printf '%s\n' "$now" > "$qm_last_file"
-          local qm_args=(next "$qm_repo" --limit "$qm_limit" --idle-ping)
+          local qm_args
           if [ -n "$qm_owner" ]; then
-            qm_args+=(--owner "$qm_owner")
+            qm_args=(dispatch "$qm_owner" "$qm_repo" --limit "$qm_limit" --message "metronome: idle hand-out; claim it, heartbeat it, or release it.")
+            if [ -n "$qm_repo_root" ]; then
+              qm_args+=(--repo-root "$qm_repo_root")
+            fi
+          else
+            qm_args=(next "$qm_repo" --limit "$qm_limit" --idle-ping)
+            if [ -n "$qm_repo_root" ]; then
+              qm_args+=(--repo-root "$qm_repo_root")
+            fi
           fi
-          if [ -n "$qm_repo_root" ]; then
-            qm_args+=(--repo-root "$qm_repo_root")
-          fi
-          printf '[%s] airc: Queue metronome pulse — checking next work for %s\n' "$(timestamp)" "$qm_repo"
+          printf '[%s] airc: Queue metronome pulse — dispatching next work for %s\n' "$(timestamp)" "$qm_repo"
           cmd_queue "${qm_args[@]}" || printf '[%s] airc: Queue metronome pulse failed; will retry on next interval.\n' "$(timestamp)"
         fi
       fi

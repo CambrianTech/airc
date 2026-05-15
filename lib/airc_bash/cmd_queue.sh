@@ -171,7 +171,7 @@ cmd_queue() {
 # exact claim + lane commands.
 #
 # Usage:
-#   airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--dry-run]
+#   airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--limit N] [--repo-root PATH] [--dry-run]
 #
 #   <agent>      target peer (with or without leading @)
 #   <owner/repo> defaults to detected from $PWD (same rules as queue next)
@@ -188,6 +188,8 @@ _cmd_queue_dispatch() {
   local target_agent=""
   local target_repo=""
   local extra_message=""
+  local limit=10
+  local repo_root=""
   local dry_run=0
 
   while [ $# -gt 0 ]; do
@@ -197,7 +199,7 @@ _cmd_queue_dispatch() {
 airc queue dispatch — personalized hand-out of next claimable card
 
 USAGE
-  airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--dry-run]
+  airc queue dispatch <agent> [<owner/repo>] [--message "..."] [--limit N] [--repo-root PATH] [--dry-run]
 
 ARGS
   <agent>           target peer name (with or without leading @)
@@ -205,6 +207,8 @@ ARGS
 
 FLAGS
   --message TEXT    extra context to append to the DM
+  --limit N         max queue cards to scan before picking top ranked card
+  --repo-root PATH  include repo path in suggested lane command
   --dry-run         print what would be sent, do not actually DM
 
 DESCRIPTION
@@ -225,6 +229,14 @@ EOF
       --message)
         shift
         extra_message="${1:-}"
+        ;;
+      --limit)
+        shift
+        limit="${1:-10}"
+        ;;
+      --repo-root)
+        shift
+        repo_root="${1:-}"
         ;;
       --dry-run)
         dry_run=1
@@ -265,13 +277,23 @@ EOF
   if ! command -v gh >/dev/null 2>&1; then
     die "queue dispatch: 'gh' CLI is required."
   fi
+  case "$limit" in
+    ''|*[!0-9]*) die "queue dispatch: --limit must be a positive integer (got: $limit)" ;;
+  esac
+  if [ "$limit" -lt 1 ]; then
+    die "queue dispatch: --limit must be >= 1 (got: $limit)"
+  fi
 
   # Pull the top candidate via JSON output of the existing next ranker.
   # Tee to a tempfile so the python parser can read structured input
-  # without having to re-shell to gh again. Use --limit 1 so the ranker
-  # picks the best single match for this agent.
+  # without having to re-shell to gh again. Scan a bounded set, then DM
+  # the first ranked result.
   local next_json
-  if ! next_json=$(_cmd_queue_next "$target_repo" --owner "$target_agent" --limit 1 --json); then
+  local next_args=("$target_repo" --owner "$target_agent" --limit "$limit" --json)
+  if [ -n "$repo_root" ]; then
+    next_args+=(--repo-root "$repo_root")
+  fi
+  if ! next_json=$(_cmd_queue_next "${next_args[@]}"); then
     die "queue dispatch: queue next lookup failed for $target_agent on $target_repo"
   fi
   if [ -z "$next_json" ]; then
@@ -1576,7 +1598,7 @@ _cmd_queue_metronome() {
   rm -f "$AIRC_WRITE_DIR/queue_metronome_last"
 
   echo "  Queue metronome every ${interval}s for ${target_repo} as ${owner}."
-  echo "  Monitor will run: airc queue next ${target_repo} --owner ${owner} --limit ${limit} --idle-ping"
+  echo "  Monitor will run: airc queue dispatch ${owner} ${target_repo}"
 }
 
 _cmd_queue_adopt() {
