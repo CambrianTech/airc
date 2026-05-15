@@ -571,8 +571,9 @@ else:
   # identical to "5 peers, all silent for 30 min" in the listing —
   # silent records persist on disk regardless of liveness.
   if ! find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | grep -q .; then
+    local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
     "$AIRC_PYTHON" -m airc_core.collaboration peers-fallback \
-      --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" && return
+      --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" && return
     echo "  No peers yet."
     return
   fi

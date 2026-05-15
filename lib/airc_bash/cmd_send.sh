@@ -739,8 +739,9 @@ cmd_send() {
       _peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
     fi
     if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
+      local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
       "$AIRC_PYTHON" -m airc_core.collaboration send-warning \
-        --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" 2>/dev/null || true
+        --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" 2>/dev/null || true
     fi
     _airc_codex_poll_after_user_send
   fi
