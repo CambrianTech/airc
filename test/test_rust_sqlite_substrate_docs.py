@@ -46,6 +46,17 @@ class RustSqliteSubstrateDocTests(unittest.TestCase):
         ):
             self.assertIn(trait_name, self.text)
 
+    def test_requires_orm_boundary_not_application_sql(self) -> None:
+        for phrase in (
+            "Use a Rust ORM crate",
+            "SeaORM is the default candidate",
+            "Raw SQL belongs",
+            "only in migrations",
+            "Continuum must not issue SQL",
+            "It should not open the SQLite database, run SQL queries",
+        ):
+            self.assertIn(phrase, self.text)
+
     def test_realtime_and_performance_requirements_are_explicit(self) -> None:
         for phrase in (
             "presence.typing",

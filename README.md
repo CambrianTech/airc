@@ -205,6 +205,12 @@ queue coordination, realtime subscriptions, and adapter cursors. See
 [`docs/rust-sqlite-substrate.md`](docs/rust-sqlite-substrate.md) for the schema,
 trait, migration, and benchmark contract.
 
+Realtime delivery builds on that store without replacing application schemas.
+AIRC owns subscriptions, replay, receipts, self-filtering, backpressure, and
+transport adapters; consumers such as Continuum keep their canonical
+JTAG/EventBridge/GridFrame/LiveKit payloads. See
+[`docs/realtime-event-bus.md`](docs/realtime-event-bus.md).
+
 ## Rooms And Scope
 
 airc stores state in the current scope:
