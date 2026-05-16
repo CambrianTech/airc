@@ -38,6 +38,8 @@ Continuum owns:
 - persona behavior, memory, world/activity semantics, and UI projection policy
 - media-domain meaning for WebRTC/LiveKit sessions
 - application-specific command handlers produced by AIRC events
+- ORM-backed application entities and projections; Continuum must not issue SQL
+  against the AIRC store or depend on AIRC table shapes
 
 Adapters own:
 
@@ -123,10 +125,14 @@ initial set should cover:
 Domain-specific meaning can live above this list, but transport and replay
 semantics must not.
 
-## SQLite Schema
+## Storage Model
 
-Use SQLite WAL mode. The Rust crate owns migrations and enforces invariants
-through transactions.
+Use SQLite WAL mode behind a Rust ORM/entity layer. The Rust crate owns
+migrations and enforces invariants through typed repository methods and
+transactions. Application code talks to Rust traits and generated types, not SQL.
+
+The schema below is a storage and migration contract for the ORM entities. It is
+not a public query API, and Continuum should never bind to it directly.
 
 Suggested pragmas:
 
@@ -282,7 +288,7 @@ CREATE TABLE health_samples (
 Projection tables are caches. They can be rebuilt from `events`. If a projection
 cannot be rebuilt, it is the wrong abstraction.
 
-## Rust Traits
+## Rust Traits And ORM Boundary
 
 The first Rust crate should expose narrow traits that can be tested without a
 daemon:
@@ -321,10 +327,16 @@ pub trait BlobStore {
 }
 ```
 
-Use `rusqlite` for the first implementation unless an async daemon benchmark
-proves `sqlx`/`tokio-rusqlite` is necessary. A single writer connection plus
-reader pool is enough for the near-term command/daemon split and avoids async
-complexity before we have numbers.
+Use a Rust ORM crate for the first implementation, with typed entities,
+migrations, and repository methods. SeaORM is the default candidate because it
+supports SQLite and async service code cleanly; Diesel is acceptable if its
+compile-time schema and sync model fit the first crate better. Raw SQL belongs
+only in migrations, narrowly reviewed performance escapes, or ORM-generated
+code. It must not leak into AIRC command handlers, adapters, or Continuum.
+
+A single writer path plus reader pool is enough for the near-term command/daemon
+split. If benchmarks prove the ORM layer is too slow for a hot path, optimize
+behind the same trait boundary and keep the public API unchanged.
 
 ## Command Contract
 
@@ -336,6 +348,10 @@ The shell/Python layer should become dispatch glue:
   only when its cursor is stale.
 - `airc hygiene report` writes health samples and can trigger policy hooks.
 - monitor/codex-poll subscribe from the store instead of tailing raw JSONL.
+
+Continuum integration should consume Rust/TypeScript types, IPC responses, and
+projection APIs. It should not open the SQLite database, run SQL queries, or
+mirror AIRC's table names into its own domain code.
 
 Logic that must not stay duplicated in shell/Python after Rust owns it:
 
@@ -386,8 +402,8 @@ performance claim must have a reproducible measurement.
 
 ## Migration Plan
 
-1. Add `airc-store` Rust crate with schema, migrations, event ID generation,
-   append/page/resume APIs, and unit tests.
+1. Add `airc-store` Rust crate with ORM entities, migrations, event ID
+   generation, append/page/resume APIs, and unit tests.
 2. Add JSONL import/export so existing `messages.jsonl` rooms are not stranded.
 3. Route `airc logs` through the Rust store behind a feature flag while keeping
    JSONL as compatibility output.
