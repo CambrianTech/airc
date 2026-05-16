@@ -2138,9 +2138,18 @@ reminder_timer_loop() {
     # only says "you have been silent"; metronome says "here are claimable
     # cards and the exact claim/lane commands." It runs on monitor cadence
     # and never exits the monitor if GitHub/network is temporarily down.
+    #
+    # airc#607 / continuum#1192 — when owner=*roster*, fan out to each
+    # recent sender in this scope's messages.jsonl (a single fixed
+    # owner could only ever feed one agent; the rest of the channel
+    # stayed idle because the metronome had nothing to say to them).
+    # Per-recipient dedup state lives under queue_metronome_recent/
+    # so a tight pulse cadence doesn't double-DM the same agent. The
+    # Rust port of this dispatcher lives in airc#628.
     local queue_metronome_file="$AIRC_WRITE_DIR/queue_metronome"
     if [ -f "$queue_metronome_file" ]; then
       local qm_repo="" qm_owner="" qm_interval=300 qm_limit=10 qm_repo_root=""
+      local qm_roster_window=86400
       while IFS='=' read -r key value; do
         case "$key" in
           repo) qm_repo="$value" ;;
@@ -2148,6 +2157,7 @@ reminder_timer_loop() {
           interval) qm_interval="$value" ;;
           limit) qm_limit="$value" ;;
           repo_root) qm_repo_root="$value" ;;
+          roster_window) qm_roster_window="$value" ;;
         esac
       done < "$queue_metronome_file"
       if [ -n "$qm_repo" ] && [ -n "$qm_interval" ] && [ "$qm_interval" -gt 0 ] 2>/dev/null; then
@@ -2157,20 +2167,103 @@ reminder_timer_loop() {
         local qm_elapsed=$(( now - qm_last ))
         if [ "$qm_elapsed" -ge "$qm_interval" ]; then
           printf '%s\n' "$now" > "$qm_last_file"
-          local qm_args
-          if [ -n "$qm_owner" ]; then
-            qm_args=(dispatch "$qm_owner" "$qm_repo" --limit "$qm_limit" --message "metronome: idle hand-out; claim it, heartbeat it, or release it.")
-            if [ -n "$qm_repo_root" ]; then
-              qm_args+=(--repo-root "$qm_repo_root")
+          if [ "$qm_owner" = "*roster*" ]; then
+            # Fan-out across recent senders. Per-recipient dedup window
+            # = qm_interval, so the same agent can't get a second DM
+            # inside the configured pulse cadence even if the monitor
+            # ticks faster for any reason.
+            local recent_dir="$AIRC_WRITE_DIR/queue_metronome_recent"
+            mkdir -p "$recent_dir"
+            local messages_log="$AIRC_WRITE_DIR/messages.jsonl"
+            # Use the same identity primitive the queue verbs use, so we
+            # filter out the same agent name that would receive its own
+            # cmd_send echo. Fall back to empty so the python below just
+            # doesn't filter — the per-recipient dedup will still gate.
+            local my_name=""
+            if declare -F _airc_queue_resolve_name >/dev/null 2>&1; then
+              my_name=$(_airc_queue_resolve_name 2>/dev/null || echo "")
             fi
+            local roster
+            roster=$("$AIRC_PYTHON" - "$messages_log" "$qm_roster_window" "$my_name" <<'PY' 2>/dev/null
+import json, os, sys, time
+log, window_s, me = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+now = time.time()
+seen = {}
+if os.path.exists(log):
+    try:
+        with open(log) as f:
+            for line in f:
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                who = m.get('from') or ''
+                if not who or who == 'airc' or who == me:
+                    continue
+                ts = m.get('ts')
+                # ts may be epoch float, epoch-ms int, or ISO string.
+                try:
+                    if isinstance(ts, (int, float)):
+                        t = float(ts)
+                        if t > 1e12:
+                            t = t / 1000.0
+                    else:
+                        from datetime import datetime
+                        t = datetime.fromisoformat(str(ts).replace('Z', '+00:00')).timestamp()
+                except Exception:
+                    continue
+                if now - t > window_s:
+                    continue
+                prev = seen.get(who, 0)
+                if t > prev:
+                    seen[who] = t
+for who in sorted(seen, key=lambda k: seen[k], reverse=True):
+    print(who)
+PY
+)
+            local dispatched=0 skipped=0
+            local agent
+            while IFS= read -r agent; do
+              [ -n "$agent" ] || continue
+              # Per-recipient dedup: skip if pinged within qm_interval.
+              local agent_stamp="$recent_dir/$agent"
+              local last_ping=0
+              [ -f "$agent_stamp" ] && last_ping=$(cat "$agent_stamp" 2>/dev/null)
+              if [ "$(( now - last_ping ))" -lt "$qm_interval" ]; then
+                skipped=$((skipped + 1))
+                continue
+              fi
+              local qm_args=(dispatch "$agent" "$qm_repo" --limit "$qm_limit" --message "metronome (fan-out): idle hand-out; claim it, heartbeat it, or release it.")
+              if [ -n "$qm_repo_root" ]; then
+                qm_args+=(--repo-root "$qm_repo_root")
+              fi
+              if cmd_queue "${qm_args[@]}" >/dev/null 2>&1; then
+                printf '%s\n' "$now" > "$agent_stamp"
+                dispatched=$((dispatched + 1))
+              else
+                # Empty queue for this agent or other dispatch failure
+                # is expected and non-fatal. Stamp anyway so we don't
+                # retry every tick — same dedup window applies.
+                printf '%s\n' "$now" > "$agent_stamp"
+              fi
+            done <<< "$roster"
+            printf '[%s] airc: Queue metronome fan-out pulse for %s — dispatched %d, skipped %d (dedup)\n' "$(timestamp)" "$qm_repo" "$dispatched" "$skipped"
           else
-            qm_args=(next "$qm_repo" --limit "$qm_limit" --idle-ping)
-            if [ -n "$qm_repo_root" ]; then
-              qm_args+=(--repo-root "$qm_repo_root")
+            local qm_args
+            if [ -n "$qm_owner" ]; then
+              qm_args=(dispatch "$qm_owner" "$qm_repo" --limit "$qm_limit" --message "metronome: idle hand-out; claim it, heartbeat it, or release it.")
+              if [ -n "$qm_repo_root" ]; then
+                qm_args+=(--repo-root "$qm_repo_root")
+              fi
+            else
+              qm_args=(next "$qm_repo" --limit "$qm_limit" --idle-ping)
+              if [ -n "$qm_repo_root" ]; then
+                qm_args+=(--repo-root "$qm_repo_root")
+              fi
             fi
+            printf '[%s] airc: Queue metronome pulse — dispatching next work for %s\n' "$(timestamp)" "$qm_repo"
+            cmd_queue "${qm_args[@]}" || printf '[%s] airc: Queue metronome pulse failed; will retry on next interval.\n' "$(timestamp)"
           fi
-          printf '[%s] airc: Queue metronome pulse — dispatching next work for %s\n' "$(timestamp)" "$qm_repo"
-          cmd_queue "${qm_args[@]}" || printf '[%s] airc: Queue metronome pulse failed; will retry on next interval.\n' "$(timestamp)"
         fi
       fi
     fi
