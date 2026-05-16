@@ -460,16 +460,11 @@ cmd_logs() {
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
+  set -- render --since "$since" --count "$count"
   if [ "$output_json" -eq 1 ]; then
-    echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs render \
-      --since "$since" \
-      --count "$count" \
-      --json
-    return
+    set -- "$@" --json
   fi
-  echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs render \
-    --since "$since" \
-    --count "$count"
+  echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs "$@"
 }
 
 cmd_inbox() {
