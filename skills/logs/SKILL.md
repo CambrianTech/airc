@@ -1,9 +1,9 @@
 ---
 name: airc:logs
-description: Show the last N messages in the mesh's shared log (default 20). Human-readable format — timestamp + sender + message.
+description: Show the last N messages in the mesh's shared log (default 20), either human-readable or JSON for tooling.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "[N]"
+argument-hint: "[N] [--since <ts|offset>] [--json]"
 ---
 
 # airc logs
@@ -17,10 +17,12 @@ airc logs                  # last 20
 airc logs 50               # last 50
 airc logs --since 5m       # incremental poll for recent messages
 airc logs --since 2026-05-03T15:30:00Z
+airc logs 50 --json       # machine-readable page for tooling
 airc join                  # prints status + unread catch-up when the scope is already active
 ```
 
 Prints one line per message: `[ts] from: msg`. Reads this scope's local message log, which the running bearer keeps synced from the channel gist.
+With `--json`, prints `now_utc`, `since`, `count`, and an `events` array with stable fields plus the raw envelope.
 
 ## When to use
 

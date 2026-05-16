@@ -416,22 +416,26 @@ cmd_logs() {
   # and O(delta) per-turn — Codex hit context exhaustion 2026-05-02
   # because polling `logs 50` every turn re-injected ~7K tokens.
   local since=""
+  local output_json=0
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      --json)
+        output_json=1; shift ;;
       --since)
         [ -n "${2:-}" ] || die "--since requires an argument (ISO timestamp or relative like 60s/5m/1h)"
         since="$2"; shift 2 ;;
       --since=*)
         since="${1#--since=}"; shift ;;
       -h|--help)
-        echo "Usage: airc logs [N] [--since <ts|Ns|Nm|Nh>]"
+        echo "Usage: airc logs [N] [--since <ts|Ns|Nm|Nh>] [--json]"
         echo "  N           tail this many recent messages (default 20)"
         echo "  --since X   filter to messages newer than X. X can be:"
         echo "              ISO timestamp (2026-05-02T19:30:00Z)"
         echo "              relative offset (60s, 5m, 1h, 2d)"
         echo "              For incremental polling — re-poll using the"
         echo "              ts of the last message you saw."
+        echo "  --json      emit now_utc, since, count, and event objects."
         return 0 ;;
       *) positional+=("$1"); shift ;;
     esac
@@ -456,51 +460,14 @@ cmd_logs() {
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
-  # Pass --since as env var (not bash-interpolated into Python) so empty
-  # value doesn't produce malformed Python like `since_arg = or ''`.
-  AIRC_LOGS_SINCE="$since" echo "$raw" | AIRC_LOGS_SINCE="$since" "$AIRC_PYTHON" -c "
-import sys, json, re, os
-from datetime import datetime, timezone, timedelta
-
-since_arg = os.environ.get('AIRC_LOGS_SINCE', '')
-since_dt = None
-if since_arg:
-    # Relative offset: <N><unit> where unit is s|m|h|d
-    m = re.fullmatch(r'(\d+)([smhd])', since_arg)
-    if m:
-        n, unit = int(m.group(1)), m.group(2)
-        delta = {'s': timedelta(seconds=n), 'm': timedelta(minutes=n),
-                 'h': timedelta(hours=n),   'd': timedelta(days=n)}[unit]
-        since_dt = datetime.now(timezone.utc) - delta
-    else:
-        # ISO timestamp — accept Z suffix or +00:00
-        try:
-            since_dt = datetime.fromisoformat(since_arg.replace('Z', '+00:00'))
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            sys.stderr.write(f\"airc logs --since: cannot parse '{since_arg}' (use ISO timestamp or 60s/5m/1h/2d)\n\")
-            sys.exit(2)
-
-for line in sys.stdin:
-    try:
-        m = json.loads(line.strip())
-        if since_dt is not None:
-            ts = m.get('ts', '')
-            if not ts:
-                continue
-            try:
-                msg_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                if msg_dt.tzinfo is None:
-                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            if msg_dt <= since_dt:
-                continue
-        print(f\"[{m.get('ts','')}] {m.get('from','?')}: {m.get('msg','')}\")
-    except Exception:
-        pass
-"
+  local json_flag=()
+  if [ "$output_json" -eq 1 ]; then
+    json_flag=(--json)
+  fi
+  echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs render \
+    --since "$since" \
+    --count "$count" \
+    "${json_flag[@]}"
 }
 
 cmd_inbox() {
