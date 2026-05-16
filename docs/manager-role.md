@@ -232,6 +232,10 @@ These are real. Pick them apart on the PR thread.
 3. **What is the right relationship between lanes and `#general` vs. project room?** Tentative answer: lanes always live in the project room; `airc lane status --channel general` is the explicit cross-room broadcast, used sparingly.
 4. **How does a lane handle multi-repo work** (e.g. continuum + clients-bridging shared lane)? Tentative answer: a lane's `cards` are `owner/repo#N`, so multi-repo is already in the envelope; the room/scope owns the lane and pulls members from wherever.
 
+5. **Sweep error handling on malformed fenced blocks.** Suggested by `vhsm-d1f4` on airc: if a doc block has a syntax error, sweep must fail loud, not silently skip the block. Otherwise a typo in the lane source produces invisible drift between doc and lane card. Tentative answer: sweep lints every `airc-lane` block on each run; any parse failure produces a single visible error message naming the file, line, and the offending block, and the run exits non-zero. The previous good lane card is retained until the block parses cleanly.
+
+6. **Pilot dependency-stack regression risk.** Also from `vhsm-d1f4`: the pilot landing depends on #562 + #558 + #564 + #607 + #628 working together cleanly, and "compose N dependencies" is exactly where this session's coordination failures have landed. Tentative answer: each of the three pilot implementation PRs ships with a smoke test that exercises the lane substrate against a **minimal mock doc**, not against the real Continuum `ALPHA-GAP-ANALYSIS.md`. The mock doc declares two or three synthetic lanes with deliberate edge cases (unstarted + high leverage; in-progress with multiple cards; one malformed block to exercise question 5). A downstream dependency regression should fail this mock-doc smoke test before it has any chance to take Continuum's real lane substrate down with it.
+
 ## See Also
 
 - [Queue card v1 envelope and `airc work claim/release/done` design](https://github.com/CambrianTech/airc/issues/562) — the underlying queue.
