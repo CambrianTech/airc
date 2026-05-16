@@ -460,14 +460,16 @@ cmd_logs() {
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
-  local json_flag=()
   if [ "$output_json" -eq 1 ]; then
-    json_flag=(--json)
+    echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs render \
+      --since "$since" \
+      --count "$count" \
+      --json
+    return
   fi
   echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs render \
     --since "$since" \
-    --count "$count" \
-    "${json_flag[@]}"
+    --count "$count"
 }
 
 cmd_inbox() {
