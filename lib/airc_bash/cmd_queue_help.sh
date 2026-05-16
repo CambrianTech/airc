@@ -367,6 +367,7 @@ airc queue metronome — configure automatic queue-next idle pulses
 
 USAGE
   airc queue metronome <owner/repo> [--interval 300] [--owner HANDLE] [--limit N]
+  airc queue metronome <owner/repo> --all [--interval 300] [--roster-window 86400]
   airc queue metronome status
   airc queue metronome off
 
@@ -379,10 +380,24 @@ DESCRIPTION
   That makes claimable work loud and addressed without waiting for a human
   to ask why agents are idle.
 
+  With --all (airc#607 / continuum#1192), the monitor fans the dispatch
+  out across every recent sender it has seen in this scope's message
+  log — closes the gap where a single-owner config could only ever feed
+  one agent while the rest of the room stayed idle.
+
 OPTIONS
   --interval <seconds>   Pulse cadence. Minimum 30s; default 300s.
   --owner <handle>       Agent/work identity used for claim suggestions.
-                         Default: current AIRC work identity.
+                         Default: current AIRC work identity. Mutually
+                         exclusive with --all.
+  --all, --roster        Fan-out mode: every pulse, iterate every recent
+                         sender in this scope's messages.jsonl and DM
+                         each one their next claimable card. Per-recipient
+                         dedup window = pulse interval, so a tight cadence
+                         can't double-ping the same agent.
+  --roster-window <sec>  How far back to look for "recent sender" when
+                         building the fan-out roster. Minimum 60s; default
+                         86400 (24h). Only meaningful with --all.
   --limit <N>            Max queue cards to scan per pulse (default 10).
   --repo-root <path>     Optional repo path for suggested lane commands.
   status                 Show current config.
@@ -394,6 +409,8 @@ NOTES
     exact next commands so agents can claim deliberately.
   - This is intentionally separate from plain `airc reminder`: reminders
     only say "you are silent"; metronome says "here is what to do next."
+  - Long-term, this dispatcher moves to a typed Rust substrate; see
+    airc#628 (Rust queue-dispatch port).
 EOF
 }
 

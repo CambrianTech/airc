@@ -1519,6 +1519,14 @@ _cmd_queue_metronome() {
   # Configure monitor-loop queue-next pulses. This is the automated half of
   # `queue next`: monitor can periodically call the same primitive and
   # broadcast candidates when an agent/session is quiet.
+  #
+  # airc#607 / continuum#1192 fan-out: when --all is set, the monitor
+  # consumer iterates the active channel roster (recent senders in this
+  # scope's messages.jsonl) and dispatches per agent — closes the gap
+  # where a single-owner metronome could only ever feed one agent and
+  # left the rest of the room idle. The longer-term Rust port lives in
+  # airc#628 (Rust queue-dispatch substrate); this bash branch is the
+  # bridge so the immediate UX bug isn't blocked on that lane.
   local target_repo=""
   local interval=300
   local owner=""
@@ -1526,6 +1534,8 @@ _cmd_queue_metronome() {
   local repo_root=""
   local off=0
   local status=0
+  local all_roster=0
+  local roster_window=86400
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1539,10 +1549,12 @@ _cmd_queue_metronome() {
       status)
         status=1
         ;;
-      --interval)  shift; interval="${1:-300}" ;;
-      --owner)     shift; owner="${1:-}" ;;
-      --limit)     shift; limit="${1:-10}" ;;
-      --repo-root) shift; repo_root="${1:-}" ;;
+      --interval)       shift; interval="${1:-300}" ;;
+      --owner)          shift; owner="${1:-}" ;;
+      --limit)          shift; limit="${1:-10}" ;;
+      --repo-root)      shift; repo_root="${1:-}" ;;
+      --all|--roster)   all_roster=1 ;;
+      --roster-window)  shift; roster_window="${1:-86400}" ;;
       -*) die "queue metronome: unknown flag: $1" ;;
       *)
         if [ -z "$target_repo" ]; then
@@ -1555,10 +1567,26 @@ _cmd_queue_metronome() {
     shift || true
   done
 
+  # --all is mutually exclusive with --owner: --all means "iterate the
+  # channel roster"; --owner means "always this one agent". Mixing them
+  # is ambiguous and likely an operator mistake (e.g. forgot to clear an
+  # old --owner). Refuse early so the config file never lands in a
+  # contradictory state the monitor would silently resolve one way.
+  if [ "$all_roster" -eq 1 ] && [ -n "$owner" ]; then
+    die "queue metronome: --all is mutually exclusive with --owner (got both: --owner $owner, --all)"
+  fi
+  case "$roster_window" in
+    ''|*[!0-9]*) die "queue metronome: --roster-window must be a positive integer seconds value (got: $roster_window)" ;;
+  esac
+  if [ "$roster_window" -lt 60 ]; then
+    die "queue metronome: --roster-window must be >= 60 seconds (got: $roster_window)"
+  fi
+
   local config_file="$AIRC_WRITE_DIR/queue_metronome"
 
   if [ "$off" -eq 1 ]; then
     rm -f "$config_file" "$AIRC_WRITE_DIR/queue_metronome_last"
+    rm -rf "$AIRC_WRITE_DIR/queue_metronome_recent"
     echo "  Queue metronome off."
     return 0
   fi
@@ -1595,7 +1623,13 @@ _cmd_queue_metronome() {
   if [ "$limit" -lt 1 ]; then
     die "queue metronome: --limit must be >= 1 (got: $limit)"
   fi
-  if [ -z "$owner" ]; then
+  # airc#607: the sentinel owner=*roster* tells the monitor consumer to
+  # enumerate recent senders from messages.jsonl rather than dispatch to
+  # one fixed agent. Operators opt in via --all; default stays single-
+  # agent to preserve existing behaviour for anyone scripting against it.
+  if [ "$all_roster" -eq 1 ]; then
+    owner='*roster*'
+  elif [ -z "$owner" ]; then
     owner=$(_airc_queue_resolve_name)
   fi
 
@@ -1606,11 +1640,22 @@ _cmd_queue_metronome() {
     printf 'owner=%s\n' "$owner"
     printf 'limit=%s\n' "$limit"
     printf 'repo_root=%s\n' "$repo_root"
+    printf 'roster_window=%s\n' "$roster_window"
   } > "$config_file"
   rm -f "$AIRC_WRITE_DIR/queue_metronome_last"
+  # Per-recipient dedup state lives under queue_metronome_recent/<name>.
+  # Wipe on reconfigure so the next pulse starts clean rather than
+  # silently suppressing recipients whose last-ping pre-dates the new
+  # cadence.
+  rm -rf "$AIRC_WRITE_DIR/queue_metronome_recent"
 
-  echo "  Queue metronome every ${interval}s for ${target_repo} as ${owner}."
-  echo "  Monitor will run: airc queue dispatch ${owner} ${target_repo}"
+  if [ "$all_roster" -eq 1 ]; then
+    echo "  Queue metronome every ${interval}s for ${target_repo}, fan-out across active roster (window ${roster_window}s)."
+    echo "  Monitor will run: airc queue dispatch <each-recent-sender> ${target_repo}"
+  else
+    echo "  Queue metronome every ${interval}s for ${target_repo} as ${owner}."
+    echo "  Monitor will run: airc queue dispatch ${owner} ${target_repo}"
+  fi
 }
 
 _cmd_queue_adopt() {
