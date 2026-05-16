@@ -211,6 +211,10 @@ transport adapters; consumers such as Continuum keep their canonical
 JTAG/EventBridge/GridFrame/LiveKit payloads. See
 [`docs/realtime-event-bus.md`](docs/realtime-event-bus.md).
 
+The first Rust crate, `crates/airc-core`, holds storage-neutral transcript,
+cursor, receipt, and attachment types. It is not wired into install yet; it is
+the typed contract that future CLI, ORM, and transport adapters should use.
+
 ## Rooms And Scope
 
 airc stores state in the current scope:
