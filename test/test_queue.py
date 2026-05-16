@@ -337,6 +337,38 @@ class QueuePlanTests(unittest.TestCase):
         self.assertIn("## Next actions", out)
         self.assertIn("Review/merge owner/repo#12", out)
 
+    def test_steward_json_proposes_queue_hygiene_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "steward", "owner/repo", "--owner", "codex-main", "--json"],
+                env_overrides=_isolated_env_with_plan_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["repo"], "owner/repo")
+        kinds = {action["kind"] for action in payload["actions"]}
+        self.assertIn("nudge-stale-claim", kinds)
+        self.assertIn("claim-ready-card", kinds)
+        self.assertNotIn("close-merged-card", kinds)
+        claim = next(action for action in payload["actions"] if action["kind"] == "claim-ready-card")
+        self.assertIn("airc queue claim 'owner/repo#11'", claim["command"])
+
+    def test_steward_human_is_read_only_and_action_oriented(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_airc(
+                ["queue", "pm", "owner/repo", "--owner", "codex-main"],
+                env_overrides=_isolated_env_with_plan_fake_gh(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn("# airc queue steward", out)
+        self.assertIn("## Proposed Steward Actions", out)
+        self.assertIn("mode: dry-run/read-only", out)
+        self.assertIn("nudge-stale-claim", out)
+        self.assertIn("claim-ready-card", out)
+
 
 class QueueAddValidationTests(unittest.TestCase):
     def test_missing_repo_fails(self) -> None:

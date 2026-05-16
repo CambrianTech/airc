@@ -8,6 +8,7 @@ airc queue — issue-backed work queue primitives (airc#562)
 USAGE
   airc queue [<owner/repo>] [--limit N] [--json]
   airc queue plan [<owner/repo>] [--limit N] [--json]
+  airc queue steward [<owner/repo>] [--stale-after 30m] [--json]
   airc queue add <owner/repo> --title "<one-line>" [card-fields...]
   airc queue list [<owner/repo>] [--owner X] [--status Y] [--limit N] [--json]
   airc queue claim <issue-url> [--owner X] [--status Y]
@@ -34,6 +35,7 @@ DESCRIPTION
 
 VERB SCOPE
   plan / priorities / kanban  Cohesive prioritized kanban for agents
+  steward / digest / pm       Dry-run PM digestion and queue hygiene
   add / list                   PR-1 (airc#566, merged)
   claim / release / set-status PR-2 (airc#568, merged)
   heartbeat / stale            Stale-claim liveness primitives (airc#572)
@@ -88,6 +90,34 @@ EXAMPLES
   airc queue
   airc queue plan CambrianTech/continuum
   airc queue plan --json | jq '.summary'
+EOF
+}
+
+_airc_queue_steward_help() {
+  cat <<'EOF'
+airc queue steward — dry-run PM digestion for queue hygiene
+
+USAGE
+  airc queue steward [<owner/repo>] [--stale-after 30m] [--limit N] [--owner HANDLE] [--json]
+  airc queue digest [<owner/repo>]
+  airc queue pm [<owner/repo>]
+
+DESCRIPTION
+  Read-only project-manager steward loop. It scans open airc-queue cards and
+  proposes concrete maintenance actions: nudge stale claims, claim ready cards,
+  fill missing next actions, review implicit P0s, detect overloaded owners, and
+  flag priority collapse when almost everything has become P0.
+
+  It does not mutate cards. The printed commands are recommendations that a
+  human, agent, or future policy engine can choose to run.
+
+OPTIONS
+  --repo <owner/repo>      Alternative way to specify repo.
+  --stale-after <dur>      Heartbeat threshold: 30m, 2h, 1d (default 30m).
+  --limit <N>              Max issues to fetch (default 100).
+  --owner <handle>         Owner used in suggested claim commands.
+  --json                   Emit machine-readable JSON.
+  -h, --help               This help.
 EOF
 }
 

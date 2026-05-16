@@ -85,6 +85,15 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
+# steward is the read-only PM digestion layer over the queue plan.
+if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_queue_steward.sh" ]; then
+  # shellcheck source=lib/airc_bash/cmd_queue_steward.sh
+  source "$_airc_lib_dir/airc_bash/cmd_queue_steward.sh"
+else
+  echo "ERROR: airc_bash/cmd_queue_steward.sh not found via lib-dir resolver." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 cmd_queue() {
   # Top-level router. Validate + dispatch to _cmd_queue_<subcommand>.
   local subcmd="${1:-}"
@@ -109,6 +118,9 @@ cmd_queue() {
       ;;
     plan|priorities|kanban)
       _cmd_queue_plan "$@"
+      ;;
+    steward|digest|pm)
+      _cmd_queue_steward "$@"
       ;;
     list|ls)
       _cmd_queue_list "$@"
