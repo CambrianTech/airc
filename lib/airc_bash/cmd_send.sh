@@ -162,7 +162,16 @@ cmd_send() {
   fi
 
   local first="${1:-}"
-  [ -z "$first" ] && die "Usage: airc send <message>  or  airc send @peer <message>"
+  # airc#644 PR-2 follow-up: --heartbeat is the one legitimate empty-body
+  # send. The signal is in the envelope metadata (kind=heartbeat + ts +
+  # from), not the msg body. Skip the usage-check for heartbeats so the
+  # reminder_timer_loop's 'cmd_send --heartbeat --internal ""' actually
+  # reaches the wire. Caught live 2026-05-17: PR-2 shipped but no
+  # heartbeats appeared in messages.jsonl after teardown+rejoin+75s wait
+  # because this usage-check was rejecting the empty body.
+  if [ -z "$first" ] && [ "$heartbeat" != "1" ]; then
+    die "Usage: airc send <message>  or  airc send @peer <message>"
+  fi
 
   # Multi-target DM: collect leading @-tokens (whitespace-separated)
   # and/or comma-separated peers within a single @-token. All forms
@@ -252,8 +261,12 @@ cmd_send() {
   # usage line but exited 0 (caught 2026-04-29). The
   # other "no message" path already dies above; this one is the
   # explicit-empty-string case that fell through.
-  [ "$peer_name" = "all" ] && [ -z "$msg" ] \
-    && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
+  #
+  # airc#644 PR-2: heartbeats are the one legitimate empty-body broadcast.
+  # Signal is in envelope metadata (kind/ts/from), not msg body. Exempt.
+  if [ "$peer_name" = "all" ] && [ -z "$msg" ] && [ "$heartbeat" != "1" ]; then
+    die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
+  fi
   ensure_init
 
   _airc_append_local_signed() {
