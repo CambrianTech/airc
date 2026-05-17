@@ -1,16 +1,29 @@
 """Envelope wrap/unwrap — the read/write seam for E2E-encrypted msg fields.
 
-The on-the-wire envelope shape after Phase E.3:
+The on-the-wire envelope shape after Phase E.3 + the kind-field add (#644):
     {
       "from":    "alpha",
       "to":      "bob"   | "all",
       "ts":      "2026-04-29T01:23:45Z",
       "channel": "general",
+      "kind":    "chat" | "heartbeat" | "system" | ... [optional, defaults to "chat"],
       "msg":     "<plaintext>" | "<base64-ciphertext>",
       "sig":     "...",                    # Ed25519 signature (existing)
       "enc":     "v1"          [optional], # marks msg as ciphertext
       "nonce":   "<base64>"    [optional]  # AEAD nonce, only when enc set
     }
+
+The `kind` field discriminates wire traffic for downstream filters:
+  - `chat` (default; back-compat for envelopes that omit the field) —
+    regular peer-authored message; renders in monitor UI.
+  - `heartbeat` — periodic liveness signal; filtered out of monitor UI;
+    used by `airc peers` to detect peer-process-down independently of
+    last-message-received. Per airc#644.
+  - `system` — protocol/lifecycle event (already used by --system sends).
+
+`kind` is bound by AEAD associated data — a transit attacker can't swap
+a `heartbeat` envelope's kind to `chat` (or vice versa) without
+invalidating the auth tag and forcing the receiver to drop.
 
 When `enc` is absent, the envelope is plaintext (current pre-Phase-E
 shape; preserved for backward compat with peers running older airc).
@@ -181,17 +194,26 @@ def _ad_fields(envelope: dict) -> dict:
     data. Anyone tampering with these on the wire invalidates the
     authentication tag and the receiver drops the message.
 
-    We bind: from, to, ts, channel — everything that the bearer or
-    a transit attacker might be tempted to swap. We do NOT bind sig
+    We bind: from, to, ts, channel, kind — everything that the bearer
+    or a transit attacker might be tempted to swap. We do NOT bind sig
     because sig is computed AFTER encryption (sig signs the ciphertext +
     metadata together) and binding it inside the AD would create a
     chicken-and-egg.
+
+    `kind` defaults to "chat" when absent. Binding the DEFAULT (not the
+    literal absence) keeps wire-compat with peers running envelopes
+    pre-#644: a peer running the old code emits no `kind`; both sides
+    AD-bind with `"chat"`, AEAD authenticates, message arrives. A peer
+    running the new code that wants to send a heartbeat emits
+    `kind="heartbeat"`; both sides bind with `"heartbeat"`, the same
+    way.
     """
     return {
         "from": envelope.get("from", ""),
         "to": envelope.get("to", ""),
         "ts": envelope.get("ts", ""),
         "channel": envelope.get("channel", ""),
+        "kind": envelope.get("kind", "chat"),
     }
 
 
