@@ -69,6 +69,16 @@ cmd_send() {
   # peers see lifecycle state on gh/local transports, but stamps from=airc
   # so monitor/inbox render it as a system notice instead of peer text.
   local system_event=0
+  # --heartbeat: periodic liveness signal (airc#644 PR-2). Like --system in
+  # that it uses the broadcast wire path, but UNLIKE --system in two ways:
+  #   (1) from stays as $my_name (each peer's heartbeats are attributed
+  #       to that peer; the whole point is per-peer process-down detection)
+  #   (2) the envelope's `kind` field is set to "heartbeat" so the
+  #       monitor formatter filters it out of UI rendering and cmd_peers
+  #       tracks it separately from chat (per airc_core.heartbeat)
+  # Empty msg body is intended — all the signal is in metadata (from + ts
+  # + kind).
+  local heartbeat=0
   # Final user-facing confirmation state. The transport branches below
   # may queue or fail after writing a loud diagnostic; the shared footer
   # must not print the same delivered arrow for those cases.
@@ -108,6 +118,14 @@ cmd_send() {
         shift ;;
       --system)
         system_event=1
+        internal=1
+        shift ;;
+      --heartbeat)
+        heartbeat=1
+        # --heartbeat implies --internal so a missing monitor doesn't
+        # produce noisy error output every 60s. Heartbeats are
+        # best-effort by design — one miss is fine, two misses is the
+        # PROCESS_DOWN signal anyway.
         internal=1
         shift ;;
       --plaintext|-plaintext)
@@ -296,6 +314,11 @@ cmd_send() {
   [ "$system_event" = "1" ] && from_name="airc"
   local payload="{\"from\":\"$from_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
   [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
+  # airc#644 PR-2: stamp kind=heartbeat when --heartbeat was passed so
+  # cmd_peers can track separately + monitor_formatter can filter from
+  # UI. Default kind (chat) is implicit — pre-#644 peers don't emit kind
+  # and downstream code treats absent kind as chat for back-compat.
+  [ "$heartbeat" = "1" ] && payload="${payload},\"kind\":\"heartbeat\""
   payload="${payload}}"
   local sig; sig=$(sign_message "$payload")
   local full_msg="${payload%?}"

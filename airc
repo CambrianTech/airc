@@ -2111,12 +2111,35 @@ reminder_timer_loop() {
   # reminder default: 300s.
   local recv_threshold=300
   local last_recv_warned=0
+
+  # Heartbeat cadence (airc#644 PR-2). Every HEARTBEAT_CADENCE seconds
+  # the loop emits a kind=heartbeat broadcast. Peers track these in
+  # `airc peers` SEPARATELY from chat — a silent peer with fresh
+  # heartbeats is alive but heads-down; a silent peer with stale
+  # heartbeats is process-down. Default 60s matches the constant in
+  # lib/airc_core/heartbeat.py (STALE_HEARTBEAT_SEC = 2x = 120s).
+  #
+  # Emission is best-effort via `airc msg --heartbeat`. If the send
+  # path fails (no bearer, gh rate-limited, etc.) the silence becomes
+  # the substrate's process-down signal anyway — the failure is
+  # self-recovering at the peer end.
+  local heartbeat_cadence=60
+  local last_heartbeat_sent=0
+
   while true; do
     sleep 5
     if ! kill -0 "$_parent_pid" 2>/dev/null; then
       return 0
     fi
     local now; now=$(date +%s)
+
+    # Heartbeat emit (airc#644 PR-2). Cheap: empty-body broadcast
+    # every 60s. Best-effort — exit-code ignored. Subshell + 2>/dev/null
+    # so a transient send failure doesn't pollute reminder loop output.
+    if [ "$(( now - last_heartbeat_sent ))" -ge "$heartbeat_cadence" ]; then
+      ( cmd_send --heartbeat --internal "" >/dev/null 2>&1 ) || true
+      last_heartbeat_sent="$now"
+    fi
 
     # Send-side reminder (existing behavior).
     local reminder_file="$AIRC_WRITE_DIR/reminder"
