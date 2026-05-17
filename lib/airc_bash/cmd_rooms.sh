@@ -632,7 +632,18 @@ if not peers_by_id:
 # fine — it's append-only and rotates at AIRC_LOG_MAX_LINES (5000
 # default), so the scan cost is bounded and we get the most recent
 # ts naturally as the loop terminates.
-last_seen = {}
+#
+# airc#644: track 'last_message' (kind=chat / no kind / system) and
+# 'last_heartbeat' (kind=heartbeat) SEPARATELY. A peer broadcasting
+# heartbeats but no chat is alive but heads-down; a peer with neither
+# is process-down. Pre-#644 peers emit no 'kind' field — their traffic
+# defaults to chat and rolls into last_message. last_heartbeat stays
+# None for legacy peers; we display 'unknown' rather than 'down' so
+# we don't false-positive on a partial rollout.
+last_message = {}
+last_heartbeat = {}
+HEARTBEAT_KIND = 'heartbeat'
+STALE_HEARTBEAT_SEC = 120  # 2x HEARTBEAT_CADENCE_SEC=60 per airc_core.heartbeat
 try:
     with open(messages_log) as f:
         for line in f:
@@ -644,31 +655,64 @@ try:
             if not who: continue
             ts = _epoch(m.get('ts'))
             if ts is None: continue
-            prev = last_seen.get(who)
-            if prev is None or ts > prev:
-                last_seen[who] = ts
+            kind = m.get('kind', 'chat')
+            if kind == HEARTBEAT_KIND:
+                prev = last_heartbeat.get(who)
+                if prev is None or ts > prev:
+                    last_heartbeat[who] = ts
+            else:
+                prev = last_message.get(who)
+                if prev is None or ts > prev:
+                    last_message[who] = ts
 except OSError:
     pass
 
+# Union: last_seen = max(last_message, last_heartbeat) for the existing
+# `last seen <age>` display column. The NEW columns are additive — they
+# show last_message and last_heartbeat distinctly when present.
+last_seen = dict(last_message)
+for who, hb_ts in last_heartbeat.items():
+    prev = last_seen.get(who)
+    if prev is None or hb_ts > prev:
+        last_seen[who] = hb_ts
+
 # Render. Each peer once, with room annotations + last-seen marker.
-# Silent >1h gets a (silent) flag so the eye catches it immediately.
+# Silent flag distinguishes three cases (airc#644):
+#   - heartbeat fresh (<= STALE_HEARTBEAT_SEC): peer alive but quiet
+#     → '(silent, heartbeat OK)' — heads-down working, no false alarm.
+#   - heartbeat stale (> STALE_HEARTBEAT_SEC): peer's airc process down
+#     → '(PROCESS DOWN)' — substrate-detected; the room can trust this.
+#   - heartbeat absent: legacy peer or unknown
+#     → '(silent)' — pre-#644 behaviour preserved.
 #
 # Track which paired-record names we've already rendered so the
 # broadcast-peer pass below doesn't double-list them.
 rendered = set()
 for (name, host), rooms in sorted(peers_by_id.items()):
-    seen = set(); ordered = []
+    seen_rooms = set(); ordered = []
     for r in rooms:
-        if r not in seen:
-            ordered.append(r); seen.add(r)
+        if r not in seen_rooms:
+            ordered.append(r); seen_rooms.add(r)
     tags = ', '.join('#' + r for r in ordered)
     last_ts = last_seen.get(name)
     age_str = _fmt_age(last_ts)
+    hb_ts = last_heartbeat.get(name)
+    hb_age = (now - hb_ts) if hb_ts is not None else None
     silent_flag = ''
-    if last_ts is not None and (now - last_ts) > 3600:
-        silent_flag = ' (silent)'
-    elif last_ts is None:
+    if last_ts is None:
         silent_flag = ' (no recorded activity)'
+    elif (now - last_ts) > 3600:
+        # Long-quiet peer: differentiate using heartbeat.
+        if hb_age is None:
+            silent_flag = ' (silent)'  # legacy peer, can't tell
+        elif hb_age <= STALE_HEARTBEAT_SEC:
+            silent_flag = ' (silent, heartbeat OK)'  # alive but heads-down
+        else:
+            silent_flag = ' (PROCESS DOWN)'  # stale heartbeat
+    elif hb_age is not None and hb_age > STALE_HEARTBEAT_SEC:
+        # Recent chat but stale heartbeat — probably the agent stopped
+        # in the middle of a session. Surface but don't be alarmist.
+        silent_flag = ' (heartbeat stale)'
     print(f'  {name} → {host}   [{tags}]   last seen {age_str}{silent_flag}')
     rendered.add(name)
 
