@@ -261,8 +261,12 @@ cmd_send() {
   # usage line but exited 0 (caught 2026-04-29). The
   # other "no message" path already dies above; this one is the
   # explicit-empty-string case that fell through.
-  [ "$peer_name" = "all" ] && [ -z "$msg" ] \
-    && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
+  #
+  # airc#644 PR-2: heartbeats are the one legitimate empty-body broadcast.
+  # Signal is in envelope metadata (kind/ts/from), not msg body. Exempt.
+  if [ "$peer_name" = "all" ] && [ -z "$msg" ] && [ "$heartbeat" != "1" ]; then
+    die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
+  fi
   ensure_init
 
   _airc_append_local_signed() {
