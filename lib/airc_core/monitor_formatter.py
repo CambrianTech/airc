@@ -431,6 +431,18 @@ def run(my_name: str, peers_dir: str) -> int:
         if m.get("airc_heartbeat") == 1:
             _arm_watchdog()
             continue
+        # airc#644 PR-2: peer-emitted heartbeats (kind=heartbeat). Different
+        # from the internal `airc_heartbeat` field above (that one is a
+        # local-loop signal for THIS process's watchdog). kind=heartbeat is
+        # a remote peer signalling "I'm alive" on the wire; consumed by
+        # cmd_peers (PR-1) for cross-peer process-down detection. The
+        # formatter is the UI layer — heartbeats are protocol traffic,
+        # never user-visible — so we filter them out here AND arm the
+        # watchdog like we do for local heartbeats (any inbound traffic
+        # proves the bearer is alive, including remote heartbeats).
+        if m.get("kind") == "heartbeat":
+            _arm_watchdog()
+            continue
         fr = m.get("from", "?")
         to = m.get("to", "")
         # Phase E.3: decrypt envelope-layer ciphertext if present. Drop
