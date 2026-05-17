@@ -669,8 +669,15 @@ except OSError:
     pass
 
 # Union: last_seen = max(last_message, last_heartbeat) for the existing
-# `last seen <age>` display column. The NEW columns are additive — they
+# 'last seen <age>' display column. The NEW columns are additive — they
 # show last_message and last_heartbeat distinctly when present.
+#
+# Note: single-quotes (not backticks) on purpose. This Python code is
+# embedded in a bash double-quoted string; bash interprets backticks
+# as command substitution inside double quotes EVEN INSIDE python-quoted
+# regions because bash parses the outer string before python sees it.
+# Caught live on canary install 2026-05-17: PR-1 (#645) shipped with
+# a backtick in this comment which broke airc peers in production.
 last_seen = dict(last_message)
 for who, hb_ts in last_heartbeat.items():
     prev = last_seen.get(who)
