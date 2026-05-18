@@ -30,9 +30,11 @@
 use serde::{Deserialize, Serialize};
 
 pub mod fs;
+pub mod gc;
 pub mod hash;
 
 pub use fs::FsStore;
+pub use gc::{run as gc_run, GcReport, RetentionPolicy};
 pub use hash::ContentHash;
 
 // ─── Errors ───────────────────────────────────────────────────────────
