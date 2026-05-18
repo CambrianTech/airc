@@ -363,6 +363,27 @@ content-addressed ids for events (those are for blobs only via
 ContentHash). Identifier discipline = UUIDv4 everywhere for the
 runtime, content-hash for blobs.
 
+**Names vs identity:** human-readable names (`#general`, `helper`,
+`foundry-mac`, `forge.work.offer`) remain throughout the system, but
+they are **mutable handles** on top of immutable UUIDv4 identity. A
+channel `#general` is displayed by name but referenced internally by
+its `ChannelId(Uuid)`. A peer `helper` is the same identity even after
+a `NICK` rename. Renaming a forge contract from `work.offer` to
+`work.bid` is a name-layer concern; the internal UUIDs that referenced
+it stay valid.
+
+The full UUIDv4 application list (consumer + substrate):
+
+- identities (humans, personas, agents, devices, machines)
+- channels / activities / rooms
+- envelopes / events
+- blobs / manifests (blob content addressed by ContentHash; the
+  manifest handle is a UUIDv4)
+- sessions / calls (WebRTC + signaling correlation)
+- commands / tasks (RPC correlation across peers)
+- replay fixtures (consumer-side — continuum's persona-turn replays)
+- work leases (resource admission tied to a UUID lease handle)
+
 ## Names + identity (no env-var hacks)
 
 `get_nick` (Rust port of today's `get_name`) auto-derives based on
