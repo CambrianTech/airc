@@ -1,0 +1,91 @@
+name: rust
+
+# Quality gates for the airc-rust workspace (anything under `crates/`).
+#
+# Three jobs on every PR + push touching Rust:
+#   fmt      — `cargo fmt --check` (no formatter drift)
+#   clippy   — `cargo clippy --all-targets --all-features -- -D warnings`
+#              (zero clippy warnings, treat all as errors)
+#   test     — `cargo test --all-features` (every test green)
+#
+# Per Joel's direction (2026-05-18): "use rust conventions and obsession
+# with tests. clippy, fmt etc." These three gates are the substrate-quality
+# bar every airc-rust PR clears before merge.
+#
+# The clean-install / install.sh smoke jobs in ci.yml continue to validate
+# the Python+bash install path; this workflow specifically gates the
+# Rust workspace as it grows.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  push:
+    branches: [canary, main, rust-rewrite]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add clippy
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+      - name: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
