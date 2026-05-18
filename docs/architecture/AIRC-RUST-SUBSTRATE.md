@@ -348,6 +348,43 @@ Identity material:
   `pii=true` (via the `body_hint`) which triggers extra retention/
   redaction policy. Audit log marks redaction events.
 
+## Contract layer: forge-alloy (and why it isn't a dependency here)
+
+airc-rust is the substrate: it owns identity, channels, transport, auth,
+blobs, presence, delivery, and replay. It does **not** know domain
+contracts such as `work.offer`, `render.request`, `model.infer`,
+`persona.turn`, or `forge.persona.turn` — it only carries typed
+envelopes and opaque payload bodies.
+
+Domain contracts live one layer above. **forge-alloy** is the natural
+home: an alloy defines the schema, required capabilities, permissions,
+lifecycle states, valid replies, validation rules, replay semantics, and
+compatibility rules for a payload. AIRC envelopes MAY include a
+`body_hint` such as `forge.work.offer` when the body conforms to a known
+alloy.
+
+**The hint is just an opaque string from airc-rust's perspective.**
+airc-rust does not depend on forge-alloy, does not import alloy schemas,
+and does not validate bodies against them. It routes and filters
+envelopes on the hint string (peers subscribe by exact match or prefix,
+e.g. `forge.work.*`); consumers that recognize the hint look up their
+own schemas. Envelopes without a hint are plain payloads; the substrate
+routes them the same way.
+
+Consumers such as Continuum personas, foundry nodes, render boxes, game
+lobbies, and IRC-style clients speak alloyed contracts over airc-rust.
+Peers that do not support the hinted alloy may ignore the event, log it,
+surface the raw body, or apply their own consumer behavior. The
+substrate only delivers; semantic interpretation lives at the
+consumer/alloy layer.
+
+This boundary is load-bearing for the project:
+- airc-rust stays generic and shippable independent of any alloy work
+- forge-alloy can evolve schemas without recompiling airc-rust
+- New consumer ecosystems (game lobbies, IoT meshes, scientific compute
+  rings) can use entirely different alloy vocabularies over the same
+  substrate without coordination
+
 ## How consumers plug in
 
 Any consumer — Continuum, OpenClaw, Hermes, a CLI client, a CI bot,
