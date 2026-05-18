@@ -33,11 +33,7 @@ pub struct TranscriptPage {
 }
 
 /// Fetch the most recent `limit` events for the room, ordered.
-pub fn page_recent(
-    room_id: RoomId,
-    events: &[TranscriptEvent],
-    limit: usize,
-) -> TranscriptPage {
+pub fn page_recent(room_id: RoomId, events: &[TranscriptEvent], limit: usize) -> TranscriptPage {
     let mut page_events = events.to_vec();
     page_events.sort_by(event_order);
     if page_events.len() > limit {
@@ -86,10 +82,7 @@ fn cursor_before(left: &TranscriptCursor, right: &TranscriptCursor) -> bool {
 /// Total event order: lamport first, then event_id alphabetically.
 /// Public-but-not-API: callers should sort via `page_recent` / `page_before`
 /// rather than reach in here.
-pub(crate) fn event_order(
-    left: &TranscriptEvent,
-    right: &TranscriptEvent,
-) -> std::cmp::Ordering {
+pub(crate) fn event_order(left: &TranscriptEvent, right: &TranscriptEvent) -> std::cmp::Ordering {
     left.lamport
         .cmp(&right.lamport)
         .then_with(|| left.event_id.0.cmp(&right.event_id.0))
@@ -99,78 +92,65 @@ pub(crate) fn event_order(
 mod tests {
     use super::*;
     use crate::body::Body;
-    use crate::filter::SelfFilter;
     use crate::ids::{ClientId, PeerId};
     use crate::transcript::{MentionTarget, TranscriptKind};
 
-    fn event(id: &str, lamport: u64, peer: &str, client: &str) -> TranscriptEvent {
+    /// Test helper: construct a transcript event with deterministic
+    /// UUID ids derived from the lamport. Deterministic so test
+    /// assertions are stable across runs.
+    fn event_at(lamport: u64, peer_seed: u128, client_seed: u128) -> TranscriptEvent {
         TranscriptEvent {
-            event_id: EventId(id.to_string()),
-            room_id: RoomId("general".to_string()),
-            peer_id: PeerId(peer.to_string()),
-            client_id: ClientId(client.to_string()),
+            event_id: EventId::from_u128(lamport as u128),
+            room_id: RoomId::from_u128(0xc0ffee),
+            peer_id: PeerId::from_u128(peer_seed),
+            client_id: ClientId::from_u128(client_seed),
             kind: TranscriptKind::Message,
             occurred_at_ms: 1_700_000_000_000 + lamport,
             lamport,
             target: MentionTarget::All,
-            body: Some(Body::text(format!("message {id}"))),
+            body: Some(Body::text(format!("message at lamport {lamport}"))),
             attachment: None,
             receipt: None,
             metadata: serde_json::json!({}),
         }
     }
 
-    // Suppress unused warning from `SelfFilter` import used by sibling
-    // crate::filter tests but not directly here.
-    #[allow(dead_code)]
-    const _: SelfFilter = SelfFilter::IncludeAll;
-
     #[test]
     fn recent_page_is_ordered_and_cursor_backed() {
-        let events = vec![
-            event("e3", 3, "a", "a1"),
-            event("e1", 1, "a", "a1"),
-            event("e2", 2, "b", "b1"),
-        ];
+        let e1 = event_at(1, 0xaa, 0xa1);
+        let e2 = event_at(2, 0xbb, 0xb1);
+        let e3 = event_at(3, 0xaa, 0xa1);
+        let room = RoomId::from_u128(0xc0ffee);
+        let events = vec![e3.clone(), e1.clone(), e2.clone()];
 
-        let page = page_recent(RoomId("general".to_string()), &events, 2);
+        let page = page_recent(room, &events, 2);
 
-        assert_eq!(
-            page.events
-                .iter()
-                .map(|e| &e.event_id.0)
-                .collect::<Vec<_>>(),
-            vec!["e2", "e3"]
-        );
-        assert_eq!(page.older.unwrap().event_id.0, "e2");
-        assert_eq!(page.newer.unwrap().event_id.0, "e3");
+        let ids: Vec<_> = page.events.iter().map(|e| e.event_id).collect();
+        assert_eq!(ids, vec![e2.event_id, e3.event_id]);
+        assert_eq!(page.older.unwrap().event_id, e2.event_id);
+        assert_eq!(page.newer.unwrap().event_id, e3.event_id);
     }
 
     #[test]
     fn older_page_uses_cursor_not_file_tail() {
-        let events = vec![
-            event("e1", 1, "a", "a1"),
-            event("e2", 2, "b", "b1"),
-            event("e3", 3, "c", "c1"),
-            event("e4", 4, "d", "d1"),
-        ];
+        let e1 = event_at(1, 0xaa, 0xa1);
+        let e2 = event_at(2, 0xbb, 0xb1);
+        let e3 = event_at(3, 0xcc, 0xc1);
+        let e4 = event_at(4, 0xdd, 0xd1);
+        let room = RoomId::from_u128(0xc0ffee);
+        let events = vec![e1, e2.clone(), e3.clone(), e4.clone()];
 
         let page = page_before(
-            RoomId("general".to_string()),
+            room,
             &events,
             &TranscriptCursor {
                 lamport: 4,
-                event_id: EventId("e4".to_string()),
+                event_id: e4.event_id,
             },
             2,
         );
 
-        assert_eq!(
-            page.events
-                .iter()
-                .map(|e| &e.event_id.0)
-                .collect::<Vec<_>>(),
-            vec!["e2", "e3"]
-        );
+        let ids: Vec<_> = page.events.iter().map(|e| e.event_id).collect();
+        assert_eq!(ids, vec![e2.event_id, e3.event_id]);
     }
 }

@@ -48,9 +48,7 @@ impl Body {
     /// any other shape (binary, JSON without text field, etc.).
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Body::Json(serde_json::Value::Object(map)) => {
-                map.get("text").and_then(|v| v.as_str())
-            }
+            Body::Json(serde_json::Value::Object(map)) => map.get("text").and_then(|v| v.as_str()),
             Body::Json(serde_json::Value::String(s)) => {
                 // Backward-compat: legacy bare-string payloads still
                 // surface as text.

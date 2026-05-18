@@ -76,18 +76,13 @@ impl TranscriptEvent {
     pub fn cursor(&self) -> TranscriptCursor {
         TranscriptCursor {
             lamport: self.lamport,
-            event_id: self.event_id.clone(),
+            event_id: self.event_id,
         }
     }
 
     /// Is this event from the receiver's own peer/client (and should be
     /// filtered from display per the filter mode)?
-    pub fn is_self_echo(
-        &self,
-        peer_id: &PeerId,
-        client_id: &ClientId,
-        filter: SelfFilter,
-    ) -> bool {
+    pub fn is_self_echo(&self, peer_id: &PeerId, client_id: &ClientId, filter: SelfFilter) -> bool {
         match filter {
             SelfFilter::IncludeAll => false,
             SelfFilter::ExcludeSameClient => &self.client_id == client_id,

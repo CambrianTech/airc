@@ -53,8 +53,9 @@ mod tests {
 
     #[test]
     fn machine_readable_serde() {
+        let file_id = FileId::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
         let manifest = AttachmentManifest {
-            file_id: FileId("file-1".to_string()),
+            file_id,
             name: "trace.json".to_string(),
             media_type: Some("application/json".to_string()),
             size_bytes: 42,
@@ -65,7 +66,8 @@ mod tests {
 
         let encoded = serde_json::to_value(&manifest).unwrap();
 
-        assert_eq!(encoded["file_id"], "file-1");
+        // file_id serializes as the canonical hyphenated UUID string.
+        assert_eq!(encoded["file_id"], "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(encoded["content_hash"], "sha256:abc");
         assert_eq!(encoded["size_bytes"], 42);
     }
