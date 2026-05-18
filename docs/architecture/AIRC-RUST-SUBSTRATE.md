@@ -225,7 +225,12 @@ remain valid; scrollback queries that hit pre-drain ranges
 transparently consult the archive partition. Active DB stays
 bounded → constant query performance.
 
-## Transport resolver
+## Transport resolver (adapter pattern, replaceable mid-life)
+
+Same adapter discipline used everywhere else in our stack — inference
+providers in continuum, model registry candidates in Lane A, storage
+adapters in zsm-server, FFI surfaces in vHSM. airc-transport is
+another instance of the same craft.
 
 `airc-transport::Resolver` picks a transport per recipient by
 capability + reachability:
@@ -239,11 +244,71 @@ capability + reachability:
 
 Same-host peers **never round-trip through gh**. Today's "gh-only
 post-Phase-3c" decision is reverted with a proper bearer registry.
-gh-gist stays as a legacy bridge for cross-network peers who haven't
-paired via Tailscale yet, but it's not the only transport.
+gh-gist stays as a legacy bearer for cross-network peers who haven't
+paired via Tailscale yet, but it's not the only one.
 
-Each transport is a `Transport` trait impl exposing `send(envelope)`
-and `receive() -> Stream<Envelope>`. The resolver multiplexes.
+### Trait shape
+
+```rust
+pub trait Transport: Send + Sync {
+    fn id(&self) -> TransportId;
+    fn capabilities(&self) -> TransportCapabilities;
+    async fn send(&self, env: Envelope) -> Result<()>;
+    fn receive(&self) -> BoxStream<'static, Envelope>;
+    async fn health(&self) -> TransportHealth;
+}
+
+pub trait Bearer: Transport {
+    // Bearer-specific: durable cross-network store-and-forward.
+    // gh-gist is a Bearer; lan-tcp is a Transport but not a Bearer.
+    async fn fetch_since(&self, channel: ChannelId, cursor: Cursor)
+        -> Result<Vec<Envelope>>;
+    async fn ack(&self, sig: Signature) -> Result<()>;
+}
+```
+
+Transports register at runtime via a registry. The resolver multiplexes;
+each peer pair holds a list of viable transports sorted by preference.
+
+### Resilient to bearer changes
+
+The point: when gh-gist stops being viable (rate limits get worse,
+GitHub deprecates gists, our trust assumptions shift, whatever) —
+we **don't get stuck**. Adapter design means:
+
+- Roll a new bearer (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
+  our own continuum-hosted store-and-forward) — implement the `Bearer`
+  trait, register it. Existing peer pairings auto-discover the new
+  bearer via the registry handshake.
+- Offer multiple bearers simultaneously — peers pick by health +
+  policy. Bearer-A goes down, traffic shifts to Bearer-B without
+  consumer involvement.
+- Deprecate a bearer gradually — mark it `deprecated_after_ts`; new
+  pairings prefer alternatives; existing pairings get a structured
+  "your transport is sunsetting" event so consumers can re-pair.
+- Hot-swap mid-life — the resolver re-evaluates on every send; a
+  bearer added at runtime is usable immediately, no restart.
+
+Same pride as the rest of the stack. No transport is a hard
+dependency. Whatever ships first is replaceable later.
+
+### Planned bearers / transports
+
+In the doc as anchors; not all in the v1 ship:
+
+- `local-fs` — same-host, same-scope. Ship v1.
+- `lan-tcp` — same-LAN direct. Ship v1.
+- `tailscale` — cross-network mesh. Ship v1.
+- `gh-gist` — legacy bridge. Ship v1 (for migration); deprecate
+  when we have a non-gh cross-network bearer.
+- `airc-relay` — own-hosted cross-network store-and-forward. Future
+  ship; the gh-gist replacement.
+- `reticulum` — Mark Qvist's mesh networking stack. Future plugin.
+  Useful for unreliable / radio / off-grid mesh.
+- `nats` or `mqtt` — for ops integration where consumers already run
+  a broker. Future plugin.
+- `webrtc-data-channel` — direct browser ↔ desktop without TURN.
+  Future plugin.
 
 ## Names + identity (no env-var hacks)
 
@@ -301,34 +366,163 @@ Consumers define their own payload schemas (commands, recipes,
 typed events, replay records, telemetry, whatever) inside the body.
 airc has no opinion.
 
-## WebRTC efficiency (airc as network-substrate)
+## Fast UDP (airc as network-substrate, not just chat)
 
-WebRTC needs efficient UDP across the same boundary airc already owns
-(peer addressing, NAT traversal, encryption keys). Punting that to
-consumers means every consumer that wants real-time A/V re-implements
-ICE candidate gathering, TURN fallback, STUN reachability. That's
-substrate-level work; airc handles it.
+A generic fast-UDP path is substrate-level work. WebRTC needs it
+(real-time A/V across NATs), game servers need it (Call-of-Duty-style
+match-state sync at 60 Hz), multiplayer simulations need it (player
+position, projectile state), some IoT meshes need it. Every one of
+those consumers re-implementing ICE candidate gathering, NAT traversal,
+TURN fallback, STUN reachability, and UDP multiplexing is the wrong
+factoring. airc owns the network primitive once; consumers ride it.
 
-`airc-rtc` crate ships:
-- ICE candidate gathering reusing airc's transport reachability data
-  (we already know which peers are LAN-direct vs Tailscale vs
-  gh-bridge; ICE candidates derive from the same probe)
-- UDP socket multiplexing alongside airc control traffic
-- STUN/TURN integration (consumer can provide their own TURN server
-  or use a default airc-supplied one for the mesh)
-- webrtc-rs as the underlying media-engine integration
-- Per-stream key derivation from the airc identity ratchet (same
-  forward-secrecy properties as airc messages)
+`airc-rtc` crate (rename pending — the WebRTC-flavored name oversells
+it) ships:
+- **UDP socket multiplexing** alongside airc control traffic on the
+  same bound port. Connectionless. Low latency.
+- **ICE candidate gathering** reusing airc's transport reachability
+  data (we already know which peers are LAN-direct vs Tailscale vs
+  gh-bridge; the candidate list derives from the same probe).
+- **STUN/TURN integration** for cross-NAT reachability. Consumer can
+  provide its own TURN server or use a default airc-supplied one for
+  the mesh.
+- **NAT traversal + hole-punching** as a peer pair handshake. Same
+  primitive whether the packets are WebRTC SRTP, Call-of-Duty match
+  state, or anything else.
+- **Per-stream key derivation** from the airc identity ratchet (same
+  forward-secrecy properties as airc messages — and consistent
+  across all fast-UDP consumers).
+- **webrtc-rs** as one integration option for consumers that want
+  the full WebRTC stack. Game servers wanting raw UDP-with-sequence
+  use the lower-level API directly.
 
-Consumers hand `airc-rtc` media tracks (audio/video frames or pre-
-encoded media); it handles peer-direct UDP where possible, falls back
-to TURN-relay when NATs require it. The signaling (SDP/ICE) flows as
-airc events alongside; airc-rtc and the consumer's signaling handler
-share the same envelope substrate.
+Consumers hand `airc-rtc` either media tracks (audio/video frames)
+or raw UDP messages (game-state diffs, multiplayer events). It
+handles peer-direct UDP where possible, falls back to TURN-relay
+when NATs require it. The signaling (SDP/ICE for WebRTC; lobby/match
+state for games) flows as airc events alongside on the regular
+TCP/gh/local channels.
 
-This is what "network related and fine" means for WebRTC: the
-substrate owns the network primitive even though the application
-owns what the media bytes represent.
+This is what "network related and fine" means: the substrate owns
+the network primitive even though the application owns what the
+bytes represent.
+
+## Reliability + connection health
+
+The substrate is operational infrastructure. It must keep connections
+alive, detect failures fast, reestablish without manual intervention.
+
+Built-in primitives:
+
+- **Keep-alive heartbeats** at the transport layer, separate from
+  application heartbeats. Configurable cadence per transport (more
+  frequent for UDP/RTC paths, slower for gh-gist).
+- **Dead-host detection**: if N consecutive heartbeats fail, the
+  peer is marked degraded; if N+M, marked dead. Subscribers get an
+  event; consumer can decide whether to fail-over to backup peers.
+- **Auto-reconnect with backoff**: when a transport reports failure,
+  airc-transport retries with exponential backoff. State (cursors,
+  subscriptions, pending sends) survives the reconnect.
+- **Self-healing host migration**: when the channel host evicts
+  (today's `[HOST EVICTED]` flow), airc-rust formalizes the
+  re-host election. Cursors and pending sends migrate to the new
+  host transparently; consumers see a structured event, not a
+  protocol fault.
+- **Message durability across reconnect**: pending sends queue in
+  `airc-store`; the daemon retries on reconnect. Loss is loud (event
+  + audit-log entry) not silent.
+- **Health probes**: `airc doctor --health` returns structured
+  status: per-transport state, last-recv timestamps, peer
+  reachability matrix, queue depths. The same data is queryable
+  programmatically by consumers.
+
+**Reticulum alignment**: Mark Qvist's [Reticulum Network Stack](https://reticulum.network)
+solves a similar shape — distributed network substrate, identity-
+addressable, transport-agnostic, designed for unreliable links.
+airc-rust's transport layer is structured to allow `airc-transport-
+reticulum` as a future plugin. When it lands, the airc-substrate API
+doesn't change — Reticulum just becomes another transport the
+resolver can pick, with its own reachability properties (e.g.
+"reticulum: works over LoRa / amateur radio when other transports
+have no path").
+
+## Security
+
+Beyond per-message encryption (handled by the double-ratchet section
+above), the substrate enforces operational safety:
+
+- **Identity attestation**: pairing produces a signed envelope
+  binding pubkey → nick → role → first-seen ts → paired-with-pubkey.
+  Re-pair under the same pubkey is a non-event; re-pair under a
+  DIFFERENT pubkey for the same nick surfaces an "identity changed"
+  warning event so consumers can re-verify.
+- **Allowlist / blocklist** on the peer registry. Untrusted peers
+  get sandboxed: their messages land in a quarantine channel
+  consumers explicitly opt into.
+- **Rate limiting** per peer per channel. Misbehaving peers (flood,
+  burst, malformed envelopes) get throttled by the receiving daemon;
+  events fan out so subscribers can decide policy.
+- **Untrusted-payload handling**: airc never executes a payload.
+  Body interpretation is consumer-level. The substrate guarantees
+  delivery integrity (signature verified, AEAD intact, hop authentic)
+  but makes no claim about payload safety. Consumers that process
+  untrusted payloads (RPC handlers, code execution, etc.) own
+  sandboxing.
+- **No-PII guarantee**: airc-store doesn't index on body content.
+  Consumers can opt into a per-message PII flag that triggers
+  shorter retention + audit-trail-only access. Default storage is
+  "structured envelope metadata + opaque body" — no body scanning,
+  no body indexing, no body-derived analytics.
+- **Hardware-backed identity** where available: macOS Secure Enclave
+  (Touch ID-protected signing), Windows TPM, Linux TPM2 / fTPM. Key
+  material never leaves the secure element. Pairing flow attests
+  hardware-rooted vs software-only.
+- **Audit log**: every key rotation, pairing, host migration,
+  rate-limit trip, and redaction event lands in an append-only audit
+  table separate from message storage. Operators can query the audit
+  log without touching message content.
+
+The threat model airc-rust defends against:
+- Network attacker (passive or active) reading or tampering with
+  on-wire traffic → defeated by AEAD + ratchet
+- Compromised peer impersonating another peer → defeated by
+  identity attestation; old keys can't replay as new identity
+- Forward-secrecy compromise (long-term key theft) → defeated by
+  double-ratchet per-message keys
+- Malicious peer flooding a channel → mitigated by rate limiting
+- Lost / stolen device → SQLCipher at-rest + Secure-Enclave-bound
+  keys mean local DB + identity remain protected without the
+  device unlocked
+- Malicious payload from an authorized peer → NOT defended at
+  substrate level; consumer responsibility
+
+## Beyond chat: airc-rust as a generic substrate
+
+The protocol primitives (peers, rooms, messages, events, signaling,
+file transfer, fast UDP) are not chat-specific. Consumer patterns
+beyond chat:
+
+- **Game lobby + match coordination**: rooms = lobbies, peers =
+  players, fast-UDP = match state, events = "player joined" / "match
+  starting" / "kill confirmed" / etc. Call-of-Duty-shaped servers
+  fit the same substrate that runs an IRC bot.
+- **Distributed scientific compute**: rooms = experiment cohorts,
+  events = task dispatched / result ready / worker failed, file
+  transfer = result-dataset shipment.
+- **IoT mesh**: rooms = device groups, events = sensor reading
+  bursts, fast-UDP = real-time telemetry, Reticulum transport when
+  links are unreliable.
+- **Multiplayer simulations / virtual worlds**: rooms = world
+  partitions, fast-UDP = entity state sync, events = world events,
+  file transfer = world-asset distribution.
+- **Persona / agent ecosystems**: rooms = team rooms, peers =
+  agents/personas/humans, events = "is thinking" indicators,
+  commands = JSON RPC inside messages.
+
+The chat-shaped consumer (IRC client, automation bot, persona) is
+the simplest case. Game/sim/IoT cases use more of the fast-UDP path
+and less of the durable-scrollback path; both share the same
+substrate primitives.
 
 ## Migration phases
 
