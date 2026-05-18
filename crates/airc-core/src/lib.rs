@@ -18,6 +18,7 @@
 //! - [`receipt`]    — delivered/read/applied acknowledgments
 //! - [`attachment`] — file-attachment manifest (consumer-side richer view)
 //! - [`filter`]     — self-echo filtering for multi-tab consumers
+//! - [`headers`]    — envelope headers for routing/filtering without body parse
 //!
 //! Every public type a consumer needs is re-exported at the crate root so
 //! `use airc_core::Identity;` works without knowing the module split.
@@ -26,6 +27,7 @@ pub mod attachment;
 pub mod body;
 pub mod cursor;
 pub mod filter;
+pub mod headers;
 pub mod identity;
 pub mod ids;
 pub mod receipt;
@@ -39,6 +41,7 @@ pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use filter::{filter_self_echoes, SelfFilter};
+pub use headers::{HeaderFilter, Headers};
 pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
 pub use receipt::{Receipt, ReceiptKind};

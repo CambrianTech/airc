@@ -60,6 +60,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000 + lamport,
             lamport,
             target: MentionTarget::All,
+            headers: Default::default(),
             body: Some(Body::text(format!("message {seed:x}"))),
             attachment: None,
             receipt: None,
