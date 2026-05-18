@@ -44,6 +44,7 @@ pub fn filter_self_echoes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::Body;
     use crate::ids::{EventId, RoomId};
     use crate::transcript::{MentionTarget, TranscriptKind};
 
@@ -57,7 +58,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000 + lamport,
             lamport,
             target: MentionTarget::All,
-            body: Some(format!("message {id}")),
+            body: Some(Body::text(format!("message {id}"))),
             attachment: None,
             receipt: None,
             metadata: serde_json::json!({}),

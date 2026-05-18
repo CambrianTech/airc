@@ -12,6 +12,7 @@
 //!
 //! - [`ids`]        — newtype wrappers for identifier strings
 //! - [`identity`]   — the per-peer Identity card (the user/account abstraction)
+//! - [`body`]       — opaque payload (Json | Binary) consumers carry
 //! - [`transcript`] — TranscriptEvent + TranscriptKind + MentionTarget
 //! - [`cursor`]     — cursor + paging primitives for transcript fetch
 //! - [`receipt`]    — delivered/read/applied acknowledgments
@@ -22,6 +23,7 @@
 //! `use airc_core::Identity;` works without knowing the module split.
 
 pub mod attachment;
+pub mod body;
 pub mod cursor;
 pub mod filter;
 pub mod identity;
@@ -34,6 +36,7 @@ pub mod transcript;
 // module paths so refactors stay clear.
 
 pub use attachment::AttachmentManifest;
+pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use filter::{filter_self_echoes, SelfFilter};
 pub use identity::Identity;
