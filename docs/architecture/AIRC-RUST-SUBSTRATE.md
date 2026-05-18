@@ -372,6 +372,38 @@ a `NICK` rename. Renaming a forge contract from `work.offer` to
 `work.bid` is a name-layer concern; the internal UUIDs that referenced
 it stay valid.
 
+#### The three-field identity model
+
+An airc Identity carries three load-bearing fields plus the rest of
+the display metadata:
+
+```
+identity_id : 9d8c4f7e-...      (UUIDv4 — substrate-stable, immutable)
+nick        : helper-ai          (mutable display name; can collide,
+                                  scoped by room)
+role        : persona            (kind classifier: human | persona |
+                                  agent | device | grid_node | bot)
+```
+
+Plus the existing pronouns / bio / status / fingerprint / integrations
+fields the Python+bash airc already had.
+
+The three fields are intentionally orthogonal:
+- `identity_id` is the **mesh-stable pointer** — every cross-machine
+  reference, lease, permission grant, audit log entry, and replay
+  record cites this. Never changes for the life of the identity.
+- `nick` is the **human-readable handle** — what appears in chat,
+  presence headers, @-mentions. Mutable; renames are normal; same-
+  nick collisions in a room are tolerable (the substrate disambiguates
+  via `identity_id`).
+- `role` is the **kind classifier** — consumers use this to render
+  appropriately (humans as chat bubbles, personas as avatars, devices
+  as system indicators, grid nodes as compute peers). Substrate
+  doesn't interpret role beyond passing it through.
+
+This is what lets humans use readable names while the mesh, replay
+logs, permissions, leases, and references stay stable.
+
 The full UUIDv4 application list (consumer + substrate):
 
 - identities (humans, personas, agents, devices, machines)
