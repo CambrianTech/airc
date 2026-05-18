@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::body::Body;
 use crate::cursor::TranscriptCursor;
 use crate::filter::SelfFilter;
 use crate::ids::{ClientId, EventId, PeerId, RoomId};
@@ -59,7 +60,11 @@ pub struct TranscriptEvent {
     pub occurred_at_ms: u64,
     pub lamport: u64,
     pub target: MentionTarget,
-    pub body: Option<String>,
+    /// Opaque payload — consumer-defined JSON or binary. See [`Body`].
+    /// Replaces the legacy `Option<String>` shape; consumers wanting
+    /// plain chat text use `Body::text("...")` and recover it via
+    /// `body.as_ref().and_then(Body::as_text)`.
+    pub body: Option<Body>,
     pub attachment: Option<crate::attachment::AttachmentManifest>,
     pub receipt: Option<crate::receipt::Receipt>,
     pub metadata: serde_json::Value,
