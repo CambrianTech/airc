@@ -407,6 +407,56 @@ This is what "network related and fine" means: the substrate owns
 the network primitive even though the application owns what the
 bytes represent.
 
+## Roster semantics — three orthogonal peer sets per room
+
+Surfaced as a real design gap by Codex on 2026-05-18: continuum's chat
+header was rendering persistent `room.members` / seeded-capable users
+as if they're active participants. That's misleading and it's a
+substrate-level fix, not a UI fix.
+
+The substrate exposes **three orthogonal peer sets** per room. They are
+distinct API surfaces; consumers compose them as their use case
+requires.
+
+| Set | What it represents | Durability |
+|---|---|---|
+| `membership` | Subscription / capability — peers who CAN be in the room (seeded, invited, allowlisted) | Durable, persisted in `peers` × `channels` join table |
+| `live_presence` | Peers who ARE in the room RIGHT NOW (connected transport, recent activity) | Transient, derived from `last_seen_at` + transport state |
+| `responder_ready` | Peers who are primed to act — model admitted, inbox ready, agent online | Transient + capability-aware; updated by consumer signals |
+
+```rust
+impl Room {
+    pub fn membership(&self) -> &MembershipSet;
+    pub fn live_presence(&self) -> &PresenceSet;
+    pub fn responder_ready(&self) -> &ResponderSet;
+}
+```
+
+The three sets are computed from different sources:
+- `membership` reads from `peers` + `channels` join in airc-store.
+- `live_presence` derives from per-transport keep-alive state + the
+  presence-event stream. A peer that hasn't sent a heartbeat in N
+  seconds drops out of live_presence even if they remain in
+  membership.
+- `responder_ready` is composed: a peer announces readiness via an
+  application-level event (consumer convention, e.g.
+  `body_hint="presence.responder_ready"`). The substrate tracks
+  which peers have most-recently announced ready vs busy/offline.
+
+UI defaults (consumer choice, but the substrate makes the data easy):
+
+| Use case | Default rendering |
+|---|---|
+| Live chat header ("who's here") | `live_presence ∩ responder_ready` |
+| Room admin / capability view | `membership` |
+| Inference dispatch ("who can respond") | `responder_ready` |
+| Quorum / mention resolution | `live_presence` |
+
+The substrate API exposes all three; consumers pick. **The substrate
+never collapses them into a single "users" list** — that collapse is
+exactly the bug Codex caught in continuum today, and it would re-emerge
+in any consumer if the substrate didn't keep them distinct.
+
 ## Reliability + connection health
 
 The substrate is operational infrastructure. It must keep connections
