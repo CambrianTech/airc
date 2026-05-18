@@ -97,8 +97,20 @@ def run(home: str, my_name: str) -> int:
 
             attrs = [
                 f'from="{html.escape(fr, quote=True)}"',
-                f'channel="{html.escape(channel or "?", quote=True)}"',
             ]
+            # Surface per-process client_id so multi-tab agents sharing a
+            # nick can be disambiguated. Mirrors monitor_formatter.py — the
+            # envelope already carries client_id; the receive side just
+            # hadn't displayed it.
+            sender_cid = str(msg.get("client_id") or "")
+            if sender_cid:
+                cid_disp = (
+                    sender_cid[len("agent:"):]
+                    if sender_cid.startswith("agent:")
+                    else sender_cid
+                )
+                attrs.append(f'client="{html.escape(cid_disp, quote=True)}"')
+            attrs.append(f'channel="{html.escape(channel or "?", quote=True)}"')
             if to and to != "all":
                 attrs.append(f'to="{html.escape(to, quote=True)}"')
             if ts:
