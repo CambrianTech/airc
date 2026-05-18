@@ -381,5 +381,98 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
             "channel name must be XML-escaped in WARN line")
 
 
+class ClientIdSurfacingTests(unittest.TestCase):
+    """When multiple Claude/Codex tabs share one `.airc` scope on the same
+    Mac, they all generate the same nick (e.g. `airc-8a5e`) and the receive
+    side can't tell them apart. The send side already stamps a
+    per-process `client_id` (humanhash) on every envelope, but the pm-tag
+    rendering didn't surface it. This test pins the behavior."""
+
+    def setUp(self):
+        self._scope = tempfile.mkdtemp(prefix="airc-mf-clientid-test-")
+        self._peers = os.path.join(self._scope, "peers")
+        os.makedirs(self._peers, exist_ok=True)
+        with open(os.path.join(self._scope, "config.json"), "w") as f:
+            json.dump({
+                "name": "alice",
+                "subscribed_channels": ["general"],
+            }, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._scope, ignore_errors=True)
+
+    def _run(self, lines):
+        body = "\n".join(json.dumps(l) for l in lines) + "\n"
+        out = io.StringIO()
+        with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
+             mock.patch.object(mf.sys, "stdout", out), \
+             mock.patch.object(mf, "current_client_id", return_value="test-client"):
+            mf.run("alice", self._peers)
+        return out.getvalue()
+
+    def test_client_id_with_agent_prefix_renders_as_client_attribute(self):
+        msg = {
+            "from": "airc-8a5e",
+            "to": "all",
+            "channel": "general",
+            "msg": "hi from one tab",
+            "client_id": "agent:summer-kansas-louisiana-tango",
+            "ts": "2026-05-18T19:00:00Z",
+        }
+        out = self._run([msg])
+        # The agent: prefix should be stripped for display; the humanhash
+        # body alone is enough to disambiguate.
+        self.assertIn('client="summer-kansas-louisiana-tango"', out,
+            "pm-tag must surface client_id (humanhash) so peers sharing a nick can be disambiguated")
+        # from is still rendered alongside.
+        self.assertIn('from="airc-8a5e"', out,
+            "from attribute must still render — client= is additive, not a replacement")
+
+    def test_client_id_without_agent_prefix_renders_verbatim(self):
+        msg = {
+            "from": "alice",
+            "to": "all",
+            "channel": "general",
+            "msg": "hello",
+            "client_id": "explicit-suffix-no-prefix",
+            "ts": "2026-05-18T19:00:00Z",
+        }
+        out = self._run([msg])
+        self.assertIn('client="explicit-suffix-no-prefix"', out,
+            "non-'agent:' client_id strings render as-is")
+
+    def test_envelope_without_client_id_has_no_client_attribute(self):
+        msg = {
+            "from": "legacy-peer",
+            "to": "all",
+            "channel": "general",
+            "msg": "i pre-date client_id stamping",
+            "ts": "2026-05-18T19:00:00Z",
+        }
+        out = self._run([msg])
+        self.assertNotIn('client="', out,
+            "legacy envelopes without client_id must NOT emit an empty client= attribute")
+
+    def test_client_id_is_xml_escaped(self):
+        # A peer cannot forge a closing pm- tag via client_id because the
+        # tag nonce is per-session; but client_id values still must be
+        # XML-escaped so peer-controlled content can't break the tag
+        # structure or inject attributes.
+        msg = {
+            "from": "bob",
+            "to": "all",
+            "channel": "general",
+            "msg": "test escape",
+            "client_id": 'agent:" injected="x',
+            "ts": "2026-05-18T19:00:00Z",
+        }
+        out = self._run([msg])
+        self.assertNotIn(' injected="x"', out,
+            "client_id must be XML-escaped so a peer can't inject extra attributes")
+        self.assertIn("&quot;", out,
+            "raw double-quote in client_id must appear as &quot;")
+
+
 if __name__ == "__main__":
     unittest.main()
