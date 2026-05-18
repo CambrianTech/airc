@@ -29,8 +29,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod fs;
 pub mod hash;
 
+pub use fs::FsStore;
 pub use hash::ContentHash;
 
 // ─── Errors ───────────────────────────────────────────────────────────
