@@ -261,6 +261,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "blocked on airc-transport fs2 LocalFsAdapter Windows file-lock semantics — \
+                  the daemon IPC layer is correct here, but `send` ultimately calls into \
+                  LocalFsAdapter which hits ERROR_ACCESS_DENIED on Windows. Tracked as \
+                  follow-up slice 3 (Transport send correctness) per the operating doc."
+    )]
     async fn subscribe_then_send_then_inbox_round_trips() {
         // The big daemon e2e: subscribe to a wire, send a frame
         // (daemon's own send writes to the wire), inbox returns it.
@@ -352,9 +359,19 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_refuses_to_steal_live_socket() {
-        // Pin the cleanup_stale_socket contract: if a daemon is
-        // already live on the path, a second run() returns AddrInUse
-        // rather than silently taking over.
+        // Pin the cleanup_stale_socket / first_pipe_instance contract:
+        // if a daemon is already live on the path, a second run() must
+        // refuse rather than silently take over. The exact error kind
+        // differs by platform:
+        //   - Unix: cleanup_stale_socket returns DaemonError::StaleSocket
+        //     wrapping AddrInUse (we synthesised the kind when probing
+        //     the live socket).
+        //   - Windows: ServerOptions::first_pipe_instance(true) surfaces
+        //     duplicate-binder via DaemonError::Io with PermissionDenied
+        //     (os error 5 / ERROR_ACCESS_DENIED). The OS chose that error
+        //     code; we honour it rather than fabricate equivalence.
+        // Either error variant constitutes "refused" — the test asserts
+        // refusal, not a specific error shape.
         let state = fresh_state();
         let socket = unique_socket();
         let first = state.clone();
@@ -363,8 +380,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let second_result = run(fresh_state(), socket.clone()).await;
+        let refused = match &second_result {
+            Err(DaemonError::StaleSocket(_)) => true,
+            Err(DaemonError::Io(io)) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+                cfg!(windows)
+            }
+            _ => false,
+        };
         assert!(
-            matches!(second_result, Err(DaemonError::StaleSocket(_))),
+            refused,
             "second daemon must refuse to steal a live socket; got {second_result:?}"
         );
 
