@@ -11,6 +11,7 @@
 //! generating if absent). `VerificationPolicy::Strict` is the only
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
+mod bearer_state;
 mod cli;
 mod client_id;
 mod codex_cli;
@@ -74,6 +75,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match parsed.command {
         Command::Init => commands::run_init(&home).await,
+
+        Command::BearerState { path } => bearer_state::run(&path),
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
 
