@@ -221,7 +221,7 @@ mod tests {
 
     /// What this catches: default `exists` impl reports true for stored
     /// + false for missing. Backends overriding `exists` should still
-    /// match this contract.
+    ///   match this contract.
     #[test]
     fn store_exists_default_impl_matches_get() {
         let store = InMemoryStore::new();

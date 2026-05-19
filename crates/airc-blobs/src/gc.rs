@@ -101,10 +101,8 @@ pub fn run<P: AsRef<Path>>(root: P, policy: &RetentionPolicy) -> Result<GcReport
             .checked_sub(max_age)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         all_blobs.retain(|b| {
-            if b.mtime < cutoff {
-                if delete_one(&b.path, &mut report) {
-                    return false; // Drop from the list — it's gone.
-                }
+            if b.mtime < cutoff && delete_one(&b.path, &mut report) {
+                return false; // Drop from the list — it's gone.
             }
             true
         });
@@ -223,10 +221,6 @@ mod tests {
         let new_hash = store.put(b"new content").expect("put new");
 
         // Mark "old" blob as 1 hour ago, "new" stays fresh
-        let old_path = root
-            .join("0d")
-            .join("28cab5c3713c80acab15d18180f5b5d317b66ddc3f9d8a92f859ea29a89a01.blob");
-        // Actually compute paths
         let old_path = store_path_for(&root, &old_hash);
         let new_path = store_path_for(&root, &new_hash);
         set_mtime_seconds_ago(&old_path, 3600); // 1 hour old
