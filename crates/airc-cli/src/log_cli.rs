@@ -47,4 +47,43 @@ pub enum LogAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Read unread messages from messages.jsonl using a byte cursor.
+    InboxRead {
+        /// Scope home containing messages.jsonl.
+        #[arg(long)]
+        home: PathBuf,
+        /// Cursor file to read/update.
+        #[arg(long)]
+        cursor_file: PathBuf,
+        /// Filter to messages newer than this ISO timestamp or relative window.
+        #[arg(long, default_value = "")]
+        since: String,
+        /// Maximum messages to print.
+        #[arg(long, default_value_t = 500)]
+        count: usize,
+        /// Do not advance the cursor.
+        #[arg(long)]
+        peek: bool,
+        /// Suppress the empty inbox line.
+        #[arg(long)]
+        quiet_empty: bool,
+        /// Hide messages from this identity.
+        #[arg(long)]
+        exclude_self: bool,
+        #[arg(long, default_value = "")]
+        my_name: String,
+        #[arg(long, default_value = "")]
+        client_id: String,
+    },
+
+    /// Move the inbox byte cursor to the current end of messages.jsonl.
+    InboxReset {
+        /// Scope home containing messages.jsonl.
+        #[arg(long)]
+        home: PathBuf,
+        /// Cursor file to write.
+        #[arg(long)]
+        cursor_file: PathBuf,
+    },
 }

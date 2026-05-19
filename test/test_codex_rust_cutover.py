@@ -109,6 +109,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" collaboration peers-fallback', combined)
         self.assertIn('"$(airc_rs_bin)" collaboration doctor', combined)
 
+    def test_inbox_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
+        start = source.index("cmd_inbox()")
+        end = source.index("cmd_codex_hook()", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.inbox", body)
+        self.assertIn('"$(airc_rs_bin)" log inbox-reset', body)
+        self.assertIn("log inbox-read", body)
+
     def test_iso_to_epoch_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
         start = source.index("iso_to_epoch()")
