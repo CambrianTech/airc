@@ -296,13 +296,6 @@ cmd_send() {
   ts_val=$(timestamp)
   local client_id; client_id=$(airc_client_id 2>/dev/null || true)
 
-  local escaped_msg
-  escaped_msg=$(printf '%s' "$msg" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
-  local escaped_client_id=""
-  if [ -n "$client_id" ]; then
-    escaped_client_id=$(printf '%s' "$client_id" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
-  fi
-
   # Channel: stamp every outbound envelope with the active channel so the
   # monitor display can route by channel uniformly (Phase 2 mesh
   # substrate). Resolution priority (Phase 2B.1):
@@ -325,14 +318,21 @@ cmd_send() {
 
   local from_name="$my_name"
   [ "$system_event" = "1" ] && from_name="airc"
-  local payload="{\"from\":\"$from_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
-  [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
   # airc#644 PR-2: stamp kind=heartbeat when --heartbeat was passed so
   # cmd_peers can track separately + monitor_formatter can filter from
   # UI. Default kind (chat) is implicit — pre-#644 peers don't emit kind
   # and downstream code treats absent kind as chat for back-compat.
-  [ "$heartbeat" = "1" ] && payload="${payload},\"kind\":\"heartbeat\""
-  payload="${payload}}"
+  local message_kind=""
+  [ "$heartbeat" = "1" ] && message_kind="heartbeat"
+  local payload
+  payload=$("$(airc_rs_bin)" message build-legacy \
+      --from "$from_name" \
+      --to "$peer_name" \
+      --ts "$ts_val" \
+      --channel "$active_channel" \
+      --msg "$msg" \
+      --client-id "$client_id" \
+      --kind "$message_kind")
   local sig; sig=$(sign_message "$payload")
   local full_msg="${payload%?}"
   full_msg="${full_msg},\"sig\":\"$sig\"}"
@@ -825,9 +825,8 @@ cmd_ping() {
   esac
   ensure_init
 
-  # uuid from python for format consistency with the regex in monitor_formatter.
   local ping_id
-  ping_id=$("$AIRC_PYTHON" -c "import uuid; print(uuid.uuid4())")
+  ping_id=$("$(airc_rs_bin)" uuid-v4)
 
   local start_time
   start_time=$(date +%s)

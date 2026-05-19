@@ -51,4 +51,26 @@ pub enum IdentityAction {
         #[arg(long, default_value = "")]
         host: String,
     },
+
+    /// Write a legacy peer record learned from the join handshake.
+    WritePeerRecord {
+        /// Legacy peers directory containing <peer>.json files.
+        #[arg(long)]
+        peers_dir: std::path::PathBuf,
+        /// Peer display/name key.
+        #[arg(long)]
+        peer_name: String,
+        /// SSH target for the peer.
+        #[arg(long)]
+        host: String,
+        /// Peer airc home path.
+        #[arg(long, default_value = "")]
+        airc_home: String,
+        /// Optional X25519 public key for envelope encryption.
+        #[arg(long, default_value = "")]
+        x25519_pub: String,
+        /// Pair timestamp.
+        #[arg(long)]
+        paired: String,
+    },
 }

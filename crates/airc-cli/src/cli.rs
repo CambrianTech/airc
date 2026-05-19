@@ -22,6 +22,7 @@ use crate::envelope_cli::EnvelopeArgs;
 use crate::gh_cli::GhArgs;
 use crate::gist_cli::GistArgs;
 use crate::identity_cli::IdentityArgs;
+use crate::message_cli::MessageArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
 use crate::transport_cli::TransportArgs;
@@ -224,6 +225,9 @@ pub enum Command {
     /// Parse legacy GitHub gist envelope JSON.
     Gist(GistArgs),
 
+    /// Build and inspect message envelopes during Rust cutover.
+    Message(MessageArgs),
+
     /// Shared GitHub request governor.
     Gh(GhArgs),
 
@@ -259,6 +263,9 @@ pub enum Command {
 
     /// Print this runtime process's client id, if one can be derived.
     ClientId,
+
+    /// Generate a UUIDv4.
+    UuidV4,
 
     /// Convert a canonical UTC timestamp to Unix epoch seconds.
     IsoToEpoch {
