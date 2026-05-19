@@ -161,7 +161,10 @@ mod tests {
             mime: None,
         };
         let json = serde_json::to_string(&media_ref).expect("serialize");
-        assert!(!json.contains("mime"), "None mime should be omitted; got: {json}");
+        assert!(
+            !json.contains("mime"),
+            "None mime should be omitted; got: {json}"
+        );
     }
 
     /// In-memory fake backend used to exercise the default `exists`
@@ -196,9 +199,7 @@ mod tests {
                 .unwrap()
                 .get(hash)
                 .cloned()
-                .ok_or_else(|| BlobError::NotFound {
-                    hash: hash.clone(),
-                })
+                .ok_or_else(|| BlobError::NotFound { hash: hash.clone() })
         }
 
         fn delete(&self, hash: &ContentHash) -> Result<(), BlobError> {
@@ -251,9 +252,7 @@ mod tests {
     #[test]
     fn blob_error_display_includes_context() {
         let hash = ContentHash::from_bytes(b"x");
-        let not_found = BlobError::NotFound {
-            hash: hash.clone(),
-        };
+        let not_found = BlobError::NotFound { hash: hash.clone() };
         let display = format!("{not_found}");
         assert!(display.contains(&hash.to_string()));
 

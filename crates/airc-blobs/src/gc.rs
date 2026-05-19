@@ -73,8 +73,8 @@ pub fn run<P: AsRef<Path>>(root: P, policy: &RetentionPolicy) -> Result<GcReport
             continue;
         }
         // Inner dir contains the blob files for this fan-out bucket.
-        let inner = fs::read_dir(&path)
-            .map_err(|e| BlobError::Io(format!("read_dir {path:?}: {e}")))?;
+        let inner =
+            fs::read_dir(&path).map_err(|e| BlobError::Io(format!("read_dir {path:?}: {e}")))?;
         for blob_entry in inner {
             let blob_entry = blob_entry.map_err(|e| BlobError::Io(format!("dir entry: {e}")))?;
             let blob_path = blob_entry.path();
@@ -97,7 +97,9 @@ pub fn run<P: AsRef<Path>>(root: P, policy: &RetentionPolicy) -> Result<GcReport
 
     // Phase 2: age-based deletion.
     if let Some(max_age) = policy.max_age {
-        let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+        let cutoff = SystemTime::now()
+            .checked_sub(max_age)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         all_blobs.retain(|b| {
             if b.mtime < cutoff {
                 if delete_one(&b.path, &mut report) {
@@ -168,11 +170,8 @@ mod tests {
     fn fresh_root() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!(
-            "airc-blobs-gc-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let p =
+            std::env::temp_dir().join(format!("airc-blobs-gc-test-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&p);
         p
     }
@@ -224,7 +223,9 @@ mod tests {
         let new_hash = store.put(b"new content").expect("put new");
 
         // Mark "old" blob as 1 hour ago, "new" stays fresh
-        let old_path = root.join("0d").join("28cab5c3713c80acab15d18180f5b5d317b66ddc3f9d8a92f859ea29a89a01.blob");
+        let old_path = root
+            .join("0d")
+            .join("28cab5c3713c80acab15d18180f5b5d317b66ddc3f9d8a92f859ea29a89a01.blob");
         // Actually compute paths
         let old_path = store_path_for(&root, &old_hash);
         let new_path = store_path_for(&root, &new_hash);

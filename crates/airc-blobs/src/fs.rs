@@ -40,7 +40,8 @@ impl FsStore {
     /// dirs lazily.
     pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, BlobError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|e| BlobError::Io(format!("create_dir_all {root:?}: {e}")))?;
+        fs::create_dir_all(&root)
+            .map_err(|e| BlobError::Io(format!("create_dir_all {root:?}: {e}")))?;
         Ok(Self { root })
     }
 
@@ -67,9 +68,8 @@ impl ContentAddressedStore for FsStore {
 
         // Ensure fan-out dir exists.
         if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                BlobError::Io(format!("create_dir_all {parent:?}: {e}"))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| BlobError::Io(format!("create_dir_all {parent:?}: {e}")))?;
         }
 
         // Write to a sibling .tmp file then rename for atomicity.
@@ -156,11 +156,7 @@ mod tests {
     fn fresh_root() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!(
-            "airc-blobs-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let p = std::env::temp_dir().join(format!("airc-blobs-test-{}-{}", std::process::id(), n));
         // Remove any leftover from a prior crashed test.
         let _ = fs::remove_dir_all(&p);
         p
@@ -270,11 +266,15 @@ mod tests {
         let root = fresh_root();
         let store = FsStore::new(&root).expect("new");
         let absent = ContentHash::from_bytes(b"never_stored");
-        store.delete(&absent).expect("delete of absent should be Ok");
+        store
+            .delete(&absent)
+            .expect("delete of absent should be Ok");
         // Double-delete also fine
         let hash = store.put(b"x").expect("put");
         store.delete(&hash).expect("first delete");
-        store.delete(&hash).expect("second delete should also be Ok");
+        store
+            .delete(&hash)
+            .expect("second delete should also be Ok");
     }
 
     /// What this catches: `get` re-verifies on-disk bytes against the
@@ -344,7 +344,11 @@ mod tests {
             }
             by_prefix.insert(prefix, bytes);
         }
-        assert_eq!(blobs.len(), 2, "should find two blobs sharing a fan-out prefix within 10000 iterations");
+        assert_eq!(
+            blobs.len(),
+            2,
+            "should find two blobs sharing a fan-out prefix within 10000 iterations"
+        );
 
         let h1 = store.put(&blobs[0]).expect("put 1");
         let h2 = store.put(&blobs[1]).expect("put 2");
