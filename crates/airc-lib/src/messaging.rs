@@ -1,6 +1,6 @@
 use airc_core::{Body, EventId, Headers, MentionTarget, TranscriptCursor, TranscriptEvent};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature};
-use airc_transport::{LocalFsAdapter, SignedTransport, Transport};
+use airc_transport::{LocalFsAdapter, Transport};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
@@ -29,7 +29,7 @@ impl Airc {
         self.ensure_wire_subscriber(&room.wire).await?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms();
-        let frame = Frame {
+        let mut frame = Frame {
             kind,
             envelope: Envelope {
                 event_id,
@@ -46,18 +46,31 @@ impl Airc {
                 signature: Signature::Unsigned,
             },
         };
-        let transport = SignedTransport::new(
-            LocalFsAdapter::new(&room.wire),
-            self.inner.identity.keypair.clone(),
-            self.inner.identity.peer_id,
-            self.inner.registry.clone(),
-            self.inner.policy,
-        );
+        frame.envelope.signature = self
+            .inner
+            .identity
+            .keypair
+            .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
+            .map_err(|error| AircError::Crypto(error.to_string()))?;
+        let transport = LocalFsAdapter::new(&room.wire);
         transport
-            .send(frame)
+            .send(frame.clone())
             .await
             .map_err(|e| AircError::Transport(e.to_string()))?;
+        self.append_sent_frame(frame).await?;
         Ok(event_id)
+    }
+
+    async fn append_sent_frame(&self, frame: Frame) -> Result<(), AircError> {
+        let event = frame.into_transcript_event();
+        match self.inner.store.append(event.clone()).await {
+            Ok(()) => {
+                let _ = self.inner.live_tx.send(event);
+                Ok(())
+            }
+            Err(airc_store::StoreError::DuplicateEventId(_)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Subscribe to the live event stream.
