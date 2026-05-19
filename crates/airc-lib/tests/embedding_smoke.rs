@@ -82,10 +82,11 @@ async fn subscribe_yields_live_events_in_order() {
 
     let mut stream = airc.subscribe().await.unwrap();
 
-    // Drive three sends from a spawned task. The subscriber on the
-    // wire converts each into a TranscriptEvent and the broadcast
-    // fans out to the stream we're holding.
-    let airc_send = Airc::open(home.path()).await.unwrap();
+    // Drive three sends from a spawned task. Cloning the Airc
+    // handle is critical: a fresh `Airc::open` on the same home
+    // would have its OWN broadcast channel, and the stream we're
+    // holding wouldn't see fan-outs from that handle's subscriber.
+    let airc_send = airc.clone();
     let send_task = tokio::spawn(async move {
         for i in 0..3 {
             airc_send.say(&format!("hi-{i}")).await.unwrap();

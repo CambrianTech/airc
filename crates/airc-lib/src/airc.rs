@@ -56,8 +56,12 @@ const LIVE_BROADCAST_CAPACITY: usize = 1024;
 /// In-process AIRC handle. Holds identity, store, per-room
 /// signed-local-fs transports, and a background subscriber per wire
 /// that converts received `Frame`s into `TranscriptEvent`s and
-/// appends them to the durable store. Cheap to clone via inner
-/// `Arc`s.
+/// appends them to the durable store.
+///
+/// `Clone` is cheap (just an Arc bump). Clones share the SAME
+/// subscriber set + live broadcast channel — call `.clone()` to
+/// pass the handle into a spawned task while keeping the parent's
+/// `subscribe()` stream live.
 ///
 /// Lifecycle:
 ///   - `Airc::open` initialises identity + store + peer registry.
@@ -65,6 +69,7 @@ const LIVE_BROADCAST_CAPACITY: usize = 1024;
 ///     subscriber on the room's wire if one isn't already running.
 ///   - Consumers wanting live push call `Airc::subscribe()` and
 ///     get a `Stream<Item = TranscriptEvent>`.
+#[derive(Clone)]
 pub struct Airc {
     inner: Arc<AircInner>,
 }
