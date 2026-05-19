@@ -138,6 +138,24 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 channel,
                 gist_id,
             } => config_commands::run_set_channel_gist(&home, config, &channel, &gist_id),
+            ConfigAction::SetHostBlock {
+                config,
+                host_airc_home,
+                host_name,
+                host_port,
+                host_ssh_pub,
+                host_identity_json,
+            } => config_commands::run_set_host_block(
+                &home,
+                config,
+                config_commands::HostBlockUpdate {
+                    host_airc_home,
+                    host_name,
+                    host_port,
+                    host_ssh_pub,
+                    host_identity_json,
+                },
+            ),
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,

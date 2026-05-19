@@ -127,7 +127,7 @@ sys.exit(0 if (target in seen and target not in my_history) else 1)
   fi
 
   # Phase 1: write the new name into THIS scope's config (the truth-
-  # layer effect for this scope). Goes through airc_core.config rather
+  # layer effect for this scope). Goes through airc-rs config rather
   # than an inline-python heredoc — the heredoc was quoting-fragile
   # (would have broken on a name containing a single quote — currently
   # safe because the sanitizer keeps names in [a-z0-9-], but a sharp

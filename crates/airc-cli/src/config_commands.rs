@@ -209,6 +209,49 @@ pub fn run_set_channel_gist(
     save_value(&config, &root)
 }
 
+#[derive(Debug)]
+pub struct HostBlockUpdate {
+    pub host_airc_home: String,
+    pub host_name: String,
+    pub host_port: String,
+    pub host_ssh_pub: String,
+    pub host_identity_json: String,
+}
+
+impl HostBlockUpdate {
+    fn parsed_port(&self) -> u16 {
+        self.host_port.parse().unwrap_or(7547)
+    }
+
+    fn parsed_identity(&self) -> Value {
+        serde_json::from_str(&self.host_identity_json).unwrap_or_else(|_| Value::Object(Map::new()))
+    }
+}
+
+pub fn run_set_host_block(
+    home: &Path,
+    config: Option<PathBuf>,
+    update: HostBlockUpdate,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let host_port = update.parsed_port();
+    let host_identity = update.parsed_identity();
+    let mut root = load_value(&config);
+    let object = object_mut(&mut root);
+    object.insert(
+        "host_airc_home".to_string(),
+        Value::String(update.host_airc_home),
+    );
+    object.insert("host_name".to_string(), Value::String(update.host_name));
+    object.insert("host_port".to_string(), Value::Number(host_port.into()));
+    object.insert(
+        "host_ssh_pub".to_string(),
+        Value::String(update.host_ssh_pub),
+    );
+    object.insert("host_identity".to_string(), host_identity);
+    save_value(&config, &root)
+}
+
 fn load_config(path: &Path) -> ConfigFile {
     fs::read_to_string(path)
         .ok()
@@ -445,5 +488,56 @@ mod tests {
 
         run_set_channel_gist(dir.path(), Some(path.clone()), "general", "").unwrap();
         assert!(!load_config(&path).channel_gists.contains_key("general"));
+    }
+
+    #[test]
+    fn set_host_block_writes_typed_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"name":"joiner"}"#).unwrap();
+
+        run_set_host_block(
+            dir.path(),
+            Some(path.clone()),
+            HostBlockUpdate {
+                host_airc_home: "/tmp/airc".to_string(),
+                host_name: "host".to_string(),
+                host_port: "7550".to_string(),
+                host_ssh_pub: "ssh-ed25519 AAA".to_string(),
+                host_identity_json: r#"{"role":"host"}"#.to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config_value(&path, "name", ""), "joiner");
+        assert_eq!(config_value(&path, "host_airc_home", ""), "/tmp/airc");
+        assert_eq!(config_value(&path, "host_name", ""), "host");
+        assert_eq!(config_value(&path, "host_port", ""), "7550");
+        assert_eq!(
+            config_value(&path, "host_identity", "{}"),
+            r#"{"role":"host"}"#
+        );
+    }
+
+    #[test]
+    fn set_host_block_defaults_bad_port_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        run_set_host_block(
+            dir.path(),
+            Some(path.clone()),
+            HostBlockUpdate {
+                host_airc_home: String::new(),
+                host_name: String::new(),
+                host_port: "not-a-port".to_string(),
+                host_ssh_pub: String::new(),
+                host_identity_json: "not-json".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config_value(&path, "host_port", ""), "7547");
+        assert_eq!(config_value(&path, "host_identity", ""), "{}");
     }
 }

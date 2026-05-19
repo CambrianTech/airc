@@ -512,7 +512,7 @@ _whois_in_scope() {
   [ -f "$scope_config" ] || return 1
 
   # All scope-local config + peer file reads route through
-  # get_config_val_in / airc_core.config (#152 Phase 1). Pre-migration
+  # get_config_val_in / airc-rs config. Pre-migration
   # this function had six inline python heredocs reading individual
   # JSON fields — each a silent-fail vector with bash-substituted
   # SCOPE_CONFIG / PEER_FILE env vars. Now: one CLI per read.
