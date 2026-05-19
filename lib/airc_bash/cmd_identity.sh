@@ -547,8 +547,8 @@ _whois_in_scope() {
     local remote_blob
     remote_blob=$(IDENTITY_DIR="$scope/identity" relay_ssh "$host_target_addr" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
     if [ -n "$remote_blob" ]; then
-      local peer_id; peer_id=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -m airc_core.handshake get_field identity "{}" 2>/dev/null || echo "{}")
-      local peer_host; peer_host=$(printf '%s' "$remote_blob" | "$AIRC_PYTHON" -m airc_core.handshake get_field host "" 2>/dev/null || echo "")
+      local peer_id; peer_id=$(printf '%s' "$remote_blob" | "$(airc_rs_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
+      local peer_host; peer_host=$(printf '%s' "$remote_blob" | "$(airc_rs_bin)" gist get .host 2>/dev/null || echo "")
       _whois_pretty "$target" "$peer_id" "$peer_host"
       return 0
     fi

@@ -209,6 +209,34 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" envelope wrap', combined)
         self.assertIn('"$(airc_rs_bin)" gist get .kind', combined)
 
+    def test_control_plane_helpers_use_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "airc",
+                REPO / "lib/airc_bash/cmd_connect.sh",
+                REPO / "lib/airc_bash/cmd_doctor.sh",
+                REPO / "lib/airc_bash/cmd_identity.sh",
+                REPO / "lib/airc_bash/cmd_status.sh",
+            ]
+        )
+
+        forbidden = [
+            "airc_core.gh_backoff run",
+            "airc_core.gh_backoff wait-seconds",
+            "airc_core.gh_backoff audit",
+            "airc_core.gh_backoff doctor",
+            "airc_core.pending_batch host-broadcast-route",
+            "airc_core.handshake get_field",
+        ]
+        for needle in forbidden:
+            self.assertNotIn(needle, combined)
+
+        self.assertIn('"$(airc_rs_bin)" gh run', combined)
+        self.assertIn('"$(airc_rs_bin)" gh wait-seconds', combined)
+        self.assertIn('"$(airc_rs_bin)" gh doctor', combined)
+        self.assertIn('"$(airc_rs_bin)" pending host-broadcast-route', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

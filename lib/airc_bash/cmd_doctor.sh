@@ -485,11 +485,12 @@ _doctor_health() {
   # per-user cross-process guard. Keep `airc gh-audit` as an advanced
   # escape hatch, but doctor owns the normal diagnosis so users/agents
   # don't need another public verb.
-  local _gov_rc=0
-  "$AIRC_PYTHON" -m airc_core.gh_backoff doctor --count 80 || _gov_rc=$?
-  case "$_gov_rc" in
-    1) warns=$((warns+1)) ;;
-    2) issues=$((issues+1)) ;;
+  local _gov_rc=0 _gov_out
+  _gov_out=$("$(airc_rs_bin)" gh doctor --count 80 2>&1) || _gov_rc=$?
+  printf '%s\n' "$_gov_out"
+  case "$_gov_out" in
+    *"[BLOCKED]"*) issues=$((issues+1)) ;;
+    *) [ "$_gov_rc" -ne 0 ] && warns=$((warns+1)) ;;
   esac
 
   # ── Legacy daemon registration check. Daemon is deprecated; surface
