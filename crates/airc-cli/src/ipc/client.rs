@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+
+use crate::ipc::transport::IpcStream;
 
 use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
 use crate::ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
@@ -78,7 +79,7 @@ impl DaemonClient {
 
     /// Generic RPC: writes `request`, reads one `Response`.
     pub async fn call(&self, request: Request) -> Result<Response, ClientError> {
-        let mut stream = UnixStream::connect(&self.socket_path)
+        let mut stream = IpcStream::connect(&self.socket_path)
             .await
             .map_err(ClientError::NotConnected)?;
 
