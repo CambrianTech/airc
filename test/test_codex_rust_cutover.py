@@ -43,6 +43,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('ln -sf "$built" "$BIN_DIR/airc-rs"', source)
         self.assertIn('cp -f "$built" "$BIN_DIR/airc-rs.exe"', source)
 
+    def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
+        source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.codex_install", source)
+        self.assertIn('codex-hook uninstall-hooks --codex-home "$HOME/.codex"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
