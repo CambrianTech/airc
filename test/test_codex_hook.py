@@ -179,7 +179,7 @@ class CodexHookTests(unittest.TestCase):
                 if "command" in hook
             ]
             self.assertIn("other = true", config)
-            self.assertIn("codex_hooks = true", config)
+            self.assertIn("hooks = true", config)
             self.assertIn("echo existing", commands)
             self.assertIn(codex_install.AIRC_HOOK_COMMAND, commands)
 
@@ -195,7 +195,24 @@ class CodexHookTests(unittest.TestCase):
                 codex_install.main(["--codex-home", str(codex_home), "install-hooks"])
             config = (codex_home / "config.toml").read_text(encoding="utf-8")
             self.assertRegex(config, r'default_permissions = "airc"\n\[profiles\.default\]')
-            self.assertRegex(config, r'\[features\]\ncodex_hooks = true')
+            self.assertRegex(config, r'\[features\]\nhooks = true')
+
+    def test_codex_hook_installer_migrates_deprecated_codex_hooks_feature(self):
+        tmp = tempfile.TemporaryDirectory()
+        with tmp:
+            codex_home = Path(tmp.name)
+            (codex_home / "config.toml").write_text(
+                "# AIRC-CODEX-HOOKS-FEATURE-START\n"
+                "[features]\n"
+                "codex_hooks = true\n"
+                "# AIRC-CODEX-HOOKS-FEATURE-END\n",
+                encoding="utf-8",
+            )
+            with redirect_stdout(io.StringIO()):
+                codex_install.main(["--codex-home", str(codex_home), "install-hooks"])
+            config = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn("hooks = true", config)
+            self.assertNotIn("codex_hooks", config)
 
     def test_codex_hook_installer_removes_legacy_managed_polling_instructions(self):
         tmp = tempfile.TemporaryDirectory()
