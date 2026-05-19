@@ -27,6 +27,7 @@ name = "airc-cli"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-daemon",
  "airc-protocol",
  "airc-transport",
  "base64",
@@ -46,6 +47,23 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "airc-daemon"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "airc-protocol",
+ "airc-transport",
+ "async-trait",
+ "base64",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 

@@ -19,11 +19,12 @@ use airc_protocol::{
 use airc_transport::{LanTcpAdapter, LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
 
-use crate::daemon::{run as run_daemon_server, DaemonState};
+use airc_daemon::{
+    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, InboxRequest,
+    SendRequest, SubscribeRequest,
+};
+
 use crate::identity::LocalIdentity;
-use crate::ipc::request::{AddPeerRequest, InboxRequest, SubscribeRequest};
-use crate::ipc::{DaemonClient, SendRequest};
-use crate::peers_store;
 use crate::registry::{format_peer_spec, PeerSpec};
 use crate::room::{self, Room};
 

@@ -1,0 +1,32 @@
+[package]
+name = "airc-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Long-running daemon runtime: IPC accept loop + typed Request/Response
+# dispatch + per-wire substrate state. The CLI (`airc-cli`) is a thin
+# client over this crate's `DaemonClient`; the daemon-mode subcommand
+# in the CLI calls `airc_daemon::run` to bring up the long-lived
+# process.
+#
+# Split out from `airc-cli` per the operating doc's needed crate
+# layout (grievance §5: CLI/Daemon Accumulating Policy → airc-cli
+# is the client, airc-daemon is the runtime).
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
+airc-transport = { path = "../airc-transport" }
+
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"

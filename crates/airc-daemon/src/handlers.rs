@@ -14,9 +14,9 @@ use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
 use futures::stream::StreamExt;
 
-use crate::daemon::state::DaemonState;
 use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
 use crate::ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
+use crate::state::DaemonState;
 
 /// Default `Inbox.limit` when the client doesn't pass one. Caps the
 /// payload size so a slow client doesn't accidentally pull MB.

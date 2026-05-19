@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::daemon::handlers::dispatch;
-use crate::daemon::state::DaemonState;
+use crate::handlers::dispatch;
 use crate::ipc::request::Request;
 use crate::ipc::response::Response;
 use crate::ipc::transport::{IpcListener, IpcStream};
+use crate::state::DaemonState;
 
 /// What can go wrong running the daemon.
 #[derive(Debug)]
