@@ -1,0 +1,72 @@
+use std::path::Path;
+
+use airc_core::{EventId, TranscriptCursor};
+use airc_protocol::Subscription;
+use airc_transport::{LocalFsAdapter, SignedTransport, Transport};
+use futures::stream::StreamExt;
+
+use crate::error::AircError;
+use crate::room::Room;
+use crate::Airc;
+
+pub(crate) struct WireSubscriber {
+    /// Kept alive by ownership of its `JoinHandle`.
+    pub(crate) _task: tokio::task::JoinHandle<()>,
+}
+
+impl Airc {
+    pub(crate) async fn ensure_room_subscriber(&self, room: &Room) -> Result<(), AircError> {
+        self.ensure_wire_subscriber(&room.wire).await
+    }
+
+    pub(crate) async fn ensure_wire_subscriber(&self, wire: &Path) -> Result<(), AircError> {
+        let mut subs = self.inner.subscribers.lock().await;
+        if subs.contains_key(wire) {
+            return Ok(());
+        }
+        let transport = SignedTransport::new(
+            LocalFsAdapter::new(wire),
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: Some(TranscriptCursor {
+                lamport: 0,
+                event_id: EventId::from_u128(0),
+            }),
+            ..Default::default()
+        };
+        let mut stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let store = self.inner.store.clone();
+        let live_tx = self.inner.live_tx.clone();
+        let task = tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(frame) => {
+                        let event = frame.into_transcript_event();
+                        match store.append(event.clone()).await {
+                            Ok(()) => {
+                                let _ = live_tx.send(event);
+                            }
+                            Err(airc_store::StoreError::DuplicateEventId(_)) => {}
+                            Err(err) => {
+                                eprintln!("airc-lib subscriber: store append failed: {err}");
+                            }
+                        }
+                    }
+                    Err(verify_err) => {
+                        eprintln!("airc-lib subscriber: frame verification failed: {verify_err}");
+                    }
+                }
+            }
+        });
+        subs.insert(wire.to_path_buf(), WireSubscriber { _task: task });
+        Ok(())
+    }
+}

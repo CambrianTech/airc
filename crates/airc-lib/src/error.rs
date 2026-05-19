@@ -13,6 +13,15 @@ pub enum AircError {
     #[error("event store: {0}")]
     Store(#[from] airc_store::StoreError),
 
+    #[error("work store: {0}")]
+    WorkStore(#[from] airc_work_store::WorkStoreError),
+
+    #[error("work projection: {0}")]
+    WorkProjection(#[from] airc_work::ProjectionError),
+
+    #[error("work event codec: {0}")]
+    WorkCodec(#[from] airc_work::WorkEventCodecError),
+
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 

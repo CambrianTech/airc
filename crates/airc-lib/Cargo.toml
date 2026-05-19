@@ -23,6 +23,8 @@ airc-protocol = { path = "../airc-protocol" }
 airc-store = { path = "../airc-store" }
 airc-transport = { path = "../airc-transport" }
 airc-daemon = { path = "../airc-daemon" }
+airc-work = { path = "../airc-work" }
+airc-work-store = { path = "../airc-work-store" }
 
 async-trait = "0.1"
 base64 = "0.22"
