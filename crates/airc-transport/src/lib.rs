@@ -20,10 +20,15 @@
 //! ride on top via `FrameKind::Event` and headers.
 
 pub mod error;
+pub mod lan_tcp;
 pub mod local_fs;
 pub mod transport;
 
 // Re-exports — stable public surface.
 pub use error::LocalFsError;
+pub use lan_tcp::{
+    extract_ed25519_pubkey, generate_self_signed_cert, CertGenError, CertParseError,
+    PinnedClientVerifier, PinnedServerVerifier,
+};
 pub use local_fs::LocalFsAdapter;
 pub use transport::{FrameStream, Transport};

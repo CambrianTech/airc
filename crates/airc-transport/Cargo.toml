@@ -10,10 +10,16 @@ airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"
 futures = "0.3"
 fs2 = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rustls-pki-types = "1"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+x509-parser = "0.18"
 
 [dev-dependencies]
 tempfile = "3"

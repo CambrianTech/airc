@@ -128,6 +128,28 @@ impl PeerKeyRegistry {
     pub fn lookup(&self, peer: PeerId, key_id: u32) -> Option<&VerifyingKey> {
         self.keys.get(&(peer, key_id))
     }
+
+    /// Reverse lookup: find which `(peer, key_id)` enrolled a given
+    /// pubkey. Used by the lan-tcp TLS verifier — at handshake time
+    /// the server receives a client cert but doesn't know which peer
+    /// is connecting; it extracts the cert's Ed25519 pubkey, calls
+    /// `find_peer`, and either binds the connection to the resulting
+    /// peer or rejects on miss.
+    ///
+    /// Returns the first match (each pubkey should be unique per
+    /// `(peer, key_id)`, but if a duplicate is enrolled, the first
+    /// hit wins). Iteration order is non-deterministic — fine for
+    /// reverse-lookup correctness because we only need to know
+    /// whether ANY match exists.
+    pub fn find_peer(&self, pubkey: &[u8; 32]) -> Option<(PeerId, u32)> {
+        self.keys.iter().find_map(|((peer, key_id), key)| {
+            if key.as_bytes() == pubkey {
+                Some((*peer, *key_id))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// What can go wrong when verifying a frame.
