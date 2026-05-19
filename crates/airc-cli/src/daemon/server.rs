@@ -1,23 +1,27 @@
-//! Unix socket listener + accept loop.
+//! Cross-platform IPC listener + accept loop.
 //!
 //! Each accepted connection is handled in its own task: read one
 //! request, dispatch, write one response, close. Independent
 //! connections so a slow handler doesn't block the listener.
 //!
+//! Transport varies by platform via `IpcListener`:
+//!   - Unix: Unix-domain socket at `<home>/daemon.sock`
+//!   - Windows: named pipe at `\\.\pipe\airc-rs-<home>`
+//!
 //! Shutdown: the state's `shutdown` notifier wakes the accept loop;
-//! the loop unbinds the socket file and returns. In-flight handlers
-//! complete normally.
+//! the loop runs the transport's `cleanup` (unlinks the socket file
+//! on Unix; no-op on Windows) and returns.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 
 use crate::daemon::handlers::dispatch;
 use crate::daemon::state::DaemonState;
 use crate::ipc::request::Request;
 use crate::ipc::response::Response;
+use crate::ipc::transport::{IpcListener, IpcStream};
 
 /// What can go wrong running the daemon.
 #[derive(Debug)]
@@ -54,12 +58,12 @@ impl From<std::io::Error> for DaemonError {
     }
 }
 
-/// Run the daemon: bind the socket, serve connections until
+/// Run the daemon: bind the IPC listener, serve connections until
 /// shutdown. Returns when the shutdown notifier fires (typically from
 /// a Stop request handler) or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = IpcListener::bind(&socket_path).await?;
 
     loop {
         tokio::select! {
@@ -68,12 +72,10 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
                 break;
             }
             accept = listener.accept() => {
-                let (stream, _addr) = accept?;
+                let stream = accept?;
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, state).await {
-                        // Surface to stderr — a real deployment can
-                        // pipe this to a log. We don't swallow.
                         eprintln!("daemon connection error: {error}");
                     }
                 });
@@ -81,24 +83,25 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
         }
     }
 
-    // Best-effort cleanup. Listener drop unlinks the socket file on
-    // some platforms but not all — call out the path explicitly so
-    // subsequent daemon starts don't trip on a stale file.
-    let _ = std::fs::remove_file(&socket_path);
+    // Best-effort transport cleanup. On Unix this unlinks the
+    // socket file; on Windows named pipes are GCd when handles
+    // close, so the call is a no-op.
+    listener.cleanup();
     Ok(())
 }
 
-/// If a socket file exists from a prior daemon and no process is
-/// holding it, unlink it. If a process IS holding it, the subsequent
-/// `bind` will fail with EADDRINUSE — that error propagates up so the
-/// user sees it instead of us silently stealing the socket.
+/// If the previous daemon left a stale socket file behind, unlink
+/// it. If a process is actively holding it (live daemon), bail with
+/// AddrInUse rather than silently steal the listener.
+///
+/// Unix only — named pipes on Windows don't leave a filesystem
+/// entry, so there's nothing to clean and the OS itself rejects
+/// duplicate binders.
+#[cfg(unix)]
 fn cleanup_stale_socket(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    // Try connecting; if that succeeds, the daemon is live → don't
-    // touch the file. If it fails with ConnectionRefused, the socket
-    // is stale.
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
@@ -111,10 +114,18 @@ fn cleanup_stale_socket(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(not(unix))]
+fn cleanup_stale_socket(_path: &Path) -> std::io::Result<()> {
+    // Windows named pipes self-clean; duplicate-binder protection
+    // comes from `ServerOptions::first_pipe_instance(true)` set in
+    // the transport layer.
+    Ok(())
+}
+
 /// Handle one connection: read a single newline-or-EOF-terminated
 /// JSON request, dispatch, write the JSON response, close.
 async fn handle_connection(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     state: Arc<DaemonState>,
 ) -> Result<(), DaemonError> {
     let mut request_bytes = Vec::new();
@@ -136,7 +147,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), DaemonError> {
+async fn write_response(stream: &mut IpcStream, response: &Response) -> Result<(), DaemonError> {
     let mut payload = serde_json::to_vec(response).map_err(|error| {
         DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

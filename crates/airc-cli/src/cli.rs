@@ -17,14 +17,21 @@ use clap::{Args, Parser, Subcommand};
 use crate::registry::PeerSpec;
 
 /// Default home directory for persisted identity + IPC state.
+///
+/// Resolution order:
+///   1. `$HOME` (Unix; also Git Bash on Windows) → `<home>/.airc-rs`
+///   2. `%USERPROFILE%` (native Windows cmd / PowerShell) →
+///      `<userprofile>/.airc-rs`
+///   3. fallback to `./.airc-rs` in the current working dir
 pub fn default_home_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".airc-rs")
-    } else {
-        // No HOME — fall back to a clearly-scoped path under /tmp so
-        // accidents don't clobber real homes.
-        PathBuf::from("/tmp").join("airc-rs")
+        return PathBuf::from(home).join(".airc-rs");
     }
+    #[cfg(windows)]
+    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(userprofile).join(".airc-rs");
+    }
+    PathBuf::from(".airc-rs")
 }
 
 /// Default Unix socket path inside `home`.
@@ -44,8 +51,9 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
 )]
 pub struct Cli {
     /// State directory for persisted identity + IPC socket. Default
-    /// `$HOME/.airc-rs`. Override for tests or multi-identity setups.
-    #[arg(long, env = "AIRC_RS_HOME", global = true)]
+    /// `$HOME/.airc-rs` (Unix) or `%USERPROFILE%/.airc-rs` (Windows).
+    /// Override for tests or multi-identity setups.
+    #[arg(long, global = true)]
     pub home: Option<PathBuf>,
 
     /// Ad-hoc peers to enrol for this invocation only, repeatable.
