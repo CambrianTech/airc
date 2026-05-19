@@ -7,9 +7,102 @@ use serde_json::{Map, Value};
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
+    parted_rooms: Vec<String>,
+    #[serde(default)]
     subscribed_channels: Vec<String>,
     #[serde(default)]
     channel_gists: std::collections::BTreeMap<String, String>,
+}
+
+pub fn run_get(
+    home: &Path,
+    config: Option<PathBuf>,
+    key: &str,
+    default: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    println!("{}", config_value(&config, key, default));
+    Ok(())
+}
+
+pub fn run_get_name(
+    home: &Path,
+    config: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    println!("{}", config_value(&config, "name", "unknown"));
+    Ok(())
+}
+
+pub fn run_set(
+    home: &Path,
+    config: Option<PathBuf>,
+    key: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let mut root = load_value(&config);
+    object_mut(&mut root).insert(key.to_string(), Value::String(value.to_string()));
+    save_value(&config, &root)
+}
+
+pub fn run_set_name(
+    home: &Path,
+    config: Option<PathBuf>,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_set(home, config, "name", name)
+}
+
+pub fn run_unset_keys(
+    home: &Path,
+    config: Option<PathBuf>,
+    keys: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let mut root = load_value(&config);
+    let object = object_mut(&mut root);
+    for key in keys {
+        object.remove(key);
+    }
+    save_value(&config, &root)
+}
+
+pub fn run_read_parted(
+    home: &Path,
+    config: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let file = load_config(&config);
+    for room in file.parted_rooms {
+        println!("{room}");
+    }
+    Ok(())
+}
+
+pub fn run_record_parted(
+    home: &Path,
+    config: Option<PathBuf>,
+    room: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let mut root = load_value(&config);
+    let rooms = parted_rooms_mut(&mut root);
+    if !rooms.iter().any(|value| value.as_str() == Some(room)) {
+        rooms.push(Value::String(room.to_string()));
+    }
+    save_value(&config, &root)
+}
+
+pub fn run_clear_parted(
+    home: &Path,
+    config: Option<PathBuf>,
+    room: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let mut root = load_value(&config);
+    parted_rooms_mut(&mut root).retain(|value| value.as_str() != Some(room));
+    save_value(&config, &root)
 }
 
 pub fn run_read_channels(
@@ -121,6 +214,7 @@ fn load_config(path: &Path) -> ConfigFile {
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| ConfigFile {
+            parted_rooms: Vec::new(),
             subscribed_channels: Vec::new(),
             channel_gists: std::collections::BTreeMap::new(),
         })
@@ -178,6 +272,32 @@ fn channel_gists_mut(value: &mut Value) -> &mut Map<String, Value> {
         .expect("entry was converted to object")
 }
 
+fn parted_rooms_mut(value: &mut Value) -> &mut Vec<Value> {
+    let object = object_mut(value);
+    let entry = object
+        .entry("parted_rooms")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !entry.is_array() {
+        *entry = Value::Array(Vec::new());
+    }
+    entry.as_array_mut().expect("entry was converted to array")
+}
+
+fn config_value(path: &Path, key: &str, default: &str) -> String {
+    let root = load_value(path);
+    match root.get(key) {
+        Some(Value::Null) | None => default.to_string(),
+        Some(Value::String(value)) if value.is_empty() => default.to_string(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Array(_)) | Some(Value::Object(_)) => {
+            serde_json::to_string(root.get(key).expect("matched value exists"))
+                .unwrap_or_else(|_| default.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +310,58 @@ mod tests {
 
         assert!(config.subscribed_channels.is_empty());
         assert!(config.channel_gists.is_empty());
+        assert!(config.parted_rooms.is_empty());
+    }
+
+    #[test]
+    fn get_returns_default_for_missing_or_empty_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"empty":"","name":"alice"}"#).unwrap();
+
+        assert_eq!(config_value(&path, "name", "unknown"), "alice");
+        assert_eq!(config_value(&path, "empty", "fallback"), "fallback");
+        assert_eq!(config_value(&path, "missing", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn get_serializes_structured_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"identity":{"role":"agent"},"rooms":["general"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config_value(&path, "identity", "{}"), r#"{"role":"agent"}"#);
+        assert_eq!(config_value(&path, "rooms", "[]"), r#"["general"]"#);
+    }
+
+    #[test]
+    fn set_and_unset_preserve_unrelated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"name":"alice","host":"localhost"}"#).unwrap();
+
+        run_set(dir.path(), Some(path.clone()), "name", "bob").unwrap();
+        run_unset_keys(dir.path(), Some(path.clone()), &["host".to_string()]).unwrap();
+
+        assert_eq!(config_value(&path, "name", ""), "bob");
+        assert_eq!(config_value(&path, "host", "missing"), "missing");
+    }
+
+    #[test]
+    fn parted_rooms_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        run_record_parted(dir.path(), Some(path.clone()), "general").unwrap();
+        run_record_parted(dir.path(), Some(path.clone()), "general").unwrap();
+        assert_eq!(load_config(&path).parted_rooms, ["general"]);
+
+        run_clear_parted(dir.path(), Some(path.clone()), "general").unwrap();
+        assert!(load_config(&path).parted_rooms.is_empty());
     }
 
     #[test]
