@@ -1714,14 +1714,7 @@ cmd_connect() {
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).
-    local my_identity_json; my_identity_json=$(CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-    print(json.dumps(c.get("identity", {})))
-except Exception:
-    print("{}")
-' 2>/dev/null)
+    local my_identity_json; my_identity_json=$("$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" identity "{}" 2>/dev/null || echo "{}")
     [ -z "$my_identity_json" ] && my_identity_json="{}"
 
     local response
@@ -1814,38 +1807,14 @@ except Exception:
     # Phase E.2: capture host's X25519 pubkey from handshake response
     # so cmd_send can encrypt envelopes destined for this peer.
     host_x25519_pub=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .x25519_pub 2>/dev/null || true)
-    HOST_X25519_PUB="$host_x25519_pub" "$AIRC_PYTHON" -c "
-import json, os
-peers_dir = os.path.expanduser('$PEERS_DIR')
-os.makedirs(peers_dir, exist_ok=True)
-peer_name = '$peer_name'
-ssh_target = '$ssh_target'
-if os.path.isdir(peers_dir):
-    for entry in os.listdir(peers_dir):
-        if not entry.endswith('.json'): continue
-        if entry == peer_name + '.json': continue
-        try:
-            d = json.load(open(os.path.join(peers_dir, entry)))
-        except Exception:
-            continue
-        if d.get('host') == ssh_target:
-            for ext in ('.json', '.pub'):
-                p = os.path.join(peers_dir, entry[:-5] + ext)
-                if os.path.isfile(p):
-                    try: os.remove(p)
-                    except Exception: pass
-record = {
-    'name': peer_name,
-    'host': ssh_target,
-    'airc_home': '$host_airc_home',
-    'paired': '$(timestamp)'
-}
-host_x = os.environ.get('HOST_X25519_PUB', '')
-if host_x:
-    record['x25519_pub'] = host_x
-with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
-    json.dump(record, f, indent=2)
-" 2>/dev/null || true
+    "$(airc_rs_bin)" identity write-peer-record --home "$AIRC_WRITE_DIR" \
+        --peers-dir "$PEERS_DIR" \
+        --peer-name "$peer_name" \
+        --host "$ssh_target" \
+        --airc-home "$host_airc_home" \
+        --x25519-pub "$host_x25519_pub" \
+        --paired "$(timestamp)" \
+        2>/dev/null || true
 
     # If we resolved this pair via gist discovery (vs. inline-invite),
     # persist the gist id so resume-time freshness checks can detect a

@@ -40,6 +40,8 @@ mod legacy_envelope;
 mod legacy_identity;
 mod log_cli;
 mod log_commands;
+mod message_cli;
+mod message_commands;
 mod pending_cli;
 mod pending_commands;
 mod route_cli;
@@ -71,6 +73,7 @@ use gist_cli::GistAction;
 use identity_cli::IdentityAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
+use message_cli::MessageAction;
 use pending_cli::PendingAction;
 use route_cli::RouteAction;
 use transport_cli::TransportAction;
@@ -199,6 +202,21 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 identity_json,
                 host,
             } => identity_commands::run_pretty(&name, &identity_json, &host),
+            IdentityAction::WritePeerRecord {
+                peers_dir,
+                peer_name,
+                host,
+                airc_home,
+                x25519_pub,
+                paired,
+            } => identity_commands::run_write_peer_record(
+                &peers_dir,
+                &peer_name,
+                &host,
+                &airc_home,
+                &x25519_pub,
+                &paired,
+            ),
         },
 
         Command::Envelope(args) => match args.action {
@@ -310,6 +328,20 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             GistAction::ListLanEntries => gist_commands::run_list_lan_entries(),
             GistAction::GistContent { channel } => gist_commands::run_gist_content(&channel),
+        },
+
+        Command::Message(args) => match args.action {
+            MessageAction::BuildLegacy {
+                from,
+                to,
+                ts,
+                channel,
+                msg,
+                client_id,
+                kind,
+            } => message_commands::run_build_legacy(
+                &from, &to, &ts, &channel, &msg, &client_id, &kind,
+            ),
         },
 
         Command::Gh(args) => match args.action {
@@ -450,6 +482,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("client id is unavailable".into());
             };
             println!("{value}");
+            Ok(())
+        }
+
+        Command::UuidV4 => {
+            println!("{}", uuid::Uuid::new_v4());
             Ok(())
         }
 

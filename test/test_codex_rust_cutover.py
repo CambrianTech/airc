@@ -237,6 +237,29 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" gh doctor', combined)
         self.assertIn('"$(airc_rs_bin)" pending host-broadcast-route', combined)
 
+    def test_message_json_glue_uses_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "lib/airc_bash/cmd_send.sh",
+                REPO / "lib/airc_bash/cmd_connect.sh",
+            ]
+        )
+
+        forbidden = [
+            "json.dumps(sys.stdin.read())",
+            "uuid.uuid4()",
+            "HOST_X25519_PUB",
+            "json.dump(record",
+        ]
+        for needle in forbidden:
+            self.assertNotIn(needle, combined)
+
+        self.assertIn('"$(airc_rs_bin)" message build-legacy', combined)
+        self.assertIn('"$(airc_rs_bin)" uuid-v4', combined)
+        self.assertIn('"$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR"', combined)
+        self.assertIn('"$(airc_rs_bin)" identity write-peer-record', combined)
+
 
 if __name__ == "__main__":
     unittest.main()
