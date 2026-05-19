@@ -8,6 +8,8 @@
 //! - [`media`]          — `MediaRef` (pointer into airc-blobs)
 //! - [`headers_keys`]   — substrate-owned `airc.*` header constants
 //! - [`signature`]      — `Signature`, `VerificationPolicy`, `verify()`
+//!   with real Ed25519 verification
+//! - [`keypair`]        — `PeerKeypair` (Ed25519 signing side)
 //! - [`canonical`]      — deterministic CBOR encoding for signing
 //! - [`subscription`]   — `Subscription` predicate for fan-out
 //! - [`policy`]         — pluggable `LiftPolicy` for body-lift decisions
@@ -20,6 +22,7 @@
 pub mod canonical;
 pub mod envelope;
 pub mod headers_keys;
+pub mod keypair;
 pub mod media;
 pub mod policy;
 pub mod signature;
@@ -33,7 +36,10 @@ pub use headers_keys::{
     HEADER_AIRC_DEADLINE, HEADER_AIRC_PRIORITY, HEADER_AIRC_REPLY_TO, HEADER_AIRC_TRACE_ID,
     HEADER_FORGE_BODY_HINT,
 };
+pub use keypair::PeerKeypair;
 pub use media::MediaRef;
 pub use policy::{AlwaysLift, LiftPolicy, NeverLift, SizeThresholdPolicy};
-pub use signature::{verify, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy};
+pub use signature::{
+    verify, KeyError, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy,
+};
 pub use subscription::Subscription;
