@@ -783,7 +783,8 @@ _install_airc_codex_developer_instructions() {
 
   if grep -qE '^[[:space:]]*(hooks|codex_hooks)[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
      && [ -f "$hooks_json" ] \
-     && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
+     && { grep -qF 'airc-rs codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null \
+          || grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; }; then
     if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
       local _tmp; _tmp=$(mktemp)
       sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
@@ -840,20 +841,20 @@ _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _python="${_airc_venv_python_bin:-}"
-  if [ -z "$_python" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-      _python=python3
-    elif command -v python >/dev/null 2>&1; then
-      _python=python
-    else
-      warn "Could not install Codex AIRC hook: python not found"
-      return 0
-    fi
+  local _airc_rs=""
+  if command -v airc-rs >/dev/null 2>&1; then
+    _airc_rs=$(command -v airc-rs)
+  elif [ -x "$CLONE_DIR/target/release/airc-rs" ]; then
+    _airc_rs="$CLONE_DIR/target/release/airc-rs"
+  elif [ -x "$CLONE_DIR/target/debug/airc-rs" ]; then
+    _airc_rs="$CLONE_DIR/target/debug/airc-rs"
+  else
+    warn "Could not install Codex AIRC hook: airc-rs not found"
+    return 0
   fi
 
   local out
-  if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$_python" -m airc_core.codex_install --codex-home "$HOME/.codex" install-hooks 2>&1); then
+  if out=$("$_airc_rs" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | while IFS= read -r line; do
         ok "Codex AIRC hook: $line"

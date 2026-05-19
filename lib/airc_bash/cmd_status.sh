@@ -541,21 +541,26 @@ cmd_inbox() {
 cmd_codex_hook() {
   ensure_init
 
+  local _airc_rs
+  _airc_rs=$(command -v airc-rs 2>/dev/null || true)
+  if [ -z "$_airc_rs" ]; then
+    die "airc-rs is required for codex-hook; build/install the Rust CLI first"
+  fi
+
   local sub="${1:-}"
   shift || true
   case "$sub" in
     user-prompt-submit)
-      local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-      "$AIRC_PYTHON" -m airc_core.codex_hook user-prompt-submit \
-        --home "$AIRC_WRITE_DIR" \
-        --cursor-file "$AIRC_WRITE_DIR/inbox_cursor" \
-        --my-name "$(get_name)" \
-        --client-id "$_client_id" \
+      "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit \
+        --cursor-file "$AIRC_WRITE_DIR/codex_hook_cursor.json" \
         "$@"
       ;;
+    install-hooks|uninstall-hooks)
+      "$_airc_rs" codex-hook "$sub" "$@"
+      ;;
     -h|--help|'')
-      echo "Usage: airc codex-hook user-prompt-submit"
-      echo "  Codex lifecycle hook adapter. Emits UserPromptSubmit JSON context for unread local airc messages."
+      echo "Usage: airc codex-hook {user-prompt-submit|install-hooks|uninstall-hooks}"
+      echo "  Codex lifecycle hook adapter backed by the Rust AIRC event store."
       ;;
     *)
       die "Unknown codex-hook command: $sub" ;;
