@@ -17,6 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use airc_lib::PeerSpec;
 
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
+use crate::gist_cli::GistArgs;
 use crate::work_cli::WorkArgs;
 
 /// Default home directory for persisted identity + IPC state.
@@ -197,6 +198,9 @@ pub enum Command {
 
     /// Inspect persisted events through subscription-style filters.
     Events(crate::events_cli::EventsArgs),
+
+    /// Parse legacy GitHub gist envelope JSON.
+    Gist(GistArgs),
 
     /// Codex lifecycle hook adapters backed by Rust AIRC events.
     CodexHook(CodexHookArgs),

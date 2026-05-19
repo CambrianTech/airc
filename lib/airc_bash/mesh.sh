@@ -130,10 +130,10 @@ _mesh_age_secs() {
   local content
   if [ -n "$channel" ]; then
     content=$(gh api "gists/$gist_id" 2>/dev/null \
-      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content --channel "$channel" 2>/dev/null || true)
+      | "$(airc_rs_bin)" gist gist-content --channel "$channel" 2>/dev/null || true)
   else
     content=$(gh api "gists/$gist_id" 2>/dev/null \
-      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null || true)
+      | "$(airc_rs_bin)" gist gist-content 2>/dev/null || true)
   fi
   [ -z "$content" ] && return 0
   local hb; hb=$(printf '%s' "$content" | "$AIRC_PYTHON" -c '
