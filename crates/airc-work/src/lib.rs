@@ -10,6 +10,7 @@ pub mod event;
 pub mod ids;
 pub mod model;
 pub mod projection;
+pub mod replay;
 
 pub use codec::{
     decode_work_event, encode_work_event, work_event_headers, work_event_subscription,
@@ -30,4 +31,8 @@ pub use model::{
 };
 pub use projection::{
     BoardSnapshot, LaneRecord, ProjectionError, StaleClaim, WorkBoardProjection, WorkspaceRecord,
+};
+pub use replay::{
+    decode_transcript_work_event, project_transcript_work_events, transcript_is_work_event,
+    WorkReplayError, WorkReplayItem,
 };
