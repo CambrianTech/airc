@@ -13,6 +13,8 @@
 
 mod cli;
 mod commands;
+mod work_cli;
+mod work_commands;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,6 +27,7 @@ use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
+use work_cli::WorkAction;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     let uuid = Uuid::from_str(input)
@@ -108,6 +111,24 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await
             }
             PeerAction::List => commands::run_peer_list(&home).await,
+        },
+
+        Command::Work(args) => match args.action {
+            WorkAction::Create {
+                repo,
+                title,
+                body,
+                priority,
+            } => work_commands::run_create(&home, repo, title, body, priority).await,
+            WorkAction::Claim { card_id, ttl_ms } => {
+                work_commands::run_claim(&home, card_id, ttl_ms).await
+            }
+            WorkAction::Release {
+                card_id,
+                claim_id,
+                reason,
+            } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
         },
     }
 }

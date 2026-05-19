@@ -36,6 +36,12 @@ async fn create_work_card_publishes_and_projects_from_store() {
         .await
         .unwrap();
 
+    let immediate = airc.work_board(128).await.unwrap();
+    assert!(
+        immediate.card(card_id).is_some(),
+        "own work sends must be immediately visible in the local durable store"
+    );
+
     let board = wait_for_card(&airc, card_id).await;
     let card = board.card(card_id).unwrap();
     assert_eq!(card.title, "wire work api through airc-lib");

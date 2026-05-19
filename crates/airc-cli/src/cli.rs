@@ -16,6 +16,8 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
+use crate::work_cli::WorkArgs;
+
 /// Default home directory for persisted identity + IPC state.
 ///
 /// Resolution order:
@@ -185,6 +187,9 @@ pub enum Command {
 
     /// Manage the persisted peer registry (`<home>/peers.json`).
     Peer(PeerArgs),
+
+    /// Coordinate work cards over the current room's AIRC substrate.
+    Work(WorkArgs),
 }
 
 #[derive(Debug, Args)]
