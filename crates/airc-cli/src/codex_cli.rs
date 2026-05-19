@@ -44,3 +44,19 @@ pub enum CodexHookAction {
         include_self: bool,
     },
 }
+
+#[derive(Debug, Args)]
+pub struct CodexStartArgs {
+    /// Path to the airc executable the detached child should run.
+    #[arg(long)]
+    pub airc: PathBuf,
+    /// AIRC_HOME/scope directory for the detached child.
+    #[arg(long)]
+    pub home: PathBuf,
+    /// Log file for detached stdout/stderr.
+    #[arg(long)]
+    pub log: PathBuf,
+    /// Arguments forwarded after `airc join`.
+    #[arg(last = true)]
+    pub join_args: Vec<String>,
+}

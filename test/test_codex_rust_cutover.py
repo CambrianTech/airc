@@ -49,6 +49,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.codex_install", source)
         self.assertIn('codex-hook uninstall-hooks --codex-home "$HOME/.codex"', source)
 
+    def test_codex_start_uses_rust_detach_adapter(self):
+        source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
+        start = source.index("cmd_codex_start()")
+        body = source[start:]
+
+        self.assertNotIn("airc_core.codex_start", body)
+        self.assertIn('"$_airc_rs" codex-start', body)
+        self.assertIn("airc-rs is required for codex-start", body)
+
 
 if __name__ == "__main__":
     unittest.main()

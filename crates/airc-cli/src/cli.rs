@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
-use crate::codex_cli::CodexHookArgs;
+use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::work_cli::WorkArgs;
 
 /// Default home directory for persisted identity + IPC state.
@@ -194,6 +194,9 @@ pub enum Command {
 
     /// Codex lifecycle hook adapters backed by Rust AIRC events.
     CodexHook(CodexHookArgs),
+
+    /// Launch legacy `airc join` detached from Codex's tool process.
+    CodexStart(CodexStartArgs),
 
     /// Coordinate work cards over the current room's AIRC substrate.
     Work(WorkArgs),
