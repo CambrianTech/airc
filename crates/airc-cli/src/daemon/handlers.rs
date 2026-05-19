@@ -15,8 +15,8 @@ use airc_transport::Transport;
 use futures::stream::StreamExt;
 
 use crate::daemon::state::DaemonState;
-use crate::ipc::request::{InboxRequest, Request, SendRequest, SubscribeRequest};
-use crate::ipc::response::{InboxResponse, Response, StatusResponse};
+use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
 
 /// Default `Inbox.limit` when the client doesn't pass one. Caps the
 /// payload size so a slow client doesn't accidentally pull MB.
@@ -35,6 +35,8 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Send(send) => handle_send(state, send).await,
         Request::Subscribe(sub) => handle_subscribe(state, sub).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
+        Request::AddPeer(add) => handle_add_peer(state, add).await,
+        Request::ListPeers => handle_list_peers(state).await,
         Request::Stop => {
             // Don't actually stop here; just signal. The server's
             // accept loop watches the same notifier and exits after
@@ -134,6 +136,68 @@ async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
     }
 }
 
+async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Response {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let bytes = match URL_SAFE_NO_PAD.decode(&add.pubkey_b64) {
+        Ok(b) => b,
+        Err(error) => {
+            return Response::Error {
+                message: format!("add_peer: base64 decode: {error}"),
+            };
+        }
+    };
+    if bytes.len() != 32 {
+        return Response::Error {
+            message: format!("add_peer: pubkey is {} bytes, expected 32", bytes.len()),
+        };
+    }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&bytes);
+    let mut registry = match state.registry.write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Response::Error {
+                message: "add_peer: registry lock poisoned".to_string(),
+            };
+        }
+    };
+    if let Err(error) = registry.enrol(add.peer_id, 0, pubkey) {
+        return Response::Error {
+            message: format!("add_peer: enrol: {error}"),
+        };
+    }
+    Response::Ok
+}
+
+async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    // We don't currently expose registry iteration on
+    // PeerKeyRegistry (only by-peer lookup + find_peer). Read the
+    // persisted peers.json instead — the source of truth that both
+    // the daemon and CLI write to.
+    let peers = match crate::peers_store::load(&state.home) {
+        Ok(peers) => peers,
+        Err(error) => {
+            return Response::Error {
+                message: format!("list_peers: {error}"),
+            };
+        }
+    };
+    let entries = peers
+        .into_iter()
+        .map(|p| PeerEntry {
+            peer_id: p.peer_id,
+            pubkey_b64: p.pubkey_b64,
+        })
+        .collect();
+    // URL_SAFE_NO_PAD pulled in to keep imports stable across future
+    // additions (e.g. signed list responses).
+    let _ = URL_SAFE_NO_PAD.encode([0u8; 0]);
+    Response::Peers(PeersResponse { peers: entries })
+}
+
 fn build_message_frame(state: &DaemonState, channel: uuid::Uuid, text: &str) -> Frame {
     let lamport = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -175,11 +239,19 @@ mod tests {
         let mut registry = PeerKeyRegistry::new();
         registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
         let registry = Arc::new(RwLock::new(registry));
+        // Test home is fresh per-call — empty peers.json is fine for
+        // dispatcher tests; no on-disk state required.
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().to_path_buf();
+        // Keep the TempDir alive for the test's lifetime by leaking
+        // it. (This is a unit-test pattern: cheap, predictable.)
+        std::mem::forget(home);
         Arc::new(DaemonState::new(
             peer_id,
             keypair,
             registry,
             VerificationPolicy::Strict,
+            home_path,
         ))
     }
 

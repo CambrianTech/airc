@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::registry::PeerSpec;
 
@@ -48,13 +48,10 @@ pub struct Cli {
     #[arg(long, env = "AIRC_RS_HOME", global = true)]
     pub home: Option<PathBuf>,
 
-    /// Peers to enrol in the local registry, repeatable.
-    /// Format: `<uuid>:<base64-pubkey-no-padding>`. Obtain by
-    /// running `airc-rs init` on the peer side and copying its
-    /// printed spec.
-    ///
-    /// (Will be replaced by a persisted `peers.json` in the next
-    /// PR; flag stays as an override.)
+    /// Ad-hoc peers to enrol for this invocation only, repeatable.
+    /// Format: `<uuid>:<base64-pubkey-no-padding>`. Persistent peers
+    /// come from `<home>/peers.json` (managed via `airc-rs peer add`);
+    /// this flag unions on top for one-shot use.
     #[arg(long = "peer", value_name = "SPEC", global = true)]
     pub peers: Vec<PeerSpec>,
 
@@ -178,4 +175,31 @@ pub enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Manage the persisted peer registry (`<home>/peers.json`).
+    Peer(PeerArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PeerArgs {
+    #[command(subcommand)]
+    pub action: PeerAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PeerAction {
+    /// Enrol a peer by spec. If a daemon is running on
+    /// `<home>/daemon.sock`, also tells it via RPC so the in-memory
+    /// registry stays in sync — no daemon restart required.
+    Add {
+        /// Peer spec: `<uuid>:<base64-pubkey-no-padding>` (the
+        /// `peer_spec:` line from the other side's `airc-rs init`).
+        spec: PeerSpec,
+        /// Override the default socket (`<home>/daemon.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// List enrolled peers. Reads from peers.json on disk (the
+    /// daemon writes the same file, so both views agree).
+    List,
 }

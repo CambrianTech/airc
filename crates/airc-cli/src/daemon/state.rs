@@ -77,6 +77,9 @@ pub struct DaemonState {
     pub keypair: PeerKeypair,
     pub registry: Arc<RwLock<PeerKeyRegistry>>,
     pub policy: VerificationPolicy,
+    /// Home directory the daemon was started against. Lets handlers
+    /// reach `<home>/peers.json` etc. without re-deriving the path.
+    pub home: PathBuf,
     /// When the daemon started — used for the Status uptime field.
     pub started_at: Instant,
     /// One signed-local-fs transport per wire directory. Lazily
@@ -97,12 +100,14 @@ impl DaemonState {
         keypair: PeerKeypair,
         registry: Arc<RwLock<PeerKeyRegistry>>,
         policy: VerificationPolicy,
+        home: PathBuf,
     ) -> Self {
         Self {
             peer_id,
             keypair,
             registry,
             policy,
+            home,
             started_at: Instant::now(),
             local_fs_transports: Mutex::new(HashMap::new()),
             inboxes: Mutex::new(HashMap::new()),

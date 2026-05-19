@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use airc_core::PeerId;
+
 /// A single client-issued operation. Wire-tagged by `op`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -15,6 +17,13 @@ pub enum Request {
     Ping,
     /// Snapshot of daemon state (peer id, uptime, …).
     Status,
+    /// Enrol a peer in the daemon's in-memory registry. The CLI
+    /// writes peers.json itself; this op keeps the running daemon's
+    /// registry in sync without a restart.
+    AddPeer(AddPeerRequest),
+    /// Snapshot of currently-enrolled peers (peer_id + pubkey).
+    /// Returned via `Response::Peers`.
+    ListPeers,
     /// Send a text Message frame. Daemon signs + dispatches via its
     /// owned `SignedTransport`.
     Send(SendRequest),
@@ -54,6 +63,15 @@ pub struct InboxRequest {
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// Parameters for `AddPeer`. `pubkey_b64` is the URL-safe-no-padding
+/// base64 of the 32-byte Ed25519 pubkey (matches the `peer add <spec>`
+/// argument shape on the CLI).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddPeerRequest {
+    pub peer_id: PeerId,
+    pub pubkey_b64: String,
 }
 
 /// Parameters for `Send`.
