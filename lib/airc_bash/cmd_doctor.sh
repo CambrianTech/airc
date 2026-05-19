@@ -459,8 +459,8 @@ _doctor_health() {
     local rate_json
     if rate_json=$(airc_gh_rate_limit_json_cached); then
       local core_remaining core_limit
-      core_remaining=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['remaining'])" 2>/dev/null || echo "")
-      core_limit=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['limit'])" 2>/dev/null || echo "")
+      core_remaining=$(printf '%s' "$rate_json" | "$(airc_rs_bin)" gist get .resources.core.remaining 2>/dev/null || echo "")
+      core_limit=$(printf '%s' "$rate_json" | "$(airc_rs_bin)" gist get .resources.core.limit 2>/dev/null || echo "")
       if [ -n "$core_remaining" ] && [ -n "$core_limit" ]; then
         if [ "$core_remaining" -lt 100 ]; then
           printf "  [WARN] gh core rate-limit: %s/%s remaining — bus may stall soon\n" "$core_remaining" "$core_limit"

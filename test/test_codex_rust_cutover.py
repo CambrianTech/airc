@@ -163,6 +163,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 -c", body)
         self.assertIn('"$(airc_rs_bin)" daemon-scope-id "$target_scope"', body)
 
+    def test_doctor_rate_limit_json_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_doctor.sh").read_text(encoding="utf-8")
+        start = source.index("airc doctor --health -- live bus health")
+        end = source.index("# ── gh request governor", start)
+        body = source[start:end]
+
+        self.assertNotIn("python3 -c", body)
+        self.assertIn('"$(airc_rs_bin)" gist get .resources.core.remaining', body)
+        self.assertIn('"$(airc_rs_bin)" gist get .resources.core.limit', body)
+
 
 if __name__ == "__main__":
     unittest.main()
