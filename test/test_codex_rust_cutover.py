@@ -72,6 +72,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" client-id', body)
         self.assertIn('"$(airc_rs_bin)" humanhash "$input"', body)
 
+    def test_iso_to_epoch_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
+        start = source.index("iso_to_epoch()")
+        end = source.index("# MSYS / Git Bash path conversion", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.datetime", body)
+        self.assertIn('"$(airc_rs_bin)" iso-to-epoch "$ts"', body)
+
 
 if __name__ == "__main__":
     unittest.main()

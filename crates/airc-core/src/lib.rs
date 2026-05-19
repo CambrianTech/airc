@@ -15,6 +15,7 @@
 //! - [`body`]       — opaque payload (Json | Binary) consumers carry
 //! - [`transcript`] — TranscriptEvent + TranscriptKind + MentionTarget
 //! - [`cursor`]     — cursor + paging primitives for transcript fetch
+//! - [`datetime`]   — fixed-format UTC timestamp parsing
 //! - [`receipt`]    — delivered/read/applied acknowledgments
 //! - [`attachment`] — file-attachment manifest (consumer-side richer view)
 //! - [`filter`]     — self-echo filtering for multi-tab consumers
@@ -27,6 +28,7 @@
 pub mod attachment;
 pub mod body;
 pub mod cursor;
+pub mod datetime;
 pub mod filter;
 pub mod headers;
 pub mod humanhash;
@@ -42,6 +44,7 @@ pub mod transcript;
 pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
+pub use datetime::{iso_to_epoch, DateTimeError};
 pub use filter::{filter_self_echoes, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
 pub use humanhash::{humanhash, HumanhashError};
