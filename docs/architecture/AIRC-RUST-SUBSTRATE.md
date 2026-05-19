@@ -75,12 +75,13 @@ envelope is what airc routes/stores/signs; the payload is what the
 consumer reads.
 
 ```rust
-pub struct Message {
-    pub id: Uuid,
-    pub from: PeerId,
+pub struct Envelope {
+    pub id: EventId,
+    pub from: IdentityId,
     pub to: Recipient,             // single peer or "all" within channel
     pub channel: ChannelId,
     pub ts: Timestamp,
+    pub headers: Headers,          // string-keyed envelope metadata (see below)
     pub body: Body,                // opaque to airc
     pub media_refs: Vec<MediaRef>, // pointers, not bytes
     pub signature: Signature,      // sender's signature over envelope+body
@@ -91,6 +92,96 @@ pub enum Body {
     Binary(Bytes),                 // when JSON overhead is wasted
 }
 ```
+
+#### Headers — HTTP-style envelope metadata (dictionary, not typed struct)
+
+The headers are how routers, middleware, and monitors decide what to
+do with an envelope **without parsing the body**. Same discipline web
+HTTP has used for decades: small string-keyed metadata for routing/
+admission decisions; body stays opaque to the substrate.
+
+```rust
+/// String-keyed envelope metadata. airc-rust does NOT bake every
+/// possible concern into typed top-level fields — that would hard-
+/// code every future header into the substrate schema and require
+/// migrations to add new ones. A plain dictionary stays extensible.
+pub type Headers = BTreeMap<String, String>;
+```
+
+`BTreeMap` (not `HashMap`) for:
+- deterministic ordering — signatures + replay + diff-tests stay stable
+- simple serialization (sorted keys, predictable JSON)
+- cheap lookup (still O(log n))
+- unknown-header pass-through (transports just copy the whole map)
+- no schema churn when middleware adds new headers
+
+Example headers a typical envelope might carry:
+
+```
+# airc.* — substrate-owned, substrate routes/observes
+"airc.trace_id"           = "01HX..."
+"airc.priority"           = "interactive"
+"airc.reply_to"           = "evt_..."
+"airc.content_encoding"   = "json"
+"airc.deadline"           = "2026-05-18T22:00:00Z"
+"airc.lease"              = "lease_..."
+"airc.auth_scope"         = "workspace.write"
+
+# forge.* — alloy/contract headers; airc routes on body_hint but
+# does not interpret the contract semantics
+"forge.body_hint"         = "forge.work.offer"
+"forge.requires_capability" = "render.gpu"
+
+# continuum.* — Continuum-specific consumer hints
+"continuum.activity"      = "general-chat"
+"continuum.persona_id"    = "<uuid>"
+
+# x-* — experimental / private headers
+"x-game-tick"             = "1247"
+"x-debug-note"            = "replay-probe"
+```
+
+**Namespace convention** (collision-free without coordination):
+
+| Prefix | Owner | Examples |
+|---|---|---|
+| `airc.*` | airc-rust substrate (reserved) | `airc.trace_id`, `airc.priority`, `airc.reply_to`, `airc.content_encoding`, `airc.deadline`, `airc.lease`, `airc.auth_scope` |
+| `forge.*` | forge-alloy contracts | `forge.body_hint`, `forge.requires_capability`, `forge.persona.tier` |
+| `continuum.*` | continuum domain | `continuum.persona_id`, `continuum.activity` |
+| `openclaw.*`, `hermes.*`, etc. | other consumer ecosystems | their own conventions |
+| `x-*` | arbitrary / experimental | `x-game-tick`, `x-render-priority` |
+
+Each consumer registers and consumes the headers it cares about.
+Unknown headers pass through unchanged. Substrate code knows the
+`airc.*` namespace; everything else is opaque routing data.
+
+**Ergonomic helpers, plain strings underneath.** The Rust API layer
+exposes typed accessors for common headers (e.g.
+`envelope.body_hint() -> Option<&str>` reads `forge.body_hint`;
+`envelope.set_priority(Priority::Interactive)` writes `airc.priority`
+as `"interactive"`) without changing the wire format. Storage and
+transport see plain `BTreeMap<String, String>`. This keeps wire
+stable across consumers and lets ergonomic API evolve without
+schema migrations.
+
+**Authority rule**: routing and admission decisions trust envelope
+headers. The body MAY contain its own `kind` / type field as local
+ergonomics for consumers that already parse the body — but the
+substrate and middleware do not consult body fields. Headers are
+canonical; body kind is consumer convenience. This eliminates the
+"two sources of truth" trap by declaring which one wins: the header.
+
+**Extensibility rule**: consumers add new headers without
+coordinating with airc-rust. The substrate carries them; other
+consumers ignore them. forge-alloy can define which headers are
+required vs optional per contract, but airc-rust enforces no schema
+on the Headers map itself.
+
+**Encryption note**: when the body is encrypted under the recipient
+key (double-ratchet section below), middleware/routers cannot read
+the body. Headers stay accessible because they're not encrypted (only
+authenticated via signature). That's how routing remains efficient
+under E2E encryption.
 
 Storage stores these. Subscribers can request them on a pull (`fetch
 since cursor` / `fetch by channel + range`). They are not pushed
@@ -116,9 +207,17 @@ Canonical events:
 
 ```rust
 pub struct Subscription {
-    pub channel: Option<ChannelId>,   // None = any
-    pub from_peer: Option<PeerId>,    // None = any
-    pub body_hint: Option<String>,    // optional payload-kind tag for filtering
+    pub channel: Option<ChannelId>,    // None = any
+    pub from_peer: Option<PeerId>,     // None = any
+    /// Header matchers — keyed by header name, value is the pattern
+    /// (exact match or prefix). Empty map = match any envelope on the
+    /// channel/peer constraints.
+    pub headers: BTreeMap<String, HeaderPattern>,
+}
+
+pub enum HeaderPattern {
+    Exact(String),
+    Prefix(String),
 }
 ```
 
@@ -126,9 +225,12 @@ Monitor processes (like Claude Code's airc Monitor) subscribe to
 events. Sentinels subscribe to events. WebRTC signaling lands as
 events so the receiving consumer wakes immediately on SDP/ICE.
 
-The `body_hint` is a peer convention (consumers agree on the string,
-e.g. "signaling.webrtc.sdp" or "kanban.card.claimed") — airc doesn't
-interpret it, just lets subscribers filter on it.
+Subscriptions filter on headers — the substrate looks at
+`envelope.headers["forge.body_hint"]` etc. without ever touching the
+body. That's the efficiency win the header pattern unlocks: a Monitor
+subscribed to `headers["forge.body_hint"] = Prefix("forge.work.")`
+events on `#cambriantech` filters past chat text without parsing
+every body.
 
 Events are still persisted (in the same `messages` table) — replay-
 ability matters. The interrupt-drivenness is purely about wake
@@ -180,18 +282,19 @@ Generic. No consumer-specific tables.
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `messages` | id, channel_id, ts, from_pubkey, to (string), body_kind (json/binary), body_blob, body_hint, is_event (bool), signature | The wire log |
+| `messages` | id, channel_id, ts, from_pubkey, to (string), headers (JSONB), body_kind (json/binary), body_blob, is_event (bool), signature | The wire log. Headers stored as JSONB so consumer-defined extension headers persist without schema migrations. |
 | `media_refs` | message_id, sha256, mime, size, blob_path | Pointers; blobs live in `airc-blobs` |
 | `channels` | id, name, host_pubkey, created_at, archive_partition_id | Rooms |
 | `peers` | pubkey, nick, role_hint, last_seen_at, attest_sig | Identity |
 | `cursors` | peer_pubkey, channel_id, last_read_sig, last_read_ts | Per-peer read state |
-| `subscriptions` | peer_pubkey, channel_id_or_null, from_peer_or_null, body_hint_or_null | Event fan-out registry |
+| `subscriptions` | peer_pubkey, channel_id_or_null, from_peer_or_null, header_filters (JSONB: header-name → pattern) | Event fan-out registry — header-keyed match patterns |
 | `archive_partitions` | id, drained_at, range_start_ts, range_end_ts | Bounded active DB; older messages moved to archive DB |
 | `key_attestations` | pubkey, paired_at, attest_sig, paired_with_pubkey | Identity audit trail |
 
 `messages.body_blob` is opaque to airc. Consumers serialize/deserialize
-their own payload shapes into/out of it. The optional `body_hint` is a
-string convention for routing/filtering — airc never validates it.
+their own payload shapes into/out of it. The optional headers (e.g.
+`forge.body_hint`) are string-keyed routing/filtering hints — airc
+never validates the values.
 
 **File transfer + media is first-class airc work, not punted to
 consumers.**
@@ -345,8 +448,8 @@ Identity material:
 - **Crypto primitives**: `ring` for X25519/Ed25519/ChaCha20-Poly1305;
   `signal-protocol` crate (or equivalent) for ratchet state.
 - **No PII assumption in storage**: consumers can tag a body with
-  `pii=true` (via the `body_hint`) which triggers extra retention/
-  redaction policy. Audit log marks redaction events.
+  `airc.pii = "true"` (via the headers map) which triggers extra
+  retention/redaction policy. Audit log marks redaction events.
 
 ## Contract layer: forge-alloy (and why it isn't a dependency here)
 
@@ -360,8 +463,8 @@ Domain contracts live one layer above. **forge-alloy** is the natural
 home: an alloy defines the schema, required capabilities, permissions,
 lifecycle states, valid replies, validation rules, replay semantics, and
 compatibility rules for a payload. AIRC envelopes MAY include a
-`body_hint` such as `forge.work.offer` when the body conforms to a known
-alloy.
+`forge.body_hint` header such as `forge.work.offer` when the body
+conforms to a known alloy.
 
 **The hint is just an opaque string from airc-rust's perspective.**
 airc-rust does not depend on forge-alloy, does not import alloy schemas,
@@ -394,7 +497,7 @@ a future persona engine — links `airc-lib` and:
 2. Joins channels (`JOIN` control frame).
 3. Sends messages: `airc.send(channel, body, ?to)` — body is whatever
    JSON/binary the consumer chooses.
-4. Sends events: `airc.send_event(channel, body, ?body_hint, ?to)`.
+4. Sends events: `airc.send_event(channel, body, headers, ?to)`.
 5. Subscribes to events: `airc.subscribe(filter, handler)`.
 6. Reads scrollback: `airc.fetch(channel, since)`.
 7. Uploads blobs: `airc.blobs.put(bytes) -> MediaRef`.
@@ -477,7 +580,7 @@ The three sets are computed from different sources:
   membership.
 - `responder_ready` is composed: a peer announces readiness via an
   application-level event (consumer convention, e.g.
-  `body_hint="presence.responder_ready"`). The substrate tracks
+  `headers["forge.body_hint"]="presence.responder_ready"`). The substrate tracks
   which peers have most-recently announced ready vs busy/offline.
 
 UI defaults (consumer choice, but the substrate makes the data easy):
@@ -636,7 +739,7 @@ Each phase reversible until phase 5.
   belong in the consumer, not in airc-core, but airc-store could
   expose an optional capability flag.
 - WebRTC: signaling shape (SDP/ICE JSON content) stays application-
-  level — consumers wrap it in event bodies with `body_hint="rtc.sdp"`
+  level — consumers wrap it in event bodies with `headers["forge.body_hint"]="rtc.sdp"`
   or similar. BUT the NETWORK side (UDP, ICE candidate gathering,
   NAT traversal, the actual efficient media path) IS airc-rust's
   job because it's network-substrate work. `airc-rtc` crate ships
@@ -680,8 +783,8 @@ A Monitor process that wakes on every event in a channel:
 let airc = AircClient::open()?;
 airc.subscribe(Subscription {
     channel: Some(ch),
-    body_hint: None,
     from_peer: None,
+    headers: BTreeMap::new(),  // empty = match any envelope
 }, |envelope| {
     // wake immediately when an event arrives
     handle(envelope);
@@ -698,14 +801,18 @@ An engine that issues RPC-style commands to peers, encoded as JSON
 in the body, with a correlation_id convention:
 
 ```rust
+let correlation_id = uuid::Uuid::new_v4();
+let mut headers = Headers::new();
+headers.insert("forge.body_hint".into(), "rpc.command".into());
+headers.insert("airc.reply_to".into(), "".into()); // initial request; reply will set this
 let envelope = airc.send_event(
     "#cambriantech",
     Body::Json(json!({
         "op": "git/pr-create",
         "args": { "branch": "feat/foo", "title": "..." },
-        "correlation_id": uuid::Uuid::new_v4(),
+        "correlation_id": correlation_id,
     })),
-    Some("rpc.command"),       // body_hint for filtering
+    headers,
     Some(target_peer),         // direct, not broadcast
 )?;
 // wait for a response event with matching correlation_id
