@@ -16,6 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
+use crate::codex_cli::CodexHookArgs;
 use crate::work_cli::WorkArgs;
 
 /// Default home directory for persisted identity + IPC state.
@@ -190,6 +191,9 @@ pub enum Command {
 
     /// Inspect persisted events through subscription-style filters.
     Events(crate::events_cli::EventsArgs),
+
+    /// Codex lifecycle hook adapters backed by Rust AIRC events.
+    CodexHook(CodexHookArgs),
 
     /// Coordinate work cards over the current room's AIRC substrate.
     Work(WorkArgs),
