@@ -249,6 +249,12 @@ pub enum Command {
         /// Timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.
         timestamp: String,
     },
+
+    /// Print the stable daemon service suffix for an airc scope path.
+    DaemonScopeId {
+        /// Scope path. Defaults to `$AIRC_HOME`, then `$HOME/.airc`.
+        scope: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]

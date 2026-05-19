@@ -23,6 +23,7 @@ mod codex_start;
 mod commands;
 mod config_cli;
 mod config_commands;
+mod daemon_scope;
 mod events_cli;
 mod events_commands;
 mod gist_cli;
@@ -382,6 +383,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::IsoToEpoch { timestamp } => {
             println!("{}", airc_core::iso_to_epoch(&timestamp)?);
+            Ok(())
+        }
+
+        Command::DaemonScopeId { scope } => {
+            let scope = scope.unwrap_or_else(daemon_scope::default_scope);
+            println!("{}", daemon_scope::scope_id(&scope));
             Ok(())
         }
     }
