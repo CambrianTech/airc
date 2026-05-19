@@ -11,8 +11,7 @@
 //! generating if absent). `VerificationPolicy::Strict` is the only
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
-mod bearer_cli;
-mod bearer_commands;
+mod bearer;
 mod bearer_state;
 mod channel_gist_cli;
 mod channel_gist_commands;
@@ -67,7 +66,7 @@ use uuid::Uuid;
 use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
-use bearer_cli::BearerAction;
+use bearer::cli::BearerAction;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
@@ -125,7 +124,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 identity_key,
                 remote_home,
                 room_gist_id,
-            } => bearer_commands::run_send(
+            } => bearer::commands::run_send(
                 &peer_id,
                 &channel,
                 host_target.as_deref(),
@@ -140,7 +139,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 identity_key,
                 remote_home,
                 room_gist_id,
-            } => bearer_commands::run_send_batch(
+            } => bearer::commands::run_send_batch(
                 &peer_id,
                 &channel,
                 host_target.as_deref(),

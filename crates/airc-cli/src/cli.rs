@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
-use crate::bearer_cli::BearerArgs;
+use crate::bearer::cli::BearerArgs;
 use crate::channel_gist_cli::ChannelGistArgs;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
