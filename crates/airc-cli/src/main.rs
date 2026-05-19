@@ -50,17 +50,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let home = parsed.home.clone().unwrap_or_else(cli::default_home_dir);
 
     match parsed.command {
-        Command::Init => commands::run_init(&home),
+        Command::Init => commands::run_init(&home).await,
 
-        Command::Send { text } => {
-            let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_send(&home, &identity, parsed.peers, &text).await
-        }
+        Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
 
-        Command::Listen { replay } => {
-            let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_listen(&home, &identity, parsed.peers, replay).await
-        }
+        Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
 
         Command::LanSend {
             to,
@@ -107,13 +101,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
 
-        Command::Room { name, wire } => commands::run_room(&home, name, wire),
+        Command::Room { name, wire } => commands::run_room(&home, name, wire).await,
 
         Command::Peer(args) => match args.action {
             PeerAction::Add { spec, socket } => {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await
             }
-            PeerAction::List => commands::run_peer_list(&home),
+            PeerAction::List => commands::run_peer_list(&home).await,
         },
     }
 }

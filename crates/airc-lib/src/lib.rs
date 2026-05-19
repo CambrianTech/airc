@@ -26,7 +26,7 @@ pub mod error;
 pub mod registry;
 pub mod room;
 
-pub use airc::{Airc, EnrolledPeer};
+pub use airc::{Airc, EnrolledPeer, EventStream, LiveLag};
 pub use error::AircError;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;

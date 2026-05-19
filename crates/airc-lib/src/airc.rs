@@ -20,7 +20,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,6 +38,7 @@ use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::{LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::{broadcast, Mutex};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use crate::error::AircError;
 use crate::registry::PeerSpec;
@@ -193,6 +193,18 @@ impl Airc {
         Ok(room)
     }
 
+    /// Variant of [`join`] that overrides the per-home default wire
+    /// dir. Used for shared-wire setups (local-fs tests where two
+    /// processes on one machine tail the same `frames.jsonl`).
+    /// Production users want [`join`].
+    pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
+        let mut room = Room::from_name(&self.inner.home, name);
+        room.wire = wire;
+        room::save(&self.inner.home, &room)?;
+        self.ensure_wire_subscriber(&room.wire).await?;
+        Ok(room)
+    }
+
     /// Read the persisted current room. Returns the default room
     /// (synthesised on the fly, NOT persisted) if no `room.json`
     /// has been written yet.
@@ -260,9 +272,15 @@ impl Airc {
     /// [`Airc::resume_from`].
     pub async fn subscribe(&self) -> Result<EventStream, AircError> {
         let room = self.current_room().await?;
+        // Subscribe to the broadcast BEFORE spawning the wire
+        // subscriber, otherwise the wire-tail's replay-on-attach
+        // can fire events into the broadcast before this receiver
+        // exists and they're lost. tokio::broadcast only delivers
+        // events sent AFTER the subscribe call.
+        let rx = self.inner.live_tx.subscribe();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(EventStream {
-            rx: self.inner.live_tx.subscribe(),
+            inner: BroadcastStream::new(rx),
         })
     }
 
@@ -315,6 +333,25 @@ impl Airc {
     /// via [`Airc::peer_spec`].
     pub async fn add_peer(&self, spec: PeerSpec) -> Result<(), AircError> {
         peers_store::add(&self.inner.home, spec.peer_id, spec.pubkey)?;
+        let mut registry = self
+            .inner
+            .registry
+            .write()
+            .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
+        registry
+            .enrol(spec.peer_id, 0, spec.pubkey)
+            .map_err(|e| AircError::Crypto(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Enrol a peer in the in-memory trust registry WITHOUT writing
+    /// to `peers.json`. Used by short-lived invocations (the CLI's
+    /// `--peer` flag, one-shot tooling) that want to trust a peer for
+    /// the current process only.
+    ///
+    /// Persistent enrolment goes through [`add_peer`] — this method
+    /// is intentionally volatile.
+    pub fn enrol_volatile_peer(&self, spec: &PeerSpec) -> Result<(), AircError> {
         let mut registry = self
             .inner
             .registry
@@ -387,19 +424,17 @@ impl Airc {
                         let event = frame.into_transcript_event();
                         match store.append(event.clone()).await {
                             Ok(()) => {
-                                // No active receivers is normal (no
-                                // one's called `subscribe()` yet) —
-                                // broadcast::send returns Err in that
-                                // case and we don't care.
+                                // No active receivers is normal — the
+                                // broadcast send returns Err and we
+                                // don't care; the event is durably in
+                                // the store either way.
                                 let _ = live_tx.send(event);
                             }
                             Err(airc_store::StoreError::DuplicateEventId(_)) => {
-                                // Replay-anchored attach re-reads
-                                // the existing wire on every fresh
+                                // Replay-anchored attach re-reads the
+                                // existing wire on every fresh
                                 // Airc::open; the store rejects the
-                                // duplicate, we move on without
-                                // fanning out (the live broadcast is
-                                // for genuinely new events).
+                                // duplicate, we skip the broadcast.
                             }
                             Err(err) => {
                                 eprintln!("airc-lib subscriber: store append failed: {err}");
@@ -427,7 +462,7 @@ impl Airc {
 /// [`Airc::resume_from`] when they catch up. Silent drops are not
 /// part of the API.
 pub struct EventStream {
-    rx: broadcast::Receiver<TranscriptEvent>,
+    inner: BroadcastStream<TranscriptEvent>,
 }
 
 impl Stream for EventStream {
@@ -435,15 +470,14 @@ impl Stream for EventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let fut = this.rx.recv();
-        futures::pin_mut!(fut);
-        match fut.as_mut().poll(cx) {
+        let inner = Pin::new(&mut this.inner);
+        match inner.poll_next(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(event)) => Poll::Ready(Some(Ok(event))),
-            Poll::Ready(Err(broadcast::error::RecvError::Lagged(n))) => {
+            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
+            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
                 Poll::Ready(Some(Err(LiveLag { skipped: n })))
             }
-            Poll::Ready(Err(broadcast::error::RecvError::Closed)) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
         }
     }
 }
