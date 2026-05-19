@@ -231,6 +231,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_then_send_then_inbox_round_trips() {
+        // The big daemon e2e: subscribe to a wire, send a frame
+        // (daemon's own send writes to the wire), inbox returns it.
+        // Proves the daemon's send + buffered-subscribe paths
+        // compose correctly.
+        use crate::ipc::request::{InboxRequest, SendRequest, SubscribeRequest};
+        use tempfile::TempDir;
+
+        let state = fresh_state();
+        let socket = unique_socket();
+        let server_state = state.clone();
+        let server_socket = socket.clone();
+        let server_handle = tokio::spawn(async move { run(server_state, server_socket).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let dir = TempDir::new().unwrap();
+        let wire = dir.path().to_path_buf();
+        let channel = uuid::Uuid::nil();
+
+        let client = DaemonClient::new(socket);
+        // Subscribe first so the daemon starts the drain task.
+        client
+            .subscribe(SubscribeRequest { wire: wire.clone() })
+            .await
+            .unwrap();
+        // Send through the daemon (daemon signs + writes to the wire).
+        client
+            .send(SendRequest {
+                wire: wire.clone(),
+                channel,
+                text: "hello from daemon".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Inbox MAY need a brief moment to drain the new frame from
+        // the subscription into the buffer.
+        let mut attempts = 0;
+        let inbox = loop {
+            let response = client
+                .inbox(InboxRequest {
+                    wire: wire.clone(),
+                    since_lamport: None,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            if !response.frames.is_empty() {
+                break response;
+            }
+            attempts += 1;
+            if attempts > 20 {
+                panic!(
+                    "inbox never saw the sent frame (attempts={attempts}, newest_lamport={})",
+                    response.newest_lamport
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(inbox.frames.len(), 1);
+        assert_eq!(
+            inbox.frames[0]
+                .envelope
+                .body
+                .as_ref()
+                .and_then(airc_core::Body::as_text)
+                .unwrap(),
+            "hello from daemon"
+        );
+
+        // newest_lamport should let us "advance past" — second inbox
+        // call returns empty.
+        let after = client
+            .inbox(InboxRequest {
+                wire: wire.clone(),
+                since_lamport: Some(inbox.newest_lamport),
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            after.frames.is_empty(),
+            "after the cursor, inbox must be empty"
+        );
+
+        client.stop().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
     async fn second_daemon_refuses_to_steal_live_socket() {
         // Pin the cleanup_stale_socket contract: if a daemon is
         // already live on the path, a second run() returns AddrInUse

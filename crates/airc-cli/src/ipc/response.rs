@@ -3,15 +3,22 @@
 
 use serde::{Deserialize, Serialize};
 
+use airc_protocol::Frame;
+
 /// One response to a `Request`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     /// Response to `Ping`.
     Pong,
     /// Response to `Status`.
     Status(StatusResponse),
-    /// Generic success for ops that don't return data (`Send`, `Stop`).
+    /// Response to `Inbox` — buffered frames + a "newest cursor" the
+    /// caller threads back on the next call to keep the stream
+    /// consume-once.
+    Inbox(InboxResponse),
+    /// Generic success for ops that don't return data (`Send`,
+    /// `Subscribe`, `Stop`).
     Ok,
     /// Failure — typed message so the client can render it.
     Error { message: String },
@@ -24,6 +31,17 @@ pub struct StatusResponse {
     pub peer_id: String,
     /// Seconds since daemon start.
     pub uptime_seconds: u64,
+}
+
+/// Result of an `Inbox` pull: frames + the lamport to feed back as
+/// `since_lamport` on the next call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InboxResponse {
+    /// Up to `limit` frames matching the request, lamport-ascending.
+    pub frames: Vec<Frame>,
+    /// Largest lamport in `frames`, or `since_lamport` echoed back if
+    /// the call returned no frames. Pass this on the next call.
+    pub newest_lamport: u64,
 }
 
 #[cfg(test)]

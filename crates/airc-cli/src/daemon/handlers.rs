@@ -7,13 +7,20 @@
 
 use std::sync::Arc;
 
-use airc_core::{headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, RoomId};
-use airc_protocol::{Envelope, Frame, FrameKind, Signature};
+use airc_core::{
+    headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, RoomId, TranscriptCursor,
+};
+use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
+use futures::stream::StreamExt;
 
 use crate::daemon::state::DaemonState;
-use crate::ipc::request::{Request, SendRequest};
-use crate::ipc::response::{Response, StatusResponse};
+use crate::ipc::request::{InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::response::{InboxResponse, Response, StatusResponse};
+
+/// Default `Inbox.limit` when the client doesn't pass one. Caps the
+/// payload size so a slow client doesn't accidentally pull MB.
+const INBOX_DEFAULT_LIMIT: usize = 32;
 
 /// Dispatch one request against the daemon's state. Always returns a
 /// Response — Err paths become `Response::Error { message }` so the
@@ -26,6 +33,8 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             uptime_seconds: state.uptime_seconds(),
         }),
         Request::Send(send) => handle_send(state, send).await,
+        Request::Subscribe(sub) => handle_subscribe(state, sub).await,
+        Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::Stop => {
             // Don't actually stop here; just signal. The server's
             // accept loop watches the same notifier and exits after
@@ -34,6 +43,84 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             Response::Ok
         }
     }
+}
+
+async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Response {
+    // Idempotent: if the inbox already exists, the subscriber task is
+    // already draining frames into it. Return Ok without spawning a
+    // duplicate.
+    if state.has_inbox(&sub.wire).await {
+        return Response::Ok;
+    }
+
+    // Create the inbox buffer + spawn the drain task.
+    let buffer = state.inbox_for(&sub.wire).await;
+    let transport = state.local_fs_for(&sub.wire).await;
+    let subscription = Subscription {
+        // Replay from the start of the wire — buffer captures
+        // pre-existing frames so an inbox call seconds later still
+        // sees them.
+        from_cursor: Some(TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        }),
+        ..Default::default()
+    };
+
+    let mut stream = match transport.subscribe(subscription).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return Response::Error {
+                message: format!("subscribe: {error}"),
+            };
+        }
+    };
+
+    let buffer_for_task = buffer.clone();
+    tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(frame) => {
+                    buffer_for_task.lock().await.push(frame);
+                }
+                Err(_verify_error) => {
+                    // Verification failure — don't buffer.
+                    // Future: surface a counter in Status response.
+                }
+            }
+        }
+    });
+
+    Response::Ok
+}
+
+async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
+    let Some(buffer) = state.inboxes.lock().await.get(&request.wire).cloned() else {
+        // No subscription on this wire — return empty inbox rather
+        // than an error so clients can call Inbox before Subscribe
+        // without an awkward warmup race.
+        return Response::Inbox(InboxResponse {
+            frames: Vec::new(),
+            newest_lamport: request.since_lamport.unwrap_or(0),
+        });
+    };
+    let buffer = buffer.lock().await;
+    let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
+    let frames = buffer.since(request.since_lamport, limit);
+    // newest_lamport in the response is the max we return so the
+    // client can hand it back as since_lamport next time. If we
+    // returned no frames, echo the input cursor so the client doesn't
+    // restart from 0.
+    let newest_lamport = frames
+        .iter()
+        .map(|f| f.envelope.lamport)
+        .max()
+        .or(request.since_lamport)
+        .unwrap_or_else(|| buffer.newest_lamport());
+    Response::Inbox(InboxResponse {
+        frames,
+        newest_lamport,
+    })
 }
 
 async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {

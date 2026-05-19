@@ -150,4 +150,24 @@ pub enum Command {
         /// Message body.
         text: String,
     },
+
+    /// Pull buffered frames from the daemon's inbox for a wire.
+    /// On first call for a wire, the daemon starts subscribing
+    /// (idempotent — repeat calls reuse the same subscription).
+    /// Pass `--since-lamport` to consume only new frames since the
+    /// last call.
+    Inbox {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Wire directory.
+        #[arg(long)]
+        wire: PathBuf,
+        /// Return frames with lamport > this value (consume-once
+        /// cursor). Defaults to 0 = everything in the buffer.
+        #[arg(long)]
+        since_lamport: Option<u64>,
+        /// Max frames in one batch.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
