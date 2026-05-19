@@ -132,7 +132,7 @@ sys.exit(0 if (target in seen and target not in my_history) else 1)
   # (would have broken on a name containing a single quote — currently
   # safe because the sanitizer keeps names in [a-z0-9-], but a sharp
   # edge in code that's about to recurse).
-  "$AIRC_PYTHON" -m airc_core.config set_name --config "$CONFIG" --name "$new_name"
+  set_config_val name "$new_name"
   echo "  Renamed: $old_name → $new_name"
 
   # Phase 2: propagate the config write to sibling scopes BEFORE

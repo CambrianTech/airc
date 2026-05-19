@@ -91,6 +91,28 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::BearerState { path } => bearer_state::run(&path),
 
         Command::Config(args) => match args.action {
+            ConfigAction::Get {
+                config,
+                key,
+                default,
+            } => config_commands::run_get(&home, config, &key, &default),
+            ConfigAction::GetName { config } => config_commands::run_get_name(&home, config),
+            ConfigAction::Set { config, key, value } => {
+                config_commands::run_set(&home, config, &key, &value)
+            }
+            ConfigAction::SetName { config, name } => {
+                config_commands::run_set_name(&home, config, &name)
+            }
+            ConfigAction::UnsetKeys { config, keys } => {
+                config_commands::run_unset_keys(&home, config, &keys)
+            }
+            ConfigAction::ReadParted { config } => config_commands::run_read_parted(&home, config),
+            ConfigAction::RecordParted { config, room } => {
+                config_commands::run_record_parted(&home, config, &room)
+            }
+            ConfigAction::ClearParted { config, room } => {
+                config_commands::run_clear_parted(&home, config, &room)
+            }
             ConfigAction::ReadChannels { config } => {
                 config_commands::run_read_channels(&home, config)
             }

@@ -158,6 +158,56 @@ fn config_set_channel_gist_sets_and_clears_mapping() {
     );
 }
 
+#[test]
+fn config_get_set_unset_round_trips() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+    fs::write(
+        home.join("config.json"),
+        r#"{"name":"alice","host":"localhost","identity":{"role":"agent"}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(run_ok(home, &["config", "get-name"]), "alice\n");
+    assert_eq!(
+        run_ok(home, &["config", "get", "identity", "{}"]),
+        "{\"role\":\"agent\"}\n"
+    );
+
+    run_ok(home, &["config", "set", "--key", "name", "--value", "bob"]);
+    assert_eq!(run_ok(home, &["config", "get-name"]), "bob\n");
+
+    run_ok(home, &["config", "unset-keys", "host"]);
+    assert_eq!(
+        run_ok(home, &["config", "get", "host", "missing"]),
+        "missing\n"
+    );
+}
+
+#[test]
+fn config_set_name_matches_legacy_command() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    run_ok(home, &["config", "set-name", "--name", "codex-tab"]);
+
+    assert_eq!(run_ok(home, &["config", "get-name"]), "codex-tab\n");
+}
+
+#[test]
+fn config_parted_rooms_are_idempotent() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    run_ok(home, &["config", "record-parted", "--room", "general"]);
+    run_ok(home, &["config", "record-parted", "--room", "general"]);
+    run_ok(home, &["config", "record-parted", "--room", "airc"]);
+    assert_eq!(run_ok(home, &["config", "read-parted"]), "general\nairc\n");
+
+    run_ok(home, &["config", "clear-parted", "--room", "general"]);
+    assert_eq!(run_ok(home, &["config", "read-parted"]), "airc\n");
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = Command::new(airc_rs())
         .arg("--home")

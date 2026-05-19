@@ -124,6 +124,30 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" gist get .airc', combined)
         self.assertIn('"$(airc_rs_bin)" gist gist-content', combined)
 
+    def test_generic_config_runtime_paths_use_airc_rs(self):
+        files = [
+            REPO / "airc",
+            REPO / "lib/airc_bash/cmd_rename.sh",
+        ]
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+        forbidden = [
+            "airc_core.config get_name",
+            "airc_core.config get ",
+            "airc_core.config set ",
+            "airc_core.config set_name",
+            "airc_core.config unset_keys",
+            "airc_core.config read_parted",
+            "airc_core.config record_parted",
+            "airc_core.config clear_parted",
+        ]
+        for needle in forbidden:
+            self.assertNotIn(needle, combined)
+
+        self.assertIn('"$(airc_rs_bin)" config get-name', combined)
+        self.assertIn('"$(airc_rs_bin)" config set ', combined)
+        self.assertIn('"$(airc_rs_bin)" config read-parted', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

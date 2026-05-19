@@ -737,14 +737,16 @@ ensure_init() {
   die "Not initialized ($AIRC_WRITE_DIR). Run: airc join"
 }
 
-# config CRUD via airc_core.config — proper argparse --flags so paths
-# are per-arg-predictable across MSYS path-translation. Each call passes
+# config CRUD via airc-rs — proper clap --flags so paths are
+# per-arg-predictable across MSYS path-translation. Each call passes
 # `--config <path>` explicitly.
 get_name() {
-  "$AIRC_PYTHON" -m airc_core.config get_name --config "$CONFIG" 2>/dev/null || echo "unknown"
+  "$(airc_rs_bin)" config get-name --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || echo "unknown"
 }
 
-get_config_val()   { "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"; }
+get_config_val() {
+  "$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
+}
 set_config_val()   {
   # Empty $2 must reach argparse as the value of --value. The plain
   # `--value "$2"` form fails on Windows when bash invocations cross
@@ -757,9 +759,11 @@ set_config_val()   {
   # Repro on Windows 11 + WSL2 Ubuntu (issue #511 trace):
   #   set_config_val host "$(get_host)"   # get_host -> ""
   #   → exit 2 + "argument --value: expected one argument"
-  "$AIRC_PYTHON" -m airc_core.config set --config "$CONFIG" --key "$1" --value="${2-}"
+  "$(airc_rs_bin)" config set --home "$AIRC_WRITE_DIR" --config "$CONFIG" --key "$1" --value="${2-}"
 }
-unset_config_keys() { "$AIRC_PYTHON" -m airc_core.config unset_keys --config "$CONFIG" "$@"; }
+unset_config_keys() {
+  "$(airc_rs_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$@"
+}
 
 airc_rs_bin() {
   local _root; _root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -830,7 +834,7 @@ airc_config_set_channel_gist() {
 # that need to read sibling-scope state without changing $CONFIG.
 get_config_val_in() {
   local cfg="$1" key="$2" default="${3:-}"
-  "$AIRC_PYTHON" -m airc_core.config get --config "$cfg" "$key" "$default" 2>/dev/null || echo "$default"
+  "$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$cfg" "$key" "$default" 2>/dev/null || echo "$default"
 }
 
 get_host() {
@@ -1344,10 +1348,10 @@ _primary_scope_for() {
 }
 
 # parted_rooms helpers (#136 sticky /part) — thin wrappers; mutation
-# logic lives in airc_core.config (#205 target 6).
-_read_parted_rooms()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config read_parted --config "$1/config.json" 2>/dev/null; }
-_record_parted_room() { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config record_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
-_clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config clear_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
+# logic lives in airc-rs config.
+_read_parted_rooms()  { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config read-parted --home "$1" --config "$1/config.json" 2>/dev/null; }
+_record_parted_room() { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config record-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
+_clear_parted_room()  { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config clear-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
 
 # Spawn the #general sidecar (issue #121) — a parallel `airc join`
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
