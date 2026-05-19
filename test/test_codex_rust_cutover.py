@@ -90,6 +90,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.log rotate", connect)
         self.assertIn('"$(airc_rs_bin)" log rotate --path "$_hb_messages"', connect)
 
+    def test_bearer_state_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_doctor.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.bearer_state", source)
+        self.assertIn('"$(airc_rs_bin)" bearer-state "$state_file"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

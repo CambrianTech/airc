@@ -536,7 +536,7 @@ _doctor_health() {
       fi
       found_state=1
       local state_ts last_recv_ts last_heartbeat_ts heartbeat_age
-      state_ts=$("$AIRC_PYTHON" -m airc_core.bearer_state "$state_file" 2>/dev/null || echo "0 0")
+      state_ts=$("$(airc_rs_bin)" bearer-state "$state_file" 2>/dev/null || echo "0 0")
       last_recv_ts=${state_ts%% *}
       last_heartbeat_ts=${state_ts#* }
       [ "$last_recv_ts" = "$state_ts" ] && last_heartbeat_ts=0

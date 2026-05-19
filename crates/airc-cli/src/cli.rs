@@ -78,6 +78,12 @@ pub enum Command {
     /// peer_id.
     Init,
 
+    /// Print legacy bearer state timestamps as `last_recv last_heartbeat`.
+    BearerState {
+        /// bearer_state.<channel>.json path to read.
+        path: PathBuf,
+    },
+
     /// Send a single text Message frame to the current room and exit.
     /// The current room lives in `<home>/room.json`; switch with
     /// `airc-rs room <name>`.
