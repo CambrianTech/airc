@@ -12,16 +12,22 @@
 //!
 //! Path conventions:
 //!   - Unix: a filesystem path like `<home>/daemon.sock`.
-//!   - Windows: a named-pipe path like `\\.\pipe\airc-rs-daemon`. If
+//!   - Windows: a named-pipe path like `\\.\pipe\airc-rs-<hash>`. If
 //!     the caller passes a plain filesystem path, the resolver
-//!     converts it to a per-home pipe name so multiple homes can
-//!     coexist on one machine.
+//!     converts it via UUIDv5 over the full path string so multiple
+//!     homes on one machine cannot collide. (Earlier versions used
+//!     only the parent dirname + file basename — two users both with
+//!     `~/.airc-rs/daemon.sock` collided. Caught in Codex audit
+//!     2026-05-19, grievance §4 / Windows Gaps.)
 
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+#[cfg(any(windows, test))]
+use uuid::Uuid;
 
 /// One IPC connection — read/write the wire bytes, no protocol
 /// knowledge.
@@ -210,51 +216,248 @@ impl IpcListener {
     }
 }
 
+/// Namespace UUID for deriving named-pipe discriminators from socket
+/// paths. Fixed so the mapping is stable across rustc versions and
+/// across machines (same path → same pipe name).
+#[cfg(any(windows, test))]
+const PIPE_NAMESPACE: Uuid = Uuid::from_bytes([
+    0xa1, 0xc2, 0x70, 0x1b, 0xe0, 0x05, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+]);
+
 /// Convert a filesystem-style path into a Windows named-pipe path.
 ///
 /// If the path already looks like a pipe (`\\.\pipe\...`) it's
-/// returned as-is. Otherwise the path's last component is sanitised
-/// and prefixed: `<home>/daemon.sock` → `\\.\pipe\airc-rs-daemon-<home>`.
-/// Multiple homes get distinct pipes so concurrent daemons coexist.
-#[cfg(windows)]
+/// returned as-is. Otherwise the path is normalised (see
+/// `canonicalize_for_hash`) and the result is hashed via UUIDv5
+/// under `PIPE_NAMESPACE`: `C:\Users\alice\.airc-rs\daemon.sock` →
+/// `\\.\pipe\airc-rs-<32-hex>`. Two distinct paths cannot collide;
+/// the same path always resolves to the same pipe name regardless
+/// of separator style or case-equivalent spelling (NTFS is
+/// case-insensitive, so `C:\Users\Alice` and `c:\users\alice` must
+/// hash to the same pipe).
+///
+/// Earlier implementations used only `parent_basename + file_basename`,
+/// which collided when two users both used `.airc-rs/daemon.sock`.
+/// Codex audit 2026-05-19, grievance §4.
+#[cfg(any(windows, test))]
 fn resolve_pipe_name(path: &Path) -> String {
     let raw = path.to_string_lossy();
     if raw.starts_with(r"\\.\pipe\") {
         return raw.into_owned();
     }
-    // Build a stable per-path pipe name. Use the immediate parent's
-    // basename + the file basename so different homes don't collide.
-    let file = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "daemon".to_string());
-    let parent_tag = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "default".to_string());
-    let sanitised = sanitise_pipe_token(&format!("{parent_tag}-{file}"));
-    format!(r"\\.\pipe\airc-rs-{sanitised}")
+    let canonical = canonicalize_for_hash(path);
+    let digest = Uuid::new_v5(&PIPE_NAMESPACE, canonical.as_bytes());
+    format!(r"\\.\pipe\airc-rs-{}", digest.as_simple())
 }
 
-#[cfg(windows)]
-fn sanitise_pipe_token(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+/// Reduce a path to a stable byte representation for hashing so that
+/// equivalent spellings (different separators, case differences,
+/// `..` segments) all collapse to the same pipe name.
+///
+/// Strategy:
+///   1. Ask the OS to canonicalise the whole path. Succeeds when the
+///      socket file already exists (the common steady-state case for
+///      a client connecting to a running daemon).
+///   2. If that fails, canonicalise just the parent dir (which exists
+///      after `airc-rs init`) and re-join the file basename.
+///   3. If that also fails, fall back to a string-level normalisation:
+///      backslashes → forward slashes, lowercase. On Windows this
+///      handles separator + case equivalence; on Unix the function
+///      isn't used in production, only by the cross-platform tests
+///      that pass synthetic non-existent `C:\...` paths.
+///
+/// Lowercase is correct on Windows (NTFS case-insensitive) and only
+/// active in this code path because `#[cfg(any(windows, test))]`
+/// gates the whole resolver. Case-sensitive file systems on Linux
+/// would never reach this function in production.
+#[cfg(any(windows, test))]
+fn canonicalize_for_hash(path: &Path) -> String {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon.to_string_lossy().to_lowercase();
+    }
+    if let Some(parent) = path.parent() {
+        if let (Ok(canon_parent), Some(file)) = (std::fs::canonicalize(parent), path.file_name()) {
+            return canon_parent.join(file).to_string_lossy().to_lowercase();
+        }
+    }
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn pipe_names_differ_across_homes() {
+        // The bug Codex flagged: two users both with
+        // `<home>/.airc-rs/daemon.sock` collided because the old
+        // resolver only used `parent_basename + file_basename`.
+        // UUIDv5 over the full path string forces uniqueness.
+        let alice: PathBuf = [r"C:\", "Users", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let bob: PathBuf = [r"C:\", "Users", "bob", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let a = resolve_pipe_name(&alice);
+        let b = resolve_pipe_name(&bob);
+        assert_ne!(a, b, "alice's and bob's pipes must not collide");
+        assert!(
+            a.starts_with(r"\\.\pipe\airc-rs-"),
+            "pipe prefix preserved: {a}"
+        );
+        assert!(
+            b.starts_with(r"\\.\pipe\airc-rs-"),
+            "pipe prefix preserved: {b}"
+        );
+    }
+
+    #[test]
+    fn pipe_name_is_stable_across_calls() {
+        // Same path → same pipe. UUIDv5 is deterministic, so the
+        // daemon and client running independently produce matching
+        // pipe names from the same socket path.
+        let path: PathBuf = [r"C:\", "Users", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let first = resolve_pipe_name(&path);
+        let second = resolve_pipe_name(&path);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn pipe_name_passes_through_explicit_pipe_path() {
+        // If someone hands the resolver an already-formed pipe path
+        // (e.g. test harness, custom daemon launcher), respect it.
+        let explicit = PathBuf::from(r"\\.\pipe\custom-airc-pipe");
+        assert_eq!(resolve_pipe_name(&explicit), r"\\.\pipe\custom-airc-pipe");
+    }
+
+    #[test]
+    fn pipe_names_handle_paths_sharing_dir_basename() {
+        // Specific collision case from grievance §4: both users have
+        // `<home>/.airc-rs/daemon.sock`, so `parent_basename + file`
+        // alone is identical for both. Path-hash discriminates.
+        let same_basename_a: PathBuf = [r"C:\", "U", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let same_basename_b: PathBuf = [r"C:\", "U", "bob", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        assert_ne!(
+            resolve_pipe_name(&same_basename_a),
+            resolve_pipe_name(&same_basename_b)
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_two_homes_round_trip_concurrently() {
+        // The defensible Windows runtime proof per grievance §4 /
+        // Windows Gaps "Runtime named-pipe IPC test on Windows":
+        // two daemons at distinct `<home>` dirs both bind, accept,
+        // read, and write — and a client connecting to home A's
+        // socket reaches home A's pipe, never home B's. Under the
+        // old resolver both pipes had the same name and this would
+        // either fail to bind or cross-deliver.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let sock_a = dir_a.path().join("daemon.sock");
+        let sock_b = dir_b.path().join("daemon.sock");
+
+        let listener_a = IpcListener::bind(&sock_a).await.expect("home A must bind");
+        let listener_b = IpcListener::bind(&sock_b)
+            .await
+            .expect("home B must bind alongside A — distinct pipe names");
+
+        // Each server task expects a unique payload from its own
+        // home's client and echoes back a home-specific reply. If
+        // the pipes were colliding the server tasks would receive
+        // each other's messages.
+        // Use `read_exact` framing on both sides so the test doesn't
+        // depend on `shutdown()` half-close semantics — Windows named
+        // pipes have no half-close, so the daemon protocol switched
+        // to newline framing for the same reason. Here we know each
+        // side writes exactly 6 bytes.
+        let server_a = tokio::spawn(async move {
+            let mut stream = listener_a.accept().await.unwrap();
+            let mut buf = [0u8; 6];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(b"PONG-A").await.unwrap();
+            stream.flush().await.unwrap();
+            buf
+        });
+        let server_b = tokio::spawn(async move {
+            let mut stream = listener_b.accept().await.unwrap();
+            let mut buf = [0u8; 6];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(b"PONG-B").await.unwrap();
+            stream.flush().await.unwrap();
+            buf
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut client_a = IpcStream::connect(&sock_a).await.unwrap();
+        client_a.write_all(b"PING-A").await.unwrap();
+        client_a.flush().await.unwrap();
+        let mut reply_a = [0u8; 6];
+        client_a.read_exact(&mut reply_a).await.unwrap();
+
+        let mut client_b = IpcStream::connect(&sock_b).await.unwrap();
+        client_b.write_all(b"PING-B").await.unwrap();
+        client_b.flush().await.unwrap();
+        let mut reply_b = [0u8; 6];
+        client_b.read_exact(&mut reply_b).await.unwrap();
+
+        let received_a = server_a.await.unwrap();
+        let received_b = server_b.await.unwrap();
+
+        // Cross-contamination check: A must see its own ping.
+        assert_eq!(&received_a, b"PING-A", "home A received its own ping");
+        assert_eq!(&received_b, b"PING-B", "home B received its own ping");
+        assert_eq!(&reply_a, b"PONG-A", "home A client got A's pong");
+        assert_eq!(&reply_b, b"PONG-B", "home B client got B's pong");
+    }
+
+    #[test]
+    fn pipe_name_normalises_case_equivalent_spellings() {
+        // NTFS is case-insensitive, so `C:\Users\Alice` and
+        // `c:\users\alice` refer to the same path. They must resolve
+        // to the same pipe so a client and daemon launched from
+        // wrappers that differ in case (PowerShell vs. cmd vs. Git
+        // Bash) still find each other.
+        let upper: PathBuf = [r"C:\", "Users", "Alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let lower: PathBuf = [r"c:\", "users", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        assert_eq!(
+            resolve_pipe_name(&upper),
+            resolve_pipe_name(&lower),
+            "case-equivalent paths must resolve to the same pipe"
+        );
+    }
+
+    #[test]
+    fn pipe_name_normalises_separator_style() {
+        // Backslash-vs-forward-slash spellings of the same path
+        // (PowerShell-style vs Git Bash-style) must resolve to the
+        // same pipe. canonicalize_for_hash collapses both to a
+        // single normalised string before hashing.
+        let backslash = PathBuf::from(r"C:\Users\alice\.airc-rs\daemon.sock");
+        let forward = PathBuf::from("C:/Users/alice/.airc-rs/daemon.sock");
+        assert_eq!(
+            resolve_pipe_name(&backslash),
+            resolve_pipe_name(&forward),
+            "separator style must not affect pipe identity"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

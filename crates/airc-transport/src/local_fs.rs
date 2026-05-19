@@ -60,14 +60,24 @@ use crate::error::LocalFsError;
 use crate::transport::{FrameStream, Transport};
 
 const FRAMES_FILENAME: &str = "frames.jsonl";
+/// Sidecar lock file. Senders take fs2's `lock_exclusive` on this
+/// file instead of on `frames.jsonl` itself. Reason: on Windows
+/// fs2's `lock_exclusive` is `LockFileEx`, which is *mandatory* —
+/// it locks the byte range so concurrent readers (subscriber tail
+/// loops) get `ERROR_LOCK_VIOLATION` (Os code 33). On Unix flock
+/// is advisory and readers proceed unbothered. A sidecar file
+/// gives uniform "serialize writers without blocking readers"
+/// semantics across both platforms.
+const LOCK_FILENAME: &str = "frames.jsonl.lock";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RECEIVER_CHANNEL_DEPTH: usize = 64;
 
 /// Same-machine wire backed by `<wire-dir>/frames.jsonl`.
 ///
 /// Cross-process send safety comes from `fs2::FileExt::lock_exclusive`
-/// (advisory flock) on the frames file — no in-memory mutex needed,
-/// flock handles both intra- and inter-process serialization.
+/// on a sidecar `frames.jsonl.lock` file — readers (subscriber tail
+/// loops) touch `frames.jsonl` directly and never the lock file, so
+/// Windows's mandatory `LockFileEx` semantics don't block them.
 pub struct LocalFsAdapter {
     wire_dir: PathBuf,
 }
@@ -92,6 +102,11 @@ impl LocalFsAdapter {
         self.wire_dir.join(FRAMES_FILENAME)
     }
 
+    /// Compute the sidecar lock-file path.
+    fn lock_path(&self) -> PathBuf {
+        self.wire_dir.join(LOCK_FILENAME)
+    }
+
     /// Create the wire directory if absent. Called on every send +
     /// subscribe so the API doesn't have an "init" step.
     async fn ensure_wire_dir(&self) -> Result<(), LocalFsError> {
@@ -108,33 +123,41 @@ impl Transport for LocalFsAdapter {
         self.ensure_wire_dir().await?;
 
         // Serialize before crossing the spawn_blocking boundary so the
-        // critical section (open + flock + write + maybe-fsync) is as
+        // critical section (lock + open + write + maybe-fsync) is as
         // short as possible.
         let mut buffer = serde_json::to_vec(&frame)?;
         buffer.push(b'\n');
         let frame_kind = frame.kind;
-        let path = self.frames_path();
+        let frames_path = self.frames_path();
+        let lock_path = self.lock_path();
 
         // std::fs + fs2 flock is sync; bracket the kernel calls in
         // spawn_blocking so we don't stall the async runtime. fs2
         // doesn't have a tokio-native equivalent and rolling our own
         // ioctl invocation would be more risk than this is worth.
         tokio::task::spawn_blocking(move || -> Result<(), LocalFsError> {
-            use std::fs::OpenOptions as StdOpenOptions;
+            // Lock the sidecar file, NOT frames.jsonl. On Windows
+            // fs2's `lock_exclusive` is mandatory (LockFileEx locks
+            // the byte range), so locking frames.jsonl would make
+            // every subscriber's read fail with ERROR_LOCK_VIOLATION
+            // until the writer releases. Locking a sidecar gives
+            // uniform writer-serialization semantics across Unix
+            // (advisory) and Windows (mandatory) without blocking
+            // readers.
+            let lock_file = open_lock_file(&lock_path)?;
+            lock_file.lock_exclusive()?;
 
-            let file = StdOpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            // Exclusive cross-process flock. Other writers (in this
-            // process or any other) block here until we release. The
-            // lock is released when `file` drops at end of block.
-            file.lock_exclusive()?;
-            let result = write_then_maybe_sync(&file, &buffer, frame_kind);
-            // Explicit unlock so an Err from write/sync doesn't leak
-            // the lock past the file's natural drop scope. (Drop
-            // also unlocks on POSIX, but being explicit is clearer.)
-            let _ = FileExt::unlock(&file);
+            // Inside the critical section: open the frames file,
+            // append, optional fsync. Readers can be observing the
+            // frames file at the same time — that's intentional.
+            let result = (|| -> Result<(), LocalFsError> {
+                let file = open_for_append_shared(&frames_path)?;
+                write_then_maybe_sync(&file, &buffer, frame_kind)
+            })();
+
+            // Explicit unlock so an Err from open/write/sync doesn't
+            // leak the lock past the lock_file's natural drop scope.
+            let _ = FileExt::unlock(&lock_file);
             result
         })
         .await
@@ -202,6 +225,67 @@ fn write_then_maybe_sync(
     Ok(())
 }
 
+/// Open (or create) the sidecar lock file. `lock_exclusive` will be
+/// called on the returned handle by `send` to serialise writers
+/// across processes. The handle needs both read and write access so
+/// `LockFileEx` on Windows accepts it (Unix flock doesn't care).
+/// Permissive share mode lets multiple senders open the lock file
+/// concurrently — only the lock itself is contended.
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    apply_windows_share_mode(&mut options);
+    options.open(path)
+}
+
+/// Open the frames file for append with permissive share modes so
+/// concurrent readers (subscribers tailing the file) and other writers
+/// can coexist. Unix opens are permissive by default; Windows defaults
+/// to `FILE_SHARE_NONE` (exclusive), which would lock subscribers out
+/// the moment a sender holds the handle for the flock + write critical
+/// section — surfacing as ERROR_ACCESS_DENIED on the reader side and
+/// breaking every multi-process test. Explicitly granting share rights
+/// here restores cross-platform parity with the Unix open(2) defaults.
+fn open_for_append_shared(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    apply_windows_share_mode(&mut options);
+    options.open(path)
+}
+
+/// Async counterpart for the subscriber tail loop. Same share-mode
+/// rationale as `open_for_append_shared`.
+async fn open_for_read_shared(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    apply_windows_share_mode_async(&mut options);
+    options.open(path).await
+}
+
+#[cfg(windows)]
+fn apply_windows_share_mode(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. Matches
+    // the permissive sharing Unix opens give by default. Without this
+    // a concurrent reader or writer hits ERROR_ACCESS_DENIED.
+    options.share_mode(0x1 | 0x2 | 0x4);
+}
+
+#[cfg(not(windows))]
+fn apply_windows_share_mode(_options: &mut std::fs::OpenOptions) {
+    // Unix opens are permissive by default; nothing to do.
+}
+
+#[cfg(windows)]
+fn apply_windows_share_mode_async(options: &mut tokio::fs::OpenOptions) {
+    // `share_mode` is an inherent method on tokio's `OpenOptions`
+    // (not via the std extension trait), so no `use` needed here.
+    options.share_mode(0x1 | 0x2 | 0x4);
+}
+
+#[cfg(not(windows))]
+fn apply_windows_share_mode_async(_options: &mut tokio::fs::OpenOptions) {}
+
 /// Background tail loop: poll the frames file, parse new lines, filter
 /// against the subscription, and ship matches through `tx`.
 async fn tail_loop(
@@ -268,7 +352,7 @@ async fn drain_new_lines(
     subscription: &Subscription,
     tx: &mpsc::Sender<Result<Frame, LocalFsError>>,
 ) -> Result<u64, LocalFsError> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = open_for_read_shared(path).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -688,12 +772,12 @@ mod tests {
         // Now truncate the file. Subscriber's tail loop has its
         // offset positioned at the end of frame_1. Without the
         // truncation-detection branch, the subscriber would stall.
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(adapter.frames_path())
-            .await
-            .unwrap();
+        {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).truncate(true);
+            apply_windows_share_mode_async(&mut options);
+            options.open(adapter.frames_path()).await.unwrap();
+        }
 
         // Give the tail loop one poll cycle to observe the shrunk
         // file and reset its offset.

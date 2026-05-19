@@ -71,8 +71,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
-    name: cargo test
-    runs-on: ubuntu-latest
+    # Cross-platform matrix — the substrate must run on Linux, macOS,
+    # and Windows. Per grievance §4, claiming Windows support from
+    # install-only checks is not sufficient; runtime tests gated by
+    # `#[cfg(windows)]` (like the named-pipe IPC concurrent-bind test)
+    # only execute when the test job actually runs on Windows.
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
