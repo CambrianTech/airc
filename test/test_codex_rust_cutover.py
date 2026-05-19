@@ -154,6 +154,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.config set_host_block", source)
         self.assertIn('"$(airc_rs_bin)" config set-host-block', source)
 
+    def test_daemon_scope_id_does_not_use_python(self):
+        source = (REPO / "lib/airc_bash/lib_daemon_detect.sh").read_text(encoding="utf-8")
+        start = source.index("airc_daemon_scope_id()")
+        end = source.index("airc_daemon_service_name_for_scope()", start)
+        body = source[start:end]
+
+        self.assertNotIn("python3 -c", body)
+        self.assertIn('"$(airc_rs_bin)" daemon-scope-id "$target_scope"', body)
+
 
 if __name__ == "__main__":
     unittest.main()
