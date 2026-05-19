@@ -520,7 +520,7 @@ _doctor_health() {
   # principle as bearer scoping in the receive-silence beacon.
   local _subs=""
   if [ -f "$CONFIG" ] && command -v "$AIRC_PYTHON" >/dev/null 2>&1; then
-    _subs=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+    _subs=$(airc_config_read_channels "$CONFIG" || true)
   fi
   local found_state=0
   if [ -d "$AIRC_WRITE_DIR" ]; then

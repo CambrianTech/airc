@@ -139,8 +139,7 @@ ensure_channel_subscribed_with_gist() {
     fi
   fi
   if [ -z "$_gid" ]; then
-    _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-           --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    _gid=$(airc_config_get_channel_gist "$channel" "$CONFIG" || true)
   fi
   if [ -n "$_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" = "1" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
     # AIRC_NO_DISCOVERY is a host-election guard, not permission to
@@ -407,12 +406,12 @@ _join_emit_join_events() {
   [ -z "$_name" ] && return 0
   [ -f "$CONFIG" ] || return 0
   local _channels _ch
-  _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  _channels=$(airc_config_read_channels "$CONFIG" || true)
   [ -z "$_channels" ] && return 0
   while IFS= read -r _ch; do
     [ -z "$_ch" ] && continue
     local _gid
-    _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$_ch" 2>/dev/null || true)
+    _gid=$(airc_config_get_channel_gist "$_ch" "$CONFIG" || true)
     [ -z "$_gid" ] && continue
     cmd_send --internal --system --channel "$_ch" "$_name joined #$_ch" >/dev/null 2>&1 || true
   done <<< "$_channels"
@@ -765,7 +764,7 @@ cmd_connect() {
     # the subscribe path so it gets added.
     local _add_subscription=0
     if [ "$room_explicit" = "1" ] && [ -n "$room_name" ] && [ -f "$CONFIG" ]; then
-      local _existing_subs; _existing_subs=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+      local _existing_subs; _existing_subs=$(airc_config_read_channels "$CONFIG" || true)
       if ! printf '%s\n' "$_existing_subs" | grep -qFx "$room_name"; then
         _add_subscription=1
       fi
@@ -808,8 +807,7 @@ cmd_connect() {
     local _repair_running_monitor=0
     if [ -f "$CONFIG" ] && command -v gh >/dev/null 2>&1; then
       local _map_lines _line _ch _gid _canonical_gid
-      _map_lines=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-        --config "$CONFIG" 2>/dev/null || true)
+      _map_lines=$(airc_config_list_channel_gists "$CONFIG" || true)
       while IFS=$'\t' read -r _ch _gid; do
         [ -z "$_ch" ] && continue
         [ -z "$_gid" ] && continue
@@ -2072,8 +2070,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # early mesh-find gate at line ~568.
           if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" = "1" ]; then
             local _configured_gid
-            _configured_gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-                              --config "$CONFIG" --channel "$room_name" 2>/dev/null || true)
+            _configured_gid=$(airc_config_get_channel_gist "$room_name" "$CONFIG" || true)
             if [ -n "$_configured_gid" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
               _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist find \
                                    --channel "$room_name" 2>/dev/null || true)
