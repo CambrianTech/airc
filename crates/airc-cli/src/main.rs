@@ -222,6 +222,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_lines,
                 keep_lines,
             } => log_commands::run_rotate(&path, max_lines, keep_lines),
+            LogAction::Render { since, count, json } => {
+                log_commands::run_render(&since, count, json)
+            }
         },
 
         Command::Workspace(args) => match args.action {

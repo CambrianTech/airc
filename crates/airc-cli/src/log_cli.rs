@@ -34,4 +34,17 @@ pub enum LogAction {
         #[arg(long, default_value_t = DEFAULT_KEEP_LINES)]
         keep_lines: usize,
     },
+
+    /// Render messages.jsonl lines from stdin.
+    Render {
+        /// Filter to messages newer than this ISO timestamp or relative window.
+        #[arg(long, default_value = "")]
+        since: String,
+        /// Number of raw tail lines read by the caller.
+        #[arg(long)]
+        count: usize,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }

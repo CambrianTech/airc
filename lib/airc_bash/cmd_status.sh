@@ -464,7 +464,7 @@ cmd_logs() {
   if [ "$output_json" -eq 1 ]; then
     set -- "$@" --json
   fi
-  echo "$raw" | "$AIRC_PYTHON" -m airc_core.logs "$@"
+  echo "$raw" | "$(airc_rs_bin)" log "$@"
 }
 
 cmd_inbox() {
