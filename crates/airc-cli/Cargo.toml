@@ -13,6 +13,7 @@ path = "src/main.rs"
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }
 airc-transport = { path = "../airc-transport" }
+airc-daemon = { path = "../airc-daemon" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }

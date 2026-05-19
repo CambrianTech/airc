@@ -13,10 +13,7 @@
 
 mod cli;
 mod commands;
-mod daemon;
 mod identity;
-mod ipc;
-mod peers_store;
 mod registry;
 mod room;
 
