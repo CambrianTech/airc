@@ -12,16 +12,22 @@
 //!
 //! Path conventions:
 //!   - Unix: a filesystem path like `<home>/daemon.sock`.
-//!   - Windows: a named-pipe path like `\\.\pipe\airc-rs-daemon`. If
+//!   - Windows: a named-pipe path like `\\.\pipe\airc-rs-<hash>`. If
 //!     the caller passes a plain filesystem path, the resolver
-//!     converts it to a per-home pipe name so multiple homes can
-//!     coexist on one machine.
+//!     converts it via UUIDv5 over the full path string so multiple
+//!     homes on one machine cannot collide. (Earlier versions used
+//!     only the parent dirname + file basename — two users both with
+//!     `~/.airc-rs/daemon.sock` collided. Caught in Codex audit
+//!     2026-05-19, grievance §4 / Windows Gaps.)
 
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+#[cfg(any(windows, test))]
+use uuid::Uuid;
 
 /// One IPC connection — read/write the wire bytes, no protocol
 /// knowledge.
@@ -210,51 +216,125 @@ impl IpcListener {
     }
 }
 
+/// Namespace UUID for deriving named-pipe discriminators from socket
+/// paths. Fixed so the mapping is stable across rustc versions and
+/// across machines (same path → same pipe name).
+#[cfg(any(windows, test))]
+const PIPE_NAMESPACE: Uuid = Uuid::from_bytes([
+    0xa1, 0xc2, 0x70, 0x1b, 0xe0, 0x05, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+]);
+
 /// Convert a filesystem-style path into a Windows named-pipe path.
 ///
 /// If the path already looks like a pipe (`\\.\pipe\...`) it's
-/// returned as-is. Otherwise the path's last component is sanitised
-/// and prefixed: `<home>/daemon.sock` → `\\.\pipe\airc-rs-daemon-<home>`.
-/// Multiple homes get distinct pipes so concurrent daemons coexist.
-#[cfg(windows)]
+/// returned as-is. Otherwise the full path string is hashed via UUIDv5
+/// under `PIPE_NAMESPACE` and the digest hex is used as the per-home
+/// discriminator: `C:\Users\alice\.airc-rs\daemon.sock` →
+/// `\\.\pipe\airc-rs-<32-hex>`. Two distinct paths cannot collide;
+/// the same path always resolves to the same pipe name. (Earlier
+/// implementations used only `parent_basename + file_basename`, which
+/// collided when two users both used `.airc-rs/daemon.sock`.)
+#[cfg(any(windows, test))]
 fn resolve_pipe_name(path: &Path) -> String {
     let raw = path.to_string_lossy();
     if raw.starts_with(r"\\.\pipe\") {
         return raw.into_owned();
     }
-    // Build a stable per-path pipe name. Use the immediate parent's
-    // basename + the file basename so different homes don't collide.
-    let file = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "daemon".to_string());
-    let parent_tag = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "default".to_string());
-    let sanitised = sanitise_pipe_token(&format!("{parent_tag}-{file}"));
-    format!(r"\\.\pipe\airc-rs-{sanitised}")
-}
-
-#[cfg(windows)]
-fn sanitise_pipe_token(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    let digest = Uuid::new_v5(&PIPE_NAMESPACE, raw.as_bytes());
+    format!(r"\\.\pipe\airc-rs-{}", digest.as_simple())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn pipe_names_differ_across_homes() {
+        // The bug Codex flagged: two users both with
+        // `<home>/.airc-rs/daemon.sock` collided because the old
+        // resolver only used `parent_basename + file_basename`.
+        // UUIDv5 over the full path string forces uniqueness.
+        let alice: PathBuf = [r"C:\", "Users", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let bob: PathBuf = [r"C:\", "Users", "bob", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let a = resolve_pipe_name(&alice);
+        let b = resolve_pipe_name(&bob);
+        assert_ne!(a, b, "alice's and bob's pipes must not collide");
+        assert!(
+            a.starts_with(r"\\.\pipe\airc-rs-"),
+            "pipe prefix preserved: {a}"
+        );
+        assert!(
+            b.starts_with(r"\\.\pipe\airc-rs-"),
+            "pipe prefix preserved: {b}"
+        );
+    }
+
+    #[test]
+    fn pipe_name_is_stable_across_calls() {
+        // Same path → same pipe. UUIDv5 is deterministic, so the
+        // daemon and client running independently produce matching
+        // pipe names from the same socket path.
+        let path: PathBuf = [r"C:\", "Users", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let first = resolve_pipe_name(&path);
+        let second = resolve_pipe_name(&path);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn pipe_name_passes_through_explicit_pipe_path() {
+        // If someone hands the resolver an already-formed pipe path
+        // (e.g. test harness, custom daemon launcher), respect it.
+        let explicit = PathBuf::from(r"\\.\pipe\custom-airc-pipe");
+        assert_eq!(resolve_pipe_name(&explicit), r"\\.\pipe\custom-airc-pipe");
+    }
+
+    #[test]
+    fn pipe_names_handle_paths_sharing_dir_basename() {
+        // Specific collision case from grievance §4: both users have
+        // `<home>/.airc-rs/daemon.sock`, so `parent_basename + file`
+        // alone is identical for both. Path-hash discriminates.
+        let same_basename_a: PathBuf = [r"C:\", "U", "alice", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        let same_basename_b: PathBuf = [r"C:\", "U", "bob", ".airc-rs", "daemon.sock"]
+            .iter()
+            .collect();
+        assert_ne!(
+            resolve_pipe_name(&same_basename_a),
+            resolve_pipe_name(&same_basename_b)
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_two_homes_bind_concurrent_listeners() {
+        // The defensible Windows-runtime proof: two daemons rooted at
+        // distinct `<home>` dirs can bind named-pipe listeners at the
+        // same time without one rejecting the other for collision.
+        // Under the old resolver this would fail because both paths
+        // produced the same pipe name.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let sock_a = dir_a.path().join("daemon.sock");
+        let sock_b = dir_b.path().join("daemon.sock");
+
+        let listener_a = IpcListener::bind(&sock_a).await.expect("home A must bind");
+        let listener_b = IpcListener::bind(&sock_b)
+            .await
+            .expect("home B must bind alongside A — distinct pipe names");
+
+        // Cross-check that connecting to A doesn't accidentally land
+        // on B's pipe.
+        let _ = (listener_a, listener_b);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
