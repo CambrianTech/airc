@@ -3,9 +3,10 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, CardCreated, ClaimId, ClaimReleased, LaneCreated, LaneId, LaneState,
-    LaneStateChanged, Priority, RepoId, WorkBoardProjection, WorkCardClaimed, WorkCardId,
-    WorkEvent,
+    encode_work_event, BranchName, CardCreated, ClaimId, ClaimReleased, LaneCreated, LaneId,
+    LaneState, LaneStateChanged, Priority, RepoId, WorkBoardProjection, WorkCardClaimed,
+    WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased,
+    WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -45,6 +46,32 @@ pub struct CreateWorkLane {
 pub struct ChangeWorkLaneState {
     pub lane_id: LaneId,
     pub state: LaneState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestWorkspace {
+    pub card_id: WorkCardId,
+    pub claim_id: ClaimId,
+    pub repo: RepoId,
+    pub branch: BranchName,
+    pub base: BranchName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocateWorkspace {
+    pub workspace_id: WorkspaceId,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatWorkspace {
+    pub workspace_id: WorkspaceId,
+    pub disk_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseWorkspace {
+    pub workspace_id: WorkspaceId,
 }
 
 impl Airc {
@@ -122,6 +149,60 @@ impl Airc {
             state: request.state,
             changed_by: self.peer_id(),
             changed_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Request a workspace lease for an already-claimed work card.
+    /// The request is a typed event; actual worktree allocation is a
+    /// later adapter that consumes this event.
+    pub async fn request_workspace(
+        &self,
+        request: RequestWorkspace,
+    ) -> Result<WorkspaceId, AircError> {
+        let workspace_id = WorkspaceId::new();
+        let event = WorkEvent::WorkspaceRequested(WorkspaceRequested {
+            workspace_id,
+            card_id: request.card_id,
+            claim_id: request.claim_id,
+            owner: self.peer_id(),
+            repo: request.repo,
+            branch: request.branch,
+            base: request.base,
+            requested_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(workspace_id)
+    }
+
+    /// Mark a requested workspace as allocated at a concrete path.
+    pub async fn allocate_workspace(&self, request: AllocateWorkspace) -> Result<(), AircError> {
+        let event = WorkEvent::WorkspaceAllocated(WorkspaceAllocated {
+            workspace_id: request.workspace_id,
+            path: request.path,
+            allocated_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Heartbeat a workspace lease with optional disk usage.
+    pub async fn heartbeat_workspace(&self, request: HeartbeatWorkspace) -> Result<(), AircError> {
+        let event = WorkEvent::WorkspaceHeartbeat(WorkspaceHeartbeat {
+            workspace_id: request.workspace_id,
+            disk_bytes: request.disk_bytes,
+            heartbeat_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Release a workspace lease.
+    pub async fn release_workspace(&self, request: ReleaseWorkspace) -> Result<(), AircError> {
+        let event = WorkEvent::WorkspaceReleased(WorkspaceReleased {
+            workspace_id: request.workspace_id,
+            released_at_ms: now_ms(),
         });
         self.publish_work_event(&event).await?;
         Ok(())

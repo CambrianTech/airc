@@ -17,6 +17,8 @@ mod lane_cli;
 mod lane_commands;
 mod work_cli;
 mod work_commands;
+mod workspace_cli;
+mod workspace_commands;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,6 +33,7 @@ use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
 use lane_cli::LaneAction;
 use work_cli::WorkAction;
+use workspace_cli::WorkspaceAction;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     let uuid = Uuid::from_str(input)
@@ -143,6 +146,29 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 lane_commands::run_state(&home, lane_id, state).await
             }
             LaneAction::Status { limit } => lane_commands::run_status(&home, limit).await,
+        },
+
+        Command::Workspace(args) => match args.action {
+            WorkspaceAction::Request {
+                card_id,
+                claim_id,
+                repo,
+                branch,
+                base,
+            } => {
+                workspace_commands::run_request(&home, card_id, claim_id, repo, branch, base).await
+            }
+            WorkspaceAction::Allocate { workspace_id, path } => {
+                workspace_commands::run_allocate(&home, workspace_id, path).await
+            }
+            WorkspaceAction::Heartbeat {
+                workspace_id,
+                disk_bytes,
+            } => workspace_commands::run_heartbeat(&home, workspace_id, disk_bytes).await,
+            WorkspaceAction::Release { workspace_id } => {
+                workspace_commands::run_release(&home, workspace_id).await
+            }
+            WorkspaceAction::List { limit } => workspace_commands::run_list(&home, limit).await,
         },
     }
 }
