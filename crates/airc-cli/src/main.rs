@@ -12,6 +12,8 @@
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod bearer_state;
+mod channel_gist_cli;
+mod channel_gist_commands;
 mod cli;
 mod client_id;
 mod codex_cli;
@@ -63,6 +65,7 @@ use uuid::Uuid;
 use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
+use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
 use config_cli::ConfigAction;
@@ -95,6 +98,9 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("airc-rs: {error}");
+            if let Some(code) = channel_gist_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
             ExitCode::FAILURE
         }
     }
@@ -174,6 +180,16 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     host_identity_json,
                 },
             ),
+        },
+
+        Command::ChannelGist(args) => match args.action {
+            ChannelGistAction::Find {
+                channel,
+                require_invite,
+            } => channel_gist_commands::run_find(&channel, require_invite),
+            ChannelGistAction::HostPreflight { channel, config } => {
+                channel_gist_commands::run_host_preflight(&channel, config.as_deref())
+            }
         },
 
         Command::Identity(args) => match args.action {

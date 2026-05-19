@@ -62,7 +62,7 @@ _mesh_find() {
       return 0
     fi
   fi
-  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" --require-invite 2>/dev/null || true
+  "$(airc_rs_bin)" channel-gist find --channel "$channel" --require-invite 2>/dev/null || true
 }
 
 # Find the canonical channel gist whether or not it currently has a host
@@ -84,7 +84,7 @@ _mesh_find_any() {
       return 0
     fi
   fi
-  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
+  "$(airc_rs_bin)" channel-gist find --channel "$channel" 2>/dev/null || true
 }
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.

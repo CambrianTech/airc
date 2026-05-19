@@ -2034,13 +2034,13 @@ cmd_connect() {
             local _configured_gid
             _configured_gid=$(airc_config_get_channel_gist "$room_name" "$CONFIG" || true)
             if [ -n "$_configured_gid" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-              _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist find \
+              _existing_room_gid=$("$(airc_rs_bin)" channel-gist find \
                                    --channel "$room_name" 2>/dev/null || true)
             fi
           fi
           if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             local _host_preflight_rc=0
-            _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist host-preflight \
+            _existing_room_gid=$("$(airc_rs_bin)" channel-gist host-preflight \
                                  --channel "$room_name" --config "$CONFIG" 2>/dev/null) || _host_preflight_rc=$?
             if [ "${_host_preflight_rc:-0}" = "2" ]; then
               die "GitHub room discovery is unavailable for #${room_name}; refusing to create a new solo room. Retry after the GitHub backoff clears."
