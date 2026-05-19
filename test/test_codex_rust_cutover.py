@@ -81,6 +81,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.datetime", body)
         self.assertIn('"$(airc_rs_bin)" iso-to-epoch "$ts"', body)
 
+    def test_log_append_and_rotate_use_airc_rs(self):
+        send = (REPO / "lib/airc_bash/cmd_send.sh").read_text(encoding="utf-8")
+        connect = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.log_append", send)
+        self.assertIn('"$(airc_rs_bin)" log append --path "$MESSAGES"', send)
+        self.assertNotIn("airc_core.log rotate", connect)
+        self.assertIn('"$(airc_rs_bin)" log rotate --path "$_hb_messages"', connect)
+
 
 if __name__ == "__main__":
     unittest.main()

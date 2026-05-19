@@ -24,6 +24,8 @@ mod events_cli;
 mod events_commands;
 mod lane_cli;
 mod lane_commands;
+mod log_cli;
+mod log_commands;
 mod work_cli;
 mod work_commands;
 mod workspace_cli;
@@ -43,6 +45,7 @@ use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
 use events_cli::EventsAction;
 use lane_cli::{LaneAction, LaneManagerAction};
+use log_cli::LogAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
 
@@ -207,6 +210,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     lane_commands::run_manager_status(&home, limit).await
                 }
             },
+        },
+
+        Command::Log(args) => match args.action {
+            LogAction::Append { path } => log_commands::run_append(&path),
+            LogAction::Rotate {
+                path,
+                max_lines,
+                keep_lines,
+            } => log_commands::run_rotate(&path, max_lines, keep_lines),
         },
 
         Command::Workspace(args) => match args.action {
