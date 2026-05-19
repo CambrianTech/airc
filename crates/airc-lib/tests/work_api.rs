@@ -1,8 +1,9 @@
 use std::time::{Duration, Instant};
 
 use airc_lib::{
-    Airc, ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard, CreateWorkLane, LaneState, Priority,
-    ReleaseWorkClaim, RepoId, WorkCardId,
+    Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard,
+    CreateWorkLane, HeartbeatWorkspace, LaneState, Priority, ReleaseWorkClaim, ReleaseWorkspace,
+    RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
 };
 use tempfile::TempDir;
 
@@ -164,4 +165,63 @@ async fn lane_create_attach_card_and_state_change_project_from_store() {
         .find(|lane| lane.lane_id == lane_id)
         .expect("lane remains projected");
     assert_eq!(lane.state, LaneState::Active);
+}
+
+#[tokio::test]
+async fn workspace_lifecycle_projects_from_store() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("workspace-api").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "workspace lease lifecycle".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let claim_id = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+
+    let workspace_id = airc
+        .request_workspace(RequestWorkspace {
+            card_id,
+            claim_id,
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            branch: BranchName::new("feat/workspace-commands").unwrap(),
+            base: BranchName::new("rust-rewrite").unwrap(),
+        })
+        .await
+        .unwrap();
+    airc.allocate_workspace(AllocateWorkspace {
+        workspace_id,
+        path: "/tmp/airc/ws".to_string(),
+    })
+    .await
+    .unwrap();
+    airc.heartbeat_workspace(HeartbeatWorkspace {
+        workspace_id,
+        disk_bytes: Some(4096),
+    })
+    .await
+    .unwrap();
+    airc.release_workspace(ReleaseWorkspace { workspace_id })
+        .await
+        .unwrap();
+
+    let board = airc.work_board(128).await.unwrap();
+    let workspace = board.workspace(workspace_id).unwrap();
+    assert_eq!(workspace.lease.status, WorkspaceStatus::Released);
+    assert_eq!(workspace.lease.path, "/tmp/airc/ws");
+    assert_eq!(workspace.lease.disk_bytes, Some(4096));
+    assert_eq!(workspace.lease.card_id, card_id);
+    assert_eq!(workspace.lease.claim_id, claim_id);
 }

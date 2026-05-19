@@ -39,7 +39,8 @@ pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
 pub use stream::{EventStream, LiveLag};
 pub use work::{
-    ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard, CreateWorkLane, ReleaseWorkClaim,
+    AllocateWorkspace, ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard, CreateWorkLane,
+    HeartbeatWorkspace, ReleaseWorkClaim, ReleaseWorkspace, RequestWorkspace,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core
@@ -50,5 +51,5 @@ pub use airc_core::{
 };
 pub use airc_work::{
     BoardSnapshot, BranchName, CardState, ClaimId, LaneId, LaneState, Priority, ProjectionError,
-    RepoId, WorkBoardProjection, WorkCardId, WorkEvent, WorkspaceId,
+    RepoId, WorkBoardProjection, WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus,
 };

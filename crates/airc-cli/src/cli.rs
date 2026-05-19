@@ -193,6 +193,9 @@ pub enum Command {
 
     /// Coordinate work lanes over the current room's AIRC substrate.
     Lane(crate::lane_cli::LaneArgs),
+
+    /// Coordinate workspace leases over the current room's AIRC substrate.
+    Workspace(crate::workspace_cli::WorkspaceArgs),
 }
 
 #[derive(Debug, Args)]
