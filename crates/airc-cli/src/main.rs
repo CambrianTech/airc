@@ -52,6 +52,8 @@ mod pending_cli;
 mod pending_commands;
 mod route_cli;
 mod route_commands;
+mod scope_cli;
+mod scope_commands;
 mod transport_cli;
 mod transport_commands;
 mod work_cli;
@@ -86,6 +88,7 @@ use message_cli::MessageAction;
 use monitor::MonitorAction;
 use pending_cli::PendingAction;
 use route_cli::RouteAction;
+use scope_cli::ScopeAction;
 use transport_cli::TransportAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
@@ -379,6 +382,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Route(args) => match args.action {
             RouteAction::Status(args) => route_commands::run_status(args),
+        },
+
+        Command::Scope(args) => match args.action {
+            ScopeAction::RepairConfig {
+                config,
+                default_name,
+                host,
+            } => scope_commands::run_repair_config(&home, &config, &default_name, &host),
         },
 
         Command::Transport(args) => match args.action {

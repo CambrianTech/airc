@@ -78,6 +78,18 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" client-id', body)
         self.assertIn('"$(airc_rs_bin)" humanhash "$input"', body)
 
+    def test_scope_repair_uses_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        start = source.index("ensure_init()")
+        end = source.index("# config CRUD via airc-rs", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.scope_repair", body)
+        self.assertIn(
+            '"$(airc_rs_bin)" --home "$AIRC_WRITE_DIR" scope repair-config',
+            body,
+        )
+
     def test_iso_to_epoch_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
         start = source.index("iso_to_epoch()")

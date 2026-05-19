@@ -724,8 +724,7 @@ _validate_peer_name() {
 ensure_init() {
   if [ -d "$AIRC_WRITE_DIR" ]; then
     local _repair_out
-    if _repair_out=$("$AIRC_PYTHON" -m airc_core.scope_repair repair-config \
-        --home "$AIRC_WRITE_DIR" \
+    if _repair_out=$("$(airc_rs_bin)" --home "$AIRC_WRITE_DIR" scope repair-config \
         --config "$CONFIG" \
         --default-name "$(derive_name)" \
         --host "$(get_host)" 2>&1); then
