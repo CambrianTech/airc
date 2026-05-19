@@ -40,7 +40,7 @@ _mesh_desc() {
 # Production invariant: the gist envelope content is the source of
 # truth, not the human description. Pre-fix this matched only gists
 # whose description was exactly "airc mesh"; meanwhile
-# airc_core.channel_gist.resolve found older "airc room: ..." gists
+# airc-rs channel-gist discovery found older "airc room: ..." gists
 # by envelope content. Two discovery systems, two answers, split-brain.
 #
 # Delegate lookup to channel_gist.find_existing so connect, subscribe,
