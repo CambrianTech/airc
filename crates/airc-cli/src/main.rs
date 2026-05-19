@@ -27,6 +27,9 @@ mod daemon_scope;
 mod envelope_cli;
 mod events_cli;
 mod events_commands;
+mod gh_cli;
+mod gh_commands;
+mod gh_state;
 mod gist_cli;
 mod gist_commands;
 mod identity_cli;
@@ -37,6 +40,8 @@ mod legacy_envelope;
 mod legacy_identity;
 mod log_cli;
 mod log_commands;
+mod pending_cli;
+mod pending_commands;
 mod route_cli;
 mod route_commands;
 mod transport_cli;
@@ -61,10 +66,12 @@ use codex_cli::CodexHookAction;
 use config_cli::ConfigAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
+use gh_cli::GhAction;
 use gist_cli::GistAction;
 use identity_cli::IdentityAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
+use pending_cli::PendingAction;
 use route_cli::RouteAction;
 use transport_cli::TransportAction;
 use work_cli::WorkAction;
@@ -303,6 +310,29 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             GistAction::ListLanEntries => gist_commands::run_list_lan_entries(),
             GistAction::GistContent { channel } => gist_commands::run_gist_content(&channel),
+        },
+
+        Command::Gh(args) => match args.action {
+            GhAction::Run { gh_args } => gh_commands::run_gh(gh_args),
+            GhAction::WaitSeconds => {
+                gh_commands::run_wait_seconds();
+                Ok(())
+            }
+            GhAction::Audit {
+                count,
+                summary,
+                reset,
+                clear_audit,
+            } => gh_commands::run_audit(count, summary, reset, clear_audit),
+            GhAction::Doctor { count } => gh_commands::run_doctor(count),
+        },
+
+        Command::Pending(args) => match args.action {
+            PendingAction::HostBroadcastRoute {
+                snapshot,
+                config,
+                fallback_gist,
+            } => pending_commands::run_host_broadcast_route(&snapshot, &config, &fallback_gist),
         },
 
         Command::CodexHook(args) => match args.action {

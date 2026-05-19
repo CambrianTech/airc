@@ -19,8 +19,10 @@ use airc_lib::PeerSpec;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
 use crate::envelope_cli::EnvelopeArgs;
+use crate::gh_cli::GhArgs;
 use crate::gist_cli::GistArgs;
 use crate::identity_cli::IdentityArgs;
+use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
 use crate::transport_cli::TransportArgs;
 use crate::work_cli::WorkArgs;
@@ -221,6 +223,12 @@ pub enum Command {
 
     /// Parse legacy GitHub gist envelope JSON.
     Gist(GistArgs),
+
+    /// Shared GitHub request governor.
+    Gh(GhArgs),
+
+    /// Pending-queue routing helpers during Rust cutover.
+    Pending(PendingArgs),
 
     /// Codex lifecycle hook adapters backed by Rust AIRC events.
     CodexHook(CodexHookArgs),

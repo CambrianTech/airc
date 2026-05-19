@@ -417,12 +417,12 @@ if [ -n "$_gh_resolved" ] && ! command -v gh >/dev/null 2>&1; then
 fi
 
 # Central GitHub request guard. All shell `gh ...` calls below route
-# through the Python adapter so one per-user budget/backoff/audit layer
-# protects every AIRC tab on this machine. Python modules call the same
-# adapter directly via airc_core.gh_backoff.run_gh().
+# through the Rust adapter so one per-user budget/backoff/audit layer
+# protects every AIRC tab on this machine. Legacy Python callers keep
+# their own adapter until those transports are deleted.
 if [ -n "$_gh_resolved" ] || command -v gh >/dev/null 2>&1; then
   gh() {
-    "$AIRC_PYTHON" -m airc_core.gh_backoff run -- "$@"
+    "$(airc_rs_bin)" gh run -- "$@"
   }
 fi
 unset _gh_resolved
@@ -1886,7 +1886,7 @@ flush_pending_loop() {
     rhome=$(remote_home)
 
     local _gh_wait=0
-    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
       sleep "$_gh_wait"
@@ -1985,7 +1985,7 @@ flush_pending_host_loop() {
     [ -s "$pending" ] || continue
 
     local _gh_wait=0
-    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
       sleep "$_gh_wait"
@@ -2002,7 +2002,7 @@ flush_pending_host_loop() {
     local _fallback_gist=""
     [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _fallback_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
     local _batch_route _batch_ok _batch_channel _batch_gist _batch_count
-    _batch_route=$("$AIRC_PYTHON" -m airc_core.pending_batch host-broadcast-route \
+    _batch_route=$("$(airc_rs_bin)" pending host-broadcast-route \
       --snapshot "$snapshot" --config "$CONFIG" --fallback-gist "$_fallback_gist" 2>/dev/null || true)
     IFS="$(printf '\t')" read -r _batch_ok _batch_channel _batch_gist _batch_count <<EOF
 $_batch_route
@@ -2808,7 +2808,7 @@ case "${1:-help}" in
   codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
   codex-start) shift; cmd_codex_start "$@" ;;
   codex-hook) shift; cmd_codex_hook "$@" ;;
-  gh-audit) shift; "$AIRC_PYTHON" -m airc_core.gh_backoff audit "$@" ;;
+  gh-audit) shift; "$(airc_rs_bin)" gh audit "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

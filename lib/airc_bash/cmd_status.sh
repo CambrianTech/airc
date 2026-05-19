@@ -227,7 +227,7 @@ else:
   [ -f "$pending" ] && pending_count=$(grep -c '^.' "$pending" 2>/dev/null || echo 0)
   if [ "$pending_count" -gt 0 ]; then
     local _gh_wait=0
-    _gh_wait=$("$AIRC_PYTHON" -m airc_core.gh_backoff wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       echo "  queue:       ${pending_count} pending (paused by gh governor for ${_gh_wait}s)"
     else

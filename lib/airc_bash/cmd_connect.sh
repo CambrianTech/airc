@@ -1791,7 +1791,7 @@ except Exception:
     # targeted ssh-keygen -R when a PRIOR real-sshd host key in known_hosts
     # is known stale (e.g. the server rotated sshd host keys).
     local host_ssh_pub
-    host_ssh_pub=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field ssh_pub "" 2>/dev/null || true)
+    host_ssh_pub=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .ssh_pub 2>/dev/null || true)
     if [ -n "$host_ssh_pub" ]; then
       mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
       grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
@@ -1810,10 +1810,10 @@ except Exception:
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
     local host_airc_home host_x25519_pub
-    host_airc_home=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field airc_home "" 2>/dev/null || true)
+    host_airc_home=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .airc_home 2>/dev/null || true)
     # Phase E.2: capture host's X25519 pubkey from handshake response
     # so cmd_send can encrypt envelopes destined for this peer.
-    host_x25519_pub=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field x25519_pub "" 2>/dev/null || true)
+    host_x25519_pub=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .x25519_pub 2>/dev/null || true)
     HOST_X25519_PUB="$host_x25519_pub" "$AIRC_PYTHON" -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
@@ -1864,7 +1864,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # the join string for onward sharing without a fresh handshake. Also
     # cache the host's identity blob from the handshake response so
     # `airc whois <host-name>` works locally (issue #34 v2).
-    local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field identity "{}" 2>/dev/null || echo "{}")
+    local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
     [ -z "$host_identity_json" ] && host_identity_json="{}"
     # Pass values as env vars instead of bash-substituted into the
     # python heredoc body. PR #164 retest 2026-04-27
@@ -1888,7 +1888,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
 
     # Pick up reminder setting from host
     local host_reminder
-    host_reminder=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field reminder 300 2>/dev/null || echo "300")
+    host_reminder=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .reminder 300 2>/dev/null || echo "300")
     if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
       echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
       date +%s > "$AIRC_WRITE_DIR/last_sent"
