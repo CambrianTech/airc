@@ -209,7 +209,12 @@ impl LanTcpAdapter {
                     let acceptor = TlsAcceptor::from(inner.server_config.clone());
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            handle_server_connection(inner, tls_stream).await;
+                            // Errors here mean the cert pubkey didn't
+                            // resolve in the registry — the verifier
+                            // should have caught this; if it didn't,
+                            // we bail rather than installing a bogus
+                            // connection.
+                            let _ = handle_server_connection(inner, tls_stream).await;
                         }
                         Err(_error) => {
                             // Handshake rejected (e.g. unenrolled
@@ -269,34 +274,44 @@ impl LanTcpAdapter {
             .await
             .map_err(LanTcpError::TlsHandshake)?;
 
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            handle_client_connection(inner, tls_stream).await;
-        });
+        // Install the outbound channel + spawn read/write loops
+        // synchronously. By the time `connect()` returns, `send()` is
+        // guaranteed to find an active connection — no sleep hack in
+        // the caller.
+        handle_client_connection(self.inner.clone(), tls_stream).await?;
 
         Ok(())
     }
 }
 
 /// Post-handshake server-side connection handler: bind the peer
-/// identity from the cert, spawn read + write loops.
-async fn handle_server_connection(inner: Arc<Inner>, tls_stream: ServerTlsStream<TcpStream>) {
-    let peer_id = match resolve_peer_from_server_stream(&inner, &tls_stream) {
-        Some(peer) => peer,
-        None => return, // verifier should have caught this; bail.
-    };
+/// identity from the cert, install the outbound channel
+/// **synchronously**, spawn read + write loops. Returns Ok after the
+/// outbound channel is installed so callers know send is ready.
+async fn handle_server_connection(
+    inner: Arc<Inner>,
+    tls_stream: ServerTlsStream<TcpStream>,
+) -> Result<(), LanTcpError> {
+    let peer_id = resolve_peer_from_server_stream(&inner, &tls_stream)
+        .ok_or(LanTcpError::PeerNotInRegistry)?;
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    spawn_connection_loops(inner, peer_id, read_half, write_half);
+    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    Ok(())
 }
 
-/// Post-handshake client-side connection handler.
-async fn handle_client_connection(inner: Arc<Inner>, tls_stream: ClientTlsStream<TcpStream>) {
-    let peer_id = match resolve_peer_from_client_stream(&inner, &tls_stream) {
-        Some(peer) => peer,
-        None => return,
-    };
+/// Post-handshake client-side connection handler. Same semantics as
+/// `handle_server_connection` — installs the outbound channel before
+/// returning so the caller's subsequent `send()` finds an active
+/// connection.
+async fn handle_client_connection(
+    inner: Arc<Inner>,
+    tls_stream: ClientTlsStream<TcpStream>,
+) -> Result<(), LanTcpError> {
+    let peer_id = resolve_peer_from_client_stream(&inner, &tls_stream)
+        .ok_or(LanTcpError::PeerNotInRegistry)?;
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    spawn_connection_loops(inner, peer_id, read_half, write_half);
+    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    Ok(())
 }
 
 fn resolve_peer_from_server_stream(
@@ -321,24 +336,29 @@ fn resolve_peer_from_client_stream(
     registry.find_peer(&pubkey).map(|(peer, _key_id)| peer)
 }
 
-fn spawn_connection_loops<R, W>(inner: Arc<Inner>, peer_id: PeerId, read_half: R, write_half: W)
-where
+/// Install the outbound channel into `inner` **before** spawning the
+/// read/write loops, then spawn them. This is the readiness-fix per
+/// Codex's #671 review finding: previously the outbound channel was
+/// set inside a spawned task, so callers (and the CLI) could call
+/// `send()` after `connect()` returned and find no connection
+/// installed yet. Now the install is awaited inline.
+async fn install_and_spawn_loops<R, W>(
+    inner: Arc<Inner>,
+    peer_id: PeerId,
+    read_half: R,
+    write_half: W,
+) where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_DEPTH);
+    // Install synchronously — when this function returns, the
+    // connection IS ready to receive sends.
+    *inner.connection.lock().await = Some(outbound_tx);
 
-    // Install this as THE connection. Replaces any prior (shouldn't
-    // happen in MVP because we check before spawning).
-    let inner_for_install = inner.clone();
-    tokio::spawn(async move {
-        *inner_for_install.connection.lock().await = Some(outbound_tx);
-    });
-
-    // Spawn write loop.
+    // Spawn the I/O loops; they continue to drive the wire after
+    // this function returns.
     tokio::spawn(write_loop(write_half, outbound_rx));
-
-    // Spawn read loop with peer binding.
     tokio::spawn(read_loop(inner, peer_id, read_half));
 }
 
@@ -384,33 +404,54 @@ where
     }
 }
 
+/// Fan out a received frame to all matching subscribers.
+///
+/// Per Codex's #671 review finding: previously we held the subscribers
+/// mutex across `.send().await` for Message/Control kinds, which lets
+/// one slow subscriber block dispatch to all others AND prevent new
+/// subscribers from registering. Fix: snapshot the matching sender
+/// handles under the lock, drop the lock, then await sends.
+///
+/// Trade-off: cloning the senders + frame for the snapshot costs a
+/// bit of memory per dispatch, but `Sender` clones are cheap (Arc
+/// underneath) and the frame clone was happening per-subscriber
+/// before anyway.
 async fn dispatch_to_subscribers(inner: &Arc<Inner>, frame: Frame) {
-    let mut dead_ids: Vec<u64> = Vec::new();
-    {
+    // 1. Snapshot under lock — drop the lock as soon as we have the
+    //    sender handles we need.
+    type Target = (u64, mpsc::Sender<Result<Frame, LanTcpError>>);
+    let targets: Vec<Target> = {
         let subs = inner.subscribers.lock().await;
-        for sub in subs.iter() {
-            if !subscription_matches_with_cursor(&sub.subscription, &frame) {
-                continue;
+        subs.iter()
+            .filter(|sub| subscription_matches_with_cursor(&sub.subscription, &frame))
+            .map(|sub| (sub.id, sub.tx.clone()))
+            .collect()
+    };
+
+    // 2. Dispatch outside the lock — slow consumers no longer block
+    //    other subscribers or new registrations.
+    let mut dead_ids: Vec<u64> = Vec::new();
+    for (id, tx) in targets {
+        let send_result = match frame.kind {
+            FrameKind::Message | FrameKind::Control => {
+                // Backpressure-bearing — block on slow consumer.
+                tx.send(Ok(frame.clone())).await.map_err(|_| ())
             }
-            let send_result = match frame.kind {
-                FrameKind::Message | FrameKind::Control => {
-                    // Backpressure-bearing — block on slow consumer.
-                    sub.tx.send(Ok(frame.clone())).await.map_err(|_| ())
+            FrameKind::Event => {
+                // Lossy — drop on full subscriber buffer.
+                match tx.try_send(Ok(frame.clone())) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
                 }
-                FrameKind::Event => {
-                    // Lossy — drop on full subscriber buffer.
-                    match sub.tx.try_send(Ok(frame.clone())) {
-                        Ok(()) => Ok(()),
-                        Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-                        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-                    }
-                }
-            };
-            if send_result.is_err() {
-                dead_ids.push(sub.id);
             }
+        };
+        if send_result.is_err() {
+            dead_ids.push(id);
         }
     }
+
+    // 3. Reap dead subscribers under a brief lock.
     if !dead_ids.is_empty() {
         let mut subs = inner.subscribers.lock().await;
         subs.retain(|sub| !dead_ids.contains(&sub.id));

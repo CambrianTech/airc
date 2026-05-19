@@ -107,7 +107,9 @@ pub async fn run_lan_send(
     let inner = LanTcpAdapter::new(peer_id, keypair.clone(), registry.clone())?;
     inner.connect(to, expected_peer).await?;
 
-    // SignedTransport wraps the inner once connected.
+    // `connect()` now installs the outbound channel synchronously
+    // before returning (Codex's #671 readiness-race fix), so no
+    // sleep needed before sending.
     let transport = SignedTransport::new(
         inner,
         keypair,
@@ -115,10 +117,6 @@ pub async fn run_lan_send(
         registry,
         VerificationPolicy::Strict,
     );
-
-    // Give the post-handshake spawn task time to install the
-    // outbound channel before send.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let channel_id = parse_channel(channel)?;
     let frame = build_message_frame(peer_id, channel_id, text);
