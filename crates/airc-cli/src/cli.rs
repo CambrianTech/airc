@@ -1,4 +1,13 @@
 //! Command-line interface definitions (clap derive).
+//!
+//! All commands default to the persisted state at `<home>` (default
+//! `$HOME/.airc-rs`), which contains:
+//!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
+//!   - `identity.json`  — stable peer_id + client_id (0600)
+//!   - `daemon.sock`    — IPC socket for the daemon
+//!   - `peers.json`     — (future) persisted peer registry
+//!
+//! The `--home` flag overrides for testing / multi-identity setups.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,15 +16,20 @@ use clap::{Parser, Subcommand};
 
 use crate::registry::PeerSpec;
 
-/// Default Unix socket path for the daemon. Overridable per-command
-/// via `--socket`.
-pub fn default_socket_path() -> PathBuf {
-    // ~/.airc-rs/daemon.sock if HOME is set; otherwise /tmp.
+/// Default home directory for persisted identity + IPC state.
+pub fn default_home_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".airc-rs").join("daemon.sock")
+        PathBuf::from(home).join(".airc-rs")
     } else {
-        PathBuf::from("/tmp").join("airc-rs-daemon.sock")
+        // No HOME — fall back to a clearly-scoped path under /tmp so
+        // accidents don't clobber real homes.
+        PathBuf::from("/tmp").join("airc-rs")
     }
+}
+
+/// Default Unix socket path inside `home`.
+pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
+    home.join("daemon.sock")
 }
 
 /// airc-rs — Rust substrate CLI. Replaces the Python `airc` step by
@@ -29,20 +43,18 @@ pub fn default_socket_path() -> PathBuf {
                   Replaces the Python airc CLI as the Rust path matures."
 )]
 pub struct Cli {
-    /// Path to the 32-byte Ed25519 identity file. Created on first
-    /// use if absent.
-    #[arg(long, env = "AIRC_RS_IDENTITY", global = true)]
-    pub identity_file: Option<PathBuf>,
-
-    /// This peer's UUID. Generated and printed on first `init`;
-    /// pass it back on subsequent commands.
-    #[arg(long, env = "AIRC_RS_PEER_ID", global = true)]
-    pub peer_id: Option<String>,
+    /// State directory for persisted identity + IPC socket. Default
+    /// `$HOME/.airc-rs`. Override for tests or multi-identity setups.
+    #[arg(long, env = "AIRC_RS_HOME", global = true)]
+    pub home: Option<PathBuf>,
 
     /// Peers to enrol in the local registry, repeatable.
     /// Format: `<uuid>:<base64-pubkey-no-padding>`. Obtain by
     /// running `airc-rs init` on the peer side and copying its
     /// printed spec.
+    ///
+    /// (Will be replaced by a persisted `peers.json` in the next
+    /// PR; flag stays as an override.)
     #[arg(long = "peer", value_name = "SPEC", global = true)]
     pub peers: Vec<PeerSpec>,
 
@@ -52,8 +64,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create or load an identity, then print this peer's spec for
-    /// out-of-band sharing.
+    /// Create or load the persisted identity (`<home>/identity.key` +
+    /// `<home>/identity.json`), then print this peer's spec for
+    /// out-of-band sharing. Idempotent — repeat runs return the same
+    /// peer_id.
     Init,
 
     /// Send a single text Message frame and exit.
@@ -97,8 +111,8 @@ pub enum Command {
         text: String,
     },
 
-    /// Same-LAN secure listen: bind a TLS server, accept ONE peer
-    /// (MVP), print received frames.
+    /// Same-LAN secure listen: bind a TLS server, accept peers,
+    /// print received frames.
     LanListen {
         /// Bind address (e.g. `127.0.0.1:7474` or `0.0.0.0:7474`).
         #[arg(long)]
@@ -112,8 +126,7 @@ pub enum Command {
     /// subsequent short-lived CLI calls (`ping`, `msg`, `status`)
     /// don't re-load identity or re-handshake.
     Daemon {
-        /// Override the default socket path
-        /// (`$HOME/.airc-rs/daemon.sock`).
+        /// Override the default socket path (`<home>/daemon.sock`).
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -153,20 +166,15 @@ pub enum Command {
 
     /// Pull buffered frames from the daemon's inbox for a wire.
     /// On first call for a wire, the daemon starts subscribing
-    /// (idempotent — repeat calls reuse the same subscription).
-    /// Pass `--since-lamport` to consume only new frames since the
-    /// last call.
+    /// (idempotent). Pass `--since-lamport` for consume-once cursor.
     Inbox {
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Wire directory.
         #[arg(long)]
         wire: PathBuf,
-        /// Return frames with lamport > this value (consume-once
-        /// cursor). Defaults to 0 = everything in the buffer.
         #[arg(long)]
         since_lamport: Option<u64>,
-        /// Max frames in one batch.
         #[arg(long)]
         limit: Option<usize>,
     },

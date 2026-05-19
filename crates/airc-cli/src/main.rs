@@ -1,20 +1,15 @@
 //! airc-rs — Rust substrate CLI binary.
 //!
-//! Wires the substrate crates (`airc-core`, `airc-protocol`,
-//! `airc-transport`) into a small command-line tool that proves the
-//! Rust substrate works end-to-end without any Python. Two terminals
-//! can chat over local-fs or LAN-TCP via this binary.
+//! State lives under `<home>` (default `$HOME/.airc-rs`):
+//!   - `identity.key`   — 32-byte Ed25519 secret (0600)
+//!   - `identity.json`  — stable peer_id + client_id (0600)
+//!   - `daemon.sock`    — IPC socket
+//!   - `peers.json`     — (next PR) persisted peer registry
 //!
-//! MVP scope:
-//!   - `init` — generate / load identity, print peer spec.
-//!   - `send` / `listen` — local-fs (same-Mac multi-process).
-//!   - `lan-send` / `lan-listen` — TLS-wrapped TCP (same-LAN secure).
-//!
-//! What's deferred:
-//!   - Persistent registry (for now, peers are passed via repeated
-//!     `--peer` flags on each command).
-//!   - A bridge daemon that holds state for short-lived CLI calls.
-//!   - Cross-platform polish (Windows ACLs, etc.).
+//! `airc-rs init` is the only command that creates the identity from
+//! nothing. All others load `<home>/identity.{key,json}` (auto-
+//! generating if absent). `VerificationPolicy::Strict` is the only
+//! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod cli;
 mod commands;
@@ -23,7 +18,9 @@ mod identity;
 mod ipc;
 mod registry;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::Parser;
 use uuid::Uuid;
@@ -31,18 +28,16 @@ use uuid::Uuid;
 use airc_core::PeerId;
 
 use cli::{Cli, Command};
+use identity::LocalIdentity;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("--peer-id {input:?} is not a valid UUID: {error}"))?;
+    let uuid = Uuid::from_str(input)
+        .map_err(|error| format!("--expected-peer {input:?} is not a valid UUID: {error}"))?;
     Ok(PeerId::from_uuid(uuid))
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Install the rustls crypto provider once at process start so all
-    // TLS paths Just Work. Ignore the duplicate-install error in case
-    // a test harness installed it first.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let parsed = Cli::parse();
@@ -56,107 +51,73 @@ async fn main() -> ExitCode {
 }
 
 async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let identity_file = parsed
-        .identity_file
-        .clone()
-        .ok_or("--identity-file or AIRC_RS_IDENTITY env var is required")?;
-
-    let parsed_peer_id = match parsed.peer_id.as_deref() {
-        Some(input) => Some(parse_peer_id(input)?),
-        None => None,
-    };
+    let home = parsed.home.clone().unwrap_or_else(cli::default_home_dir);
 
     match parsed.command {
-        Command::Init => commands::run_init(&identity_file, parsed_peer_id).map_err(Into::into),
+        Command::Init => commands::run_init(&home),
+
         Command::Send {
             wire,
             channel,
             text,
         } => {
-            let peer_id = parsed_peer_id.ok_or("--peer-id is required for send")?;
-            commands::run_send(
-                &identity_file,
-                peer_id,
-                parsed.peers,
-                &wire,
-                &channel,
-                &text,
-            )
-            .await
+            let identity = LocalIdentity::load_or_generate(&home)?;
+            commands::run_send(&identity, parsed.peers, &wire, &channel, &text).await
         }
+
         Command::Listen {
             wire,
             channel,
             replay,
         } => {
-            let peer_id = parsed_peer_id.ok_or("--peer-id is required for listen")?;
-            commands::run_listen(
-                &identity_file,
-                peer_id,
-                parsed.peers,
-                &wire,
-                channel,
-                replay,
-            )
-            .await
+            let identity = LocalIdentity::load_or_generate(&home)?;
+            commands::run_listen(&identity, parsed.peers, &wire, channel, replay).await
         }
+
         Command::LanSend {
             to,
             expected_peer,
             channel,
             text,
         } => {
-            let peer_id = parsed_peer_id.ok_or("--peer-id is required for lan-send")?;
+            let identity = LocalIdentity::load_or_generate(&home)?;
             let expected = parse_peer_id(&expected_peer)?;
-            commands::run_lan_send(
-                &identity_file,
-                peer_id,
-                parsed.peers,
-                to,
-                expected,
-                &channel,
-                &text,
-            )
-            .await
+            commands::run_lan_send(&identity, parsed.peers, to, expected, &channel, &text).await
         }
+
         Command::LanListen { bind, replay } => {
-            let peer_id = parsed_peer_id.ok_or("--peer-id is required for lan-listen")?;
-            commands::run_lan_listen(&identity_file, peer_id, parsed.peers, bind, replay).await
+            let identity = LocalIdentity::load_or_generate(&home)?;
+            commands::run_lan_listen(&identity, parsed.peers, bind, replay).await
         }
+
         Command::Daemon { socket } => {
-            let peer_id = parsed_peer_id.ok_or("--peer-id is required for daemon")?;
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_daemon(&identity_file, peer_id, parsed.peers, socket).await
+            let identity = LocalIdentity::load_or_generate(&home)?;
+            let socket = default_or(socket, &home);
+            commands::run_daemon(identity, parsed.peers, socket).await
         }
-        Command::Ping { socket } => {
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_ping(socket).await
-        }
-        Command::Status { socket } => {
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_status(socket).await
-        }
-        Command::Stop { socket } => {
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_stop(socket).await
-        }
+
+        Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
+        Command::Status { socket } => commands::run_status(default_or(socket, &home)).await,
+        Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
+
         Command::Msg {
             socket,
             wire,
             channel,
             text,
-        } => {
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_msg(socket, wire, &channel, &text).await
-        }
+        } => commands::run_msg(default_or(socket, &home), wire, &channel, &text).await,
+
         Command::Inbox {
             socket,
             wire,
             since_lamport,
             limit,
-        } => {
-            let socket = socket.unwrap_or_else(cli::default_socket_path);
-            commands::run_inbox(socket, wire, since_lamport, limit).await
-        }
+        } => commands::run_inbox(default_or(socket, &home), wire, since_lamport, limit).await,
     }
+}
+
+/// Resolve `--socket` override to its value, falling back to the
+/// home-derived default.
+fn default_or(explicit: Option<PathBuf>, home: &Path) -> PathBuf {
+    explicit.unwrap_or_else(|| cli::default_socket_path_in(home))
 }
