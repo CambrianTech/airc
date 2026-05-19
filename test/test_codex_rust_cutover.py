@@ -140,6 +140,7 @@ class CodexRustCutoverTests(unittest.TestCase):
             "airc_core.config read_parted",
             "airc_core.config record_parted",
             "airc_core.config clear_parted",
+            "airc_core.config set_host_block",
         ]
         for needle in forbidden:
             self.assertNotIn(needle, combined)
@@ -147,6 +148,11 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" config get-name', combined)
         self.assertIn('"$(airc_rs_bin)" config set ', combined)
         self.assertIn('"$(airc_rs_bin)" config read-parted', combined)
+
+    def test_host_block_config_write_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
+        self.assertNotIn("airc_core.config set_host_block", source)
+        self.assertIn('"$(airc_rs_bin)" config set-host-block', source)
 
 
 if __name__ == "__main__":

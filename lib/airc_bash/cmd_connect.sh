@@ -1877,7 +1877,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # to env-var pass — python reads from os.environ; bash never
     # touches the python source. Also emit stderr to surface failures
     # for the future debugger (not /dev/null).
-    "$AIRC_PYTHON" -m airc_core.config set_host_block \
+    "$(airc_rs_bin)" config set-host-block --home "$AIRC_WRITE_DIR" \
         --config "$CONFIG" \
         --host-airc-home "$host_airc_home" \
         --host-name "$peer_name" \

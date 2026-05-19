@@ -154,4 +154,26 @@ pub enum ConfigAction {
         #[arg(long, default_value = "")]
         gist_id: String,
     },
+
+    /// Persist host fields learned from a pairing handshake.
+    SetHostBlock {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Host airc home path.
+        #[arg(long, default_value = "")]
+        host_airc_home: String,
+        /// Host display name.
+        #[arg(long, default_value = "")]
+        host_name: String,
+        /// Host TCP port.
+        #[arg(long, default_value = "7547")]
+        host_port: String,
+        /// Host SSH public key.
+        #[arg(long, default_value = "")]
+        host_ssh_pub: String,
+        /// Host identity JSON blob.
+        #[arg(long, default_value = "{}")]
+        host_identity_json: String,
+    },
 }

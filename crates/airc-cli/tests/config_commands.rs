@@ -208,6 +208,43 @@ fn config_parted_rooms_are_idempotent() {
     assert_eq!(run_ok(home, &["config", "read-parted"]), "airc\n");
 }
 
+#[test]
+fn config_set_host_block_writes_handshake_fields() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+    fs::write(home.join("config.json"), r#"{"name":"joiner"}"#).unwrap();
+
+    run_ok(
+        home,
+        &[
+            "config",
+            "set-host-block",
+            "--host-airc-home",
+            "/tmp/host airc",
+            "--host-name",
+            "host",
+            "--host-port",
+            "7551",
+            "--host-ssh-pub",
+            "ssh-ed25519 AAA host",
+            "--host-identity-json",
+            r#"{"role":"host"}"#,
+        ],
+    );
+
+    assert_eq!(
+        run_ok(home, &["config", "get", "host_airc_home"]),
+        "/tmp/host airc\n"
+    );
+    assert_eq!(run_ok(home, &["config", "get", "host_name"]), "host\n");
+    assert_eq!(run_ok(home, &["config", "get", "host_port"]), "7551\n");
+    assert_eq!(
+        run_ok(home, &["config", "get", "host_identity", "{}"]),
+        "{\"role\":\"host\"}\n"
+    );
+    assert_eq!(run_ok(home, &["config", "get-name"]), "joiner\n");
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = Command::new(airc_rs())
         .arg("--home")

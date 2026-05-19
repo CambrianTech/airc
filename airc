@@ -1466,7 +1466,7 @@ _monitor_multi_channel() {
   # writes to the parent's stdout interleave at line boundaries.
   #
   # Args: my_name, TAB-separated "channel<TAB>gist_id" lines (one per
-  # subscribed channel, from airc_core.config list_channel_gists).
+  # subscribed channel, from airc-rs config list-channel-gists).
   local my_name="$1"
   local channel_map="$2"
 
