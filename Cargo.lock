@@ -145,6 +145,7 @@ name = "airc-work"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-protocol",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
