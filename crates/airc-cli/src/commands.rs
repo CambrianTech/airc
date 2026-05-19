@@ -6,7 +6,6 @@
 //! There is no opt-in for `AllowUnsigned` here — production rules.
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -19,7 +18,6 @@ use airc_protocol::{
 };
 use airc_transport::{LanTcpAdapter, LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
-use uuid::Uuid;
 
 use crate::daemon::{run as run_daemon_server, DaemonState};
 use crate::identity::LocalIdentity;
@@ -27,37 +25,78 @@ use crate::ipc::request::{AddPeerRequest, InboxRequest, SubscribeRequest};
 use crate::ipc::{DaemonClient, SendRequest};
 use crate::peers_store;
 use crate::registry::{format_peer_spec, PeerSpec};
+use crate::room::{self, Room};
 
 /// `init` — create or load the persisted identity under `<home>`,
-/// then print the peer spec for out-of-band sharing.
+/// auto-create the default room, then print the peer spec.
 pub fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let identity = LocalIdentity::load_or_generate(home)?;
+    // Auto-join "default" room on first init so subsequent
+    // `airc-rs msg` calls work without `--wire`/`--channel`.
+    if !room::path_in(home).exists() {
+        let default_room = Room::default_for(home);
+        room::save(home, &default_room)?;
+    }
+    let current = room::load_or_default(home)?;
     println!("home:        {}", home.display());
     println!("peer_id:     {}", identity.peer_id);
     println!("client_id:   {}", identity.client_id);
+    println!("room:        {} ({})", current.name, current.channel);
     println!(
         "peer_spec:   {}",
         format_peer_spec(identity.peer_id, &identity.keypair.public_bytes())
     );
     println!();
     println!(
-        "Share peer_spec with other peers. Enrol theirs with \
-         `airc-rs peer add <spec>` (persisted to `<home>/peers.json`)."
+        "Share peer_spec with peers; enrol theirs via `airc-rs peer add <spec>`. \
+         Use `airc-rs room <name>` to switch rooms; `airc-rs msg \"hi\"` sends \
+         to the current room."
     );
     Ok(())
 }
 
-/// `send` — local-fs single-shot send, signed under Strict.
+/// `room` — print current room. `room <name>` — switch to a
+/// deterministic room derived from `<name>` (same name across peers
+/// = same channel UUID, so they don't need to share it). `--wire`
+/// overrides the per-home default wire dir; used for shared-wire
+/// setups (e.g. local-fs tests with two processes on one machine).
+pub fn run_room(
+    home: &Path,
+    name: Option<String>,
+    wire: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match name {
+        Some(name) => {
+            let mut next = Room::from_name(home, &name);
+            if let Some(wire) = wire {
+                next.wire = wire;
+            }
+            room::save(home, &next)?;
+            println!("switched room: {}", next.name);
+            println!("  wire:    {}", next.wire.display());
+            println!("  channel: {}", next.channel);
+        }
+        None => {
+            let current = room::load_or_default(home)?;
+            println!("room:    {}", current.name);
+            println!("wire:    {}", current.wire.display());
+            println!("channel: {}", current.channel);
+        }
+    }
+    Ok(())
+}
+
+/// `send` — local-fs single-shot send to the current room, signed
+/// under Strict.
 pub async fn run_send(
     home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
-    wire: &Path,
-    channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let current = room::load_or_default(home)?;
     let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LocalFsAdapter::new(wire);
+    let inner = LocalFsAdapter::new(&current.wire);
     let transport = SignedTransport::new(
         inner,
         identity.keypair.clone(),
@@ -65,24 +104,23 @@ pub async fn run_send(
         registry,
         VerificationPolicy::Strict,
     );
-    let channel_id = parse_channel(channel)?;
-    let frame = build_message_frame(identity, channel_id, text);
+    let frame = build_message_frame(identity, current.channel, text);
     transport.send(frame).await?;
-    println!("sent.");
+    println!("sent to {} ({}).", current.name, current.channel);
     Ok(())
 }
 
-/// `listen` — local-fs subscribe loop. Prints frames until Ctrl-C.
+/// `listen` — local-fs subscribe loop on the current room. Prints
+/// frames until Ctrl-C.
 pub async fn run_listen(
     home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
-    wire: &Path,
-    channel: Option<String>,
     replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let current = room::load_or_default(home)?;
     let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LocalFsAdapter::new(wire);
+    let inner = LocalFsAdapter::new(&current.wire);
     let transport = SignedTransport::new(
         inner,
         identity.keypair.clone(),
@@ -90,27 +128,29 @@ pub async fn run_listen(
         registry,
         VerificationPolicy::Strict,
     );
-    let subscription = subscription_for(channel.as_deref(), replay)?;
+    let subscription = subscription_with_channel(current.channel, replay);
     let mut stream = transport.subscribe(subscription).await?;
 
     println!(
-        "listening on {} (peer_id {}) …",
-        wire.display(),
+        "listening on {} ({}, peer_id {}) …",
+        current.name,
+        current.wire.display(),
         identity.peer_id
     );
     print_until_signal(&mut stream).await
 }
 
-/// `lan-send` — TLS-wrapped single-shot send to a remote peer.
+/// `lan-send` — TLS-wrapped single-shot send to a remote peer, on
+/// the current room's channel.
 pub async fn run_lan_send(
     home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     to: std::net::SocketAddr,
     expected_peer: PeerId,
-    channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let current = room::load_or_default(home)?;
     let registry = build_combined_registry(home, identity, &peers)?;
     let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
     inner.connect(to, expected_peer).await?;
@@ -121,10 +161,12 @@ pub async fn run_lan_send(
         registry,
         VerificationPolicy::Strict,
     );
-    let channel_id = parse_channel(channel)?;
-    let frame = build_message_frame(identity, channel_id, text);
+    let frame = build_message_frame(identity, current.channel, text);
     transport.send(frame).await?;
-    println!("sent over lan-tcp.");
+    println!(
+        "sent over lan-tcp to {} ({}).",
+        current.name, current.channel
+    );
     Ok(())
 }
 
@@ -147,7 +189,16 @@ pub async fn run_lan_listen(
         registry,
         VerificationPolicy::Strict,
     );
-    let subscription = subscription_for(None, replay)?;
+    // LAN listen accepts frames on any channel — no filter.
+    let from_cursor = replay.then(|| TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    });
+    let subscription = Subscription {
+        channel: None,
+        from_cursor,
+        ..Default::default()
+    };
     let mut stream = transport.subscribe(subscription).await?;
     print_until_signal(&mut stream).await
 }
@@ -209,37 +260,39 @@ pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
 }
 
 pub async fn run_msg(
+    home: &Path,
     socket: PathBuf,
-    wire: PathBuf,
-    channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let channel_uuid = Uuid::from_str(channel)?;
+    let current = room::load_or_default(home)?;
     let client = DaemonClient::new(socket);
     client
         .send(SendRequest {
-            wire,
-            channel: channel_uuid,
+            wire: current.wire,
+            channel: current.channel.as_uuid(),
             text: text.to_string(),
         })
         .await?;
-    println!("sent.");
+    println!("sent to {} ({}).", current.name, current.channel);
     Ok(())
 }
 
 pub async fn run_inbox(
+    home: &Path,
     socket: PathBuf,
-    wire: PathBuf,
     since_lamport: Option<u64>,
     limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let current = room::load_or_default(home)?;
     let client = DaemonClient::new(socket);
     client
-        .subscribe(SubscribeRequest { wire: wire.clone() })
+        .subscribe(SubscribeRequest {
+            wire: current.wire.clone(),
+        })
         .await?;
     let inbox = client
         .inbox(InboxRequest {
-            wire,
+            wire: current.wire,
             since_lamport,
             limit,
         })
@@ -261,32 +314,16 @@ pub async fn run_inbox(
 
 // ---- Shared helpers -------------------------------------------------
 
-fn parse_channel(channel: &str) -> Result<RoomId, uuid::Error> {
-    let uuid = Uuid::from_str(channel)?;
-    Ok(RoomId::from_uuid(uuid))
-}
-
-fn subscription_for(
-    channel: Option<&str>,
-    replay: bool,
-) -> Result<Subscription, Box<dyn std::error::Error>> {
-    let channel_id = match channel {
-        Some(s) => Some(parse_channel(s)?),
-        None => None,
-    };
-    let from_cursor = if replay {
-        Some(TranscriptCursor {
-            lamport: 0,
-            event_id: EventId::from_u128(0),
-        })
-    } else {
-        None
-    };
-    Ok(Subscription {
-        channel: channel_id,
+fn subscription_with_channel(channel: RoomId, replay: bool) -> Subscription {
+    let from_cursor = replay.then(|| TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    });
+    Subscription {
+        channel: Some(channel),
         from_cursor,
         ..Default::default()
-    })
+    }
 }
 
 fn build_message_frame(identity: &LocalIdentity, channel: RoomId, text: &str) -> Frame {
