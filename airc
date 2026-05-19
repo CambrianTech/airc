@@ -89,11 +89,9 @@ fi
 export AIRC_PYTHON
 
 # Issue #341 follow-up: shell openssl is no longer used for Ed25519
-# identity gen / signing. Both paths now route through the venv
-# cryptography module (airc_core.identity bootstrap-ed25519 / sign-
-# ed25519). The prior _resolve_openssl + AIRC_OPENSSL + _die helper
-# were #342's loud-failure mitigation; once truth moved to Python they
-# became dead code and were removed in this commit. ssh-keygen still
+# identity gen / signing. The prior _resolve_openssl + AIRC_OPENSSL +
+# _die helper were #342's loud-failure mitigation; once truth moved to
+# the Rust CLI they became dead code and were removed. ssh-keygen still
 # stays — that's an OpenSSH client tool, separate from libcrypto, and
 # every supported platform ships a working version.
 
@@ -1216,11 +1214,7 @@ humanhash() {
 }
 
 sign_message() {
-  # Sign message bytes via the venv cryptography path (issue #341 — the
-  # prior shell openssl call broke on macOS LibreSSL silently). Identity
-  # module's sign-ed25519 reads from stdin, prints base64 sig matching
-  # the prior `openssl pkeyutl -sign | base64` output byte-for-byte.
-  printf '%s' "$1" | "$AIRC_PYTHON" -m airc_core.identity sign-ed25519 --dir "$IDENTITY_DIR"
+  printf '%s' "$1" | "$(airc_rs_bin)" identity sign-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"
 }
 
 # ── Platform adapters ───────────────────────────────────────────────────
@@ -1435,8 +1429,8 @@ init_identity() {
   # PEM format the openssl path produced, so existing scopes upgrade
   # in place without rotating keys.
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
-    if ! "$AIRC_PYTHON" -m airc_core.identity bootstrap-ed25519 --dir "$IDENTITY_DIR"; then
-      die "Ed25519 identity bootstrap failed — check that the venv has the cryptography package (re-run install.sh)"
+    if ! "$(airc_rs_bin)" identity bootstrap-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"; then
+      die "Ed25519 identity bootstrap failed"
     fi
   fi
   if [ ! -f "$IDENTITY_DIR/ssh_key" ]; then
@@ -1449,10 +1443,7 @@ init_identity() {
     }
   fi
   # Phase E.2: bootstrap X25519 keypair for envelope encryption.
-  # Idempotent — exits silently if files exist or cryptography isn't
-  # installed (in which case airc gracefully falls back to plaintext
-  # for ALL peers; tests cover both paths).
-  "$AIRC_PYTHON" -m airc_core.identity bootstrap --dir "$IDENTITY_DIR" >/dev/null 2>&1 || true
+  "$(airc_rs_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" >/dev/null
   touch "$MESSAGES"
 }
 
@@ -2020,11 +2011,7 @@ EOF
       local _batch_outcome _batch_kind
       _batch_outcome=$(cat "$snapshot" | "$AIRC_PYTHON" -m airc_core.bearer_cli send-batch \
         all "$_batch_channel" --room-gist-id "$_batch_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
-      _batch_kind=$(printf '%s' "$_batch_outcome" | "$AIRC_PYTHON" -c 'import json,sys
-try:
-  print(json.load(sys.stdin).get("kind",""))
-except Exception:
-  print("")' 2>/dev/null)
+      _batch_kind=$(printf '%s' "$_batch_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
       if [ "$_batch_kind" = "delivered" ]; then
         cat "$snapshot" >> "$MESSAGES"
         delivered=${_batch_count:-0}
@@ -2043,11 +2030,7 @@ except Exception:
       # never the wrapped envelope — cmd_send queues pre-wrap so the
       # drain can re-resolve recipient pubkey at retry time).
       local _line_channel
-      _line_channel=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
-try:
-  print(json.loads(sys.stdin.readline()).get("channel",""))
-except Exception:
-  print("")' 2>/dev/null)
+      _line_channel=$(printf '%s\n' "$line" | "$(airc_rs_bin)" gist get .channel 2>/dev/null)
 
       # Resolve channel → gist. Fall back to legacy room_gist_id only
       # when the line carries no channel (older queued lines may pre-date
@@ -2070,20 +2053,16 @@ except Exception:
       # Re-resolve recipient pubkey at drain time. Pre-pair queued lines
       # shipped plaintext; post-pair drain wraps them with the new pubkey.
       local _line_to
-      _line_to=$(printf '%s\n' "$line" | "$AIRC_PYTHON" -c 'import json,sys
-try:
-  print(json.loads(sys.stdin.readline()).get("to",""))
-except Exception:
-  print("")' 2>/dev/null)
+      _line_to=$(printf '%s\n' "$line" | "$(airc_rs_bin)" gist get .to 2>/dev/null)
       local _line_pub=""
       if [ -n "$_line_to" ] && [ "$_line_to" != "all" ]; then
-        _line_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+        _line_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
           --peers-dir "$PEERS_DIR" --peer-name "$_line_to" 2>/dev/null || true)
       fi
       local _wire="$line"
       if [ -n "$_line_pub" ]; then
-        _wire=$(printf '%s' "$line" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
-          --recipient-pub "$_line_pub" \
+        _wire=$(printf '%s' "$line" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+          --recipient-pub="$_line_pub" \
           --identity-dir "$IDENTITY_DIR" 2>/dev/null || printf '%s' "$line")
       fi
 
@@ -2091,11 +2070,7 @@ except Exception:
       _outcome=$(printf '%s' "$_wire" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
         "${_line_to:-all}" "$_line_channel" \
         --room-gist-id "$_line_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
-      _kind=$(printf '%s' "$_outcome" | "$AIRC_PYTHON" -c 'import json,sys
-try:
-  print(json.load(sys.stdin).get("kind",""))
-except Exception:
-  print("")' 2>/dev/null)
+      _kind=$(printf '%s' "$_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
 
       case "$_kind" in
         delivered)

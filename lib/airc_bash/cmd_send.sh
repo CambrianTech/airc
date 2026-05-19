@@ -360,14 +360,14 @@ cmd_send() {
     # that case, transparently.
     local recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
-      recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+      recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local wire_msg="$full_msg"
     if [ -n "$recipient_pub" ]; then
       # Stderr unredirected — wrap failures surface loud (CLAUDE.md "never swallow").
-      wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
-        --recipient-pub "$recipient_pub" \
+      wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+        --recipient-pub="$recipient_pub" \
         --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
       # Diagnostic: emit the wire shape to stderr so test logs surface
       # whether encryption actually engaged. Phase E debug aid; remove
@@ -413,8 +413,8 @@ cmd_send() {
       --remote-home "$rhome" \
       --room-gist-id "$room_gist_id")
     local kind detail
-    kind=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
-    detail=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+    kind=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+    detail=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
 
     case "$kind" in
       delivered)
@@ -455,8 +455,8 @@ cmd_send() {
             --host-target "$host_target" \
             --remote-home "$rhome" \
             --room-gist-id "$room_gist_id" 2>&1) || true
-          retry_kind=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
-          retry_detail=$(printf '%s' "$retry_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+          retry_kind=$(printf '%s' "$retry_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+          retry_detail=$(printf '%s' "$retry_outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
           if [ "$retry_kind" = "delivered" ]; then
             echo "  ✓ Sent post-heal." >&2
             return 0
@@ -595,13 +595,13 @@ cmd_send() {
     # encryption is a future Phase E.4).
     local _host_recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
-      _host_recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+      _host_recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local _host_wire_msg="$full_msg"
     if [ -n "$_host_recipient_pub" ]; then
-      _host_wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
-        --recipient-pub "$_host_recipient_pub" \
+      _host_wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+        --recipient-pub="$_host_recipient_pub" \
         --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
     fi
 
@@ -627,8 +627,8 @@ cmd_send() {
         "$peer_name" "$active_channel" \
         --room-gist-id "$_host_room_gist_id")
       local _host_kind _host_detail
-      _host_kind=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
-      _host_detail=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+      _host_kind=$(printf '%s' "$_host_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+      _host_detail=$(printf '%s' "$_host_outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
       case "$_host_kind" in
         delivered)
           # Append to local audit log only on confirmed delivery. Pre-fix
