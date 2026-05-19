@@ -13,6 +13,8 @@
 
 mod cli;
 mod commands;
+mod events_cli;
+mod events_commands;
 mod lane_cli;
 mod lane_commands;
 mod work_cli;
@@ -31,6 +33,7 @@ use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
+use events_cli::EventsAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
@@ -117,6 +120,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await
             }
             PeerAction::List => commands::run_peer_list(&home).await,
+        },
+
+        Command::Events(args) => match args.action {
+            EventsAction::List {
+                kind,
+                header,
+                header_prefix,
+                limit,
+            } => events_commands::run_list(&home, kind, header, header_prefix, limit).await,
         },
 
         Command::Work(args) => match args.action {
