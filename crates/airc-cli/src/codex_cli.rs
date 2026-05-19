@@ -12,6 +12,18 @@ pub struct CodexHookArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CodexHookAction {
+    /// Install the Rust UserPromptSubmit hook into Codex config.
+    InstallHooks {
+        /// Codex home directory. Defaults to `$HOME/.codex`.
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+    },
+    /// Remove AIRC-managed UserPromptSubmit hooks from Codex config.
+    UninstallHooks {
+        /// Codex home directory. Defaults to `$HOME/.codex`.
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+    },
     /// Emit Codex UserPromptSubmit JSON with unread AIRC context.
     UserPromptSubmit {
         /// Cursor file. Defaults to `<home>/codex_hook_cursor.json`.

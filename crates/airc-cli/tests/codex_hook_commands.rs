@@ -102,6 +102,86 @@ fn codex_hook_raw_mode_preserves_full_event_lines() {
     assert!(context.contains(']'));
 }
 
+#[test]
+fn codex_hook_installer_replaces_legacy_python_hook() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[features]\ncodex_hooks = true\nother = true\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo existing"},{"type":"command","command":"airc codex-hook user-prompt-submit"}]}]}}"#,
+    )
+    .expect("write hooks");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "install-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    assert!(config.contains("hooks = true"));
+    assert!(config.contains("other = true"));
+    assert!(!config.contains("codex_hooks"));
+
+    let hooks: Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("hooks.json")).unwrap())
+            .expect("hooks json");
+    let commands = hook_commands(&hooks);
+    assert!(commands.contains(&"echo existing".to_string()));
+    assert!(commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()));
+    assert!(!commands.contains(&"airc codex-hook user-prompt-submit".to_string()));
+}
+
+#[test]
+fn codex_hook_uninstaller_removes_managed_hooks_only() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[features]\nhooks = true\nother = true\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo existing"},{"type":"command","command":"airc-rs codex-hook user-prompt-submit"}]}]}}"#,
+    )
+    .expect("write hooks");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "uninstall-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    assert!(!config.contains("hooks = true"));
+    assert!(config.contains("other = true"));
+
+    let hooks: Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("hooks.json")).unwrap())
+            .expect("hooks json");
+    let commands = hook_commands(&hooks);
+    assert!(commands.contains(&"echo existing".to_string()));
+    assert!(!commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()));
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = Command::new(airc_rs())
         .arg("--home")
@@ -152,4 +232,14 @@ fn additional_context(output: &str) -> String {
         .as_str()
         .expect("additionalContext string")
         .to_string()
+}
+
+fn hook_commands(hooks: &Value) -> Vec<String> {
+    hooks["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("UserPromptSubmit array")
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str().map(ToString::to_string))
+        .collect()
 }
