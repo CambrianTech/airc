@@ -1,10 +1,10 @@
 //! End-to-end integration test for the `airc-rs` binary.
 //!
 //! Spawns two real subprocesses (Alice + Bob), has them chat over the
-//! Rust substrate, and asserts the message arrives. This is the proof
-//! of life: no Python anywhere in the loop. If this test passes,
-//! Python `airc` has a fully functional Rust replacement for the
-//! basic chat use case.
+//! Rust substrate, and asserts the message arrives. No Python anywhere.
+//!
+//! Each subprocess uses its own `--home <dir>` so the identity state
+//! is isolated per-test and per-peer.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -13,17 +13,16 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-/// Returns the path to the `airc-rs` binary cargo built for this test.
 fn airc_rs() -> &'static str {
     env!("CARGO_BIN_EXE_airc-rs")
 }
 
-/// Run `airc-rs init` and parse the printed `peer_id:` and
-/// `peer_spec:` lines from stdout.
-fn run_init(identity_file: &Path) -> (String, String) {
+/// Run `airc-rs --home <dir> init` and parse the printed `peer_id:`
+/// and `peer_spec:` lines from stdout.
+fn run_init(home: &Path) -> (String, String) {
     let output = Command::new(airc_rs())
-        .arg("--identity-file")
-        .arg(identity_file)
+        .arg("--home")
+        .arg(home)
         .arg("init")
         .output()
         .expect("airc-rs init must spawn");
@@ -50,28 +49,23 @@ fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[test]
 fn two_airc_rs_processes_chat_over_local_fs() {
-    // The headline test: Alice runs `airc-rs listen`; Bob runs
-    // `airc-rs send`; Alice's stdout MUST contain the message body
-    // within a few seconds. No Python anywhere.
-    let dir = TempDir::new().expect("tempdir");
-    let alice_key = dir.path().join("alice.key");
-    let bob_key = dir.path().join("bob.key");
-    let wire = dir.path().join("wire");
+    // Alice runs `airc-rs listen`; Bob runs `airc-rs send`; Alice's
+    // stdout MUST contain the message body within a few seconds. No
+    // Python anywhere.
+    let workspace = TempDir::new().expect("tempdir");
+    let alice_home = workspace.path().join("alice");
+    let bob_home = workspace.path().join("bob");
+    let wire = workspace.path().join("wire");
 
-    let (alice_id, alice_spec) = run_init(&alice_key);
-    let (bob_id, bob_spec) = run_init(&bob_key);
+    let (_alice_id, alice_spec) = run_init(&alice_home);
+    let (_bob_id, bob_spec) = run_init(&bob_home);
 
-    // Fixed channel UUID so both sides agree.
     let channel = "11111111-2222-3333-4444-555555555555";
 
-    // Spawn Alice's listener with --replay so she sees messages sent
-    // even slightly before her subscribe completes (race-safe).
     let mut alice = Command::new(airc_rs())
         .args([
-            "--identity-file",
-            alice_key.to_str().unwrap(),
-            "--peer-id",
-            &alice_id,
+            "--home",
+            alice_home.to_str().unwrap(),
             "--peer",
             &bob_spec,
             "listen",
@@ -86,16 +80,12 @@ fn two_airc_rs_processes_chat_over_local_fs() {
         .spawn()
         .expect("alice must spawn");
 
-    // Give the listener a moment to start the tail loop.
     std::thread::sleep(Duration::from_millis(300));
 
-    // Bob sends.
     let bob_send = Command::new(airc_rs())
         .args([
-            "--identity-file",
-            bob_key.to_str().unwrap(),
-            "--peer-id",
-            &bob_id,
+            "--home",
+            bob_home.to_str().unwrap(),
             "--peer",
             &alice_spec,
             "send",
@@ -113,7 +103,6 @@ fn two_airc_rs_processes_chat_over_local_fs() {
         String::from_utf8_lossy(&bob_send.stderr)
     );
 
-    // Read Alice's stdout until we see the message or hit the timeout.
     let alice_stdout = alice.stdout.take().expect("alice stdout");
     let body_arrived = wait_for_line_contains(
         alice_stdout,
@@ -121,7 +110,6 @@ fn two_airc_rs_processes_chat_over_local_fs() {
         Duration::from_secs(6),
     );
 
-    // Clean up: kill the listener.
     let _ = alice.kill();
     let _ = alice.wait();
 
@@ -133,28 +121,24 @@ fn two_airc_rs_processes_chat_over_local_fs() {
 
 #[test]
 fn listen_rejects_unenrolled_signer() {
-    // Security guarantee through the CLI: Mallory (not in Alice's
-    // peer list) writes a signed frame to the wire. Alice's listen
-    // process should NOT print it as a happy message; instead it
-    // surfaces "verification failed" via stderr.
-    let dir = TempDir::new().expect("tempdir");
-    let alice_key = dir.path().join("alice.key");
-    let mallory_key = dir.path().join("mallory.key");
-    let wire = dir.path().join("wire");
+    // Mallory's signed frame must be rejected by Alice's listen — she
+    // isn't in Alice's peer registry. Stderr surfaces a verification
+    // failure; stdout never prints it as a happy message.
+    let workspace = TempDir::new().expect("tempdir");
+    let alice_home = workspace.path().join("alice");
+    let mallory_home = workspace.path().join("mallory");
+    let wire = workspace.path().join("wire");
 
-    let (alice_id, _alice_spec) = run_init(&alice_key);
-    let (mallory_id, mallory_spec) = run_init(&mallory_key);
+    let (_alice_id, _alice_spec) = run_init(&alice_home);
+    let (_mallory_id, mallory_spec) = run_init(&mallory_home);
 
     let channel = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     // Alice's peer list does NOT include Mallory.
-    // No `--peer` flags passed at all.
     let mut alice = Command::new(airc_rs())
         .args([
-            "--identity-file",
-            alice_key.to_str().unwrap(),
-            "--peer-id",
-            &alice_id,
+            "--home",
+            alice_home.to_str().unwrap(),
             "listen",
             "--wire",
             wire.to_str().unwrap(),
@@ -169,19 +153,13 @@ fn listen_rejects_unenrolled_signer() {
 
     std::thread::sleep(Duration::from_millis(300));
 
-    // Mallory sends; Mallory's registry only contains herself + Alice
-    // (so she CAN sign), but Alice's registry doesn't contain her.
+    // Mallory passes herself as `--peer` so her own registry is
+    // non-empty; her CLI signs the frame under her own identity.
     let _mallory_send = Command::new(airc_rs())
         .args([
-            "--identity-file",
-            mallory_key.to_str().unwrap(),
-            "--peer-id",
-            &mallory_id,
+            "--home",
+            mallory_home.to_str().unwrap(),
             "--peer",
-            // Mallory needs Alice in HER registry to sign — but the
-            // CLI's send only needs the sender's own identity to be
-            // enrolled (we enrol self automatically). We still pass
-            // Alice as a peer so the registry is non-empty.
             &mallory_spec,
             "send",
             "--wire",
@@ -193,9 +171,6 @@ fn listen_rejects_unenrolled_signer() {
         .output()
         .expect("mallory send must spawn");
 
-    // Read Alice's stderr — we expect a "verification failed" line.
-    // (Stdout might be empty because the listen never accepts the
-    // frame as a valid message.)
     let alice_stderr = alice.stderr.take().expect("alice stderr");
     let saw_rejection =
         wait_for_line_contains(alice_stderr, "verification failed", Duration::from_secs(6));
@@ -209,10 +184,24 @@ fn listen_rejects_unenrolled_signer() {
     );
 }
 
+#[test]
+fn rerun_init_returns_same_peer_id() {
+    // The persistence pin: `airc-rs init` must be idempotent. The
+    // second run reuses the on-disk identity rather than minting a
+    // new peer_id.
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("alice");
+    let (first_id, first_spec) = run_init(&home);
+    let (second_id, second_spec) = run_init(&home);
+    assert_eq!(first_id, second_id, "peer_id must persist across init runs");
+    assert_eq!(
+        first_spec, second_spec,
+        "peer_spec must persist across init runs"
+    );
+}
+
 /// Block until `reader` yields a line containing `needle`, or the
-/// deadline elapses. Reads byte-by-byte so we don't have to predict
-/// line boundaries; this matters because the airc-rs output is
-/// line-oriented but the test's view of stdout/stderr is a stream.
+/// deadline elapses.
 fn wait_for_line_contains<R: Read + Send + 'static>(
     reader: R,
     needle: &str,
@@ -242,10 +231,8 @@ fn wait_for_line_contains<R: Read + Send + 'static>(
     }
 }
 
-// Linker stub: silences an unused-import lint when `Write` is only
-// pulled in for trait usage. (`Write` is used implicitly by `tx.send`
-// via the channel impl; this trait import is here in case future
-// tests need it directly.)
+// Trait keepalive for `Write` — silences unused-import lints if the
+// import is otherwise only needed transitively.
 #[allow(dead_code)]
 fn _trait_keepalive(mut w: impl Write) {
     let _ = w.write(&[]);

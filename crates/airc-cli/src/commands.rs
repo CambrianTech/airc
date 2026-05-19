@@ -1,5 +1,9 @@
 //! Subcommand handlers — keep them small and direct. Each function
-//! takes the parsed CLI context and runs.
+//! takes a `LocalIdentity` (loaded once per invocation by `main`) +
+//! command-specific args.
+//!
+//! `VerificationPolicy::Strict` is the only policy used in CLI paths.
+//! There is no opt-in for `AllowUnsigned` here — production rules.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -15,50 +19,49 @@ use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use crate::daemon::{run as run_daemon_server, DaemonState};
-use crate::identity::load_or_generate;
+use crate::identity::LocalIdentity;
 use crate::ipc::request::{InboxRequest, SubscribeRequest};
 use crate::ipc::{DaemonClient, SendRequest};
 use crate::registry::{build_registry, format_peer_spec, PeerSpec};
 
-/// `init` — load or generate the identity, print the peer spec.
-pub fn run_init(identity_file: &Path, peer_id: Option<PeerId>) -> std::io::Result<()> {
-    let keypair = load_or_generate(identity_file)?;
-    let peer_id = peer_id.unwrap_or_default();
-    println!("identity_file: {}", identity_file.display());
-    println!("peer_id:       {peer_id}");
+/// `init` — create or load the persisted identity under `<home>`,
+/// then print the peer spec for out-of-band sharing.
+pub fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = LocalIdentity::load_or_generate(home)?;
+    println!("home:        {}", home.display());
+    println!("peer_id:     {}", identity.peer_id);
+    println!("client_id:   {}", identity.client_id);
     println!(
-        "peer_spec:     {}",
-        format_peer_spec(peer_id, &keypair.public_bytes())
+        "peer_spec:   {}",
+        format_peer_spec(identity.peer_id, &identity.keypair.public_bytes())
     );
     println!();
-    println!("Share `peer_spec` with the other side, and pass it back as");
-    println!("`--peer <spec>` plus `--peer-id {peer_id}` on subsequent commands.");
+    println!(
+        "Share peer_spec with other peers and pass it back as --peer <spec>. \
+         (Persistent peers.json coming in the next PR.)"
+    );
     Ok(())
 }
 
 /// `send` — local-fs single-shot send, signed under Strict.
 pub async fn run_send(
-    identity_file: &Path,
-    peer_id: PeerId,
+    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     wire: &Path,
     channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let keypair = load_or_generate(identity_file)?;
-    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
-
+    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
     let inner = LocalFsAdapter::new(wire);
     let transport = SignedTransport::new(
         inner,
-        keypair,
-        peer_id,
+        identity.keypair.clone(),
+        identity.peer_id,
         registry,
         VerificationPolicy::Strict,
     );
-
     let channel_id = parse_channel(channel)?;
-    let frame = build_message_frame(peer_id, channel_id, text);
+    let frame = build_message_frame(identity, channel_id, text);
     transport.send(frame).await?;
     println!("sent.");
     Ok(())
@@ -66,93 +69,187 @@ pub async fn run_send(
 
 /// `listen` — local-fs subscribe loop. Prints frames until Ctrl-C.
 pub async fn run_listen(
-    identity_file: &Path,
-    peer_id: PeerId,
+    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     wire: &Path,
     channel: Option<String>,
     replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let keypair = load_or_generate(identity_file)?;
-    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
-
+    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
     let inner = LocalFsAdapter::new(wire);
     let transport = SignedTransport::new(
         inner,
-        keypair,
-        peer_id,
+        identity.keypair.clone(),
+        identity.peer_id,
         registry,
         VerificationPolicy::Strict,
     );
-
     let subscription = subscription_for(channel.as_deref(), replay)?;
     let mut stream = transport.subscribe(subscription).await?;
 
-    println!("listening on {} (peer_id {peer_id}) …", wire.display());
+    println!(
+        "listening on {} (peer_id {}) …",
+        wire.display(),
+        identity.peer_id
+    );
     print_until_signal(&mut stream).await
 }
 
 /// `lan-send` — TLS-wrapped single-shot send to a remote peer.
 pub async fn run_lan_send(
-    identity_file: &Path,
-    peer_id: PeerId,
+    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     to: std::net::SocketAddr,
     expected_peer: PeerId,
     channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let keypair = load_or_generate(identity_file)?;
-    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
-
-    let inner = LanTcpAdapter::new(peer_id, keypair.clone(), registry.clone())?;
+    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
     inner.connect(to, expected_peer).await?;
-
-    // `connect()` now installs the outbound channel synchronously
-    // before returning (Codex's #671 readiness-race fix), so no
-    // sleep needed before sending.
     let transport = SignedTransport::new(
         inner,
-        keypair,
-        peer_id,
+        identity.keypair.clone(),
+        identity.peer_id,
         registry,
         VerificationPolicy::Strict,
     );
-
     let channel_id = parse_channel(channel)?;
-    let frame = build_message_frame(peer_id, channel_id, text);
+    let frame = build_message_frame(identity, channel_id, text);
     transport.send(frame).await?;
     println!("sent over lan-tcp.");
     Ok(())
 }
 
-/// `lan-listen` — bind a TLS server, accept ONE peer, print frames.
+/// `lan-listen` — bind a TLS server, accept peers, print frames.
 pub async fn run_lan_listen(
-    identity_file: &Path,
-    peer_id: PeerId,
+    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     bind: std::net::SocketAddr,
     replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let keypair = load_or_generate(identity_file)?;
-    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
-
-    let inner = LanTcpAdapter::new(peer_id, keypair.clone(), registry.clone())?;
+    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
     let actual = inner.listen(bind).await?;
-    println!("listening on {actual} (peer_id {peer_id}) …");
-
+    println!("listening on {actual} (peer_id {}) …", identity.peer_id);
     let transport = SignedTransport::new(
         inner,
-        keypair,
-        peer_id,
+        identity.keypair.clone(),
+        identity.peer_id,
         registry,
         VerificationPolicy::Strict,
     );
-
     let subscription = subscription_for(None, replay)?;
     let mut stream = transport.subscribe(subscription).await?;
     print_until_signal(&mut stream).await
 }
+
+/// `daemon` — run the long-lived daemon process on the given socket.
+pub async fn run_daemon(
+    identity: LocalIdentity,
+    peers: Vec<PeerSpec>,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+
+    if let Some(parent) = socket.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let state = Arc::new(DaemonState::new(
+        identity.peer_id,
+        identity.keypair,
+        registry,
+        VerificationPolicy::Strict,
+    ));
+    println!(
+        "airc-rs daemon: peer_id={} listening on {}",
+        identity.peer_id,
+        socket.display()
+    );
+    run_daemon_server(state, socket).await?;
+    println!("airc-rs daemon: stopped.");
+    Ok(())
+}
+
+// ---- Daemon-client commands (no identity load needed) ---------------
+
+pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    client.ping().await?;
+    println!("pong");
+    Ok(())
+}
+
+pub async fn run_status(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    let status = client.status().await?;
+    println!("peer_id:        {}", status.peer_id);
+    println!("uptime_seconds: {}", status.uptime_seconds);
+    Ok(())
+}
+
+pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    client.stop().await?;
+    println!("daemon: stop requested.");
+    Ok(())
+}
+
+pub async fn run_msg(
+    socket: PathBuf,
+    wire: PathBuf,
+    channel: &str,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channel_uuid = Uuid::from_str(channel)?;
+    let client = DaemonClient::new(socket);
+    client
+        .send(SendRequest {
+            wire,
+            channel: channel_uuid,
+            text: text.to_string(),
+        })
+        .await?;
+    println!("sent.");
+    Ok(())
+}
+
+pub async fn run_inbox(
+    socket: PathBuf,
+    wire: PathBuf,
+    since_lamport: Option<u64>,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    client
+        .subscribe(SubscribeRequest { wire: wire.clone() })
+        .await?;
+    let inbox = client
+        .inbox(InboxRequest {
+            wire,
+            since_lamport,
+            limit,
+        })
+        .await?;
+    if inbox.frames.is_empty() {
+        println!("(no new frames; newest_lamport={})", inbox.newest_lamport);
+        return Ok(());
+    }
+    for frame in &inbox.frames {
+        print_frame(frame);
+    }
+    println!();
+    println!(
+        "newest_lamport={} — pass as --since-lamport on the next call",
+        inbox.newest_lamport
+    );
+    Ok(())
+}
+
+// ---- Shared helpers -------------------------------------------------
 
 fn parse_channel(channel: &str) -> Result<RoomId, uuid::Error> {
     let uuid = Uuid::from_str(channel)?;
@@ -182,7 +279,7 @@ fn subscription_for(
     })
 }
 
-fn build_message_frame(sender: PeerId, channel: RoomId, text: &str) -> Frame {
+fn build_message_frame(identity: &LocalIdentity, channel: RoomId, text: &str) -> Frame {
     let lamport = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -191,8 +288,10 @@ fn build_message_frame(sender: PeerId, channel: RoomId, text: &str) -> Frame {
         kind: FrameKind::Message,
         envelope: Envelope {
             event_id: EventId::new(),
-            sender,
-            sender_client: ClientId::new(),
+            sender: identity.peer_id,
+            // Stable ClientId from the persisted identity — multi-tab
+            // disambiguation, replay records cite this.
+            sender_client: identity.client_id,
             channel,
             target: MentionTarget::All,
             lamport,
@@ -200,8 +299,9 @@ fn build_message_frame(sender: PeerId, channel: RoomId, text: &str) -> Frame {
             reply_to: None,
             headers: Headers::new(),
             body: Some(Body::text(text)),
-            media: Vec::new(),
+            // SignedTransport replaces this with Ed25519 on the way out.
             signature: Signature::Unsigned,
+            media: Vec::new(),
         },
     }
 }
@@ -235,121 +335,6 @@ where
     }
 }
 
-/// `daemon` — run the long-lived daemon process on the given socket.
-pub async fn run_daemon(
-    identity_file: &Path,
-    peer_id: PeerId,
-    peers: Vec<PeerSpec>,
-    socket: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let keypair = load_or_generate(identity_file)?;
-    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
-
-    // Ensure the socket's parent directory exists; the daemon won't
-    // create it for the user.
-    if let Some(parent) = socket.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let state = Arc::new(DaemonState::new(
-        peer_id,
-        keypair,
-        registry,
-        VerificationPolicy::Strict,
-    ));
-    println!(
-        "airc-rs daemon: peer_id={peer_id} listening on {}",
-        socket.display()
-    );
-    run_daemon_server(state, socket).await?;
-    println!("airc-rs daemon: stopped.");
-    Ok(())
-}
-
-/// `ping` — RPC the daemon. Prints "pong" on success.
-pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DaemonClient::new(socket);
-    client.ping().await?;
-    println!("pong");
-    Ok(())
-}
-
-/// `status` — fetch daemon's health snapshot.
-pub async fn run_status(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DaemonClient::new(socket);
-    let status = client.status().await?;
-    println!("peer_id:        {}", status.peer_id);
-    println!("uptime_seconds: {}", status.uptime_seconds);
-    Ok(())
-}
-
-/// `stop` — ask the daemon to shut down gracefully.
-pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DaemonClient::new(socket);
-    client.stop().await?;
-    println!("daemon: stop requested.");
-    Ok(())
-}
-
-/// `inbox` — Subscribe-then-Inbox via the daemon. Prints any
-/// buffered frames newer than `since_lamport`. The first call for a
-/// wire kicks off the daemon's subscription; subsequent calls are
-/// pure reads.
-pub async fn run_inbox(
-    socket: PathBuf,
-    wire: PathBuf,
-    since_lamport: Option<u64>,
-    limit: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DaemonClient::new(socket);
-    // Idempotent — daemon ignores duplicate subscribes for the wire.
-    client
-        .subscribe(SubscribeRequest { wire: wire.clone() })
-        .await?;
-    let inbox = client
-        .inbox(InboxRequest {
-            wire,
-            since_lamport,
-            limit,
-        })
-        .await?;
-    if inbox.frames.is_empty() {
-        println!("(no new frames; newest_lamport={})", inbox.newest_lamport);
-        return Ok(());
-    }
-    for frame in &inbox.frames {
-        print_frame(frame);
-    }
-    println!();
-    println!(
-        "newest_lamport={} — pass as --since-lamport on the next call",
-        inbox.newest_lamport
-    );
-    Ok(())
-}
-
-/// `msg` — send via the daemon.
-pub async fn run_msg(
-    socket: PathBuf,
-    wire: PathBuf,
-    channel: &str,
-    text: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let channel_uuid = Uuid::from_str(channel)?;
-    let client = DaemonClient::new(socket);
-    client
-        .send(SendRequest {
-            wire,
-            channel: channel_uuid,
-            text: text.to_string(),
-        })
-        .await?;
-    println!("sent.");
-    Ok(())
-}
-
 fn print_frame(frame: &Frame) {
     let text = frame
         .envelope
@@ -364,3 +349,10 @@ fn print_frame(frame: &Frame) {
         channel = frame.envelope.channel,
     );
 }
+
+// Silence the unused-import warning for `ClientId`: it's used
+// transitively through `LocalIdentity::client_id` (which is the
+// `airc_core::ClientId` newtype) but not referenced by name in this
+// file. Keeping the import explicit keeps the dep graph readable.
+#[allow(dead_code)]
+fn _client_id_kept_in_scope(_: ClientId) {}
