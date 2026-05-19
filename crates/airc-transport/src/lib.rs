@@ -22,6 +22,7 @@
 pub mod error;
 pub mod lan_tcp;
 pub mod local_fs;
+pub mod signed;
 pub mod transport;
 
 // Re-exports — stable public surface.
@@ -32,4 +33,5 @@ pub use lan_tcp::{
     PinnedServerVerifier, TlsConfigError,
 };
 pub use local_fs::LocalFsAdapter;
+pub use signed::{SignedError, SignedTransport};
 pub use transport::{FrameStream, Transport};

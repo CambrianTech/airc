@@ -660,7 +660,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let channel = RoomId::from_u128(0xc0ffee);
-        let send_result = alice.send(frame_at(1, channel, "should never arrive")).await;
+        let send_result = alice
+            .send(frame_at(1, channel, "should never arrive"))
+            .await;
         assert!(
             matches!(send_result, Err(LanTcpError::NotConnected)),
             "Alice must have no installed connection after refusing stranger's handshake; got {send_result:?}"
