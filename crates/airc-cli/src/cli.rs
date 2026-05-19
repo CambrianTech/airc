@@ -218,6 +218,12 @@ pub enum Command {
 
     /// Print this runtime process's client id, if one can be derived.
     ClientId,
+
+    /// Convert a canonical UTC timestamp to Unix epoch seconds.
+    IsoToEpoch {
+        /// Timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.
+        timestamp: String,
+    },
 }
 
 #[derive(Debug, Args)]

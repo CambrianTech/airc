@@ -144,7 +144,7 @@ except Exception:
     pass
 ' 2>/dev/null || true)
   [ -z "$hb" ] && return 0
-  local hb_epoch; hb_epoch=$("$AIRC_PYTHON" -m airc_core.datetime iso_to_epoch "$hb" 2>/dev/null || true)
+  local hb_epoch; hb_epoch=$(iso_to_epoch "$hb")
   [ -z "$hb_epoch" ] && return 0
   local now_epoch; now_epoch=$(date -u +%s)
   echo $(( now_epoch - hb_epoch ))

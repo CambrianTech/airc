@@ -175,17 +175,12 @@ detect_platform() {
 # Convert an ISO 8601 UTC timestamp to a Unix epoch (seconds since 1970).
 # Echoes the epoch on success, empty on failure.
 #
-# Migrated to airc_core.datetime as Phase 0a of the Python truth-layer
-# (#152 architecture). Pre-migration this was a 3-fallback adapter
-# chain inline in bash (BSD date / GNU date / python3 heredoc).
-# Post-migration the bash function is a one-line call into the
-# Python module — same contract, same stdout shape, but the logic
-# lives in a testable Python file with no bash → python heredoc
-# substitution risk. First migration; pattern for the rest.
+# Runtime path is Rust-owned; invalid input keeps the legacy empty-output
+# contract for bash callers.
 iso_to_epoch() {
   local ts="${1:-}"
   [ -z "$ts" ] && return 0
-  "$AIRC_PYTHON" -m airc_core.datetime iso_to_epoch "$ts" 2>/dev/null
+  "$(airc_rs_bin)" iso-to-epoch "$ts" 2>/dev/null || true
 }
 
 # MSYS / Git Bash path conversion. Six callsites in airc + three in

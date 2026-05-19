@@ -244,6 +244,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{value}");
             Ok(())
         }
+
+        Command::IsoToEpoch { timestamp } => {
+            println!("{}", airc_core::iso_to_epoch(&timestamp)?);
+            Ok(())
+        }
     }
 }
 
