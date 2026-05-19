@@ -87,7 +87,7 @@ async fn install_and_spawn_loops<R, W>(
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_DEPTH);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_DEPTH);
     // Install synchronously — when this function returns, the
     // connection IS ready to receive sends.
     inner.connections.lock().await.insert(peer_id, outbound_tx);
@@ -138,20 +138,28 @@ where
     }
 }
 
-/// Write loop: drain the outbound channel, write framed bytes to TLS.
-async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Frame>)
+/// Write loop: drain the outbound channel, length-prefix the
+/// already-validated payload, write framed bytes to TLS.
+///
+/// The payload is pre-serialized and size-checked by
+/// `LanTcpAdapter::send` before it lands in the channel — by the
+/// time it reaches this loop the bytes are known-valid, so the
+/// only failure mode is a dead socket (which terminates the loop).
+/// No silent drops.
+async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Vec<u8>>)
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    while let Some(frame) = outbound_rx.recv().await {
-        let payload = match serde_json::to_vec(&frame) {
-            Ok(bytes) => bytes,
-            Err(_) => continue, // skip malformed frame
-        };
-        if payload.len() > MAX_FRAME_BYTES as usize {
-            // Drop oversized frames — caller should be lifting bodies.
-            continue;
-        }
+    while let Some(payload) = outbound_rx.recv().await {
+        // Defense-in-depth assertion: the sender already enforced
+        // this, but if a future regression bypasses pre-validation
+        // we'd rather fail loudly here than silently truncate.
+        debug_assert!(
+            payload.len() <= MAX_FRAME_BYTES as usize,
+            "write_loop received oversized payload ({} bytes, limit {})",
+            payload.len(),
+            MAX_FRAME_BYTES
+        );
         let len = (payload.len() as u32).to_be_bytes();
         if write_half.write_all(&len).await.is_err() {
             return;

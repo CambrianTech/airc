@@ -31,9 +31,15 @@ pub(super) const OUTBOUND_CHANNEL_DEPTH: usize = 256;
 /// Subscriber inbound channel depth — matches local-fs.
 pub(super) const SUBSCRIBER_CHANNEL_DEPTH: usize = 64;
 
-/// Active connection's sender half — write-task receives Frames from
-/// this and pushes them onto the TLS stream.
-pub(super) type OutboundTx = mpsc::Sender<Frame>;
+/// Active connection's sender half — write-task receives the
+/// serialized payload (no length prefix; the write loop adds it)
+/// from this and pushes the framed bytes onto the TLS stream.
+/// Carrying pre-validated bytes rather than `Frame` ensures
+/// `send()` can return synchronously if the frame is oversized or
+/// unserializable — no post-acceptance silent drops in the write
+/// loop. (Closes grievance §9 "Silent drop after acceptance is not
+/// acceptable" / Codex audit 2026-05-19.)
+pub(super) type OutboundTx = mpsc::Sender<Vec<u8>>;
 
 /// One subscriber's filtered inbound channel + matching predicate.
 pub(super) struct SubscriberHandle {

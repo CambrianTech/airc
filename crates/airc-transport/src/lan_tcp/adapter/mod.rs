@@ -54,7 +54,7 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    Inner, OutboundTx, SubscriberHandle, SUBSCRIBER_CHANNEL_DEPTH,
+    Inner, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
@@ -200,6 +200,19 @@ impl Transport for LanTcpAdapter {
     type Error = LanTcpError;
 
     async fn send(&self, frame: Frame) -> Result<(), Self::Error> {
+        // Pre-validate BEFORE enqueueing so any failure (serialize
+        // error, oversized payload) returns synchronously rather
+        // than being silently dropped by the write loop after the
+        // caller already saw Ok. Grievance §9: `send()` must mean
+        // something measurable.
+        let payload = serde_json::to_vec(&frame)?;
+        if payload.len() > MAX_FRAME_BYTES as usize {
+            return Err(LanTcpError::FrameTooLarge {
+                announced: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+
         // Snapshot under lock, drop, dispatch — never hold the
         // connections mutex across awaits.
         let targets: Vec<(PeerId, OutboundTx)> = {
@@ -220,7 +233,7 @@ impl Transport for LanTcpAdapter {
         let mut delivered_any = false;
         let mut last_error: Option<LanTcpError> = None;
         for (_peer, tx) in targets {
-            match tx.send(frame.clone()).await {
+            match tx.send(payload.clone()).await {
                 Ok(()) => delivered_any = true,
                 Err(_closed) => {
                     last_error = Some(LanTcpError::NoActivePeers);
@@ -503,5 +516,52 @@ mod tests {
         let channel = RoomId::from_u128(0xc0ffee);
         let result = alice.send(frame_at(1, channel, "into the void")).await;
         assert!(matches!(result, Err(LanTcpError::NoActivePeers)));
+    }
+
+    #[tokio::test]
+    async fn send_oversized_frame_returns_err_synchronously_without_dispatch() {
+        // The defensible proof for grievance §9 / "no post-acceptance
+        // silent drops": when the frame's serialized form exceeds the
+        // per-frame size cap, `send()` must surface `FrameTooLarge`
+        // *before* enqueueing — so the caller learns about the
+        // failure rather than seeing Ok and never observing the drop
+        // on the wire. The bob-side never receives the frame.
+        let (alice_id, alice, bob_id, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+
+        let mut bob_stream = bob.subscribe(Subscription::default()).await.unwrap();
+
+        // Build a frame whose serialized JSON is guaranteed past the
+        // 16 MiB cap: a 17 MiB ASCII body alone exceeds the limit.
+        let oversized_body = "a".repeat((MAX_FRAME_BYTES as usize) + 1024 * 1024);
+        let channel = RoomId::from_u128(0xc0ffee);
+        let huge_frame = frame_at(1, channel, &oversized_body);
+
+        let send_result = alice.send(huge_frame).await;
+        assert!(
+            matches!(
+                send_result,
+                Err(LanTcpError::FrameTooLarge { announced, limit })
+                    if announced > limit && limit == MAX_FRAME_BYTES
+            ),
+            "expected FrameTooLarge with announced > limit, got {send_result:?}"
+        );
+
+        // Cross-check: bob's subscriber must not see the frame
+        // (because send() rejected it before enqueueing). Give the
+        // network a generous tick to surface anything in flight.
+        let bob_saw = tokio::time::timeout(Duration::from_millis(200), bob_stream.next()).await;
+        assert!(
+            bob_saw.is_err(),
+            "bob must not have received an oversized frame on the wire — got {bob_saw:?}"
+        );
+
+        // peer_id parameter is otherwise unused but the assertion is
+        // here to make the test's intent obvious in the diff.
+        let _ = bob_id;
     }
 }
