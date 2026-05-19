@@ -413,6 +413,112 @@ In the doc as anchors; not all in the v1 ship:
 - `webrtc-data-channel` — direct browser ↔ desktop without TURN.
   Future plugin.
 
+## Identifiers — UUIDv4 everywhere
+
+Every internal identifier in airc-rust is a UUIDv4. EventId, IdentityId
+(formerly PeerId), ClientId, ChannelId, RoomId, FileId, LeaseId,
+SubscriptionId — all UUIDv4.
+
+This is non-negotiable for a P2P mesh substrate. The architecture
+requires:
+
+- **No central authority** — peers generate ids locally without
+  coordination. UUIDv4's random space (122 bits of entropy) gives
+  collision-free local generation across an unlimited number of
+  peers without a coordinator.
+- **Globally stable across the mesh** — a peer-generated UUIDv4 is
+  the same identifier every other peer sees, replay sees, audit log
+  sees. No re-keying when an envelope moves between transports.
+- **Cross-machine, cross-language interop** — UUIDv4 is a 32-char
+  hex string on the wire (or 16 binary bytes). Every language has a
+  parser; no custom encoding gotchas.
+- **Privacy friendly** — random ids leak no information about the
+  generator (no timestamp encoding, no MAC-derived bits, no counter).
+  Suitable for use across trust boundaries.
+
+Rust API: `uuid` crate, `Uuid::new_v4()` at generation, `Uuid` as the
+underlying type for newtype wrappers:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(pub Uuid);
+
+impl EventId {
+    pub fn new() -> Self { Self(Uuid::new_v4()) }
+}
+```
+
+Wire shape: serde encodes `Uuid` as the canonical hyphenated string
+(`"550e8400-e29b-41d4-a716-446655440000"`), so JSON envelopes stay
+human-readable and the legacy Python+bash airc can round-trip them.
+
+What this changes from the current airc-core (which uses
+`pub struct EventId(pub String);`): tighter typing at compile time
+(can't pass a random String where an EventId is expected), parse-on-
+ingest (a malformed id fails at envelope deserialization, not deep in
+the routing path), and a clear policy ("if you need an id, use
+Uuid::new_v4() — never invent one"). Wire stays compatible.
+
+**No alternative id schemes.** No timestamp-prefixed ids, no
+human-hash-derived ids (those stay for display nicks only), no
+content-addressed ids for events (those are for blobs only via
+ContentHash). Identifier discipline = UUIDv4 everywhere for the
+runtime, content-hash for blobs.
+
+**Names vs identity:** human-readable names (`#general`, `helper`,
+`foundry-mac`, `forge.work.offer`) remain throughout the system, but
+they are **mutable handles** on top of immutable UUIDv4 identity. A
+channel `#general` is displayed by name but referenced internally by
+its `ChannelId(Uuid)`. A peer `helper` is the same identity even after
+a `NICK` rename. Renaming a forge contract from `work.offer` to
+`work.bid` is a name-layer concern; the internal UUIDs that referenced
+it stay valid.
+
+#### The three-field identity model
+
+An airc Identity carries three load-bearing fields plus the rest of
+the display metadata:
+
+```
+identity_id : 9d8c4f7e-...      (UUIDv4 — substrate-stable, immutable)
+nick        : helper-ai          (mutable display name; can collide,
+                                  scoped by room)
+role        : persona            (kind classifier: human | persona |
+                                  agent | device | grid_node | bot)
+```
+
+Plus the existing pronouns / bio / status / fingerprint / integrations
+fields the Python+bash airc already had.
+
+The three fields are intentionally orthogonal:
+- `identity_id` is the **mesh-stable pointer** — every cross-machine
+  reference, lease, permission grant, audit log entry, and replay
+  record cites this. Never changes for the life of the identity.
+- `nick` is the **human-readable handle** — what appears in chat,
+  presence headers, @-mentions. Mutable; renames are normal; same-
+  nick collisions in a room are tolerable (the substrate disambiguates
+  via `identity_id`).
+- `role` is the **kind classifier** — consumers use this to render
+  appropriately (humans as chat bubbles, personas as avatars, devices
+  as system indicators, grid nodes as compute peers). Substrate
+  doesn't interpret role beyond passing it through.
+
+This is what lets humans use readable names while the mesh, replay
+logs, permissions, leases, and references stay stable.
+
+The full UUIDv4 application list (consumer + substrate):
+
+- identities (humans, personas, agents, devices, machines)
+- channels / activities / rooms
+- envelopes / events
+- blobs / manifests (blob content addressed by ContentHash; the
+  manifest handle is a UUIDv4)
+- sessions / calls (WebRTC + signaling correlation)
+- commands / tasks (RPC correlation across peers)
+- replay fixtures (consumer-side — continuum's persona-turn replays)
+- work leases (resource admission tied to a UUID lease handle)
+
 ## Names + identity (no env-var hacks)
 
 `get_nick` (Rust port of today's `get_name`) auto-derives based on
