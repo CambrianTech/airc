@@ -18,7 +18,7 @@ use crate::ids::{ClientId, EventId, PeerId, RoomId};
 
 /// The category of a transcript event. Different kinds may carry
 /// different optional fields on `TranscriptEvent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptKind {
     /// Conversational message body — the bulk of chat traffic.

@@ -188,6 +188,9 @@ pub enum Command {
     /// Manage the persisted peer registry (`<home>/peers.json`).
     Peer(PeerArgs),
 
+    /// Inspect persisted events through subscription-style filters.
+    Events(crate::events_cli::EventsArgs),
+
     /// Coordinate work cards over the current room's AIRC substrate.
     Work(WorkArgs),
 

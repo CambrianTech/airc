@@ -37,7 +37,7 @@ pub use error::AircError;
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
-pub use stream::{EventStream, LiveLag};
+pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
     CreateWorkLane, HeartbeatWorkspace, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
@@ -47,8 +47,10 @@ pub use work::{
 // Convenience re-exports so consumers don't need to pull airc-core
 // just to type the common return values.
 pub use airc_core::{
-    body::Body, headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
-    TranscriptCursor, TranscriptEvent,
+    body::Body,
+    headers::{HeaderFilter, Headers},
+    transcript::MentionTarget,
+    ClientId, EventId, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
 };
 pub use airc_work::{
     BoardSnapshot, BranchName, CardState, ClaimId, LaneId, LaneState, ManagerHat, Priority,

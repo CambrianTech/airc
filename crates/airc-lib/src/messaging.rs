@@ -4,7 +4,7 @@ use airc_transport::{LocalFsAdapter, Transport};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
-use crate::stream::EventStream;
+use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
@@ -83,6 +83,19 @@ impl Airc {
         })
     }
 
+    /// Subscribe to live events matching `filter`. If the filter does
+    /// not specify a channel, it is scoped to the current room.
+    pub async fn subscribe_filtered(
+        &self,
+        filter: EventFilter,
+    ) -> Result<FilteredEventStream, AircError> {
+        let filter = self.scope_filter_to_current_room(filter).await?;
+        Ok(FilteredEventStream {
+            inner: self.subscribe().await?,
+            filter,
+        })
+    }
+
     /// Fetch the most recent `limit` events from the current room.
     pub async fn page_recent(&self, limit: usize) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
@@ -92,6 +105,25 @@ impl Airc {
             .store
             .page_recent(Some(room.channel), limit)
             .await?)
+    }
+
+    /// Fetch recent events matching `filter`. If the filter does not
+    /// specify a channel, it is scoped to the current room.
+    pub async fn page_recent_filtered(
+        &self,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let filter = self.scope_filter_to_current_room(filter).await?;
+        self.ensure_current_room_subscriber().await?;
+        Ok(self
+            .inner
+            .store
+            .page_recent(filter.channel, limit)
+            .await?
+            .into_iter()
+            .filter(|event| filter.matches(event))
+            .collect())
     }
 
     /// Fetch up to `limit` events strictly after `cursor`.
@@ -108,6 +140,26 @@ impl Airc {
             .await?)
     }
 
+    /// Fetch events strictly after `cursor` that match `filter`. If
+    /// the filter does not specify a channel, it is scoped to the
+    /// current room.
+    pub async fn resume_from_filtered(
+        &self,
+        cursor: &TranscriptCursor,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let filter = self.scope_filter_to_current_room(filter).await?;
+        Ok(self
+            .inner
+            .store
+            .resume_from(cursor, filter.channel, limit)
+            .await?
+            .into_iter()
+            .filter(|event| filter.matches(event))
+            .collect())
+    }
+
     /// Cursor of the newest event in the current room.
     pub async fn latest_cursor(&self) -> Result<Option<TranscriptCursor>, AircError> {
         let room = self.current_room().await?;
@@ -117,5 +169,20 @@ impl Airc {
     /// Append a `TranscriptEvent` to the durable store directly.
     pub async fn append_event(&self, event: TranscriptEvent) -> Result<(), AircError> {
         Ok(self.inner.store.append(event).await?)
+    }
+
+    async fn scope_filter_to_current_room(
+        &self,
+        mut filter: EventFilter,
+    ) -> Result<EventFilter, AircError> {
+        if filter.channel.is_none() {
+            filter.channel = Some(self.current_room().await?.channel);
+        }
+        Ok(filter)
+    }
+
+    async fn ensure_current_room_subscriber(&self) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        self.ensure_wire_subscriber(&room.wire).await
     }
 }

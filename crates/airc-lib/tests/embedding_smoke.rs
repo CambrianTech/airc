@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use airc_lib::{Airc, Body, Headers, PeerSpec};
+use airc_lib::{Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, TranscriptKind};
 use futures::stream::StreamExt;
 use tempfile::TempDir;
 
@@ -179,5 +179,37 @@ async fn send_typed_body_with_headers_round_trips() {
     assert_eq!(
         page[0].headers.get("forge.body_hint").map(String::as_str),
         Some("application/json")
+    );
+}
+
+#[tokio::test]
+async fn filtered_event_queries_match_kind_and_headers_without_body_parse() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("filtered-events").await.unwrap();
+
+    let mut headers = Headers::new();
+    headers.insert(
+        "forge.body_hint".to_string(),
+        "forge.persona.turn".to_string(),
+    );
+    headers.insert("continuum.activity".to_string(), "general".to_string());
+    airc.send(Body::text("persona turn payload"), headers)
+        .await
+        .unwrap();
+    airc.say("plain chat").await.unwrap();
+
+    let mut filter = EventFilter::current_room();
+    filter.kinds.insert(TranscriptKind::Message);
+    filter.headers_filter = HeaderFilter::Prefix {
+        key: "forge.body_hint".to_string(),
+        value_prefix: "forge.persona.".to_string(),
+    };
+
+    let matches = airc.page_recent_filtered(filter, 32).await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0].body.as_ref().and_then(Body::as_text),
+        Some("persona turn payload")
     );
 }
