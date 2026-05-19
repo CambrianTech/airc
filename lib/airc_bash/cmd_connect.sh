@@ -187,7 +187,7 @@ _join_show_status_and_inbox() {
 _join_transport_health_ok() {
   [ -f "$CONFIG" ] || return 1
   local _channels
-  _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  _channels=$("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || true)
   # Legacy/no-room mode has no gist bearer to heartbeat. If the caller
   # already proved the scope owner is alive, transport_health has no
   # channel rows to evaluate and must not force a duplicate restart.

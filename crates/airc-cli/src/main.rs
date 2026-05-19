@@ -21,6 +21,8 @@ mod codex_hooks_json;
 mod codex_install;
 mod codex_start;
 mod commands;
+mod config_cli;
+mod config_commands;
 mod events_cli;
 mod events_commands;
 mod gist_cli;
@@ -50,6 +52,7 @@ use airc_core::PeerId;
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
+use config_cli::ConfigAction;
 use events_cli::EventsAction;
 use gist_cli::GistAction;
 use lane_cli::{LaneAction, LaneManagerAction};
@@ -86,6 +89,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Init => commands::run_init(&home).await,
 
         Command::BearerState { path } => bearer_state::run(&path),
+
+        Command::Config(args) => match args.action {
+            ConfigAction::ReadChannels { config } => {
+                config_commands::run_read_channels(&home, config)
+            }
+        },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
 

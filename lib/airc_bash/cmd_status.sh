@@ -64,7 +64,7 @@ cmd_status() {
   # is config.json's subscribed_channels; first element is the default
   # channel that cmd_send stamps. Display the list with a marker for
   # the default.
-  local _channels; _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null)
+  local _channels; _channels=$("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
   if [ -n "$_channels" ]; then
     local _default; _default=$(echo "$_channels" | head -1)
     local _rest; _rest=$(echo "$_channels" | tail -n +2 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, #/g')
