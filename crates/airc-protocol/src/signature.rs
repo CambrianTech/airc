@@ -5,20 +5,26 @@
 //! variant — production secure mode (`VerificationPolicy::Strict`) MUST
 //! refuse unsigned frames. Dev mode (`VerificationPolicy::AllowUnsigned`)
 //! permits `Unsigned` so the substrate is testable end-to-end before
-//! keypairs are plumbed (transport / bridge work lands in PR-2/3).
+//! every adapter is keyed.
 //!
-//! Ed25519 byte-level signing/verification is not wired in this PR — the
-//! crypto plumbing is its own side-quest (key generation, key-rotation,
-//! key registry persistence) and lands once the transport adapter exists.
-//! In the meantime: a `Signature::Ed25519` frame submitted under `Strict`
-//! returns `UnknownSigner` until the registry is populated, which is the
-//! correct fail-closed behavior. This file pins the contract; PR-3
-//! supplies the bytes.
+//! PR-3a wired real Ed25519 verification via `ed25519-dalek`. The verify
+//! path:
+//!   1. Structural validation (reply_to consistency).
+//!   2. Policy dispatch on `Signature` variant.
+//!   3. For `Ed25519`: registry lookup (UnknownSigner if missing),
+//!      canonical CBOR encoding, byte-level signature verification.
+//!
+//! No silent passes, no "try secure then plaintext" fallback. Strict
+//! policy fails closed on every failure mode.
+//!
+//! See `keypair` module for the send side (`PeerKeypair`).
 
+use ed25519_dalek::{Signature as Ed25519Sig, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 
+use crate::canonical::canonical_signed_bytes;
 use crate::envelope::{Envelope, Frame};
 use crate::headers_keys::HEADER_AIRC_REPLY_TO;
 
@@ -58,17 +64,45 @@ pub enum VerificationPolicy {
     AllowUnsigned,
 }
 
-/// Registry of which `PeerId`s have which public keys. Populated by the
-/// bridge / pairing layer (PR-3+). PR-1 ships an empty-by-default
-/// implementation so `Strict` verification of `Ed25519` frames fails
-/// closed with `UnknownSigner` rather than silently passing.
+/// Why enroling a key might fail.
+#[derive(Debug)]
+pub enum KeyError {
+    /// 32-byte pubkey didn't decode as a valid Ed25519 point. Caller
+    /// passed garbage or a key from a different curve.
+    InvalidPublicKey(ed25519_dalek::SignatureError),
+}
+
+impl std::fmt::Display for KeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyError::InvalidPublicKey(error) => {
+                write!(f, "invalid Ed25519 public key: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            KeyError::InvalidPublicKey(error) => Some(error),
+        }
+    }
+}
+
+/// Registry of which `PeerId`s have which public keys.
+///
+/// Storage is parsed `VerifyingKey` rather than raw bytes, so verify
+/// doesn't re-parse on every frame (per-frame parsing would burn a
+/// noticeable fraction of the verify budget). `enrol` validates the
+/// bytes once at enrolment time.
 #[derive(Debug, Default, Clone)]
 pub struct PeerKeyRegistry {
     // HashMap rather than BTreeMap — PeerId is a UUIDv4 newtype which
     // derives Hash+Eq but not Ord. The registry isn't serialized or
     // iterated for canonical output, so non-deterministic key order is
     // harmless here.
-    keys: std::collections::HashMap<(PeerId, u32), [u8; 32]>,
+    keys: std::collections::HashMap<(PeerId, u32), VerifyingKey>,
 }
 
 impl PeerKeyRegistry {
@@ -78,14 +112,20 @@ impl PeerKeyRegistry {
         }
     }
 
-    /// Enrol a peer's public key (32 bytes for Ed25519). `key_id` allows
-    /// the same peer to have multiple keys for rotation.
-    pub fn enrol(&mut self, peer: PeerId, key_id: u32, pubkey: [u8; 32]) {
-        self.keys.insert((peer, key_id), pubkey);
+    /// Enrol a peer's public key (32 bytes for Ed25519). `key_id`
+    /// allows the same peer to have multiple keys for rotation.
+    /// Returns `KeyError::InvalidPublicKey` if the bytes don't
+    /// decode as a valid Ed25519 point — substrate refuses garbage
+    /// at enrolment rather than at verify time.
+    pub fn enrol(&mut self, peer: PeerId, key_id: u32, pubkey: [u8; 32]) -> Result<(), KeyError> {
+        let verifying_key =
+            VerifyingKey::from_bytes(&pubkey).map_err(KeyError::InvalidPublicKey)?;
+        self.keys.insert((peer, key_id), verifying_key);
+        Ok(())
     }
 
-    /// Look up a pubkey for verification.
-    pub fn lookup(&self, peer: PeerId, key_id: u32) -> Option<&[u8; 32]> {
+    /// Look up a parsed `VerifyingKey` for verification.
+    pub fn lookup(&self, peer: PeerId, key_id: u32) -> Option<&VerifyingKey> {
         self.keys.get(&(peer, key_id))
     }
 }
@@ -99,10 +139,10 @@ pub enum VerificationError {
     /// `Signature::Ed25519` signer is not in the registry.
     UnknownSigner(PeerId),
 
-    /// Cryptographic verification failed. (PR-3 wires the actual check;
-    /// PR-1 returns this only when the registry has a key AND the
-    /// envelope's canonical encoding fails to match — wired so the
-    /// failure mode exists end-to-end.)
+    /// Cryptographic verification failed — the canonical bytes did
+    /// not verify against the enrolled `VerifyingKey`. Indicates
+    /// tampering, replay with mutated content, or use of the wrong
+    /// key. PR-3a wired this to real Ed25519; PR-1 had it stubbed.
     BadSignature,
 
     /// `Envelope.reply_to` and `headers["airc.reply_to"]` are both set
@@ -163,24 +203,45 @@ pub fn verify(
             VerificationPolicy::Strict => Err(VerificationError::MissingSignature),
             VerificationPolicy::AllowUnsigned => Ok(()),
         },
-        Signature::Ed25519 { signer, key_id, .. } => {
-            // Registry lookup. Missing key → fail closed (UnknownSigner).
-            // This is the path that returns the right error even before
-            // the Ed25519 byte-level check is wired.
-            if registry.lookup(*signer, *key_id).is_none() {
-                return Err(VerificationError::UnknownSigner(*signer));
-            }
-            // PR-3 wires the actual cryptographic verification here:
-            //   1. canonical_encode(envelope-minus-sig) -> bytes
-            //   2. ed25519_dalek::PublicKey::verify(bytes, sig)
-            //   3. Err(BadSignature) on mismatch
-            //
-            // PR-1 reaches this point only when the registry was
-            // populated, which doesn't happen in PR-1's call sites.
-            // Strict + Ed25519 + empty registry = UnknownSigner (above).
-            Ok(())
-        }
+        Signature::Ed25519 {
+            signer,
+            key_id,
+            sig,
+        } => verify_ed25519(&frame.envelope, *signer, *key_id, sig, registry),
     }
+}
+
+/// Crypto-level verification for an Ed25519-signed envelope. Splits
+/// out the lookup + canonical-encode + ed25519 verify steps so the
+/// dispatcher in `verify` stays a clean policy match.
+///
+/// Steps:
+///   1. Look up `(signer, key_id)` in the registry — `None` →
+///      `UnknownSigner` (fail-closed).
+///   2. Canonical-encode the envelope (everything except signature).
+///   3. Ed25519-verify the 64-byte signature over those bytes.
+fn verify_ed25519(
+    envelope: &Envelope,
+    signer: PeerId,
+    key_id: u32,
+    sig_bytes: &[u8; 64],
+    registry: &PeerKeyRegistry,
+) -> Result<(), VerificationError> {
+    let verifying_key = registry
+        .lookup(signer, key_id)
+        .ok_or(VerificationError::UnknownSigner(signer))?;
+
+    let canonical =
+        canonical_signed_bytes(envelope).map_err(|_| VerificationError::CanonicalEncodingFailed)?;
+
+    // `Ed25519Sig::from_bytes` cannot fail for a 64-byte array (the
+    // newer dalek API is infallible-by-length). Any "this is not a
+    // valid signature" comes out of `verify` itself.
+    let signature = Ed25519Sig::from_bytes(sig_bytes);
+
+    verifying_key
+        .verify(&canonical, &signature)
+        .map_err(|_| VerificationError::BadSignature)
 }
 
 /// Internal: enforce that the structured `reply_to` and the optional
@@ -319,24 +380,28 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_with_registered_signer_passes_pr1_stub() {
-        // PR-1's verify reaches Ok(()) when the registry has the key.
-        // PR-3 wires the actual ed25519_dalek check here; this test
-        // pins the contract so the regression surfaces if anyone
-        // weakens it (e.g. early-returning Ok before crypto).
+    fn ed25519_with_garbage_signature_fails_bad_signature() {
+        // PR-3a wired real Ed25519. An all-zero 64-byte signature
+        // can't possibly verify against a real enrolled pubkey —
+        // pin BadSignature as the resulting error. (PR-1 had a stub
+        // that early-returned Ok here; this test replaces that stub
+        // assertion with the correct fail-closed behavior.)
+        use crate::keypair::PeerKeypair;
         let signer = PeerId::from_u128(0xa1);
+        let real_keypair = PeerKeypair::generate();
         let mut registry = PeerKeyRegistry::new();
-        registry.enrol(signer, 0, [0u8; 32]);
+        registry
+            .enrol(signer, 0, real_keypair.public_bytes())
+            .unwrap();
         let frame = frame_with(Signature::Ed25519 {
             signer,
             key_id: 0,
             sig: [0u8; 64],
         });
-        // NOTE: this passes in PR-1 because the byte-level check isn't
-        // wired yet. In PR-3 the all-zero key + all-zero sig will fail
-        // BadSignature, which will be the desired stronger contract.
-        // The test name flags this is the PR-1 stub.
-        assert!(verify(&frame, VerificationPolicy::Strict, &registry).is_ok());
+        assert_eq!(
+            verify(&frame, VerificationPolicy::Strict, &registry),
+            Err(VerificationError::BadSignature)
+        );
     }
 
     #[test]
