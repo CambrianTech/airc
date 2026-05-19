@@ -1497,12 +1497,12 @@ _monitor_multi_channel() {
         local ch="$1" gid="$2"
         [ -z "$ch" ] && return 0
         [ -z "$gid" ] && return 0
-        # bearer_cli recv stderr → per-channel log file (CLAUDE.md
+        # airc-rs bearer recv stderr → per-channel log file (CLAUDE.md
         # "never swallow errors"). The previous 2>/dev/null hid every
         # transient gh failure, leaving "monitor's fine but no events"
         # undebuggable. Append-mode so a tail of the log shows the
         # actual cause when a channel dies.
-        "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+        "$(airc_rs_bin)" bearer recv "self" \
           --room-gist-id "$gid" \
           --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
           --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
@@ -1576,7 +1576,7 @@ _monitor_multi_channel() {
             gid=$(airc_config_list_channel_gists "$CONFIG" | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
             if [ -n "$gid" ]; then
               sleep 3
-              "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+              "$(airc_rs_bin)" bearer recv "self" \
                 --room-gist-id "$gid" \
                 --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
                 --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
@@ -1758,7 +1758,7 @@ monitor() {
     local consecutive_timeouts=0
     local ESCALATE_AFTER=4
     while true; do
-      "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+      "$(airc_rs_bin)" bearer recv "self" \
         --room-gist-id "$room_gist_id" \
         --offset-file "$offset_file" \
         --state-file "$AIRC_WRITE_DIR/bearer_state.json" \
@@ -2541,18 +2541,18 @@ EOF
     # Force a bearer respawn so the new gist takes effect immediately.
     # _monitor_multi_channel re-reads channel_map at the top of each
     # outer cycle (companion change in this PR), so killing the
-    # bearer_cli children triggers respawn against the freshly-updated
+    # bearer recv children triggers respawn against the freshly-updated
     # config.
     #
-    # SCOPE-SAFE pkill (Copilot review #422 caught this): bearer_cli
+    # SCOPE-SAFE pkill (Copilot review #422 caught this): bearer recv
     # processes from OTHER scopes (different AIRC_HOME) on the same
-    # machine match a bare 'airc_core.bearer_cli recv' pattern. Each
-    # bearer_cli is launched with `--state-file $AIRC_WRITE_DIR/...`
+    # machine match a bare recv pattern. Each bearer recv is launched
+    # with `--state-file $AIRC_WRITE_DIR/...`
     # so AIRC_WRITE_DIR appears uniquely in this scope's process
     # command lines. Match on that to scope the kill to OUR children
     # only — multi-scope safety, same principle as cmd_teardown's
     # scope-isolation guarantee.
-    pkill -f "airc_core.bearer_cli recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
+    pkill -f "airc-rs bearer recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
   done
 }
 

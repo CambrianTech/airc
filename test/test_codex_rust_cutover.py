@@ -292,6 +292,13 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" bearer send ', combined)
         self.assertIn('"$(airc_rs_bin)" bearer send-batch', combined)
 
+    def test_bearer_recv_paths_use_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.bearer_cli recv", source)
+        self.assertIn('"$(airc_rs_bin)" bearer recv "self"', source)
+        self.assertIn('pkill -f "airc-rs bearer recv.*${AIRC_WRITE_DIR}"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
