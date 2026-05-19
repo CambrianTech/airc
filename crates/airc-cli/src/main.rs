@@ -14,6 +14,9 @@
 mod cli;
 mod codex_cli;
 mod codex_commands;
+mod codex_config;
+mod codex_hooks_json;
+mod codex_install;
 mod commands;
 mod events_cli;
 mod events_commands;
@@ -135,6 +138,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::CodexHook(args) => match args.action {
+            CodexHookAction::InstallHooks { codex_home } => {
+                codex_install::run_install_hooks(codex_home).await
+            }
+            CodexHookAction::UninstallHooks { codex_home } => {
+                codex_install::run_uninstall_hooks(codex_home).await
+            }
             CodexHookAction::UserPromptSubmit {
                 cursor_file,
                 count,
