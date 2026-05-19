@@ -75,33 +75,24 @@ pub enum Command {
     /// peer_id.
     Init,
 
-    /// Send a single text Message frame and exit.
+    /// Send a single text Message frame to the current room and exit.
+    /// The current room lives in `<home>/room.json`; switch with
+    /// `airc-rs room <name>`.
     Send {
-        /// Wire directory (must be the same as the receiver's).
-        #[arg(long)]
-        wire: PathBuf,
-        /// Channel UUID (any unique value shared with the receiver).
-        #[arg(long, value_name = "UUID")]
-        channel: String,
         /// Message body.
         text: String,
     },
 
-    /// Subscribe and print frames until interrupted (Ctrl-C).
+    /// Subscribe to the current room and print frames until
+    /// interrupted (Ctrl-C).
     Listen {
-        /// Wire directory.
-        #[arg(long)]
-        wire: PathBuf,
-        /// Channel filter (optional). If omitted, all channels.
-        #[arg(long, value_name = "UUID")]
-        channel: Option<String>,
         /// Replay from the start of the wire instead of live-only.
         #[arg(long)]
         replay: bool,
     },
 
     /// Same-LAN secure send: dial a peer over TLS and send a single
-    /// text frame.
+    /// text frame to the current room's channel.
     LanSend {
         /// Address of the listening peer (e.g. `127.0.0.1:7474`).
         #[arg(long)]
@@ -109,9 +100,6 @@ pub enum Command {
         /// UUID of the listening peer (for cert pinning).
         #[arg(long)]
         expected_peer: String,
-        /// Channel UUID.
-        #[arg(long)]
-        channel: String,
         /// Message body.
         text: String,
     },
@@ -154,34 +142,39 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// Send a text message via the running daemon (fast — no
-    /// per-call substrate setup).
+    /// Send a text message to the current room via the running
+    /// daemon (fast — no per-call substrate setup).
     Msg {
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Wire directory the daemon should write to.
-        #[arg(long)]
-        wire: PathBuf,
-        /// Channel UUID.
-        #[arg(long)]
-        channel: String,
         /// Message body.
         text: String,
     },
 
-    /// Pull buffered frames from the daemon's inbox for a wire.
-    /// On first call for a wire, the daemon starts subscribing
-    /// (idempotent). Pass `--since-lamport` for consume-once cursor.
+    /// Pull buffered frames from the daemon's inbox for the current
+    /// room's wire.
     Inbox {
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Wire directory.
-        #[arg(long)]
-        wire: PathBuf,
         #[arg(long)]
         since_lamport: Option<u64>,
         #[arg(long)]
         limit: Option<usize>,
+    },
+
+    /// Print or switch the current room. With no name, prints the
+    /// current room's name + wire + channel. With a name, derives a
+    /// deterministic `(wire, channel)` from the name and sets it as
+    /// the current room — two peers who run `airc-rs room project-x`
+    /// land in the same channel without sharing the UUID.
+    Room {
+        /// Room name. Omit to just print the current room.
+        name: Option<String>,
+        /// Override the default wire path (`<home>/wires/<name>/`).
+        /// Use for shared-wire setups (e.g. local-fs tests where two
+        /// processes need to read/write the same dir).
+        #[arg(long)]
+        wire: Option<PathBuf>,
     },
 
     /// Manage the persisted peer registry (`<home>/peers.json`).

@@ -18,6 +18,7 @@ mod identity;
 mod ipc;
 mod peers_store;
 mod registry;
+mod room;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -57,42 +58,24 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match parsed.command {
         Command::Init => commands::run_init(&home),
 
-        Command::Send {
-            wire,
-            channel,
-            text,
-        } => {
+        Command::Send { text } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_send(&home, &identity, parsed.peers, &wire, &channel, &text).await
+            commands::run_send(&home, &identity, parsed.peers, &text).await
         }
 
-        Command::Listen {
-            wire,
-            channel,
-            replay,
-        } => {
+        Command::Listen { replay } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_listen(&home, &identity, parsed.peers, &wire, channel, replay).await
+            commands::run_listen(&home, &identity, parsed.peers, replay).await
         }
 
         Command::LanSend {
             to,
             expected_peer,
-            channel,
             text,
         } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
             let expected = parse_peer_id(&expected_peer)?;
-            commands::run_lan_send(
-                &home,
-                &identity,
-                parsed.peers,
-                to,
-                expected,
-                &channel,
-                &text,
-            )
-            .await
+            commands::run_lan_send(&home, &identity, parsed.peers, to, expected, &text).await
         }
 
         Command::LanListen { bind, replay } => {
@@ -110,19 +93,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { socket } => commands::run_status(default_or(socket, &home)).await,
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
-        Command::Msg {
-            socket,
-            wire,
-            channel,
-            text,
-        } => commands::run_msg(default_or(socket, &home), wire, &channel, &text).await,
+        Command::Msg { socket, text } => {
+            commands::run_msg(&home, default_or(socket, &home), &text).await
+        }
 
         Command::Inbox {
             socket,
-            wire,
             since_lamport,
             limit,
-        } => commands::run_inbox(default_or(socket, &home), wire, since_lamport, limit).await,
+        } => commands::run_inbox(&home, default_or(socket, &home), since_lamport, limit).await,
+
+        Command::Room { name, wire } => commands::run_room(&home, name, wire),
 
         Command::Peer(args) => match args.action {
             PeerAction::Add { spec, socket } => {

@@ -60,7 +60,12 @@ fn two_airc_rs_processes_chat_over_local_fs() {
     let (_alice_id, alice_spec) = run_init(&alice_home);
     let (_bob_id, bob_spec) = run_init(&bob_home);
 
-    let channel = "11111111-2222-3333-4444-555555555555";
+    // Both peers join the same room name — same channel UUID — and
+    // override the wire to a shared dir so two local-fs processes
+    // can talk. In production each peer has its own wire and uses
+    // LAN-TCP / daemon, not a shared filesystem.
+    run_room(&alice_home, "e2e", &wire);
+    run_room(&bob_home, "e2e", &wire);
 
     let mut alice = Command::new(airc_rs())
         .args([
@@ -69,10 +74,6 @@ fn two_airc_rs_processes_chat_over_local_fs() {
             "--peer",
             &bob_spec,
             "listen",
-            "--wire",
-            wire.to_str().unwrap(),
-            "--channel",
-            channel,
             "--replay",
         ])
         .stdout(Stdio::piped())
@@ -89,10 +90,6 @@ fn two_airc_rs_processes_chat_over_local_fs() {
             "--peer",
             &alice_spec,
             "send",
-            "--wire",
-            wire.to_str().unwrap(),
-            "--channel",
-            channel,
             "hello from bob over rust substrate",
         ])
         .output()
@@ -119,6 +116,27 @@ fn two_airc_rs_processes_chat_over_local_fs() {
     );
 }
 
+/// Run `airc-rs --home <dir> room <name> --wire <wire>`. Used by
+/// tests to pin two peers to the same shared-wire room.
+fn run_room(home: &Path, name: &str, wire: &Path) {
+    let output = Command::new(airc_rs())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "room",
+            name,
+            "--wire",
+            wire.to_str().unwrap(),
+        ])
+        .output()
+        .expect("airc-rs room must spawn");
+    assert!(
+        output.status.success(),
+        "room setup failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn listen_rejects_unenrolled_signer() {
     // Mallory's signed frame must be rejected by Alice's listen — she
@@ -132,20 +150,13 @@ fn listen_rejects_unenrolled_signer() {
     let (_alice_id, _alice_spec) = run_init(&alice_home);
     let (_mallory_id, mallory_spec) = run_init(&mallory_home);
 
-    let channel = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    // Both peers share the same wire / room name. Alice's peer
+    // registry deliberately does NOT include Mallory.
+    run_room(&alice_home, "e2e", &wire);
+    run_room(&mallory_home, "e2e", &wire);
 
-    // Alice's peer list does NOT include Mallory.
     let mut alice = Command::new(airc_rs())
-        .args([
-            "--home",
-            alice_home.to_str().unwrap(),
-            "listen",
-            "--wire",
-            wire.to_str().unwrap(),
-            "--channel",
-            channel,
-            "--replay",
-        ])
+        .args(["--home", alice_home.to_str().unwrap(), "listen", "--replay"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -162,10 +173,6 @@ fn listen_rejects_unenrolled_signer() {
             "--peer",
             &mallory_spec,
             "send",
-            "--wire",
-            wire.to_str().unwrap(),
-            "--channel",
-            channel,
             "should be rejected",
         ])
         .output()
