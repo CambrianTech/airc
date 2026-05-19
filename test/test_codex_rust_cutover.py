@@ -182,6 +182,33 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 <<", body)
         self.assertIn('"$(airc_rs_bin)" identity pretty', body)
 
+    def test_message_crypto_helpers_use_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "airc",
+                REPO / "lib/airc_bash/cmd_send.sh",
+                REPO / "lib/airc_bash/cmd_connect.sh",
+            ]
+        )
+
+        forbidden = [
+            "airc_core.identity sign-ed25519",
+            "airc_core.identity bootstrap-ed25519",
+            "airc_core.identity bootstrap --dir",
+            "airc_core.identity peer_pub",
+            "airc_core.envelope wrap",
+            "json.load(sys.stdin).get(\"kind\"",
+        ]
+        for needle in forbidden:
+            self.assertNotIn(needle, combined)
+
+        self.assertIn('"$(airc_rs_bin)" identity sign-ed25519', combined)
+        self.assertIn('"$(airc_rs_bin)" identity bootstrap-ed25519', combined)
+        self.assertIn('"$(airc_rs_bin)" identity peer-pub', combined)
+        self.assertIn('"$(airc_rs_bin)" envelope wrap', combined)
+        self.assertIn('"$(airc_rs_bin)" gist get .kind', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

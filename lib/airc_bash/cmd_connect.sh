@@ -1710,7 +1710,7 @@ cmd_connect() {
     # bootstrap is idempotent (no-ops if keypair exists). Empty value
     # if cryptography isn't installed — handshake stays compatible
     # with peers running pre-Phase-E airc.
-    my_x25519_pub=$("$AIRC_PYTHON" -m airc_core.identity bootstrap --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
+    my_x25519_pub=$("$(airc_rs_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).

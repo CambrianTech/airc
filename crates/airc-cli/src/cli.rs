@@ -18,6 +18,7 @@ use airc_lib::PeerSpec;
 
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
+use crate::envelope_cli::EnvelopeArgs;
 use crate::gist_cli::GistArgs;
 use crate::identity_cli::IdentityArgs;
 use crate::route_cli::RouteArgs;
@@ -94,6 +95,9 @@ pub enum Command {
 
     /// Identity and whois helpers during Rust cutover.
     Identity(IdentityArgs),
+
+    /// Legacy envelope encryption helpers during Rust cutover.
+    Envelope(EnvelopeArgs),
 
     /// Send a single text Message frame to the current room and exit.
     /// The current room lives in `<home>/room.json`; switch with

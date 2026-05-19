@@ -24,6 +24,7 @@ mod commands;
 mod config_cli;
 mod config_commands;
 mod daemon_scope;
+mod envelope_cli;
 mod events_cli;
 mod events_commands;
 mod gist_cli;
@@ -32,6 +33,8 @@ mod identity_cli;
 mod identity_commands;
 mod lane_cli;
 mod lane_commands;
+mod legacy_envelope;
+mod legacy_identity;
 mod log_cli;
 mod log_commands;
 mod route_cli;
@@ -56,6 +59,7 @@ use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
 use config_cli::ConfigAction;
+use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
 use gist_cli::GistAction;
 use identity_cli::IdentityAction;
@@ -163,11 +167,38 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Identity(args) => match args.action {
+            IdentityAction::Bootstrap { identity_dir } => {
+                println!("{}", legacy_identity::bootstrap_x25519(&identity_dir)?);
+                Ok(())
+            }
+            IdentityAction::BootstrapEd25519 { identity_dir } => {
+                legacy_identity::bootstrap_ed25519(&identity_dir)
+            }
+            IdentityAction::PeerPub {
+                peers_dir,
+                peer_name,
+            } => {
+                if let Some(pubkey) = legacy_identity::peer_pub(&peers_dir, &peer_name)? {
+                    println!("{pubkey}");
+                }
+                Ok(())
+            }
+            IdentityAction::SignEd25519 { identity_dir } => {
+                println!("{}", legacy_identity::sign_ed25519_stdin(&identity_dir)?);
+                Ok(())
+            }
             IdentityAction::Pretty {
                 name,
                 identity_json,
                 host,
             } => identity_commands::run_pretty(&name, &identity_json, &host),
+        },
+
+        Command::Envelope(args) => match args.action {
+            EnvelopeAction::Wrap {
+                recipient_pub,
+                identity_dir,
+            } => legacy_envelope::wrap_stdin(&recipient_pub, &identity_dir),
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
