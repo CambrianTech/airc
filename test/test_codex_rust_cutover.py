@@ -60,6 +60,8 @@ class CodexRustCutoverTests(unittest.TestCase):
 
     def test_runtime_identity_helpers_use_airc_rs(self):
         source = (REPO / "airc").read_text(encoding="utf-8")
+        resolver_start = source.index("airc_rs_bin()")
+        resolver_end = source.index("airc_client_id()", resolver_start)
         client_start = source.index("airc_client_id()")
         client_end = source.index("get_config_val_in()", client_start)
         human_start = source.index("humanhash()")
@@ -69,6 +71,10 @@ class CodexRustCutoverTests(unittest.TestCase):
 
         self.assertNotIn("airc_core.client_id", body)
         self.assertNotIn("airc_core.humanhash", body)
+        self.assertLess(
+            source.index('"$_root/target/debug/airc-rs"', resolver_start, resolver_end),
+            source.index("command -v airc-rs", resolver_start, resolver_end),
+        )
         self.assertIn('"$(airc_rs_bin)" client-id', body)
         self.assertIn('"$(airc_rs_bin)" humanhash "$input"', body)
 
@@ -95,6 +101,15 @@ class CodexRustCutoverTests(unittest.TestCase):
 
         self.assertNotIn("airc_core.bearer_state", source)
         self.assertIn('"$(airc_rs_bin)" bearer-state "$state_file"', source)
+
+    def test_logs_render_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
+        start = source.index("cmd_logs()")
+        end = source.index("cmd_inbox()", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.logs", body)
+        self.assertIn('"$(airc_rs_bin)" log "$@"', body)
 
 
 if __name__ == "__main__":

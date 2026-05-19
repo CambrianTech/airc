@@ -5,9 +5,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 const LOCK_STALE: Duration = Duration::from_secs(30);
@@ -27,6 +28,19 @@ pub fn run_append(path: &Path) -> Result<(), Box<dyn Error>> {
 
 pub fn run_rotate(path: &Path, max_lines: usize, keep_lines: usize) -> Result<(), Box<dyn Error>> {
     rotate_if_needed(path, max_lines, keep_lines)?;
+    Ok(())
+}
+
+pub fn run_render(since: &str, count: usize, json_output: bool) -> Result<(), Box<dyn Error>> {
+    let since_epoch = parse_since(since)?;
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let events = events_from_lines(input.lines(), since_epoch);
+    if json_output {
+        println!("{}", render_json(&events, since, count)?);
+    } else {
+        print!("{}", render_human(&events));
+    }
     Ok(())
 }
 
@@ -160,6 +174,146 @@ fn temp_path_for(path: &Path) -> PathBuf {
         std::process::id(),
         Uuid::new_v4()
     ))
+}
+
+fn parse_since(value: &str) -> Result<Option<i64>, Box<dyn Error>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Some((amount, unit)) = parse_relative_since(value) {
+        let now = epoch_now();
+        let window = amount
+            .checked_mul(unit)
+            .ok_or("airc logs --since: relative window is too large")?;
+        return Ok(Some(now - window));
+    }
+    airc_core::iso_to_epoch(value).map(Some).map_err(|_| {
+        format!("airc logs --since: cannot parse '{value}' (use ISO timestamp or 60s/5m/1h/2d)")
+            .into()
+    })
+}
+
+fn parse_relative_since(value: &str) -> Option<(i64, i64)> {
+    let unit = match value.as_bytes().last().copied()? {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        _ => return None,
+    };
+    let amount = value[..value.len() - 1].parse::<i64>().ok()?;
+    if amount < 0 {
+        return None;
+    }
+    Some((amount, unit))
+}
+
+fn events_from_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    since_epoch: Option<i64>,
+) -> Vec<LogEvent> {
+    lines
+        .into_iter()
+        .filter_map(|line| event_from_line(line, since_epoch))
+        .collect()
+}
+
+fn event_from_line(line: &str, since_epoch: Option<i64>) -> Option<LogEvent> {
+    let raw: Value = serde_json::from_str(line.trim()).ok()?;
+    let Value::Object(raw_obj) = raw else {
+        return None;
+    };
+    let raw = Value::Object(raw_obj);
+    let ts = string_field(&raw, "ts", "");
+    if let Some(since_epoch) = since_epoch {
+        let event_epoch = airc_core::iso_to_epoch(&ts).ok()?;
+        if event_epoch <= since_epoch {
+            return None;
+        }
+    }
+    let msg = raw
+        .get("msg")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| raw.get("msg").map(ToString::to_string).unwrap_or_default());
+    Some(LogEvent {
+        id: string_field(&raw, "sig", &string_field(&raw, "id", "")),
+        ts,
+        sender: string_field(&raw, "from", "?"),
+        recipient: string_field(&raw, "to", ""),
+        channel: string_field(&raw, "channel", ""),
+        msg,
+        client_id: string_field(&raw, "client_id", &string_field(&raw, "clientId", "")),
+        raw,
+    })
+}
+
+fn render_human(events: &[LogEvent]) -> String {
+    events
+        .iter()
+        .map(|event| format!("[{}] {}: {}\n", event.ts, event.sender, event.msg))
+        .collect()
+}
+
+fn render_json(events: &[LogEvent], since: &str, count: usize) -> Result<String, Box<dyn Error>> {
+    Ok(serde_json::to_string_pretty(&json!({
+        "now_utc": format_epoch_utc(epoch_now()),
+        "since": since,
+        "count": count,
+        "events": events,
+    }))?)
+}
+
+fn string_field(value: &Value, key: &str, default: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn epoch_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn format_epoch_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era as i32 + era as i32 * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i32::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+#[derive(Debug, Serialize)]
+struct LogEvent {
+    id: String,
+    ts: String,
+    sender: String,
+    recipient: String,
+    channel: String,
+    msg: String,
+    client_id: String,
+    raw: Value,
 }
 
 struct LogLock {
@@ -301,5 +455,63 @@ mod tests {
         let path = dir.path().join("messages.jsonl");
 
         assert!(rotate_if_needed(&path, 2, 2).is_err());
+    }
+
+    #[test]
+    fn render_human_preserves_legacy_shape() {
+        let events = super::events_from_lines(
+            [r#"{"ts":"2026-05-16T01:00:00Z","from":"agent","msg":"ready"}"#],
+            None,
+        );
+
+        assert_eq!(
+            super::render_human(&events),
+            "[2026-05-16T01:00:00Z] agent: ready\n"
+        );
+    }
+
+    #[test]
+    fn render_json_exposes_stable_event_fields() {
+        let events = super::events_from_lines(
+            [
+                r#"{"sig":"sig-1","ts":"2026-05-16T01:00:00Z","from":"agent","to":"all","channel":"general","msg":"ready","client_id":"client-a"}"#,
+            ],
+            None,
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::render_json(&events, "", 20).unwrap()).unwrap();
+
+        assert_eq!(payload["count"], 20);
+        assert_eq!(payload["events"][0]["id"], "sig-1");
+        assert_eq!(payload["events"][0]["sender"], "agent");
+        assert_eq!(payload["events"][0]["recipient"], "all");
+        assert_eq!(payload["events"][0]["channel"], "general");
+        assert_eq!(payload["events"][0]["client_id"], "client-a");
+        assert_eq!(payload["events"][0]["raw"]["msg"], "ready");
+    }
+
+    #[test]
+    fn since_filters_by_message_timestamp() {
+        let since = airc_core::iso_to_epoch("2026-05-16T01:00:00Z").unwrap();
+        let events = super::events_from_lines(
+            [
+                r#"{"ts":"2026-05-16T00:59:59Z","from":"agent","msg":"old"}"#,
+                r#"{"ts":"2026-05-16T01:00:01Z","from":"agent","msg":"new"}"#,
+            ],
+            Some(since),
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.msg.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+    }
+
+    #[test]
+    fn relative_since_rejects_negative_windows() {
+        assert!(super::parse_since("-5m").is_err());
     }
 }
