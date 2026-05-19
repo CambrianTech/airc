@@ -31,6 +31,8 @@ mod log_cli;
 mod log_commands;
 mod route_cli;
 mod route_commands;
+mod transport_cli;
+mod transport_commands;
 mod work_cli;
 mod work_commands;
 mod workspace_cli;
@@ -53,6 +55,7 @@ use gist_cli::GistAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
 use route_cli::RouteAction;
+use transport_cli::TransportAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
 
@@ -144,6 +147,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Route(args) => match args.action {
             RouteAction::Status(args) => route_commands::run_status(args),
+        },
+
+        Command::Transport(args) => match args.action {
+            TransportAction::Health {
+                config,
+                fresh_after,
+                quiet,
+                degraded_only,
+                fail,
+            } => transport_commands::run_health(
+                &home,
+                config,
+                fresh_after,
+                quiet,
+                degraded_only,
+                fail,
+            ),
         },
 
         Command::Events(args) => match args.action {
