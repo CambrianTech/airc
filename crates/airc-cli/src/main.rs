@@ -17,6 +17,7 @@ mod codex_commands;
 mod codex_config;
 mod codex_hooks_json;
 mod codex_install;
+mod codex_start;
 mod commands;
 mod events_cli;
 mod events_commands;
@@ -162,6 +163,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await
             }
         },
+
+        Command::CodexStart(args) => {
+            codex_start::run(&args.airc, &args.home, &args.log, args.join_args).await
+        }
 
         Command::Work(args) => match args.action {
             WorkAction::Create {

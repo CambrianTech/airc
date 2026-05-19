@@ -35,6 +35,7 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "libc",
  "rustls",
  "serde",
  "serde_json",

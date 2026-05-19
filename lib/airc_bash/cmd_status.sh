@@ -587,7 +587,12 @@ cmd_codex_start() {
 
   local _started_at
   _started_at=$(date +%s)
-  "$AIRC_PYTHON" -m airc_core.codex_start \
+  local _airc_rs
+  _airc_rs=$(command -v airc-rs 2>/dev/null || true)
+  if [ -z "$_airc_rs" ]; then
+    die "airc-rs is required for codex-start; build/install the Rust CLI first"
+  fi
+  "$_airc_rs" codex-start \
     --airc "$0" \
     --home "$AIRC_WRITE_DIR" \
     --log "$_log" \
