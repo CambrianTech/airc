@@ -27,6 +27,7 @@ mod messaging;
 mod peers;
 pub mod registry;
 pub mod room;
+pub mod route_policy;
 mod stream;
 mod time;
 mod transport;
@@ -37,6 +38,9 @@ pub use error::AircError;
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
+pub use route_policy::{
+    RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind, TransportRole,
+};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
