@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::ipc::transport::IpcStream;
 
@@ -77,24 +77,29 @@ impl DaemonClient {
         Self { socket_path }
     }
 
-    /// Generic RPC: writes `request`, reads one `Response`.
+    /// Generic RPC: writes a single newline-terminated request line,
+    /// reads a single newline-terminated response line. No half-close
+    /// — newline framing avoids the Windows-vs-Unix asymmetry where
+    /// Unix sockets support `shutdown` half-close but named pipes
+    /// don't. Both sides read until `\n`, parse, drop.
     pub async fn call(&self, request: Request) -> Result<Response, ClientError> {
-        let mut stream = IpcStream::connect(&self.socket_path)
+        let stream = IpcStream::connect(&self.socket_path)
             .await
             .map_err(ClientError::NotConnected)?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
 
         let mut buffer = serde_json::to_vec(&request)?;
         buffer.push(b'\n');
-        stream.write_all(&buffer).await.map_err(ClientError::Io)?;
-        // Signal end of request so the daemon's read-to-end completes.
-        stream.shutdown().await.map_err(ClientError::Io)?;
+        writer.write_all(&buffer).await.map_err(ClientError::Io)?;
+        writer.flush().await.map_err(ClientError::Io)?;
 
-        let mut response_bytes = Vec::new();
-        stream
-            .read_to_end(&mut response_bytes)
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
             .await
             .map_err(ClientError::Io)?;
-        let response: Response = serde_json::from_slice(&response_bytes)?;
+        let response: Response = serde_json::from_str(response_line.trim_end_matches('\n'))?;
 
         match response {
             Response::Error { message } => Err(ClientError::Daemon(message)),

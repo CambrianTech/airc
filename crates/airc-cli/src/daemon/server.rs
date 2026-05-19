@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::handlers::dispatch;
 use crate::daemon::state::DaemonState;
@@ -122,32 +122,46 @@ fn cleanup_stale_socket(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Handle one connection: read a single newline-or-EOF-terminated
-/// JSON request, dispatch, write the JSON response, close.
-async fn handle_connection(
-    mut stream: IpcStream,
-    state: Arc<DaemonState>,
-) -> Result<(), DaemonError> {
-    let mut request_bytes = Vec::new();
-    stream.read_to_end(&mut request_bytes).await?;
+/// Handle one connection: read a single newline-terminated JSON
+/// request line, dispatch, write the JSON response line, drop. No
+/// half-close on the read side — Unix sockets can `shutdown` to
+/// signal EOF, but Windows named pipes have no half-close, so a
+/// protocol that relies on `shutdown` + `read_to_end` hangs on
+/// Windows. Newline-delimited single-line framing works identically
+/// on both transports.
+async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result<(), DaemonError> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut request_line = String::new();
+    let bytes_read = reader.read_line(&mut request_line).await?;
+    if bytes_read == 0 {
+        // Client closed without sending a request line. Nothing to
+        // respond to; just drop the connection.
+        return Ok(());
+    }
 
-    let request: Request = match serde_json::from_slice(&request_bytes) {
+    let request: Request = match serde_json::from_str(request_line.trim_end_matches('\n')) {
         Ok(request) => request,
         Err(error) => {
             let response = Response::Error {
                 message: format!("could not parse request: {error}"),
             };
-            write_response(&mut stream, &response).await?;
+            write_response(&mut writer, &response).await?;
             return Ok(());
         }
     };
 
     let response = dispatch(state, request).await;
-    write_response(&mut stream, &response).await?;
+    write_response(&mut writer, &response).await?;
+    // Drop reader+writer (and thus the underlying stream) so the
+    // client's read sees EOF promptly.
     Ok(())
 }
 
-async fn write_response(stream: &mut IpcStream, response: &Response) -> Result<(), DaemonError> {
+async fn write_response<W>(writer: &mut W, response: &Response) -> Result<(), DaemonError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let mut payload = serde_json::to_vec(response).map_err(|error| {
         DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -155,8 +169,8 @@ async fn write_response(stream: &mut IpcStream, response: &Response) -> Result<(
         ))
     })?;
     payload.push(b'\n');
-    stream.write_all(&payload).await?;
-    stream.shutdown().await?;
+    writer.write_all(&payload).await?;
+    writer.flush().await?;
     Ok(())
 }
 

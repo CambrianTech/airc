@@ -378,12 +378,17 @@ mod tests {
         // home's client and echoes back a home-specific reply. If
         // the pipes were colliding the server tasks would receive
         // each other's messages.
+        // Use `read_exact` framing on both sides so the test doesn't
+        // depend on `shutdown()` half-close semantics — Windows named
+        // pipes have no half-close, so the daemon protocol switched
+        // to newline framing for the same reason. Here we know each
+        // side writes exactly 6 bytes.
         let server_a = tokio::spawn(async move {
             let mut stream = listener_a.accept().await.unwrap();
             let mut buf = [0u8; 6];
             stream.read_exact(&mut buf).await.unwrap();
             stream.write_all(b"PONG-A").await.unwrap();
-            stream.shutdown().await.unwrap();
+            stream.flush().await.unwrap();
             buf
         });
         let server_b = tokio::spawn(async move {
@@ -391,7 +396,7 @@ mod tests {
             let mut buf = [0u8; 6];
             stream.read_exact(&mut buf).await.unwrap();
             stream.write_all(b"PONG-B").await.unwrap();
-            stream.shutdown().await.unwrap();
+            stream.flush().await.unwrap();
             buf
         });
 
@@ -399,15 +404,15 @@ mod tests {
 
         let mut client_a = IpcStream::connect(&sock_a).await.unwrap();
         client_a.write_all(b"PING-A").await.unwrap();
-        client_a.shutdown().await.unwrap();
-        let mut reply_a = Vec::new();
-        client_a.read_to_end(&mut reply_a).await.unwrap();
+        client_a.flush().await.unwrap();
+        let mut reply_a = [0u8; 6];
+        client_a.read_exact(&mut reply_a).await.unwrap();
 
         let mut client_b = IpcStream::connect(&sock_b).await.unwrap();
         client_b.write_all(b"PING-B").await.unwrap();
-        client_b.shutdown().await.unwrap();
-        let mut reply_b = Vec::new();
-        client_b.read_to_end(&mut reply_b).await.unwrap();
+        client_b.flush().await.unwrap();
+        let mut reply_b = [0u8; 6];
+        client_b.read_exact(&mut reply_b).await.unwrap();
 
         let received_a = server_a.await.unwrap();
         let received_b = server_b.await.unwrap();
@@ -415,8 +420,8 @@ mod tests {
         // Cross-contamination check: A must see its own ping.
         assert_eq!(&received_a, b"PING-A", "home A received its own ping");
         assert_eq!(&received_b, b"PING-B", "home B received its own ping");
-        assert_eq!(reply_a, b"PONG-A", "home A client got A's pong");
-        assert_eq!(reply_b, b"PONG-B", "home B client got B's pong");
+        assert_eq!(&reply_a, b"PONG-A", "home A client got A's pong");
+        assert_eq!(&reply_b, b"PONG-B", "home B client got B's pong");
     }
 
     #[test]
