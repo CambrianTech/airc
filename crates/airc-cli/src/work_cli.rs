@@ -21,6 +21,9 @@ pub enum WorkAction {
         /// Optional card body.
         #[arg(long)]
         body: Option<String>,
+        /// Optional lane UUID to attach this card to.
+        #[arg(long)]
+        lane_id: Option<String>,
         /// Scheduling priority.
         #[arg(long, value_enum, default_value = "p2")]
         priority: CliPriority,

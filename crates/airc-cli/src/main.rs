@@ -13,6 +13,8 @@
 
 mod cli;
 mod commands;
+mod lane_cli;
+mod lane_commands;
 mod work_cli;
 mod work_commands;
 
@@ -27,6 +29,7 @@ use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
+use lane_cli::LaneAction;
 use work_cli::WorkAction;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
@@ -118,8 +121,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 repo,
                 title,
                 body,
+                lane_id,
                 priority,
-            } => work_commands::run_create(&home, repo, title, body, priority).await,
+            } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
             WorkAction::Claim { card_id, ttl_ms } => {
                 work_commands::run_claim(&home, card_id, ttl_ms).await
             }
@@ -129,6 +133,16 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reason,
             } => work_commands::run_release(&home, card_id, claim_id, reason).await,
             WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
+        },
+
+        Command::Lane(args) => match args.action {
+            LaneAction::Create { repo, title, state } => {
+                lane_commands::run_create(&home, repo, title, state).await
+            }
+            LaneAction::State { lane_id, state } => {
+                lane_commands::run_state(&home, lane_id, state).await
+            }
+            LaneAction::Status { limit } => lane_commands::run_status(&home, limit).await,
         },
     }
 }

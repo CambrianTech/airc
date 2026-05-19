@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use airc_lib::{
-    Airc, ClaimWorkCard, CreateWorkCard, Priority, ReleaseWorkClaim, RepoId, WorkCardId,
+    Airc, ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard, CreateWorkLane, LaneState, Priority,
+    ReleaseWorkClaim, RepoId, WorkCardId,
 };
 use tempfile::TempDir;
 
@@ -110,4 +111,57 @@ async fn claim_and_release_work_card_round_trip_through_projection() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn lane_create_attach_card_and_state_change_project_from_store() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("lane-api").await.unwrap();
+
+    let lane_id = airc
+        .create_work_lane(CreateWorkLane {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "rust lane surface".to_string(),
+            state: LaneState::Planned,
+        })
+        .await
+        .unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "attach card to lane".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: Some(lane_id),
+        })
+        .await
+        .unwrap();
+
+    let board = airc.work_board(128).await.unwrap();
+    let snapshot = board.snapshot();
+    let lane = snapshot
+        .lanes
+        .iter()
+        .find(|lane| lane.lane_id == lane_id)
+        .expect("created lane projects");
+    assert_eq!(lane.card_ids, vec![card_id]);
+    assert_eq!(lane.state, LaneState::Planned);
+
+    airc.change_work_lane_state(ChangeWorkLaneState {
+        lane_id,
+        state: LaneState::Active,
+    })
+    .await
+    .unwrap();
+
+    let board = airc.work_board(128).await.unwrap();
+    let lane = board
+        .snapshot()
+        .lanes
+        .into_iter()
+        .find(|lane| lane.lane_id == lane_id)
+        .expect("lane remains projected");
+    assert_eq!(lane.state, LaneState::Active);
 }
