@@ -31,7 +31,7 @@ use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
-use lane_cli::LaneAction;
+use lane_cli::{LaneAction, LaneManagerAction};
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
 
@@ -146,6 +146,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 lane_commands::run_state(&home, lane_id, state).await
             }
             LaneAction::Status { limit } => lane_commands::run_status(&home, limit).await,
+            LaneAction::Manager { action } => match action {
+                LaneManagerAction::Claim { repo, ttl_ms } => {
+                    lane_commands::run_manager_claim(&home, repo, ttl_ms).await
+                }
+                LaneManagerAction::Release { repo } => {
+                    lane_commands::run_manager_release(&home, repo).await
+                }
+                LaneManagerAction::Status { limit } => {
+                    lane_commands::run_manager_status(&home, limit).await
+                }
+            },
         },
 
         Command::Workspace(args) => match args.action {

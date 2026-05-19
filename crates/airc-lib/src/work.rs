@@ -4,9 +4,9 @@ use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
     encode_work_event, BranchName, CardCreated, ClaimId, ClaimReleased, LaneCreated, LaneId,
-    LaneState, LaneStateChanged, Priority, RepoId, WorkBoardProjection, WorkCardClaimed,
-    WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased,
-    WorkspaceRequested,
+    LaneState, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, Priority, RepoId,
+    WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
+    WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -72,6 +72,17 @@ pub struct HeartbeatWorkspace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseWorkspace {
     pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimManagerHat {
+    pub repo: RepoId,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseManagerHat {
+    pub repo: RepoId,
 }
 
 impl Airc {
@@ -202,6 +213,31 @@ impl Airc {
     pub async fn release_workspace(&self, request: ReleaseWorkspace) -> Result<(), AircError> {
         let event = WorkEvent::WorkspaceReleased(WorkspaceReleased {
             workspace_id: request.workspace_id,
+            released_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Claim the manager hat for a repo in the current room. This is
+    /// a lease, not a permission boundary; peers can see who is
+    /// coordinating and when that claim expires.
+    pub async fn claim_manager_hat(&self, request: ClaimManagerHat) -> Result<(), AircError> {
+        let event = WorkEvent::ManagerHatClaimed(ManagerHatClaimed {
+            repo: request.repo,
+            manager: self.peer_id(),
+            ttl_ms: request.ttl_ms,
+            claimed_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Release this peer's manager hat for a repo.
+    pub async fn release_manager_hat(&self, request: ReleaseManagerHat) -> Result<(), AircError> {
+        let event = WorkEvent::ManagerHatReleased(ManagerHatReleased {
+            repo: request.repo,
+            manager: self.peer_id(),
             released_at_ms: now_ms(),
         });
         self.publish_work_event(&event).await?;

@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use airc_lib::{
-    Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimWorkCard, CreateWorkCard,
-    CreateWorkLane, HeartbeatWorkspace, LaneState, Priority, ReleaseWorkClaim, ReleaseWorkspace,
-    RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
+    Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
+    CreateWorkCard, CreateWorkLane, HeartbeatWorkspace, LaneState, Priority, ReleaseManagerHat,
+    ReleaseWorkClaim, ReleaseWorkspace, RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
 };
 use tempfile::TempDir;
 
@@ -224,4 +224,39 @@ async fn workspace_lifecycle_projects_from_store() {
     assert_eq!(workspace.lease.disk_bytes, Some(4096));
     assert_eq!(workspace.lease.card_id, card_id);
     assert_eq!(workspace.lease.claim_id, claim_id);
+}
+
+#[tokio::test]
+async fn manager_hat_claim_and_release_project_from_store() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("manager-hat-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    airc.claim_manager_hat(ClaimManagerHat {
+        repo: repo.clone(),
+        ttl_ms: 60_000,
+    })
+    .await
+    .unwrap();
+
+    let board = airc.work_board(128).await.unwrap();
+    let snapshot = board.snapshot();
+    let hat = snapshot
+        .manager_hats
+        .iter()
+        .find(|hat| hat.repo == repo)
+        .expect("manager hat projects");
+    assert_eq!(hat.manager, airc.peer_id());
+    assert!(hat.expires_at_ms > hat.claimed_at_ms);
+
+    airc.release_manager_hat(ReleaseManagerHat { repo: repo.clone() })
+        .await
+        .unwrap();
+
+    let board = airc.work_board(128).await.unwrap();
+    assert!(
+        board.snapshot().manager_hats.is_empty(),
+        "released manager hat must leave projection"
+    );
 }
