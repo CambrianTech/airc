@@ -12,6 +12,8 @@
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod cli;
+mod codex_cli;
+mod codex_commands;
 mod commands;
 mod events_cli;
 mod events_commands;
@@ -33,6 +35,7 @@ use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
+use codex_cli::CodexHookAction;
 use events_cli::EventsAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use work_cli::WorkAction;
@@ -129,6 +132,26 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 header_prefix,
                 limit,
             } => events_commands::run_list(&home, kind, header, header_prefix, limit).await,
+        },
+
+        Command::CodexHook(args) => match args.action {
+            CodexHookAction::UserPromptSubmit {
+                cursor_file,
+                count,
+                max_items,
+                raw,
+                include_self,
+            } => {
+                codex_commands::run_user_prompt_submit(
+                    &home,
+                    cursor_file,
+                    count,
+                    max_items,
+                    raw,
+                    include_self,
+                )
+                .await
+            }
         },
 
         Command::Work(args) => match args.action {
