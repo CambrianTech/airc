@@ -29,6 +29,7 @@ dependencies = [
  "airc-core",
  "airc-daemon",
  "airc-protocol",
+ "airc-store",
  "airc-transport",
  "base64",
  "clap",
@@ -56,6 +57,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "airc-protocol",
+ "airc-store",
  "airc-transport",
  "async-trait",
  "base64",

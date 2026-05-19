@@ -23,6 +23,7 @@ use airc_daemon::{
     peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, InboxRequest,
     SendRequest, SubscribeRequest,
 };
+use airc_store::{EventStore, SqliteEventStore};
 
 use crate::identity::LocalIdentity;
 use crate::registry::{format_peer_spec, PeerSpec};
@@ -219,12 +220,20 @@ pub async fn run_daemon(
         }
     }
 
+    // The durable event store lives under `<home>/events.sqlite`.
+    // Migrations are applied on open; consumers that subscribed
+    // before the daemon was last restarted can resume from the
+    // same `(lamport, event_id)` cursor on next boot.
+    let store_path = home.join("events.sqlite");
+    let store_url = format!("sqlite://{}?mode=rwc", store_path.display());
+    let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open(&store_url).await?);
     let state = Arc::new(DaemonState::new(
         identity.peer_id,
         identity.keypair,
         registry,
         VerificationPolicy::Strict,
         home.to_path_buf(),
+        store,
     ));
     println!(
         "airc-rs daemon: peer_id={} listening on {}",
@@ -282,6 +291,7 @@ pub async fn run_inbox(
     home: &Path,
     socket: PathBuf,
     since_lamport: Option<u64>,
+    since_event_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current = room::load_or_default(home)?;
@@ -291,25 +301,48 @@ pub async fn run_inbox(
             wire: current.wire.clone(),
         })
         .await?;
+    // Both --since-lamport and --since-event-id must be supplied
+    // together; the cursor is a tuple per grievance §7.
+    let since = match (since_lamport, since_event_id) {
+        (Some(lamport), Some(ref ev)) => Some(TranscriptCursor {
+            lamport,
+            event_id: EventId::from_uuid(uuid::Uuid::parse_str(ev)?),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "--since-lamport and --since-event-id must be passed together (cursor is a tuple)"
+                    .into(),
+            );
+        }
+    };
     let inbox = client
         .inbox(InboxRequest {
-            wire: current.wire,
-            since_lamport,
+            since,
+            channel: Some(current.channel),
             limit,
         })
         .await?;
-    if inbox.frames.is_empty() {
-        println!("(no new frames; newest_lamport={})", inbox.newest_lamport);
+    if inbox.events.is_empty() {
+        match &inbox.newest {
+            Some(c) => println!(
+                "(no new events; cursor lamport={} event_id={})",
+                c.lamport, c.event_id
+            ),
+            None => println!("(no events yet — store is empty)"),
+        }
         return Ok(());
     }
-    for frame in &inbox.frames {
-        print_frame(frame);
+    for event in &inbox.events {
+        print_event(event);
     }
-    println!();
-    println!(
-        "newest_lamport={} — pass as --since-lamport on the next call",
-        inbox.newest_lamport
-    );
+    if let Some(cursor) = inbox.newest {
+        println!();
+        println!(
+            "cursor: lamport={} event_id={} — pass both as --since-lamport / --since-event-id",
+            cursor.lamport, cursor.event_id
+        );
+    }
     Ok(())
 }
 
@@ -395,6 +428,20 @@ fn print_frame(frame: &Frame) {
         kind = frame.kind,
         sender = frame.envelope.sender,
         channel = frame.envelope.channel,
+    );
+}
+
+fn print_event(event: &airc_core::TranscriptEvent) {
+    let text = event
+        .body
+        .as_ref()
+        .and_then(Body::as_text)
+        .unwrap_or("<non-text body>");
+    println!(
+        "[{kind:?}] {sender} → {channel}: {text}",
+        kind = event.kind,
+        sender = event.peer_id,
+        channel = event.room_id,
     );
 }
 

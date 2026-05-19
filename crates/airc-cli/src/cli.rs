@@ -156,8 +156,14 @@ pub enum Command {
     Inbox {
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
+        /// Cursor lamport — pair with `--since-event-id`. The cursor
+        /// is `(lamport, event_id)`; both halves required when paging
+        /// from a specific point.
+        #[arg(long, requires = "since_event_id")]
         since_lamport: Option<u64>,
+        /// Cursor event_id (UUID) — pair with `--since-lamport`.
+        #[arg(long, requires = "since_lamport")]
+        since_event_id: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
     },

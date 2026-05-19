@@ -32,10 +32,10 @@ pub enum Request {
     /// wire. Idempotent — repeated calls return Ok without
     /// duplicating subscriptions.
     Subscribe(SubscribeRequest),
-    /// Read buffered frames from the daemon's inbox for `wire`.
-    /// Returns frames strictly after `since_lamport` (if provided),
-    /// up to `limit`. Pass back the response's newest_lamport on the
-    /// next call to keep the stream "consume-once".
+    /// Read events from the daemon's durable event store, strictly
+    /// after `since` (a `(lamport, event_id)` cursor) and optionally
+    /// filtered to a single channel. Pass back the response's
+    /// `newest` cursor on the next call for consume-once streaming.
     Inbox(InboxRequest),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.
@@ -53,13 +53,19 @@ pub struct SubscribeRequest {
 /// Parameters for `Inbox`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InboxRequest {
-    /// Wire directory the daemon should pull buffered frames from.
-    pub wire: std::path::PathBuf,
-    /// Return only frames whose lamport > this value. `None` means
-    /// "everything in the buffer."
+    /// Return only events strictly after this cursor. `None` means
+    /// "give me the most recent events available."
+    ///
+    /// Cursor is `(lamport, event_id)` per grievance §7 — lamport is
+    /// the primary order, event_id is the deterministic tiebreaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since_lamport: Option<u64>,
-    /// Max frames to return in this batch. `None` defaults to a
+    pub since: Option<airc_core::TranscriptCursor>,
+    /// Restrict to events on this channel (room). `None` means "any
+    /// channel" — used when the caller wants global tail rather than
+    /// per-room paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<airc_core::RoomId>,
+    /// Max events to return in this batch. `None` defaults to a
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,

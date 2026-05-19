@@ -4,7 +4,6 @@
 use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
-use airc_protocol::Frame;
 
 /// One response to a `Request`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,15 +51,19 @@ pub struct PeersResponse {
     pub peers: Vec<PeerEntry>,
 }
 
-/// Result of an `Inbox` pull: frames + the lamport to feed back as
-/// `since_lamport` on the next call.
+/// Result of an `Inbox` pull: events + the cursor to feed back as
+/// `since` on the next call. Returned events are oldest → newest
+/// within the page.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InboxResponse {
-    /// Up to `limit` frames matching the request, lamport-ascending.
-    pub frames: Vec<Frame>,
-    /// Largest lamport in `frames`, or `since_lamport` echoed back if
-    /// the call returned no frames. Pass this on the next call.
-    pub newest_lamport: u64,
+    /// Up to `limit` events matching the request, in transcript
+    /// order `(lamport asc, event_id asc)`.
+    pub events: Vec<airc_core::TranscriptEvent>,
+    /// Cursor of the newest event in `events`. `None` when the page
+    /// was empty — in that case the caller's `since` is still the
+    /// authoritative position to feed back on the next poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest: Option<airc_core::TranscriptCursor>,
 }
 
 #[cfg(test)]

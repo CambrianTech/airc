@@ -27,6 +27,7 @@ pub mod media;
 pub mod policy;
 pub mod signature;
 pub mod subscription;
+pub mod transcript_conv;
 
 // Re-exports — the stable public API surface.
 
