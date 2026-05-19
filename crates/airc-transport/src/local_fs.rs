@@ -60,14 +60,24 @@ use crate::error::LocalFsError;
 use crate::transport::{FrameStream, Transport};
 
 const FRAMES_FILENAME: &str = "frames.jsonl";
+/// Sidecar lock file. Senders take fs2's `lock_exclusive` on this
+/// file instead of on `frames.jsonl` itself. Reason: on Windows
+/// fs2's `lock_exclusive` is `LockFileEx`, which is *mandatory* —
+/// it locks the byte range so concurrent readers (subscriber tail
+/// loops) get `ERROR_LOCK_VIOLATION` (Os code 33). On Unix flock
+/// is advisory and readers proceed unbothered. A sidecar file
+/// gives uniform "serialize writers without blocking readers"
+/// semantics across both platforms.
+const LOCK_FILENAME: &str = "frames.jsonl.lock";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RECEIVER_CHANNEL_DEPTH: usize = 64;
 
 /// Same-machine wire backed by `<wire-dir>/frames.jsonl`.
 ///
 /// Cross-process send safety comes from `fs2::FileExt::lock_exclusive`
-/// (advisory flock) on the frames file — no in-memory mutex needed,
-/// flock handles both intra- and inter-process serialization.
+/// on a sidecar `frames.jsonl.lock` file — readers (subscriber tail
+/// loops) touch `frames.jsonl` directly and never the lock file, so
+/// Windows's mandatory `LockFileEx` semantics don't block them.
 pub struct LocalFsAdapter {
     wire_dir: PathBuf,
 }
@@ -92,6 +102,11 @@ impl LocalFsAdapter {
         self.wire_dir.join(FRAMES_FILENAME)
     }
 
+    /// Compute the sidecar lock-file path.
+    fn lock_path(&self) -> PathBuf {
+        self.wire_dir.join(LOCK_FILENAME)
+    }
+
     /// Create the wire directory if absent. Called on every send +
     /// subscribe so the API doesn't have an "init" step.
     async fn ensure_wire_dir(&self) -> Result<(), LocalFsError> {
@@ -108,28 +123,41 @@ impl Transport for LocalFsAdapter {
         self.ensure_wire_dir().await?;
 
         // Serialize before crossing the spawn_blocking boundary so the
-        // critical section (open + flock + write + maybe-fsync) is as
+        // critical section (lock + open + write + maybe-fsync) is as
         // short as possible.
         let mut buffer = serde_json::to_vec(&frame)?;
         buffer.push(b'\n');
         let frame_kind = frame.kind;
-        let path = self.frames_path();
+        let frames_path = self.frames_path();
+        let lock_path = self.lock_path();
 
         // std::fs + fs2 flock is sync; bracket the kernel calls in
         // spawn_blocking so we don't stall the async runtime. fs2
         // doesn't have a tokio-native equivalent and rolling our own
         // ioctl invocation would be more risk than this is worth.
         tokio::task::spawn_blocking(move || -> Result<(), LocalFsError> {
-            let file = open_for_append_shared(&path)?;
-            // Exclusive cross-process flock. Other writers (in this
-            // process or any other) block here until we release. The
-            // lock is released when `file` drops at end of block.
-            file.lock_exclusive()?;
-            let result = write_then_maybe_sync(&file, &buffer, frame_kind);
-            // Explicit unlock so an Err from write/sync doesn't leak
-            // the lock past the file's natural drop scope. (Drop
-            // also unlocks on POSIX, but being explicit is clearer.)
-            let _ = FileExt::unlock(&file);
+            // Lock the sidecar file, NOT frames.jsonl. On Windows
+            // fs2's `lock_exclusive` is mandatory (LockFileEx locks
+            // the byte range), so locking frames.jsonl would make
+            // every subscriber's read fail with ERROR_LOCK_VIOLATION
+            // until the writer releases. Locking a sidecar gives
+            // uniform writer-serialization semantics across Unix
+            // (advisory) and Windows (mandatory) without blocking
+            // readers.
+            let lock_file = open_lock_file(&lock_path)?;
+            lock_file.lock_exclusive()?;
+
+            // Inside the critical section: open the frames file,
+            // append, optional fsync. Readers can be observing the
+            // frames file at the same time — that's intentional.
+            let result = (|| -> Result<(), LocalFsError> {
+                let file = open_for_append_shared(&frames_path)?;
+                write_then_maybe_sync(&file, &buffer, frame_kind)
+            })();
+
+            // Explicit unlock so an Err from open/write/sync doesn't
+            // leak the lock past the lock_file's natural drop scope.
+            let _ = FileExt::unlock(&lock_file);
             result
         })
         .await
@@ -197,6 +225,19 @@ fn write_then_maybe_sync(
     Ok(())
 }
 
+/// Open (or create) the sidecar lock file. `lock_exclusive` will be
+/// called on the returned handle by `send` to serialise writers
+/// across processes. The handle needs both read and write access so
+/// `LockFileEx` on Windows accepts it (Unix flock doesn't care).
+/// Permissive share mode lets multiple senders open the lock file
+/// concurrently — only the lock itself is contended.
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    apply_windows_share_mode(&mut options);
+    options.open(path)
+}
+
 /// Open the frames file for append with permissive share modes so
 /// concurrent readers (subscribers tailing the file) and other writers
 /// can coexist. Unix opens are permissive by default; Windows defaults
@@ -207,14 +248,7 @@ fn write_then_maybe_sync(
 /// here restores cross-platform parity with the Unix open(2) defaults.
 fn open_for_append_shared(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    // `read(true)` is required for fs2's `lock_exclusive` on Windows:
-    // LockFileEx wants the handle to grant at least GENERIC_READ. A
-    // pure-append handle (`FILE_APPEND_DATA` only) succeeds on Unix
-    // flock but Windows surfaces ERROR_ACCESS_DENIED when we try to
-    // take the cross-process lock. The handle still appends because
-    // `append(true)` flips the seek-to-end behaviour; read access is
-    // never used — it's a Windows ACL formality.
-    options.read(true).create(true).append(true);
+    options.create(true).append(true);
     apply_windows_share_mode(&mut options);
     options.open(path)
 }
