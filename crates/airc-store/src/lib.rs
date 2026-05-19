@@ -1,0 +1,39 @@
+//! `airc-store` — durable event store for AIRC transcripts.
+//!
+//! Closes grievance §5 (CLI/Daemon Is Accumulating Policy — the
+//! needed crate split lists `airc-store` as the source of truth for
+//! events) and §7 (Inbox And Replay Need Stronger Cursor Semantics —
+//! the store owns `(lamport, event_id)` cursoring and channel-aware
+//! filtering rather than the per-wire JSONL append in airc-transport).
+//!
+//! The trait surface ([`EventStore`]) is the consumer-facing API:
+//!   - `append(event)` durably persists a `TranscriptEvent`;
+//!   - `page_recent(channel, limit)` returns the newest N events;
+//!   - `resume_from(cursor, channel, limit)` returns events strictly
+//!     after the cursor;
+//!   - `latest_cursor(channel)` returns the newest cursor or None.
+//!
+//! Two implementations ship in this crate:
+//!   - [`SqliteEventStore`]: SeaORM-backed SQLite. Production target
+//!     for v1; migrations applied on `open`.
+//!   - [`InMemoryEventStore`]: trait-only test double, no I/O. Use
+//!     in unit tests that don't need durability.
+
+#![deny(unsafe_code)]
+// `rust_2018_idioms` would force `&SchemaManager<'_>` syntax on the
+// MigrationTrait impls, but sea-orm-migration declares those methods
+// late-bound (`&SchemaManager` without a lifetime param) — the impl
+// signature has to match verbatim. Opt out at the crate level rather
+// than scattering `#[allow(elided_lifetimes_in_paths)]` per impl.
+
+pub mod entities;
+pub mod error;
+pub mod memory;
+pub mod migration;
+pub mod sqlite;
+pub mod store;
+
+pub use error::StoreError;
+pub use memory::InMemoryEventStore;
+pub use sqlite::SqliteEventStore;
+pub use store::EventStore;
