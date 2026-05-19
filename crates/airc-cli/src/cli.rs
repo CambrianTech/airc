@@ -204,6 +204,9 @@ pub enum Command {
     /// Coordinate work lanes over the current room's AIRC substrate.
     Lane(crate::lane_cli::LaneArgs),
 
+    /// Append and rotate legacy messages.jsonl files through Rust.
+    Log(crate::log_cli::LogArgs),
+
     /// Coordinate workspace leases over the current room's AIRC substrate.
     Workspace(crate::workspace_cli::WorkspaceArgs),
 

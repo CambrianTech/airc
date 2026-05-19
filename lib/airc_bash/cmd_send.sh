@@ -270,7 +270,7 @@ cmd_send() {
   ensure_init
 
   _airc_append_local_signed() {
-    if ! printf '%s\n' "$1" | "$AIRC_PYTHON" -m airc_core.log_append append --path "$MESSAGES" >/dev/null; then
+    if ! printf '%s\n' "$1" | "$(airc_rs_bin)" log append --path "$MESSAGES" >/dev/null; then
       echo "$1" >> "$MESSAGES"
     fi
   }

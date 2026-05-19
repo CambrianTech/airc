@@ -2322,11 +2322,11 @@ JSON
                 printf '%s\n' "$_hb_payload" > "$_hb_tmp"
                 # Rotate the host's messages.jsonl when it exceeds the
                 # AIRC_LOG_MAX_LINES threshold (default 5000). Trims
-                # in-place via airc_core.log; SSH-tail's -F flag detects
+                # in-place via airc-rs log rotate; SSH-tail's -F flag detects
                 # the atomic replace and re-opens. Joiners with offsets
                 # past the new file's line count are caught by #245.
                 # Cheap no-op when under threshold.
-                "$AIRC_PYTHON" -m airc_core.log rotate --path "$_hb_messages" \
+                "$(airc_rs_bin)" log rotate --path "$_hb_messages" \
                   --max-lines "${AIRC_LOG_MAX_LINES:-5000}" \
                   --keep-lines "${AIRC_LOG_KEEP_LINES:-2500}" >/dev/null 2>&1 || true
                 # Capture stderr to a state file (per never-swallow-errors
