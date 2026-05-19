@@ -79,6 +79,85 @@ fn config_list_channel_gists_prints_tab_separated_mappings() {
     assert_eq!(output, "airc\tgist-airc\ngeneral\tgist-general\n");
 }
 
+#[test]
+fn config_subscribe_unsubscribe_round_trips() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+    fs::write(
+        home.join("config.json"),
+        r#"{"subscribed_channels":["general"]}"#,
+    )
+    .unwrap();
+
+    run_ok(home, &["config", "subscribe", "--channel", "airc"]);
+    run_ok(home, &["config", "subscribe", "--channel", "airc"]);
+    assert_eq!(
+        run_ok(home, &["config", "read-channels"]),
+        "general\nairc\n"
+    );
+
+    run_ok(home, &["config", "unsubscribe", "--channel", "general"]);
+    assert_eq!(run_ok(home, &["config", "read-channels"]), "airc\n");
+}
+
+#[test]
+fn config_subscribe_first_promotes_default_channel() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+    fs::write(
+        home.join("config.json"),
+        r#"{"subscribed_channels":["general","airc"]}"#,
+    )
+    .unwrap();
+
+    run_ok(
+        home,
+        &["config", "subscribe", "--channel", "airc", "--first"],
+    );
+
+    assert_eq!(
+        run_ok(home, &["config", "read-channels"]),
+        "airc\ngeneral\n"
+    );
+}
+
+#[test]
+fn config_set_channel_gist_sets_and_clears_mapping() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    run_ok(
+        home,
+        &[
+            "config",
+            "set-channel-gist",
+            "--channel",
+            "general",
+            "--gist-id",
+            "gist-general",
+        ],
+    );
+    assert_eq!(
+        run_ok(
+            home,
+            &["config", "get-channel-gist", "--channel", "general"]
+        ),
+        "gist-general\n"
+    );
+
+    run_ok(
+        home,
+        &["config", "set-channel-gist", "--channel", "general"],
+    );
+    assert_eq!(
+        run_ok(
+            home,
+            &["config", "get-channel-gist", "--channel", "general"]
+        ),
+        ""
+    );
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = Command::new(airc_rs())
         .arg("--home")

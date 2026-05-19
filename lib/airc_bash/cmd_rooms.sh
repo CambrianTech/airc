@@ -255,8 +255,8 @@ cmd_part() {
       fi
     fi
     # Remove from subscribed_channels + clear channel_gists mapping.
-    "$AIRC_PYTHON" -m airc_core.config unsubscribe --config "$CONFIG" --channel "$arg_room" 2>/dev/null || true
-    "$AIRC_PYTHON" -m airc_core.config set_channel_gist --config "$CONFIG" --channel "$arg_room" --gist-id "" 2>/dev/null || true
+    airc_config_unsubscribe "$arg_room" "$CONFIG" 2>/dev/null || true
+    airc_config_set_channel_gist "$arg_room" "" "$CONFIG" 2>/dev/null || true
     return 0
   fi
 
@@ -309,8 +309,7 @@ cmd_part() {
   # anymore, the monitor display drops the channel prefix from
   # outbound, and a future cmd_join --room <name> re-adds it.
   if [ "$room_name" != "(unnamed)" ]; then
-    "$AIRC_PYTHON" -m airc_core.config unsubscribe \
-      --config "$CONFIG" --channel "$room_name" 2>/dev/null || true
+    airc_config_unsubscribe "$room_name" "$CONFIG" 2>/dev/null || true
   fi
 
   # IRC `/part` semantics — leave THIS room only; the #general sidecar

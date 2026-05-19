@@ -111,10 +111,9 @@ ensure_channel_subscribed_with_gist() {
   trap '[ -n "${_err:-}" ] && rm -f "$_err"' RETURN
 
   # 1. Subscribe in config.
-  local _first_flag=""
-  [ "$mode" = "--first" ] && _first_flag="--first"
-  if ! "$AIRC_PYTHON" -m airc_core.config subscribe \
-       --config "$CONFIG" --channel "$channel" $_first_flag 2>"$_err"; then
+  local _first=0
+  [ "$mode" = "--first" ] && _first=1
+  if ! airc_config_subscribe "$channel" "$CONFIG" "$_first" 2>"$_err"; then
     echo "  ⚠ Could not subscribe to #${channel}:" >&2
     [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
     return 1
@@ -161,8 +160,7 @@ ensure_channel_subscribed_with_gist() {
   fi
 
   # 3. Persist channel→gist mapping for cmd_send + monitor routing.
-  if ! "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-       --config "$CONFIG" --channel "$channel" --gist-id "$_gid" 2>"$_err"; then
+  if ! airc_config_set_channel_gist "$channel" "$_gid" "$CONFIG" 2>"$_err"; then
     echo "  ⚠ Could not persist channel→gist mapping for #${channel}:" >&2
     [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
     return 1
@@ -775,15 +773,14 @@ cmd_connect() {
       # (create if missing). The bearer for this channel will be
       # picked up on the next _monitor_multi_channel cycle (which
       # re-reads channel_map at top of each outer poll).
-      "$AIRC_PYTHON" -m airc_core.config subscribe --config "$CONFIG" --channel "$room_name" 2>/dev/null || true
+      airc_config_subscribe "$room_name" "$CONFIG" 0 2>/dev/null || true
       # Resolve --create-if-missing: returns the gist id (find existing
       # or create new gist named "airc room: #<channel>").
       local _new_gist; _new_gist=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
           --channel "$room_name" --create-if-missing 2>&1)
       if [ -n "$_new_gist" ] && printf '%s' "$_new_gist" | grep -qE '^[0-9a-f]{32}$'; then
         # Save the channel→gist mapping in config so cmd_send can route to it.
-        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-          --config "$CONFIG" --channel "$room_name" --gist-id "$_new_gist" 2>/dev/null || true
+        airc_config_set_channel_gist "$room_name" "$_new_gist" "$CONFIG" 2>/dev/null || true
         echo "  ✓ Subscribed to #${room_name} (gist $_new_gist). Bearer respawn picks it up within ~30s."
       else
         echo "  ⚠ Subscribed to #${room_name} but gist resolve failed: $_new_gist"
@@ -814,8 +811,7 @@ cmd_connect() {
         _canonical_gid=$(_mesh_find_any "$_ch")
         if [ -n "$_canonical_gid" ] && [ "$_canonical_gid" != "$_gid" ]; then
           echo "  airc join: running monitor is on stale #${_ch} gist $_gid; canonical is $_canonical_gid."
-          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-            --config "$CONFIG" --channel "$_ch" --gist-id "$_canonical_gid" 2>/dev/null || true
+          airc_config_set_channel_gist "$_ch" "$_canonical_gid" "$CONFIG" 2>/dev/null || true
           _repair_running_monitor=1
         fi
       done <<< "$_map_lines"
@@ -1647,8 +1643,7 @@ cmd_connect() {
         # does not immediately hit GitHub discovery again during the exact
         # transient/rate-limited condition it is meant to survive.
         if [ -n "${_resolved_gist_id:-}" ]; then
-          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-            --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+          airc_config_set_channel_gist "$resolved_room_name" "$_resolved_gist_id" "$CONFIG" 2>/dev/null || true
         fi
         if [ "${AIRC_TEST_FAIL_ENSURE_CHANNEL:-}" = "$resolved_room_name" ] \
            || ! ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null; then
@@ -1861,8 +1856,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       # #283: also map this channel→gist in channel_gists so the
       # multi-channel monitor polls it and cmd_send routes by channel.
       if [ -n "$resolved_room_name" ]; then
-        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-          --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+        airc_config_set_channel_gist "$resolved_room_name" "$_resolved_gist_id" "$CONFIG" 2>/dev/null || true
       fi
     fi
 
@@ -1998,8 +1992,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
       # Phase 2B.2: also seed subscribed_channels with our hosted channel
       # so cmd_send + future config-driven consumers see it.
-      "$AIRC_PYTHON" -m airc_core.config subscribe \
-        --config "$CONFIG" --channel "$room_name" --first 2>/dev/null || true
+      airc_config_subscribe "$room_name" "$CONFIG" 1 2>/dev/null || true
       if [ -n "${AIRC_ADOPT_GIST:-}" ]; then
         echo "  Hosting #${room_name} — recovering existing room gist ${AIRC_ADOPT_GIST}."
       else
@@ -2095,8 +2088,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # existing gist.
           echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
           echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
-          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-            --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
+          airc_config_set_channel_gist "$room_name" "$_gist_id" "$CONFIG" 2>/dev/null || true
           : >"$AIRC_WRITE_DIR/.using_existing_room_gist"
         fi
 
@@ -2225,8 +2217,7 @@ JSON
             # #283: also map this channel→gist in channel_gists so
             # the multi-channel monitor polls it and cmd_send routes
             # by channel.
-            "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-              --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
+            airc_config_set_channel_gist "$room_name" "$_gist_id" "$CONFIG" 2>/dev/null || true
 
             # Heartbeat loop: keep last_heartbeat fresh in the gist so
             # joiners can deterministically detect a dead host. Without

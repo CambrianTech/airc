@@ -481,9 +481,7 @@ cmd_send() {
         # clear stale mapping, surface [GONE] marker, do NOT queue
         # (retries would all 404 too). Recovery: airc join --room
         # rediscovers / re-hosts.
-        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-          --config "$CONFIG" --channel "$active_channel" --gist-id "" \
-          >/dev/null 2>&1 || true
+        airc_config_set_channel_gist "$active_channel" "" "$CONFIG" >/dev/null 2>&1 || true
         [ -n "${room_gist_id:-}" ] && printf '%s\n' "$room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
         local gone_marker; gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
           "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${detail:-no detail}")
@@ -678,9 +676,7 @@ cmd_send() {
           # API budget for nothing. Drop the message on the floor with
           # loud surface (the [GONE] marker) — same UX as auth_failure
           # but a different remedy.
-          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-            --config "$CONFIG" --channel "$active_channel" --gist-id "" \
-            >/dev/null 2>&1 || true
+          airc_config_set_channel_gist "$active_channel" "" "$CONFIG" >/dev/null 2>&1 || true
           [ -n "${_host_room_gist_id:-}" ] && printf '%s\n' "$_host_room_gist_id" > "$AIRC_WRITE_DIR/gone_channel_gist.${active_channel}" 2>/dev/null || true
           local _host_gone_marker; _host_gone_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[GONE: room gist 404 — channel #%s dissolved, message NOT delivered. Re-host with: airc join --room %s] %s"}' \
             "$(timestamp)" "$active_channel" "$active_channel" "$active_channel" "${_host_detail:-no detail}")

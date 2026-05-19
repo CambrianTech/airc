@@ -103,6 +103,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ConfigAction::ListChannelGists { config } => {
                 config_commands::run_list_channel_gists(&home, config)
             }
+            ConfigAction::Subscribe {
+                config,
+                channel,
+                first,
+            } => config_commands::run_subscribe(&home, config, &channel, first),
+            ConfigAction::Unsubscribe { config, channel } => {
+                config_commands::run_unsubscribe(&home, config, &channel)
+            }
+            ConfigAction::SetChannelGist {
+                config,
+                channel,
+                gist_id,
+            } => config_commands::run_set_channel_gist(&home, config, &channel, &gist_id),
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
