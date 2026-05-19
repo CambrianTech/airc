@@ -1,11 +1,12 @@
 //! `LanTcpAdapter` — secure same-LAN wire over TLS-wrapped TCP.
 //!
-//! MVP scope (PR-3c):
-//!   - Point-to-peer: one active connection per adapter (either
-//!     accepted-from listener or dialed via connect). PR-3d expands
-//!     to N-peer fan-out.
-//!   - Multi-subscriber fan-out (one adapter, many local
-//!     `Transport::subscribe` callers).
+//! Scope:
+//!   - **Multi-peer**: N concurrent connections, keyed by `PeerId`.
+//!     `listen()` accepts indefinitely; `connect()` allows multiple
+//!     dials to different peers; `send()` broadcasts to all
+//!     connected peers.
+//!   - **Multi-subscriber fan-out**: one adapter, many local
+//!     `Transport::subscribe` callers.
 //!   - Length-prefixed JSON frames over TLS.
 //!   - FrameKind delivery split inherited from the Transport trait:
 //!     Message/Control durable+backpressure, Event lossy.
@@ -13,12 +14,14 @@
 //!     post-handshake by reading the peer cert and looking up via
 //!     `PeerKeyRegistry::find_peer`.
 //!
-//! What's deferred to follow-ups:
-//!   - Multi-peer concurrent connections (PR-3d).
+//! What's deferred:
 //!   - mDNS/discovery (separate concern).
 //!   - Reconnect / retry logic (robustness PR).
-//!   - Per-frame ack/replay-cursor (PR-3e or bridge layer).
+//!   - Per-frame ack/replay-cursor (bridge layer).
+//!   - `send_to(peer_id, frame)` for targeted unicast (broadcast-
+//!     only for now).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,10 +73,15 @@ pub enum LanTcpError {
         announced: u32,
         limit: u32,
     },
-    /// `send()` called with no connection established.
-    NotConnected,
-    /// `connect()` or `listen()` called twice on the same adapter.
-    AlreadyHasConnection,
+    /// `send()` called with no peers connected.
+    NoActivePeers,
+    /// `connect()` called for a peer that's already connected on this
+    /// adapter. (Listening sides don't see this; they only get new
+    /// peers via accept.)
+    AlreadyConnectedTo(PeerId),
+    /// `listen()` called more than once on the same adapter — only
+    /// one bound listener supported.
+    AlreadyListening,
 }
 
 impl std::fmt::Display for LanTcpError {
@@ -91,12 +99,16 @@ impl std::fmt::Display for LanTcpError {
                 f,
                 "lan-tcp refused frame with announced size {announced} bytes (limit {limit})"
             ),
-            LanTcpError::NotConnected => {
-                write!(f, "lan-tcp adapter has no active connection")
+            LanTcpError::NoActivePeers => {
+                write!(f, "lan-tcp adapter has no connected peers — call listen() or connect() first")
             }
-            LanTcpError::AlreadyHasConnection => write!(
+            LanTcpError::AlreadyConnectedTo(peer) => write!(
                 f,
-                "lan-tcp adapter already has an active connection — point-to-peer for MVP, PR-3d adds multi-peer"
+                "lan-tcp adapter is already connected to peer {peer}"
+            ),
+            LanTcpError::AlreadyListening => write!(
+                f,
+                "lan-tcp adapter already has a bound listener"
             ),
         }
     }
@@ -147,9 +159,14 @@ struct Inner {
     keypair: PeerKeypair,
     registry: Arc<RwLock<PeerKeyRegistry>>,
     server_config: Arc<rustls::ServerConfig>,
-    /// At most one active connection per adapter in MVP. PR-3d
-    /// promotes this to `HashMap<PeerId, OutboundTx>`.
-    connection: Mutex<Option<OutboundTx>>,
+    /// Active connections keyed by remote `PeerId`. Filled by both
+    /// the accept loop (server-side handshakes) and `connect()`
+    /// (client-side dials). Entries removed when the read loop
+    /// detects a closed connection.
+    connections: Mutex<HashMap<PeerId, OutboundTx>>,
+    /// True after the first `listen()` call so subsequent calls
+    /// error rather than silently spawning a second accept loop.
+    listening: Mutex<bool>,
     subscribers: Mutex<Vec<SubscriberHandle>>,
     next_sub_id: AtomicU64,
 }
@@ -174,11 +191,24 @@ impl LanTcpAdapter {
                 keypair,
                 registry,
                 server_config,
-                connection: Mutex::new(None),
+                connections: Mutex::new(HashMap::new()),
+                listening: Mutex::new(false),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Snapshot of currently-connected peers. Useful for diagnostics
+    /// (`airc-rs peers`) + tests.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        self.inner
+            .connections
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Bind a TCP listener and accept ONE incoming connection. The
@@ -189,12 +219,13 @@ impl LanTcpAdapter {
     /// tasks. Returns after the listener is bound, NOT after a peer
     /// has connected — callers await delivery via `subscribe`.
     pub async fn listen(&self, bind_addr: SocketAddr) -> Result<SocketAddr, LanTcpError> {
-        // Refuse if already connected; MVP is point-to-peer.
+        // Only one listener per adapter.
         {
-            let conn = self.inner.connection.lock().await;
-            if conn.is_some() {
-                return Err(LanTcpError::AlreadyHasConnection);
+            let mut listening = self.inner.listening.lock().await;
+            if *listening {
+                return Err(LanTcpError::AlreadyListening);
             }
+            *listening = true;
         }
 
         let listener = TcpListener::bind(bind_addr).await?;
@@ -202,19 +233,30 @@ impl LanTcpAdapter {
         let inner = self.inner.clone();
 
         tokio::spawn(async move {
-            // Accept ONE connection; subsequent attempts ignored in
-            // MVP. PR-3d turns this into a multi-accept loop.
-            match listener.accept().await {
-                Ok((tcp_stream, _peer_addr)) => {
-                    let acceptor = TlsAcceptor::from(inner.server_config.clone());
+            // Accept indefinitely — each accepted peer gets its own
+            // per-connection task. The accept loop runs until the
+            // listener errors (e.g. the adapter drops the OS socket).
+            loop {
+                let (tcp_stream, _peer_addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_error) => {
+                        // Accept failed — most plausibly because the
+                        // listener was torn down. Exit the loop so
+                        // the task doesn't spin.
+                        return;
+                    }
+                };
+                let inner_for_conn = inner.clone();
+                let acceptor = TlsAcceptor::from(inner.server_config.clone());
+                tokio::spawn(async move {
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
                             // Errors here mean the cert pubkey didn't
                             // resolve in the registry — the verifier
                             // should have caught this; if it didn't,
-                            // we bail rather than installing a bogus
+                            // bail rather than installing a bogus
                             // connection.
-                            let _ = handle_server_connection(inner, tls_stream).await;
+                            let _ = handle_server_connection(inner_for_conn, tls_stream).await;
                         }
                         Err(_error) => {
                             // Handshake rejected (e.g. unenrolled
@@ -223,10 +265,7 @@ impl LanTcpAdapter {
                             // action needed.
                         }
                     }
-                }
-                Err(_error) => {
-                    // Listener failed — no recovery in MVP.
-                }
+                });
             }
         });
 
@@ -242,9 +281,9 @@ impl LanTcpAdapter {
         expected_peer: PeerId,
     ) -> Result<(), LanTcpError> {
         {
-            let conn = self.inner.connection.lock().await;
-            if conn.is_some() {
-                return Err(LanTcpError::AlreadyHasConnection);
+            let connections = self.inner.connections.lock().await;
+            if connections.contains_key(&expected_peer) {
+                return Err(LanTcpError::AlreadyConnectedTo(expected_peer));
             }
         }
 
@@ -354,7 +393,7 @@ async fn install_and_spawn_loops<R, W>(
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_DEPTH);
     // Install synchronously — when this function returns, the
     // connection IS ready to receive sends.
-    *inner.connection.lock().await = Some(outbound_tx);
+    inner.connections.lock().await.insert(peer_id, outbound_tx);
 
     // Spawn the I/O loops; they continue to drive the wire after
     // this function returns.
@@ -364,7 +403,9 @@ async fn install_and_spawn_loops<R, W>(
 
 /// Read loop: pull length-prefixed JSON frames off the TLS stream
 /// and fan out to subscribers per the Transport trait's lag policy.
-async fn read_loop<R>(inner: Arc<Inner>, _peer_id: PeerId, mut read_half: R)
+/// Removes this peer's entry from `connections` on any termination
+/// (clean EOF, I/O error, malformed payload, oversized frame).
+async fn read_loop<R>(inner: Arc<Inner>, peer_id: PeerId, mut read_half: R)
 where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
 {
@@ -372,20 +413,19 @@ where
         // Read 4-byte BE length prefix.
         let mut len_bytes = [0u8; 4];
         if read_half.read_exact(&mut len_bytes).await.is_err() {
-            // Connection closed (clean EOF or error). Drop the
-            // outbound channel so senders see "not connected."
-            *inner.connection.lock().await = None;
+            // Connection closed (clean EOF or error).
+            inner.connections.lock().await.remove(&peer_id);
             return;
         }
         let len = u32::from_be_bytes(len_bytes);
         if len > MAX_FRAME_BYTES {
             // Hostile or misconfigured peer — drop the connection.
-            *inner.connection.lock().await = None;
+            inner.connections.lock().await.remove(&peer_id);
             return;
         }
         let mut payload = vec![0u8; len as usize];
         if read_half.read_exact(&mut payload).await.is_err() {
-            *inner.connection.lock().await = None;
+            inner.connections.lock().await.remove(&peer_id);
             return;
         }
 
@@ -394,7 +434,7 @@ where
             Err(_error) => {
                 // Malformed payload — drop the connection rather
                 // than silently skipping.
-                *inner.connection.lock().await = None;
+                inner.connections.lock().await.remove(&peer_id);
                 return;
             }
         };
@@ -508,9 +548,39 @@ impl Transport for LanTcpAdapter {
     type Error = LanTcpError;
 
     async fn send(&self, frame: Frame) -> Result<(), Self::Error> {
-        let conn = self.inner.connection.lock().await;
-        let tx = conn.as_ref().ok_or(LanTcpError::NotConnected)?;
-        tx.send(frame).await.map_err(|_| LanTcpError::NotConnected)
+        // Snapshot the sender handles under the lock, drop the lock,
+        // then dispatch — same pattern as `dispatch_to_subscribers`
+        // (don't hold a mutex across awaits).
+        let targets: Vec<(PeerId, OutboundTx)> = {
+            let connections = self.inner.connections.lock().await;
+            if connections.is_empty() {
+                return Err(LanTcpError::NoActivePeers);
+            }
+            connections
+                .iter()
+                .map(|(peer, tx)| (*peer, tx.clone()))
+                .collect()
+        };
+
+        // Broadcast: send to each connected peer. Per-peer failures
+        // are tolerated (peer may have dropped between snapshot and
+        // send); the read loop will GC the dead entry. We treat the
+        // send as successful if at least one peer received it.
+        let mut delivered_any = false;
+        let mut last_error: Option<LanTcpError> = None;
+        for (_peer, tx) in targets {
+            match tx.send(frame.clone()).await {
+                Ok(()) => delivered_any = true,
+                Err(_closed) => {
+                    last_error = Some(LanTcpError::NoActivePeers);
+                }
+            }
+        }
+        if delivered_any {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or(LanTcpError::NoActivePeers))
+        }
     }
 
     async fn subscribe(
@@ -694,7 +764,7 @@ mod tests {
         // protocol property, not a substrate bug. The substrate
         // guarantee is that no frames can flow: Alice never installs
         // a connection, so a subsequent `alice.send()` MUST fail with
-        // `NotConnected`.
+        // `NoActivePeers`.
         let _ = stranger.connect(bound, alice_id).await;
         // Give the server side a moment to observe the rejected
         // handshake and tear the connection down.
@@ -705,18 +775,121 @@ mod tests {
             .send(frame_at(1, channel, "should never arrive"))
             .await;
         assert!(
-            matches!(send_result, Err(LanTcpError::NotConnected)),
+            matches!(send_result, Err(LanTcpError::NoActivePeers)),
             "Alice must have no installed connection after refusing stranger's handshake; got {send_result:?}"
         );
     }
 
     #[tokio::test]
-    async fn send_without_connection_returns_not_connected() {
+    async fn three_peers_all_connect_and_alice_broadcasts() {
+        // Pin the multi-peer contract: Alice listens, Bob + Charlie
+        // both dial Alice. Alice's `connected_peers()` reports both
+        // remote peers; her `send()` broadcasts to both; both
+        // streams receive the frame within a reasonable window.
+        ensure_crypto_provider();
+        let alice_id = PeerId::from_u128(0xa1);
+        let bob_id = PeerId::from_u128(0xb2);
+        let charlie_id = PeerId::from_u128(0xcc);
+        let alice_kp = PeerKeypair::generate();
+        let bob_kp = PeerKeypair::generate();
+        let charlie_kp = PeerKeypair::generate();
+
+        // All three enrolled in the shared registry.
+        let mut registry = PeerKeyRegistry::new();
+        registry
+            .enrol(alice_id, 0, alice_kp.public_bytes())
+            .unwrap();
+        registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
+        registry
+            .enrol(charlie_id, 0, charlie_kp.public_bytes())
+            .unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+
+        let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
+        let bob = LanTcpAdapter::new(bob_id, bob_kp, registry.clone()).unwrap();
+        let charlie = LanTcpAdapter::new(charlie_id, charlie_kp, registry).unwrap();
+
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+
+        let mut bob_stream = bob
+            .subscribe(Subscription {
+                channel: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut charlie_stream = charlie
+            .subscribe(Subscription {
+                channel: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        bob.connect(bound, alice_id).await.unwrap();
+        charlie.connect(bound, alice_id).await.unwrap();
+
+        // Give Alice's accept loop a moment to install both
+        // connections post-handshake.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alice_peers = alice.connected_peers().await;
+        assert_eq!(
+            alice_peers.len(),
+            2,
+            "Alice should see both Bob and Charlie connected; got {alice_peers:?}"
+        );
+        assert!(alice_peers.contains(&bob_id));
+        assert!(alice_peers.contains(&charlie_id));
+
+        let channel = RoomId::from_u128(0xc0ffee);
+        alice
+            .send(frame_at(1, channel, "broadcast to all"))
+            .await
+            .unwrap();
+
+        let recv_bob = tokio::time::timeout(Duration::from_secs(3), bob_stream.next())
+            .await
+            .expect("bob must receive within 3s")
+            .expect("bob stream must yield")
+            .expect("bob frame must parse");
+        let recv_charlie = tokio::time::timeout(Duration::from_secs(3), charlie_stream.next())
+            .await
+            .expect("charlie must receive within 3s")
+            .expect("charlie stream must yield")
+            .expect("charlie frame must parse");
+        assert_eq!(recv_bob.envelope.lamport, 1);
+        assert_eq!(recv_charlie.envelope.lamport, 1);
+    }
+
+    #[tokio::test]
+    async fn connect_to_same_peer_twice_returns_typed_error() {
+        // Multi-peer contract: different peers OK, same peer twice
+        // is `AlreadyConnectedTo(peer)`.
+        let (alice_id, alice, _bob_id, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+        // Bob already has a connection to Alice. Second connect to
+        // Alice must surface AlreadyConnectedTo.
+        let second = bob.connect(bound, alice_id).await;
+        assert!(
+            matches!(second, Err(LanTcpError::AlreadyConnectedTo(peer)) if peer == alice_id),
+            "expected AlreadyConnectedTo(alice), got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_no_active_peers_returns_typed_error() {
         // Sending before listen/connect should surface a typed error,
         // not panic or block forever.
         let (_alice_id, alice, _bob_id, _bob) = make_paired_adapters();
         let channel = RoomId::from_u128(0xc0ffee);
         let result = alice.send(frame_at(1, channel, "into the void")).await;
-        assert!(matches!(result, Err(LanTcpError::NotConnected)));
+        assert!(matches!(result, Err(LanTcpError::NoActivePeers)));
     }
 }
