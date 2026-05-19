@@ -19,4 +19,11 @@ pub enum MonitorAction {
         #[arg(long)]
         my_name: String,
     },
+
+    /// Attach to the local messages.jsonl stream without owning transport.
+    Attach {
+        /// Current local display name.
+        #[arg(long)]
+        my_name: String,
+    },
 }

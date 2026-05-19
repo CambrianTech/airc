@@ -309,6 +309,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$_airc_rs" monitor format', body)
         self.assertIn("airc-rs is required for monitor format", body)
 
+    def test_attach_log_tail_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
+        start = source.index("_join_attach_local_stream()")
+        end = source.index("_join_emit_join_events()", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.log_tail", body)
+        self.assertIn('"$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach', body)
+        self.assertIn("airc-rs is required for monitor attach", body)
+
 
 if __name__ == "__main__":
     unittest.main()

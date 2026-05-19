@@ -271,7 +271,7 @@ _join_restart_scope_processes() {
     kill -0 "$_candidate" 2>/dev/null || continue
     _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
     case "$_candidate_cmd" in
-      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
+      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
       *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
       *) continue ;;
     esac
@@ -314,7 +314,7 @@ _join_scope_transport_pids() {
       [ "$_pid" = "$PPID" ] && continue
       _cmd=$(proc_cmdline "$_pid" || true)
       case "$_cmd" in
-        *airc_core.log_tail*) continue ;;
+        *airc_core.log_tail*|*airc-rs*monitor*attach*) continue ;;
         *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
           _pids="$_pids $_pid"
           ;;
@@ -392,10 +392,15 @@ _join_attach_local_stream() {
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
   local _tail_name; _tail_name=$(get_name 2>/dev/null || echo "airc")
+  local _airc_rs; _airc_rs=$(airc_rs_bin 2>/dev/null || true)
+  if [ -z "$_airc_rs" ]; then
+    echo "airc: airc-rs is required for monitor attach" >&2
+    return 127
+  fi
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
+    AIRC_CLIENT_ID="$_client_id" exec "$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
   else
-    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$_tail_name"
+    exec "$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
   fi
 }
 
