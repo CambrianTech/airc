@@ -173,6 +173,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" gist get .resources.core.remaining', body)
         self.assertIn('"$(airc_rs_bin)" gist get .resources.core.limit', body)
 
+    def test_whois_pretty_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_identity.sh").read_text(encoding="utf-8")
+        start = source.index("_whois_pretty()")
+        end = source.index("# cmd_kick extracted", start)
+        body = source[start:end]
+
+        self.assertNotIn("python3 <<", body)
+        self.assertIn('"$(airc_rs_bin)" identity pretty', body)
+
 
 if __name__ == "__main__":
     unittest.main()

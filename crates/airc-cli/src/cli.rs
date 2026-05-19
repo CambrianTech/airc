@@ -19,6 +19,7 @@ use airc_lib::PeerSpec;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
 use crate::gist_cli::GistArgs;
+use crate::identity_cli::IdentityArgs;
 use crate::route_cli::RouteArgs;
 use crate::transport_cli::TransportArgs;
 use crate::work_cli::WorkArgs;
@@ -90,6 +91,9 @@ pub enum Command {
 
     /// Read and update legacy config.json during Rust cutover.
     Config(ConfigArgs),
+
+    /// Identity and whois helpers during Rust cutover.
+    Identity(IdentityArgs),
 
     /// Send a single text Message frame to the current room and exit.
     /// The current room lives in `<home>/room.json`; switch with
