@@ -261,13 +261,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "blocked on airc-transport fs2 LocalFsAdapter Windows file-lock semantics — \
-                  the daemon IPC layer is correct here, but `send` ultimately calls into \
-                  LocalFsAdapter which hits ERROR_ACCESS_DENIED on Windows. Tracked as \
-                  follow-up slice 3 (Transport send correctness) per the operating doc."
-    )]
     async fn subscribe_then_send_then_inbox_round_trips() {
         // The big daemon e2e: subscribe to a wire, send a frame
         // (daemon's own send writes to the wire), inbox returns it.

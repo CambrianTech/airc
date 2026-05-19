@@ -120,12 +120,7 @@ impl Transport for LocalFsAdapter {
         // doesn't have a tokio-native equivalent and rolling our own
         // ioctl invocation would be more risk than this is worth.
         tokio::task::spawn_blocking(move || -> Result<(), LocalFsError> {
-            use std::fs::OpenOptions as StdOpenOptions;
-
-            let file = StdOpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
+            let file = open_for_append_shared(&path)?;
             // Exclusive cross-process flock. Other writers (in this
             // process or any other) block here until we release. The
             // lock is released when `file` drops at end of block.
@@ -202,6 +197,53 @@ fn write_then_maybe_sync(
     Ok(())
 }
 
+/// Open the frames file for append with permissive share modes so
+/// concurrent readers (subscribers tailing the file) and other writers
+/// can coexist. Unix opens are permissive by default; Windows defaults
+/// to `FILE_SHARE_NONE` (exclusive), which would lock subscribers out
+/// the moment a sender holds the handle for the flock + write critical
+/// section — surfacing as ERROR_ACCESS_DENIED on the reader side and
+/// breaking every multi-process test. Explicitly granting share rights
+/// here restores cross-platform parity with the Unix open(2) defaults.
+fn open_for_append_shared(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    apply_windows_share_mode(&mut options);
+    options.open(path)
+}
+
+/// Async counterpart for the subscriber tail loop. Same share-mode
+/// rationale as `open_for_append_shared`.
+async fn open_for_read_shared(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    apply_windows_share_mode_async(&mut options);
+    options.open(path).await
+}
+
+#[cfg(windows)]
+fn apply_windows_share_mode(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. Matches
+    // the permissive sharing Unix opens give by default. Without this
+    // a concurrent reader or writer hits ERROR_ACCESS_DENIED.
+    options.share_mode(0x1 | 0x2 | 0x4);
+}
+
+#[cfg(not(windows))]
+fn apply_windows_share_mode(_options: &mut std::fs::OpenOptions) {
+    // Unix opens are permissive by default; nothing to do.
+}
+
+#[cfg(windows)]
+fn apply_windows_share_mode_async(options: &mut tokio::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.share_mode(0x1 | 0x2 | 0x4);
+}
+
+#[cfg(not(windows))]
+fn apply_windows_share_mode_async(_options: &mut tokio::fs::OpenOptions) {}
+
 /// Background tail loop: poll the frames file, parse new lines, filter
 /// against the subscription, and ship matches through `tx`.
 async fn tail_loop(
@@ -268,7 +310,7 @@ async fn drain_new_lines(
     subscription: &Subscription,
     tx: &mpsc::Sender<Result<Frame, LocalFsError>>,
 ) -> Result<u64, LocalFsError> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = open_for_read_shared(path).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -688,12 +730,12 @@ mod tests {
         // Now truncate the file. Subscriber's tail loop has its
         // offset positioned at the end of frame_1. Without the
         // truncation-detection branch, the subscriber would stall.
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(adapter.frames_path())
-            .await
-            .unwrap();
+        {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).truncate(true);
+            apply_windows_share_mode_async(&mut options);
+            options.open(adapter.frames_path()).await.unwrap();
+        }
 
         // Give the tail loop one poll cycle to observe the shrunk
         // file and reset its offset.

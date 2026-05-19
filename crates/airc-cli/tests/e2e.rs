@@ -48,13 +48,6 @@ fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "blocked on airc-transport fs2 LocalFsAdapter Windows file-lock semantics — \
-              two airc-rs processes sharing a wire dir hit ERROR_ACCESS_DENIED on the \
-              append+exclusive-flock path. Tracked as follow-up slice 3 (Transport send \
-              correctness) per the operating doc."
-)]
 fn two_airc_rs_processes_chat_over_local_fs() {
     // Alice runs `airc-rs listen`; Bob runs `airc-rs send`; Alice's
     // stdout MUST contain the message body within a few seconds. No
@@ -145,12 +138,6 @@ fn run_room(home: &Path, name: &str, wire: &Path) {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "blocked on airc-transport fs2 LocalFsAdapter Windows file-lock semantics — \
-              same root cause as two_airc_rs_processes_chat_over_local_fs. Tracked as \
-              follow-up slice 3 (Transport send correctness) per the operating doc."
-)]
 fn listen_rejects_unenrolled_signer() {
     // Mallory's signed frame must be rejected by Alice's listen — she
     // isn't in Alice's peer registry. Stderr surfaces a verification
