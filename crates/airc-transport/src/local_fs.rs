@@ -237,7 +237,8 @@ fn apply_windows_share_mode(_options: &mut std::fs::OpenOptions) {
 
 #[cfg(windows)]
 fn apply_windows_share_mode_async(options: &mut tokio::fs::OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
+    // `share_mode` is an inherent method on tokio's `OpenOptions`
+    // (not via the std extension trait), so no `use` needed here.
     options.share_mode(0x1 | 0x2 | 0x4);
 }
 
