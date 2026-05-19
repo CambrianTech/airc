@@ -30,10 +30,13 @@
 #![deny(unsafe_code)]
 
 pub mod handlers;
+pub mod identity;
 pub mod ipc;
 pub mod peers_store;
 pub mod server;
 pub mod state;
+
+pub use identity::{IdentityError, LocalIdentity};
 
 pub use ipc::client::{ClientError, DaemonClient};
 pub use ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};

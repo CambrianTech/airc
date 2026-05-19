@@ -13,9 +13,6 @@
 
 mod cli;
 mod commands;
-mod identity;
-mod registry;
-mod room;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,8 +23,8 @@ use uuid::Uuid;
 
 use airc_core::PeerId;
 
+use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
-use identity::LocalIdentity;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     let uuid = Uuid::from_str(input)

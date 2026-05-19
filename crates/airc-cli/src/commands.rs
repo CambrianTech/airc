@@ -21,13 +21,10 @@ use futures::stream::StreamExt;
 
 use airc_daemon::{
     peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, InboxRequest,
-    SendRequest, SubscribeRequest,
+    LocalIdentity, SendRequest, SubscribeRequest,
 };
+use airc_lib::{format_peer_spec, room, PeerSpec, Room};
 use airc_store::{EventStore, SqliteEventStore};
-
-use crate::identity::LocalIdentity;
-use crate::registry::{format_peer_spec, PeerSpec};
-use crate::room::{self, Room};
 
 /// `init` — create or load the persisted identity under `<home>`,
 /// auto-create the default room, then print the peer spec.

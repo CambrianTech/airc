@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::registry::PeerSpec;
+use airc_lib::PeerSpec;
 
 /// Default home directory for persisted identity + IPC state.
 ///
