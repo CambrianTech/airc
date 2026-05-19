@@ -183,6 +183,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::ChannelGist(args) => match args.action {
+            ChannelGistAction::Resolve {
+                channel,
+                create_if_missing,
+                require_invite,
+            } => channel_gist_commands::run_resolve(&channel, create_if_missing, require_invite),
             ChannelGistAction::Find {
                 channel,
                 require_invite,
@@ -190,6 +195,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ChannelGistAction::HostPreflight { channel, config } => {
                 channel_gist_commands::run_host_preflight(&channel, config.as_deref())
             }
+            ChannelGistAction::RememberCreated {
+                channel,
+                gist_id,
+                description,
+                payload_file,
+            } => channel_gist_commands::run_remember_created(
+                &channel,
+                &gist_id,
+                &description,
+                &payload_file,
+            ),
         },
 
         Command::Identity(args) => match args.action {

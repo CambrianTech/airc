@@ -271,8 +271,12 @@ class CodexRustCutoverTests(unittest.TestCase):
 
         self.assertNotIn("airc_core.channel_gist find", combined)
         self.assertNotIn("airc_core.channel_gist host-preflight", combined)
+        self.assertNotIn("airc_core.channel_gist resolve", combined)
+        self.assertNotIn("airc_core.channel_gist remember-created", combined)
         self.assertIn('"$(airc_rs_bin)" channel-gist find', combined)
         self.assertIn('"$(airc_rs_bin)" channel-gist host-preflight', combined)
+        self.assertIn('"$(airc_rs_bin)" channel-gist resolve', combined)
+        self.assertIn('"$(airc_rs_bin)" channel-gist remember-created', combined)
 
 
 if __name__ == "__main__":

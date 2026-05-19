@@ -3,14 +3,28 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::gh_state::{
     backoff_until, now_seconds, record_backoff, reserve_guarded_request, split_include_output,
 };
 
 const GIST_LIST_LIMIT: usize = 100;
+
+pub fn run_resolve(
+    channel: &str,
+    create_if_missing: bool,
+    require_invite: bool,
+) -> Result<(), Box<dyn Error>> {
+    let Some(gist_id) = resolve(channel, create_if_missing, require_invite)? else {
+        return Err("channel gist could not be resolved".into());
+    };
+    println!("{gist_id}");
+    Ok(())
+}
 
 pub fn run_find(channel: &str, require_invite: bool) -> Result<(), Box<dyn Error>> {
     if let Some(gist_id) = find_existing(channel, require_invite)? {
@@ -19,6 +33,47 @@ pub fn run_find(channel: &str, require_invite: bool) -> Result<(), Box<dyn Error
     } else {
         Err("channel gist not found".into())
     }
+}
+
+pub fn run_remember_created(
+    channel: &str,
+    gist_id: &str,
+    description: &str,
+    payload_file: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let envelope: Value = serde_json::from_str(&fs::read_to_string(payload_file)?)?;
+    remember_created_gist(gist_id, channel, description, envelope)?;
+    Ok(())
+}
+
+fn resolve(
+    channel: &str,
+    create_if_missing: bool,
+    require_invite: bool,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if channel.is_empty() {
+        return Ok(None);
+    }
+    let attempts = if env::var("AIRC_RESOLVE_NO_RETRY").ok().as_deref() == Some("1") {
+        1
+    } else {
+        3
+    };
+    let mut unavailable = false;
+    for attempt in 0..attempts {
+        match find_existing_with_state(channel, require_invite)? {
+            Discovery::Found(gist_id) => return Ok(Some(gist_id)),
+            Discovery::Unavailable => unavailable = true,
+            Discovery::Missing => {}
+        }
+        if attempt < attempts - 1 {
+            thread::sleep(Duration::from_millis(1500 * (attempt as u64 + 1)));
+        }
+    }
+    if create_if_missing && !require_invite && !unavailable && backoff_until() <= now_seconds() {
+        return create_new(channel);
+    }
+    Ok(None)
 }
 
 pub fn run_host_preflight(channel: &str, config: Option<&Path>) -> Result<(), Box<dyn Error>> {
@@ -197,6 +252,97 @@ fn get_gist(gist_id: &str) -> Result<Option<Value>, Box<dyn Error>> {
     Ok(serde_json::from_str(body.trim()).ok())
 }
 
+fn create_new(channel: &str) -> Result<Option<String>, Box<dyn Error>> {
+    if backoff_until() > now_seconds() {
+        return Ok(None);
+    }
+    let envelope = json!({
+        "airc": 1,
+        "kind": "mesh",
+        "channels": [channel],
+    });
+    let tmpdir = env::temp_dir().join(format!(
+        "airc-channel-gist-{}-{}",
+        std::process::id(),
+        now_seconds() as u64
+    ));
+    fs::create_dir_all(&tmpdir)?;
+    let seed_path = tmpdir.join(format!("airc-room-{channel}.json"));
+    fs::write(&seed_path, serde_json::to_vec(&envelope)?)?;
+    let description = format!("airc room: #{channel} (post-3c per-channel gist)");
+    let args = vec![
+        "gist".to_string(),
+        "create".to_string(),
+        "-d".to_string(),
+        description.clone(),
+        seed_path.display().to_string(),
+    ];
+    let result = create_new_with_args(&args);
+    let _ = fs::remove_dir_all(&tmpdir);
+    let gist_id = result?;
+    if let Some(gist_id) = gist_id.as_deref() {
+        remember_created_gist(gist_id, channel, &description, envelope)?;
+    }
+    Ok(gist_id)
+}
+
+fn create_new_with_args(args: &[String]) -> Result<Option<String>, Box<dyn Error>> {
+    let (allowed, _) = reserve_guarded_request(args, now_seconds())?;
+    if !allowed {
+        return Ok(None);
+    }
+    let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let Ok(output) = Command::new(gh).args(args).output() else {
+        return Ok(None);
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        record_backoff(&format!("{stderr}{stdout}"));
+        return Ok(None);
+    }
+    let gist_id = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.rsplit('/').next())
+        .map(str::trim)
+        .filter(|value| valid_gist_id(value))
+        .map(ToOwned::to_owned);
+    Ok(gist_id)
+}
+
+fn remember_created_gist(
+    gist_id: &str,
+    channel: &str,
+    description: &str,
+    envelope: Value,
+) -> Result<(), Box<dyn Error>> {
+    if !valid_gist_id(gist_id) {
+        return Ok(());
+    }
+    let mut cached = load_cached_gist_list(f64::INFINITY).unwrap_or_default();
+    cached.retain(|gist| gist.get("id").and_then(Value::as_str) != Some(gist_id));
+    let filename = format!("airc-room-{channel}.json");
+    cached.insert(
+        0,
+        json!({
+            "id": gist_id,
+            "description": description,
+            "created_at": now_iso_utc(),
+            "updated_at": now_iso_utc(),
+            "files": {
+                filename.clone(): {
+                    "filename": filename,
+                    "content": serde_json::to_string(&envelope)?,
+                }
+            }
+        }),
+    );
+    cached.truncate(GIST_LIST_LIMIT);
+    save_cached_gist_list(&cached);
+    Ok(())
+}
+
 fn choose_canonical<'a>(matches: impl Iterator<Item = &'a Value>, channel: &str) -> Option<String> {
     let matches: Vec<&Value> = matches.collect();
     let prefix = format!("airc room: #{channel}");
@@ -312,6 +458,9 @@ fn valid_gist_id(gist_id: &str) -> bool {
 }
 
 fn cache_path() -> PathBuf {
+    if let Some(path) = env::var_os("AIRC_GH_GIST_LIST_CACHE_PATH") {
+        return PathBuf::from(path);
+    }
     let suffix = state_suffix();
     env::temp_dir().join(format!("airc-gh-gist-list-{suffix}.json"))
 }
@@ -348,6 +497,16 @@ fn save_cached_gist_list(gists: &[Value]) {
     }
 }
 
+fn now_iso_utc() -> String {
+    let seconds = now_seconds() as i64;
+    let Some(datetime) = chrono::DateTime::from_timestamp(seconds, 0) else {
+        return "1970-01-01T00:00:00Z".to_string();
+    };
+    datetime
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .replace("+00:00", "Z")
+}
+
 fn env_f64(name: &str, default: f64) -> f64 {
     env::var(name)
         .ok()
@@ -368,6 +527,14 @@ impl Error for ExitCodeError {}
 
 pub fn command_exit_code(error: &(dyn Error + 'static)) -> Option<u8> {
     error.downcast_ref::<ExitCodeError>().map(|error| error.0)
+}
+
+#[cfg(test)]
+fn scoped_cache_path(suffix: &str) -> PathBuf {
+    env::temp_dir().join(format!(
+        "airc-channel-gist-test-{}-{suffix}.json",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -413,6 +580,33 @@ mod tests {
         assert_eq!(
             choose_canonical([generic, room].iter(), "general"),
             Some("aaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn remember_created_updates_discovery_cache() {
+        let path = scoped_cache_path("remember");
+        temp_env::with_var(
+            "AIRC_GH_GIST_LIST_CACHE_PATH",
+            Some(path.as_os_str()),
+            || {
+                let _ = fs::remove_file(&path);
+                remember_created_gist(
+                    "0123456789abcdef",
+                    "general",
+                    "airc room: #general",
+                    json!({"channels":["general"]}),
+                )
+                .unwrap();
+
+                let cached = load_cached_gist_list(f64::INFINITY).unwrap();
+                assert_eq!(cached[0]["id"], "0123456789abcdef");
+                assert_eq!(
+                    cached[0]["files"]["airc-room-general.json"]["filename"],
+                    "airc-room-general.json"
+                );
+                let _ = fs::remove_file(&path);
+            },
         );
     }
 }

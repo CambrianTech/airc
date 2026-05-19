@@ -86,7 +86,7 @@ _join_phase_done() {
 #      --first: prepend (sets the scope's default channel).
 #      default: append.
 #   2. Resolve-or-create the canonical gist for the channel on the
-#      user's gh account (airc_core.channel_gist resolve
+#      user's gh account (airc-rs channel-gist resolve
 #      --create-if-missing). Idempotent across runs.
 #   3. Persist the channel→gist mapping in channel_gists{} so cmd_send's
 #      route-by-channel and the multi-channel monitor's per-channel
@@ -150,7 +150,7 @@ ensure_channel_subscribed_with_gist() {
     _gid=""
   fi
   if [ -z "$_gid" ]; then
-    _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+    _gid=$("$(airc_rs_bin)" channel-gist resolve \
            --channel "$channel" --create-if-missing 2>"$_err")
   fi
   if [ -z "$_gid" ]; then
@@ -776,7 +776,7 @@ cmd_connect() {
       airc_config_subscribe "$room_name" "$CONFIG" 0 2>/dev/null || true
       # Resolve --create-if-missing: returns the gist id (find existing
       # or create new gist named "airc room: #<channel>").
-      local _new_gist; _new_gist=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+      local _new_gist; _new_gist=$("$(airc_rs_bin)" channel-gist resolve \
           --channel "$room_name" --create-if-missing 2>&1)
       if [ -n "$_new_gist" ] && printf '%s' "$_new_gist" | grep -qE '^[0-9a-f]{32}$'; then
         # Save the channel→gist mapping in config so cmd_send can route to it.
@@ -2170,7 +2170,7 @@ JSON
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
           if [ "$use_room" = "1" ]; then
-            "$AIRC_PYTHON" -m airc_core.channel_gist remember-created \
+            "$(airc_rs_bin)" channel-gist remember-created \
               --channel "$room_name" \
               --gist-id "$_gist_id" \
               --description "$_gist_desc" \
