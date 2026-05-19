@@ -18,6 +18,7 @@ use airc_lib::PeerSpec;
 
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::gist_cli::GistArgs;
+use crate::route_cli::RouteArgs;
 use crate::work_cli::WorkArgs;
 
 /// Default home directory for persisted identity + IPC state.
@@ -195,6 +196,9 @@ pub enum Command {
 
     /// Manage the persisted peer registry (`<home>/peers.json`).
     Peer(PeerArgs),
+
+    /// Inspect transport route policy and candidate selection.
+    Route(RouteArgs),
 
     /// Inspect persisted events through subscription-style filters.
     Events(crate::events_cli::EventsArgs),

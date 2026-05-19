@@ -29,6 +29,8 @@ mod lane_cli;
 mod lane_commands;
 mod log_cli;
 mod log_commands;
+mod route_cli;
+mod route_commands;
 mod work_cli;
 mod work_commands;
 mod workspace_cli;
@@ -50,6 +52,7 @@ use events_cli::EventsAction;
 use gist_cli::GistAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
+use route_cli::RouteAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
 
@@ -137,6 +140,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await
             }
             PeerAction::List => commands::run_peer_list(&home).await,
+        },
+
+        Command::Route(args) => match args.action {
+            RouteAction::Status(args) => route_commands::run_status(args),
         },
 
         Command::Events(args) => match args.action {
