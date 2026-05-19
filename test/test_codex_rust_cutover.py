@@ -278,6 +278,20 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" channel-gist resolve', combined)
         self.assertIn('"$(airc_rs_bin)" channel-gist remember-created', combined)
 
+    def test_bearer_send_paths_use_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "airc",
+                REPO / "lib/airc_bash/cmd_send.sh",
+            ]
+        )
+
+        self.assertNotIn("airc_core.bearer_cli send ", combined)
+        self.assertNotIn("airc_core.bearer_cli send-batch", combined)
+        self.assertIn('"$(airc_rs_bin)" bearer send ', combined)
+        self.assertIn('"$(airc_rs_bin)" bearer send-batch', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

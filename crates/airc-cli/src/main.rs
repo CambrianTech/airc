@@ -11,6 +11,8 @@
 //! generating if absent). `VerificationPolicy::Strict` is the only
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
+mod bearer_cli;
+mod bearer_commands;
 mod bearer_state;
 mod channel_gist_cli;
 mod channel_gist_commands;
@@ -65,6 +67,7 @@ use uuid::Uuid;
 use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
+use bearer_cli::BearerAction;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
@@ -113,6 +116,39 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Init => commands::run_init(&home).await,
 
         Command::BearerState { path } => bearer_state::run(&path),
+
+        Command::Bearer(args) => match args.action {
+            BearerAction::Send {
+                peer_id,
+                channel,
+                host_target,
+                identity_key,
+                remote_home,
+                room_gist_id,
+            } => bearer_commands::run_send(
+                &peer_id,
+                &channel,
+                host_target.as_deref(),
+                identity_key.as_deref(),
+                remote_home.as_deref(),
+                room_gist_id.as_deref(),
+            ),
+            BearerAction::SendBatch {
+                peer_id,
+                channel,
+                host_target,
+                identity_key,
+                remote_home,
+                room_gist_id,
+            } => bearer_commands::run_send_batch(
+                &peer_id,
+                &channel,
+                host_target.as_deref(),
+                identity_key.as_deref(),
+                remote_home.as_deref(),
+                room_gist_id.as_deref(),
+            ),
+        },
 
         Command::Config(args) => match args.action {
             ConfigAction::Get {

@@ -16,6 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
+use crate::bearer_cli::BearerArgs;
 use crate::channel_gist_cli::ChannelGistArgs;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
@@ -93,6 +94,9 @@ pub enum Command {
         /// bearer_state.<channel>.json path to read.
         path: PathBuf,
     },
+
+    /// Legacy bearer transport helpers during Rust cutover.
+    Bearer(BearerArgs),
 
     /// Read and update legacy config.json during Rust cutover.
     Config(ConfigArgs),

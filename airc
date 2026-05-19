@@ -2009,7 +2009,7 @@ $_batch_route
 EOF
     if [ "$_batch_ok" = "ok" ] && [ -n "$_batch_gist" ]; then
       local _batch_outcome _batch_kind
-      _batch_outcome=$(cat "$snapshot" | "$AIRC_PYTHON" -m airc_core.bearer_cli send-batch \
+      _batch_outcome=$(cat "$snapshot" | "$(airc_rs_bin)" bearer send-batch \
         all "$_batch_channel" --room-gist-id "$_batch_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
       _batch_kind=$(printf '%s' "$_batch_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
       if [ "$_batch_kind" = "delivered" ]; then
@@ -2067,7 +2067,7 @@ EOF
       fi
 
       local _outcome _kind
-      _outcome=$(printf '%s' "$_wire" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+      _outcome=$(printf '%s' "$_wire" | "$(airc_rs_bin)" bearer send \
         "${_line_to:-all}" "$_line_channel" \
         --room-gist-id "$_line_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
       _kind=$(printf '%s' "$_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
