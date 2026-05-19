@@ -27,8 +27,9 @@ pub mod transport;
 // Re-exports — stable public surface.
 pub use error::LocalFsError;
 pub use lan_tcp::{
-    extract_ed25519_pubkey, generate_self_signed_cert, CertGenError, CertParseError,
-    PinnedClientVerifier, PinnedServerVerifier,
+    build_client_config, build_server_config, extract_ed25519_pubkey, generate_self_signed_cert,
+    CertGenError, CertParseError, LanTcpAdapter, LanTcpError, PinnedClientVerifier,
+    PinnedServerVerifier, TlsConfigError,
 };
 pub use local_fs::LocalFsAdapter;
 pub use transport::{FrameStream, Transport};

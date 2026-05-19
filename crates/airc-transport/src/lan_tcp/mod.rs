@@ -16,15 +16,18 @@
 //!     reject.
 //!   - Cert decode failure / wrong SPKI algorithm → reject.
 //!
-//! This module owns the cryptographic *infrastructure* — cert
-//! generation and pinning verifiers. The `LanTcpAdapter` (a
-//! `Transport` impl that uses these verifiers to wrap real TCP
-//! connections in TLS) lands in PR-3c; this PR pins the security
-//! foundation independently so it's reviewable and testable in
-//! isolation.
+//! Module layout:
+//!   - `cert` — bidirectional cert ↔ Ed25519 pubkey bridge
+//!   - `verifier` — rustls verifiers pinned to enrolled keys
+//!   - `tls_config` — composes cert + verifier into rustls configs
+//!   - `adapter` — `LanTcpAdapter` (the `Transport` impl)
 
+pub mod adapter;
 pub mod cert;
+pub mod tls_config;
 pub mod verifier;
 
+pub use adapter::{LanTcpAdapter, LanTcpError};
 pub use cert::{extract_ed25519_pubkey, generate_self_signed_cert, CertGenError, CertParseError};
+pub use tls_config::{build_client_config, build_server_config, TlsConfigError};
 pub use verifier::{PinnedClientVerifier, PinnedServerVerifier};
