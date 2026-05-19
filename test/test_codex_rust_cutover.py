@@ -111,6 +111,19 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.logs", body)
         self.assertIn('"$(airc_rs_bin)" log "$@"', body)
 
+    def test_gistparse_runtime_paths_use_airc_rs(self):
+        files = [
+            REPO / "airc",
+            REPO / "lib/airc_bash/mesh.sh",
+            REPO / "lib/airc_bash/cmd_connect.sh",
+        ]
+        for path in files:
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("airc_core.gistparse", source, path)
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in files)
+        self.assertIn('"$(airc_rs_bin)" gist get .airc', combined)
+        self.assertIn('"$(airc_rs_bin)" gist gist-content', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

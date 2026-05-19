@@ -23,6 +23,8 @@ mod codex_start;
 mod commands;
 mod events_cli;
 mod events_commands;
+mod gist_cli;
+mod gist_commands;
 mod lane_cli;
 mod lane_commands;
 mod log_cli;
@@ -45,6 +47,7 @@ use airc_daemon::LocalIdentity;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
 use events_cli::EventsAction;
+use gist_cli::GistAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
 use work_cli::WorkAction;
@@ -143,6 +146,22 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 header_prefix,
                 limit,
             } => events_commands::run_list(&home, kind, header, header_prefix, limit).await,
+        },
+
+        Command::Gist(args) => match args.action {
+            GistAction::Get { path, default } => gist_commands::run_get(&path, &default),
+            GistAction::GetJson { path } => gist_commands::run_get_json(&path),
+            GistAction::GetFirstOf { paths, default } => {
+                gist_commands::run_get_first_of(&paths, &default)
+            }
+            GistAction::PickAddr { scope } => gist_commands::run_pick_addr(&scope),
+            GistAction::PickAddrFirst => gist_commands::run_pick_addr_first(),
+            GistAction::PickAddrNonlocalFirst => gist_commands::run_pick_addr_nonlocal_first(),
+            GistAction::PickAddrExcluding { exclude_scopes } => {
+                gist_commands::run_pick_addr_excluding(&exclude_scopes)
+            }
+            GistAction::ListLanEntries => gist_commands::run_list_lan_entries(),
+            GistAction::GistContent { channel } => gist_commands::run_gist_content(&channel),
         },
 
         Command::CodexHook(args) => match args.action {
