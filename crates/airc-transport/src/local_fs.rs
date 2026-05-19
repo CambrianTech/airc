@@ -231,11 +231,24 @@ async fn tail_loop(
         let len = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // File deleted under us (logrotate, manual cleanup,
+                // teardown). Forget our position so when a writer
+                // recreates the file we read from the start.
+                offset = 0;
                 sleep(POLL_INTERVAL).await;
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
+
+        if len < offset {
+            // Truncation or recreation detected — file is shorter
+            // than our last recorded position. Without this branch
+            // we'd wait forever for the file to grow past the stale
+            // offset, silently dropping every new frame.
+            // (Codex's #668 review finding.)
+            offset = 0;
+        }
 
         if len > offset {
             offset = drain_new_lines(&path, offset, &subscription, &tx).await?;
@@ -636,6 +649,126 @@ mod tests {
             assert_eq!(item.envelope.lamport, received);
         }
         assert_eq!(received, total_sent);
+    }
+
+    #[tokio::test]
+    async fn truncation_recovers_offset_to_start() {
+        // Codex's #668 review finding: if the log is truncated/
+        // recreated under a live subscriber whose offset has
+        // advanced past the new EOF, the subscriber must NOT stall.
+        // The tail loop has to detect `len < offset`, reset to 0,
+        // and continue reading.
+        let dir = TempDir::new().unwrap();
+        let adapter = LocalFsAdapter::new(dir.path());
+        let channel = RoomId::from_u128(0xc0ffee);
+
+        // Send a big-ish frame so the file has meaningful length.
+        // Then attach live and read it via cursor replay; offset
+        // advances past frame_1.
+        let frame_1 = frame_at(1, channel, "before-truncation");
+        adapter.send(frame_1.clone()).await.unwrap();
+
+        let sub = Subscription {
+            channel: Some(channel),
+            from_cursor: Some(TranscriptCursor {
+                lamport: 0,
+                event_id: EventId::from_u128(0),
+            }),
+            ..Default::default()
+        };
+        let mut stream = adapter.subscribe(sub).await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.envelope.lamport, 1);
+
+        // Now truncate the file. Subscriber's tail loop has its
+        // offset positioned at the end of frame_1. Without the
+        // truncation-detection branch, the subscriber would stall.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(adapter.frames_path())
+            .await
+            .unwrap();
+
+        // Give the tail loop one poll cycle to observe the shrunk
+        // file and reset its offset.
+        sleep(Duration::from_millis(100)).await;
+
+        // Send a fresh frame post-truncation. Subscriber MUST see
+        // it (the bug would have it stall here, waiting for the
+        // file to grow past the old offset).
+        let frame_2 = frame_at(2, channel, "after-truncation");
+        adapter.send(frame_2.clone()).await.unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("tail must recover from truncation within 2s")
+            .expect("stream must yield Some")
+            .expect("frame must parse");
+        assert_eq!(second.envelope.lamport, 2);
+        assert_eq!(
+            second
+                .envelope
+                .body
+                .as_ref()
+                .and_then(Body::as_text)
+                .unwrap(),
+            "after-truncation"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_then_recreation_recovers_offset() {
+        // Companion to the truncation test: outright DELETE the
+        // file and recreate via a fresh send. The tail loop's
+        // NotFound branch must also reset offset so the recreated
+        // file is read from the start.
+        let dir = TempDir::new().unwrap();
+        let adapter = LocalFsAdapter::new(dir.path());
+        let channel = RoomId::from_u128(0xc0ffee);
+
+        adapter
+            .send(frame_at(1, channel, "before-delete"))
+            .await
+            .unwrap();
+
+        let sub = Subscription {
+            channel: Some(channel),
+            from_cursor: Some(TranscriptCursor {
+                lamport: 0,
+                event_id: EventId::from_u128(0),
+            }),
+            ..Default::default()
+        };
+        let mut stream = adapter.subscribe(sub).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.envelope.lamport, 1);
+
+        // Delete the file entirely.
+        tokio::fs::remove_file(adapter.frames_path()).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        // Send recreates the file via OpenOptions::create(true).
+        adapter
+            .send(frame_at(2, channel, "after-delete"))
+            .await
+            .unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("tail must recover from deletion within 2s")
+            .expect("stream must yield Some")
+            .expect("frame must parse");
+        assert_eq!(second.envelope.lamport, 2);
     }
 
     #[tokio::test]
