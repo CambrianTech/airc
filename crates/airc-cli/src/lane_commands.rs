@@ -5,7 +5,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    Airc, ChangeWorkLaneState, CreateWorkLane, LaneId, LaneState, RepoId, WorkBoardProjection,
+    Airc, ChangeWorkLaneState, ClaimManagerHat, CreateWorkLane, LaneId, LaneState,
+    ReleaseManagerHat, RepoId, WorkBoardProjection,
 };
 
 use crate::lane_cli::CliLaneState;
@@ -50,6 +51,44 @@ pub async fn run_status(home: &Path, limit: usize) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+pub async fn run_manager_claim(
+    home: &Path,
+    repo: String,
+    ttl_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let repo = RepoId::new(repo)?;
+    airc.claim_manager_hat(ClaimManagerHat {
+        repo: repo.clone(),
+        ttl_ms,
+    })
+    .await?;
+    println!("manager_hat_claimed: repo={repo} ttl_ms={ttl_ms}");
+    Ok(())
+}
+
+pub async fn run_manager_release(
+    home: &Path,
+    repo: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let repo = RepoId::new(repo)?;
+    airc.release_manager_hat(ReleaseManagerHat { repo: repo.clone() })
+        .await?;
+    println!("manager_hat_released: repo={repo}");
+    Ok(())
+}
+
+pub async fn run_manager_status(
+    home: &Path,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let board = airc.work_board(limit).await?;
+    print_manager_status(&board);
+    Ok(())
+}
+
 fn print_status(board: &WorkBoardProjection) {
     let snapshot = board.snapshot();
     if snapshot.lanes.is_empty() {
@@ -66,6 +105,25 @@ fn print_status(board: &WorkBoardProjection) {
             cards = lane.card_ids.len(),
             repo = lane.repo,
             title = lane.title,
+        );
+    }
+}
+
+fn print_manager_status(board: &WorkBoardProjection) {
+    let snapshot = board.snapshot();
+    if snapshot.manager_hats.is_empty() {
+        println!("(no manager hats)");
+        return;
+    }
+
+    println!("manager hats: {}", snapshot.manager_hats.len());
+    for hat in &snapshot.manager_hats {
+        println!(
+            "{repo}  manager={manager}  claimed_at_ms={claimed_at_ms}  expires_at_ms={expires_at_ms}",
+            repo = hat.repo,
+            manager = hat.manager,
+            claimed_at_ms = hat.claimed_at_ms,
+            expires_at_ms = hat.expires_at_ms,
         );
     }
 }

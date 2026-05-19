@@ -30,7 +30,8 @@ pub use model::{
     WorkspaceLease, WorkspaceStatus,
 };
 pub use projection::{
-    BoardSnapshot, LaneRecord, ProjectionError, StaleClaim, WorkBoardProjection, WorkspaceRecord,
+    BoardSnapshot, LaneRecord, ManagerHat, ProjectionError, StaleClaim, WorkBoardProjection,
+    WorkspaceRecord,
 };
 pub use replay::{
     decode_transcript_work_event, project_transcript_work_events, transcript_is_work_event,

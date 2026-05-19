@@ -121,6 +121,42 @@ fn lane_create_status_and_state_drive_work_projection() {
 }
 
 #[test]
+fn lane_manager_claim_status_and_release_project_from_board() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let claim = run_ok(
+        &home,
+        &[
+            "lane",
+            "manager",
+            "claim",
+            "--repo",
+            "CambrianTech/airc",
+            "--ttl-ms",
+            "60000",
+        ],
+    );
+    assert!(claim.contains("manager_hat_claimed"));
+
+    let status = run_ok(&home, &["lane", "manager", "status"]);
+    assert!(status.contains("manager hats: 1"));
+    assert!(status.contains("CambrianTech/airc"));
+    assert!(status.contains("manager="));
+    assert!(status.contains("expires_at_ms="));
+
+    let release = run_ok(
+        &home,
+        &["lane", "manager", "release", "--repo", "CambrianTech/airc"],
+    );
+    assert!(release.contains("manager_hat_released"));
+
+    let status = run_ok(&home, &["lane", "manager", "status"]);
+    assert!(status.contains("(no manager hats)"));
+}
+
+#[test]
 fn work_board_empty_state_is_explicit() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
