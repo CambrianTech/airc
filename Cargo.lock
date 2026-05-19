@@ -79,6 +79,8 @@ dependencies = [
  "airc-protocol",
  "airc-store",
  "airc-transport",
+ "airc-work",
+ "airc-work-store",
  "async-trait",
  "base64",
  "futures",

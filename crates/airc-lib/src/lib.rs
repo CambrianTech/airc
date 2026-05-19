@@ -23,17 +23,30 @@
 
 pub mod airc;
 pub mod error;
+mod messaging;
+mod peers;
 pub mod registry;
 pub mod room;
+mod stream;
+mod time;
+mod transport;
+pub mod work;
 
-pub use airc::{Airc, EnrolledPeer, EventStream, LiveLag};
+pub use airc::Airc;
 pub use error::AircError;
+pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
+pub use stream::{EventStream, LiveLag};
+pub use work::{ClaimWorkCard, CreateWorkCard, ReleaseWorkClaim};
 
 // Convenience re-exports so consumers don't need to pull airc-core
 // just to type the common return values.
 pub use airc_core::{
     body::Body, headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
     TranscriptCursor, TranscriptEvent,
+};
+pub use airc_work::{
+    BoardSnapshot, BranchName, CardState, ClaimId, LaneId, Priority, ProjectionError, RepoId,
+    WorkBoardProjection, WorkCardId, WorkEvent, WorkspaceId,
 };
