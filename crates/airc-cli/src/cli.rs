@@ -206,6 +206,18 @@ pub enum Command {
 
     /// Coordinate workspace leases over the current room's AIRC substrate.
     Workspace(crate::workspace_cli::WorkspaceArgs),
+
+    /// Print the stable mnemonic for a hex digest.
+    Humanhash {
+        /// Hex input to convert into a mnemonic.
+        hex_input: String,
+        /// Number of words to emit.
+        #[arg(long, default_value_t = 4)]
+        words: usize,
+    },
+
+    /// Print this runtime process's client id, if one can be derived.
+    ClientId,
 }
 
 #[derive(Debug, Args)]

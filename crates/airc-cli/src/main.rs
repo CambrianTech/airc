@@ -12,6 +12,7 @@
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod cli;
+mod client_id;
 mod codex_cli;
 mod codex_commands;
 mod codex_config;
@@ -230,6 +231,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             WorkspaceAction::List { limit } => workspace_commands::run_list(&home, limit).await,
         },
+
+        Command::Humanhash { hex_input, words } => {
+            println!("{}", airc_core::humanhash(&hex_input, words)?);
+            Ok(())
+        }
+
+        Command::ClientId => {
+            let Some(value) = client_id::current_client_id()? else {
+                return Err("client id is unavailable".into());
+            };
+            println!("{value}");
+            Ok(())
+        }
     }
 }
 

@@ -761,8 +761,20 @@ set_config_val()   {
 }
 unset_config_keys() { "$AIRC_PYTHON" -m airc_core.config unset_keys --config "$CONFIG" "$@"; }
 
+airc_rs_bin() {
+  if command -v airc-rs >/dev/null 2>&1; then
+    command -v airc-rs
+    return 0
+  fi
+  local _root; _root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for _candidate in "$_root/target/release/airc-rs" "$_root/target/debug/airc-rs"; do
+    [ -x "$_candidate" ] && { printf '%s\n' "$_candidate"; return 0; }
+  done
+  die "airc-rs is required; run install.sh or cargo build --manifest-path \"$_root/Cargo.toml\" -p airc-cli"
+}
+
 airc_client_id() {
-  "$AIRC_PYTHON" -m airc_core.client_id 2>/dev/null
+  "$(airc_rs_bin)" client-id 2>/dev/null
 }
 
 # Same as get_config_val but reads from an arbitrary config.json path.
@@ -1149,7 +1161,7 @@ _have_tailscale_locally() {
 humanhash() {
   local input="${1:-}"
   [ -z "$input" ] && return 1
-  "$AIRC_PYTHON" -m airc_core.humanhash "$input"
+  "$(airc_rs_bin)" humanhash "$input"
 }
 
 sign_message() {

@@ -58,6 +58,20 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$_airc_rs" codex-start', body)
         self.assertIn("airc-rs is required for codex-start", body)
 
+    def test_runtime_identity_helpers_use_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        client_start = source.index("airc_client_id()")
+        client_end = source.index("get_config_val_in()", client_start)
+        human_start = source.index("humanhash()")
+        human_end = source.index("sign_message()", human_start)
+
+        body = source[client_start:client_end] + source[human_start:human_end]
+
+        self.assertNotIn("airc_core.client_id", body)
+        self.assertNotIn("airc_core.humanhash", body)
+        self.assertIn('"$(airc_rs_bin)" client-id', body)
+        self.assertIn('"$(airc_rs_bin)" humanhash "$input"', body)
+
 
 if __name__ == "__main__":
     unittest.main()
