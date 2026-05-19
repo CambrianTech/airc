@@ -271,7 +271,7 @@ _join_restart_scope_processes() {
     kill -0 "$_candidate" 2>/dev/null || continue
     _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
     case "$_candidate_cmd" in
-      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
+      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc-rs*handshake*) ;;
       *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
       *) continue ;;
     esac
@@ -300,10 +300,10 @@ _join_restart_scope_processes() {
 
 _join_scope_transport_pids() {
   # Scope-path catch-all for `airc join` self-heal. Pidfiles are not
-  # enough after Monitor restarts: old bearer_cli / monitor_formatter
+  # enough after Monitor restarts: old bearer/formatter
   # children can be reparented to init and keep serving the same scope
   # while the new generation also runs. Match only transport/process
-  # owners for THIS scope; leave UI-only log_tail attach streams alone.
+  # owners for THIS scope; leave UI-only attach streams alone.
   local _pids=""
   local _pid _cmd _scope_variant
   while IFS= read -r _scope_variant; do
@@ -314,8 +314,8 @@ _join_scope_transport_pids() {
       [ "$_pid" = "$PPID" ] && continue
       _cmd=$(proc_cmdline "$_pid" || true)
       case "$_cmd" in
-        *airc_core.log_tail*|*airc-rs*monitor*attach*) continue ;;
-        *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
+        *airc-rs*monitor*attach*) continue ;;
+        *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*handshake*accept-one*)
           _pids="$_pids $_pid"
           ;;
         *) continue ;;
@@ -1724,14 +1724,7 @@ cmd_connect() {
 
     local response
     local _pair_ok=1
-    # Migrated to airc_core.handshake send with proper --flags (not env
-    # vars). MSYS path-translation on Git Bash silently mangles env-var
-    # values that look like Unix paths (/Users/... → C:/Program
-    # Files/Git/Users/...) when they cross to a Windows-binary subprocess.
-    # argparse --flags are per-arg-predictable (callers can //-prefix
-    # or set MSYS2_ARG_CONV_EXCL targeted-ly). Continuum-b69f 2026-04-27
-    # traced the env-var path-mangling class.
-    response=$("$AIRC_PYTHON" -m airc_core.handshake send "$peer_host_only" "$peer_port" \
+    response=$("$(airc_rs_bin)" handshake send "$peer_host_only" "$peer_port" \
                   --my-name "$my_name" \
                   --my-host "$(whoami)@$(get_host)" \
                   --my-ssh-pub "$my_ssh_pub" \
@@ -2447,25 +2440,21 @@ JSON
     # Parent-watch (#132): the loop exits when its own parent disappears
     # (PPID=1 = reparented to init = airc parent bash died). Without
     # this, the loop survives terminal close / Monitor tool teardown /
-    # kill of the parent, keeps spawning fresh python listeners, and
+    # kill of the parent, keeps spawning fresh listeners, and
     # every joiner that hits the cached port gets a real-looking pair
-    # handshake against a ghost host. Pair-listener Python has its own
-    # 1s parent-watch thread (see airc_core.handshake._start_parent_watch)
-    # to catch the in-flight-handshake case; this loop check covers the
-    # between-iterations case before the next python is spawned.
+    # handshake against a ghost host. The Rust listener also receives
+    # --watch-pid, so in-flight accepts exit when the parent dies.
     _orphan_parent_pid=$$
     (
       # Loop while the airc parent bash is still alive. kill -0 is the
       # cheapest "is PID still running" probe (no signal sent, just an
       # error if the process is gone). When the parent dies, this exits
-      # before the next iteration so no fresh python is spawned.
+      # before the next iteration so no fresh listener is spawned.
       #
-      # --watch-pid hands the same PID to the python listener, which
-      # spawns a 1s polling thread that os._exit()s mid-accept the
-      # moment the parent dies — covering the in-flight handshake
-      # case that the bash between-iterations check can't see.
+      # --watch-pid hands the same PID to the Rust listener, which exits
+      # during accept polling the moment the parent dies.
       while kill -0 "$_orphan_parent_pid" 2>/dev/null; do
-        "$AIRC_PYTHON" -m airc_core.handshake accept_one \
+        "$(airc_rs_bin)" handshake accept-one \
           --host-port "$host_port" \
           --peers-dir "$PEERS_DIR" \
           --identity-dir "$IDENTITY_DIR" \

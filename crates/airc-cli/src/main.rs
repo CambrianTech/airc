@@ -35,6 +35,8 @@ mod gh_commands;
 mod gh_state;
 mod gist_cli;
 mod gist_commands;
+mod handshake_cli;
+mod handshake_commands;
 mod identity_cli;
 mod identity_commands;
 mod lane_cli;
@@ -76,6 +78,7 @@ use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
 use gh_cli::GhAction;
 use gist_cli::GistAction;
+use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
@@ -447,6 +450,51 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 clear_audit,
             } => gh_commands::run_audit(count, summary, reset, clear_audit),
             GhAction::Doctor { count } => gh_commands::run_doctor(count),
+        },
+
+        Command::Handshake(args) => match args.action {
+            HandshakeAction::Send {
+                host,
+                port,
+                my_name,
+                my_host,
+                my_ssh_pub,
+                my_sign_pub,
+                my_x25519_pub,
+                my_airc_home,
+                my_identity_json,
+            } => handshake_commands::run_send(
+                &host,
+                port,
+                &my_name,
+                &my_host,
+                &my_ssh_pub,
+                &my_sign_pub,
+                &my_x25519_pub,
+                &my_airc_home,
+                &my_identity_json,
+            ),
+            HandshakeAction::AcceptOne {
+                host_port,
+                peers_dir,
+                identity_dir,
+                config,
+                host_name,
+                reminder_interval,
+                airc_home,
+                messages,
+                watch_pid,
+            } => handshake_commands::run_accept_one(
+                host_port,
+                &peers_dir,
+                &identity_dir,
+                &config,
+                &host_name,
+                reminder_interval,
+                &airc_home,
+                &messages,
+                watch_pid,
+            ),
         },
 
         Command::Pending(args) => match args.action {

@@ -98,6 +98,13 @@ pub fn load_x25519_private(identity_dir: &Path) -> Result<[u8; 32], Box<dyn Erro
     read_exact_32(&identity_dir.join(X25519_PRIV), "X25519 private key")
 }
 
+pub fn load_x25519_public(identity_dir: &Path) -> Result<String, Box<dyn Error>> {
+    Ok(b64_url_no_pad(&read_exact_32(
+        &identity_dir.join(X25519_PUB),
+        "X25519 public key",
+    )?))
+}
+
 fn x25519_paths(identity_dir: &Path) -> (PathBuf, PathBuf) {
     (
         identity_dir.join(X25519_PRIV),

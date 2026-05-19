@@ -23,6 +23,7 @@ use crate::config_cli::ConfigArgs;
 use crate::envelope_cli::EnvelopeArgs;
 use crate::gh_cli::GhArgs;
 use crate::gist_cli::GistArgs;
+use crate::handshake_cli::HandshakeArgs;
 use crate::identity_cli::IdentityArgs;
 use crate::message_cli::MessageArgs;
 use crate::pending_cli::PendingArgs;
@@ -238,6 +239,9 @@ pub enum Command {
 
     /// Shared GitHub request governor.
     Gh(GhArgs),
+
+    /// TCP pairing handshake during Rust cutover.
+    Handshake(HandshakeArgs),
 
     /// Pending-queue routing helpers during Rust cutover.
     Pending(PendingArgs),

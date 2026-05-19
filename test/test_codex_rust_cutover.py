@@ -319,6 +319,14 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach', body)
         self.assertIn("airc-rs is required for monitor attach", body)
 
+    def test_handshake_runtime_paths_use_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.handshake send", source)
+        self.assertNotIn("airc_core.handshake accept_one", source)
+        self.assertIn('"$(airc_rs_bin)" handshake send', source)
+        self.assertIn('"$(airc_rs_bin)" handshake accept-one', source)
+
 
 if __name__ == "__main__":
     unittest.main()
