@@ -5,6 +5,7 @@ members = [
     "crates/airc-protocol",
     "crates/airc-transport",
     "crates/airc-store",
+    "crates/airc-work",
     "crates/airc-daemon",
     "crates/airc-lib",
     "crates/airc-cli",
