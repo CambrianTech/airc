@@ -48,20 +48,16 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
 }
 
 async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Response {
-    // Idempotent: if the inbox already exists, the subscriber task is
-    // already draining frames into it. Return Ok without spawning a
-    // duplicate.
-    if state.has_inbox(&sub.wire).await {
+    // Idempotent: if a subscriber task is already running for this
+    // wire, return Ok without spawning a duplicate.
+    if !state.register_subscriber(&sub.wire).await {
         return Response::Ok;
     }
 
-    // Create the inbox buffer + spawn the drain task.
-    let buffer = state.inbox_for(&sub.wire).await;
     let transport = state.local_fs_for(&sub.wire).await;
     let subscription = Subscription {
-        // Replay from the start of the wire — buffer captures
-        // pre-existing frames so an inbox call seconds later still
-        // sees them.
+        // Replay from the start of the wire — late `Inbox` calls
+        // still see pre-existing frames via the store.
         from_cursor: Some(TranscriptCursor {
             lamport: 0,
             event_id: EventId::from_u128(0),
@@ -78,15 +74,23 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
         }
     };
 
-    let buffer_for_task = buffer.clone();
+    let store = state.event_store.clone();
     tokio::spawn(async move {
         while let Some(item) = stream.next().await {
             match item {
                 Ok(frame) => {
-                    buffer_for_task.lock().await.push(frame);
+                    let event = frame.into_transcript_event();
+                    if let Err(err) = store.append(event).await {
+                        // Persistence failures are loud. Most likely
+                        // a duplicate replay (DuplicateEventId), which
+                        // is benign for replay-style subscriptions.
+                        // Anything else (Database, Migration, Codec)
+                        // surfaces here so the operator sees it.
+                        eprintln!("daemon subscriber: store append failed: {err}");
+                    }
                 }
                 Err(_verify_error) => {
-                    // Verification failure — don't buffer.
+                    // Verification failure — don't persist.
                     // Future: surface a counter in Status response.
                 }
             }
@@ -97,32 +101,30 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
 }
 
 async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
-    let Some(buffer) = state.inboxes.lock().await.get(&request.wire).cloned() else {
-        // No subscription on this wire — return empty inbox rather
-        // than an error so clients can call Inbox before Subscribe
-        // without an awkward warmup race.
-        return Response::Inbox(InboxResponse {
-            frames: Vec::new(),
-            newest_lamport: request.since_lamport.unwrap_or(0),
-        });
-    };
-    let buffer = buffer.lock().await;
     let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
-    let frames = buffer.since(request.since_lamport, limit);
-    // newest_lamport in the response is the max we return so the
-    // client can hand it back as since_lamport next time. If we
-    // returned no frames, echo the input cursor so the client doesn't
-    // restart from 0.
-    let newest_lamport = frames
-        .iter()
-        .map(|f| f.envelope.lamport)
-        .max()
-        .or(request.since_lamport)
-        .unwrap_or_else(|| buffer.newest_lamport());
-    Response::Inbox(InboxResponse {
-        frames,
-        newest_lamport,
-    })
+    let events = match request.since.as_ref() {
+        Some(cursor) => {
+            state
+                .event_store
+                .resume_from(cursor, request.channel, limit)
+                .await
+        }
+        None => state.event_store.page_recent(request.channel, limit).await,
+    };
+    let events = match events {
+        Ok(events) => events,
+        Err(err) => {
+            return Response::Error {
+                message: format!("inbox: {err}"),
+            };
+        }
+    };
+    // Newest cursor in the response is the cursor of the last event
+    // returned, so the client can hand it back as `since` next time.
+    // Empty page: return None so the caller knows to keep its existing
+    // cursor rather than reset to 0.
+    let newest = events.last().map(|e| e.cursor());
+    Response::Inbox(InboxResponse { events, newest })
 }
 
 async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
@@ -246,12 +248,15 @@ mod tests {
         // Keep the TempDir alive for the test's lifetime by leaking
         // it. (This is a unit-test pattern: cheap, predictable.)
         std::mem::forget(home);
+        let store: Arc<dyn airc_store::EventStore> =
+            Arc::new(airc_store::InMemoryEventStore::new());
         Arc::new(DaemonState::new(
             peer_id,
             keypair,
             registry,
             VerificationPolicy::Strict,
             home_path,
+            store,
         ))
     }
 

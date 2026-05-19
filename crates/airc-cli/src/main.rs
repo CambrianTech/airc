@@ -97,8 +97,18 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Inbox {
             socket,
             since_lamport,
+            since_event_id,
             limit,
-        } => commands::run_inbox(&home, default_or(socket, &home), since_lamport, limit).await,
+        } => {
+            commands::run_inbox(
+                &home,
+                default_or(socket, &home),
+                since_lamport,
+                since_event_id,
+                limit,
+            )
+            .await
+        }
 
         Command::Room { name, wire } => commands::run_room(&home, name, wire),
 

@@ -18,6 +18,7 @@ publish = false
 [dependencies]
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }
+airc-store = { path = "../airc-store" }
 airc-transport = { path = "../airc-transport" }
 
 async-trait = "0.1"

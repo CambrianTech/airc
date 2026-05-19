@@ -193,12 +193,15 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let home_path = home.path().to_path_buf();
         std::mem::forget(home);
+        let store: Arc<dyn airc_store::EventStore> =
+            Arc::new(airc_store::InMemoryEventStore::new());
         Arc::new(DaemonState::new(
             peer_id,
             keypair,
             registry,
             VerificationPolicy::Strict,
             home_path,
+            store,
         ))
     }
 
@@ -296,34 +299,34 @@ mod tests {
             .await
             .unwrap();
 
-        // Inbox MAY need a brief moment to drain the new frame from
-        // the subscription into the buffer.
+        // Inbox MAY need a brief moment for the subscriber task to
+        // drain the new frame from the wire's tail loop into the
+        // event store.
         let mut attempts = 0;
         let inbox = loop {
             let response = client
                 .inbox(InboxRequest {
-                    wire: wire.clone(),
-                    since_lamport: None,
+                    since: None,
+                    channel: None,
                     limit: None,
                 })
                 .await
                 .unwrap();
-            if !response.frames.is_empty() {
+            if !response.events.is_empty() {
                 break response;
             }
             attempts += 1;
             if attempts > 20 {
                 panic!(
-                    "inbox never saw the sent frame (attempts={attempts}, newest_lamport={})",
-                    response.newest_lamport
+                    "inbox never saw the sent event (attempts={attempts}, newest={:?})",
+                    response.newest
                 );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert_eq!(inbox.frames.len(), 1);
+        assert_eq!(inbox.events.len(), 1);
         assert_eq!(
-            inbox.frames[0]
-                .envelope
+            inbox.events[0]
                 .body
                 .as_ref()
                 .and_then(airc_core::Body::as_text)
@@ -331,18 +334,19 @@ mod tests {
             "hello from daemon"
         );
 
-        // newest_lamport should let us "advance past" — second inbox
-        // call returns empty.
+        // `newest` cursor should let us "advance past" — second
+        // inbox call returns empty.
+        let cursor = inbox.newest.clone().unwrap();
         let after = client
             .inbox(InboxRequest {
-                wire: wire.clone(),
-                since_lamport: Some(inbox.newest_lamport),
+                since: Some(cursor),
+                channel: None,
                 limit: None,
             })
             .await
             .unwrap();
         assert!(
-            after.frames.is_empty(),
+            after.events.is_empty(),
             "after the cursor, inbox must be empty"
         );
 
