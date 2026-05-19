@@ -6,6 +6,7 @@
 //! slices can add health probes/discovery without changing the rule
 //! that GitHub is bootstrap/migration only.
 
+use crate::route_health::TransportHealthSample;
 use crate::route_policy::{
     RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind,
 };
@@ -29,12 +30,20 @@ impl TransportResolver {
         }
     }
 
+    pub fn from_health(samples: impl IntoIterator<Item = TransportHealthSample>) -> Self {
+        Self::new(samples.into_iter().map(TransportHealthSample::candidate))
+    }
+
     pub fn candidates(&self) -> &[TransportCandidate] {
         &self.candidates
     }
 
     pub fn replace_candidates(&mut self, candidates: impl IntoIterator<Item = TransportCandidate>) {
         self.candidates = candidates.into_iter().collect();
+    }
+
+    pub fn replace_health(&mut self, samples: impl IntoIterator<Item = TransportHealthSample>) {
+        self.replace_candidates(samples.into_iter().map(TransportHealthSample::candidate));
     }
 
     pub fn resolve(&self, purpose: RoutePurpose) -> Result<TransportRoute, RouteDecision> {
@@ -48,6 +57,7 @@ impl TransportResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route_health::{TransportHealthSample, TransportHealthState};
     use crate::route_policy::{TransportKind::*, TransportRole};
 
     fn candidate(kind: TransportKind, role: TransportRole) -> TransportCandidate {
@@ -103,6 +113,25 @@ mod tests {
         );
 
         resolver.replace_candidates([candidate(Reticulum, TransportRole::Direct)]);
+
+        assert_eq!(
+            resolver.resolve(RoutePurpose::Data),
+            Ok(TransportRoute { kind: Reticulum })
+        );
+    }
+
+    #[test]
+    fn resolver_can_build_candidates_from_health_samples() {
+        let resolver = TransportResolver::from_health([
+            TransportHealthSample::down(LanTcp, TransportRole::Direct),
+            TransportHealthSample {
+                kind: Reticulum,
+                role: TransportRole::Direct,
+                state: TransportHealthState::Healthy,
+                rtt_ms: Some(80),
+                success_ppm: Some(1_000_000),
+            },
+        ]);
 
         assert_eq!(
             resolver.resolve(RoutePurpose::Data),

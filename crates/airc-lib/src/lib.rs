@@ -27,6 +27,7 @@ mod messaging;
 mod peers;
 pub mod registry;
 pub mod room;
+pub mod route_health;
 pub mod route_policy;
 pub mod route_resolver;
 mod stream;
@@ -39,6 +40,7 @@ pub use error::AircError;
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
+pub use route_health::{TransportHealthSample, TransportHealthState};
 pub use route_policy::{
     RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind, TransportRole,
 };
