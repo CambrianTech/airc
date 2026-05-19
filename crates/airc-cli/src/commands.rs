@@ -1,8 +1,9 @@
 //! Subcommand handlers — keep them small and direct. Each function
 //! takes the parsed CLI context and runs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use airc_core::{
     headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, PeerId, RoomId,
@@ -13,7 +14,9 @@ use airc_transport::{LanTcpAdapter, LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
 use uuid::Uuid;
 
+use crate::daemon::{run as run_daemon_server, DaemonState};
 use crate::identity::load_or_generate;
+use crate::ipc::{DaemonClient, SendRequest};
 use crate::registry::{build_registry, format_peer_spec, PeerSpec};
 
 /// `init` — load or generate the identity, print the peer spec.
@@ -231,6 +234,84 @@ where
             }
         }
     }
+}
+
+/// `daemon` — run the long-lived daemon process on the given socket.
+pub async fn run_daemon(
+    identity_file: &Path,
+    peer_id: PeerId,
+    peers: Vec<PeerSpec>,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let keypair = load_or_generate(identity_file)?;
+    let registry = build_registry(peer_id, keypair.public_bytes(), &peers)?;
+
+    // Ensure the socket's parent directory exists; the daemon won't
+    // create it for the user.
+    if let Some(parent) = socket.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let state = Arc::new(DaemonState::new(
+        peer_id,
+        keypair,
+        registry,
+        VerificationPolicy::Strict,
+    ));
+    println!(
+        "airc-rs daemon: peer_id={peer_id} listening on {}",
+        socket.display()
+    );
+    run_daemon_server(state, socket).await?;
+    println!("airc-rs daemon: stopped.");
+    Ok(())
+}
+
+/// `ping` — RPC the daemon. Prints "pong" on success.
+pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    client.ping().await?;
+    println!("pong");
+    Ok(())
+}
+
+/// `status` — fetch daemon's health snapshot.
+pub async fn run_status(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    let status = client.status().await?;
+    println!("peer_id:        {}", status.peer_id);
+    println!("uptime_seconds: {}", status.uptime_seconds);
+    Ok(())
+}
+
+/// `stop` — ask the daemon to shut down gracefully.
+pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    client.stop().await?;
+    println!("daemon: stop requested.");
+    Ok(())
+}
+
+/// `msg` — send via the daemon.
+pub async fn run_msg(
+    socket: PathBuf,
+    wire: PathBuf,
+    channel: &str,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channel_uuid = Uuid::from_str(channel)?;
+    let client = DaemonClient::new(socket);
+    client
+        .send(SendRequest {
+            wire,
+            channel: channel_uuid,
+            text: text.to_string(),
+        })
+        .await?;
+    println!("sent.");
+    Ok(())
 }
 
 fn print_frame(frame: &Frame) {

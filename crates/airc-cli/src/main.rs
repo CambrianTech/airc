@@ -18,7 +18,9 @@
 
 mod cli;
 mod commands;
+mod daemon;
 mod identity;
+mod ipc;
 mod registry;
 
 use std::process::ExitCode;
@@ -120,6 +122,32 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::LanListen { bind, replay } => {
             let peer_id = parsed_peer_id.ok_or("--peer-id is required for lan-listen")?;
             commands::run_lan_listen(&identity_file, peer_id, parsed.peers, bind, replay).await
+        }
+        Command::Daemon { socket } => {
+            let peer_id = parsed_peer_id.ok_or("--peer-id is required for daemon")?;
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_daemon(&identity_file, peer_id, parsed.peers, socket).await
+        }
+        Command::Ping { socket } => {
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_ping(socket).await
+        }
+        Command::Status { socket } => {
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_status(socket).await
+        }
+        Command::Stop { socket } => {
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_stop(socket).await
+        }
+        Command::Msg {
+            socket,
+            wire,
+            channel,
+            text,
+        } => {
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_msg(socket, wire, &channel, &text).await
         }
     }
 }

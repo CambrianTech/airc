@@ -7,6 +7,17 @@ use clap::{Parser, Subcommand};
 
 use crate::registry::PeerSpec;
 
+/// Default Unix socket path for the daemon. Overridable per-command
+/// via `--socket`.
+pub fn default_socket_path() -> PathBuf {
+    // ~/.airc-rs/daemon.sock if HOME is set; otherwise /tmp.
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".airc-rs").join("daemon.sock")
+    } else {
+        PathBuf::from("/tmp").join("airc-rs-daemon.sock")
+    }
+}
+
 /// airc-rs — Rust substrate CLI. Replaces the Python `airc` step by
 /// step; each subcommand exercises one slice of the substrate.
 #[derive(Debug, Parser)]
@@ -95,5 +106,48 @@ pub enum Command {
         /// Replay-mode subscription (defaults to live-only).
         #[arg(long)]
         replay: bool,
+    },
+
+    /// Start the daemon in the foreground. Holds substrate state so
+    /// subsequent short-lived CLI calls (`ping`, `msg`, `status`)
+    /// don't re-load identity or re-handshake.
+    Daemon {
+        /// Override the default socket path
+        /// (`$HOME/.airc-rs/daemon.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Probe the daemon — returns immediately if alive.
+    Ping {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Daemon health snapshot.
+    Status {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Ask the daemon to shut down gracefully.
+    Stop {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Send a text message via the running daemon (fast — no
+    /// per-call substrate setup).
+    Msg {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Wire directory the daemon should write to.
+        #[arg(long)]
+        wire: PathBuf,
+        /// Channel UUID.
+        #[arg(long)]
+        channel: String,
+        /// Message body.
+        text: String,
     },
 }
