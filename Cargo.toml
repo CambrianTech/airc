@@ -1,3 +1,8 @@
 [workspace]
-members = ["crates/airc-core", "crates/airc-blobs", "crates/airc-protocol"]
+members = [
+    "crates/airc-core",
+    "crates/airc-blobs",
+    "crates/airc-protocol",
+    "crates/airc-transport",
+]
 resolver = "2"

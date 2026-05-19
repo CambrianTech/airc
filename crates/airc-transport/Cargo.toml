@@ -1,0 +1,20 @@
+[package]
+name = "airc-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
