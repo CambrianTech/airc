@@ -28,6 +28,7 @@ mod peers;
 pub mod registry;
 pub mod room;
 pub mod route_policy;
+pub mod route_resolver;
 mod stream;
 mod time;
 mod transport;
@@ -41,6 +42,7 @@ pub use room::Room;
 pub use route_policy::{
     RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind, TransportRole,
 };
+pub use route_resolver::{TransportResolver, TransportRoute};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
