@@ -207,7 +207,14 @@ fn write_then_maybe_sync(
 /// here restores cross-platform parity with the Unix open(2) defaults.
 fn open_for_append_shared(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    // `read(true)` is required for fs2's `lock_exclusive` on Windows:
+    // LockFileEx wants the handle to grant at least GENERIC_READ. A
+    // pure-append handle (`FILE_APPEND_DATA` only) succeeds on Unix
+    // flock but Windows surfaces ERROR_ACCESS_DENIED when we try to
+    // take the cross-process lock. The handle still appends because
+    // `append(true)` flips the seek-to-end behaviour; read access is
+    // never used — it's a Windows ACL formality.
+    options.read(true).create(true).append(true);
     apply_windows_share_mode(&mut options);
     options.open(path)
 }
