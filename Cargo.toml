@@ -4,5 +4,6 @@ members = [
     "crates/airc-blobs",
     "crates/airc-protocol",
     "crates/airc-transport",
+    "crates/airc-cli",
 ]
 resolver = "2"
