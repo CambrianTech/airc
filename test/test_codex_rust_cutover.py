@@ -299,6 +299,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" bearer recv "self"', source)
         self.assertIn('pkill -f "airc-rs bearer recv.*${AIRC_WRITE_DIR}"', source)
 
+    def test_monitor_formatter_uses_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        start = source.index("monitor_formatter()")
+        end = source.index("# cmd_connect extracted", start)
+        body = source[start:end]
+
+        self.assertNotIn("airc_core.monitor_formatter", body)
+        self.assertIn('"$_airc_rs" monitor format', body)
+        self.assertIn("airc-rs is required for monitor format", body)
+
 
 if __name__ == "__main__":
     unittest.main()

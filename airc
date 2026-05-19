@@ -22,8 +22,7 @@ export AIRC_SELF
 # on PATH; Git Bash on Windows typically has `python` only (the launcher
 # from python.org). Resolve once at startup; every `python3 ...` invocation
 # downstream goes through this wrapper. Hard fail if neither is present
-# (we genuinely need Python — the inline heredocs for monitor formatting
-# and pair handshake are not yet ported to pure shell).
+# (we still need Python for the remaining legacy handshake/control slices).
 #
 # AIRC_PYTHON: resolve real Python interpreter once, propagate via env
 # var. Pre-fix (PR #153) used a bash function shim named python3
@@ -550,7 +549,7 @@ prune_pidfile_and_count() {
 # Two-phase:
 #
 #   1. kill -0 on PIDs in pidfile (the canonical, fast path)
-#   2. monitor_formatter process fallback when (1) returns no live PIDs but
+#   2. monitor formatter process fallback when (1) returns no live PIDs but
 #      a pidfile is present — covers Codex's sandbox where kill -0 across
 #      process trees can be false-negative. The formatter argv includes
 #      --peers-dir <scope>/peers, which proves the scope has a monitor
@@ -569,10 +568,13 @@ _airc_scope_monitor_formatter_pids() {
   local scope_dir="${1:-}"
   [ -n "$scope_dir" ] || return 0
   local p cmd
-  proc_airc_pids_matching 'airc_core\.monitor_formatter' 2>/dev/null | while IFS= read -r p; do
+  proc_airc_pids_matching 'airc-rs.*monitor.*format|airc_core\.monitor_formatter' 2>/dev/null | while IFS= read -r p; do
     case "$p" in ''|*[!0-9]*) continue ;; esac
     cmd=$(proc_cmdline "$p" 2>/dev/null || true)
-    printf '%s\n' "$cmd" | grep -Fq -- 'airc_core.monitor_formatter' || continue
+    case "$cmd" in
+      *airc-rs*monitor*format*|*airc_core.monitor_formatter*) ;;
+      *) continue ;;
+    esac
     _airc_cmdline_mentions_scope "$cmd" "$scope_dir/peers" || continue
     printf '%s\n' "$p"
   done
@@ -1813,32 +1815,20 @@ monitor() {
 # Read JSONL from stdin, emit one human-readable line per message.
 # Handles [rename] protocol by updating peer records on disk.
 # Read JSONL from stdin, emit one human-readable line per message.
-# Migrated to airc_core.monitor_formatter (#152 Phase 1) — same
-# stdin/stdout contract, but the python lives in a real .py file
-# (no shell-escape gymnastics, no bash-into-python heredoc fragility).
-# Bash function is a thin wrapper that invokes the module with the
-# same env vars (PEERS_DIR) and argv (my_name).
+# Rust monitor formatter. Same stdin/stdout contract as the retired
+# Python module, but live receive formatting now stays on airc-rs.
 monitor_formatter() {
   local my_name="$1"
-  # -X utf8 forces UTF-8 mode regardless of locale (cp1252 on Windows
-  # default + non-UTF-8 macOS terminals). Without it, monitor_formatter
-  # CRASHES SILENTLY on print() of any line containing unicode (→, ✓,
-  # ⚠ — all of which we use in airc system messages + peer chat). The
-  # crash kills the formatter mid-stream; bash sees the pipe close,
-  # restarts the bearer/formatter pair, and the missed event is
-  # silently lost. Symptom: substrate writes events to messages.jsonl
-  # correctly, formatter "runs," but Claude Code Monitor surfaces
-  # nothing. Joel's "your monitor code is the problem" was exactly
-  # this — caught 2026-05-02 after b69f's tail-direct workaround
-  # (which uses `python -X utf8`) wakes their AI session reliably
-  # while airc's own monitor_formatter (no -X utf8) drops events.
-  # Same fix here closes the gap at the SOURCE rather than relying on
-  # each operator to add their own tail-pipeline.
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  local _airc_rs; _airc_rs=$(airc_rs_bin 2>/dev/null || true)
+  if [ -z "$_airc_rs" ]; then
+    echo "airc: airc-rs is required for monitor format" >&2
+    return 127
+  fi
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+    AIRC_CLIENT_ID="$_client_id" "$_airc_rs" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
   else
-    "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+    "$_airc_rs" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
   fi
 }
 

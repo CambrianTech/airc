@@ -257,6 +257,9 @@ pub enum Command {
     /// Append and rotate legacy messages.jsonl files through Rust.
     Log(crate::log_cli::LogArgs),
 
+    /// Format legacy monitor JSONL streams for AI/runtime consumers.
+    Monitor(crate::monitor::MonitorArgs),
+
     /// Coordinate workspace leases over the current room's AIRC substrate.
     Workspace(crate::workspace_cli::WorkspaceArgs),
 

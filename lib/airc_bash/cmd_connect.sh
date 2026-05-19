@@ -271,7 +271,7 @@ _join_restart_scope_processes() {
     kill -0 "$_candidate" 2>/dev/null || continue
     _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
     case "$_candidate_cmd" in
-      *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
+      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc_core.monitor_formatter*|*airc_core.handshake*|*airc_core.log_tail*) ;;
       *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
       *) continue ;;
     esac
@@ -315,7 +315,7 @@ _join_scope_transport_pids() {
       _cmd=$(proc_cmdline "$_pid" || true)
       case "$_cmd" in
         *airc_core.log_tail*) continue ;;
-        *airc_core.bearer_cli*recv*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
+        *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc_core.monitor_formatter*|*airc_core.handshake*accept_one*)
           _pids="$_pids $_pid"
           ;;
         *) continue ;;

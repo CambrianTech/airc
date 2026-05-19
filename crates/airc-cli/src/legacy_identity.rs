@@ -68,6 +68,23 @@ pub fn peer_pub(peers_dir: &Path, peer_name: &str) -> Result<Option<String>, Box
     Ok(Some(b64_url_no_pad(&decoded)))
 }
 
+pub fn peer_x25519_public_raw(
+    peers_dir: &Path,
+    peer_name: &str,
+) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
+    let Some(encoded) = peer_pub(peers_dir, peer_name)? else {
+        return Ok(None);
+    };
+    let decoded = b64_url_decode(&encoded)?;
+    let pubkey: [u8; 32] = decoded.try_into().map_err(|data: Vec<u8>| {
+        format!(
+            "peer X25519 public key for {peer_name} is {} bytes; expected 32",
+            data.len()
+        )
+    })?;
+    Ok(Some(pubkey))
+}
+
 pub fn sign_ed25519_stdin(identity_dir: &Path) -> Result<String, Box<dyn Error>> {
     let mut data = Vec::new();
     io::stdin().read_to_end(&mut data)?;

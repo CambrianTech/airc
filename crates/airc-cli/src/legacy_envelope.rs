@@ -46,6 +46,88 @@ pub fn wrap_stdin(recipient_pub: &str, identity_dir: &Path) -> Result<(), Box<dy
     Ok(())
 }
 
+pub fn unwrap_stdin(sender_pub: &str, identity_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let mut envelope: Value = serde_json::from_str(trimmed)?;
+    if !is_encrypted(&envelope) {
+        println!("{}", serde_json::to_string(&envelope)?);
+        return Ok(());
+    }
+    if sender_pub.is_empty() {
+        return Err("legacy envelope unwrap requires --sender-pub for encrypted input".into());
+    }
+
+    let recipient_priv = legacy_identity::load_x25519_private(identity_dir)?;
+    let sender_pub = legacy_identity::b64_url_decode(sender_pub)?;
+    let sender_pub: [u8; 32] = sender_pub.try_into().map_err(|data: Vec<u8>| {
+        format!(
+            "sender X25519 public key is {} bytes; expected 32",
+            data.len()
+        )
+    })?;
+    unwrap_value(&mut envelope, recipient_priv, sender_pub)?;
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
+}
+
+pub fn unwrap_value(
+    envelope: &mut Value,
+    recipient_priv: [u8; 32],
+    sender_pub: [u8; 32],
+) -> Result<(), Box<dyn Error>> {
+    let enc = envelope
+        .get("enc")
+        .and_then(Value::as_str)
+        .ok_or("legacy envelope has no enc field")?;
+    if enc != ENC_VERSION {
+        return Err(format!("unsupported legacy envelope enc version: {enc}").into());
+    }
+    let ciphertext = envelope
+        .get("msg")
+        .and_then(Value::as_str)
+        .ok_or("encrypted legacy envelope msg must be a string")?;
+    let nonce = envelope
+        .get("nonce")
+        .and_then(Value::as_str)
+        .ok_or("encrypted legacy envelope missing nonce")?;
+    let ciphertext = legacy_identity::b64_url_decode(ciphertext)?;
+    let nonce = legacy_identity::b64_url_decode(nonce)?;
+    let nonce: [u8; 12] = nonce.try_into().map_err(|data: Vec<u8>| {
+        format!("legacy envelope nonce is {} bytes; expected 12", data.len())
+    })?;
+    let ad = associated_data(envelope)?;
+    let key = derive_pairwise_key(recipient_priv, sender_pub)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    let plaintext = cipher
+        .decrypt(
+            &nonce.into(),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext.as_slice(),
+                aad: ad.as_bytes(),
+            },
+        )
+        .map_err(|_| "legacy envelope decryption failed")?;
+    let msg = String::from_utf8(plaintext)?;
+
+    let object = envelope
+        .as_object_mut()
+        .ok_or("legacy envelope must be a JSON object")?;
+    object.insert("msg".to_string(), Value::String(msg));
+    object.remove("enc");
+    object.remove("nonce");
+    Ok(())
+}
+
+pub fn is_encrypted(envelope: &Value) -> bool {
+    envelope.get("enc").and_then(Value::as_str).is_some()
+}
+
 fn wrap_value(
     envelope: &mut Value,
     sender_priv: [u8; 32],
@@ -146,5 +228,28 @@ mod tests {
             associated_data(&envelope).unwrap(),
             r#"{"channel":"general","from":"alice","kind":"heartbeat","to":"bob","ts":"2026-05-19T00:00:00Z"}"#
         );
+    }
+
+    #[test]
+    fn wrap_then_unwrap_restores_plaintext() {
+        let sender_priv = [1u8; 32];
+        let recipient_priv = [2u8; 32];
+        let recipient_pub = *PublicKey::from(&StaticSecret::from(recipient_priv)).as_bytes();
+        let sender_pub = *PublicKey::from(&StaticSecret::from(sender_priv)).as_bytes();
+        let mut envelope = json!({
+            "from": "alice",
+            "to": "bob",
+            "ts": "2026-05-19T00:00:00Z",
+            "channel": "general",
+            "msg": "hello encrypted"
+        });
+
+        wrap_value(&mut envelope, sender_priv, recipient_pub).unwrap();
+        assert!(is_encrypted(&envelope));
+        unwrap_value(&mut envelope, recipient_priv, sender_pub).unwrap();
+
+        assert_eq!(envelope["msg"], "hello encrypted");
+        assert!(envelope.get("enc").is_none());
+        assert!(envelope.get("nonce").is_none());
     }
 }
