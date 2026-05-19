@@ -28,6 +28,8 @@ mod events_cli;
 mod events_commands;
 mod gist_cli;
 mod gist_commands;
+mod identity_cli;
+mod identity_commands;
 mod lane_cli;
 mod lane_commands;
 mod log_cli;
@@ -56,6 +58,7 @@ use codex_cli::CodexHookAction;
 use config_cli::ConfigAction;
 use events_cli::EventsAction;
 use gist_cli::GistAction;
+use identity_cli::IdentityAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
 use route_cli::RouteAction;
@@ -157,6 +160,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     host_identity_json,
                 },
             ),
+        },
+
+        Command::Identity(args) => match args.action {
+            IdentityAction::Pretty {
+                name,
+                identity_json,
+                host,
+            } => identity_commands::run_pretty(&name, &identity_json, &host),
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,

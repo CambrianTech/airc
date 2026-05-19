@@ -561,33 +561,7 @@ _whois_in_scope() {
 # Args: name, identity-json, host (any may be empty).
 _whois_pretty() {
   local name="$1" blob="${2:-{\}}" host="${3:-}"
-  NAME="$name" BLOB="$blob" HOST="$host" python3 <<'PYEOF'
-import json, os
-name = os.environ["NAME"]
-host = os.environ.get("HOST", "")
-try:
-    ident = json.loads(os.environ.get("BLOB", "{}") or "{}")
-except Exception:
-    ident = {}
-print(f"  name:      {name}")
-fields = [("pronouns", ident.get("pronouns", "")),
-          ("role",     ident.get("role", "")),
-          ("bio",      ident.get("bio", "")),
-          ("status",   ident.get("status", ""))]
-for k, v in fields:
-    label = k + ":"
-    fallback = "(unset)"
-    print(f"  {label:<11} {v if v else fallback}")
-ints = ident.get("integrations", {}) or {}
-if ints:
-    print("  integrations:")
-    for k, v in ints.items():
-        print(f"    {k}: {v}")
-else:
-    print("  integrations: (none)")
-if host:
-    print(f"  host:      {host}")
-PYEOF
+  "$(airc_rs_bin)" identity pretty --name "$name" --identity-json "$blob" --host "$host"
 }
 
 # cmd_kick extracted to lib/airc_bash/cmd_kick.sh
