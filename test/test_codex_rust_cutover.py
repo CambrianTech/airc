@@ -260,6 +260,20 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR"', combined)
         self.assertIn('"$(airc_rs_bin)" identity write-peer-record', combined)
 
+    def test_channel_gist_find_paths_use_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "lib/airc_bash/mesh.sh",
+                REPO / "lib/airc_bash/cmd_connect.sh",
+            ]
+        )
+
+        self.assertNotIn("airc_core.channel_gist find", combined)
+        self.assertNotIn("airc_core.channel_gist host-preflight", combined)
+        self.assertIn('"$(airc_rs_bin)" channel-gist find', combined)
+        self.assertIn('"$(airc_rs_bin)" channel-gist host-preflight', combined)
+
 
 if __name__ == "__main__":
     unittest.main()

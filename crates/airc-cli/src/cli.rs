@@ -16,6 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
+use crate::channel_gist_cli::ChannelGistArgs;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::config_cli::ConfigArgs;
 use crate::envelope_cli::EnvelopeArgs;
@@ -95,6 +96,9 @@ pub enum Command {
 
     /// Read and update legacy config.json during Rust cutover.
     Config(ConfigArgs),
+
+    /// Resolve channel-to-gist discovery state during Rust cutover.
+    ChannelGist(ChannelGistArgs),
 
     /// Identity and whois helpers during Rust cutover.
     Identity(IdentityArgs),
