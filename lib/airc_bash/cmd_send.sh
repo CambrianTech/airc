@@ -316,7 +316,7 @@ cmd_send() {
     active_channel="$channel_override"
   fi
   if [ -z "$active_channel" ]; then
-    active_channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+    active_channel=$(airc_config_default_channel "$CONFIG" || true)
   fi
   if [ -z "$active_channel" ] && [ -f "$AIRC_WRITE_DIR/room_name" ]; then
     active_channel=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || true)
@@ -391,8 +391,7 @@ cmd_send() {
     # If the channel has no mapping, fall back to the scope's primary
     # room_gist_id so single-room scopes keep working unchanged.
     local room_gist_id=""
-    room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    room_gist_id=$(airc_config_get_channel_gist "$active_channel" "$CONFIG" || true)
     # Phantom-room guard: when --room/--channel was used explicitly,
     # NEVER fall back to the scope's primary room_gist_id — that publishes
     # to the wrong gist with the right channel-tag, creating an invisible
@@ -614,8 +613,7 @@ cmd_send() {
     # (otherwise the fallback turns --room into a phantom success that
     # silently mis-routes to the primary gist; see _explicit_channel).
     local _host_room_gist_id=""
-    _host_room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    _host_room_gist_id=$(airc_config_get_channel_gist "$active_channel" "$CONFIG" || true)
     if [ -z "$_host_room_gist_id" ]; then
       if [ "$_explicit_channel" = "1" ]; then
         die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"

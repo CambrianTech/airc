@@ -786,6 +786,26 @@ airc_client_id() {
   "$(airc_rs_bin)" client-id 2>/dev/null
 }
 
+airc_config_read_channels() {
+  local cfg="${1:-$CONFIG}"
+  "$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+}
+
+airc_config_default_channel() {
+  local cfg="${1:-$CONFIG}"
+  "$(airc_rs_bin)" config default-channel --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+}
+
+airc_config_get_channel_gist() {
+  local channel="$1" cfg="${2:-$CONFIG}"
+  "$(airc_rs_bin)" config get-channel-gist --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" 2>/dev/null
+}
+
+airc_config_list_channel_gists() {
+  local cfg="${1:-$CONFIG}"
+  "$(airc_rs_bin)" config list-channel-gists --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+}
+
 # Same as get_config_val but reads from an arbitrary config.json path.
 # Used by _whois_in_scope (#134 cross-scope walk) and other places
 # that need to read sibling-scope state without changing $CONFIG.
@@ -1437,8 +1457,7 @@ _monitor_multi_channel() {
     # required. Empty is meaningful: it means no channel currently has
     # a viable wire, so do not fall back to the stale startup map.
     local _refreshed_map
-    _refreshed_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-      --config "$CONFIG" 2>/dev/null || true)
+    _refreshed_map=$(airc_config_list_channel_gists "$CONFIG" || true)
     channel_map="$_refreshed_map"
     if [ -z "$channel_map" ]; then
       echo "airc: no channel_gists mappings remain; monitor waiting for 'airc join --room <channel>' to re-host" >&2
@@ -1526,8 +1545,7 @@ _monitor_multi_channel() {
             if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ] \
                && tail -20 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | grep -qE 'returned 404|\(gone\)|GET gists/.* failed: gone'; then
               local _gone_gid
-              _gone_gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-                --config "$CONFIG" --channel "$ch" 2>/dev/null || true)
+              _gone_gid=$(airc_config_get_channel_gist "$ch" "$CONFIG" || true)
               "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
                 --config "$CONFIG" --channel "$ch" --gist-id "" \
                 >/dev/null 2>&1 || true
@@ -1543,8 +1561,7 @@ _monitor_multi_channel() {
             # mapping disappeared, leave this channel down; healthy
             # channels keep flowing and the next outer cycle/config
             # refresh can pick it up again.
-            gid=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-              --config "$CONFIG" 2>/dev/null | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
+            gid=$(airc_config_list_channel_gists "$CONFIG" | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
             if [ -n "$gid" ]; then
               sleep 3
               "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
@@ -1568,8 +1585,7 @@ _monitor_multi_channel() {
         # stop removed channels in-place while the formatter pipe stays
         # alive.
         local _current_map
-        _current_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-          --config "$CONFIG" 2>/dev/null || true)
+        _current_map=$(airc_config_list_channel_gists "$CONFIG" || true)
         if [ -n "$_current_map" ]; then
           local _kept=()
           for entry in "${_pids[@]}"; do
@@ -1682,7 +1698,7 @@ monitor() {
     # publishable route (channel_gists OR legacy room_gist_id), otherwise
     # the subshell exits immediately and airc.pid lists a dead PID.
     local _has_pub=0
-    if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+    if airc_config_list_channel_gists "$CONFIG" | grep -q .; then
       _has_pub=1
     fi
     if [ "$_has_pub" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
@@ -1713,8 +1729,7 @@ monitor() {
   #      that haven't been re-bootstrapped to populate channel_gists)
   #   3. neither → local-tail mode (standalone tests, --no-room --no-gist)
   local channel_map
-  channel_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-    --config "$CONFIG" 2>/dev/null || true)
+  channel_map=$(airc_config_list_channel_gists "$CONFIG" || true)
 
   if [ -n "$channel_map" ]; then
     _monitor_multi_channel "$my_name" "$channel_map"
@@ -1937,7 +1952,7 @@ flush_pending_host_loop() {
   # at startup so the spawn site can rely on a quick return when nothing
   # to do, mirroring the joiner-side host_target gate.
   local _has_route=0
-  if "$AIRC_PYTHON" -m airc_core.config list_channel_gists --config "$CONFIG" 2>/dev/null | grep -q .; then
+  if airc_config_list_channel_gists "$CONFIG" | grep -q .; then
     _has_route=1
   fi
   if [ "$_has_route" = "0" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
@@ -2018,8 +2033,7 @@ except Exception:
       # the channel field).
       local _line_gist=""
       if [ -n "$_line_channel" ]; then
-        _line_gist=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-          --config "$CONFIG" --channel "$_line_channel" 2>/dev/null || true)
+        _line_gist=$(airc_config_get_channel_gist "$_line_channel" "$CONFIG" || true)
       fi
       if [ -z "$_line_gist" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
         _line_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
@@ -2481,9 +2495,7 @@ _mesh_rediscover_loop() {
     # channel implies host rotation.
     local current_ch current_gist
     read -r current_ch current_gist <<EOF
-$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-      --config "$CONFIG" 2>/dev/null \
-      | awk -F'\t' 'NR==1 {print $1, $2}')
+$(airc_config_list_channel_gists "$CONFIG" | awk -F'\t' 'NR==1 {print $1, $2}')
 EOF
     [ -n "$current_gist" ] || continue
     # Same-gist host lease check. Rotation is not the only failure
@@ -2514,9 +2526,7 @@ EOF
     # stderr) so the AI's Monitor wakes and the user sees what
     # happened, even if the bearer respawn that follows is invisible.
     local channels
-    channels=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
-      --config "$CONFIG" 2>/dev/null \
-      | awk -F'\t' '{print $1}')
+    channels=$(airc_config_list_channel_gists "$CONFIG" | awk -F'\t' '{print $1}')
     while IFS= read -r ch; do
       [ -z "$ch" ] && continue
       # The CLI flag is --gist-id (see lib/airc_core/config.py:325).

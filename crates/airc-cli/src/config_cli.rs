@@ -16,4 +16,28 @@ pub enum ConfigAction {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Print the default subscribed channel.
+    DefaultChannel {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Print the gist id mapped to a channel.
+    GetChannelGist {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Channel name.
+        #[arg(long)]
+        channel: String,
+    },
+
+    /// Print channel-to-gist mappings as tab-separated lines.
+    ListChannelGists {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }

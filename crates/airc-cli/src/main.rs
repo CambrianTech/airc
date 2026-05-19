@@ -94,6 +94,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ConfigAction::ReadChannels { config } => {
                 config_commands::run_read_channels(&home, config)
             }
+            ConfigAction::DefaultChannel { config } => {
+                config_commands::run_default_channel(&home, config)
+            }
+            ConfigAction::GetChannelGist { config, channel } => {
+                config_commands::run_get_channel_gist(&home, config, &channel)
+            }
+            ConfigAction::ListChannelGists { config } => {
+                config_commands::run_list_channel_gists(&home, config)
+            }
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,

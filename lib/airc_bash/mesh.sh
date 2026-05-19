@@ -51,12 +51,12 @@ _mesh_find() {
   command -v gh >/dev/null 2>&1 || return 0
   local channel="${1:-${room_name:-}}"
   if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
-    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+    channel=$(airc_config_default_channel "$CONFIG" || true)
   fi
   [ -z "$channel" ] && channel="general"
   if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
     local configured
-    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    configured=$(airc_config_get_channel_gist "$channel" "$CONFIG" || true)
     if [ -n "$configured" ]; then
       printf '%s\n' "$configured"
       return 0
@@ -73,12 +73,12 @@ _mesh_find_any() {
   command -v gh >/dev/null 2>&1 || return 0
   local channel="${1:-${room_name:-}}"
   if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
-    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+    channel=$(airc_config_default_channel "$CONFIG" || true)
   fi
   [ -z "$channel" ] && channel="general"
   if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
     local configured
-    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    configured=$(airc_config_get_channel_gist "$channel" "$CONFIG" || true)
     if [ -n "$configured" ]; then
       printf '%s\n' "$configured"
       return 0

@@ -239,8 +239,7 @@ cmd_part() {
     # Default-room path below (no arg or matching arg) handles the
     # primary scope teardown; this path JUST removes the named room
     # without touching primary scope state.
-    local _ch_gist; _ch_gist=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-        --config "$CONFIG" --channel "$arg_room" 2>/dev/null || true)
+    local _ch_gist; _ch_gist=$(airc_config_get_channel_gist "$arg_room" "$CONFIG" || true)
     if [ -z "$_ch_gist" ]; then
       die "Not subscribed to #${arg_room} (no channel_gists mapping). Use 'airc list' to see open rooms; 'airc status' for your subscriptions."
     fi
@@ -398,7 +397,7 @@ _cmd_invite_human() {
   # (Copilot's review of #454 flagged the previous comment as
   # mis-describing this; comment now matches actual behavior.)
   local primary_chan primary_gid
-  primary_chan=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  primary_chan=$(airc_config_default_channel "$CONFIG" || true)
   if [ -n "$primary_chan" ]; then
     primary_gid=$("$AIRC_PYTHON" -c "
 import json, sys
