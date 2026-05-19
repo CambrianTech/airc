@@ -1,0 +1,37 @@
+name: runtime-guards
+
+# Fast guardrail for non-crate runtime changes on rust-rewrite PRs.
+# The full clean-install workflow is intentionally heavier and still
+# gates canary/main. This workflow prevents shell/Python migration
+# slices from having only the WIP check.
+
+on:
+  pull_request:
+    branches: [rust-rewrite, canary, main]
+    paths:
+      - "airc"
+      - "install.sh"
+      - "uninstall.sh"
+      - "lib/airc_bash/**"
+      - "test/test_codex_rust_cutover.py"
+      - ".github/workflows/runtime-guards.yml"
+  push:
+    branches: [rust-rewrite, canary, main]
+    paths:
+      - "airc"
+      - "install.sh"
+      - "uninstall.sh"
+      - "lib/airc_bash/**"
+      - "test/test_codex_rust_cutover.py"
+      - ".github/workflows/runtime-guards.yml"
+
+jobs:
+  shell-and-cutover:
+    name: shell syntax + rust cutover guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell syntax
+        run: bash -n install.sh uninstall.sh airc lib/airc_bash/*.sh
+      - name: Codex Rust cutover guards
+        run: python3 test/test_codex_rust_cutover.py
