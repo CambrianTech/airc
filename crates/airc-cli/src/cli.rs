@@ -17,6 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use airc_lib::PeerSpec;
 
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
+use crate::config_cli::ConfigArgs;
 use crate::gist_cli::GistArgs;
 use crate::route_cli::RouteArgs;
 use crate::transport_cli::TransportArgs;
@@ -86,6 +87,9 @@ pub enum Command {
         /// bearer_state.<channel>.json path to read.
         path: PathBuf,
     },
+
+    /// Read and update legacy config.json during Rust cutover.
+    Config(ConfigArgs),
 
     /// Send a single text Message frame to the current room and exit.
     /// The current room lives in `<home>/room.json`; switch with
