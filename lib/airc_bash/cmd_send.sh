@@ -407,7 +407,7 @@ cmd_send() {
     fi
 
     local outcome
-    outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+    outcome=$(printf '%s' "$wire_msg" | "$(airc_rs_bin)" bearer send \
       "$peer_name" "$active_channel" \
       --host-target "$host_target" \
       --remote-home "$rhome" \
@@ -450,7 +450,7 @@ cmd_send() {
           # set -euo pipefail). Re-invoke the same bearer_cli pipeline
           # the initial send used (lines ~316-320) so the retry path is
           # exactly the original send path replayed against fresh auth.
-          retry_outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+          retry_outcome=$(printf '%s' "$wire_msg" | "$(airc_rs_bin)" bearer send \
             "$peer_name" "$active_channel" \
             --host-target "$host_target" \
             --remote-home "$rhome" \
@@ -623,7 +623,7 @@ cmd_send() {
 
     if [ -n "$_host_room_gist_id" ]; then
       local _host_outcome
-      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$(airc_rs_bin)" bearer send \
         "$peer_name" "$active_channel" \
         --room-gist-id "$_host_room_gist_id")
       local _host_kind _host_detail
