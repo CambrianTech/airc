@@ -616,6 +616,30 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             LogAction::Render { since, count, json } => {
                 log_commands::run_render(&since, count, json)
             }
+            LogAction::InboxRead {
+                home,
+                cursor_file,
+                since,
+                count,
+                peek,
+                quiet_empty,
+                exclude_self,
+                my_name,
+                client_id,
+            } => log_commands::run_inbox_read(log_commands::InboxReadArgs {
+                home,
+                cursor_file,
+                since,
+                count,
+                peek,
+                quiet_empty,
+                exclude_self,
+                my_name,
+                client_id,
+            }),
+            LogAction::InboxReset { home, cursor_file } => {
+                log_commands::run_inbox_reset(&home, &cursor_file)
+            }
         },
 
         Command::Monitor(args) => match args.action {

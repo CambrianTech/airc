@@ -342,7 +342,7 @@ cmd_inbox() {
       --exclude-self)
         exclude_self=1; shift ;;
       --reset)
-        "$AIRC_PYTHON" -m airc_core.inbox reset \
+        "$(airc_rs_bin)" log inbox-reset \
           --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file"
         return 0 ;;
       -h|--help)
@@ -367,7 +367,7 @@ cmd_inbox() {
   fi
 
   local out
-  local inbox_args=(read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
+  local inbox_args=(log inbox-read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
   [ -n "$since" ] && inbox_args+=(--since "$since")
   [ "$peek" -eq 1 ] && inbox_args+=(--peek)
   [ "$quiet_empty" = "1" ] && inbox_args+=(--quiet-empty)
@@ -375,7 +375,7 @@ cmd_inbox() {
     local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
     inbox_args+=(--exclude-self --my-name "$(get_name)" --client-id "$_client_id")
   fi
-  if ! out=$("$AIRC_PYTHON" -m airc_core.inbox "${inbox_args[@]}" 2>&1); then
+  if ! out=$("$(airc_rs_bin)" "${inbox_args[@]}" 2>&1); then
     printf '%s\n' "$out" >&2
     return 1
   fi

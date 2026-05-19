@@ -1,8 +1,8 @@
 //! `airc-rs log ...` handlers for legacy shell log paths.
 
 use std::error::Error;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -40,6 +40,109 @@ pub fn run_render(since: &str, count: usize, json_output: bool) -> Result<(), Bo
         println!("{}", render_json(&events, since, count)?);
     } else {
         print!("{}", render_human(&events));
+    }
+    Ok(())
+}
+
+pub struct InboxReadArgs {
+    pub home: PathBuf,
+    pub cursor_file: PathBuf,
+    pub since: String,
+    pub count: usize,
+    pub peek: bool,
+    pub quiet_empty: bool,
+    pub exclude_self: bool,
+    pub my_name: String,
+    pub client_id: String,
+}
+
+pub fn run_inbox_reset(home: &Path, cursor_file: &Path) -> Result<(), Box<dyn Error>> {
+    let offset = fs::metadata(home.join("messages.jsonl"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    write_cursor(cursor_file, offset)?;
+    println!("airc inbox cursor reset.");
+    Ok(())
+}
+
+pub fn run_inbox_read(args: InboxReadArgs) -> Result<(), Box<dyn Error>> {
+    if args.count == 0 {
+        return Err("inbox --count must be greater than zero".into());
+    }
+    let log_path = args.home.join("messages.jsonl");
+    let (cursor_offset, legacy_since) = read_cursor(&args.cursor_file);
+    let since_arg = if !args.since.is_empty() {
+        args.since.clone()
+    } else if cursor_offset.is_none() {
+        legacy_since.unwrap_or_else(|| "5m".to_string())
+    } else {
+        String::new()
+    };
+    let since_epoch = if since_arg.is_empty() {
+        None
+    } else {
+        Some(parse_inbox_since(&since_arg)?)
+    };
+    let size = fs::metadata(&log_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let start_offset = if since_epoch.is_none() {
+        cursor_offset.filter(|offset| *offset <= size).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut printed = 0usize;
+    let mut last_offset = start_offset;
+    if let Ok(mut file) = File::open(&log_path) {
+        file.seek(SeekFrom::Start(start_offset))?;
+        let mut reader = BufReader::new(file);
+        while printed < args.count {
+            let mut raw = Vec::new();
+            let read = reader.read_until(b'\n', &mut raw)?;
+            if read == 0 {
+                break;
+            }
+            let next_offset = reader.stream_position()?;
+            let Ok(line) = serde_json::from_slice::<Value>(&raw) else {
+                last_offset = next_offset;
+                continue;
+            };
+            if args.exclude_self && inbox_is_self(&line, &args.my_name, &args.client_id) {
+                last_offset = next_offset;
+                continue;
+            }
+            if let Some(since_epoch) = since_epoch {
+                let Some(ts) = line
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .and_then(|ts| airc_core::iso_to_epoch(ts).ok())
+                else {
+                    last_offset = next_offset;
+                    continue;
+                };
+                if ts <= since_epoch {
+                    last_offset = next_offset;
+                    continue;
+                }
+            }
+            println!("{}", render_inbox_line(&line));
+            printed += 1;
+            last_offset = next_offset;
+        }
+    }
+
+    if printed == 0 && !args.quiet_empty {
+        println!(
+            "No new airc messages since {}",
+            if since_arg.is_empty() {
+                "last inbox check"
+            } else {
+                &since_arg
+            }
+        );
+    } else if !args.peek {
+        write_cursor(&args.cursor_file, last_offset)?;
     }
     Ok(())
 }
@@ -191,6 +294,83 @@ fn parse_since(value: &str) -> Result<Option<i64>, Box<dyn Error>> {
         format!("airc logs --since: cannot parse '{value}' (use ISO timestamp or 60s/5m/1h/2d)")
             .into()
     })
+}
+
+fn parse_inbox_since(value: &str) -> Result<i64, Box<dyn Error>> {
+    if let Some((amount, unit)) = parse_relative_since(value) {
+        let window = amount
+            .checked_mul(unit)
+            .ok_or("airc inbox --since: relative window is too large")?;
+        return Ok(epoch_now() - window);
+    }
+    airc_core::iso_to_epoch(value)
+        .map_err(|_| format!("airc inbox --since: cannot parse '{value}'").into())
+}
+
+fn read_cursor(path: &Path) -> (Option<u64>, Option<String>) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return (None, Some(trimmed.to_string()));
+    };
+    let offset = value.get("offset").and_then(Value::as_u64);
+    (offset, None)
+}
+
+fn write_cursor(path: &Path, offset: u64) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension(format!(
+        "{}tmp.{}",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    fs::write(&tmp_path, format!("{{\"offset\":{offset}}}\n"))?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn inbox_is_self(line: &Value, my_name: &str, client_id: &str) -> bool {
+    if !client_id.is_empty()
+        && line
+            .get("client_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == client_id)
+    {
+        return true;
+    }
+    client_id.is_empty()
+        && !my_name.is_empty()
+        && line
+            .get("from")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == my_name)
+}
+
+fn render_inbox_line(line: &Value) -> String {
+    let msg = line
+        .get("msg")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| line.get("msg").map(ToString::to_string).unwrap_or_default());
+    format!(
+        "[{}] {}: {}",
+        string_field(line, "ts", ""),
+        string_field(line, "from", "?"),
+        msg
+    )
 }
 
 fn parse_relative_since(value: &str) -> Option<(i64, i64)> {
@@ -394,7 +574,10 @@ enum RotateOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_unique_sig, rotate_if_needed, AppendOutcome, RotateOutcome};
+    use super::{
+        append_unique_sig, rotate_if_needed, run_inbox_read, run_inbox_reset, AppendOutcome,
+        InboxReadArgs, RotateOutcome,
+    };
 
     #[test]
     fn append_skips_duplicate_sig_from_recent_tail() {
@@ -513,5 +696,66 @@ mod tests {
     #[test]
     fn relative_since_rejects_negative_windows() {
         assert!(super::parse_since("-5m").is_err());
+    }
+
+    #[test]
+    fn inbox_read_advances_cursor_and_excludes_self() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cursor_file = home.join("cursor.json");
+        std::fs::write(
+            home.join("messages.jsonl"),
+            concat!(
+                r#"{"ts":"2026-05-16T01:00:00Z","from":"me","client_id":"mine","msg":"self"}"#,
+                "\n",
+                r#"{"ts":"2026-05-16T01:00:01Z","from":"peer","client_id":"other","msg":"hello"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        run_inbox_read(InboxReadArgs {
+            home: home.to_path_buf(),
+            cursor_file: cursor_file.clone(),
+            since: "2026-05-16T00:59:59Z".to_string(),
+            count: 500,
+            peek: false,
+            quiet_empty: true,
+            exclude_self: true,
+            my_name: "me".to_string(),
+            client_id: "mine".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(cursor_file).unwrap()
+            )
+            .unwrap()["offset"]
+                .as_u64()
+                .unwrap(),
+            std::fs::metadata(home.join("messages.jsonl"))
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn inbox_reset_moves_cursor_to_log_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cursor_file = home.join("cursor.json");
+        std::fs::write(home.join("messages.jsonl"), "one\ntwo\n").unwrap();
+
+        run_inbox_reset(home, &cursor_file).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(cursor_file).unwrap()
+            )
+            .unwrap()["offset"]
+                .as_u64(),
+            Some(8)
+        );
     }
 }
