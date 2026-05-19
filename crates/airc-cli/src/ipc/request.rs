@@ -18,9 +18,42 @@ pub enum Request {
     /// Send a text Message frame. Daemon signs + dispatches via its
     /// owned `SignedTransport`.
     Send(SendRequest),
+    /// Start a subscription on `wire` if one isn't already running.
+    /// Daemon buffers received frames into an in-memory inbox per
+    /// wire. Idempotent — repeated calls return Ok without
+    /// duplicating subscriptions.
+    Subscribe(SubscribeRequest),
+    /// Read buffered frames from the daemon's inbox for `wire`.
+    /// Returns frames strictly after `since_lamport` (if provided),
+    /// up to `limit`. Pass back the response's newest_lamport on the
+    /// next call to keep the stream "consume-once".
+    Inbox(InboxRequest),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.
     Stop,
+}
+
+/// Parameters for `Subscribe`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeRequest {
+    /// Wire directory to subscribe on (creates the local-fs adapter
+    /// + replay-anchored subscription if not already running).
+    pub wire: std::path::PathBuf,
+}
+
+/// Parameters for `Inbox`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboxRequest {
+    /// Wire directory the daemon should pull buffered frames from.
+    pub wire: std::path::PathBuf,
+    /// Return only frames whose lamport > this value. `None` means
+    /// "everything in the buffer."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_lamport: Option<u64>,
+    /// Max frames to return in this batch. `None` defaults to a
+    /// reasonable cap (32) so a slow client doesn't pull megabytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 /// Parameters for `Send`.

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::daemon::{run as run_daemon_server, DaemonState};
 use crate::identity::load_or_generate;
+use crate::ipc::request::{InboxRequest, SubscribeRequest};
 use crate::ipc::{DaemonClient, SendRequest};
 use crate::registry::{build_registry, format_peer_spec, PeerSpec};
 
@@ -289,6 +290,43 @@ pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     let client = DaemonClient::new(socket);
     client.stop().await?;
     println!("daemon: stop requested.");
+    Ok(())
+}
+
+/// `inbox` — Subscribe-then-Inbox via the daemon. Prints any
+/// buffered frames newer than `since_lamport`. The first call for a
+/// wire kicks off the daemon's subscription; subsequent calls are
+/// pure reads.
+pub async fn run_inbox(
+    socket: PathBuf,
+    wire: PathBuf,
+    since_lamport: Option<u64>,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket);
+    // Idempotent — daemon ignores duplicate subscribes for the wire.
+    client
+        .subscribe(SubscribeRequest { wire: wire.clone() })
+        .await?;
+    let inbox = client
+        .inbox(InboxRequest {
+            wire,
+            since_lamport,
+            limit,
+        })
+        .await?;
+    if inbox.frames.is_empty() {
+        println!("(no new frames; newest_lamport={})", inbox.newest_lamport);
+        return Ok(());
+    }
+    for frame in &inbox.frames {
+        print_frame(frame);
+    }
+    println!();
+    println!(
+        "newest_lamport={} — pass as --since-lamport on the next call",
+        inbox.newest_lamport
+    );
     Ok(())
 }
 

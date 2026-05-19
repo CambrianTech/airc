@@ -149,5 +149,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let socket = socket.unwrap_or_else(cli::default_socket_path);
             commands::run_msg(socket, wire, &channel, &text).await
         }
+        Command::Inbox {
+            socket,
+            wire,
+            since_lamport,
+            limit,
+        } => {
+            let socket = socket.unwrap_or_else(cli::default_socket_path);
+            commands::run_inbox(socket, wire, since_lamport, limit).await
+        }
     }
 }

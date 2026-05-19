@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::ipc::request::{Request, SendRequest};
-use crate::ipc::response::{Response, StatusResponse};
+use crate::ipc::request::{InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::response::{InboxResponse, Response, StatusResponse};
 
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
@@ -118,6 +118,20 @@ impl DaemonClient {
     pub async fn send(&self, request: SendRequest) -> Result<(), ClientError> {
         match self.call(Request::Send(request)).await? {
             Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    pub async fn subscribe(&self, request: SubscribeRequest) -> Result<(), ClientError> {
+        match self.call(Request::Subscribe(request)).await? {
+            Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
+        match self.call(Request::Inbox(request)).await? {
+            Response::Inbox(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
