@@ -494,7 +494,7 @@ cmd_whois() {
     return 0
   fi
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-  if "$AIRC_PYTHON" -m airc_core.collaboration whois-fallback \
+  if "$(airc_rs_bin)" collaboration whois-fallback \
       --home "$AIRC_WRITE_DIR" --my-name "$my_name" --peer-name "$target" --client-id "$_client_id"; then
     return 0
   fi

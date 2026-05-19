@@ -23,6 +23,8 @@ mod codex_config;
 mod codex_hooks_json;
 mod codex_install;
 mod codex_start;
+mod collaboration_cli;
+mod collaboration_commands;
 mod commands;
 mod config_cli;
 mod config_commands;
@@ -75,6 +77,7 @@ use bearer::cli::BearerAction;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
+use collaboration_cli::CollaborationAction;
 use config_cli::ConfigAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
@@ -107,10 +110,13 @@ async fn main() -> ExitCode {
     match dispatch(parsed).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("airc-rs: {error}");
             if let Some(code) = channel_gist_commands::command_exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
+            if let Some(code) = collaboration_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
+            eprintln!("airc-rs: {error}");
             ExitCode::FAILURE
         }
     }
@@ -240,6 +246,20 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     host_identity_json,
                 },
             ),
+        },
+
+        Command::Collaboration(args) => match args.action {
+            CollaborationAction::Status(args) => collaboration_commands::run_status(&home, args),
+            CollaborationAction::Doctor(args) => collaboration_commands::run_doctor(&home, args),
+            CollaborationAction::SendWarning(args) => {
+                collaboration_commands::run_send_warning(&home, args)
+            }
+            CollaborationAction::PeersFallback(args) => {
+                collaboration_commands::run_peers_fallback(&home, args)
+            }
+            CollaborationAction::WhoisFallback { scope, peer_name } => {
+                collaboration_commands::run_whois_fallback(&home, scope, &peer_name)
+            }
         },
 
         Command::ChannelGist(args) => match args.action {

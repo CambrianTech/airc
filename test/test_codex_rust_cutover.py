@@ -90,6 +90,25 @@ class CodexRustCutoverTests(unittest.TestCase):
             body,
         )
 
+    def test_collaboration_helpers_use_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "lib/airc_bash/cmd_status.sh",
+                REPO / "lib/airc_bash/cmd_send.sh",
+                REPO / "lib/airc_bash/cmd_identity.sh",
+                REPO / "lib/airc_bash/cmd_rooms.sh",
+                REPO / "lib/airc_bash/cmd_doctor.sh",
+            ]
+        )
+
+        self.assertNotIn("airc_core.collaboration", combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration status', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration send-warning', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration whois-fallback', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration peers-fallback', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration doctor', combined)
+
     def test_iso_to_epoch_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
         start = source.index("iso_to_epoch()")

@@ -591,7 +591,7 @@ _doctor_health() {
   if [ "${peer_count:-0}" -eq 0 ] 2>/dev/null; then
     local _collab_rc=0
     local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-    "$AIRC_PYTHON" -m airc_core.collaboration doctor \
+    "$(airc_rs_bin)" collaboration doctor \
       --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" || _collab_rc=$?
     case "$_collab_rc" in
       1) warns=$((warns+1)) ;;

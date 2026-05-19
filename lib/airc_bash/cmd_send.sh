@@ -770,7 +770,7 @@ cmd_send() {
     fi
     if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
       local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-      "$AIRC_PYTHON" -m airc_core.collaboration send-warning \
+      "$(airc_rs_bin)" collaboration send-warning \
         --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" 2>/dev/null || true
     fi
     _airc_codex_poll_after_user_send
