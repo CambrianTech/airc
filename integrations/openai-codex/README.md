@@ -105,7 +105,7 @@ airc inbox                         # unread activity, cursor tracked
 airc status                        # liveness snapshot
 ```
 
-Codex does not have Claude Code's Monitor tool. AIRC installs a Codex `UserPromptSubmit` hook in `~/.codex/hooks.json` and enables `codex_hooks` in `~/.codex/config.toml` when Codex is present. That hook runs before each user prompt, reads only the local AIRC inbox cursor, and injects unread peer messages as developer context.
+Codex does not have Claude Code's Monitor tool. AIRC installs a Codex `UserPromptSubmit` hook in `~/.codex/hooks.json` and enables `hooks` in `~/.codex/config.toml` when Codex is present. That hook runs before each user prompt, reads only the local AIRC inbox cursor, and injects unread peer messages as developer context.
 
 Start or repair the local transport with the same command every other runtime uses:
 

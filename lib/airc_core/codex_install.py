@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -30,25 +31,75 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _set_codex_hooks_feature(config: Path) -> bool:
+def _feature_enabled(text: str, key: str) -> bool:
+    pattern = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=[ \t]*true(?:[ \t]*(?:#.*)?)?$")
+    return any(pattern.match(line) for line in text.splitlines())
+
+
+def _remove_legacy_codex_hooks_feature_text(text: str) -> tuple[str, bool]:
+    lines = text.splitlines()
+    out: list[str] = []
+    changed = False
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if line.strip() == "# AIRC-CODEX-HOOKS-FEATURE-START":
+            block: list[str] = []
+            idx += 1
+            while idx < len(lines) and lines[idx].strip() != "# AIRC-CODEX-HOOKS-FEATURE-END":
+                block.append(lines[idx])
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            if any(_feature_enabled(row, "codex_hooks") for row in block):
+                changed = True
+                continue
+            out.append("# AIRC-CODEX-HOOKS-FEATURE-START")
+            out.extend(block)
+            out.append("# AIRC-CODEX-HOOKS-FEATURE-END")
+            continue
+        if line.strip() == "# AIRC-CODEX-HOOKS-FEATURE":
+            idx += 1
+            if idx < len(lines) and _feature_enabled(lines[idx], "codex_hooks"):
+                idx += 1
+                changed = True
+            else:
+                out.append(line)
+            continue
+        if _feature_enabled(line, "codex_hooks"):
+            changed = True
+            idx += 1
+            continue
+        out.append(line)
+        idx += 1
+    new_text = "\n".join(out)
+    if text.endswith("\n") and new_text:
+        new_text += "\n"
+    return new_text, changed
+
+
+def _set_hooks_feature(config: Path) -> bool:
     text = _read_text(config)
-    if "codex_hooks" in text:
-        return False
+    text, removed_legacy = _remove_legacy_codex_hooks_feature_text(text)
+    if _feature_enabled(text, "hooks"):
+        if removed_legacy:
+            _write_text(config, text)
+        return removed_legacy
     lines = text.splitlines()
     for idx, line in enumerate(lines):
         if line.strip() == "[features]":
             lines.insert(idx + 1, "# AIRC-CODEX-HOOKS-FEATURE")
-            lines.insert(idx + 2, "codex_hooks = true")
+            lines.insert(idx + 2, "hooks = true")
             _write_text(config, "\n".join(lines) + "\n")
             return True
 
-    block = "\n# AIRC-CODEX-HOOKS-FEATURE-START\n[features]\ncodex_hooks = true\n# AIRC-CODEX-HOOKS-FEATURE-END\n"
+    block = "\n# AIRC-CODEX-HOOKS-FEATURE-START\n[features]\nhooks = true\n# AIRC-CODEX-HOOKS-FEATURE-END\n"
     suffix = "" if text.endswith("\n") or not text else "\n"
     _write_text(config, text + suffix + block)
     return True
 
 
-def _remove_codex_hooks_feature(config: Path) -> bool:
+def _remove_hooks_feature(config: Path) -> bool:
     text = _read_text(config)
     if not text:
         return False
@@ -66,7 +117,9 @@ def _remove_codex_hooks_feature(config: Path) -> bool:
             continue
         if line.strip() == "# AIRC-CODEX-HOOKS-FEATURE":
             idx += 1
-            if idx < len(lines) and lines[idx].strip() == "codex_hooks = true":
+            if idx < len(lines) and (
+                _feature_enabled(lines[idx], "hooks") or _feature_enabled(lines[idx], "codex_hooks")
+            ):
                 idx += 1
             continue
         out.append(line)
@@ -185,11 +238,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).expanduser()
     config = codex_home / "config.toml"
     hooks_json = codex_home / "hooks.json"
-    changed_feature = _set_codex_hooks_feature(config)
+    changed_feature = _set_hooks_feature(config)
     changed_hook = _install_hooks_json(hooks_json)
     removed_instructions = _remove_managed_developer_instructions(config)
     if changed_feature:
-        print(f"enabled codex_hooks in {config}")
+        print(f"enabled hooks in {config}")
     if changed_hook:
         print(f"installed AIRC UserPromptSubmit hook in {hooks_json}")
     if removed_instructions:
@@ -201,8 +254,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).expanduser()
     config = codex_home / "config.toml"
     hooks_json = codex_home / "hooks.json"
-    if _remove_codex_hooks_feature(config):
-        print(f"removed airc-managed codex_hooks feature from {config}")
+    if _remove_hooks_feature(config):
+        print(f"removed airc-managed hooks feature from {config}")
     if _uninstall_hooks_json(hooks_json):
         print(f"removed AIRC UserPromptSubmit hook from {hooks_json}")
     return 0

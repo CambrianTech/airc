@@ -781,7 +781,7 @@ _install_airc_codex_developer_instructions() {
   [ "${AIRC_SKIP_CODEX_INSTRUCTIONS:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
 
-  if grep -qE '^[[:space:]]*codex_hooks[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
+  if grep -qE '^[[:space:]]*(hooks|codex_hooks)[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
      && [ -f "$hooks_json" ] \
      && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
     if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
