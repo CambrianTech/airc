@@ -10,7 +10,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    Airc, ClaimId, ClaimWorkCard, CreateWorkCard, Priority, ReleaseWorkClaim, RepoId,
+    Airc, ClaimId, ClaimWorkCard, CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId,
     WorkBoardProjection, WorkCardId,
 };
 
@@ -21,6 +21,7 @@ pub async fn run_create(
     repo: String,
     title: String,
     body: Option<String>,
+    lane_id: Option<String>,
     priority: CliPriority,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
@@ -30,7 +31,7 @@ pub async fn run_create(
             title,
             body,
             priority: priority.into(),
-            lane_id: None,
+            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
         })
         .await?;
     println!("card_id: {card_id}");
@@ -113,6 +114,18 @@ fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
     let uuid = Uuid::parse_str(input)
         .map_err(|error| format!("claim id {input:?} is not a valid UUID: {error}"))?;
     Ok(ClaimId::from_uuid(uuid))
+}
+
+fn parse_optional_lane_id(
+    input: Option<&str>,
+) -> Result<Option<LaneId>, Box<dyn std::error::Error>> {
+    input.map(parse_lane_id).transpose()
+}
+
+fn parse_lane_id(input: &str) -> Result<LaneId, Box<dyn std::error::Error>> {
+    let uuid = Uuid::parse_str(input)
+        .map_err(|error| format!("lane id {input:?} is not a valid UUID: {error}"))?;
+    Ok(LaneId::from_uuid(uuid))
 }
 
 impl From<CliPriority> for Priority {

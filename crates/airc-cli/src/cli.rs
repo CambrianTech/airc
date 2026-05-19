@@ -190,6 +190,9 @@ pub enum Command {
 
     /// Coordinate work cards over the current room's AIRC substrate.
     Work(WorkArgs),
+
+    /// Coordinate work lanes over the current room's AIRC substrate.
+    Lane(crate::lane_cli::LaneArgs),
 }
 
 #[derive(Debug, Args)]

@@ -3,8 +3,9 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, CardCreated, ClaimId, ClaimReleased, LaneId, Priority, RepoId,
-    WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent,
+    encode_work_event, CardCreated, ClaimId, ClaimReleased, LaneCreated, LaneId, LaneState,
+    LaneStateChanged, Priority, RepoId, WorkBoardProjection, WorkCardClaimed, WorkCardId,
+    WorkEvent,
 };
 use airc_work_store::WorkEventStore;
 
@@ -31,6 +32,19 @@ pub struct ReleaseWorkClaim {
     pub card_id: WorkCardId,
     pub claim_id: ClaimId,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkLane {
+    pub repo: RepoId,
+    pub title: String,
+    pub state: LaneState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeWorkLaneState {
+    pub lane_id: LaneId,
+    pub state: LaneState,
 }
 
 impl Airc {
@@ -76,6 +90,38 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Create a work lane in the current room. Kanban boards are
+    /// projections over lane + card events; this returns the UUIDv4
+    /// lane id generated locally.
+    pub async fn create_work_lane(&self, request: CreateWorkLane) -> Result<LaneId, AircError> {
+        let lane_id = LaneId::new();
+        let event = WorkEvent::LaneCreated(LaneCreated {
+            lane_id,
+            repo: request.repo,
+            title: request.title,
+            state: request.state,
+            created_by: self.peer_id(),
+            created_at_ms: now_ms(),
+        });
+        self.publish_work_event(&event).await?;
+        Ok(lane_id)
+    }
+
+    /// Change a lane's state through the work event stream.
+    pub async fn change_work_lane_state(
+        &self,
+        request: ChangeWorkLaneState,
+    ) -> Result<(), AircError> {
+        let event = WorkEvent::LaneStateChanged(LaneStateChanged {
+            lane_id: request.lane_id,
+            state: request.state,
+            changed_by: self.peer_id(),
+            changed_at_ms: now_ms(),
         });
         self.publish_work_event(&event).await?;
         Ok(())

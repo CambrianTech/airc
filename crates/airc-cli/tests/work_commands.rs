@@ -72,6 +72,55 @@ fn work_create_claim_release_projects_on_board() {
 }
 
 #[test]
+fn lane_create_status_and_state_drive_work_projection() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+
+    let lane = run_ok(
+        &home,
+        &[
+            "lane",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "rust lane commands",
+            "--state",
+            "planned",
+        ],
+    );
+    let lane_id = extract_field(&lane, "lane_id:").expect("lane create prints lane_id");
+
+    let status = run_ok(&home, &["lane", "status"]);
+    assert!(status.contains(lane_id));
+    assert!(status.contains("Planned"));
+    assert!(status.contains("cards=0"));
+
+    run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "card inside lane",
+            "--lane-id",
+            lane_id,
+        ],
+    );
+
+    let status = run_ok(&home, &["lane", "status"]);
+    assert!(status.contains("cards=1"));
+
+    run_ok(&home, &["lane", "state", lane_id, "active"]);
+    let status = run_ok(&home, &["lane", "status"]);
+    assert!(status.contains("Active"));
+}
+
+#[test]
 fn work_board_empty_state_is_explicit() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
