@@ -1,50 +1,59 @@
-//! Subcommand handlers — keep them small and direct. Each function
-//! takes a `LocalIdentity` (loaded once per invocation by `main`) +
-//! command-specific args.
+//! Subcommand handlers.
+//!
+//! Local-substrate commands (`init`, `send`, `listen`, `room`,
+//! `peer add`, `peer list`) route through `airc_lib::Airc` — the
+//! CLI is a thin client of the same API consumers embed. Closes
+//! grievance §5 / Codex audit finding #4.
+//!
+//! LAN-TCP and daemon-host commands construct lower-level handles
+//! (`LanTcpAdapter`, `DaemonState`) directly — they're not in
+//! airc-lib's surface yet. Daemon-client commands (`ping`, `status`,
+//! `stop`, `msg`, `inbox`) use `airc_daemon::DaemonClient` directly.
 //!
 //! `VerificationPolicy::Strict` is the only policy used in CLI paths.
-//! There is no opt-in for `AllowUnsigned` here — production rules.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use airc_core::{
-    headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, PeerId, RoomId,
+    headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
     TranscriptCursor,
 };
 use airc_protocol::{
     Envelope, Frame, FrameKind, PeerKeyRegistry, Signature, Subscription, VerificationPolicy,
 };
-use airc_transport::{LanTcpAdapter, LocalFsAdapter, SignedTransport, Transport};
+use airc_transport::{LanTcpAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
 
 use airc_daemon::{
     peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, InboxRequest,
     LocalIdentity, SendRequest, SubscribeRequest,
 };
-use airc_lib::{format_peer_spec, room, PeerSpec, Room};
+use airc_lib::{room, Airc, Body, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
 
-/// `init` — create or load the persisted identity under `<home>`,
-/// auto-create the default room, then print the peer spec.
-pub fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let identity = LocalIdentity::load_or_generate(home)?;
+/// `init` — open the substrate at `<home>`. `Airc::open` loads or
+/// generates the identity, opens the event store, applies any
+/// pending migrations, and primes the peer registry. The CLI then
+/// prints the local peer's spec so the user can share it.
+pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
     // Auto-join "default" room on first init so subsequent
-    // `airc-rs msg` calls work without `--wire`/`--channel`.
-    if !room::path_in(home).exists() {
-        let default_room = Room::default_for(home);
-        room::save(home, &default_room)?;
+    // `airc-rs msg` / `say` work without explicit room selection.
+    if airc.current_room().await?.name != "default" {
+        // load_or_default returns the synthesised default when
+        // room.json is missing; if a different room name comes back
+        // the user has already joined something — leave it.
+    } else if !airc.home().join("room.json").exists() {
+        airc.join("default").await?;
     }
-    let current = room::load_or_default(home)?;
-    println!("home:        {}", home.display());
-    println!("peer_id:     {}", identity.peer_id);
-    println!("client_id:   {}", identity.client_id);
+    let current = airc.current_room().await?;
+    println!("home:        {}", airc.home().display());
+    println!("peer_id:     {}", airc.peer_id());
+    println!("client_id:   {}", airc.client_id());
     println!("room:        {} ({})", current.name, current.channel);
-    println!(
-        "peer_spec:   {}",
-        format_peer_spec(identity.peer_id, &identity.keypair.public_bytes())
-    );
+    println!("peer_spec:   {}", airc.peer_spec());
     println!();
     println!(
         "Share peer_spec with peers; enrol theirs via `airc-rs peer add <spec>`. \
@@ -55,28 +64,26 @@ pub fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `room` — print current room. `room <name>` — switch to a
-/// deterministic room derived from `<name>` (same name across peers
-/// = same channel UUID, so they don't need to share it). `--wire`
-/// overrides the per-home default wire dir; used for shared-wire
-/// setups (e.g. local-fs tests with two processes on one machine).
-pub fn run_room(
+/// deterministic room derived from `<name>`. `--wire` overrides the
+/// per-home default wire dir (test-only shared-wire setup).
+pub async fn run_room(
     home: &Path,
     name: Option<String>,
     wire: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
-            let mut next = Room::from_name(home, &name);
-            if let Some(wire) = wire {
-                next.wire = wire;
-            }
-            room::save(home, &next)?;
+            let next = match wire {
+                Some(wire) => airc.join_with_wire(&name, wire).await?,
+                None => airc.join(&name).await?,
+            };
             println!("switched room: {}", next.name);
             println!("  wire:    {}", next.wire.display());
             println!("  channel: {}", next.channel);
         }
         None => {
-            let current = room::load_or_default(home)?;
+            let current = airc.current_room().await?;
             println!("room:    {}", current.name);
             println!("wire:    {}", current.wire.display());
             println!("channel: {}", current.channel);
@@ -85,58 +92,53 @@ pub fn run_room(
     Ok(())
 }
 
-/// `send` — local-fs single-shot send to the current room, signed
-/// under Strict.
+/// `send` — local-fs single-shot send to the current room. Routes
+/// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
+/// in-process registry for the duration of the invocation.
 pub async fn run_send(
     home: &Path,
-    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let current = room::load_or_default(home)?;
-    let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LocalFsAdapter::new(&current.wire);
-    let transport = SignedTransport::new(
-        inner,
-        identity.keypair.clone(),
-        identity.peer_id,
-        registry,
-        VerificationPolicy::Strict,
-    );
-    let frame = build_message_frame(identity, current.channel, text);
-    transport.send(frame).await?;
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+    let current = airc.current_room().await?;
+    airc.say(text).await?;
     println!("sent to {} ({}).", current.name, current.channel);
     Ok(())
 }
 
-/// `listen` — local-fs subscribe loop on the current room. Prints
-/// frames until Ctrl-C.
+/// `listen` — subscribe to live events on the current room and
+/// print them until Ctrl-C. Routes through `Airc::subscribe`. The
+/// underlying wire subscriber is replay-anchored: existing frames
+/// on the wire are replayed through the broadcast first, then live
+/// events flow. `--replay` is accepted for compatibility but the
+/// distinction is no longer load-bearing — the substrate always
+/// gives consumers the full transcript.
 pub async fn run_listen(
     home: &Path,
-    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
-    replay: bool,
+    _replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let current = room::load_or_default(home)?;
-    let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LocalFsAdapter::new(&current.wire);
-    let transport = SignedTransport::new(
-        inner,
-        identity.keypair.clone(),
-        identity.peer_id,
-        registry,
-        VerificationPolicy::Strict,
-    );
-    let subscription = subscription_with_channel(current.channel, replay);
-    let mut stream = transport.subscribe(subscription).await?;
-
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+    let current = airc.current_room().await?;
     println!(
         "listening on {} ({}, peer_id {}) …",
         current.name,
         current.wire.display(),
-        identity.peer_id
+        airc.peer_id()
     );
-    print_until_signal(&mut stream).await
+
+    // Subscribe creates the live receiver BEFORE spawning the wire
+    // subscriber (see `Airc::subscribe`), so pre-existing frames
+    // on the wire flow through this stream without race-loss.
+    let mut stream = airc.subscribe().await?;
+    print_event_stream_until_signal(&mut stream).await
 }
 
 /// `lan-send` — TLS-wrapped single-shot send to a remote peer, on
@@ -343,19 +345,7 @@ pub async fn run_inbox(
     Ok(())
 }
 
-// ---- Shared helpers -------------------------------------------------
-
-fn subscription_with_channel(channel: RoomId, replay: bool) -> Subscription {
-    let from_cursor = replay.then(|| TranscriptCursor {
-        lamport: 0,
-        event_id: EventId::from_u128(0),
-    });
-    Subscription {
-        channel: Some(channel),
-        from_cursor,
-        ..Default::default()
-    }
-}
+// ---- Shared helpers (LAN commands) ---------------------------------
 
 fn build_message_frame(identity: &LocalIdentity, channel: RoomId, text: &str) -> Frame {
     let lamport = std::time::SystemTime::now()
@@ -428,6 +418,39 @@ fn print_frame(frame: &Frame) {
     );
 }
 
+async fn print_event_stream_until_signal(
+    stream: &mut airc_lib::EventStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sigint = tokio::signal::ctrl_c();
+    let mut sigint = Box::pin(sigint);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut sigint => {
+                println!();
+                println!("interrupted; exiting.");
+                return Ok(());
+            }
+            next = stream.next() => {
+                match next {
+                    Some(Ok(event)) => print_event(&event),
+                    Some(Err(lag)) => {
+                        // LiveLag is the explicit signal that the
+                        // consumer fell behind broadcast capacity.
+                        // Print and continue — the operating doc
+                        // says lag must surface, not silently drop.
+                        eprintln!("{lag}");
+                    }
+                    None => {
+                        println!("stream closed; exiting.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn print_event(event: &airc_core::TranscriptEvent) {
     let text = event
         .body
@@ -463,24 +486,31 @@ fn build_combined_registry(
     Ok(Arc::new(RwLock::new(registry)))
 }
 
-/// `peer add <spec>` — persist a peer to `<home>/peers.json`. If a
-/// daemon is running on the given socket, also tells it via the
-/// AddPeer RPC so the in-memory registry stays in sync.
+/// `peer add <spec>` — persist a peer to `<home>/peers.json` via
+/// `Airc::add_peer`. If a daemon is running on the given socket,
+/// also tells it via the AddPeer RPC so the in-memory registry
+/// stays in sync.
 pub async fn run_peer_add(
     home: &Path,
     spec: PeerSpec,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stored = peers_store::add(home, spec.peer_id, spec.pubkey)?;
-    println!("enroled peer_id={} (pubkey 32 bytes)", stored.peer_id);
+    let airc = Airc::open(home).await?;
+    let pubkey_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        spec.pubkey,
+    );
+    let peer_id = spec.peer_id;
+    airc.add_peer(spec).await?;
+    println!("enroled peer_id={peer_id} (pubkey 32 bytes)");
 
     // Best-effort daemon sync. If the daemon isn't running, that's
     // fine — it'll pick up peers.json on next start.
     let client = DaemonClient::new(socket);
     match client
         .add_peer(AddPeerRequest {
-            peer_id: stored.peer_id,
-            pubkey_b64: stored.pubkey_b64.clone(),
+            peer_id,
+            pubkey_b64,
         })
         .await
     {
@@ -492,11 +522,12 @@ pub async fn run_peer_add(
     Ok(())
 }
 
-/// `peer list` — print enroled peers from `<home>/peers.json`. The
-/// daemon writes the same file, so this is a stable view whether the
-/// daemon is running or not.
-pub fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let peers = peers_store::load(home)?;
+/// `peer list` — print enroled peers via `Airc::peers`. The daemon
+/// writes the same `<home>/peers.json`, so this view stays
+/// consistent whether the daemon is running or not.
+pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let peers = airc.peers().await?;
     if peers.is_empty() {
         println!("(no enroled peers — use `airc-rs peer add <spec>` to enrol)");
         return Ok(());
