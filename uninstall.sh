@@ -139,13 +139,23 @@ if [ -f "$codex_config" ]; then
     mv "$_tmp" "$codex_config"
     ok "Removed airc command-rules pre-approval from $codex_config"
   fi
-  if [ -x "$CLONE_DIR/.venv/bin/python" ]; then
-    if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$CLONE_DIR/.venv/bin/python" -m airc_core.codex_install --codex-home "$HOME/.codex" uninstall-hooks 2>&1); then
+  _airc_rs=""
+  if command -v airc-rs >/dev/null 2>&1; then
+    _airc_rs=$(command -v airc-rs)
+  elif [ -x "$CLONE_DIR/target/release/airc-rs" ]; then
+    _airc_rs="$CLONE_DIR/target/release/airc-rs"
+  elif [ -x "$CLONE_DIR/target/debug/airc-rs" ]; then
+    _airc_rs="$CLONE_DIR/target/debug/airc-rs"
+  fi
+  if [ -n "$_airc_rs" ]; then
+    if out=$("$_airc_rs" codex-hook uninstall-hooks --codex-home "$HOME/.codex" 2>&1); then
       if [ -n "$out" ]; then
         printf '%s\n' "$out" | while IFS= read -r line; do
           ok "Codex AIRC hook: $line"
         done
       fi
+    else
+      warn "Could not uninstall Codex AIRC hook through airc-rs: $out"
     fi
   fi
 fi
