@@ -192,10 +192,11 @@ _join_transport_health_ok() {
   # already proved the scope owner is alive, transport_health has no
   # channel rows to evaluate and must not force a duplicate restart.
   [ -n "$_channels" ] || return 0
-  "$AIRC_PYTHON" -m airc_core.transport_health check \
+  "$(airc_rs_bin)" transport health \
     --home "$AIRC_WRITE_DIR" \
     --config "$CONFIG" \
-    --quiet >/dev/null 2>&1
+    --quiet \
+    --fail >/dev/null 2>&1
 }
 
 _join_transport_in_startup_grace() {
@@ -831,9 +832,10 @@ cmd_connect() {
       sleep 1
     else
       local _health_out _health_rc=0
-      _health_out=$("$AIRC_PYTHON" -m airc_core.transport_health check \
+      _health_out=$("$(airc_rs_bin)" transport health \
         --home "$AIRC_WRITE_DIR" \
-        --config "$CONFIG" 2>/dev/null) || _health_rc=$?
+        --config "$CONFIG" \
+        --fail 2>/dev/null) || _health_rc=$?
       if [ "$_health_rc" != "0" ] && _join_transport_in_startup_grace "$_health_out" "$_early_pidfile"; then
         local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
         echo "  airc join: AIRC process is still starting in this scope (AIRC PIDs: $_early_pids)."
