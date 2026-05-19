@@ -84,6 +84,10 @@ impl FromStr for PeerSpec {
 
 /// Build a registry from a list of peer specs. Each spec's pubkey is
 /// enrolled at key_id = 0 (the substrate default).
+// Kept available for tests; the CLI command path now uses
+// `commands::build_combined_registry` which unions persistent +
+// ad-hoc peers under one helper.
+#[allow(dead_code)]
 pub fn build_registry(
     self_peer_id: PeerId,
     self_pubkey: [u8; 32],

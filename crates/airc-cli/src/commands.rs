@@ -8,21 +8,25 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use airc_core::{
     headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, PeerId, RoomId,
     TranscriptCursor,
 };
-use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription, VerificationPolicy};
+use airc_protocol::{
+    Envelope, Frame, FrameKind, PeerKeyRegistry, Signature, Subscription, VerificationPolicy,
+};
 use airc_transport::{LanTcpAdapter, LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use crate::daemon::{run as run_daemon_server, DaemonState};
 use crate::identity::LocalIdentity;
-use crate::ipc::request::{InboxRequest, SubscribeRequest};
+use crate::ipc::request::{AddPeerRequest, InboxRequest, SubscribeRequest};
 use crate::ipc::{DaemonClient, SendRequest};
-use crate::registry::{build_registry, format_peer_spec, PeerSpec};
+use crate::peers_store;
+use crate::registry::{format_peer_spec, PeerSpec};
 
 /// `init` — create or load the persisted identity under `<home>`,
 /// then print the peer spec for out-of-band sharing.
@@ -37,21 +41,22 @@ pub fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
     println!(
-        "Share peer_spec with other peers and pass it back as --peer <spec>. \
-         (Persistent peers.json coming in the next PR.)"
+        "Share peer_spec with other peers. Enrol theirs with \
+         `airc-rs peer add <spec>` (persisted to `<home>/peers.json`)."
     );
     Ok(())
 }
 
 /// `send` — local-fs single-shot send, signed under Strict.
 pub async fn run_send(
+    home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     wire: &Path,
     channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let registry = build_combined_registry(home, identity, &peers)?;
     let inner = LocalFsAdapter::new(wire);
     let transport = SignedTransport::new(
         inner,
@@ -69,13 +74,14 @@ pub async fn run_send(
 
 /// `listen` — local-fs subscribe loop. Prints frames until Ctrl-C.
 pub async fn run_listen(
+    home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     wire: &Path,
     channel: Option<String>,
     replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let registry = build_combined_registry(home, identity, &peers)?;
     let inner = LocalFsAdapter::new(wire);
     let transport = SignedTransport::new(
         inner,
@@ -97,6 +103,7 @@ pub async fn run_listen(
 
 /// `lan-send` — TLS-wrapped single-shot send to a remote peer.
 pub async fn run_lan_send(
+    home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     to: std::net::SocketAddr,
@@ -104,7 +111,7 @@ pub async fn run_lan_send(
     channel: &str,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let registry = build_combined_registry(home, identity, &peers)?;
     let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
     inner.connect(to, expected_peer).await?;
     let transport = SignedTransport::new(
@@ -123,12 +130,13 @@ pub async fn run_lan_send(
 
 /// `lan-listen` — bind a TLS server, accept peers, print frames.
 pub async fn run_lan_listen(
+    home: &Path,
     identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     bind: std::net::SocketAddr,
     replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let registry = build_combined_registry(home, identity, &peers)?;
     let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
     let actual = inner.listen(bind).await?;
     println!("listening on {actual} (peer_id {}) …", identity.peer_id);
@@ -146,11 +154,12 @@ pub async fn run_lan_listen(
 
 /// `daemon` — run the long-lived daemon process on the given socket.
 pub async fn run_daemon(
+    home: &Path,
     identity: LocalIdentity,
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_registry(identity.peer_id, identity.keypair.public_bytes(), &peers)?;
+    let registry = build_combined_registry(home, &identity, &peers)?;
 
     if let Some(parent) = socket.parent() {
         if !parent.as_os_str().is_empty() {
@@ -163,6 +172,7 @@ pub async fn run_daemon(
         identity.keypair,
         registry,
         VerificationPolicy::Strict,
+        home.to_path_buf(),
     ));
     println!(
         "airc-rs daemon: peer_id={} listening on {}",
@@ -350,9 +360,76 @@ fn print_frame(frame: &Frame) {
     );
 }
 
+/// Build the runtime `PeerKeyRegistry` from persistent peers
+/// (`<home>/peers.json`) + ad-hoc `--peer` flags. Self is always
+/// enroled. Ad-hoc unions on top of persistent — if the same peer_id
+/// appears in both, the ad-hoc pubkey wins (matches "this invocation
+/// is authoritative" intuition).
+fn build_combined_registry(
+    home: &Path,
+    identity: &LocalIdentity,
+    adhoc: &[PeerSpec],
+) -> Result<Arc<RwLock<PeerKeyRegistry>>, Box<dyn std::error::Error>> {
+    let mut registry = PeerKeyRegistry::new();
+    registry.enrol(identity.peer_id, 0, identity.keypair.public_bytes())?;
+    for stored in peers_store::load(home)? {
+        registry.enrol(stored.peer_id, 0, stored.pubkey_bytes()?)?;
+    }
+    for spec in adhoc {
+        registry.enrol(spec.peer_id, 0, spec.pubkey)?;
+    }
+    Ok(Arc::new(RwLock::new(registry)))
+}
+
+/// `peer add <spec>` — persist a peer to `<home>/peers.json`. If a
+/// daemon is running on the given socket, also tells it via the
+/// AddPeer RPC so the in-memory registry stays in sync.
+pub async fn run_peer_add(
+    home: &Path,
+    spec: PeerSpec,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = peers_store::add(home, spec.peer_id, spec.pubkey)?;
+    println!("enroled peer_id={} (pubkey 32 bytes)", stored.peer_id);
+
+    // Best-effort daemon sync. If the daemon isn't running, that's
+    // fine — it'll pick up peers.json on next start.
+    let client = DaemonClient::new(socket);
+    match client
+        .add_peer(AddPeerRequest {
+            peer_id: stored.peer_id,
+            pubkey_b64: stored.pubkey_b64.clone(),
+        })
+        .await
+    {
+        Ok(()) => println!("daemon: in-memory registry updated."),
+        Err(_) => {
+            println!("daemon: not running (peers.json updated; daemon will load on next start).")
+        }
+    }
+    Ok(())
+}
+
+/// `peer list` — print enroled peers from `<home>/peers.json`. The
+/// daemon writes the same file, so this is a stable view whether the
+/// daemon is running or not.
+pub fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let peers = peers_store::load(home)?;
+    if peers.is_empty() {
+        println!("(no enroled peers — use `airc-rs peer add <spec>` to enrol)");
+        return Ok(());
+    }
+    for peer in &peers {
+        println!("{}  {}", peer.peer_id, peer.pubkey_b64);
+    }
+    println!();
+    println!("{} peer(s) enroled at {}", peers.len(), home.display());
+    Ok(())
+}
+
 // Silence the unused-import warning for `ClientId`: it's used
-// transitively through `LocalIdentity::client_id` (which is the
+// transitively through `LocalIdentity::client_id` (the
 // `airc_core::ClientId` newtype) but not referenced by name in this
-// file. Keeping the import explicit keeps the dep graph readable.
+// file. Keeping the import explicit makes the dep graph readable.
 #[allow(dead_code)]
 fn _client_id_kept_in_scope(_: ClientId) {}

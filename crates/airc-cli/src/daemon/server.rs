@@ -164,11 +164,16 @@ mod tests {
         let mut registry = PeerKeyRegistry::new();
         registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
         let registry = Arc::new(RwLock::new(registry));
+        // Test home — leaked so it lives until process exit.
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().to_path_buf();
+        std::mem::forget(home);
         Arc::new(DaemonState::new(
             peer_id,
             keypair,
             registry,
             VerificationPolicy::Strict,
+            home_path,
         ))
     }
 

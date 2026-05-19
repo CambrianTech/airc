@@ -16,6 +16,7 @@ mod commands;
 mod daemon;
 mod identity;
 mod ipc;
+mod peers_store;
 mod registry;
 
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ use uuid::Uuid;
 
 use airc_core::PeerId;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, PeerAction};
 use identity::LocalIdentity;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
@@ -62,7 +63,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             text,
         } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_send(&identity, parsed.peers, &wire, &channel, &text).await
+            commands::run_send(&home, &identity, parsed.peers, &wire, &channel, &text).await
         }
 
         Command::Listen {
@@ -71,7 +72,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             replay,
         } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_listen(&identity, parsed.peers, &wire, channel, replay).await
+            commands::run_listen(&home, &identity, parsed.peers, &wire, channel, replay).await
         }
 
         Command::LanSend {
@@ -82,18 +83,27 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
             let expected = parse_peer_id(&expected_peer)?;
-            commands::run_lan_send(&identity, parsed.peers, to, expected, &channel, &text).await
+            commands::run_lan_send(
+                &home,
+                &identity,
+                parsed.peers,
+                to,
+                expected,
+                &channel,
+                &text,
+            )
+            .await
         }
 
         Command::LanListen { bind, replay } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_lan_listen(&identity, parsed.peers, bind, replay).await
+            commands::run_lan_listen(&home, &identity, parsed.peers, bind, replay).await
         }
 
         Command::Daemon { socket } => {
             let identity = LocalIdentity::load_or_generate(&home)?;
             let socket = default_or(socket, &home);
-            commands::run_daemon(identity, parsed.peers, socket).await
+            commands::run_daemon(&home, identity, parsed.peers, socket).await
         }
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
@@ -113,6 +123,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             since_lamport,
             limit,
         } => commands::run_inbox(default_or(socket, &home), wire, since_lamport, limit).await,
+
+        Command::Peer(args) => match args.action {
+            PeerAction::Add { spec, socket } => {
+                commands::run_peer_add(&home, spec, default_or(socket, &home)).await
+            }
+            PeerAction::List => commands::run_peer_list(&home),
+        },
     }
 }
 

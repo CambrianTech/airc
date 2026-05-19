@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use airc_core::PeerId;
 use airc_protocol::Frame;
 
 /// One response to a `Request`.
@@ -17,8 +18,11 @@ pub enum Response {
     /// caller threads back on the next call to keep the stream
     /// consume-once.
     Inbox(InboxResponse),
+    /// Response to `ListPeers` — the daemon's currently-enrolled
+    /// peers (peer_id + URL-safe-no-padding base64 pubkey).
+    Peers(PeersResponse),
     /// Generic success for ops that don't return data (`Send`,
-    /// `Subscribe`, `Stop`).
+    /// `Subscribe`, `AddPeer`, `Stop`).
     Ok,
     /// Failure — typed message so the client can render it.
     Error { message: String },
@@ -31,6 +35,21 @@ pub struct StatusResponse {
     pub peer_id: String,
     /// Seconds since daemon start.
     pub uptime_seconds: u64,
+}
+
+/// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
+/// but lives in `ipc` so the client doesn't need to depend on the
+/// daemon's storage module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerEntry {
+    pub peer_id: PeerId,
+    pub pubkey_b64: String,
+}
+
+/// Snapshot of enrolled peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeersResponse {
+    pub peers: Vec<PeerEntry>,
 }
 
 /// Result of an `Inbox` pull: frames + the lamport to feed back as

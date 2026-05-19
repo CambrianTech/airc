@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::ipc::request::{InboxRequest, Request, SendRequest, SubscribeRequest};
-use crate::ipc::response::{InboxResponse, Response, StatusResponse};
+use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
 
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
@@ -139,6 +139,24 @@ impl DaemonClient {
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
+        match self.call(Request::AddPeer(request)).await? {
+            Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    // Reserved for future CLI surfaces that want the daemon's
+    // authoritative in-memory view (rather than reading peers.json
+    // directly). The current `airc-rs peer list` reads the file.
+    #[allow(dead_code)]
+    pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
+        match self.call(Request::ListPeers).await? {
+            Response::Peers(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
