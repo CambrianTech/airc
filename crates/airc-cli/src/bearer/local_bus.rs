@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 const MESSAGES_FILE: &str = "messages.jsonl";
@@ -16,6 +16,35 @@ pub fn append_batch(gist_id: &str, payloads: &[String]) -> (bool, String) {
         }
     }
     (ok, detail)
+}
+
+pub fn read_from(gist_id: &str, mut byte_offset: u64) -> (Vec<String>, u64) {
+    let path = path_for(gist_id);
+    let Ok(mut file) = fs::File::open(path) else {
+        return (Vec::new(), byte_offset);
+    };
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if byte_offset > size {
+        byte_offset = 0;
+    }
+    if file.seek(SeekFrom::Start(byte_offset)).is_err() {
+        return (Vec::new(), byte_offset);
+    }
+    let mut chunk = Vec::new();
+    if file.read_to_end(&mut chunk).is_err() || chunk.is_empty() {
+        return (Vec::new(), byte_offset);
+    }
+    let Some(last_newline) = chunk.iter().rposition(|byte| *byte == b'\n') else {
+        return (Vec::new(), byte_offset);
+    };
+    let complete = &chunk[..=last_newline];
+    let Ok(text) = String::from_utf8(complete.to_vec()) else {
+        return (Vec::new(), byte_offset);
+    };
+    (
+        text.lines().map(str::to_string).collect(),
+        byte_offset + complete.len() as u64,
+    )
 }
 
 fn append(gist_id: &str, line: &str) -> (bool, String) {

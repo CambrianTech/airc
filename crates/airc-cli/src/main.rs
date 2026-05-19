@@ -147,6 +147,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 remote_home.as_deref(),
                 room_gist_id.as_deref(),
             ),
+            BearerAction::Recv {
+                peer_id,
+                host_target,
+                identity_key,
+                remote_home,
+                offset_file,
+                state_file,
+                room_gist_id,
+            } => bearer::recv::run_recv(
+                &peer_id,
+                host_target.as_deref(),
+                identity_key.as_deref(),
+                remote_home.as_deref(),
+                offset_file.as_deref(),
+                state_file.as_deref(),
+                room_gist_id.as_deref(),
+            ),
         },
 
         Command::Config(args) => match args.action {

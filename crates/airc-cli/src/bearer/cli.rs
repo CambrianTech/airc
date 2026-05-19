@@ -35,4 +35,21 @@ pub enum BearerAction {
         #[arg(long)]
         room_gist_id: Option<String>,
     },
+
+    /// Stream legacy JSONL envelopes to stdout.
+    Recv {
+        peer_id: String,
+        #[arg(long)]
+        host_target: Option<String>,
+        #[arg(long)]
+        identity_key: Option<String>,
+        #[arg(long)]
+        remote_home: Option<String>,
+        #[arg(long)]
+        offset_file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        state_file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        room_gist_id: Option<String>,
+    },
 }
