@@ -49,7 +49,8 @@ _to_bash_path() {
 # install via the platform's package manager, then verify. Designed for
 # FIRST-TIME users with nothing pre-installed beyond a shell.
 #
-# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip)
+# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip),
+# cargo (to build the Rust substrate CLI).
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
 # Deliberately not required: openssl. Issue #341 — identity Ed25519 ops
 # moved to the venv cryptography module so we don't depend on system
@@ -105,6 +106,16 @@ pkgname_for() {
         pacman) echo "python" ;;
         winget) echo "Python.Python.3.12" ;;
         *)      echo "python3" ;;
+      esac ;;
+    cargo)
+      case "$mgr" in
+        brew)   echo "rust" ;;
+        apt)    echo "cargo" ;;
+        dnf)    echo "cargo" ;;
+        pacman) echo "rust" ;;
+        apk)    echo "cargo" ;;
+        winget) echo "Rustlang.Rustup" ;;
+        *)      echo "cargo" ;;
       esac ;;
     git)
       case "$mgr" in
@@ -193,7 +204,7 @@ ensure_prereqs() {
       fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
-      warn "Required prereqs: git, gh, python3 (cryptography via pip)"
+      warn "Required prereqs: git, gh, python3 (cryptography via pip), cargo"
       return 0
     fi
   fi
@@ -208,7 +219,7 @@ ensure_prereqs() {
   # both route through the venv cryptography module (which is already
   # a hard dep, pip-installed below). LibreSSL on macOS used to make
   # this an ordeal; now it's a non-issue at the source.
-  for cmd in git gh ssh-keygen python3; do
+  for cmd in git gh ssh-keygen python3 cargo; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
@@ -487,6 +498,29 @@ case "$(uname -s 2>/dev/null)" in
     ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
     ;;
 esac
+
+_install_airc_rs_binary() {
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc-rs build"; return 0; }
+  if ! command -v cargo >/dev/null 2>&1; then
+    fail "cargo is required to build airc-rs. Install Rust, then re-run install.sh."
+  fi
+  info "Building Rust CLI: airc-rs"
+  (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
+  local built="$CLONE_DIR/target/release/airc-rs"
+  [ -x "$built" ] || fail "airc-rs build completed but binary is missing: $built"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      cp -f "$built" "$BIN_DIR/airc-rs.exe"
+      ok "Installed airc-rs: $BIN_DIR/airc-rs.exe"
+      ;;
+    *)
+      ln -sf "$built" "$BIN_DIR/airc-rs"
+      ok "Installed airc-rs: $BIN_DIR/airc-rs"
+      ;;
+  esac
+}
+
+_install_airc_rs_binary
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do

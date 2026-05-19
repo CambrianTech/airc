@@ -33,6 +33,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('codex-hook install-hooks --codex-home "$HOME/.codex"', body)
         self.assertIn("airc-rs not found", body)
 
+    def test_installer_builds_airc_rs_before_hook_registration(self):
+        source = (REPO / "install.sh").read_text(encoding="utf-8")
+        build_pos = source.index("_install_airc_rs_binary")
+        hook_pos = source.index("_install_airc_codex_hooks()")
+
+        self.assertLess(build_pos, hook_pos)
+        self.assertIn("cargo build --release -p airc-cli", source)
+        self.assertIn('ln -sf "$built" "$BIN_DIR/airc-rs"', source)
+        self.assertIn('cp -f "$built" "$BIN_DIR/airc-rs.exe"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
