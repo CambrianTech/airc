@@ -1,3 +1,4 @@
+mod attach;
 mod cli;
 mod formatter;
 mod rename;
@@ -21,4 +22,8 @@ pub fn run_format(peers_dir: &Path, my_name: &str) -> Result<(), Box<dyn Error>>
     } else {
         formatter.run_locked_stdin()
     }
+}
+
+pub fn run_attach(home: &Path, my_name: &str) -> Result<(), Box<dyn Error>> {
+    attach::run(home, my_name)
 }
