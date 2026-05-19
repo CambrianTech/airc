@@ -44,7 +44,7 @@ pub fn run_render(since: &str, count: usize, json_output: bool) -> Result<(), Bo
     Ok(())
 }
 
-fn append_unique_sig(path: &Path, line: &str) -> Result<AppendOutcome, Box<dyn Error>> {
+pub fn append_unique_sig(path: &Path, line: &str) -> Result<AppendOutcome, Box<dyn Error>> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -381,7 +381,7 @@ fn is_stale_lock(path: &Path) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppendOutcome {
+pub enum AppendOutcome {
     Appended,
     Skipped,
 }

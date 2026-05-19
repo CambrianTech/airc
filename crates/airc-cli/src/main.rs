@@ -45,6 +45,7 @@ mod log_cli;
 mod log_commands;
 mod message_cli;
 mod message_commands;
+mod monitor;
 mod pending_cli;
 mod pending_commands;
 mod route_cli;
@@ -79,6 +80,7 @@ use identity_cli::IdentityAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
 use message_cli::MessageAction;
+use monitor::MonitorAction;
 use pending_cli::PendingAction;
 use route_cli::RouteAction;
 use transport_cli::TransportAction;
@@ -308,6 +310,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 recipient_pub,
                 identity_dir,
             } => legacy_envelope::wrap_stdin(&recipient_pub, &identity_dir),
+            EnvelopeAction::Unwrap {
+                sender_pub,
+                identity_dir,
+            } => legacy_envelope::unwrap_stdin(&sender_pub, &identity_dir),
         },
 
         Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
@@ -530,6 +536,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => log_commands::run_rotate(&path, max_lines, keep_lines),
             LogAction::Render { since, count, json } => {
                 log_commands::run_render(&since, count, json)
+            }
+        },
+
+        Command::Monitor(args) => match args.action {
+            MonitorAction::Format { peers_dir, my_name } => {
+                monitor::run_format(&peers_dir, &my_name)
             }
         },
 
