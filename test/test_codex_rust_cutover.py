@@ -100,6 +100,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 -c", queue_body)
         self.assertNotIn("python3 -c", teardown_body)
 
+    def test_integration_tabs_peer_record_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_tabs()")
+        end = source.index("scenario_scope()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config get --config "$peer_file" airc_home', body)
+        self.assertNotIn("python3 -c", body)
+
     def test_integration_quit_config_probes_use_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_quit()")
