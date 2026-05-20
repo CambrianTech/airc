@@ -4329,7 +4329,7 @@ scenario_general_has_shared_gist() {
   pass "host published project room gist: $proj_gid (for #$rname)"
 
   trap "gh gist delete '$proj_gid' --yes 2>/dev/null || true; \
-        general_gid=\$(python3 -c \"import json; c=json.load(open('/tmp/airc-it-tdd283-h/state/config.json')); print(c.get('channel_gists',{}).get('general',''))\" 2>/dev/null); \
+        general_gid=\$(\"$(airc_rs_bin)\" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null); \
         [ -n \"\$general_gid\" ] && [ \"\$general_gid\" != \"$proj_gid\" ] && gh gist delete \"\$general_gid\" --yes 2>/dev/null || true" EXIT
 
   # Sleep a moment so the sidecar code has had a chance to also resolve
@@ -4339,14 +4339,7 @@ scenario_general_has_shared_gist() {
   # Critical assertion 1: config.json must have a channel_gists map
   # with "general" pointing at a gist id distinct from the project room.
   local general_gid
-  general_gid=$(python3 -c "
-import json, sys
-try:
-    c = json.load(open('/tmp/airc-it-tdd283-h/state/config.json'))
-    print(c.get('channel_gists', {}).get('general', ''))
-except Exception:
-    pass
-" 2>/dev/null)
+  general_gid=$("$(airc_rs_bin)" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null)
 
   if [ -n "$general_gid" ]; then
     pass "config.channel_gists['general'] resolved to: $general_gid"
@@ -4409,16 +4402,27 @@ scenario_custom_room_creates_gist() {
   local home; home=$(mktemp -d -t airc-it-customroom.XXXXXX)
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=tdd-cr-$$ AIRC_PORT=7565 AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
       "$AIRC" connect --room "$rname" --no-general > "$home/out.log" 2>&1 & )
-  local i; for i in 1 2 3 4 5 6 7 8; do sleep 1; [ -f "$home/state/config.json" ] && break; done
-  sleep 2
-  local gid; gid=$(python3 -c "import json,sys;print(json.load(open('$home/state/config.json')).get('channel_gists',{}).get('$rname',''))" 2>/dev/null)
+  local gid="" i
+  for i in $(seq 1 30); do
+    sleep 1
+    [ -f "$home/state/config.json" ] || continue
+    gid=$("$(airc_rs_bin)" config get-channel-gist --config "$home/state/config.json" --channel "$rname" 2>/dev/null)
+    [ -n "$gid" ] && break
+  done
   trap "[ -n '$gid' ] && gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
   if [ -n "$gid" ]; then pass "channel_gists['$rname'] = $gid"; else fail "channel_gists['$rname'] empty — phantom room"; cleanup_all; return; fi
   gh api "gists/$gid" --jq '.id' >/dev/null 2>&1 && pass "gist actually exists on gh" || fail "gist id present but gh has no such gist"
   local marker="tdd-cr-$$"
   AIRC_HOME="$home/state" "$AIRC" msg --room "$rname" "$marker" >/dev/null 2>&1
-  sleep 2
-  gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null | grep -q "$marker" \
+  local landed=0
+  for i in $(seq 1 15); do
+    sleep 1
+    if gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null | grep -q "$marker"; then
+      landed=1
+      break
+    fi
+  done
+  [ "$landed" = "1" ] \
     && pass "broadcast to #$rname landed in its gist" \
     || fail "broadcast to #$rname did NOT land — channel routing broken"
   trap - EXIT; gh gist delete "$gid" --yes 2>/dev/null || true
@@ -4461,14 +4465,7 @@ scenario_invite_human() {
   for i in $(seq 1 60); do
     sleep 1
     [ -f "$home_h/state/config.json" ] || continue
-    host_gid=$(python3 -c "
-import json
-try:
-    c = json.load(open('$home_h/state/config.json'))
-    print(c.get('channel_gists', {}).get('$rname', ''))
-except Exception:
-    pass
-" 2>/dev/null)
+    host_gid=$("$(airc_rs_bin)" config get-channel-gist --config "$home_h/state/config.json" --channel "$rname" 2>/dev/null)
     [ -n "$host_gid" ] && break
   done
 
