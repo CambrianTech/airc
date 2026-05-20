@@ -9,7 +9,7 @@ use airc_protocol::Frame;
 use airc_transport::{LocalFsAdapter, Transport};
 
 use crate::error::AircError;
-use crate::route_policy::TransportKind;
+use crate::route::policy::TransportKind;
 use crate::{Airc, Room};
 
 impl Airc {

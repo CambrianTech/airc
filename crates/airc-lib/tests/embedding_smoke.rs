@@ -10,7 +10,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use airc_lib::{
-    Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, TranscriptKind,
+    Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, RouteEndpoint, TranscriptKind,
     TransportHealthSample, TransportKind, TransportRole,
 };
 use futures::stream::StreamExt;
@@ -235,6 +235,48 @@ async fn two_embedded_handles_chat_over_lan_without_cli() {
         .filter_map(|event| event.body.as_ref().and_then(Body::as_text))
         .collect();
     assert_eq!(bodies, vec!["hello over sdk lan"]);
+}
+
+#[tokio::test]
+async fn lan_listen_feeds_health_and_invite_endpoint_without_tailscale() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+
+    let bound = airc
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+
+    let health = airc.transport_health().unwrap();
+    assert!(
+        health
+            .iter()
+            .any(|sample| sample.kind == TransportKind::LocalFs),
+        "local route remains present"
+    );
+    assert!(
+        health.iter().any(|sample| {
+            sample.kind == TransportKind::LanTcp
+                && sample.state == airc_lib::TransportHealthState::Healthy
+        }),
+        "LAN listen must feed route health"
+    );
+
+    let beacon = airc.invite_beacon().unwrap();
+    assert_eq!(beacon.peer_id, airc.peer_id());
+    assert!(
+        beacon
+            .endpoints
+            .contains(&RouteEndpoint::LanTcp { addr: bound }),
+        "invite beacon publishes connection metadata"
+    );
+    assert!(
+        beacon
+            .endpoints
+            .iter()
+            .all(|endpoint| !matches!(endpoint, RouteEndpoint::TailscaleTcp { .. })),
+        "Tailscale must not be invented for local LAN operation"
+    );
 }
 
 #[tokio::test]

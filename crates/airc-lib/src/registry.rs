@@ -12,6 +12,7 @@ use std::sync::RwLock;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use airc_core::PeerId;
@@ -50,7 +51,7 @@ impl std::fmt::Display for PeerSpecError {
 impl std::error::Error for PeerSpecError {}
 
 /// A parsed peer spec: which peer it identifies + their 32-byte pubkey.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerSpec {
     pub peer_id: PeerId,
     pub pubkey: [u8; 32],

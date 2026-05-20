@@ -6,8 +6,8 @@
 //! slices can add health probes/discovery without changing the rule
 //! that GitHub is invite/rendezvous only.
 
-use crate::route_health::TransportHealthSample;
-use crate::route_policy::{
+use crate::route::health::TransportHealthSample;
+use crate::route::policy::{
     RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind,
 };
 
@@ -57,8 +57,8 @@ impl TransportResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route_health::{TransportHealthSample, TransportHealthState};
-    use crate::route_policy::{TransportKind::*, TransportRole};
+    use crate::route::health::{TransportHealthSample, TransportHealthState};
+    use crate::route::policy::{TransportKind::*, TransportRole};
 
     fn candidate(kind: TransportKind, role: TransportRole) -> TransportCandidate {
         TransportCandidate {

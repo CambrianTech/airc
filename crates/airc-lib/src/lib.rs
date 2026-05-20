@@ -28,10 +28,7 @@ mod messaging;
 mod peers;
 pub mod registry;
 pub mod room;
-mod route_execution;
-pub mod route_health;
-pub mod route_policy;
-pub mod route_resolver;
+pub mod route;
 mod stream;
 mod time;
 mod transport;
@@ -42,11 +39,11 @@ pub use error::AircError;
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
-pub use route_health::{TransportHealthSample, TransportHealthState};
-pub use route_policy::{
-    RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind, TransportRole,
+pub use route::{
+    InviteBeacon, RouteClass, RouteDecision, RouteEndpoint, RoutePolicy, TransportCandidate,
+    TransportHealthSample, TransportHealthState, TransportHealthTable, TransportKind,
+    TransportResolver, TransportRole, TransportRoute,
 };
-pub use route_resolver::{TransportResolver, TransportRoute};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,

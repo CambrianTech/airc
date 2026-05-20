@@ -33,8 +33,9 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
 use crate::room::{self, Room};
-use crate::route_health::TransportHealthSample;
-use crate::route_policy::TransportKind;
+use crate::route::health::TransportHealthTable;
+use crate::route::invite::RouteEndpointTable;
+use crate::route::TransportHealthSample;
 use crate::transport::{FrameSubscriber, WireSubscriber};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
@@ -73,7 +74,8 @@ pub(crate) struct AircInner {
     pub(crate) store: Arc<dyn EventStore>,
     pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
     pub(crate) policy: VerificationPolicy,
-    pub(crate) route_health: RwLock<Vec<TransportHealthSample>>,
+    pub(crate) route_health: RwLock<TransportHealthTable>,
+    pub(crate) route_endpoints: RwLock<RouteEndpointTable>,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
@@ -139,9 +141,8 @@ impl Airc {
                 store,
                 registry,
                 policy,
-                route_health: RwLock::new(vec![TransportHealthSample::healthy_direct(
-                    TransportKind::LocalFs,
-                )]),
+                route_health: RwLock::new(TransportHealthTable::local_default()),
+                route_endpoints: RwLock::new(RouteEndpointTable::default()),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
@@ -165,9 +166,10 @@ impl Airc {
         self.inner.identity.client_id
     }
 
-    /// Replace the route-health view consumed by the resolver. Discovery
-    /// and transport probes own this in production; tests and embedded
-    /// harnesses can pin samples to prove route admission behavior.
+    /// Replace the route-health view consumed by the resolver.
+    /// Discovery and transport probes own this in production; tests
+    /// and embedded harnesses can pin samples to prove route
+    /// admission behavior.
     pub fn replace_transport_health(
         &self,
         samples: impl IntoIterator<Item = TransportHealthSample>,
@@ -177,7 +179,30 @@ impl Airc {
             .route_health
             .write()
             .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?;
-        *route_health = samples.into_iter().collect();
+        route_health.replace(samples);
+        Ok(())
+    }
+
+    /// Snapshot the current route-health samples. Consumers can use
+    /// this for diagnostics without reaching into resolver internals.
+    pub fn transport_health(&self) -> Result<Vec<TransportHealthSample>, AircError> {
+        self.inner
+            .route_health
+            .read()
+            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))
+            .map(|table| table.samples())
+    }
+
+    pub(crate) fn upsert_transport_health(
+        &self,
+        sample: TransportHealthSample,
+    ) -> Result<(), AircError> {
+        let mut route_health = self
+            .inner
+            .route_health
+            .write()
+            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?;
+        route_health.upsert(sample);
         Ok(())
     }
 
