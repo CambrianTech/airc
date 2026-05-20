@@ -32,6 +32,16 @@ pub enum IdentityAction {
         peer_name: String,
     },
 
+    /// Print an enrolled peer's SSH public key from its peer record.
+    PeerSshPub {
+        /// Legacy peers directory containing <peer>.json files.
+        #[arg(long)]
+        peers_dir: std::path::PathBuf,
+        /// Peer display/name key.
+        #[arg(long)]
+        peer_name: String,
+    },
+
     /// Sign stdin bytes with the legacy Ed25519 PEM identity.
     SignEd25519 {
         /// Legacy identity directory containing private.pem.

@@ -59,14 +59,9 @@ cmd_kick() {
   # peer could keep authenticating despite the "kick" — caught by
   # Copilot review on PR #73.
   local peer_ssh_pub
-  peer_ssh_pub=$(PEER_FILE="$peer_file" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    p = json.load(open(os.environ["PEER_FILE"]))
-    print((p.get("ssh_pub") or "").strip())
-except Exception:
-    pass
-' 2>/dev/null || echo "")
+  peer_ssh_pub=$("$(airc_rs_bin)" identity peer-ssh-pub \
+    --peers-dir "$PEERS_DIR" \
+    --peer-name "$target" 2>/dev/null || echo "")
 
   if [ -n "$peer_ssh_pub" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
     # grep -v returns 1 when every line matches (or the file is empty);

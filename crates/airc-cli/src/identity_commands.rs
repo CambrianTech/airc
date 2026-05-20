@@ -66,6 +66,27 @@ pub fn run_write_peer_record(
     Ok(())
 }
 
+pub fn run_peer_ssh_pub(peers_dir: &Path, peer_name: &str) -> Result<(), Box<dyn Error>> {
+    if let Some(ssh_pub) = peer_ssh_pub(peers_dir, peer_name) {
+        println!("{ssh_pub}");
+    }
+    Ok(())
+}
+
+fn peer_ssh_pub(peers_dir: &Path, peer_name: &str) -> Option<String> {
+    let path = peers_dir.join(format!("{peer_name}.json"));
+    let value = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    value
+        .get("ssh_pub")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn remove_stale_host_records(
     peers_dir: &Path,
     peer_name: &str,
@@ -126,5 +147,21 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(peers.join("new.json")).unwrap()).unwrap();
         assert_eq!(written["host"], "alice@example");
         assert_eq!(written["x25519_pub"], "xpub");
+    }
+
+    #[test]
+    fn peer_ssh_pub_reads_peer_record() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("alice.json"),
+            r#"{"ssh_pub":"ssh-ed25519 AAAAC3Nz alice"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            peer_ssh_pub(dir.path(), "alice").as_deref(),
+            Some("ssh-ed25519 AAAAC3Nz alice")
+        );
+        assert_eq!(peer_ssh_pub(dir.path(), "missing"), None);
     }
 }
