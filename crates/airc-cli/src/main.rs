@@ -39,6 +39,8 @@ mod gist_cli;
 mod gist_commands;
 mod handshake_cli;
 mod handshake_commands;
+mod hygiene_cli;
+mod hygiene_commands;
 mod identity_cli;
 mod identity_commands;
 mod lane_cli;
@@ -527,6 +529,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 watch_pid,
             ),
         },
+
+        Command::Hygiene(args) => hygiene_commands::run(args),
 
         Command::Pending(args) => match args.action {
             PendingAction::HostBroadcastRoute {

@@ -119,6 +119,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" log inbox-reset', body)
         self.assertIn("log inbox-read", body)
 
+    def test_hygiene_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_hygiene.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("airc_core.hygiene", source)
+        self.assertIn('"$(airc_rs_bin)" hygiene "$@"', source)
+
     def test_iso_to_epoch_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
         start = source.index("iso_to_epoch()")
