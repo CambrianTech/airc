@@ -21,7 +21,7 @@ mode = "limited"
 domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
 ```
 
-…and sets `default_permissions = "airc"` if no other default is set. Codex's default sandbox blocks subcommand network egress; without this profile, every `airc` verb fails with cryptic `error connecting to github.com` because the substrate IS gh-API-driven. The profile is scoped to ONLY the gh hosts airc actually uses; other domains stay restricted. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_CONFIG=1` to opt out.
+…and sets `default_permissions = "airc"` if no other default is set. Codex's default sandbox blocks subcommand network egress. The gh hosts in this profile are needed by airc's **invite/rendezvous path** (`airc join` cross-account, gist-id discovery, room bootstrapping) — NOT for routine messaging. Post-Rust-rewrite, sustained traffic (`airc msg`, `airc inbox`, subscriptions) flows over the Rust local data plane and the Rust transports (LAN-TCP, relay, UDP, WebRTC), none of which touch the gh API. If gh is rate-limited, your routine sends still go through; only invite/discovery operations queue. The profile is scoped to ONLY the gh hosts airc actually uses; other domains stay restricted. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_CONFIG=1` to opt out.
 
 If you already had a different `default_permissions` set, install.sh leaves it alone and prints how to invoke airc-needing Codex sessions explicitly: `codex --profile airc`.
 
