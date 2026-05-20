@@ -75,6 +75,44 @@ pub fn remove_managed_developer_instructions(
     Ok(true)
 }
 
+pub fn remove_stale_airc_filesystem_permissions(
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    if !original.contains("[permissions.airc.filesystem")
+        && !original.contains("# airc filesystem permissions")
+    {
+        return Ok(false);
+    }
+
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in original.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with("# airc filesystem permissions")
+            || stripped.starts_with("[permissions.airc.filesystem")
+        {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if stripped.starts_with('[') && !stripped.starts_with("[permissions.airc.filesystem") {
+                skipping = false;
+                out.push(line);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+
+    let rendered = collapse_blank_lines(&out.join("\n"));
+    if rendered == original {
+        return Ok(false);
+    }
+    write_text(path, &rendered)?;
+    Ok(true)
+}
+
 fn parse_toml_document(text: &str) -> Result<DocumentMut, Box<dyn std::error::Error>> {
     if text.trim().is_empty() {
         return Ok(DocumentMut::new());
@@ -101,6 +139,24 @@ fn remove_legacy_codex_hooks_key(text: &str) -> Result<String, Box<dyn std::erro
         features.remove("codex_hooks");
     }
     Ok(doc.to_string())
+}
+
+fn collapse_blank_lines(text: &str) -> String {
+    let mut rendered = String::new();
+    let mut blank_count = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                rendered.push('\n');
+            }
+            continue;
+        }
+        blank_count = 0;
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered
 }
 
 fn read_text(path: &Path) -> Result<String, Box<dyn std::error::Error>> {

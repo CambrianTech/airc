@@ -43,6 +43,21 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('ln -sf "$built" "$BIN_DIR/airc-rs"', source)
         self.assertIn('cp -f "$built" "$BIN_DIR/airc-rs.exe"', source)
 
+    def test_installer_no_longer_bootstraps_python_runtime(self):
+        source = (REPO / "install.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("python3 -m venv", source)
+        self.assertNotIn("pip install", source)
+        self.assertNotIn("cryptography is not importable", source)
+        self.assertNotIn("${AIRC_PYTHON:-python3}", source)
+
+    def test_doctor_no_longer_requires_python_runtime(self):
+        source = (REPO / "lib/airc_bash/cmd_doctor.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn('_doctor_probe "python3"', source)
+        self.assertNotIn("_doctor_probe_cryptography", source)
+        self.assertNotIn("AIRC_PYTHON", source)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 

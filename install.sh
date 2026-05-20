@@ -49,12 +49,10 @@ _to_bash_path() {
 # install via the platform's package manager, then verify. Designed for
 # FIRST-TIME users with nothing pre-installed beyond a shell.
 #
-# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip),
-# cargo (to build the Rust substrate CLI).
+# Required: git, gh, ssh-keygen, cargo (to build the Rust substrate CLI).
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
-# Deliberately not required: openssl. Issue #341 — identity Ed25519 ops
-# moved to the venv cryptography module so we don't depend on system
-# openssl flavoring (LibreSSL vs OpenSSL etc).
+# Deliberately not required: openssl or Python. Identity, signing, hooks,
+# config, and message parsing are Rust-owned.
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -100,12 +98,6 @@ pkgname_for() {
         pacman) echo "openssh" ;;
         apk)    echo "openssh-client" ;;
         winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
-      esac ;;
-    python3)
-      case "$mgr" in
-        pacman) echo "python" ;;
-        winget) echo "Python.Python.3.12" ;;
-        *)      echo "python3" ;;
       esac ;;
     cargo)
       case "$mgr" in
@@ -204,27 +196,17 @@ ensure_prereqs() {
       fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
-      warn "Required prereqs: git, gh, python3 (cryptography via pip), cargo"
+      warn "Required prereqs: git, gh, cargo"
       return 0
     fi
   fi
 
   local missing=() pkgs=() unmappable=()
-  # #188: jq removed — airc's gist envelope parser now uses Python's
-  # stdlib JSON (lib/airc_core/gistparse.py). Python was already a hard
-  # dep since #152 Phase 0; jq was redundant. Drop the dep + the
-  # winget step that would install it.
-  # Issue #341 follow-up: openssl removed from the prereq list. airc
-  # no longer shells out to it for Ed25519 — identity gen + signing
-  # both route through the venv cryptography module (which is already
-  # a hard dep, pip-installed below). LibreSSL on macOS used to make
-  # this an ordeal; now it's a non-issue at the source.
-  for cmd in git gh ssh-keygen python3 cargo; do
+  # jq, openssl, and Python are not install prereqs. JSON handling,
+  # Ed25519 identity/signing, hooks, and config mutation are Rust-owned.
+  for cmd in git gh ssh-keygen cargo; do
     # Strict probe: presence on PATH AND a successful --version invocation.
-    # Used selectively: python3 needs the strict variant because Windows
-    # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (2026-04-27). git/gh all
-    # support --version cleanly. ssh-keygen does NOT have a version
+    # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
     # produces false positives — Joel 2026-04-28 saw "ssh-keygen needs
@@ -272,10 +254,9 @@ ensure_prereqs() {
   else
     ok "All required prereqs present"
   fi
-  # Issue #341 follow-up: openssl Ed25519-capability probe + brew
-  # install dance removed. Identity gen + signing live in the venv
-  # cryptography module now; the system openssl version (LibreSSL or
-  # otherwise) is irrelevant to airc.
+  # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
+  # Identity gen + signing live in Rust, so system OpenSSL and Python
+  # package state are irrelevant to airc install correctness.
 
   # Post-3c: sshd setup + Tailscale install fully removed. Cross-network
   # messaging routes through gh-as-bearer (envelope-encrypted gist),
@@ -533,66 +514,6 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   export PATH="$BIN_DIR:$PATH"
 fi
 
-# ── Python venv with crypto deps (Phase E: envelope encryption) ────────
-# airc's envelope-layer end-to-end encryption needs the cryptography
-# package. We create a venv inside the install dir and pip-install
-# there because PEP 668 makes `pip install --user` fail on managed
-# Pythons (homebrew, system Python on Debian/Ubuntu/etc). The venv
-# avoids touching system Python at all — fully self-contained.
-#
-# airc's bash wrapper detects this venv at AIRC_PYTHON resolution time
-# and prefers it over system python3. Ed25519 signing is required for
-# identity bootstrap, so cryptography is a hard install dependency: if
-# we cannot provide it through the venv or an existing system Python,
-# fail here instead of reporting "Installed" and breaking at first join.
-_airc_venv="$CLONE_DIR/.venv"
-if [ ! -d "$_airc_venv" ] && command -v python3 >/dev/null 2>&1; then
-  if python3 -m venv "$_airc_venv" 2>/dev/null; then
-    ok "Python venv created: $_airc_venv"
-  else
-    warn "Could not create Python venv (python3-venv missing?). Will use system python3 only if cryptography is already available."
-  fi
-fi
-# Locate venv pip — POSIX vs Windows-Git-Bash paths.
-_airc_venv_pip=""
-if [ -x "$_airc_venv/bin/pip" ]; then
-  _airc_venv_pip="$_airc_venv/bin/pip"
-elif [ -x "$_airc_venv/Scripts/pip.exe" ]; then
-  _airc_venv_pip="$_airc_venv/Scripts/pip.exe"
-fi
-if [ -n "$_airc_venv_pip" ]; then
-  # Check if cryptography is already installed (idempotent install).
-  _airc_venv_python_bin=""
-  if [ -x "$_airc_venv/bin/python" ]; then
-    _airc_venv_python_bin="$_airc_venv/bin/python"
-  elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
-    _airc_venv_python_bin="$_airc_venv/Scripts/python.exe"
-  fi
-  if [ -n "$_airc_venv_python_bin" ] && \
-     "$_airc_venv_python_bin" -c "import cryptography" >/dev/null 2>&1; then
-    : # already installed; skip
-  else
-    if "$_airc_venv_pip" install -q --upgrade pip >/dev/null 2>&1; then : ; fi
-    if "$_airc_venv_pip" install -q cryptography 2>&1 | tail -3; then
-      ok "cryptography installed in venv (envelope encryption ready)"
-    else
-      fail "cryptography install failed; airc requires it for Ed25519 signing. Manual fix: $_airc_venv_pip install cryptography"
-    fi
-  fi
-fi
-
-_airc_crypto_python=""
-if [ -x "$_airc_venv/bin/python" ]; then
-  _airc_crypto_python="$_airc_venv/bin/python"
-elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
-  _airc_crypto_python="$_airc_venv/Scripts/python.exe"
-elif command -v python3 >/dev/null 2>&1; then
-  _airc_crypto_python="python3"
-fi
-if [ -z "$_airc_crypto_python" ] || ! "$_airc_crypto_python" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
-  fail "cryptography is not importable after install; airc cannot bootstrap signed identity. Re-run install.sh after fixing Python/pip."
-fi
-
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
 #
 # Both Claude Code and OpenAI Codex use the same on-disk skill format:
@@ -720,51 +641,9 @@ TOML
   # When Codex's runtime supports outside-workspace filesystem profiles,
   # restore the block (history at git log -- install.sh).
 
-  # Cleanup: machines that ran the buggy intermediate (3b20369..c1)
-  # still have the [permissions.airc.filesystem] block in their
-  # config.toml and Codex won't start. Detect and strip it on every
-  # install.sh run so Codex starts cleanly without the user having
-  # to hand-edit their config.
-  if grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
-    info "Removing stale [permissions.airc.filesystem] block from ~/.codex/config.toml (Codex 0.125 doesn't support outside-workspace filesystem profiles; was breaking session startup)..."
-    "${AIRC_PYTHON:-python3}" - "$config" <<'PY'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-# Strip from any '# airc filesystem permissions' header (or bare
-# [permissions.airc.filesystem] header) through end of that section
-# and any [permissions.airc.filesystem.<sub>] children. Section ends
-# at the next top-level header that is NOT under [permissions.airc.filesystem].
-lines = text.splitlines(keepends=True)
-out = []
-in_airc_fs = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith('# airc filesystem permissions'):
-        # Drop the leading comment block too (cohesive with the section)
-        in_airc_fs = True
-        continue
-    if stripped.startswith('[permissions.airc.filesystem'):
-        in_airc_fs = True
-        continue
-    if in_airc_fs:
-        # Continue dropping comment lines and key=value lines until we
-        # hit a new section header that isn't airc.filesystem.
-        if stripped.startswith('[') and not stripped.startswith('[permissions.airc.filesystem'):
-            in_airc_fs = False
-            out.append(line)
-        # else: drop (comment, blank, or key=value within the section)
-        continue
-    out.append(line)
-# Collapse runs of >2 blank lines that the strip might have left.
-result = ''.join(out)
-result = re.sub(r'\n{3,}', '\n\n', result)
-with open(path, 'w') as f:
-    f.write(result)
-PY
-    _changed=1
-  fi
+  # Cleanup for stale [permissions.airc.filesystem] blocks lives in the
+  # Rust Codex hook installer below. Keep this profile function focused
+  # on the network profile it owns.
 
   # Set default_permissions = "airc" at the file's top level, but only if
   # no default is currently set. A pre-existing default belongs to the

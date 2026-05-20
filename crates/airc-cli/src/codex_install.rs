@@ -14,6 +14,12 @@ pub async fn run_install_hooks(
     if codex_config::enable_hooks_feature(&config)? {
         println!("enabled hooks in {}", config.display());
     }
+    if codex_config::remove_stale_airc_filesystem_permissions(&config)? {
+        println!(
+            "removed stale AIRC filesystem permission profile from {}",
+            config.display()
+        );
+    }
     if codex_hooks_json::install(&hooks_json)? {
         println!(
             "installed AIRC UserPromptSubmit hook in {}",

@@ -144,6 +144,48 @@ fn codex_hook_installer_replaces_legacy_python_hook() {
 }
 
 #[test]
+fn codex_hook_installer_removes_stale_filesystem_profile() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"
+[features]
+codex_hooks = true
+
+# airc filesystem permissions
+[permissions.airc.filesystem]
+enabled = true
+
+[permissions.airc.filesystem.write]
+paths = ["/tmp"]
+
+[permissions.airc.network]
+enabled = true
+"#,
+    )
+    .expect("write config");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "install-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    assert!(!config.contains("permissions.airc.filesystem"));
+    assert!(!config.contains("paths = [\"/tmp\"]"));
+    assert!(config.contains("[permissions.airc.network]"));
+    assert!(config.contains("hooks = true"));
+}
+
+#[test]
 fn codex_hook_uninstaller_removes_managed_hooks_only() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("airc");
