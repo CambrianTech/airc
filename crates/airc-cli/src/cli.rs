@@ -27,6 +27,7 @@ use crate::gist_cli::GistArgs;
 use crate::handshake_cli::HandshakeArgs;
 use crate::hygiene_cli::HygieneArgs;
 use crate::identity_cli::IdentityArgs;
+use crate::knock_cli::KnockArgs;
 use crate::message_cli::MessageArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
@@ -254,6 +255,9 @@ pub enum Command {
 
     /// Workspace/resource hygiene policy.
     Hygiene(HygieneArgs),
+
+    /// Knock/approve crypto helpers during Rust cutover.
+    Knock(KnockArgs),
 
     /// Pending-queue routing helpers during Rust cutover.
     Pending(PendingArgs),

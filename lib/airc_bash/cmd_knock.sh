@@ -123,10 +123,10 @@ cmd_knock() {
   local knock_keys_json knocker_pub knocker_priv
   knock_keys_json=$(_airc_knock_gen_keys 2>/dev/null || echo "")
   if [ -n "$knock_keys_json" ]; then
-    knocker_pub=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("pub",""))' <<< "$knock_keys_json" 2>/dev/null || echo "")
-    knocker_priv=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("priv",""))' <<< "$knock_keys_json" 2>/dev/null || echo "")
+    knocker_pub=$("$(airc_rs_bin)" knock approval-field --field pub <<< "$knock_keys_json" 2>/dev/null || echo "")
+    knocker_priv=$("$(airc_rs_bin)" knock approval-field --field priv <<< "$knock_keys_json" 2>/dev/null || echo "")
   else
-    # Crypto path unavailable (no python venv with cryptography). Knock
+    # Crypto path unavailable. Knock
     # still posts but without an approval pubkey — cmd_approve will
     # hard-fail with a clear "no knocker pubkey, can't encrypt" error
     # rather than silently shipping plaintext.
@@ -291,15 +291,11 @@ _airc_knock_json_str() {
 }
 
 _airc_knock_gen_keys() {
-  # Generate per-knock ephemeral X25519 keypair via the python venv.
+  # Generate per-knock ephemeral X25519 keypair via the Rust CLI.
   # Returns JSON {"priv": "<hex>", "pub": "<hex>"} on stdout.
   # Returns non-zero (caller falls back to no-pubkey envelope) when the
-  # python crypto path isn't available — typically a fresh checkout
-  # without `pip install cryptography` in the venv.
-  if [ -z "${AIRC_PYTHON:-}" ]; then
-    return 1
-  fi
-  "$AIRC_PYTHON" -m airc_core.knock_crypto gen-knock-keys
+  # Rust binary isn't available.
+  "$(airc_rs_bin)" knock gen-keys
 }
 
 _airc_knock_issue_body() {

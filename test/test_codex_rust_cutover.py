@@ -125,6 +125,23 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.hygiene", source)
         self.assertIn('"$(airc_rs_bin)" hygiene "$@"', source)
 
+    def test_knock_crypto_uses_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "lib/airc_bash/cmd_knock.sh",
+                REPO / "lib/airc_bash/cmd_approve.sh",
+            ]
+        )
+
+        self.assertNotIn("airc_core.knock_crypto", combined)
+        self.assertIn('"$(airc_rs_bin)" knock gen-keys', combined)
+        self.assertIn('"$(airc_rs_bin)" knock encrypt-for-knocker', combined)
+        self.assertIn('"$(airc_rs_bin)" knock decrypt-from-approver', combined)
+        self.assertIn('"$(airc_rs_bin)" knock approval-field', combined)
+        self.assertIn('"$(airc_rs_bin)" knock extract-knocker-pub', combined)
+        self.assertIn('"$(airc_rs_bin)" knock extract-approval', combined)
+
     def test_iso_to_epoch_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/platform_adapters.sh").read_text(encoding="utf-8")
         start = source.index("iso_to_epoch()")
