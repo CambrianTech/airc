@@ -398,14 +398,10 @@ _cmd_invite_human() {
   local primary_chan primary_gid
   primary_chan=$(airc_config_default_channel "$CONFIG" || true)
   if [ -n "$primary_chan" ]; then
-    primary_gid=$("$AIRC_PYTHON" -c "
-import json, sys
-try:
-    c = json.load(open('$CONFIG'))
-    print(c.get('channel_gists', {}).get('$primary_chan', ''))
-except Exception:
-    pass
-" 2>/dev/null)
+    primary_gid=$("$(airc_rs_bin)" config get-channel-gist \
+      --home "$AIRC_WRITE_DIR" \
+      --config "$CONFIG" \
+      --channel "$primary_chan" 2>/dev/null || true)
   fi
   # Fallback: legacy room_gist_id file (pre-channel-gists installs).
   if [ -z "$primary_gid" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
