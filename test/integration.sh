@@ -18,6 +18,21 @@ set -u
 
 AIRC="${AIRC:-$(cd "$(dirname "$0")/.." && pwd)/airc}"
 [ -x "$AIRC" ] || { echo "FATAL: $AIRC not executable"; exit 2; }
+AIRC_REPO_ROOT="$(cd "$(dirname "$AIRC")" && pwd)"
+
+airc_rs_bin() {
+  if command -v airc-rs >/dev/null 2>&1; then
+    command -v airc-rs
+    return 0
+  fi
+  for candidate in "$AIRC_REPO_ROOT/target/release/airc-rs" "$AIRC_REPO_ROOT/target/debug/airc-rs"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 # Suppress the #general sidecar globally for the test suite (issue #121).
 # Default behavior on canary spawns a sibling .general scope alongside
@@ -152,7 +167,7 @@ requires_local_pair_bearer_or_skip() {
   local _scn="$1"
   if [ -z "$_airc_have_local_bearer" ]; then
     local _kinds
-    _kinds=$(PYTHONPATH="$(dirname "$AIRC")/lib" python3 -c "from airc_core.bearer_resolver import available_kinds; print(' '.join(available_kinds()))" 2>/dev/null || echo "")
+    _kinds=$("$(airc_rs_bin)" bearer kinds 2>/dev/null | tr '\n' ' ' || echo "")
     case " $_kinds " in
       *" local "*|*" ssh "*) _airc_have_local_bearer="yes" ;;
       *)                     _airc_have_local_bearer="no" ;;

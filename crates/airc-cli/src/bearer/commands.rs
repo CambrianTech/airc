@@ -9,6 +9,14 @@ use super::outcome::{kind_name, SendKind, SendOutcome};
 use super::rotate::rotate_if_needed;
 use crate::gh_state::now_seconds;
 
+const REGISTERED_BEARER_KINDS: &[&str] = &["gh"];
+
+pub fn run_kinds() {
+    for kind in REGISTERED_BEARER_KINDS {
+        println!("{kind}");
+    }
+}
+
 pub fn run_send(
     _peer_id: &str,
     _channel: &str,
@@ -227,6 +235,11 @@ fn sleep_jittered_backoff(attempt: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_bearer_kinds_are_explicit() {
+        assert_eq!(REGISTERED_BEARER_KINDS, &["gh"]);
+    }
 
     #[test]
     fn frame_line_adds_exactly_one_newline() {

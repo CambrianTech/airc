@@ -8,6 +8,9 @@ pub struct BearerArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BearerAction {
+    /// Print registered legacy bearer kinds, one per line.
+    Kinds,
+
     /// Deliver one legacy JSONL envelope from stdin.
     Send {
         peer_id: String,
