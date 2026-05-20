@@ -11,7 +11,7 @@
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
 #   - ~/.local/bin/{airc, relay, airc.cmd, airc.ps1}
 #   - skill symlinks under ~/.claude/skills/ pointing into the clone
-#   - the clone itself (~/.airc-src or $AIRC_DIR), including the .venv inside
+#   - the clone itself (~/.airc-src or $AIRC_DIR)
 #
 # What it leaves:
 #   - per-project .airc/ state in every dir you ran `airc join` from
@@ -60,7 +60,7 @@ cat <<EOF
 This will remove airc from this machine:
   binary symlinks   $BIN_DIR/{airc,relay,airc.cmd,airc.ps1}
   skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
-  install dir       $CLONE_DIR (clone + .venv)
+  install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
   running processes airc teardown --all (if airc is on PATH)
 
@@ -179,7 +179,7 @@ for f in airc relay airc.cmd airc.ps1; do
 done
 [ "$removed_bins" -gt 0 ] && ok "Removed $removed_bins binary forwarder(s) from $BIN_DIR"
 
-# 5. Clone dir + venv. Last, since the steps above call into airc + read
+# 5. Clone dir. Last, since the steps above call into airc + read
 # from the clone for the skill walk. Once this runs, `airc` is gone.
 if [ -d "$CLONE_DIR" ]; then
   rm -rf "$CLONE_DIR"

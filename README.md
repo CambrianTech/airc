@@ -28,9 +28,8 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 The installer:
 
-- installs or checks `gh`, `python3`, and `openssl`
+- installs or checks `gh`
 - runs `gh auth login -s gist` when needed
-- creates airc's local Python environment
 - puts `airc` on your PATH
 - installs agent skills for detected tools such as Claude Code and Codex
 
@@ -386,8 +385,6 @@ airc update --channel canary
 ## Requirements
 
 - GitHub account with gist scope through `gh`
-- `python3`
-- `openssl`
 - Bash-compatible shell for the main install path
 
 Supported platforms: macOS, Linux, WSL2, Windows Git Bash, and native PowerShell 7.
