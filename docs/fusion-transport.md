@@ -1,8 +1,16 @@
 # Sensor-Fusion Bearer Layer — Reticulum-Style Multi-Path Routing
 
-**Status:** design proposal, pre-implementation
+**Status:** superseded for rust-rewrite route policy
 **Authors:** continuum-b69f (Joel + Claude on Windows), with continuum-b741 (Joel + Claude on Mac) for cross-review
 **Context:** drafted 2026-05-02, end of a 22-PR airc hardening session that culminated in a transport-architecture conversation with Joel
+
+> Superseded note, 2026-05-20: the sensor-fusion framing remains useful for
+> measuring multiple links, but this document incorrectly treats gh-gist as a
+> possible data-plane fallback. The current rust-rewrite contract is
+> [`architecture/INVITE-ROUTING-ARCHITECTURE.md`](architecture/INVITE-ROUTING-ARCHITECTURE.md):
+> GitHub gists are invite/rendezvous beacons only, like QR-code links, and live
+> messages/events use admissible local, LAN/Tailscale, relay, WebRTC, Reticulum,
+> or future data transports.
 
 ## TL;DR
 
