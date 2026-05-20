@@ -5,8 +5,8 @@ use tempfile::TempDir;
 fn from_name_is_deterministic_across_homes() {
     let home_a = TempDir::new().unwrap();
     let home_b = TempDir::new().unwrap();
-    let a = Room::from_name(home_a.path(), "project-x");
-    let b = Room::from_name(home_b.path(), "project-x");
+    let a = Room::from_name(home_a.path(), "project-x").unwrap();
+    let b = Room::from_name(home_b.path(), "project-x").unwrap();
     assert_eq!(a.channel, b.channel);
     assert_ne!(a.wire, b.wire);
 }
@@ -14,8 +14,8 @@ fn from_name_is_deterministic_across_homes() {
 #[test]
 fn from_name_differs_per_name() {
     let home = TempDir::new().unwrap();
-    let a = Room::from_name(home.path(), "general");
-    let b = Room::from_name(home.path(), "private");
+    let a = Room::from_name(home.path(), "general").unwrap();
+    let b = Room::from_name(home.path(), "private").unwrap();
     assert_ne!(a.channel, b.channel);
     assert_ne!(a.wire, b.wire);
 }
@@ -30,7 +30,7 @@ fn load_or_default_returns_default_when_missing() {
 #[test]
 fn save_then_load_roundtrips() {
     let home = TempDir::new().unwrap();
-    let original = Room::from_name(home.path(), "test-room");
+    let original = Room::from_name(home.path(), "test-room").unwrap();
     save(home.path(), &original).unwrap();
     let loaded = load_or_default(home.path()).unwrap();
     assert_eq!(loaded.name, original.name);

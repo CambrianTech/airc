@@ -106,7 +106,9 @@ impl std::error::Error for IdentityError {
         match self {
             IdentityError::Io(error) => Some(error),
             IdentityError::Json(error) => Some(error),
-            _ => None,
+            IdentityError::SchemaVersionMismatch { .. }
+            | IdentityError::PartialState { .. }
+            | IdentityError::BadKeyLength(_) => None,
         }
     }
 }

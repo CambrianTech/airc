@@ -577,7 +577,7 @@ pub(crate) fn value_text(value: &Value) -> String {
         Value::Number(number) => number.to_string(),
         Value::Bool(boolean) => boolean.to_string(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        other @ (Value::Array(_) | Value::Object(_)) => other.to_string(),
     }
 }
 

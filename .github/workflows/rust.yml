@@ -4,8 +4,10 @@ name: rust
 #
 # Three jobs on every PR + push touching Rust:
 #   fmt      — `cargo fmt --check` (no formatter drift)
-#   clippy   — `cargo clippy --all-targets --all-features -- -D warnings`
-#              (zero clippy warnings, treat all as errors)
+#   clippy   — regular all-target warning gate plus a production-only
+#              no-silent-fallback gate. Tests may stay concise, but
+#              library/binary code cannot use unwrap/expect/panic/todo/
+#              unimplemented or wildcard enum matches.
 #   test     — `cargo test --all-features` (every test green)
 #
 # Per Joel's direction (2026-05-18): "use rust conventions and obsession
@@ -68,6 +70,16 @@ jobs:
             ${{ runner.os }}-cargo-clippy-
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo clippy production no-silent-fallback gate
+        run: >
+          cargo clippy --workspace --lib --bins --
+          -D warnings
+          -D clippy::unwrap_used
+          -D clippy::expect_used
+          -D clippy::panic
+          -D clippy::todo
+          -D clippy::unimplemented
+          -D clippy::wildcard_enum_match_arm
 
   test:
     # Cross-platform matrix — the substrate must run on Linux, macOS,

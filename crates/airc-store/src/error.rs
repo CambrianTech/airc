@@ -14,6 +14,10 @@ pub enum StoreError {
     #[error("store database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    /// In-memory store lock was poisoned by a panic in another task.
+    #[error("store lock poisoned")]
+    LockPoisoned,
+
     /// Migration error during `open`.
     #[error("store migration error: {0}")]
     Migration(String),
@@ -23,6 +27,11 @@ pub enum StoreError {
     /// generally indicates a replay or a duplicated network frame.
     #[error("duplicate event_id: {0}")]
     DuplicateEventId(uuid::Uuid),
+
+    /// Stored transcript kind is not known to this binary. Refuse to
+    /// reinterpret it as another kind; replay must be exact.
+    #[error("unknown transcript kind: {0}")]
+    UnknownTranscriptKind(String),
 
     /// JSON encode/decode failure on the stored `metadata` /
     /// `headers` / `body` blob. Wrapped so callers can distinguish

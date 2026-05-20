@@ -85,7 +85,7 @@ fn send_payloads(room_gist_id: Option<&str>, payloads: &[String]) -> SendOutcome
     for attempt in 0..retries {
         let (gist, get_kind) = gh::get_classified(gist_id);
         let Some(gist) = gist else {
-            return get_failure_outcome(gist_id, payloads, local_ok, get_kind);
+            return get_failure_outcome(gist_id, get_kind);
         };
 
         let existing = gh::read_messages_content(&gist);
@@ -98,9 +98,6 @@ fn send_payloads(room_gist_id: Option<&str>, payloads: &[String]) -> SendOutcome
                 continue;
             }
             let send_kind = patch_kind.into_send_kind();
-            if let Some(outcome) = local_bus_deferred(payloads, local_ok, send_kind) {
-                return outcome;
-            }
             return SendOutcome::new(send_kind, last_detail);
         }
 
@@ -126,15 +123,7 @@ fn send_payloads(room_gist_id: Option<&str>, payloads: &[String]) -> SendOutcome
     conflict_exhausted_outcome(payloads, local_ok, &local_detail, retries, &last_detail)
 }
 
-fn get_failure_outcome(
-    gist_id: &str,
-    payloads: &[String],
-    local_ok: bool,
-    get_kind: SendKind,
-) -> SendOutcome {
-    if let Some(outcome) = local_bus_deferred(payloads, local_ok, get_kind) {
-        return outcome;
-    }
+fn get_failure_outcome(gist_id: &str, get_kind: SendKind) -> SendOutcome {
     if matches!(
         get_kind,
         SendKind::Gone | SendKind::SecondaryRateLimit | SendKind::AuthFailure
@@ -150,45 +139,13 @@ fn get_failure_outcome(
     )
 }
 
-fn local_bus_deferred(
-    payloads: &[String],
-    local_ok: bool,
-    failure_kind: SendKind,
-) -> Option<SendOutcome> {
-    if !local_ok
-        || !matches!(
-            failure_kind,
-            SendKind::SecondaryRateLimit | SendKind::TransientFailure | SendKind::AuthFailure
-        )
-    {
-        return None;
-    }
-    Some(SendOutcome::new(
-        SendKind::Delivered,
-        format!(
-            "delivered{} via local bus; gh publish deferred ({})",
-            batch_suffix(payloads),
-            kind_name(failure_kind)
-        ),
-    ))
-}
-
 fn conflict_exhausted_outcome(
     payloads: &[String],
-    local_ok: bool,
+    _local_ok: bool,
     local_detail: &str,
     retries: usize,
     last_detail: &str,
 ) -> SendOutcome {
-    if local_ok {
-        return SendOutcome::new(
-            SendKind::Delivered,
-            format!(
-                "delivered{} via local bus; gh conflict after {retries} retries; last: {last_detail}",
-                batch_suffix(payloads)
-            ),
-        );
-    }
     SendOutcome::new(
         SendKind::TransientFailure,
         format!(
@@ -210,14 +167,6 @@ fn delivered_detail(payloads: &[String]) -> SendOutcome {
             SendKind::Delivered,
             format!("{} payload(s)", payloads.len()),
         )
-    }
-}
-
-fn batch_suffix(payloads: &[String]) -> &'static str {
-    if payloads.len() == 1 {
-        ""
-    } else {
-        " batch"
     }
 }
 
@@ -245,5 +194,12 @@ mod tests {
     fn frame_line_adds_exactly_one_newline() {
         assert_eq!(frame_line("abc\n\n"), "abc\n");
         assert_eq!(frame_line("abc"), "abc\n");
+    }
+
+    #[test]
+    fn local_bus_write_does_not_turn_gh_conflict_into_delivered() {
+        let outcome = conflict_exhausted_outcome(&["{}\n".to_string()], true, "", 8, "conflict");
+        let encoded = serde_json::to_value(outcome).unwrap();
+        assert_eq!(encoded["kind"], "transient_failure");
     }
 }

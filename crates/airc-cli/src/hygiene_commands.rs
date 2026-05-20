@@ -402,7 +402,7 @@ impl WalkDecision<'_> {
     fn skips(&self, name: &str) -> bool {
         match self {
             Self::SkipNamed(names) => names.contains(&name),
-            _ => false,
+            Self::Continue | Self::SkipChildren => false,
         }
     }
 }

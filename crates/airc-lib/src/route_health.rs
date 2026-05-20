@@ -30,10 +30,7 @@ impl TransportHealthSample {
         TransportCandidate {
             kind: self.kind,
             role: self.role,
-            healthy: matches!(
-                self.state,
-                TransportHealthState::Healthy | TransportHealthState::Degraded
-            ),
+            healthy: matches!(self.state, TransportHealthState::Healthy),
         }
     }
 
@@ -79,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn degraded_health_is_still_candidate_usable() {
+    fn degraded_health_is_not_admissible_by_default() {
         let candidate = TransportHealthSample {
             kind: TransportKind::LanTcp,
             role: TransportRole::Direct,
@@ -89,6 +86,6 @@ mod tests {
         }
         .candidate();
 
-        assert!(candidate.healthy);
+        assert!(!candidate.healthy);
     }
 }

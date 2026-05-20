@@ -99,7 +99,7 @@ impl Airc {
             priority: request.priority,
             lane_id: request.lane_id,
             created_by: self.peer_id(),
-            created_at_ms: now_ms(),
+            created_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(card_id)
@@ -114,7 +114,7 @@ impl Airc {
             claim_id,
             owner: self.peer_id(),
             ttl_ms: request.ttl_ms,
-            claimed_at_ms: now_ms(),
+            claimed_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(claim_id)
@@ -127,7 +127,7 @@ impl Airc {
             claim_id: request.claim_id,
             owner: self.peer_id(),
             reason: request.reason,
-            released_at_ms: now_ms(),
+            released_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -144,7 +144,7 @@ impl Airc {
             title: request.title,
             state: request.state,
             created_by: self.peer_id(),
-            created_at_ms: now_ms(),
+            created_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(lane_id)
@@ -159,7 +159,7 @@ impl Airc {
             lane_id: request.lane_id,
             state: request.state,
             changed_by: self.peer_id(),
-            changed_at_ms: now_ms(),
+            changed_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -181,7 +181,7 @@ impl Airc {
             repo: request.repo,
             branch: request.branch,
             base: request.base,
-            requested_at_ms: now_ms(),
+            requested_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(workspace_id)
@@ -192,7 +192,7 @@ impl Airc {
         let event = WorkEvent::WorkspaceAllocated(WorkspaceAllocated {
             workspace_id: request.workspace_id,
             path: request.path,
-            allocated_at_ms: now_ms(),
+            allocated_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -203,7 +203,7 @@ impl Airc {
         let event = WorkEvent::WorkspaceHeartbeat(WorkspaceHeartbeat {
             workspace_id: request.workspace_id,
             disk_bytes: request.disk_bytes,
-            heartbeat_at_ms: now_ms(),
+            heartbeat_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -213,7 +213,7 @@ impl Airc {
     pub async fn release_workspace(&self, request: ReleaseWorkspace) -> Result<(), AircError> {
         let event = WorkEvent::WorkspaceReleased(WorkspaceReleased {
             workspace_id: request.workspace_id,
-            released_at_ms: now_ms(),
+            released_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -227,7 +227,7 @@ impl Airc {
             repo: request.repo,
             manager: self.peer_id(),
             ttl_ms: request.ttl_ms,
-            claimed_at_ms: now_ms(),
+            claimed_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -238,7 +238,7 @@ impl Airc {
         let event = WorkEvent::ManagerHatReleased(ManagerHatReleased {
             repo: request.repo,
             manager: self.peer_id(),
-            released_at_ms: now_ms(),
+            released_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

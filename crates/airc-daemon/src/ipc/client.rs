@@ -57,7 +57,7 @@ impl std::error::Error for ClientError {
         match self {
             ClientError::NotConnected(error) | ClientError::Io(error) => Some(error),
             ClientError::Codec(error) => Some(error),
-            _ => None,
+            ClientError::Daemon(_) | ClientError::UnexpectedResponse(_) => None,
         }
     }
 }
@@ -103,56 +103,88 @@ impl DaemonClient {
 
         match response {
             Response::Error { message } => Err(ClientError::Daemon(message)),
-            other => Ok(other),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Ok) => Ok(other),
         }
     }
 
     pub async fn ping(&self) -> Result<(), ClientError> {
         match self.call(Request::Ping).await? {
             Response::Pong => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Ok
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn status(&self) -> Result<StatusResponse, ClientError> {
         match self.call(Request::Status).await? {
             Response::Status(status) => Ok(status),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Ok
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn send(&self, request: SendRequest) -> Result<(), ClientError> {
         match self.call(Request::Send(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn subscribe(&self, request: SubscribeRequest) -> Result<(), ClientError> {
         match self.call(Request::Subscribe(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Peers(_)
+            | Response::Ok
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
         match self.call(Request::AddPeer(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
@@ -163,7 +195,11 @@ impl DaemonClient {
     pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
         match self.call(Request::ListPeers).await? {
             Response::Peers(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Ok
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 }

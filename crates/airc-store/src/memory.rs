@@ -31,7 +31,7 @@ impl Default for InMemoryEventStore {
 #[async_trait]
 impl EventStore for InMemoryEventStore {
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         if events.iter().any(|e| e.event_id == ev.event_id) {
             return Err(StoreError::DuplicateEventId(ev.event_id.as_uuid()));
         }
@@ -44,7 +44,7 @@ impl EventStore for InMemoryEventStore {
         channel: Option<RoomId>,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let events = self.events.lock().unwrap();
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut filtered: Vec<TranscriptEvent> = events
             .iter()
             .filter(|e| channel.is_none_or(|room| e.room_id == room))
@@ -64,7 +64,7 @@ impl EventStore for InMemoryEventStore {
         channel: Option<RoomId>,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let events = self.events.lock().unwrap();
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut filtered: Vec<TranscriptEvent> = events
             .iter()
             .filter(|e| channel.is_none_or(|room| e.room_id == room))
@@ -80,7 +80,7 @@ impl EventStore for InMemoryEventStore {
         &self,
         channel: Option<RoomId>,
     ) -> Result<Option<TranscriptCursor>, StoreError> {
-        let events = self.events.lock().unwrap();
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         let newest = events
             .iter()
             .filter(|e| channel.is_none_or(|room| e.room_id == room))
