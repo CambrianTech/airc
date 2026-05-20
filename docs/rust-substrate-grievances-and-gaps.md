@@ -703,10 +703,11 @@ Pass when:
 2. Create `airc-store` and move event append/replay/cursor there first.
 3. Split daemon into `airc-daemon` and keep CLI thin.
 4. Move queue/lane models into Rust as typed data and parsers.
-5. Add Windows runtime IPC tests before claiming Windows support.
-6. Add transport resolver and Tailscale discovery before broader grid claims.
-7. Add consumer smoke examples for Continuum/OpenClaw/Hermes/opencode.
-8. Add migration/deletion board tracking every remaining Python/shell module.
+5. Add workspace sanitation/drain as a first-class Rust feature: leased workspaces report disk usage, policy names safe cleanup targets, and low-space pressure can trigger dry-run reports or approved drains without waiting for a human.
+6. Add Windows runtime IPC tests before claiming Windows support.
+7. Add transport resolver and Tailscale discovery before broader grid claims.
+8. Add consumer smoke examples for Continuum/OpenClaw/Hermes/opencode.
+9. Add migration/deletion board tracking every remaining Python/shell module.
 
 ## Work Coordination Design (2026-05-19)
 
@@ -744,6 +745,9 @@ Bodies are typed alloy contracts:
 - `LaneStateChanged`
 - `WorkspaceAllocated`
 - `WorkspaceReleased`
+- `WorkspacePressureReported`
+- `WorkspaceDrainRequested`
+- `WorkspaceDrainCompleted`
 - `PullRequestLinked`
 - `PullRequestMerged`
 - `HygieneReportRecorded`
@@ -755,6 +759,7 @@ Projections (read models) are built by replaying events from `airc-store`:
 - `WorkBoardProjection`
 - `LaneProjection`
 - `WorkspaceRegistryProjection`
+- `WorkspacePressureProjection`
 - `PeerWorkloadProjection`
 - `StaleWorkProjection`
 - `GitHubMirrorProjection`
@@ -784,6 +789,19 @@ Events: `workspace.requested`, `workspace.allocated`, `workspace.heartbeat`, `wo
 
 Disk hygiene, stale-branch cleanup, and "who is doing what" all derive from the same event stream.
 
+Workspace sanitation is not optional polish. A machine may host 20+ local agents, each with lanes, worktrees, Rust targets, Docker layers, model caches, browser traces, and project sandboxes. AIRC must know what it allocated and provide a drain path for anything rebuildable. The feature shape:
+
+- every workspace lease records disk usage and cache roots it owns;
+- every drain candidate is typed as `RebuildableCache`, `GeneratedArtifact`, `DownloadedDependency`, `DockerLayer`, `ModelCache`, `TraceArtifact`, or `Unknown`;
+- default policy may drain only safe rebuildable caches;
+- destructive or ambiguous drains require explicit policy opt-in;
+- `airc-rs workspace report` and `airc-rs hygiene report` expose the same projection;
+- low-space pressure emits `WorkspacePressureReported`, then policy may emit `WorkspaceDrainRequested`;
+- completed cleanup records bytes reclaimed, paths touched, and policy rule id;
+- dry-run and record/replay are required so cleanup decisions can be inspected after the fact.
+
+This is the "everything needs a drain" rule for the local grid. It applies to workspaces first, then model caches, renderer caches, Docker/build caches, and consumer-specific sandboxes through hooks.
+
 ### Kanban as projection
 
 Kanban is a *projection*, not a primary object. Cards are typed work items; lanes are grouping/priority/state machines; board views are derived.
@@ -812,10 +830,11 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
 
 1. **PR 1 — `airc-work` crate foundation.** Typed work events, workspace events, typed lane/card state, projection traits, in-memory projection tests. No GitHub yet. **Owner: Codex.**
 2. **PR 2 — store-backed projections.** Replay from `airc-store`, cursor-based update, board query APIs, stale lease detection.
-3. **PR 3 — CLI thin wrapper.** `airc-rs work list`, `airc-rs work claim`, `airc-rs lane status`, `airc-rs workspace list` — all backed by `airc-work`, no Python touched.
-4. **PR 4 — GitHub adapter.** Mirror card state to issues/PRs; reconcile PR status into events; GitHub is adapter-only.
-5. **PR 5 — monitor/hook subscriptions.** Codex hook becomes `airc-rs codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
-6. **PR 6 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
+3. **PR 3 — workspace sanitation/drain.** Rust-owned workspace pressure projection, policy-loaded drain candidates, dry-run reports, typed drain events, and tests proving safe caches can be reclaimed without touching source or untracked work.
+4. **PR 4 — CLI thin wrapper.** `airc-rs work list`, `airc-rs work claim`, `airc-rs lane status`, `airc-rs workspace list`, `airc-rs workspace report`, `airc-rs hygiene report`, `airc-rs hygiene clean --dry-run` — all backed by `airc-work`, no Python touched.
+5. **PR 5 — GitHub adapter.** Mirror card state to issues/PRs; reconcile PR status into events; GitHub is adapter-only.
+6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc-rs codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
+7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 
 ### What this replaces in the previous plan
 
@@ -825,15 +844,15 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
 
 ### Python-removal sequencing under this design
 
-Slice 7 (PR 1–6) closes most of what Python currently owns at runtime:
+Slice 7 (PR 1–7) closes most of what Python currently owns at runtime:
 
 - queue/lane/workspace/kanban — `airc-work` (PR 1–3)
-- hygiene/sweep/manager-hat — projections + lease TTLs (PR 1–2)
-- GitHub bearer / token state — moves into the GitHub adapter (PR 4), or is deleted if gh is no longer the wire
-- Codex hooks — Rust subscription (PR 5)
-- Claude monitor / monitor channel — Rust subscription (PR 5)
+- hygiene/sweep/manager-hat — projections + lease TTLs (PR 1–3)
+- GitHub bearer / token state — moves into the GitHub adapter (PR 5), or is deleted if gh is no longer the wire
+- Codex hooks — Rust subscription (PR 6)
+- Claude monitor / monitor channel — Rust subscription (PR 6)
 
-Once PR 1–5 land, the only Python left is install/update/uninstall bootstrapping plus migration shims. That clears Gate 5.
+Once PR 1–6 land, the only Python left is install/update/uninstall bootstrapping plus migration shims. That clears Gate 5.
 
 ## Non-Negotiables
 

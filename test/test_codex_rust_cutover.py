@@ -122,7 +122,7 @@ class CodexRustCutoverTests(unittest.TestCase):
     def test_integration_bearer_config_probes_use_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_ssh_send()")
-        end = source.index("scenario_bearer_local()", start)
+        end = source.index("scenario_bearer_gh()", start)
         body = source[start:end]
 
         self.assertIn('"$(airc_rs_bin)" config get --config "$jstate/config.json" host_target', body)
@@ -154,7 +154,7 @@ class CodexRustCutoverTests(unittest.TestCase):
     def test_integration_invite_human_channel_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_invite_human()")
-        end = source.index("scenario_bearer_local()", start)
+        end = source.index("scenario_bearer_gh()", start)
         body = source[start:end]
 
         self.assertIn('"$(airc_rs_bin)" config get-channel-gist --config "$home_h/state/config.json" --channel "$rname"', body)
@@ -219,26 +219,22 @@ class CodexRustCutoverTests(unittest.TestCase):
     def test_integration_bearer_gist_file_content_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_gh()")
-        end = source.index("scenario_e2e_encryption()", start)
+        end = source.index('case "$MODE" in', start)
         body = source[start:end]
 
         self.assertIn('"$(airc_rs_bin)" gist file-content --filename messages.jsonl', body)
         self.assertNotIn("json.load(sys.stdin)['files']['messages.jsonl']['content']", body)
         self.assertNotIn("| python3 -c", body)
 
-    def test_integration_e2e_json_predicates_use_airc_rs(self):
+    def test_removed_legacy_bearer_scenarios_stay_deleted(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
-        start = source.index("scenario_e2e_encryption()")
-        end = source.index("scenario_bearer_observability()", start)
-        body = source[start:end]
 
-        self.assertIn('"$(airc_rs_bin)" config get --config "$h_peer" x25519_pub', body)
-        self.assertIn('"$(airc_rs_bin)" config get --config "$j_peer" x25519_pub', body)
-        self.assertIn('"$(airc_rs_bin)" gist get .enc', body)
-        self.assertIn('"$(airc_rs_bin)" gist get .nonce', body)
-        self.assertNotIn("d=json.load(open('$h_peer'))", body)
-        self.assertNotIn("d=json.load(open('$j_peer'))", body)
-        self.assertNotIn("d=json.load(sys.stdin)", body)
+        self.assertNotIn("scenario_bearer_local()", source)
+        self.assertNotIn("scenario_e2e_encryption()", source)
+        self.assertNotIn("scenario_bearer_observability()", source)
+        self.assertNotIn("bearer_local)", source)
+        self.assertNotIn("e2e_encryption)", source)
+        self.assertNotIn("bearer_observability)", source)
 
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
