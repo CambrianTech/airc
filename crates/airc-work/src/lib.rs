@@ -6,6 +6,7 @@
 //! runtime source of truth.
 
 pub mod codec;
+pub mod drain_policy;
 pub mod event;
 pub mod ids;
 pub mod model;
@@ -17,6 +18,10 @@ pub use codec::{
     WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_CARD_ID,
     HEADER_FORGE_WORK_CLAIM_ID, HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_LANE_ID,
     HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
+};
+pub use drain_policy::{
+    evaluate as evaluate_drain_policy, AdmitReason, DrainDecision, GitStatusSummary, PolicyConfig,
+    PolicyInputs, PrStatus, PrTerminalState, ReportOnlyReason, DEFAULT_HEARTBEAT_STALE_MS,
 };
 pub use event::{
     CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, HygieneReportRecorded,
