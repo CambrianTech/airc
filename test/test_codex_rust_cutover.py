@@ -64,6 +64,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("scenario_python_units", source)
         self.assertNotIn("python units:", source)
 
+    def test_integration_local_bearer_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("requires_local_pair_bearer_or_skip()")
+        end = source.index("# Reap any orphan room gists", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" bearer kinds', body)
+        self.assertNotIn("airc_core.bearer_resolver", body)
+        self.assertNotIn("python3", body)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 

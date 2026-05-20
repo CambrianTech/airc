@@ -208,6 +208,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => metronome_commands::run_recent_senders(&messages_log, window_seconds, &exclude_name),
 
         Command::Bearer(args) => match args.action {
+            BearerAction::Kinds => {
+                bearer::commands::run_kinds();
+                Ok(())
+            }
             BearerAction::Send {
                 peer_id,
                 channel,
