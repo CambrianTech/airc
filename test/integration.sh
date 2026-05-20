@@ -3386,9 +3386,8 @@ scenario_platform_adapters() {
     return
   fi
   _adapter_call() {
-    AIRC_PYTHON="${AIRC_PYTHON:-python3}" \
-    PYTHONPATH="${_airc_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-    bash -c "source '$_adapters_file'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
+    local _rs; _rs=$(airc_rs_bin) || return 1
+    AIRC_RS_BIN="$_rs" bash -c "airc_rs_bin() { printf '%s\n' \"\$AIRC_RS_BIN\"; }; source '$_adapters_file'; $*"
   }
 
   # ── proc_children ──
@@ -3427,27 +3426,38 @@ scenario_platform_adapters() {
   wait $_child_pid 2>/dev/null
 
   # ── port_listeners ──
-  # Bring up a python listener on a random high port, verify
+  # Bring up a netcat listener on a random high port, verify
   # port_listeners returns its PID.
   local _test_port=49917
-  python3 -c "
-import socket, time, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $_test_port))
-s.listen(1)
-sys.stderr.write(f'pid={__import__(\"os\").getpid()}\n')
-sys.stderr.flush()
-time.sleep(30)
-" 2> /tmp/airc-it-pa-listener.err &
-  local _listener_pid=$!
+  local _listener_pid=""
+  : > /tmp/airc-it-pa-listener.err
+  if command -v nc >/dev/null 2>&1; then
+    local _listener_cmd
+    for _listener_cmd in \
+      "nc -l 127.0.0.1 $_test_port" \
+      "nc -l $_test_port" \
+      "nc -l -p $_test_port -s 127.0.0.1"; do
+      sh -c "$_listener_cmd" >/dev/null 2>>/tmp/airc-it-pa-listener.err &
+      _listener_pid=$!
+      sleep 0.4
+      if kill -0 "$_listener_pid" 2>/dev/null; then
+        break
+      fi
+      wait "$_listener_pid" 2>/dev/null || true
+      _listener_pid=""
+    done
+  fi
+  if [ -z "$_listener_pid" ]; then
+    echo "  (skipped — nc listener unavailable; port_listeners covered on hosts with nc/lsof/ss/netstat)"
+  else
   sleep 0.5
   local _detected; _detected=$(_adapter_call "port_listeners $_test_port" | tr '\n' ' ')
   echo "$_detected" | grep -qE "(^| )${_listener_pid}( |$)" \
-    && pass "port_listeners: finds python listener on :$_test_port" \
+      && pass "port_listeners: finds nc listener on :$_test_port" \
     || fail "port_listeners: missed listener $_listener_pid (got: '$_detected', stderr: $(cat /tmp/airc-it-pa-listener.err 2>/dev/null))"
   kill -9 $_listener_pid 2>/dev/null
   wait $_listener_pid 2>/dev/null
+  fi
   rm -f /tmp/airc-it-pa-listener.err
 
   # ── file_size ──
@@ -3502,8 +3512,7 @@ time.sleep(30)
   # 3 callsites (heartbeat parse, _format_relative_time, _is_stale).
   # Same fixed timestamp + arithmetic check on the result keeps the
   # assertion deterministic regardless of which date flavor wins.
-  # 2026-01-15T12:34:56Z = 1768480496 (UTC epoch seconds; computed via
-  # python3 -c "import datetime; print(int(datetime.datetime(2026,1,15,12,34,56,tzinfo=datetime.timezone.utc).timestamp()))").
+  # 2026-01-15T12:34:56Z = 1768480496 (UTC epoch seconds).
   local _epoch_known
   _epoch_known=$(_adapter_call "iso_to_epoch '2026-01-15T12:34:56Z'" 2>/dev/null)
   [ "$_epoch_known" = "1768480496" ] \
