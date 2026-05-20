@@ -54,8 +54,6 @@ cmd_doctor() {
   _doctor_probe_gh_auth                                             || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
-  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
-  _doctor_probe_cryptography                                            || issues=$((issues+1))
   # sshd probe removed post-3c: the gist IS the wire for ALL peers; airc no
   # longer ssh's into the host's airc_home. ssh-keygen above stays (identity
   # key generation), ssh client stays (occasional manual diagnostic + future
@@ -118,11 +116,6 @@ _doctor_install_cmd_for() {
         pacman) pkg="openssh" ;;
         apk)    pkg="openssh-client" ;;
       esac ;;
-    python3)
-      case "$mgr" in
-        pacman) pkg="python" ;;
-        *)      pkg="python3" ;;
-      esac ;;
     *) pkg="$prereq" ;;
   esac
   case "$mgr" in
@@ -139,44 +132,15 @@ _doctor_install_cmd_for() {
 
 _doctor_probe() {
   local cmd="$1" mgr="$2" purpose="$3"
-  # Strict-probe ONLY the binaries that have known shadow-aliases on
-  # Windows. PR #153's blanket strict-probe broke on macOS BSD utilities
-  # — `ssh-keygen --version` exits 1 ("illegal option") because BSD
-  # doesn't accept --version, and there's no portable single-flag that
-  # discriminates "real ssh-keygen" from "stub" anyway. Only the
-  # Microsoft Store {python.exe, python3.exe} aliases need defense
-  # against; everything else is uniquely shipped by the user's package
-  # manager (no shadowing ambiguity), so bare `command -v` is correct.
-  case "$cmd" in
-    python|python3)
-      if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version >/dev/null 2>&1; then
-        printf "  [ok] %s\n" "$cmd"
-        return 0
-      fi
-      ;;
-    *)
-      if command -v "$cmd" >/dev/null 2>&1; then
-        printf "  [ok] %s\n" "$cmd"
-        return 0
-      fi
-      ;;
-  esac
-  # Distinguish "absent" from "stub on PATH" so the fix hint is correct.
-  local fix
   if command -v "$cmd" >/dev/null 2>&1; then
-    # Present but non-functional — almost certainly a stub.
-    printf "  [BROKEN] %s -- %s\n" "$cmd" "$purpose"
-    printf "         '%s' is on PATH but '%s --version' fails. " "$cmd" "$cmd"
-    printf "Likely a Microsoft Store alias on Windows.\n"
-    printf "         Disable: Settings -> Apps -> Advanced app settings -> App execution aliases\n"
-    printf "         Or PATH-prepend a real install ahead of WindowsApps/.\n"
-    fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
-    printf "         Or install fresh: %s\n" "$fix"
-  else
-    fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
-    printf "  [MISSING] %s -- %s\n" "$cmd" "$purpose"
-    printf "         Fix: %s\n" "$fix"
+    printf "  [ok] %s\n" "$cmd"
+    return 0
   fi
+
+  local fix
+  fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
+  printf "  [MISSING] %s -- %s\n" "$cmd" "$purpose"
+  printf "         Fix: %s\n" "$fix"
   return 1
 }
 
@@ -207,26 +171,6 @@ _doctor_probe_gh_auth() {
       return 1
       ;;
   esac
-}
-
-# Probe the venv cryptography package — issue #341 follow-up. airc's
-# Ed25519 identity gen + signing now route through python-cryptography;
-# without it init_identity / sign_message hard-fail. install.sh's venv
-# step pip-installs it, so the failure surface here is "venv setup
-# didn't complete cleanly" or "the system python the resolver picked
-# differs from the venv one". Either way: surface clearly so doctor
-# tells the user to re-run install.sh.
-_doctor_probe_cryptography() {
-  if ! command -v "${AIRC_PYTHON:-python3}" >/dev/null 2>&1; then
-    return 0  # already reported missing by the python3 probe
-  fi
-  if "${AIRC_PYTHON:-python3}" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
-    printf "  [ok] cryptography (Ed25519 identity gen + signing)\n"
-    return 0
-  fi
-  printf "  [MISSING] cryptography (Python package, used for Ed25519 identity)\n"
-  printf "         Fix: re-run install.sh (sets up the venv with cryptography)\n"
-  return 1
 }
 
 _doctor_probe_tailscale() {
@@ -280,8 +224,6 @@ _doctor_connect_preflight() {
   _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
-  _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
-  _doctor_probe_cryptography                                           || issues=$((issues+1))
   # sshd probe removed post-3c — see cmd_doctor() in this file for rationale.
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.
