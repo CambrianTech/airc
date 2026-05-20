@@ -13,7 +13,7 @@ grep_forbid() {
   local reason="$1"
   local pattern="$2"
   shift 2
-  if git grep -nE "$pattern" -- "$@"; then
+  if git grep -nE "$pattern" -- "$@" ':(exclude)test/rust_quality_guard.sh'; then
     fail "$reason"
   fi
 }
