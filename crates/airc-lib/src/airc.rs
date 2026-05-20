@@ -32,6 +32,8 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
 use crate::room::{self, Room};
+use crate::route_health::TransportHealthSample;
+use crate::route_policy::TransportKind;
 use crate::transport::WireSubscriber;
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
@@ -70,6 +72,7 @@ pub(crate) struct AircInner {
     pub(crate) store: Arc<dyn EventStore>,
     pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
     pub(crate) policy: VerificationPolicy,
+    pub(crate) route_health: RwLock<Vec<TransportHealthSample>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
     /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
     /// Held in a Mutex so concurrent calls can't double-spawn.
@@ -133,6 +136,9 @@ impl Airc {
                 store,
                 registry,
                 policy,
+                route_health: RwLock::new(vec![TransportHealthSample::healthy_direct(
+                    TransportKind::LocalFs,
+                )]),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
             }),
@@ -152,6 +158,21 @@ impl Airc {
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id
+    }
+
+    /// Replace the route-health view consumed by the resolver. Discovery
+    /// and transport probes own this in production; tests and embedded
+    /// harnesses can pin samples to prove route admission behavior.
+    pub fn replace_transport_health(
+        &self,
+        samples: impl IntoIterator<Item = TransportHealthSample>,
+    ) {
+        let mut route_health = self
+            .inner
+            .route_health
+            .write()
+            .expect("route health lock poisoned");
+        *route_health = samples.into_iter().collect();
     }
 
     /// Switch the current room to one derived from `name`. Same name

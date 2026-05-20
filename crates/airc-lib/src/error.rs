@@ -41,6 +41,11 @@ pub enum AircError {
     #[error("transport: {0}")]
     Transport(String),
 
+    /// Route resolver refused or selected a route the current sender
+    /// cannot execute.
+    #[error("route: {0}")]
+    Route(String),
+
     /// Caller asked for an operation that needs an active room but
     /// the state has none yet. Construct one via `Airc::join`.
     #[error("no current room — call `join` to set one")]
