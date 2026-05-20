@@ -18,6 +18,111 @@
 # Joel 2026-04-27 modularization push: every cmd_X group becomes its own
 # file so the airc top-level retains only bootstrap + helpers + dispatch.
 
+_airc_teardown_is_live_airc_pid() {
+  local pid="${1:-}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  local cmd
+  cmd=$(proc_cmdline "$pid" || true)
+  echo "$cmd" | grep -Eq '(^|[[:space:]])([^[:space:]]*/)?airc([[:space:]]+(join|connect)|$)|(^|[[:space:]])([^[:space:]]*/)?airc-rs([[:space:]]|$)'
+}
+
+_airc_teardown_live_only() {
+  local p
+  for p in "$@"; do
+    _airc_teardown_is_live_airc_pid "$p" && printf '%s\n' "$p"
+  done
+}
+
+_airc_teardown_is_live_scope_pid() {
+  local pid="${1:-}" scope="${2:-}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$scope" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  local cmd
+  cmd=$(proc_cmdline "$pid" || true)
+  _airc_cmdline_mentions_scope "$cmd" "$scope"
+}
+
+_airc_teardown_scope_live_only() {
+  local scope="$1"
+  shift
+  local p
+  for p in "$@"; do
+    _airc_teardown_is_live_scope_pid "$p" "$scope" && printf '%s\n' "$p"
+  done
+}
+
+_airc_teardown_kill_and_verify() {
+  local label="$1"
+  shift
+
+  local live_pids
+  live_pids=$(_airc_teardown_live_only "$@" | sort -un || true)
+  [ -n "$live_pids" ] || return 1
+
+  echo "  killing $label: $(echo $live_pids | tr '\n' ' ')"
+  kill -TERM $live_pids 2>/dev/null || true
+  sleep 0.2
+
+  local survivors=""
+  local p
+  for p in $live_pids; do
+    _airc_teardown_is_live_airc_pid "$p" && survivors="$survivors $p"
+  done
+  if [ -n "$survivors" ]; then
+    kill -KILL $survivors 2>/dev/null || true
+    sleep 0.2
+  fi
+
+  local remaining=""
+  for p in $live_pids; do
+    _airc_teardown_is_live_airc_pid "$p" && remaining="$remaining $p"
+  done
+  if [ -n "$remaining" ]; then
+    echo "  warning: failed to reap $label:$(echo $remaining | tr '\n' ' ')" >&2
+    return 2
+  fi
+
+  return 0
+}
+
+_airc_teardown_kill_scope_and_verify() {
+  local label="$1" scope="$2"
+  shift 2
+
+  local live_pids
+  live_pids=$(_airc_teardown_scope_live_only "$scope" "$@" | sort -un || true)
+  [ -n "$live_pids" ] || return 1
+
+  echo "  killing $label: $(echo $live_pids | tr '\n' ' ')"
+  kill -TERM $live_pids 2>/dev/null || true
+  sleep 0.2
+
+  local survivors=""
+  local p
+  for p in $live_pids; do
+    _airc_teardown_is_live_scope_pid "$p" "$scope" && survivors="$survivors $p"
+  done
+  if [ -n "$survivors" ]; then
+    kill -KILL $survivors 2>/dev/null || true
+    sleep 0.2
+  fi
+
+  local remaining=""
+  for p in $live_pids; do
+    _airc_teardown_is_live_scope_pid "$p" "$scope" && remaining="$remaining $p"
+  done
+  if [ -n "$remaining" ]; then
+    echo "  warning: failed to reap $label:$(echo $remaining | tr '\n' ' ')" >&2
+    return 2
+  fi
+
+  return 0
+}
+
 cmd_teardown() {
   # Kill all airc processes for this user and free any ports they hold.
   # Add --flush to also wipe the state dir (identity, peers, messages) — nuclear.
@@ -54,14 +159,22 @@ cmd_teardown() {
   # + reap any orphaned listener on our specific port.
   if [ "$all" = "1" ]; then
     local nuked=0
-    # Bash airc-connect processes (any path that ends in /airc connect or
-    # the /tmp/airc-prefix bootstrap variant the curl|bash installer uses).
+    # Bash airc join/connect processes (any path that ends in /airc join,
+    # /airc connect, or the /tmp/airc-prefix bootstrap variant the
+    # curl|bash installer uses).
     local bash_pids
-    bash_pids=$(proc_airc_pids_matching '(airc|airc-prefix)[[:space:]]+connect' || true)
+    bash_pids=$(proc_airc_pids_matching '(airc|airc-prefix)[[:space:]]+(join|connect)' || true)
     if [ -n "$bash_pids" ]; then
-      echo "  --all: killing airc bash processes: $(echo $bash_pids | tr '\n' ' ')"
-      kill -9 $bash_pids 2>/dev/null || true
-      nuked=1
+      local bash_tree="$bash_pids"
+      local bp
+      for bp in $bash_pids; do
+        local bp_kids; bp_kids=$(proc_children "$bp" | tr '\n' ' ' || true)
+        [ -n "$bp_kids" ] && bash_tree="$bash_tree $bp_kids"
+      done
+      bash_tree=$(echo "$bash_tree" | tr ' ' '\n' | sort -un || true)
+      if _airc_teardown_kill_and_verify "--all airc process tree" $bash_tree; then
+        nuked=1
+      fi
     fi
     # AIRC listeners on airc port range (7547-7559). Don't touch
     # outside that range — could be unrelated processes.
@@ -73,9 +186,9 @@ cmd_teardown() {
         local cmd
         cmd=$(proc_cmdline "$lpid" || true)
         if echo "$cmd" | grep -q "socket.SOCK_STREAM\|socket.AF_INET"; then
-          echo "  --all: freeing port $port (pid $lpid)"
-          kill -9 "$lpid" 2>/dev/null || true
-          nuked=1
+          if _airc_teardown_kill_and_verify "--all port $port listener" "$lpid"; then
+            nuked=1
+          fi
         fi
       done
     done
@@ -84,9 +197,9 @@ cmd_teardown() {
     local tail_pids
     tail_pids=$(proc_airc_pids_matching '\.airc/messages\.jsonl' || true)
     if [ -n "$tail_pids" ]; then
-      echo "  --all: killing stale airc message tails: $(echo $tail_pids | tr '\n' ' ')"
-      kill -9 $tail_pids 2>/dev/null || true
-      nuked=1
+      if _airc_teardown_kill_and_verify "--all stale airc message tails" $tail_pids; then
+        nuked=1
+      fi
     fi
     [ "$nuked" = "0" ] && echo "  --all: no machine-wide airc processes to kill."
     # Fall through to scope-aware path below to also clean up THIS scope's
@@ -178,9 +291,9 @@ cmd_teardown() {
         done
         _all_sc=$(echo "$_all_sc" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
         if [ -n "$_all_sc" ]; then
-          echo "  killing sidecar scope $_sidecar_scope: $(echo $_all_sc | tr '\n' ' ')"
-          kill -9 $_all_sc 2>/dev/null || true
-          killed=1
+          if _airc_teardown_kill_and_verify "sidecar scope $_sidecar_scope" $_all_sc; then
+            killed=1
+          fi
         fi
       fi
       rm -f "$_sidecar_scope/airc.pid"
@@ -237,9 +350,9 @@ cmd_teardown() {
         fi
       fi
       if [ -n "$all_pids" ]; then
-        echo "  killing scope $AIRC_WRITE_DIR: $(echo $all_pids | tr '\n' ' ')"
-        kill -9 $all_pids 2>/dev/null || true
-        killed=1
+        if _airc_teardown_kill_and_verify "scope $AIRC_WRITE_DIR" $all_pids; then
+          killed=1
+        fi
       fi
     fi
     rm -f "$pidfile" 2>/dev/null
@@ -268,7 +381,15 @@ cmd_teardown() {
     # keep pgrep happy. `|| true` swallows the empty-match case;
     # genuine errors (lsof permissions etc) still produce empty output
     # which the if-block handles cleanly.
-    _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true)
+    _scope_path_pids=""
+    local _scope_variant
+    while IFS= read -r _scope_variant; do
+      [ -n "$_scope_variant" ] || continue
+      _scope_path_pids="$_scope_path_pids $(pgrep -f "$_scope_variant" 2>/dev/null | tr '\n' ' ' || true)"
+    done <<EOF
+$(_airc_scope_path_variants "$AIRC_WRITE_DIR")
+EOF
+    _scope_path_pids=$(echo "$_scope_path_pids" | tr ' ' '\n' | sort -un || true)
     if [ -n "$_scope_path_pids" ]; then
       # The scope-path match catches bearer/formatter children because
       # their argv includes --state-file/--peers-dir paths. Their
@@ -312,9 +433,9 @@ cmd_teardown() {
         _filter_pids="$_filter_pids $_p"
       done
       if [ -n "$_filter_pids" ]; then
-        echo "  killing scope-path-tagged orphans: $(echo $_filter_pids | tr '\n' ' ')"
-        kill -9 $_filter_pids 2>/dev/null || true
-        killed=1
+        if _airc_teardown_kill_scope_and_verify "scope-path-tagged orphans" "$AIRC_WRITE_DIR" $_filter_pids; then
+          killed=1
+        fi
       fi
     fi
   fi
@@ -339,9 +460,9 @@ cmd_teardown() {
       local cmd; cmd=$(proc_cmdline "$lpid" || true)
       # Reap if orphaned AND is a socket listener.
       if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
-        echo "  freeing orphaned port $port (pid $lpid)"
-        kill -9 "$lpid" 2>/dev/null || true
-        killed=1
+        if _airc_teardown_kill_and_verify "orphaned port $port listener" "$lpid"; then
+          killed=1
+        fi
       fi
     done
   done
