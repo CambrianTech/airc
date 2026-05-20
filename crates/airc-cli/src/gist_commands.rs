@@ -106,6 +106,16 @@ pub fn run_gist_content(channel: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub fn run_file_content(filename: &str) -> Result<(), Box<dyn Error>> {
+    let Some(json) = read_stdin_json() else {
+        return Ok(());
+    };
+    if let Some(content) = file_content(&json, filename) {
+        print!("{content}");
+    }
+    Ok(())
+}
+
 fn read_stdin_json() -> Option<Value> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw).ok()?;
@@ -152,6 +162,15 @@ fn gist_content(json: &Value, channel: &str) -> Option<String> {
     files
         .values()
         .find_map(|entry| entry.get("content").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn file_content(json: &Value, filename: &str) -> Option<String> {
+    json.get("files")?
+        .as_object()?
+        .get(filename)?
+        .get("content")?
+        .as_str()
         .map(ToOwned::to_owned)
 }
 
@@ -242,6 +261,22 @@ mod tests {
         let content = gist_content(&gist, "acme").unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["invite"], "fresh-host@example");
+    }
+
+    #[test]
+    fn file_content_extracts_exact_filename_with_dot() {
+        let gist = json!({
+            "files": {
+                "messages.jsonl": {"content": "line one\nline two\n"},
+                "airc-room-general.json": {"content": "{}"}
+            }
+        });
+
+        assert_eq!(
+            file_content(&gist, "messages.jsonl").as_deref(),
+            Some("line one\nline two\n")
+        );
+        assert!(file_content(&gist, "missing.jsonl").is_none());
     }
 
     #[test]

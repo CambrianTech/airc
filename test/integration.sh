@@ -4767,7 +4767,7 @@ bearer.close()
 
   # Verify the marker actually landed in the gist.
   local content; content=$(gh api "gists/$gist_id" 2>/dev/null \
-    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'])" 2>/dev/null)
+    | "$(airc_rs_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
   if printf '%s' "$content" | grep -q "$marker"; then
     pass "payload visible in gist's messages.jsonl"
   else
@@ -4819,7 +4819,7 @@ finally:
   # wholesale, so reconstruct the full content.
   sleep 2
   local prior_content; prior_content=$(gh api "gists/$gist_id" 2>/dev/null \
-    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'], end='')" 2>/dev/null)
+    | "$(airc_rs_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
   local seed2; seed2=$(mktemp -d -t airc-it-bg-seed2.XXXXXX)
   {
     printf '%s' "$prior_content"
