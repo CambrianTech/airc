@@ -116,6 +116,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("AIRC_PYTHON", body)
         self.assertNotIn("python", body.lower())
 
+        invite_start = rooms.index("_cmd_invite_human()")
+        invite_end = rooms.index("cmd_invite()", invite_start)
+        invite_body = rooms[invite_start:invite_end]
+        self.assertIn("config get-channel-gist", invite_body)
+        self.assertNotIn("AIRC_PYTHON", invite_body)
+
     def test_inbox_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
         start = source.index("cmd_inbox()")
