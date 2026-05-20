@@ -28,13 +28,14 @@ use airc_core::{ClientId, PeerId, TranscriptEvent};
 use airc_daemon::{peers_store, LocalIdentity};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
+use airc_transport::LanTcpAdapter;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
 use crate::room::{self, Room};
 use crate::route_health::TransportHealthSample;
 use crate::route_policy::TransportKind;
-use crate::transport::WireSubscriber;
+use crate::transport::{FrameSubscriber, WireSubscriber};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
 
@@ -73,6 +74,8 @@ pub(crate) struct AircInner {
     pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
     pub(crate) policy: VerificationPolicy,
     pub(crate) route_health: RwLock<Vec<TransportHealthSample>>,
+    pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
+    pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
     /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
     /// Held in a Mutex so concurrent calls can't double-spawn.
@@ -139,6 +142,8 @@ impl Airc {
                 route_health: RwLock::new(vec![TransportHealthSample::healthy_direct(
                     TransportKind::LocalFs,
                 )]),
+                lan_tcp: Mutex::new(None),
+                lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
             }),

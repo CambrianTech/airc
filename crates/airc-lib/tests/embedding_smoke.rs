@@ -7,7 +7,7 @@
 //! background subscriber, the store, and the broadcast fan-out.
 //! This is the slice-6b proof point.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use airc_lib::{
     Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, TranscriptKind,
@@ -206,6 +206,35 @@ async fn send_refuses_github_invite_only_route() {
             .contains("DataInteractive has no admissible live route"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn two_embedded_handles_chat_over_lan_without_cli() {
+    let alice_home = TempDir::new().unwrap();
+    let bob_home = TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().unwrap();
+    let bob_spec: PeerSpec = bob.peer_spec().parse().unwrap();
+    alice.add_peer(bob_spec).await.unwrap();
+    bob.add_peer(alice_spec).await.unwrap();
+
+    alice.join("lan-room").await.unwrap();
+    bob.join("lan-room").await.unwrap();
+
+    let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    let alice_addr = alice.listen_lan(bind).await.unwrap();
+    bob.connect_lan(alice_addr, alice.peer_id()).await.unwrap();
+
+    bob.say("hello over sdk lan").await.unwrap();
+
+    let page = wait_for_events(&alice, 1, Duration::from_secs(3)).await;
+    let bodies: Vec<&str> = page
+        .iter()
+        .filter_map(|event| event.body.as_ref().and_then(Body::as_text))
+        .collect();
+    assert_eq!(bodies, vec!["hello over sdk lan"]);
 }
 
 #[tokio::test]
