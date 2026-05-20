@@ -3089,12 +3089,7 @@ scenario_general_sidecar_default() {
     [ -f "$home1/config.json" ] && grep -q 'subscribed_channels' "$home1/config.json" && break
   done
 
-  if [ -f "$home1/config.json" ] && python3 -c "
-import json,sys
-c=json.load(open('$home1/config.json'))
-chans=c.get('subscribed_channels',[])
-sys.exit(0 if 'general' in chans else 1)
-" 2>/dev/null; then
+  if [ -f "$home1/config.json" ] && "$(airc_rs_bin)" config read-channels --config "$home1/config.json" | grep -qx "general"; then
     pass "subscribed_channels includes 'general'"
   else
     fail "subscribed_channels missing 'general' (config: $(cat "$home1/config.json" 2>/dev/null))"

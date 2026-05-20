@@ -130,6 +130,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("json.load(open('$jstate/config.json'))", body)
         self.assertNotIn("python3 -c \"import json; print", body)
 
+    def test_integration_general_sidecar_channels_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_general_sidecar_default()")
+        end = source.index("scenario_away()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config read-channels --config "$home1/config.json"', body)
+        self.assertNotIn("subscribed_channels',[]", body)
+        self.assertNotIn("python3 -c", body)
+
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_heartbeat()")
