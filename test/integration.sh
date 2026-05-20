@@ -3816,16 +3816,12 @@ scenario_bearer_cli_recv() {
 
   # Verify the line is JSONL-shaped (parseable JSON object). Defends
   # against accidental wrapping or pretty-printing in the CLI.
-  if [ $found -eq 1 ] && python3 -c "
-import json, sys
-for line in open('$cli_out'):
-    line = line.strip()
-    if not line: continue
-    obj = json.loads(line)
-    if obj.get('msg') == '$marker':
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null; then
+  local parsed_found=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" = "$marker" ] && parsed_found=1 && break
+  done < "$cli_out"
+  if [ $found -eq 1 ] && [ "$parsed_found" = "1" ]; then
     pass "bearer_cli recv output is parseable JSONL"
   elif [ $found -eq 1 ]; then
     fail "bearer_cli recv emitted the marker but output is not parseable JSONL: $(cat "$cli_out" 2>/dev/null)"
@@ -4934,12 +4930,14 @@ scenario_e2e_encryption() {
   # peer record for the OTHER must contain x25519_pub.
   local h_peer=/tmp/airc-it-e2e-h/state/peers/encjoiner.json
   local j_peer=/tmp/airc-it-e2e-j/state/peers/enchost.json
-  if [ -f "$h_peer" ] && python3 -c "import json; d=json.load(open('$h_peer')); exit(0 if d.get('x25519_pub') else 1)"; then
+  local h_x25519=""; [ -f "$h_peer" ] && h_x25519=$("$(airc_rs_bin)" config get --config "$h_peer" x25519_pub 2>/dev/null)
+  if [ -n "$h_x25519" ]; then
     pass "host's peer record has joiner's x25519_pub (handshake exchanged)"
   else
     fail "host's peer record MISSING x25519_pub: $(cat "$h_peer" 2>/dev/null)"
   fi
-  if [ -f "$j_peer" ] && python3 -c "import json; d=json.load(open('$j_peer')); exit(0 if d.get('x25519_pub') else 1)"; then
+  local j_x25519=""; [ -f "$j_peer" ] && j_x25519=$("$(airc_rs_bin)" config get --config "$j_peer" x25519_pub 2>/dev/null)
+  if [ -n "$j_x25519" ]; then
     pass "joiner's peer record has host's x25519_pub (handshake exchanged)"
   else
     fail "joiner's peer record MISSING x25519_pub: $(cat "$j_peer" 2>/dev/null)"
@@ -4967,7 +4965,8 @@ scenario_e2e_encryption() {
     fail "no inbound line on host from encjoiner"
   elif printf '%s' "$host_line" | grep -q "$marker"; then
     fail "WIRE IS PLAINTEXT — encryption did not engage. Line: $host_line"
-  elif printf '%s' "$host_line" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('enc')=='v1' and 'nonce' in d else 1)"; then
+  elif [ "$(printf '%s' "$host_line" | "$(airc_rs_bin)" gist get .enc)" = "v1" ] \
+       && [ -n "$(printf '%s' "$host_line" | "$(airc_rs_bin)" gist get .nonce)" ]; then
     pass "host's wire form is ciphertext (enc=v1, nonce present)"
   else
     fail "host's wire form unexpected shape: $host_line"
