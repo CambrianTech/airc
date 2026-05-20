@@ -28,7 +28,7 @@ Walks the full removal in order:
 2. Removes any legacy background registration if present
 3. Removes binary forwarders: `~/.local/bin/{airc, relay, airc.cmd, airc.ps1}`
 4. Removes airc skill symlinks under `~/.claude/skills/`
-5. Removes the clone dir (`~/.airc-src` or `$AIRC_DIR`), including the `.venv` inside
+5. Removes the clone dir (`~/.airc-src` or `$AIRC_DIR`)
 
 **Confirmation prompt:** asks the user to type `yes` to proceed. If you're invoking from an agent, pass `--yes` only after the user has explicitly confirmed.
 
@@ -40,7 +40,7 @@ Walks the full removal in order:
 ## What it leaves alone
 
 - **Per-project `.airc/` state** — your identity keys, peer records, message logs in every dir you ran `airc join` from. Use `--purge` to get a list of them.
-- **`gh` auth, brew/apt-installed packages** (gh / python3 / openssl) — those aren't airc's to remove.
+- **`gh` auth, brew/apt-installed packages** — those aren't airc's to remove.
 - **Other agents' configs** (Codex, Cursor, opencode, Windsurf) — airc only owns its own integration files.
 
 ## Read the result
