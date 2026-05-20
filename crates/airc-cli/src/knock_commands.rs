@@ -1,5 +1,8 @@
 use std::error::Error;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::Path;
+use std::process::Command;
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -77,6 +80,12 @@ pub fn run_approval_field(field: &str) -> Result<(), Box<dyn Error>> {
     if let Some(value) = value.get(field).and_then(Value::as_str) {
         println!("{value}");
     }
+    Ok(())
+}
+
+pub fn run_identity_json(name: &str, state_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let identity = load_knock_identity(state_dir, name);
+    println!("{}", serde_json::to_string(&identity)?);
     Ok(())
 }
 
@@ -170,6 +179,49 @@ fn extract_knocker_pub(markdown: &str) -> Option<String> {
                 .filter(|pubkey| !pubkey.is_empty())
                 .map(str::to_owned)
         })
+}
+
+fn load_knock_identity(state_dir: &Path, name: &str) -> Value {
+    let identity_path = state_dir.join("identity.json");
+    let identity = fs::read_to_string(identity_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    json!({
+        "name": name,
+        "pronouns": string_field(&identity, "pronouns").unwrap_or_default(),
+        "role": string_field(&identity, "role").unwrap_or_default(),
+        "bio": string_field(&identity, "bio").unwrap_or_default(),
+        "gh_login": string_field(&identity, "gh_login")
+            .or_else(query_gh_login)
+            .unwrap_or_default(),
+    })
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn query_gh_login() -> Option<String> {
+    let output = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let login = String::from_utf8(output.stdout).ok()?;
+    let login = login.trim();
+    if login.is_empty() {
+        None
+    } else {
+        Some(login.to_owned())
+    }
 }
 
 fn extract_latest_approval(raw_comments_json: &str) -> Result<Option<Value>, Box<dyn Error>> {
@@ -277,6 +329,36 @@ mod tests {
 "#;
 
         assert_eq!(extract_knocker_pub(markdown).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn identity_json_reads_existing_fields_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("identity.json"),
+            r#"{"pronouns":"they/them","role":"agent","bio":"works","gh_login":"octo"}"#,
+        )
+        .unwrap();
+
+        let value = load_knock_identity(dir.path(), "clio");
+
+        assert_eq!(value["name"], "clio");
+        assert_eq!(value["pronouns"], "they/them");
+        assert_eq!(value["role"], "agent");
+        assert_eq!(value["bio"], "works");
+        assert_eq!(value["gh_login"], "octo");
+    }
+
+    #[test]
+    fn identity_json_defaults_when_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let value = load_knock_identity(dir.path(), "fresh");
+
+        assert_eq!(value["name"], "fresh");
+        assert_eq!(value["pronouns"], "");
+        assert_eq!(value["role"], "");
+        assert_eq!(value["bio"], "");
     }
 
     #[test]
