@@ -280,6 +280,37 @@ async fn lan_listen_feeds_health_and_invite_endpoint_without_tailscale() {
 }
 
 #[tokio::test]
+async fn discovery_refresh_is_local_first_without_github_or_tailscale() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+
+    airc.replace_transport_health([]).unwrap();
+    let snapshot = airc.refresh_route_discovery().await.unwrap();
+
+    assert!(
+        snapshot
+            .health
+            .iter()
+            .any(|sample| sample.kind == TransportKind::LocalFs),
+        "local-fs must be discovered without GitHub"
+    );
+    assert!(
+        snapshot
+            .health
+            .iter()
+            .all(|sample| sample.kind != TransportKind::GhGist),
+        "GitHub must not appear in local discovery"
+    );
+    assert!(
+        snapshot
+            .health
+            .iter()
+            .all(|sample| sample.kind != TransportKind::Tailscale),
+        "Tailscale is optional reachability, not a local dependency"
+    );
+}
+
+#[tokio::test]
 async fn filtered_event_queries_match_kind_and_headers_without_body_parse() {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();
