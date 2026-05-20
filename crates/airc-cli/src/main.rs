@@ -496,14 +496,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             expected_peer,
             text,
         } => {
-            let identity = LocalIdentity::load_or_generate(&home)?;
             let expected = parse_peer_id(&expected_peer)?;
-            commands::run_lan_send(&home, &identity, parsed.peers, to, expected, &text).await
+            commands::run_lan_send(&home, parsed.peers, to, expected, &text).await
         }
 
         Command::LanListen { bind, replay } => {
-            let identity = LocalIdentity::load_or_generate(&home)?;
-            commands::run_lan_listen(&home, &identity, parsed.peers, bind, replay).await
+            commands::run_lan_listen(&home, parsed.peers, bind, replay).await
         }
 
         Command::Daemon { socket } => {

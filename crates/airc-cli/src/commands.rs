@@ -5,10 +5,9 @@
 //! CLI is a thin client of the same API consumers embed. Closes
 //! grievance §5 / Codex audit finding #4.
 //!
-//! LAN-TCP and daemon-host commands construct lower-level handles
-//! (`LanTcpAdapter`, `DaemonState`) directly — they're not in
-//! airc-lib's surface yet. Daemon-client commands (`ping`, `status`,
-//! `stop`, `msg`, `inbox`) use `airc_daemon::DaemonClient` directly.
+//! Daemon-host commands construct daemon state directly because they
+//! host the service. Daemon-client commands (`ping`, `status`, `stop`,
+//! `msg`, `inbox`) use `airc_daemon::DaemonClient` directly.
 //!
 //! `VerificationPolicy::Strict` is the only policy used in CLI paths.
 
@@ -16,14 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use airc_core::{
-    headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
-    TranscriptCursor,
-};
-use airc_protocol::{
-    Envelope, Frame, FrameKind, PeerKeyRegistry, Signature, Subscription, VerificationPolicy,
-};
-use airc_transport::{LanTcpAdapter, SignedTransport, Transport};
+use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
+use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use futures::stream::StreamExt;
 
 use airc_daemon::{
@@ -145,25 +138,18 @@ pub async fn run_listen(
 /// the current room's channel.
 pub async fn run_lan_send(
     home: &Path,
-    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     to: std::net::SocketAddr,
     expected_peer: PeerId,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let current = room::load_or_default(home)?;
-    let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
-    inner.connect(to, expected_peer).await?;
-    let transport = SignedTransport::new(
-        inner,
-        identity.keypair.clone(),
-        identity.peer_id,
-        registry,
-        VerificationPolicy::Strict,
-    );
-    let frame = build_message_frame(identity, current.channel, text);
-    transport.send(frame).await?;
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+    let current = airc.current_room().await?;
+    airc.connect_lan(to, expected_peer).await?;
+    airc.say(text).await?;
     println!(
         "sent over lan-tcp to {} ({}).",
         current.name, current.channel
@@ -174,34 +160,18 @@ pub async fn run_lan_send(
 /// `lan-listen` — bind a TLS server, accept peers, print frames.
 pub async fn run_lan_listen(
     home: &Path,
-    identity: &LocalIdentity,
     peers: Vec<PeerSpec>,
     bind: std::net::SocketAddr,
-    replay: bool,
+    _replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_combined_registry(home, identity, &peers)?;
-    let inner = LanTcpAdapter::new(identity.peer_id, identity.keypair.clone(), registry.clone())?;
-    let actual = inner.listen(bind).await?;
-    println!("listening on {actual} (peer_id {}) …", identity.peer_id);
-    let transport = SignedTransport::new(
-        inner,
-        identity.keypair.clone(),
-        identity.peer_id,
-        registry,
-        VerificationPolicy::Strict,
-    );
-    // LAN listen accepts frames on any channel — no filter.
-    let from_cursor = replay.then(|| TranscriptCursor {
-        lamport: 0,
-        event_id: EventId::from_u128(0),
-    });
-    let subscription = Subscription {
-        channel: None,
-        from_cursor,
-        ..Default::default()
-    };
-    let mut stream = transport.subscribe(subscription).await?;
-    print_until_signal(&mut stream).await
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+    let actual = airc.listen_lan(bind).await?;
+    println!("listening on {actual} (peer_id {}) …", airc.peer_id());
+    let mut stream = airc.subscribe().await?;
+    print_event_stream_until_signal(&mut stream).await
 }
 
 /// `daemon` — run the long-lived daemon process on the given socket.
@@ -342,79 +312,6 @@ pub async fn run_inbox(
         );
     }
     Ok(())
-}
-
-// ---- Shared helpers (LAN commands) ---------------------------------
-
-fn build_message_frame(identity: &LocalIdentity, channel: RoomId, text: &str) -> Frame {
-    let lamport = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    Frame {
-        kind: FrameKind::Message,
-        envelope: Envelope {
-            event_id: EventId::new(),
-            sender: identity.peer_id,
-            // Stable ClientId from the persisted identity — multi-tab
-            // disambiguation, replay records cite this.
-            sender_client: identity.client_id,
-            channel,
-            target: MentionTarget::All,
-            lamport,
-            occurred_at_ms: lamport,
-            reply_to: None,
-            headers: Headers::new(),
-            body: Some(Body::text(text)),
-            // SignedTransport replaces this with Ed25519 on the way out.
-            signature: Signature::Unsigned,
-            media: Vec::new(),
-        },
-    }
-}
-
-async fn print_until_signal<S, E>(stream: &mut S) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: futures::Stream<Item = Result<Frame, E>> + Unpin,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let sigint = tokio::signal::ctrl_c();
-    let mut sigint = Box::pin(sigint);
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut sigint => {
-                println!();
-                println!("interrupted; exiting.");
-                return Ok(());
-            }
-            next = stream.next() => {
-                match next {
-                    Some(Ok(frame)) => print_frame(&frame),
-                    Some(Err(error)) => eprintln!("verification failed: {error}"),
-                    None => {
-                        println!("stream closed; exiting.");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn print_frame(frame: &Frame) {
-    let text = frame
-        .envelope
-        .body
-        .as_ref()
-        .and_then(Body::as_text)
-        .unwrap_or("<non-text body>");
-    println!(
-        "[{kind:?}] {sender} → {channel}: {text}",
-        kind = frame.kind,
-        sender = frame.envelope.sender,
-        channel = frame.envelope.channel,
-    );
 }
 
 async fn print_event_stream_until_signal(
