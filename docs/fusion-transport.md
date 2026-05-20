@@ -160,9 +160,9 @@ Combined into a `cost` scalar: `cost = rtt_ms / success_rate / budget_remaining`
 Get the driver abstraction in place. Implement loopback + LAN drivers as straight TCP/JSONL with envelope auth. Single-driver-at-a-time selection (existing behavior) but routed through the new abstraction. Validate the contract works.
 
 **Deliverables:**
-- `lib/airc_core/bearer_loopback.py`
-- `lib/airc_core/bearer_lan.py`
-- Modify `bearer_resolver.py` to dispatch based on peer address scope
+- Rust transport adapter for loopback
+- Rust transport adapter for LAN
+- Transport resolver dispatch based on peer address scope
 - Tests: connect + send + recv via each driver, no fusion yet
 
 ### Phase 2 — Tailscale driver + multi-driver active
@@ -170,7 +170,7 @@ Get the driver abstraction in place. Implement loopback + LAN drivers as straigh
 Add TS driver (same TCP/JSONL but binds to TS interface). Maintain multiple connections concurrently. Pick by simple priority (TS > LAN > localhost > gh). Validate that losing one connection doesn't drop the session.
 
 **Deliverables:**
-- `lib/airc_core/bearer_tailscale.py`
+- Rust transport adapter for Tailscale
 - Per-driver health stub (just available/unavailable, no metrics yet)
 - Smoke test: kill TS mid-session, verify LAN takes over
 
@@ -205,7 +205,7 @@ Slot in real Reticulum as another driver. No fusion layer changes. Validate cros
 
 ## Open questions
 
-1. **Auth on direct transports**: Tailscale's identity alone isn't trust. First message exchange = sign challenge with Ed25519, peer verifies against published pubkey in gist. Does the existing `airc_core/identity.py` Ed25519 plumbing cover this, or do we need a new handshake?
+1. **Auth on direct transports**: Tailscale's identity alone isn't trust. First message exchange = sign challenge with Ed25519, peer verifies against the Rust identity store / signed peer record.
 2. **Connection persistence vs ephemeral**: keep TCP open (lower latency, more state) or reconnect-per-burst (less state, more handshake cost)? Probably persistent with idle keepalive.
 3. **Multi-message ordering across transports**: if message A goes via TS, message B via LAN, do we need ordering guarantees? Probably not for chat; envelope timestamp is enough.
 4. **Backpressure**: fusion layer needs to push back on app when all transports are throttled. Queue + caller-visible state.

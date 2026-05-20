@@ -624,7 +624,7 @@ Verified strengths:
 
 Critical remaining gaps:
 
-- The public `airc` product path is still the legacy Python/GitHub/shell system. README and integration docs still instruct users to install `python3`, use `gh`/gists, and have agents shell out.
+- The public `airc` product path now routes through Rust for identity, config, bearer, logs, monitor formatting, Codex hooks, queue/work helpers, and install-time setup. Remaining shell should keep shrinking toward install/bootstrap only.
 - `airc-lib` does not yet provide a live subscription stream or daemon-attached mode. The embedding smoke test manually appends to the store after `say()` because pure embedding has no background subscriber.
 - `airc-cli` still owns too much policy. The daemon split helped, but command handlers still build registries, manage rooms, open stores, wire transports, and print user semantics.
 - Peer trust rotation is still too permissive: `peers_store::add` silently replaces a pubkey for the same `PeerId`. That must become an explicit signed rotation/audit operation.

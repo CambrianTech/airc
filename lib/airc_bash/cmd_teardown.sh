@@ -46,10 +46,10 @@ cmd_teardown() {
   # Find every airc-related process for THIS user and kill it. Targets:
   #   - bash processes running `airc connect` (any scope)
   #   - bash processes running `<dir>/airc connect` or `/tmp/airc-prefix connect`
-  #   - python processes spawned by airc (the inline -u -c monitor with
+  #   - helper processes spawned by airc (the inline monitor with
   #     the `WATCHDOG_SEC` heredoc) — identified by ppid pointing at one
   #     of the bash processes we're killing
-  #   - python listeners holding any TCP port in the airc range (7547-7559)
+  #   - listeners holding any TCP port in the airc range (7547-7559)
   # Then proceeds to the scope-aware path below to clean up our own pidfile
   # + reap any orphaned listener on our specific port.
   if [ "$all" = "1" ]; then
@@ -63,7 +63,7 @@ cmd_teardown() {
       kill -9 $bash_pids 2>/dev/null || true
       nuked=1
     fi
-    # Python listeners on airc port range (7547-7559). Don't touch python
+    # AIRC listeners on airc port range (7547-7559). Don't touch
     # outside that range — could be unrelated processes.
     local port
     for port in 7547 7548 7549 7550 7551 7552 7553 7554 7555 7556 7557 7558 7559; do
@@ -73,7 +73,7 @@ cmd_teardown() {
         local cmd
         cmd=$(proc_cmdline "$lpid" || true)
         if echo "$cmd" | grep -q "socket.SOCK_STREAM\|socket.AF_INET"; then
-          echo "  --all: freeing port $port (python pid $lpid)"
+          echo "  --all: freeing port $port (pid $lpid)"
           kill -9 "$lpid" 2>/dev/null || true
           nuked=1
         fi
@@ -200,7 +200,7 @@ cmd_teardown() {
     # reach `rm -f` below. Empty main_pids → we fall through cleanly.
     main_pids=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ' || true)
     if [ -n "$main_pids" ]; then
-      # Collect descendants (Python listener etc) before killing the parent.
+      # Collect descendants before killing the parent.
       local all_pids="$main_pids"
       for pid in $main_pids; do
         local kids
@@ -247,15 +247,15 @@ cmd_teardown() {
 
   # Scope-path catch-all: ANY process whose argv contains this scope's
   # path is ours, even if airc.pid never knew about it. Catches:
-  #   - Python handshake / monitor_formatter / bearer_cli children
-  #     whose parent died before airc.pid was updated.
+  #   - monitor / transport children whose parent died before airc.pid
+  #     was updated.
   #   - Subshells reparented to init that still hold scope state.
   #   - Stale processes from multi-bounce sessions.
-  # pgrep -f matches command + arguments (not env). Every airc python
-  # subprocess passes scope paths on its argv (--peers-dir,
+  # pgrep -f matches command + arguments (not env). Rust monitor and
+  # transport children pass scope paths on argv (--peers-dir,
   # --offset-file, etc), so cmdline match catches them all. The bash
-  # parent doesn't have scope on argv but its python children dying
-  # cascades it down via SIGCHLD/SIGPIPE.
+  # parent doesn't have scope on argv but child death cascades it down
+  # via SIGCHLD/SIGPIPE.
   # Skipped under AIRC_TEARDOWN_PART_ONLY (cmd_part shouldn't sweep).
   if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" != "1" ]; then
     local _scope_path_pids
@@ -270,8 +270,8 @@ cmd_teardown() {
     # which the if-block handles cleanly.
     _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true)
     if [ -n "$_scope_path_pids" ]; then
-      # The scope-path match catches Python bearer/formatter children
-      # because their argv includes --state-file/--peers-dir paths. Their
+      # The scope-path match catches bearer/formatter children because
+      # their argv includes --state-file/--peers-dir paths. Their
       # bash `airc join|connect` parents usually do NOT have AIRC_HOME in
       # argv, only in env, so killing children alone can leave the parent
       # alive to respawn them. Walk upward through airc-looking wrappers
@@ -319,11 +319,11 @@ cmd_teardown() {
     fi
   fi
 
-  # Brief pause to let the kernel reparent any airc python listener children
+  # Brief pause to let the kernel reparent any airc listener children
   # to init (PID 1) after we killed their bash parent. Then reap orphans.
   [ "$killed" = "1" ] && sleep 0.5
 
-  # Free the TCP port we were listening on. Kill any python socket listener
+  # Free the TCP port we were listening on. Kill any socket listener
   # that's now orphaned (parent=1). Don't touch anything else.
   local ports="${AIRC_PORT:-7547}"
   [ "$ports" != "7547" ] && ports="$ports 7547"
@@ -337,7 +337,7 @@ cmd_teardown() {
       # Empty parent/cmd → the `if` below falls through, which is correct.
       local parent; parent=$(proc_parent "$lpid" || true)
       local cmd; cmd=$(proc_cmdline "$lpid" || true)
-      # Reap if orphaned AND is a python socket listener.
+      # Reap if orphaned AND is a socket listener.
       if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
         echo "  freeing orphaned port $port (pid $lpid)"
         kill -9 "$lpid" 2>/dev/null || true

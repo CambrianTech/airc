@@ -831,8 +831,9 @@ substrate primitives.
    consumers go away.
 4. **Phase 4 — CLI parity.** The Rust `airc` binary replaces the
    bash `airc` script. Subcommands behavior-identical at launch.
-5. **Phase 5 — Python/shell deletion.** All `airc_core/*.py` and
-   `cmd_*.sh` deleted. Only `install.sh` remains in shell.
+5. **Phase 5 — Python/shell deletion.** `lib/airc_core` and Python
+   tests are deleted. Remaining `cmd_*.sh` wrappers continue shrinking
+   toward install/bootstrap only.
 6. **Phase 6 — Security upgrade.** Double-ratchet + SQLCipher
    landed once stable. Pairing flows updated to produce attestation.
 

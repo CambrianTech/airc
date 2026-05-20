@@ -32,7 +32,7 @@ Today, `airc send` requires the local airc daemon to be running. If the daemon i
 
 `cmd_send` checks daemon liveness up front:
 - **Daemon RUNNING** → existing path (queue to bearer's outbox, daemon delivers).
-- **Daemon DOWN** → fall back: build envelope locally (sign with `airc_core/identity.py` Ed25519), `gh api PATCH gists/<id>` directly. Same envelope shape — receiving peers parse normally.
+- **Daemon DOWN** → fail loudly and let the Rust transport resolver choose a valid route. The removed direct-PATCH fallback is not allowed to return.
 
 ### Proven viable
 
@@ -142,7 +142,7 @@ Last-resort but non-zero. Reliability cost: issue comments are PUBLIC by default
 
 ### Deliverables
 
-- `lib/airc_core/bearer_issues.py`: new bearer driver writing/reading issue comments
+- Rust transport adapter for issue-comment delivery if this path is still wanted.
 - Routing policy: only used when ALL gists throttled (last-resort)
 - Encryption-required guard for any non-broadcast traffic
 
@@ -180,7 +180,7 @@ Each rung validates the next. Don't skip.
 
 ## Decisions to ratify before L1 ships
 
-1. **Direct-PATCH signing**: reuse `airc_core/identity.py` Ed25519 in-process (sign in cmd_send), or shell out to existing `bearer_cli send` (slower, but reuses tested code path)?
+1. **Direct-PATCH signing**: obsolete. The old identity/envelope path is deleted; any direct path must be a Rust transport adapter with the same signing contract as the rest of the substrate.
 2. **Dedupe key**: envelope `sig` field (already-existing, unique per signed msg) or add an explicit `id` field?
 3. **L1 fallback messaging**: should the receiver-side mark OOB messages distinctly in the formatter, or treat them transparently?
 4. **L2 dual-source vs replace**: keep local-tail as primary + gist-poll as backup, OR switch primary to gist-poll for everyone (simpler, slightly higher cost)?

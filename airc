@@ -325,7 +325,7 @@ fi
 
 # Central GitHub request guard. All shell `gh ...` calls below route
 # through the Rust adapter so one per-user budget/backoff/audit layer
-# protects every AIRC tab on this machine. Legacy Python callers keep
+# protects every AIRC tab on this machine. Older callers keep
 # their own adapter until those transports are deleted.
 if [ -n "$_gh_resolved" ] || command -v gh >/dev/null 2>&1; then
   gh() {
@@ -581,7 +581,7 @@ _monitor_alive_with_bearer_fallback() {
   # that PID, including processes the OS has REUSED the PID for after sleep+wake
   # (or container restart, or any session that spawned through the same PID
   # range). Joel hit this 2026-05-03: laptop slept, airc Monitor died, OS
-  # later reused the PIDs for unrelated bash/python procs, `airc status`
+  # later reused the PIDs for unrelated shell/Rust procs, `airc status`
   # then said "monitor running" pointing at zombie PIDs that weren't ours.
   # Mesh effectively partitioned with no diagnosis path.
   #
@@ -1244,7 +1244,7 @@ _clear_parted_room()  { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config clear
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
 # its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
 # ssh_key + peer records are per-scope. Each subscription gets its own
-# wire (the python formatter prefixes events with the scope's room_name,
+# wire (the formatter prefixes events with the scope's room_name,
 # so the user sees `[#acme] X` and `[#general] Y` interleaved).
 #
 # Reads from cmd_connect's locals via bash's dynamic scoping:
@@ -1704,7 +1704,7 @@ monitor() {
 # Handles [rename] protocol by updating peer records on disk.
 # Read JSONL from stdin, emit one human-readable line per message.
 # Rust monitor formatter. Same stdin/stdout contract as the retired
-# Python module, but live receive formatting now stays on airc-rs.
+# formatter, but live receive formatting now stays on airc-rs.
 monitor_formatter() {
   local my_name="$1"
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
