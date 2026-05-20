@@ -1,8 +1,9 @@
 use crate::event::{
     CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, HygieneReportRecorded,
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestLinked,
-    PullRequestMerged, WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat,
-    WorkspaceReleased, WorkspaceRequested,
+    PullRequestMerged, WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
+    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
+    WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
@@ -30,6 +31,9 @@ impl WorkBoardProjection {
             WorkEvent::WorkspaceAllocated(e) => self.apply_workspace_allocated(e),
             WorkEvent::WorkspaceHeartbeat(e) => self.apply_workspace_heartbeat(e),
             WorkEvent::WorkspaceReleased(e) => self.apply_workspace_released(e),
+            WorkEvent::WorkspacePressureReported(e) => self.apply_workspace_pressure_reported(e),
+            WorkEvent::WorkspaceDrainRequested(e) => self.apply_workspace_drain_requested(e),
+            WorkEvent::WorkspaceDrainCompleted(e) => self.apply_workspace_drain_completed(e),
             WorkEvent::PullRequestLinked(e) => self.apply_pull_request_linked(e),
             WorkEvent::PullRequestMerged(e) => self.apply_pull_request_merged(e),
             WorkEvent::HygieneReportRecorded(e) => self.apply_hygiene_report_recorded(e),
@@ -225,6 +229,41 @@ impl WorkBoardProjection {
         let workspace = self.workspace_mut(e.workspace_id)?;
         workspace.lease.status = WorkspaceStatus::Released;
         workspace.lease.released_at_ms = Some(e.released_at_ms);
+        Ok(())
+    }
+
+    fn apply_workspace_pressure_reported(
+        &mut self,
+        e: &WorkspacePressureReported,
+    ) -> Result<(), ProjectionError> {
+        // Workspace-id-keyed; intentionally tolerates pressure on
+        // workspaces that don't yet have a lease record. Replaces
+        // previous observation; the projection holds only the latest
+        // reading per workspace.
+        self.workspace_pressure.insert(e.workspace_id, e.clone());
+        Ok(())
+    }
+
+    fn apply_workspace_drain_requested(
+        &mut self,
+        e: &WorkspaceDrainRequested,
+    ) -> Result<(), ProjectionError> {
+        // Same workspace + same policy rule already pending = overwrite.
+        // Two concurrent drains under the same rule is a policy bug;
+        // the projection surfaces it by keeping the latest, not by
+        // erroring (errors would hide the bug from observers).
+        self.pending_drains
+            .insert((e.workspace_id, e.policy_rule_id.clone()), e.clone());
+        Ok(())
+    }
+
+    fn apply_workspace_drain_completed(
+        &mut self,
+        e: &WorkspaceDrainCompleted,
+    ) -> Result<(), ProjectionError> {
+        self.pending_drains
+            .remove(&(e.workspace_id, e.policy_rule_id.clone()));
+        self.drain_history.push(e.clone());
         Ok(())
     }
 

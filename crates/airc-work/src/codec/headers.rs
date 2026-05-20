@@ -12,6 +12,7 @@ pub const HEADER_FORGE_WORK_CARD_ID: &str = "forge.work.card_id";
 pub const HEADER_FORGE_WORK_LANE_ID: &str = "forge.work.lane_id";
 pub const HEADER_FORGE_WORK_CLAIM_ID: &str = "forge.work.claim_id";
 pub const HEADER_FORGE_WORK_WORKSPACE_ID: &str = "forge.work.workspace_id";
+pub const HEADER_FORGE_WORK_POLICY_RULE_ID: &str = "forge.work.policy_rule_id";
 
 pub fn work_event_headers(event: &WorkEvent) -> Headers {
     let mut headers = Headers::new();
@@ -62,6 +63,26 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
         }
         WorkEvent::WorkspaceReleased(e) => {
             insert_display_header(headers, HEADER_FORGE_WORK_WORKSPACE_ID, e.workspace_id);
+        }
+        WorkEvent::WorkspacePressureReported(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_WORKSPACE_ID, e.workspace_id);
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+        }
+        WorkEvent::WorkspaceDrainRequested(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_WORKSPACE_ID, e.workspace_id);
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            headers.insert(
+                HEADER_FORGE_WORK_POLICY_RULE_ID.to_string(),
+                e.policy_rule_id.clone(),
+            );
+        }
+        WorkEvent::WorkspaceDrainCompleted(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_WORKSPACE_ID, e.workspace_id);
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            headers.insert(
+                HEADER_FORGE_WORK_POLICY_RULE_ID.to_string(),
+                e.policy_rule_id.clone(),
+            );
         }
         WorkEvent::PullRequestLinked(e) => {
             project_pull_request(headers, e.card_id, &e.pull_request.repo)

@@ -4,8 +4,10 @@ use airc_core::{
 };
 use airc_store::{EventStore, InMemoryEventStore};
 use airc_work::{
-    encode_work_event, CardCreated, CardState, CardStateChanged, Priority, RepoId, WorkCardId,
-    WorkEvent,
+    encode_work_event, CardCreated, CardState, CardStateChanged, DrainCandidate,
+    DrainCandidateCategory, DrainOutcome, PressureLevel, Priority, RepoId, WorkBoardProjection,
+    WorkCardId, WorkEvent, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceId,
+    WorkspacePressureReported,
 };
 
 use super::*;
@@ -145,4 +147,84 @@ async fn resume_from_uses_store_cursor_contract() {
 
     assert_eq!(page.events, vec![card_created(card_b)]);
     assert_eq!(page.newest_cursor.unwrap().event_id, EventId::from_u128(2));
+}
+
+#[tokio::test]
+async fn drain_sequence_through_store_replays_into_projection_state() {
+    // Pressure → drain-request → drain-completed goes through the
+    // append-only store, gets paged back out, and replays into the
+    // expected projection state. Proves the events survive serialization
+    // + cursor-based pagination + projection apply end-to-end.
+    let store = InMemoryEventStore::new();
+    let room = RoomId::from_u128(10);
+    let workspace_id = WorkspaceId::from_u128(42);
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+    let reporter = PeerId::from_u128(7);
+    let rule = "default.rebuildable".to_string();
+
+    let pressure = WorkEvent::WorkspacePressureReported(WorkspacePressureReported {
+        workspace_id,
+        repo: repo.clone(),
+        reporter,
+        total_bytes: 1_000,
+        available_bytes: 100,
+        level: PressureLevel::High,
+        reported_at_ms: 1,
+    });
+    let request = WorkEvent::WorkspaceDrainRequested(WorkspaceDrainRequested {
+        workspace_id,
+        repo: repo.clone(),
+        requester: reporter,
+        policy_rule_id: rule.clone(),
+        dry_run: false,
+        candidates: vec![DrainCandidate {
+            path: "/tmp/work/target".to_string(),
+            category: DrainCandidateCategory::RebuildableCache,
+            est_bytes: 800,
+        }],
+        requested_at_ms: 2,
+    });
+    let completed = WorkEvent::WorkspaceDrainCompleted(WorkspaceDrainCompleted {
+        workspace_id,
+        repo,
+        performer: reporter,
+        policy_rule_id: rule,
+        dry_run: false,
+        outcome: DrainOutcome {
+            bytes_reclaimed: 800,
+            paths_touched: vec!["/tmp/work/target".to_string()],
+            paths_skipped: vec![],
+            errors: vec![],
+        },
+        completed_at_ms: 3,
+    });
+
+    store
+        .append(work_transcript(1, room, 1, &pressure))
+        .await
+        .unwrap();
+    store
+        .append(work_transcript(2, room, 2, &request))
+        .await
+        .unwrap();
+    store
+        .append(work_transcript(3, room, 3, &completed))
+        .await
+        .unwrap();
+
+    let page = WorkEventStore::new(&store)
+        .page_recent(Some(room), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 3);
+
+    let projection = WorkBoardProjection::replay(page.events).unwrap();
+    assert_eq!(
+        projection.workspace_pressure(&workspace_id).unwrap().level,
+        PressureLevel::High,
+    );
+    assert!(projection.pending_drains_for(&workspace_id).is_empty());
+    let history = projection.drain_history_for(&workspace_id);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].outcome.bytes_reclaimed, 800);
 }
