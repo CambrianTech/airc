@@ -1094,19 +1094,17 @@ scenario_events() {
   # expects (from=airc, to=all, msg + ts present). Otherwise it'll be
   # silently skipped by the monitor formatter's json.loads guard.
   if [ -n "$seen" ]; then
-    python3 -c "
-import json,sys
-ok=False
-for line in open('/tmp/airc-it-h/state/messages.jsonl'):
-    try:
-        m=json.loads(line)
-    except Exception:
-        continue
-    if m.get('from')=='airc' and 'beta joined' in m.get('msg',''):
-        if m.get('to')=='all' and m.get('ts'):
-            ok=True
-sys.exit(0 if ok else 1)
-" 2>/dev/null \
+    local event_ok=0 line
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .from 2>/dev/null)" = "airc" ] || continue
+      printf '%s' "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" | grep -q 'beta joined' || continue
+      [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .to 2>/dev/null)" = "all" ] || continue
+      [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .ts 2>/dev/null)" ] || continue
+      event_ok=1
+      break
+    done < /tmp/airc-it-h/state/messages.jsonl
+    [ "$event_ok" = "1" ] \
       && pass "event has required fields (from=airc, to=all, ts, msg)" \
       || fail "event line malformed — formatter will skip it"
   fi
@@ -1943,11 +1941,7 @@ JSON
   # another tab or leftover bearer can keep channel health fresh while
   # this scope's visible Monitor is absent. `status` and `msg` must not
   # turn that into "airc process running".
-  "${AIRC_PYTHON:-python3}" - <<PY
-import json, time
-with open("$home/bearer_state.general.json", "w") as f:
-    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
-PY
+  printf '{"last_recv_ts":%s,"kind":"gist"}\n' "$(date +%s)" > "$home/bearer_state.general.json"
   local status_out
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
   echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
@@ -1990,16 +1984,16 @@ PY
   grep -q 'live monitor probe ascii' "$home/messages.jsonl" \
     && pass "live-pid scope: message appended to local log as expected" \
     || fail "live-pid scope: message NOT in log despite rc=0 (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
-  python3 - <<PY
-import json, sys
-for line in open("$home/messages.jsonl"):
-    obj = json.loads(line)
-    if obj.get("msg") == "live monitor probe ascii":
-        if obj.get("client_id") and obj.get("sig"):
-            sys.exit(0)
-sys.exit(1)
-PY
-  [ "$?" = "0" ] \
+  local sent_ok=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" = "live monitor probe ascii" ] || continue
+    [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .client_id 2>/dev/null)" ] || continue
+    [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .sig 2>/dev/null)" ] || continue
+    sent_ok=1
+    break
+  done < "$home/messages.jsonl"
+  [ "$sent_ok" = "1" ] \
     && pass "client_id send line is valid JSON with sig" \
     || fail "client_id send line is malformed JSON or missing fields: $(tail -1 "$home/messages.jsonl" 2>/dev/null)"
   kill "$fake_airc_pid" 2>/dev/null || true
@@ -2196,11 +2190,7 @@ scenario_monitor_liveness_process_evidence() {
 { "name": "monitor-liveness-test", "subscribed_channels": ["general"] }
 JSON
   echo "99999" > "$home/airc.pid"
-  "${AIRC_PYTHON:-python3}" - <<PY
-import json, time
-with open("$home/bearer_state.general.json", "w") as f:
-    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
-PY
+  printf '{"last_recv_ts":%s,"kind":"gist"}\n' "$(date +%s)" > "$home/bearer_state.general.json"
 
   local status_out
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)

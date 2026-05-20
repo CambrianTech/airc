@@ -197,6 +197,25 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 -m airc_core.channel_gist", body)
         self.assertNotIn("airc_core.channel_gist resolve", body)
 
+    def test_integration_event_and_liveness_json_probes_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        events_start = source.index("scenario_events()")
+        events_end = source.index("scenario_send_dead_monitor_dies()", events_start)
+        dead_start = events_end
+        dead_end = source.index("# #511 regression", dead_start)
+        live_start = source.index("scenario_monitor_liveness_process_evidence()")
+        live_end = source.index("scenario_attach_starts_background_transport()", live_start)
+        body = source[events_start:events_end] + source[dead_start:dead_end] + source[live_start:live_end]
+
+        self.assertIn('"$(airc_rs_bin)" gist get .from', body)
+        self.assertIn('"$(airc_rs_bin)" gist get .client_id', body)
+        self.assertIn('printf \'{"last_recv_ts":%s,"kind":"gist"}\\n\' "$(date +%s)"', body)
+        self.assertNotIn("json.loads(line)", body)
+        self.assertNotIn("json.dump", body)
+        self.assertNotIn("AIRC_PYTHON:-python3", body)
+        self.assertNotIn("python3 - <<", body)
+        self.assertNotIn("python3 -c", body)
+
     def test_integration_bearer_gist_file_content_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_gh()")
