@@ -18,6 +18,10 @@ pub enum CollaborationAction {
     SendWarning(CollaborationScopeArgs),
     /// Print recent broadcast peers when peer records are empty.
     PeersFallback(CollaborationScopeArgs),
+    /// Print paired peers plus recent broadcast-only peers.
+    Peers(CollaborationScopeArgs),
+    /// Remove stale duplicate peer records for the same host.
+    PrunePeers(CollaborationScopeArgs),
     /// Print a broadcast-only whois fallback.
     WhoisFallback {
         #[command(flatten)]
