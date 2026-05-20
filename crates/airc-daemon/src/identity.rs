@@ -70,6 +70,9 @@ pub enum IdentityError {
     },
     /// `identity.key` exists but isn't the expected 32 bytes.
     BadKeyLength(usize),
+    /// System clock is before UNIX_EPOCH; refuse to write a corrupt
+    /// timestamp into the identity audit record.
+    Clock(std::time::SystemTimeError),
 }
 
 impl std::fmt::Display for IdentityError {
@@ -97,6 +100,7 @@ impl std::fmt::Display for IdentityError {
                 f,
                 "identity.key is {got} bytes, expected 32 (raw Ed25519 secret)"
             ),
+            IdentityError::Clock(error) => write!(f, "identity timestamp clock error: {error}"),
         }
     }
 }
@@ -106,6 +110,7 @@ impl std::error::Error for IdentityError {
         match self {
             IdentityError::Io(error) => Some(error),
             IdentityError::Json(error) => Some(error),
+            IdentityError::Clock(error) => Some(error),
             IdentityError::SchemaVersionMismatch { .. }
             | IdentityError::PartialState { .. }
             | IdentityError::BadKeyLength(_) => None,
@@ -122,6 +127,12 @@ impl From<std::io::Error> for IdentityError {
 impl From<serde_json::Error> for IdentityError {
     fn from(error: serde_json::Error) -> Self {
         IdentityError::Json(error)
+    }
+}
+
+impl From<std::time::SystemTimeError> for IdentityError {
+    fn from(error: std::time::SystemTimeError) -> Self {
+        IdentityError::Clock(error)
     }
 }
 
@@ -187,7 +198,7 @@ impl LocalIdentity {
         let keypair = PeerKeypair::generate();
         let peer_id = PeerId::new();
         let client_id = ClientId::new();
-        let created_at_ms = now_ms();
+        let created_at_ms = now_ms()?;
 
         write_owner_only(&Self::key_path(home), &keypair.secret_bytes())?;
 
@@ -243,11 +254,10 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn now_ms() -> Result<u64, std::time::SystemTimeError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64)
 }
 
 #[cfg(test)]

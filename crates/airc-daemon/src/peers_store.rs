@@ -29,6 +29,7 @@ pub enum PeersStoreError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Base64(base64::DecodeError),
+    Clock(std::time::SystemTimeError),
     SchemaVersionMismatch { found: u32, expected: u32 },
     WrongPubkeyLength(usize),
 }
@@ -39,6 +40,7 @@ impl std::fmt::Display for PeersStoreError {
             PeersStoreError::Io(error) => write!(f, "peers.json I/O: {error}"),
             PeersStoreError::Json(error) => write!(f, "peers.json parse: {error}"),
             PeersStoreError::Base64(error) => write!(f, "peers.json base64: {error}"),
+            PeersStoreError::Clock(error) => write!(f, "peers.json timestamp clock error: {error}"),
             PeersStoreError::SchemaVersionMismatch { found, expected } => {
                 write!(f, "peers.json version {found}, expected {expected}")
             }
@@ -55,6 +57,7 @@ impl std::error::Error for PeersStoreError {
             PeersStoreError::Io(error) => Some(error),
             PeersStoreError::Json(error) => Some(error),
             PeersStoreError::Base64(error) => Some(error),
+            PeersStoreError::Clock(error) => Some(error),
             PeersStoreError::SchemaVersionMismatch { .. }
             | PeersStoreError::WrongPubkeyLength(_) => None,
         }
@@ -76,6 +79,12 @@ impl From<serde_json::Error> for PeersStoreError {
 impl From<base64::DecodeError> for PeersStoreError {
     fn from(error: base64::DecodeError) -> Self {
         PeersStoreError::Base64(error)
+    }
+}
+
+impl From<std::time::SystemTimeError> for PeersStoreError {
+    fn from(error: std::time::SystemTimeError) -> Self {
+        PeersStoreError::Clock(error)
     }
 }
 
@@ -141,7 +150,7 @@ pub fn add(home: &Path, peer_id: PeerId, pubkey: [u8; 32]) -> Result<StoredPeer,
     let entry = StoredPeer {
         peer_id,
         pubkey_b64: pubkey_b64.clone(),
-        added_at_ms: now_ms(),
+        added_at_ms: now_ms()?,
     };
 
     // Replace existing entry for this peer_id (rotation) or append.
@@ -187,11 +196,10 @@ fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn now_ms() -> Result<u64, std::time::SystemTimeError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64)
 }
 
 #[cfg(test)]
