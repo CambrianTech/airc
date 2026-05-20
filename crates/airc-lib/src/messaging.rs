@@ -33,6 +33,7 @@ impl Airc {
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
+        let lamport = self.next_lamport(occurred_at_ms);
         let mut frame = Frame {
             kind,
             envelope: Envelope {
@@ -41,7 +42,7 @@ impl Airc {
                 sender_client: self.inner.identity.client_id,
                 channel: room.channel,
                 target: MentionTarget::All,
-                lamport: occurred_at_ms,
+                lamport,
                 occurred_at_ms,
                 reply_to: None,
                 headers,

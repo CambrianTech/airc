@@ -19,7 +19,9 @@
 //! identity bridge, Hermes agent contracts, etc.) — this crate is the
 //! foundation those build on.
 //!
-//! Constraint: this crate depends ONLY on `airc-lib`. If a future
-//! change forces a substrate-internal import in here, that's a
-//! signal `airc-lib` is missing a re-export, not a sign this crate
-//! should grow more imports.
+//! Constraint: this crate's only AIRC dependency is `airc-lib`. If a
+//! future change forces a substrate-internal AIRC import in here,
+//! that's a signal `airc-lib` is missing a re-export, not a sign this
+//! crate should grow more substrate imports.
+
+pub mod agent;
