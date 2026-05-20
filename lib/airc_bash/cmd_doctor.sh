@@ -520,7 +520,7 @@ _doctor_health() {
   # fix is to intersect with the current subscribed_channels list — same
   # principle as bearer scoping in the receive-silence beacon.
   local _subs=""
-  if [ -f "$CONFIG" ] && command -v "$AIRC_PYTHON" >/dev/null 2>&1; then
+  if [ -f "$CONFIG" ]; then
     _subs=$(airc_config_read_channels "$CONFIG" || true)
   fi
   local found_state=0

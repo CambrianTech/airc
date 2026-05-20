@@ -88,6 +88,24 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("AIRC_PYTHON", body)
         self.assertNotIn("socket.socket", body)
 
+    def test_airc_startup_does_not_require_python(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        startup = source[: source.index("# Issue #341 follow-up")]
+
+        self.assertNotIn("AIRC_PYTHON", startup)
+        self.assertNotIn("requires a working python", startup)
+        self.assertNotIn("python3 --version", startup)
+
+    def test_quick_message_roster_uses_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        start = source.index('if [ "$qm_owner" = "*roster*" ]; then')
+        end = source.index("local dispatched=0 skipped=0", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" recent-senders', body)
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("import json", body)
+
     def test_scope_repair_uses_airc_rs(self):
         source = (REPO / "airc").read_text(encoding="utf-8")
         start = source.index("ensure_init()")

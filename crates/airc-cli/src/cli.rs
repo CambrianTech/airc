@@ -106,6 +106,19 @@ pub enum Command {
     /// Print the primary non-loopback LAN IPv4 address, if detectable.
     LanIp,
 
+    /// Print recent message senders from a legacy messages.jsonl log.
+    RecentSenders {
+        /// Path to legacy messages.jsonl.
+        #[arg(long)]
+        messages_log: PathBuf,
+        /// Only include senders active within this many seconds.
+        #[arg(long)]
+        window_seconds: u64,
+        /// Sender name to exclude, usually this agent's display name.
+        #[arg(long, default_value = "")]
+        exclude_name: String,
+    },
+
     /// Legacy bearer transport helpers during Rust cutover.
     Bearer(BearerArgs),
 
