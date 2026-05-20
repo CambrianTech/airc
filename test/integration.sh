@@ -828,14 +828,10 @@ scenario_status() {
 
   # Pending queue: simulate an outage by flipping host_target and sending, then assert queue size.
   # Reuse the same fake-target pattern as scenario_queue.
-  python3 -c "
-import json
-p = '/tmp/airc-it-s-j/state/config.json'
-c = json.load(open(p))
-c['_real_host_target'] = c['host_target']
-c['host_target'] = 'nobody@198.51.100.99'
-json.dump(c, open(p, 'w'))
-"
+  local real_target
+  real_target=$("$(airc_rs_bin)" config get --config /tmp/airc-it-s-j/state/config.json host_target)
+  "$(airc_rs_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key _real_host_target --value "$real_target"
+  "$(airc_rs_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key host_target --value nobody@198.51.100.99
   echo '{"name":"shost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
   AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" send @shost "status-queue-probe" >/dev/null 2>&1 || true
   local j_out3; j_out3=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
