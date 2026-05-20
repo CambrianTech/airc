@@ -124,6 +124,9 @@ async fn main() -> ExitCode {
             if let Some(code) = collaboration_commands::command_exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
+            if let Some(code) = identity_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
             eprintln!("airc-rs: {error}");
             ExitCode::FAILURE
         }
@@ -341,6 +344,45 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &x25519_pub,
                 &paired,
             ),
+            IdentityAction::SessionFile {
+                write_dir,
+                transport_name,
+            } => identity_commands::run_session_file(&write_dir, &transport_name),
+            IdentityAction::DefaultWorkName {
+                transport_name,
+                session_file,
+            } => identity_commands::run_default_work_name(&transport_name, &session_file),
+            IdentityAction::ReadWorkName { session_file } => {
+                identity_commands::run_read_work_name(&session_file)
+            }
+            IdentityAction::WriteWorkSession {
+                session_file,
+                name,
+                transport_name,
+            } => identity_commands::run_write_work_session(&session_file, &name, &transport_name),
+            IdentityAction::ShowConfig { config } => identity_commands::run_show_config(&config),
+            IdentityAction::SetConfig {
+                config,
+                pronouns,
+                role,
+                bio,
+                status,
+            } => identity_commands::run_set_config(&config, pronouns, role, bio, status),
+            IdentityAction::LinkConfig {
+                config,
+                platform,
+                handle,
+            } => identity_commands::run_link_config(&config, &platform, &handle),
+            IdentityAction::NudgeNeeded { config } => identity_commands::run_nudge_needed(&config),
+            IdentityAction::ImportContinuum { config, blob } => {
+                identity_commands::run_import_continuum(&config, &blob)
+            }
+            IdentityAction::ContinuumHandle { config } => {
+                identity_commands::run_continuum_handle(&config)
+            }
+            IdentityAction::PushContinuum { config, handle } => {
+                identity_commands::run_push_continuum(&config, &handle)
+            }
         },
 
         Command::Envelope(args) => match args.action {

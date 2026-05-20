@@ -17,7 +17,7 @@
 #     adapters for continuum (the only platform implemented today).
 #
 # External cross-references (call-time): die, ensure_init, get_config_val,
-# set_config_val, resolve_name, AIRC_HOME, AIRC_PYTHON, CONFIG, plus the
+# set_config_val, resolve_name, airc_rs_bin, AIRC_HOME, CONFIG, plus the
 # continuum CLI on PATH for import/push.
 #
 # Extracted from airc as part of #152 Phase 3 file split. The bundle is
@@ -103,116 +103,25 @@ _identity_session_file() {
   local transport_name="${1:-}"
   [ -z "$transport_name" ] && transport_name="anonymous"
   mkdir -p "$AIRC_WRITE_DIR/sessions" 2>/dev/null || true
-  AIRC_WRITE_DIR="$AIRC_WRITE_DIR" \
-    TRANSPORT_NAME="$transport_name" \
-    "$AIRC_PYTHON" -c '
-import hashlib, os, pathlib, re, subprocess
-
-def first_env(*names):
-    for name in names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return name, value
-    return "", ""
-
-source, value = first_env(
-    "AIRC_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "CLAUDE_SESSION_ID",
-    "CLAUDE_CODE_SESSION_ID",
-    "TERM_SESSION_ID",
-    "TMUX_PANE",
-)
-if not value:
-    tty = ""
-    try:
-        tty = subprocess.check_output(["tty"], text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        tty = ""
-    if tty and tty != "not a tty":
-        source, value = "tty", tty
-if not value:
-    source = "cwd"
-    value = os.getcwd()
-
-raw = f"{source}:{value}"
-digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-base = os.environ["AIRC_WRITE_DIR"]
-path = pathlib.Path(base) / "sessions" / f"{digest}.json"
-print(path)
-'
+  "$(airc_rs_bin)" identity session-file --write-dir "$AIRC_WRITE_DIR" --transport-name "$transport_name"
 }
 
 _identity_default_work_name() {
   local transport_name="${1:-anonymous}"
   local session_file="${2:-}"
-  SESSION_FILE="$session_file" TRANSPORT_NAME="$transport_name" "$AIRC_PYTHON" -c '
-import hashlib, os, re
-name = os.environ.get("TRANSPORT_NAME", "anonymous") or "anonymous"
-session_file = os.environ.get("SESSION_FILE", "")
-suffix = hashlib.sha256(session_file.encode("utf-8")).hexdigest()[:4]
-base = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "agent"
-print(f"{base}-{suffix}")
-'
+  "$(airc_rs_bin)" identity default-work-name --transport-name "$transport_name" --session-file "$session_file"
 }
 
 _identity_read_work_name() {
   local session_file="$1"
   [ -f "$session_file" ] || return 1
-  SESSION_FILE="$session_file" "$AIRC_PYTHON" -c '
-import json, os, sys
-try:
-    data = json.load(open(os.environ["SESSION_FILE"]))
-except Exception:
-    sys.exit(1)
-name = str(data.get("name", "")).strip()
-if not name:
-    sys.exit(1)
-print(name)
-'
+  "$(airc_rs_bin)" identity read-work-name --session-file "$session_file"
 }
 
 _identity_write_work_session() {
   local session_file="$1" name="$2" transport_name="$3"
   _validate_peer_name "$name"
-  SESSION_FILE="$session_file" \
-    NAME="$name" \
-    TRANSPORT_NAME="$transport_name" \
-    "$AIRC_PYTHON" -c '
-import json, os, pathlib, subprocess, time
-path = pathlib.Path(os.environ["SESSION_FILE"])
-path.parent.mkdir(parents=True, exist_ok=True)
-source = ""
-value = ""
-for key in ("AIRC_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "TERM_SESSION_ID", "TMUX_PANE"):
-    candidate = os.environ.get(key, "").strip()
-    if candidate:
-        source, value = key, candidate
-        break
-if not value:
-    try:
-        tty = subprocess.check_output(["tty"], text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        tty = ""
-    if tty and tty != "not a tty":
-        source, value = "tty", tty
-if not value:
-    source, value = "cwd", os.getcwd()
-data = {}
-if path.exists():
-    try:
-        data = json.load(open(path))
-    except Exception:
-        data = {}
-data.update({
-    "name": os.environ["NAME"],
-    "transport_name": os.environ.get("TRANSPORT_NAME", ""),
-    "session_source": source,
-    "session_hint": value,
-    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-})
-json.dump(data, open(path, "w"), indent=2, sort_keys=True)
-'
+  "$(airc_rs_bin)" identity write-work-session --session-file "$session_file" --name "$name" --transport-name "$transport_name"
 }
 
 _identity_resolve_work_name() {
@@ -295,63 +204,22 @@ _identity_register() {
 _identity_bootstrap_nudge_if_unset() {
   local nudge_file="$AIRC_WRITE_DIR/.identity_nudged_v1"
   [ -f "$nudge_file" ] && return 0
-  CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os, sys
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-except Exception:
-    sys.exit(0)
-ident = c.get("identity", {}) or {}
-unset = [k for k in ("pronouns", "role", "bio") if not ident.get(k)]
-if len(unset) == 3:
-    sys.exit(2)  # all three unset → nudge
-sys.exit(0)
-' || {
-    if [ "$?" = "2" ]; then
-      echo ""
-      echo "  Tip: set your identity so peers know who they are talking to. One-line example:"
-      echo "    airc identity set --pronouns they --role 'your role' --bio 'one-sentence bio'"
-      echo "  Done? Suppress this nudge: touch $nudge_file"
-      echo ""
-    fi
-  }
+  "$(airc_rs_bin)" identity nudge-needed --config "$CONFIG"
+  local nudge_status=$?
+  if [ "$nudge_status" = "2" ]; then
+    echo ""
+    echo "  Tip: set your identity so peers know who they are talking to. One-line example:"
+    echo "    airc identity set --pronouns they --role 'your role' --bio 'one-sentence bio'"
+    echo "  Done? Suppress this nudge: touch $nudge_file"
+    echo ""
+  elif [ "$nudge_status" != "0" ]; then
+    return "$nudge_status"
+  fi
   : > "$nudge_file" 2>/dev/null || true
 }
 
 _identity_show() {
-  CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    c = json.load(open(os.environ["CONFIG"]))
-except Exception:
-    print("  (no config — run airc join)"); raise SystemExit(0)
-ident = c.get("identity", {}) or {}
-# Render-time truncation. Peer records from before the write-side
-# length caps (#328) may have multi-KB bios that would clutter
-# screens / break terminal rendering. Truncate to the same caps used
-# at write time, with an ellipsis to signal it happened.
-def _trunc(v, cap):
-    s = str(v or "")
-    return s if len(s) <= cap else s[: cap - 1] + "…"
-fields = [
-    ("name",     c.get("name", "?"),                         ""),
-    ("pronouns", _trunc(ident.get("pronouns", ""), 64),      "(unset)"),
-    ("role",     _trunc(ident.get("role", ""), 128),         "(unset)"),
-    ("bio",      _trunc(ident.get("bio", ""), 512),          "(unset)"),
-    ("status",   _trunc(ident.get("status", ""), 256),       "(unset; airc away <msg> to set)"),
-]
-for k, v, fallback in fields:
-    label = k + ":"
-    value = v if v else fallback
-    print(f"  {label:<11} {value}")
-ints = ident.get("integrations", {}) or {}
-if ints:
-    print("  integrations:")
-    for k, v in ints.items():
-        print(f"    {k}: {v}")
-else:
-    print("  integrations: (none)")
-'
+  "$(airc_rs_bin)" identity show-config --config "$CONFIG"
 }
 
 _identity_set() {
@@ -388,58 +256,18 @@ _identity_set() {
   if [ "$set_status" = 1 ] && [ "${#status}" -gt "$_max_status" ]; then
     die "status too long (${#status} chars; max $_max_status)"
   fi
-  CONFIG="$CONFIG" \
-    SET_PRONOUNS="$set_pronouns" PRONOUNS="$pronouns" \
-    SET_ROLE="$set_role"         ROLE="$role" \
-    SET_BIO="$set_bio"           BIO="$bio" \
-    SET_STATUS="$set_status"     STATUS="$status" \
-    "$AIRC_PYTHON" -c '
-import json, os
-c = json.load(open(os.environ["CONFIG"]))
-ident = c.setdefault("identity", {})
-for key, env_set, env_val in [
-    ("pronouns", "SET_PRONOUNS", "PRONOUNS"),
-    ("role",     "SET_ROLE",     "ROLE"),
-    ("bio",      "SET_BIO",      "BIO"),
-    ("status",   "SET_STATUS",   "STATUS"),
-]:
-    if os.environ.get(env_set) == "1":
-        v = os.environ.get(env_val, "").strip()
-        if v:
-            ident[key] = v
-        else:
-            ident.pop(key, None)
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-print("  identity updated.")
-'
+  local args=(identity set-config --config "$CONFIG")
+  [ "$set_pronouns" = 1 ] && args+=(--pronouns "$pronouns")
+  [ "$set_role" = 1 ] && args+=(--role "$role")
+  [ "$set_bio" = 1 ] && args+=(--bio "$bio")
+  [ "$set_status" = 1 ] && args+=(--status "$status")
+  "$(airc_rs_bin)" "${args[@]}"
 }
 
 _identity_link() {
   local platform="${1:-}" handle="${2:-}"
   [ -z "$platform" ] && die "Usage: airc identity link <platform> [handle] (omit/blank handle to unlink)"
-  CONFIG="$CONFIG" PLATFORM="$platform" HANDLE="$handle" "$AIRC_PYTHON" -c '
-import json, os
-c = json.load(open(os.environ["CONFIG"]))
-ints = c.setdefault("identity", {}).setdefault("integrations", {})
-platform = os.environ["PLATFORM"]
-handle = os.environ.get("HANDLE", "").strip()
-prev = ints.get(platform)
-if handle:
-    ints[platform] = handle
-    if prev and prev != handle:
-        print(f"  linked: {platform} -> {handle} (was: {prev})")
-    else:
-        print(f"  linked: {platform} -> {handle}")
-elif prev:
-    # QA-pass clarification 2026-04-28: be explicit about "you said
-    # link but I unlinked" — happens when user omits the handle.
-    ints.pop(platform, None)
-    print(f"  unlinked: {platform} (was: {prev}; pass a handle to (re)link)")
-else:
-    # Nothing was linked. Be explicit instead of saying "unlinked" for a no-op.
-    print(f"  no {platform} integration to unlink. Pass a handle to link: airc identity link {platform} <handle>")
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-'
+  "$(airc_rs_bin)" identity link-config --config "$CONFIG" --platform "$platform" --handle "$handle"
 }
 
 # WHOIS: prints identity for self, host, paired peer, or other peer of
@@ -513,7 +341,7 @@ _whois_in_scope() {
 
   # All scope-local config + peer file reads route through
   # get_config_val_in / airc-rs config. Pre-migration
-  # this function had six inline python heredocs reading individual
+  # this function had six inline JSON snippets reading individual
   # JSON fields — each a silent-fail vector with bash-substituted
   # SCOPE_CONFIG / PEER_FILE env vars. Now: one CLI per read.
   #
@@ -646,49 +474,14 @@ _identity_import_continuum() {
   fi
   # Parse the JSON; merge into our identity. Empty fields skip; existing
   # fields get overwritten (the user's intent: "I want to BE this persona").
-  BLOB="$blob" CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-try:
-    src = json.loads(os.environ["BLOB"])
-except Exception:
-    src = {}
-c = json.load(open(os.environ["CONFIG"]))
-ident = c.setdefault("identity", {})
-for k in ("pronouns", "role", "bio"):
-    v = src.get(k)
-    if v:
-        ident[k] = v
-ints = ident.setdefault("integrations", {})
-ints["continuum"] = src.get("name", "")
-json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
-print(f"  imported continuum:{src.get(\"name\", \"?\")} → pronouns={src.get(\"pronouns\", \"\")} role={src.get(\"role\", \"\")} bio set={bool(src.get(\"bio\"))}")
-'
+  "$(airc_rs_bin)" identity import-continuum --config "$CONFIG" --blob "$blob"
 }
 
 _identity_push_continuum() {
   if ! command -v continuum >/dev/null 2>&1; then
     die "continuum CLI not on PATH — install continuum before pushing."
   fi
-  local handle; handle=$(CONFIG="$CONFIG" "$AIRC_PYTHON" -c '
-import json, os
-c = json.load(open(os.environ["CONFIG"]))
-print(c.get("identity", {}).get("integrations", {}).get("continuum", ""))
-' 2>/dev/null)
+  local handle; handle=$("$(airc_rs_bin)" identity continuum-handle --config "$CONFIG" 2>/dev/null)
   [ -z "$handle" ] && die "No continuum handle linked. Run: airc identity link continuum <name>"
-  CONFIG="$CONFIG" HANDLE="$handle" "$AIRC_PYTHON" -c '
-import json, os, subprocess
-c = json.load(open(os.environ["CONFIG"]))
-ident = c.get("identity", {})
-handle = os.environ["HANDLE"]
-args = ["continuum", "persona", "update", handle]
-for k in ("pronouns", "role", "bio"):
-    v = ident.get(k)
-    if v:
-        args += [f"--{k}", v]
-res = subprocess.run(args, capture_output=True, text=True)
-if res.returncode != 0:
-    print(f"  continuum push failed: {res.stderr.strip() or res.stdout.strip()}")
-    raise SystemExit(1)
-print(f"  pushed local identity to continuum:{handle}")
-'
+  "$(airc_rs_bin)" identity push-continuum --config "$CONFIG" --handle "$handle"
 }

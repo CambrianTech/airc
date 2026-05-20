@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub struct IdentityArgs {
@@ -82,5 +83,95 @@ pub enum IdentityAction {
         /// Pair timestamp.
         #[arg(long)]
         paired: String,
+    },
+
+    /// Print the session state path for a transport identity.
+    SessionFile {
+        #[arg(long)]
+        write_dir: PathBuf,
+        #[arg(long, default_value = "anonymous")]
+        transport_name: String,
+    },
+
+    /// Print the default work identity for a transport + session.
+    DefaultWorkName {
+        #[arg(long, default_value = "anonymous")]
+        transport_name: String,
+        #[arg(long)]
+        session_file: PathBuf,
+    },
+
+    /// Read the saved work identity from a session file.
+    ReadWorkName {
+        #[arg(long)]
+        session_file: PathBuf,
+    },
+
+    /// Write the saved work identity for a session.
+    WriteWorkSession {
+        #[arg(long)]
+        session_file: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "anonymous")]
+        transport_name: String,
+    },
+
+    /// Print local identity from config.json.
+    ShowConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+
+    /// Update local identity fields in config.json.
+    SetConfig {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        pronouns: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        bio: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Link or unlink a platform handle in config.json.
+    LinkConfig {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        platform: String,
+        #[arg(long, default_value = "")]
+        handle: String,
+    },
+
+    /// Exit 2 when config identity should show the first-run nudge.
+    NudgeNeeded {
+        #[arg(long)]
+        config: PathBuf,
+    },
+
+    /// Merge a continuum persona JSON blob into config.json.
+    ImportContinuum {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        blob: String,
+    },
+
+    /// Print linked continuum handle from config.json.
+    ContinuumHandle {
+        #[arg(long)]
+        config: PathBuf,
+    },
+
+    /// Push local identity fields to a linked continuum persona.
+    PushContinuum {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        handle: String,
     },
 }
