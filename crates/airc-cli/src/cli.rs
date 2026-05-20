@@ -1,7 +1,7 @@
 //! Command-line interface definitions (clap derive).
 //!
 //! All commands default to the persisted state at `<home>` (default
-//! `$HOME/.airc-rs`), which contains:
+//! `$HOME/.airc`), which contains:
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
 //!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket for the daemon
@@ -38,19 +38,19 @@ use crate::work_cli::WorkArgs;
 /// Default home directory for persisted identity + IPC state.
 ///
 /// Resolution order:
-///   1. `$HOME` (Unix; also Git Bash on Windows) → `<home>/.airc-rs`
+///   1. `$HOME` (Unix; also Git Bash on Windows) → `<home>/.airc`
 ///   2. `%USERPROFILE%` (native Windows cmd / PowerShell) →
-///      `<userprofile>/.airc-rs`
-///   3. fallback to `./.airc-rs` in the current working dir
+///      `<userprofile>/.airc`
+///   3. fallback to `./.airc` in the current working dir
 pub fn default_home_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".airc-rs");
+        return PathBuf::from(home).join(".airc");
     }
     #[cfg(windows)]
     if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(userprofile).join(".airc-rs");
+        return PathBuf::from(userprofile).join(".airc");
     }
-    PathBuf::from(".airc-rs")
+    PathBuf::from(".airc")
 }
 
 /// Default Unix socket path inside `home`.
@@ -70,7 +70,7 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
 )]
 pub struct Cli {
     /// State directory for persisted identity + IPC socket. Default
-    /// `$HOME/.airc-rs` (Unix) or `%USERPROFILE%/.airc-rs` (Windows).
+    /// `$HOME/.airc` (Unix) or `%USERPROFILE%/.airc` (Windows).
     /// Override for tests or multi-identity setups.
     #[arg(long, global = true)]
     pub home: Option<PathBuf>,

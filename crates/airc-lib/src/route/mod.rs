@@ -15,7 +15,7 @@ pub(crate) mod execution;
 
 pub use discovery::RouteDiscoverySnapshot;
 pub use health::{TransportHealthSample, TransportHealthState, TransportHealthTable};
-pub use invite::{InviteBeacon, RouteEndpoint};
+pub use invite::{ImportedInvite, InviteBeacon, RouteEndpoint};
 pub use policy::{
     RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind, TransportRole,
 };

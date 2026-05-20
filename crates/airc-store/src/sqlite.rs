@@ -484,11 +484,11 @@ mod tests {
 
     #[test]
     fn sqlite_file_url_uses_uri_slashes_for_windows_paths() {
-        let path = Path::new(r"C:\Users\agent\.airc-rs\events.sqlite");
+        let path = Path::new(r"C:\Users\agent\.airc\events.sqlite");
 
         assert_eq!(
             sqlite_file_url(path),
-            "sqlite:///C:/Users/agent/.airc-rs/events.sqlite?mode=rwc"
+            "sqlite:///C:/Users/agent/.airc/events.sqlite?mode=rwc"
         );
     }
 

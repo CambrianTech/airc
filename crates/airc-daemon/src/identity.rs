@@ -2,7 +2,7 @@
 //! stable `peer_id` + `client_id` so the substrate's identity survives
 //! across CLI invocations and across daemon restarts.
 //!
-//! Layout on disk (under `<home>/`, default `$HOME/.airc-rs/`):
+//! Layout on disk (under `<home>/`, default `$HOME/.airc/`):
 //!
 //!   - `identity.key`  — raw 32-byte Ed25519 secret (0600)
 //!   - `identity.json` — `{ peer_id, client_id, version, created_at_ms }` (0600)

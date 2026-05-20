@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, Mutex};
 use crate::error::AircError;
 use crate::room::{self, Room};
 use crate::route::health::TransportHealthTable;
-use crate::route::invite::RouteEndpointTable;
+use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
 use crate::transport::{FrameSubscriber, WireSubscriber};
 
@@ -76,6 +76,7 @@ pub(crate) struct AircInner {
     pub(crate) policy: VerificationPolicy,
     pub(crate) route_health: RwLock<TransportHealthTable>,
     pub(crate) route_endpoints: RwLock<RouteEndpointTable>,
+    pub(crate) imported_invites: RwLock<ImportedInviteTable>,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
@@ -143,6 +144,7 @@ impl Airc {
                 policy,
                 route_health: RwLock::new(TransportHealthTable::local_default()),
                 route_endpoints: RwLock::new(RouteEndpointTable::default()),
+                imported_invites: RwLock::new(ImportedInviteTable::default()),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),

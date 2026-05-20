@@ -1,6 +1,6 @@
 //! airc-rs — Rust substrate CLI binary.
 //!
-//! State lives under `<home>` (default `$HOME/.airc-rs`):
+//! State lives under `<home>` (default `$HOME/.airc`):
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600)
 //!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket

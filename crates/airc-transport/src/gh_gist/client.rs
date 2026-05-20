@@ -6,12 +6,16 @@ use tokio::process::Command;
 
 use super::error::GhGistError;
 
-const MESSAGES_FILE: &str = "messages.jsonl";
-
 #[async_trait]
 pub trait GistClient: Send + Sync {
-    async fn get_messages(&self, gist_id: &str) -> Result<String, GhGistError>;
-    async fn put_messages(&self, gist_id: &str, content: &str) -> Result<(), GhGistError>;
+    async fn get_file(&self, gist_id: &str, filename: &str) -> Result<Option<String>, GhGistError>;
+
+    async fn put_file(
+        &self,
+        gist_id: &str,
+        filename: &str,
+        content: &str,
+    ) -> Result<(), GhGistError>;
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +45,7 @@ impl Default for GhCliClient {
 
 #[async_trait]
 impl GistClient for GhCliClient {
-    async fn get_messages(&self, gist_id: &str) -> Result<String, GhGistError> {
+    async fn get_file(&self, gist_id: &str, filename: &str) -> Result<Option<String>, GhGistError> {
         let output = Command::new(&self.gh_bin)
             .args(["api", &format!("gists/{gist_id}")])
             .output()
@@ -55,17 +59,21 @@ impl GistClient for GhCliClient {
         let gist: Value = serde_json::from_slice(&output.stdout)?;
         Ok(gist
             .get("files")
-            .and_then(|files| files.get(MESSAGES_FILE))
+            .and_then(|files| files.get(filename))
             .and_then(|file| file.get("content"))
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string())
+            .map(ToString::to_string))
     }
 
-    async fn put_messages(&self, gist_id: &str, content: &str) -> Result<(), GhGistError> {
+    async fn put_file(
+        &self,
+        gist_id: &str,
+        filename: &str,
+        content: &str,
+    ) -> Result<(), GhGistError> {
         let body = serde_json::json!({
             "files": {
-                MESSAGES_FILE: {
+                filename: {
                     "content": content,
                 }
             }
