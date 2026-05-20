@@ -18,10 +18,11 @@ If `$ARGUMENTS` contains an invite string (looks like `name@user@host[:port]#<ba
 
 ```bash
 # Grab the pieces the host wrote into config during the last pair.
-HOST_NAME=$(python3 -c "import json; print(json.load(open('$(airc debug-scope)/config.json')).get('host_name',''))" 2>/dev/null)
-HOST_TARGET=$(python3 -c "import json; print(json.load(open('$(airc debug-scope)/config.json')).get('host_target',''))" 2>/dev/null)
-HOST_PORT=$(python3 -c "import json; print(json.load(open('$(airc debug-scope)/config.json')).get('host_port',7547))" 2>/dev/null)
-HOST_PUB=$(python3 -c "import json; print(json.load(open('$(airc debug-scope)/config.json')).get('host_ssh_pub',''))" 2>/dev/null)
+SCOPE=$(airc debug-scope)
+HOST_NAME=$(airc-rs config get --config "$SCOPE/config.json" host_name 2>/dev/null || true)
+HOST_TARGET=$(airc-rs config get --config "$SCOPE/config.json" host_target 2>/dev/null || true)
+HOST_PORT=$(airc-rs config get --config "$SCOPE/config.json" host_port 7547 2>/dev/null || true)
+HOST_PUB=$(airc-rs config get --config "$SCOPE/config.json" host_ssh_pub 2>/dev/null || true)
 PUB_B64=$(printf '%s\n' "$HOST_PUB" | base64 | tr -d '\n')
 
 if [ -n "$HOST_NAME" ] && [ -n "$HOST_TARGET" ] && [ -n "$HOST_PUB" ]; then

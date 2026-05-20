@@ -314,7 +314,7 @@ The suite runs in isolated `AIRC_HOME` directories and does not touch your live 
 - Treat a room gist id as a room secret. Anyone with access to that gist can read plaintext broadcasts.
 - Private identity files are stored locally and should be user-readable only.
 
-GitHub is the default bearer, not the whole design. The bearer layer lives under [`lib/airc_core/`](lib/airc_core/) so alternate transports can be added without changing the user-facing IRC surface.
+GitHub is the default bearer, not the whole design. The bearer layer is moving into the Rust substrate so alternate transports can be added without changing the user-facing IRC surface.
 
 ## Core Commands
 

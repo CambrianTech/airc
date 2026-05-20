@@ -256,7 +256,7 @@ _join_restart_scope_processes() {
   # Filter rules:
   #   - drop non-numeric / empty entries (already a no-op)
   #   - drop $$ and $PPID (case 1)
-  #   - drop any PID whose cmdline doesn't look like airc/airc_core
+  #   - drop any PID whose cmdline doesn't look like airc/airc-rs
   #     (case 2). Same regex shape as the stale-pidfile check at
   #     ~line 971 and cmd_teardown's parent-chain reaper.
   local _self_filtered_pids="" _candidate _candidate_cmd
@@ -271,7 +271,7 @@ _join_restart_scope_processes() {
     kill -0 "$_candidate" 2>/dev/null || continue
     _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
     case "$_candidate_cmd" in
-      *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc-rs*handshake*) ;;
+      *airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc-rs*handshake*|*airc-rs*bearer*recv*) ;;
       *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
       *) continue ;;
     esac
@@ -315,7 +315,7 @@ _join_scope_transport_pids() {
       _cmd=$(proc_cmdline "$_pid" || true)
       case "$_cmd" in
         *airc-rs*monitor*attach*) continue ;;
-        *airc_core.bearer_cli*recv*|*airc-rs*monitor*format*|*airc-rs*handshake*accept-one*)
+        *airc-rs*monitor*format*|*airc-rs*handshake*accept-one*|*airc-rs*bearer*recv*)
           _pids="$_pids $_pid"
           ;;
         *) continue ;;
@@ -366,7 +366,7 @@ _join_scope_has_duplicate_transport() {
   fi
 
   local _seen_gists="" _pid _cmd _gid
-  for _pid in $(proc_airc_pids_matching 'airc_core\.bearer_cli[[:space:]]+recv' 2>/dev/null | sort -un || true); do
+  for _pid in $(proc_airc_pids_matching 'airc-rs.*bearer[[:space:]]+recv' 2>/dev/null | sort -un || true); do
     _cmd=$(proc_cmdline "$_pid" || true)
     _airc_cmdline_mentions_scope "$_cmd" "$AIRC_WRITE_DIR" || continue
     _gid=$(printf '%s\n' "$_cmd" | awk '{
@@ -1760,10 +1760,8 @@ cmd_connect() {
         echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
-      # Surface the captured pair-handshake stderr (2026-04-27:
-      # Windows users got "Can't reach ..." with no clue the real cause was
-      # a Microsoft Store python3.exe stub returning exit 49). Per the
-      # global "never swallow errors" rule — evidence is for the debugger,
+      # Surface the captured pair-handshake stderr. Per the global
+      # "never swallow errors" rule — evidence is for the debugger,
       # not the trash. The handshake captured stderr+stdout via 2>&1 into
       # $response just above, so we have the real error in hand.
       if [ -n "${response:-}" ]; then
