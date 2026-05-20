@@ -1042,6 +1042,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-consumer-smoke"
+version = "0.1.0"
+dependencies = [
+ "airc-lib",
+ "futures",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
