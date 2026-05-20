@@ -1,18 +1,14 @@
-//! GitHub gist bootstrap/rendezvous transport.
+//! GitHub gist bootstrap/rendezvous support.
 //!
-//! This adapter exists to contain the old gist-backed message wire
-//! behind the same `Transport` trait while AIRC moves to real peer
-//! transports. It is not intended as the steady-state chat path:
-//! GitHub can help peers discover each other and exchange bootstrap
-//! metadata, then LAN/Tailscale/relay transports should carry the
-//! runtime stream. Nothing in this module is wired as automatic
-//! fallback; consumers must opt into it deliberately for bootstrap or
-//! rendezvous work.
+//! GitHub is a public invite beacon, not a runtime transport. It can
+//! publish signed connection metadata so peers can move onto admitted
+//! live routes such as local-fs, LAN/Tailscale TCP, relay, Reticulum,
+//! UDP, or WebRTC. It must not carry sustained chat/event frames.
 
-mod adapter;
 mod client;
 mod error;
+mod invite;
 
-pub use adapter::GhGistAdapter;
 pub use client::{GhCliClient, GistClient};
 pub use error::GhGistError;
+pub use invite::{GhGistInviteStore, GIST_INVITE_FILE};

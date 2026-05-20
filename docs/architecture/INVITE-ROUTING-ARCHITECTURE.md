@@ -261,8 +261,8 @@ diagnosis.
 7. **Partial: CLI path through SDK.** Local send/listen and LAN send/listen use
    `airc-lib`; remaining user-facing commands must continue moving onto SDK
    surfaces instead of owning policy.
-8. **Next: discovery.** Add real local/LAN discovery feeding `TransportHealthTable`
-   and route endpoints without manual peer/address flags.
+8. **Done: discovery.** Local/LAN discovery feeds `TransportHealthTable`
+   and route endpoints without GitHub, Tailscale, or manual test overrides.
 9. **Next: relay.** Build `airc-relay` and relay adapter for different tailnets,
    NAT boundaries, and intermittent peers.
 10. **Next: UDP/WebRTC.** Build UDP and WebRTC datachannel adapters for low-latency
@@ -275,14 +275,14 @@ diagnosis.
 These are the next PR groups. Each group should merge before the next group
 depends on it; parallel work is only clean where write scopes are disjoint.
 
-1. **PR-A: Discovery + health ingestion.**
+1. **Done PR-A: Discovery + health ingestion.**
    - Scope: `airc-lib::route`, local/LAN discovery probes, route endpoint table,
      route health updates, SDK diagnostics.
    - Deliverable: an embedded caller can open AIRC, discover local/LAN candidates,
      and have `TransportHealthTable` populated without manual test overrides.
    - Non-goals: relay, UDP, WebRTC, Continuum integration.
 
-2. **PR-B: Gist invite beacon cutover.**
+2. **Current PR-B: Gist invite beacon cutover.**
    - Scope: gh-gist invite/rendezvous adapter only.
    - Deliverable: gist publication writes signed `InviteBeacon` / route endpoint
      metadata, never runtime message frames. Consumers can import that invite and
