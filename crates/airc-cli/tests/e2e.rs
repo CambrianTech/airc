@@ -9,6 +9,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -192,6 +193,75 @@ fn listen_rejects_unenrolled_signer() {
 }
 
 #[test]
+fn two_airc_rs_processes_chat_over_lan_via_sdk_route() {
+    // The LAN CLI commands must be thin wrappers over airc-lib. This
+    // test spawns real processes and uses `lan-listen` / `lan-send`
+    // without a shared local-fs wire.
+    let workspace = TempDir::new().expect("tempdir");
+    let alice_home = workspace.path().join("alice");
+    let bob_home = workspace.path().join("bob");
+
+    let (alice_id, alice_spec) = run_init(&alice_home);
+    let (_bob_id, bob_spec) = run_init(&bob_home);
+
+    let mut alice = Command::new(airc_rs())
+        .args([
+            "--home",
+            alice_home.to_str().unwrap(),
+            "--peer",
+            &bob_spec,
+            "lan-listen",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("alice lan-listen must spawn");
+
+    let alice_stdout = alice.stdout.take().expect("alice stdout");
+    let lines = spawn_line_reader(alice_stdout);
+    let listen_line =
+        wait_for_channel_line_contains(&lines, "listening on", Duration::from_secs(6))
+            .expect("alice must print bound LAN address");
+    let bound_addr = parse_listening_addr(&listen_line);
+
+    let bob_send = Command::new(airc_rs())
+        .args([
+            "--home",
+            bob_home.to_str().unwrap(),
+            "--peer",
+            &alice_spec,
+            "lan-send",
+            "--to",
+            &bound_addr,
+            "--expected-peer",
+            &alice_id,
+            "hello over cli sdk lan",
+        ])
+        .output()
+        .expect("bob lan-send must spawn");
+    assert!(
+        bob_send.status.success(),
+        "bob lan-send failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&bob_send.stdout),
+        String::from_utf8_lossy(&bob_send.stderr),
+    );
+
+    let body_arrived =
+        wait_for_channel_line_contains(&lines, "hello over cli sdk lan", Duration::from_secs(6))
+            .is_some();
+
+    let _ = alice.kill();
+    let _ = alice.wait();
+
+    assert!(
+        body_arrived,
+        "Alice's LAN listener did not print Bob's message within 6s"
+    );
+}
+
+#[test]
 fn rerun_init_returns_same_peer_id() {
     // The persistence pin: `airc-rs init` must be idempotent. The
     // second run reuses the on-disk identity rather than minting a
@@ -205,6 +275,45 @@ fn rerun_init_returns_same_peer_id() {
         first_spec, second_spec,
         "peer_spec must persist across init runs"
     );
+}
+
+fn spawn_line_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let buf = BufReader::new(reader);
+        for line in buf.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+fn wait_for_channel_line_contains(
+    rx: &mpsc::Receiver<String>,
+    needle: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains(needle) => return Some(line),
+            Ok(_) => {}
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn parse_listening_addr(line: &str) -> String {
+    line.strip_prefix("listening on ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("listening line must contain address")
+        .to_string()
 }
 
 /// Block until `reader` yields a line containing `needle`, or the
