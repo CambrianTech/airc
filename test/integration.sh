@@ -21,6 +21,10 @@ AIRC="${AIRC:-$(cd "$(dirname "$0")/.." && pwd)/airc}"
 AIRC_REPO_ROOT="$(cd "$(dirname "$AIRC")" && pwd)"
 
 airc_rs_bin() {
+  if [ -n "${AIRC_RS_BIN:-}" ]; then
+    [ -x "$AIRC_RS_BIN" ] && { printf '%s\n' "$AIRC_RS_BIN"; return 0; }
+    return 1
+  fi
   if command -v airc-rs >/dev/null 2>&1; then
     command -v airc-rs
     return 0
@@ -2073,10 +2077,10 @@ JSON
     && pass "status reports recv-side 404 as degraded despite fresh heartbeat" \
     || fail "status treated recv-side 404 as healthy (got: $status_out)"
 
-  local real_py="${AIRC_PYTHON:-$(command -v python3)}"
-  cat > "$fakebin/python" <<SH
+  local real_airc_rs; real_airc_rs=$(airc_rs_bin)
+  cat > "$fakebin/airc-rs" <<SH
 #!/bin/bash
-if [ "\${1:-}" = "-m" ] && [ "\${2:-}" = "airc_core.bearer_cli" ] && [ "\${3:-}" = "send" ]; then
+if [ "\${1:-}" = "bearer" ] && [ "\${2:-}" = "send" ]; then
   cat >/dev/null
   case "\${AIRC_FAKE_BEARER_KIND:-gone}" in
     gone)
@@ -2089,14 +2093,14 @@ if [ "\${1:-}" = "-m" ] && [ "\${2:-}" = "airc_core.bearer_cli" ] && [ "\${3:-}"
       ;;
   esac
 fi
-exec "$real_py" "\$@"
+exec "$real_airc_rs" "\$@"
 SH
-  chmod +x "$fakebin/python"
+  chmod +x "$fakebin/airc-rs"
 
   local out err rc
   out=$(mktemp -t airc-gone-out.XXXXXX)
   err=$(mktemp -t airc-gone-err.XXXXXX)
-  AIRC_HOME="$home" AIRC_PYTHON="$fakebin/python" "$AIRC" msg @ghost "lost forever" >"$out" 2>"$err"
+  AIRC_HOME="$home" AIRC_RS_BIN="$fakebin/airc-rs" "$AIRC" msg @ghost "lost forever" >"$out" 2>"$err"
   rc=$?
 
   [ "$rc" -ne 0 ] \
@@ -2114,13 +2118,13 @@ SH
   fi
 
   local mapping
-  mapping=$(AIRC_HOME="$home" "$real_py" -m airc_core.config get_channel_gist \
+  mapping=$(AIRC_HOME="$home" "$real_airc_rs" config get-channel-gist \
     --config "$home/config.json" --channel general 2>/dev/null || true)
   [ -z "$mapping" ] \
     && pass "stale channel gist mapping cleared" \
     || fail "stale channel gist mapping still present: $mapping"
 
-  AIRC_FAKE_BEARER_KIND=transient_failure AIRC_HOME="$home" AIRC_PYTHON="$fakebin/python" \
+  AIRC_FAKE_BEARER_KIND=transient_failure AIRC_HOME="$home" AIRC_RS_BIN="$fakebin/airc-rs" \
     "$AIRC" msg @ghost "retry later" >"$out" 2>"$err"
   rc=$?
   [ "$rc" -eq 0 ] \
