@@ -351,6 +351,56 @@ cmd_inbox() {
     since=""
   fi
 
+  _airc_try_rust_inbox_read() {
+    # Plain inbox reads follow plain msg sends onto the Rust local
+    # substrate. Legacy relative-time/self-filter modes stay on the
+    # old log reader until those filters are represented in the Rust
+    # transcript API.
+    [ -z "$since" ] || return 1
+    [ "$exclude_self" = "0" ] || return 1
+
+    local rust_cursor_file="$AIRC_WRITE_DIR/inbox_cursor.rust"
+    local rust_args=(--home "$AIRC_WRITE_DIR" inbox --limit "$count")
+    if [ -s "$rust_cursor_file" ]; then
+      local cursor_lamport cursor_event_id
+      read -r cursor_lamport cursor_event_id < "$rust_cursor_file" || true
+      if [ -n "${cursor_lamport:-}" ] && [ -n "${cursor_event_id:-}" ]; then
+        rust_args+=(--since-lamport "$cursor_lamport" --since-event-id "$cursor_event_id")
+      fi
+    fi
+
+    local rust_out
+    if ! rust_out=$("$(airc_rs_bin)" "${rust_args[@]}" 2>&1); then
+      printf '%s\n' "$rust_out" >&2
+      return 2
+    fi
+
+    local cursor_line
+    cursor_line=$(printf '%s\n' "$rust_out" | grep '^cursor: lamport=' | tail -1 || true)
+    if [ "$peek" -eq 0 ] && [ -n "$cursor_line" ]; then
+      local next_lamport next_event_id
+      next_lamport=$(printf '%s\n' "$cursor_line" | sed -n 's/^cursor: lamport=\([0-9][0-9]*\) event_id=.*/\1/p')
+      next_event_id=$(printf '%s\n' "$cursor_line" | sed -n 's/^cursor: lamport=[0-9][0-9]* event_id=\([^ ]*\).*/\1/p')
+      if [ -n "$next_lamport" ] && [ -n "$next_event_id" ]; then
+        printf '%s %s\n' "$next_lamport" "$next_event_id" > "$rust_cursor_file"
+      fi
+    fi
+
+    if [ "$quiet_empty" = "1" ] && [ "$rust_out" = "(no events)" ]; then
+      return 0
+    fi
+    printf '%s\n' "$rust_out" | sed '/^cursor: lamport=/d'
+    return 0
+  }
+
+  local _rust_inbox_rc=0
+  _airc_try_rust_inbox_read || _rust_inbox_rc=$?
+  if [ "$_rust_inbox_rc" -eq 0 ]; then
+    return 0
+  elif [ "$_rust_inbox_rc" -eq 2 ]; then
+    return 1
+  fi
+
   local out
   local inbox_args=(log inbox-read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
   [ -n "$since" ] && inbox_args+=(--since "$since")

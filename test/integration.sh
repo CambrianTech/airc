@@ -4695,6 +4695,13 @@ JSON
     fail "airc msg leaked into gh bearer path (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null); pending: $(cat "$home/pending.jsonl" 2>/dev/null))"
   fi
 
+  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" inbox --count 5 >"$out" 2>"$err" \
+      && grep -q "$marker" "$out"; then
+    pass "airc inbox reads Rust local transcript"
+  else
+    fail "airc inbox did not read Rust local transcript (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
+  fi
+
   rm -rf "$root"
 }
 

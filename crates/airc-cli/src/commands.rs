@@ -251,12 +251,15 @@ pub async fn run_msg(
 
 pub async fn run_inbox(
     home: &Path,
-    socket: PathBuf,
+    socket: Option<PathBuf>,
     since_lamport: Option<u64>,
     since_event_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::attach(home, socket).await?;
+    let airc = match socket {
+        Some(socket) => Airc::attach(home, socket).await?,
+        None => Airc::open(home).await?,
+    };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
     let since = match (since_lamport, since_event_id) {
