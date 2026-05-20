@@ -45,4 +45,11 @@ pub enum GistAction {
         #[arg(long, default_value = "")]
         channel: String,
     },
+
+    /// Extract a named file's content from a GitHub gist API response.
+    FileContent {
+        /// Exact gist filename, for example messages.jsonl.
+        #[arg(long)]
+        filename: String,
+    },
 }

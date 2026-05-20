@@ -600,6 +600,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             GistAction::ListLanEntries => gist_commands::run_list_lan_entries(),
             GistAction::GistContent { channel } => gist_commands::run_gist_content(&channel),
+            GistAction::FileContent { filename } => gist_commands::run_file_content(&filename),
         },
 
         Command::Message(args) => match args.action {
