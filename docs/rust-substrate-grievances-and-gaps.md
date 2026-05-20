@@ -802,6 +802,8 @@ Workspace sanitation is not optional polish. A machine may host 20+ local agents
 
 This is the "everything needs a drain" rule for the local grid. It applies to workspaces first, then model caches, renderer caches, Docker/build caches, and consumer-specific sandboxes through hooks.
 
+Local reference while implementing: Joel's `~/Development/ddd.py` ("Developer Disk Declutter") is not product code, but it is a useful inventory of real cleanup pressure on the Mac: Xcode DerivedData and DeviceSupport, iOS simulators, Android SDK/NDK images, Docker prune, Cargo/Gradle/npm/pip caches, browser/tool logs, Playwright browsers, and large project `target` directories. The Rust feature should generalize those categories into policy-backed drain targets rather than hard-code that machine's paths.
+
 ### Kanban as projection
 
 Kanban is a *projection*, not a primary object. Cards are typed work items; lanes are grouping/priority/state machines; board views are derived.

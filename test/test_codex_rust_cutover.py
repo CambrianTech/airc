@@ -224,6 +224,8 @@ class CodexRustCutoverTests(unittest.TestCase):
 
         self.assertIn('"$(airc_rs_bin)" gist file-content --filename messages.jsonl', body)
         self.assertNotIn("json.load(sys.stdin)['files']['messages.jsonl']['content']", body)
+        self.assertNotIn("PYTHONPATH", body)
+        self.assertNotIn("python3", body)
         self.assertNotIn("| python3 -c", body)
 
     def test_removed_legacy_bearer_scenarios_stay_deleted(self):
