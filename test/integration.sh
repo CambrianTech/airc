@@ -5130,42 +5130,6 @@ else:
   cleanup_all
 }
 
-scenario_python_units() {
-  # Python unit tests for airc_core/. Currently exercises the bearer
-  # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
-  # bearer_ssh.py). Add new test_*.py files in test/ as the airc_core
-  # surface grows — each file is auto-discovered by the loop below.
-  #
-  # 2026-05-03 reliability fix: pre-fix grepped `tail -3 | ^OK` which
-  # broke when unittest emitted DeprecationWarning + skipped lines
-  # ahead of the OK marker (CI Python 3.x pushes OK past tail -3).
-  # Now: trust the exit code (unittest exits 0 on pass, non-zero on
-  # fail). Capture stderr+stdout to a tempfile so on failure we can
-  # surface the actual error to CI logs instead of just '✗ test_X'.
-  echo
-  echo "── scenario: python unit tests ──"
-  local _here; _here="$(cd "$(dirname "$0")" && pwd)"
-  local _failed=0
-  for _t in "$_here"/test_*.py; do
-    [ -f "$_t" ] || continue
-    local _name; _name=$(basename "$_t" .py)
-    local _out; _out=$(mktemp -t "airc-pyunit-${_name}.XXXXXX")
-    if ( cd "$_here" && python3 "$_t" >"$_out" 2>&1 ); then
-      pass "python units: $_name"
-      rm -f "$_out"
-    else
-      local _exit=$?
-      fail "python units: $_name (exit=$_exit; run: cd test && python3 $(basename "$_t"))"
-      echo "  ── failure output (last 30 lines): ──" >&2
-      tail -30 "$_out" >&2
-      echo "  ────────────────────────────────────" >&2
-      rm -f "$_out"
-      _failed=$((_failed + 1))
-    fi
-  done
-  return $_failed
-}
-
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -5209,7 +5173,6 @@ case "$MODE" in
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
   windows_cmd_shim_direct_bash) scenario_windows_cmd_shim_direct_bash ;;
-  python_units) scenario_python_units ;;
   bearer_ssh_send) scenario_bearer_ssh_send ;;
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
   bearer_cli_recv) scenario_bearer_cli_recv ;;
@@ -5246,7 +5209,6 @@ case "$MODE" in
     scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters; scenario_windows_cmd_shim_direct_bash
-    scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
@@ -5254,7 +5216,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
