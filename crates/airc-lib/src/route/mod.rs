@@ -5,6 +5,7 @@
 //! routes. App and CLI layers consume this through `Airc`; they do
 //! not construct transport adapters or route frames themselves.
 
+pub mod discovery;
 pub mod health;
 pub mod invite;
 pub mod policy;
@@ -12,6 +13,7 @@ pub mod resolver;
 
 pub(crate) mod execution;
 
+pub use discovery::RouteDiscoverySnapshot;
 pub use health::{TransportHealthSample, TransportHealthState, TransportHealthTable};
 pub use invite::{InviteBeacon, RouteEndpoint};
 pub use policy::{
