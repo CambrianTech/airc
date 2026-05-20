@@ -103,6 +103,9 @@ pub enum Command {
         summary: bool,
     },
 
+    /// Print the primary non-loopback LAN IPv4 address, if detectable.
+    LanIp,
+
     /// Legacy bearer transport helpers during Rust cutover.
     Bearer(BearerArgs),
 

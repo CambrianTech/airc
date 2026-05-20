@@ -55,6 +55,7 @@ mod log_commands;
 mod message_cli;
 mod message_commands;
 mod monitor;
+mod network_commands;
 mod pending_cli;
 mod pending_commands;
 mod queue_card_cli;
@@ -196,6 +197,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 bearer_state::run(&path)
             }
         }
+
+        Command::LanIp => network_commands::run_lan_ip(),
 
         Command::Bearer(args) => match args.action {
             BearerAction::Send {
