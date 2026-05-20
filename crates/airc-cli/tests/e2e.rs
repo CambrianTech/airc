@@ -262,6 +262,75 @@ fn two_airc_rs_processes_chat_over_lan_via_sdk_route() {
 }
 
 #[test]
+fn daemon_msg_and_inbox_use_sdk_attach_path() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+    let socket = workspace.path().join("daemon.sock");
+    run_init(&home);
+
+    let mut daemon = Command::new(airc_rs())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "daemon",
+            "--socket",
+            socket.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("daemon must spawn");
+
+    wait_for_line_contains(
+        daemon.stdout.take().expect("daemon stdout"),
+        "listening on",
+        Duration::from_secs(6),
+    );
+
+    let msg = Command::new(airc_rs())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "msg",
+            "--socket",
+            socket.to_str().unwrap(),
+            "hello through cli attach",
+        ])
+        .output()
+        .expect("msg must spawn");
+    assert!(
+        msg.status.success(),
+        "msg failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&msg.stdout),
+        String::from_utf8_lossy(&msg.stderr),
+    );
+
+    let inbox = wait_for_command_stdout_contains(
+        &home,
+        &socket,
+        "hello through cli attach",
+        Duration::from_secs(6),
+    );
+    assert!(
+        inbox,
+        "inbox did not print daemon-sent message through SDK attach path"
+    );
+
+    let stop = Command::new(airc_rs())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "stop",
+            "--socket",
+            socket.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stop must spawn");
+    assert!(stop.status.success(), "stop failed");
+    let _ = daemon.wait();
+}
+
+#[test]
 fn rerun_init_returns_same_peer_id() {
     // The persistence pin: `airc-rs init` must be idempotent. The
     // second run reuses the on-disk identity rather than minting a
@@ -275,6 +344,36 @@ fn rerun_init_returns_same_peer_id() {
         first_spec, second_spec,
         "peer_spec must persist across init runs"
     );
+}
+
+fn wait_for_command_stdout_contains(
+    home: &Path,
+    socket: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new(airc_rs())
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "inbox",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--limit",
+                "16",
+            ])
+            .output()
+            .expect("inbox must spawn");
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn spawn_line_reader<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<String> {

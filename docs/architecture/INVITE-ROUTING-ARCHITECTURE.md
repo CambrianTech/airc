@@ -295,7 +295,7 @@ depends on it; parallel work is only clean where write scopes are disjoint.
      stream and store; subscriptions persist outside individual commands.
    - Non-goals: new transport adapters.
 
-4. **PR-D: CLI/user commands through SDK.**
+4. **Current PR-D: CLI/user commands through SDK.**
    - Scope: remaining CLI commands that still construct substrate state directly.
    - Deliverable: command handlers call `airc-lib`/daemon client APIs instead of
      building registries, stores, transports, or route decisions themselves.
