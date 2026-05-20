@@ -331,6 +331,45 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
 }
 
 #[test]
+fn inbox_without_socket_reads_in_process_store() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+    run_init(&home);
+
+    let send = Command::new(airc_rs())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "send",
+            "hello through in-process inbox",
+        ])
+        .output()
+        .expect("send must spawn");
+    assert!(
+        send.status.success(),
+        "send failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&send.stdout),
+        String::from_utf8_lossy(&send.stderr),
+    );
+
+    let inbox = Command::new(airc_rs())
+        .args(["--home", home.to_str().unwrap(), "inbox", "--limit", "16"])
+        .output()
+        .expect("inbox must spawn");
+    assert!(
+        inbox.status.success(),
+        "inbox failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&inbox.stdout),
+        String::from_utf8_lossy(&inbox.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&inbox.stdout).contains("hello through in-process inbox"),
+        "inbox stdout missing sent message: {}",
+        String::from_utf8_lossy(&inbox.stdout)
+    );
+}
+
+#[test]
 fn rerun_init_returns_same_peer_id() {
     // The persistence pin: `airc-rs init` must be idempotent. The
     // second run reuses the on-disk identity rather than minting a
