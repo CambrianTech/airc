@@ -11,35 +11,35 @@ fn route_status_defaults_to_local_runtime_route() {
     let output = run_ok(&["route", "status"]);
 
     assert!(output.contains("- local-fs role=direct state=healthy"));
-    assert!(output.contains("- data -> local-fs"));
-    assert!(output.contains("- live-event -> local-fs"));
+    assert!(output.contains("- data-interactive -> local-fs"));
+    assert!(output.contains("- presence-ephemeral -> local-fs"));
     assert!(!output.contains("gh-gist"));
 }
 
 #[test]
-fn route_status_keeps_github_bootstrap_only() {
-    let output = run_ok(&["route", "status", "--bootstrap", "gh-gist"]);
+fn route_status_keeps_github_invite_only() {
+    let output = run_ok(&["route", "status", "--invite", "gh-gist"]);
 
-    assert!(output.contains("- gh-gist role=bootstrap-only state=healthy"));
-    assert!(output.contains("- data -> no-route"));
-    assert!(output.contains("- live-event -> no-route"));
-    assert!(output.contains("- bootstrap -> gh-gist"));
+    assert!(output.contains("- gh-gist role=invite-beacon state=healthy"));
+    assert!(output.contains("- invite-advertise -> gh-gist"));
+    assert!(output.contains("- data-interactive -> no-route"));
+    assert!(output.contains("- presence-ephemeral -> no-route"));
     assert!(!output.contains("migration"));
 }
 
 #[test]
-fn route_status_prefers_direct_route_over_bootstrap_github() {
+fn route_status_prefers_direct_route_over_rendezvous_github() {
     let output = run_ok(&[
         "route",
         "status",
-        "--bootstrap",
+        "--rendezvous",
         "gh-gist",
         "--direct",
         "reticulum",
     ]);
 
-    assert!(output.contains("- data -> reticulum"));
-    assert!(output.contains("- bootstrap -> reticulum"));
+    assert!(output.contains("- peer-rendezvous -> reticulum"));
+    assert!(output.contains("- data-interactive -> reticulum"));
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn route_status_down_override_removes_candidate() {
     let output = run_ok(&["route", "status", "--down", "local-fs:direct"]);
 
     assert!(output.contains("- local-fs role=direct state=down"));
-    assert!(output.contains("- data -> no-route"));
+    assert!(output.contains("- data-interactive -> no-route"));
 }
 
 fn run_ok(args: &[&str]) -> String {

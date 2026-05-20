@@ -4,11 +4,11 @@
 //! It does not open sockets, poll GitHub, or probe Reticulum. It
 //! accepts measured candidates and applies [`RoutePolicy`]. Later
 //! slices can add health probes/discovery without changing the rule
-//! that GitHub is bootstrap/rendezvous only.
+//! that GitHub is invite/rendezvous only.
 
 use crate::route_health::TransportHealthSample;
 use crate::route_policy::{
-    RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind,
+    RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +46,8 @@ impl TransportResolver {
         self.replace_candidates(samples.into_iter().map(TransportHealthSample::candidate));
     }
 
-    pub fn resolve(&self, purpose: RoutePurpose) -> Result<TransportRoute, RouteDecision> {
-        match self.policy.choose(purpose, self.candidates.iter().copied()) {
+    pub fn resolve(&self, class: RouteClass) -> Result<TransportRoute, RouteDecision> {
+        match self.policy.choose(class, self.candidates.iter().copied()) {
             RouteDecision::Selected(kind) => Ok(TransportRoute { kind }),
             decision @ RouteDecision::NoRoute { .. } => Err(decision),
         }
@@ -70,22 +70,22 @@ mod tests {
 
     #[test]
     fn resolver_rejects_github_for_runtime_data() {
-        let resolver = TransportResolver::new([candidate(GhGist, TransportRole::BootstrapOnly)]);
+        let resolver = TransportResolver::new([candidate(GhGist, TransportRole::Rendezvous)]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Data),
+            resolver.resolve(RouteClass::DataInteractive),
             Err(RouteDecision::NoRoute {
-                purpose: RoutePurpose::Data
+                class: RouteClass::DataInteractive
             })
         );
     }
 
     #[test]
-    fn resolver_allows_github_for_bootstrap_only() {
-        let resolver = TransportResolver::new([candidate(GhGist, TransportRole::BootstrapOnly)]);
+    fn resolver_allows_github_for_invite_only() {
+        let resolver = TransportResolver::new([candidate(GhGist, TransportRole::InviteBeacon)]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Bootstrap),
+            resolver.resolve(RouteClass::InviteAdvertise),
             Ok(TransportRoute { kind: GhGist })
         );
     }
@@ -93,12 +93,12 @@ mod tests {
     #[test]
     fn resolver_selects_reticulum_for_runtime_data() {
         let resolver = TransportResolver::new([
-            candidate(GhGist, TransportRole::BootstrapOnly),
+            candidate(GhGist, TransportRole::Rendezvous),
             candidate(Reticulum, TransportRole::Direct),
         ]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Data),
+            resolver.resolve(RouteClass::DataInteractive),
             Ok(TransportRoute { kind: Reticulum })
         );
     }
@@ -108,14 +108,14 @@ mod tests {
         let mut resolver = TransportResolver::new([candidate(LanTcp, TransportRole::Direct)]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Data),
+            resolver.resolve(RouteClass::DataInteractive),
             Ok(TransportRoute { kind: LanTcp })
         );
 
         resolver.replace_candidates([candidate(Reticulum, TransportRole::Direct)]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Data),
+            resolver.resolve(RouteClass::DataInteractive),
             Ok(TransportRoute { kind: Reticulum })
         );
     }
@@ -134,8 +134,22 @@ mod tests {
         ]);
 
         assert_eq!(
-            resolver.resolve(RoutePurpose::Data),
+            resolver.resolve(RouteClass::DataInteractive),
             Ok(TransportRoute { kind: Reticulum })
+        );
+    }
+
+    #[test]
+    fn resolver_selects_udp_for_interactive_data_when_available() {
+        let resolver = TransportResolver::new([
+            candidate(GhGist, TransportRole::Rendezvous),
+            candidate(Udp, TransportRole::Direct),
+            candidate(Relay, TransportRole::Relay),
+        ]);
+
+        assert_eq!(
+            resolver.resolve(RouteClass::DataInteractive),
+            Ok(TransportRoute { kind: Udp })
         );
     }
 }

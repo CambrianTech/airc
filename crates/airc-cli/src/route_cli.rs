@@ -22,12 +22,16 @@ pub struct RouteStatusArgs {
     #[arg(long = "relay", value_enum)]
     pub relay: Vec<RouteTransport>,
 
-    /// Add a healthy bootstrap-only transport candidate.
-    #[arg(long = "bootstrap", value_enum)]
-    pub bootstrap: Vec<RouteTransport>,
+    /// Add a healthy peer rendezvous transport candidate.
+    #[arg(long = "rendezvous", value_enum)]
+    pub rendezvous: Vec<RouteTransport>,
+
+    /// Add a healthy invite beacon transport candidate.
+    #[arg(long = "invite", value_enum)]
+    pub invite: Vec<RouteTransport>,
 
     /// Mark a transport down. Format: `<transport>:<role>`, e.g.
-    /// `lan-tcp:direct` or `gh-gist:bootstrap-only`.
+    /// `lan-tcp:direct` or `gh-gist:rendezvous`.
     #[arg(long = "down")]
     pub down: Vec<RouteHealthOverride>,
 }
@@ -37,8 +41,11 @@ pub enum RouteTransport {
     LocalFs,
     LanTcp,
     Tailscale,
+    Udp,
+    WebRtcDataChannel,
     Reticulum,
     Relay,
+    Ssh,
     GhGist,
 }
 
@@ -52,7 +59,9 @@ pub struct RouteHealthOverride {
 pub enum RouteRole {
     Direct,
     Relay,
-    BootstrapOnly,
+    InviteBeacon,
+    Rendezvous,
+    Admin,
 }
 
 impl std::str::FromStr for RouteHealthOverride {
