@@ -3612,8 +3612,8 @@ scenario_bearer_ssh_send() {
   # Pull the joiner's host_target + remote_home from its config; identity
   # key is at a known path on disk.
   local jstate=/tmp/airc-it-bs-j/state
-  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
-  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
   # because the actual SSH messaging goes through the system sshd at port 22
   # (the airc port is only used for the pairing handshake). The bearer's
@@ -3671,8 +3671,8 @@ scenario_bearer_ssh_recv() {
   pass "joiner delta paired with alpha"
 
   local jstate=/tmp/airc-it-br-j/state
-  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
-  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
   # because the actual SSH messaging goes through the system sshd at port 22
   # (the airc port is only used for the pairing handshake). The bearer's
@@ -3773,8 +3773,8 @@ scenario_bearer_cli_recv() {
   pass "joiner delta paired with alpha"
 
   local jstate=/tmp/airc-it-cli-j/state
-  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
-  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   local ikey="$jstate/identity/ssh_key"
   local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
   local hstate=/tmp/airc-it-cli-h/state
