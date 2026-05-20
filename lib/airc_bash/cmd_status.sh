@@ -163,22 +163,7 @@ cmd_status() {
   local bearer_state="$AIRC_WRITE_DIR/bearer_state.json"
   if [ -f "$bearer_state" ]; then
     local _bs_summary
-    _bs_summary=$("$AIRC_PYTHON" -c "
-import json, sys, time
-try:
-    s = json.load(open('$bearer_state'))
-except Exception as e:
-    print(f'unreadable: {e}'); sys.exit(0)
-ts = s.get('last_recv_ts')
-kind = s.get('kind', '?')
-diag = s.get('diag', '')
-total = s.get('events_total', 0)
-if ts is None:
-    print(f'awaiting first event (bearer={kind}, {diag})')
-else:
-    age = int(time.time() - float(ts))
-    print(f'{age}s ago via {kind} ({total} events; {diag})')
-" 2>/dev/null)
+    _bs_summary=$("$(airc_rs_bin)" bearer-state --summary "$bearer_state" 2>/dev/null)
     echo "  bearer:      ${_bs_summary:-unreadable}"
   elif [ -n "$host_target" ]; then
     # Joiner with no bearer state — monitor never came up or hasn't

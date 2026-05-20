@@ -163,10 +163,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" log rotate --path "$_hb_messages"', connect)
 
     def test_bearer_state_uses_airc_rs(self):
-        source = (REPO / "lib/airc_bash/cmd_doctor.sh").read_text(encoding="utf-8")
+        doctor = (REPO / "lib/airc_bash/cmd_doctor.sh").read_text(encoding="utf-8")
+        status = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
 
-        self.assertNotIn("airc_core.bearer_state", source)
-        self.assertIn('"$(airc_rs_bin)" bearer-state "$state_file"', source)
+        self.assertNotIn("airc_core.bearer_state", doctor + status)
+        self.assertIn('"$(airc_rs_bin)" bearer-state "$state_file"', doctor)
+        self.assertIn('"$(airc_rs_bin)" bearer-state --summary "$bearer_state"', status)
 
     def test_logs_render_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")
@@ -189,6 +191,7 @@ class CodexRustCutoverTests(unittest.TestCase):
         combined = "\n".join(path.read_text(encoding="utf-8") for path in files)
         self.assertIn('"$(airc_rs_bin)" gist get .airc', combined)
         self.assertIn('"$(airc_rs_bin)" gist gist-content', combined)
+        self.assertIn('"$(airc_rs_bin)" gist get .last_heartbeat', combined)
 
     def test_generic_config_runtime_paths_use_airc_rs(self):
         files = [

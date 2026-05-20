@@ -374,16 +374,8 @@ cmd_disconnect() {
   esac
   cmd_teardown >/dev/null 2>&1 || true
   if [ -f "$CONFIG" ]; then
-    "$AIRC_PYTHON" -c "
-import json
-try:
-    c = json.load(open('$CONFIG'))
-    for k in ('host_target', 'host_name', 'host_airc_home', 'host_port', 'host_ssh_pub'):
-        c.pop(k, None)
-    json.dump(c, open('$CONFIG', 'w'), indent=2)
-except Exception:
-    pass
-" 2>/dev/null || true
+    "$(airc_rs_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" \
+      host_target host_name host_airc_home host_port host_ssh_pub >/dev/null 2>&1 || true
   fi
   echo "  Disconnected. Identity preserved. Next 'airc join' starts fresh."
 }
