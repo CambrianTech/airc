@@ -46,7 +46,7 @@
 # contract field names yet. PR-3/PR-4 will tighten as needed.
 #
 # External cross-references (resolved at call time):
-#   die, resolve_name, AIRC_PYTHON; `gh` CLI.
+#   die, resolve_name, airc_rs_bin; `gh` CLI.
 
 # Help text is split out so cmd_queue.sh keeps behavior logic readable.
 if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_queue_help.sh" ]; then
@@ -1989,111 +1989,24 @@ _cmd_queue_staleness() {
   git -C "$repo_root" diff --unified=0 "$head_git_ref..$base_git_ref" -- $(cat "$files_file") >"$diff_file" \
     || { rm -f "$files_file" "$diff_file" "$base_new_file"; die "queue staleness: git diff head..base failed"; }
 
-  AIRC_QUEUE_STALENESS_LIMIT="$limit_lines" "$AIRC_PYTHON" - \
-      "$repo_root" "$pr_repo" "$pr_num" "$base_ref" "$head_ref" "$base_git_ref" "$head_git_ref" \
-      "$merge_base" "$pr_canonical_url" "$output_json" "$files_file" "$diff_file" "$base_new_file" <<'PYEOF'
-import json, os, re, subprocess, sys
-
-(
-    repo_root,
-    pr_repo,
-    pr_num,
-    base_ref,
-    head_ref,
-    base_git_ref,
-    head_git_ref,
-    merge_base,
-    pr_url,
-    output_json_raw,
-    files_path,
-    diff_path,
-    base_new_path,
-) = sys.argv[1:14]
-output_json = output_json_raw == "1"
-limit = int(os.environ.get("AIRC_QUEUE_STALENESS_LIMIT", "40"))
-
-with open(files_path, "r", encoding="utf-8") as f:
-    touched_files = [line.strip() for line in f if line.strip()]
-with open(diff_path, "r", encoding="utf-8", errors="replace") as f:
-    diff_lines = f.read().splitlines()
-with open(base_new_path, "r", encoding="utf-8", errors="replace") as f:
-    base_new_lines = f.read().splitlines()
-
-def plus_lines_by_file(lines):
-    out = {}
-    current = ""
-    for raw in lines:
-        if raw.startswith("+++ b/"):
-            current = raw[6:]
-            continue
-        if not raw.startswith("+") or raw.startswith("+++"):
-            continue
-        content = raw[1:]
-        if not content.strip():
-            continue
-        out.setdefault(current, set()).add(content)
-    return out
-
-base_added = plus_lines_by_file(base_new_lines)
-
-warnings = []
-current_file = ""
-for line in diff_lines:
-    if line.startswith("+++ b/"):
-        current_file = line[6:]
-        continue
-    if not line.startswith("+") or line.startswith("+++"):
-        continue
-    content = line[1:]
-    if not content.strip():
-        continue
-    if content not in base_added.get(current_file, set()):
-        continue
-    if len(content) > 240:
-        content = content[:240] + "..."
-    origin = ""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", repo_root, "log", "--format=%h %s", "-n", "1", "-S", content, base_git_ref, "--", current_file],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        origin = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
-    except Exception:
-        origin = ""
-    warnings.append({"file": current_file, "line": content, "origin": origin})
-    if len(warnings) >= limit:
-        break
-
-payload = {
-    "repo": pr_repo,
-    "pr": pr_num,
-    "url": pr_url,
-    "base": base_ref,
-    "head": head_ref,
-    "base_git_ref": base_git_ref,
-    "head_git_ref": head_git_ref,
-    "merge_base": merge_base,
-    "touched_files": touched_files,
-    "warning_count": len(warnings),
-    "warnings": warnings,
-}
-
-if output_json:
-    print(json.dumps(payload, indent=2))
-elif not warnings:
-    print(f"OK: no stale conflicts detected for {pr_repo + '#' + pr_num if pr_repo and pr_num else head_ref}.")
-    print(f"base={base_ref} head={head_ref} files_touched={len(touched_files)}")
-else:
-    label = f"{pr_repo}#{pr_num}" if pr_repo and pr_num else head_ref
-    print(f"WARN: {label} branch may erase current-base work.")
-    print(f"base={base_ref} head={head_ref} files_touched={len(touched_files)} missing_base_lines_sample={len(warnings)}")
-    print("Rebase the PR branch onto the current base before merge, then rerun this command.")
-    for item in warnings:
-        origin = f" ({item['origin']})" if item["origin"] else ""
-        print(f"  - {item['file']}: {item['line']}{origin}")
-PYEOF
+  local analyze_args=(
+    queue-card staleness-analyze
+    --repo-root "$repo_root"
+    --pr-repo "$pr_repo"
+    --pr-num "$pr_num"
+    --base-ref "$base_ref"
+    --head-ref "$head_ref"
+    --base-git-ref "$base_git_ref"
+    --head-git-ref "$head_git_ref"
+    --merge-base "$merge_base"
+    --pr-url "$pr_canonical_url"
+    --limit-lines "$limit_lines"
+    --files-file "$files_file"
+    --diff-file "$diff_file"
+    --base-new-file "$base_new_file"
+  )
+  [ "$output_json" -eq 1 ] && analyze_args+=(--json)
+  "$(airc_rs_bin)" "${analyze_args[@]}"
   local py_status=$?
   rm -f "$files_file" "$diff_file" "$base_new_file"
   return "$py_status"
