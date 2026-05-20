@@ -66,6 +66,8 @@ mod work_cli;
 mod work_commands;
 mod workspace_cli;
 mod workspace_commands;
+mod worktree_lane_cli;
+mod worktree_lane_commands;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -100,6 +102,7 @@ use scope_cli::ScopeAction;
 use transport_cli::TransportAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
+use worktree_lane_cli::WorktreeLaneAction;
 
 fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     let uuid = Uuid::from_str(input)
@@ -640,6 +643,33 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     lane_commands::run_manager_status(&home, limit).await
                 }
             },
+        },
+
+        Command::WorktreeLane(args) => match args.action {
+            WorktreeLaneAction::AbsPath { path } => worktree_lane_commands::run_abs_path(&path),
+            WorktreeLaneAction::Slug { value } => {
+                worktree_lane_commands::run_slug(&value);
+                Ok(())
+            }
+            WorktreeLaneAction::Record {
+                registry,
+                issue,
+                repo,
+                dir,
+                branch,
+                base,
+                owner,
+            } => {
+                worktree_lane_commands::run_record(&registry, issue, repo, dir, branch, base, owner)
+            }
+            WorktreeLaneAction::List { registry, json } => {
+                worktree_lane_commands::run_list(&registry, json)
+            }
+            WorktreeLaneAction::Find {
+                registry,
+                target,
+                field,
+            } => worktree_lane_commands::run_find(&registry, &target, &field),
         },
 
         Command::Log(args) => match args.action {

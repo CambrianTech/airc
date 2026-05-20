@@ -274,6 +274,9 @@ pub enum Command {
     /// Coordinate work lanes over the current room's AIRC substrate.
     Lane(crate::lane_cli::LaneArgs),
 
+    /// Manage legacy local git worktree lane registry during Rust cutover.
+    WorktreeLane(crate::worktree_lane_cli::WorktreeLaneArgs),
+
     /// Append and rotate legacy messages.jsonl files through Rust.
     Log(crate::log_cli::LogArgs),
 

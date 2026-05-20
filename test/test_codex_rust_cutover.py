@@ -254,6 +254,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("AIRC_PYTHON", source)
         self.assertIn('"$(airc_rs_bin)" identity peer-ssh-pub', source)
 
+    def test_lane_registry_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_lane.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("AIRC_PYTHON", source)
+        self.assertIn('"$(airc_rs_bin)" worktree-lane abs-path', source)
+        self.assertIn('"$(airc_rs_bin)" worktree-lane slug', source)
+        self.assertIn('"$(airc_rs_bin)" worktree-lane record', source)
+        self.assertIn('"$(airc_rs_bin)" worktree-lane list', source)
+        self.assertIn('"$(airc_rs_bin)" worktree-lane find', source)
+
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
             path.read_text(encoding="utf-8")
