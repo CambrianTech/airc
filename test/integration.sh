@@ -277,16 +277,6 @@ read_join_string() {
 # a host scope manually (rather than going through spawn_host) so they
 # can test specific code paths in isolation.
 #
-# Pre-#343 the scaffold only needed `ssh-keygen ed25519 ssh_key` because
-# init_identity used `openssl genpkey` which the test scenarios
-# implicitly depended on running at first airc invocation. Post-#343
-# init_identity uses python-cryptography via airc_core.identity
-# bootstrap-ed25519, but scenarios that synthesize state without going
-# through airc connect at all (cmd_send liveness probe, away-status
-# scaffold, etc.) need to create private.pem themselves or sign-message
-# fails with `ed25519 sign failed: [Errno 2] No such file or directory:
-# .../private.pem` before reaching the actual code-under-test.
-#
 # Args: identity_dir (the directory where ssh_key + private.pem land,
 # usually $home/identity or $home/state/identity), name (used for the
 # ssh_key comment).
@@ -297,42 +287,7 @@ scaffold_identity() {
     ssh-keygen -t ed25519 -f "$identity_dir/ssh_key" -N '' -q -C "$name" 2>/dev/null
   fi
   if [ ! -f "$identity_dir/private.pem" ]; then
-    # PYTHONPATH must include airc_core's parent (lib/) so the module
-    # is importable when invoking python directly. The airc binary
-    # sets this env at startup; tests calling python directly need
-    # the same setup.
-    local _lib_dir; _lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
-    # Walk the same venv-then-system fallback airc itself uses for
-    # AIRC_PYTHON — bootstrap-ed25519 needs the cryptography module,
-    # which install.sh installs into .venv but isn't always present in
-    # the harness's bare python3. Pre-fix: ${AIRC_PYTHON:-python3}
-    # silently fell back to system python with `2>/dev/null` swallowing
-    # the resulting ImportError, so private.pem was never written and
-    # any later signing op failed with [Errno 2] ENOENT — caller got
-    # an opaque "ed25519 sign failed" instead of "cryptography missing."
-    # Per CLAUDE.md "never swallow errors" (Joel 2026-05-04 directive
-    # via Codex relay): probe for a working python, let stderr through,
-    # fail loudly if none available.
-    local _py=""
-    for _candidate in \
-        "${AIRC_PYTHON:-}" \
-        "$HOME/.airc-src/.venv/bin/python" \
-        "$HOME/.airc-src/.venv/bin/python3" \
-        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python" \
-        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python3" \
-        "$(command -v python3 || true)"; do
-      [ -n "$_candidate" ] && [ -x "$_candidate" ] || continue
-      if "$_candidate" -c "import cryptography" 2>/dev/null; then
-        _py="$_candidate"
-        break
-      fi
-    done
-    if [ -z "$_py" ]; then
-      echo "scaffold_identity: no python with cryptography importable; install.sh's .venv covers this in production" >&2
-      return 1
-    fi
-    PYTHONPATH="${_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-      "$_py" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir"
+    "$(airc_rs_bin)" identity bootstrap-ed25519 --dir "$identity_dir"
   fi
 }
 
