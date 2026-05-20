@@ -280,6 +280,9 @@ pub enum Command {
     /// Manage legacy local git worktree lane registry during Rust cutover.
     WorktreeLane(crate::worktree_lane_cli::WorktreeLaneArgs),
 
+    /// Queue-card parsing and mutation primitives during Rust cutover.
+    QueueCard(crate::queue_card_cli::QueueCardArgs),
+
     /// Append and rotate legacy messages.jsonl files through Rust.
     Log(crate::log_cli::LogArgs),
 
