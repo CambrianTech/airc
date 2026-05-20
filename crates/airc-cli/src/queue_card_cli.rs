@@ -123,4 +123,38 @@ pub enum QueueCardAction {
         #[arg(long)]
         raw_json_file: PathBuf,
     },
+
+    /// Summarize repo-nudge pong replies from queue cards and message log.
+    Pongs {
+        #[arg(long)]
+        repo: String,
+        #[arg(long, default_value = "")]
+        sweep_id: String,
+        #[arg(long, default_value = "30m")]
+        since: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        cards_file: PathBuf,
+        #[arg(long)]
+        messages_file: PathBuf,
+    },
+
+    /// Summarize queue owners, recent activity, and stale claimed cards.
+    Availability {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        sweep_id: String,
+        #[arg(long, default_value = "30m")]
+        since: String,
+        #[arg(long, default_value = "30m")]
+        stale_after: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        cards_file: PathBuf,
+        #[arg(long)]
+        messages_file: PathBuf,
+    },
 }
