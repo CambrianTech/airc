@@ -22,6 +22,27 @@ pub enum ConfigAction {
         default: String,
     },
 
+    /// Print a dotted config path, or a default when missing/null.
+    GetPath {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Dotted path, for example `.identity.role`.
+        path: String,
+        /// Value printed when the path is missing or null.
+        #[arg(default_value = "")]
+        default: String,
+    },
+
+    /// Print whether a top-level config key exists.
+    HasKey {
+        /// Config file. Defaults to `<home>/config.json`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Top-level config key.
+        key: String,
+    },
+
     /// Print the configured identity name.
     GetName {
         /// Config file. Defaults to `<home>/config.json`.

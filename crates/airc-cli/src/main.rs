@@ -44,6 +44,7 @@ mod hygiene_cli;
 mod hygiene_commands;
 mod identity_cli;
 mod identity_commands;
+mod json_path;
 mod knock_cli;
 mod knock_commands;
 mod lane_cli;
@@ -267,6 +268,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 key,
                 default,
             } => config_commands::run_get(&home, config, &key, &default),
+            ConfigAction::GetPath {
+                config,
+                path,
+                default,
+            } => config_commands::run_get_path(&home, config, &path, &default),
+            ConfigAction::HasKey { config, key } => {
+                config_commands::run_has_key(&home, config, &key)
+            }
             ConfigAction::GetName { config } => config_commands::run_get_name(&home, config),
             ConfigAction::Set { config, key, value } => {
                 config_commands::run_set(&home, config, &key, &value)
