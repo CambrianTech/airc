@@ -139,7 +139,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match parsed.command {
         Command::Init => commands::run_init(&home).await,
 
-        Command::BearerState { path } => bearer_state::run(&path),
+        Command::BearerState { path, summary } => {
+            if summary {
+                bearer_state::run_summary(&path)
+            } else {
+                bearer_state::run(&path)
+            }
+        }
 
         Command::Bearer(args) => match args.action {
             BearerAction::Send {

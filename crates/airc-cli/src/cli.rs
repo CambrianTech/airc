@@ -98,6 +98,9 @@ pub enum Command {
     BearerState {
         /// bearer_state.<channel>.json path to read.
         path: PathBuf,
+        /// Print human-readable receive summary for `airc status`.
+        #[arg(long)]
+        summary: bool,
     },
 
     /// Legacy bearer transport helpers during Rust cutover.

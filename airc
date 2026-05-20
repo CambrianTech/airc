@@ -2343,15 +2343,7 @@ PY
         sub="${sub#\#}"
         local sf_path="$AIRC_WRITE_DIR/bearer_state.${sub}.json"
         subs_file_glob="${subs_file_glob}${sf_path}|"
-      done < <("$AIRC_PYTHON" -c "
-import json, sys
-try:
-    cfg = json.load(open('$CONFIG'))
-    for c in cfg.get('subscribed_channels') or []:
-        print(c)
-except Exception:
-    pass
-" 2>/dev/null)
+      done < <("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
 
       for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
         [ -f "$sf" ] || continue
@@ -2366,25 +2358,8 @@ except Exception:
           esac
         fi
         has_any_state=1
-        local ts; ts=$("$AIRC_PYTHON" -c "
-import json, sys, calendar, time
-try:
-    d = json.load(open('$sf'))
-    v = d.get('last_recv_ts')
-    if v is None:
-        print(0)
-    elif isinstance(v, (int, float)):
-        print(int(v))
-    else:
-        # ISO-8601 string — parse to epoch seconds
-        try:
-            t = time.strptime(v.rstrip('Z'), '%Y-%m-%dT%H:%M:%S')
-            print(calendar.timegm(t))
-        except Exception:
-            print(0)
-except Exception:
-    print(0)
-" 2>/dev/null)
+        local ts
+        ts=$("$(airc_rs_bin)" bearer-state "$sf" 2>/dev/null | awk '{print $1}')
         if [ -n "$ts" ] && [ "$ts" -gt "$freshest_recv" ] 2>/dev/null; then
           freshest_recv="$ts"
         fi

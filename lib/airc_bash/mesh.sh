@@ -136,13 +136,7 @@ _mesh_age_secs() {
       | "$(airc_rs_bin)" gist gist-content 2>/dev/null || true)
   fi
   [ -z "$content" ] && return 0
-  local hb; hb=$(printf '%s' "$content" | "$AIRC_PYTHON" -c '
-import sys, json
-try:
-    print(json.loads(sys.stdin.read()).get("last_heartbeat", ""))
-except Exception:
-    pass
-' 2>/dev/null || true)
+  local hb; hb=$(printf '%s' "$content" | "$(airc_rs_bin)" gist get .last_heartbeat 2>/dev/null || true)
   [ -z "$hb" ] && return 0
   local hb_epoch; hb_epoch=$(iso_to_epoch "$hb")
   [ -z "$hb_epoch" ] && return 0
