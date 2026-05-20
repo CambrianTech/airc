@@ -16,7 +16,7 @@
 # What it leaves:
 #   - per-project .airc/ state in every dir you ran `airc join` from
 #     (identity keys, peer records, message logs — your data, not ours)
-#   - gh auth, brew/apt-installed packages (gh / python3 / openssl)
+#   - gh auth, brew/apt-installed packages (gh / cargo / openssh)
 #   - other agents' configs (Codex / Cursor / opencode / etc.)
 #
 # Flags:
@@ -66,7 +66,7 @@ This will remove airc from this machine:
 
 It will NOT remove:
   per-project .airc/ state in every dir you ran 'airc join' from
-  gh auth, brew/apt packages (gh / python3 / openssl)
+  gh auth, brew/apt packages (gh / cargo / openssh)
   other agents' configs
 
 EOF

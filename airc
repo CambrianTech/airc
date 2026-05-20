@@ -2671,11 +2671,6 @@ case "${1:-help}" in
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;
   debug-host)  get_host ;;
-  debug-pythonpath)
-    echo "AIRC_PYTHON=${AIRC_PYTHON:-<unset>}"
-    echo "lib_dir=${_airc_lib_dir:-<not-resolved>}"
-    echo "PYTHONPATH=${PYTHONPATH:-<unset>}"
-    "${AIRC_PYTHON:-python3}" -c "import airc_core; print(f'airc_core import ok: v{airc_core.__version__}')" 2>&1 ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo "(IRC verbs are the public interface)"
