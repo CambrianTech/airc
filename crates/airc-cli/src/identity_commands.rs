@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,19 @@ pub fn run_peer_ssh_pub(peers_dir: &Path, peer_name: &str) -> Result<(), Box<dyn
         println!("{ssh_pub}");
     }
     Ok(())
+}
+
+pub fn run_rename_collision(
+    messages_file: &Path,
+    target: &str,
+    old_name: &str,
+    tail_lines: usize,
+) -> Result<(), Box<dyn Error>> {
+    if rename_collision(messages_file, target, old_name, tail_lines) {
+        Ok(())
+    } else {
+        Err(NoCollision.into())
+    }
 }
 
 pub fn run_session_file(write_dir: &Path, transport_name: &str) -> Result<(), Box<dyn Error>> {
@@ -292,6 +306,9 @@ fn peer_ssh_pub(peers_dir: &Path, peer_name: &str) -> Option<String> {
 #[derive(Debug)]
 struct NudgeNeeded;
 
+#[derive(Debug)]
+struct NoCollision;
+
 impl std::fmt::Display for NudgeNeeded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "identity nudge needed")
@@ -300,12 +317,82 @@ impl std::fmt::Display for NudgeNeeded {
 
 impl Error for NudgeNeeded {}
 
+impl std::fmt::Display for NoCollision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "no rename collision")
+    }
+}
+
+impl Error for NoCollision {}
+
 pub fn command_exit_code(error: &(dyn Error + 'static)) -> Option<u8> {
     if error.is::<NudgeNeeded>() {
         Some(2)
+    } else if error.is::<NoCollision>() {
+        Some(1)
     } else {
         None
     }
+}
+
+fn rename_collision(messages_file: &Path, target: &str, old_name: &str, tail_lines: usize) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    let mut my_history = BTreeSet::from([old_name.trim().to_string()]);
+    for line in tail_lines_from_file(messages_file, tail_lines) {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(sender) = message
+            .get("from")
+            .and_then(Value::as_str)
+            .filter(|sender| !sender.is_empty())
+        {
+            seen.insert(sender.to_string());
+        }
+        if let Some((old, new)) = message
+            .get("msg")
+            .and_then(Value::as_str)
+            .and_then(parse_rename_marker)
+        {
+            if my_history.contains(old) || my_history.contains(new) {
+                my_history.insert(old.to_string());
+                my_history.insert(new.to_string());
+            }
+        }
+    }
+    seen.contains(target) && !my_history.contains(target)
+}
+
+fn tail_lines_from_file(path: &Path, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut lines = VecDeque::with_capacity(limit);
+    for line in fs::read_to_string(path).unwrap_or_default().lines() {
+        if lines.len() == limit {
+            lines.pop_front();
+        }
+        lines.push_back(line.to_string());
+    }
+    lines.into_iter().collect()
+}
+
+fn parse_rename_marker(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix("[rename] ")?;
+    let mut old = None;
+    let mut new = None;
+    for part in rest.split_whitespace() {
+        if let Some(value) = part.strip_prefix("old=") {
+            old = Some(value);
+        } else if let Some(value) = part.strip_prefix("new=") {
+            new = Some(value);
+        }
+    }
+    Some((old?, new?))
 }
 
 fn session_file(write_dir: &Path, transport_name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -606,6 +693,42 @@ mod tests {
             Some("ssh-ed25519 AAAAC3Nz alice")
         );
         assert_eq!(peer_ssh_pub(dir.path(), "missing"), None);
+    }
+
+    #[test]
+    fn rename_collision_detects_foreign_recent_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("messages.jsonl");
+        fs::write(
+            &log,
+            r#"{"from":"mine","msg":"hello","ts":"2026-05-20T00:00:00Z"}"#.to_string()
+                + "\n"
+                + r#"{"from":"alice","msg":"hello","ts":"2026-05-20T00:00:01Z"}"#
+                + "\n",
+        )
+        .unwrap();
+
+        assert!(rename_collision(&log, "alice", "mine", 200));
+        assert!(!rename_collision(&log, "bob", "mine", 200));
+    }
+
+    #[test]
+    fn rename_collision_excludes_local_rename_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("messages.jsonl");
+        fs::write(
+            &log,
+            r#"{"from":"old","msg":"[rename] old=old new=temp","ts":"2026-05-20T00:00:00Z"}"#
+                .to_string()
+                + "\n"
+                + r#"{"from":"temp","msg":"[rename] old=temp new=old","ts":"2026-05-20T00:00:01Z"}"#
+                + "\n"
+                + r#"{"from":"old","msg":"back","ts":"2026-05-20T00:00:02Z"}"#
+                + "\n",
+        )
+        .unwrap();
+
+        assert!(!rename_collision(&log, "temp", "old", 200));
     }
 
     #[test]

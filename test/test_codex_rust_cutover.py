@@ -231,6 +231,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" config set ', combined)
         self.assertIn('"$(airc_rs_bin)" config read-parted', combined)
 
+    def test_rename_collision_scan_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_rename.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("AIRC_PYTHON", source)
+        self.assertIn('"$(airc_rs_bin)" identity rename-collision', source)
+
     def test_host_block_config_write_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
         self.assertNotIn("airc_core.config set_host_block", source)

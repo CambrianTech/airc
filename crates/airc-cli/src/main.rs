@@ -380,6 +380,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 peers_dir,
                 peer_name,
             } => identity_commands::run_peer_ssh_pub(&peers_dir, &peer_name),
+            IdentityAction::RenameCollision {
+                messages_file,
+                target,
+                old_name,
+                tail_lines,
+            } => identity_commands::run_rename_collision(
+                &messages_file,
+                &target,
+                &old_name,
+                tail_lines,
+            ),
             IdentityAction::SignEd25519 { identity_dir } => {
                 println!("{}", legacy_identity::sign_ed25519_stdin(&identity_dir)?);
                 Ok(())
