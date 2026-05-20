@@ -2157,7 +2157,10 @@ JSON
         fi
         local _gist_url=""
         if [ -n "${_existing_room_gid:-}" ] && [ "$use_room" = "1" ]; then
-          if gh gist edit "$_existing_room_gid" "$_gist_tmp" >/dev/null 2>/dev/null \
+          if "$(airc_rs_bin)" gh patch-gist-file \
+               --gist-id "$_existing_room_gid" \
+               --filename "airc-room-${room_name}.json" \
+               --content-file "$_gist_tmp" >/dev/null 2>/dev/null \
              || gh gist edit "$_existing_room_gid" -a "$_gist_tmp" >/dev/null 2>/dev/null; then
             _gist_url="https://gist.github.com/$_existing_room_gid"
           fi
@@ -2294,7 +2297,10 @@ JSON
                 # consecutive failures: after N in a row, detect
                 # active-host-evicted (#224) and self-heal.
                 _hb_tried_add=0
-                if gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
+                if "$(airc_rs_bin)" gh patch-gist-file \
+                     --gist-id "$_gist_id" \
+                     --filename "airc-room-${_hb_room}.json" \
+                     --content-file "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
                   _consec_fail=0
                 elif grep -qE 'unsure what file to edit|file does not exist|no such file' "$_hb_stderr" 2>/dev/null \
                      && gh gist edit "$_gist_id" -a "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then

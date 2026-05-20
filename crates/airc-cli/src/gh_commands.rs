@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -14,6 +16,48 @@ use crate::gh_state::{
 
 pub fn run_gh(gh_args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let gh_args = strip_separator(gh_args);
+    run_gh_with_input(gh_args, None)
+}
+
+pub fn run_patch_gist_file(
+    gist_id: &str,
+    filename: &str,
+    content_file: &Path,
+) -> Result<(), Box<dyn Error>> {
+    if gist_id.trim().is_empty() {
+        return Err("gh patch-gist-file: --gist-id is required".into());
+    }
+    if filename.trim().is_empty() {
+        return Err("gh patch-gist-file: --filename is required".into());
+    }
+    let content = fs::read_to_string(content_file)?;
+    let input = patch_gist_file_input(filename, &content);
+    run_gh_with_input(
+        vec![
+            "api".to_string(),
+            "--include".to_string(),
+            "--method".to_string(),
+            "PATCH".to_string(),
+            format!("gists/{gist_id}"),
+            "--input".to_string(),
+            "-".to_string(),
+        ],
+        Some(input),
+    )
+}
+
+fn patch_gist_file_input(filename: &str, content: &str) -> String {
+    json!({
+        "files": {
+            filename: {
+                "content": content
+            }
+        }
+    })
+    .to_string()
+}
+
+fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), Box<dyn Error>> {
     let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
 
     if gh_args.len() >= 2
@@ -74,7 +118,20 @@ pub fn run_gh(gh_args: Vec<String>) -> Result<(), Box<dyn Error>> {
         return Err("gh request blocked by governor".into());
     }
 
-    let output = Command::new(&gh).args(&gh_args).output()?;
+    let output = if let Some(input) = input {
+        let mut child = Command::new(&gh)
+            .args(&gh_args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input.as_bytes())?;
+        }
+        child.wait_with_output()?
+    } else {
+        Command::new(&gh).args(&gh_args).output()?
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     print!("{stdout}");
@@ -245,4 +302,22 @@ fn strip_separator(mut args: Vec<String>) -> Vec<String> {
         args.remove(0);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_gist_file_input_targets_exact_filename() {
+        let body =
+            patch_gist_file_input("airc-room-general.json", "{\"host\":{\"name\":\"beta\"}}\n");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(
+            parsed["files"]["airc-room-general.json"]["content"],
+            "{\"host\":{\"name\":\"beta\"}}\n"
+        );
+        assert!(parsed["files"]["messages.jsonl"].is_null());
+    }
 }

@@ -618,6 +618,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Gh(args) => match args.action {
             GhAction::Run { gh_args } => gh_commands::run_gh(gh_args),
+            GhAction::PatchGistFile {
+                gist_id,
+                filename,
+                content_file,
+            } => gh_commands::run_patch_gist_file(&gist_id, &filename, &content_file),
             GhAction::WaitSeconds => {
                 gh_commands::run_wait_seconds();
                 Ok(())
