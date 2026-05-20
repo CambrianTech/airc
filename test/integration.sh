@@ -362,13 +362,8 @@ scenario_tabs() {
   cp /tmp/airc-it-j/state/identity/* "$fake_home/state/identity/" 2>/dev/null
   cp /tmp/airc-it-j/state/config.json "$fake_home/state/config.json"
   # Point host_target at an unreachable host
-  python3 -c "
-import json
-c = json.load(open('$fake_home/state/config.json'))
-c['host_target'] = 'nobody@198.51.100.99'
-c['host_airc_home'] = '/tmp/nowhere'
-json.dump(c, open('$fake_home/state/config.json', 'w'))
-"
+  "$(airc_rs_bin)" config set --config "$fake_home/state/config.json" --key host_target --value nobody@198.51.100.99
+  "$(airc_rs_bin)" config set --config "$fake_home/state/config.json" --key host_airc_home --value /tmp/nowhere
   # Write a fake peer so resolution doesn't fail
   echo '{"name":"ghost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
   AIRC_HOME=$fake_home/state "$AIRC" send @ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
@@ -418,7 +413,7 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
   [ -f "$peer_file" ] && pass "peer record for renamed peer is on disk" \
                       || fail "no peer record for gamma (rename didn't persist)"
   local peer_home
-  peer_home=$(python3 -c "import json; print(json.load(open('$peer_file')).get('airc_home',''))" 2>/dev/null || true)
+  peer_home=$("$(airc_rs_bin)" config get --config "$peer_file" airc_home)
   [ -n "$peer_home" ] && pass "peer record has non-empty airc_home ($peer_home)" \
                       || fail "peer record airc_home is empty — remote_home() fallback would misroute sends"
 
