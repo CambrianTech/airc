@@ -97,16 +97,14 @@ The OS launchd/systemd/HKCU manages start/stop of registered units automatically
   esac
 }
 
-# Resolve the absolute path to airc binary that should run under the daemon.
-# install.sh symlinks $HOME/.local/bin/airc → $AIRC_DIR/airc; we want the
-# real path so a future `airc update` (which mutates $AIRC_DIR/airc in
-# place) is picked up by launchd/systemd without re-installing the unit.
+# Resolve the absolute path to the airc script that should run under the
+# daemon. POSIX install uses ~/.airc/src/airc directly; Windows may still
+# have shim files under BIN_DIR.
 _daemon_airc_path() {
-  local airc_link="${HOME}/.local/bin/airc"
-  if [ -L "$airc_link" ] || [ -x "$airc_link" ]; then
-    echo "$airc_link"
-  elif [ -x "${AIRC_DIR:-$HOME/.airc/src}/airc" ]; then
+  if [ -x "${AIRC_DIR:-$HOME/.airc/src}/airc" ]; then
     echo "${AIRC_DIR:-$HOME/.airc/src}/airc"
+  elif [ -x "${HOME}/.local/bin/airc" ]; then
+    echo "${HOME}/.local/bin/airc"
   else
     echo "/usr/local/bin/airc"  # last-resort guess; install will fail loud if wrong
   fi

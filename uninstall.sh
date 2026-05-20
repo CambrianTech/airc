@@ -9,7 +9,7 @@
 # What it removes:
 #   - running airc processes (via airc teardown --all, if airc is on PATH)
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
-#   - ~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}
+#   - stale POSIX forwarders and Windows shim files under $BIN_DIR
 #   - skill symlinks under ~/.claude/skills/ pointing into the clone
 #   - the clone itself (~/.airc/src or $AIRC_DIR)
 #
@@ -58,7 +58,7 @@ cd "$HOME" 2>/dev/null || cd /
 
 cat <<EOF
 This will remove airc from this machine:
-  binary files      $BIN_DIR/{airc,airc-core,airc-core.exe,airc.cmd,airc.ps1}
+  PATH files        $CLONE_DIR/airc plus stale $BIN_DIR/{airc,airc-core,airc-core.exe,airc.cmd,airc.ps1}
   skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
@@ -159,7 +159,7 @@ if [ -f "$codex_config" ]; then
   fi
 fi
 
-# 4. Binary forwarders on PATH.
+# 4. Stale POSIX forwarders and Windows shim files on PATH.
 removed_bins=0
 for f in airc airc-core airc-core.exe airc.cmd airc.ps1; do
   if [ -L "$BIN_DIR/$f" ] || [ -f "$BIN_DIR/$f" ]; then
@@ -176,7 +176,7 @@ for f in airc airc-core airc-core.exe airc.cmd airc.ps1; do
     fi
   fi
 done
-[ "$removed_bins" -gt 0 ] && ok "Removed $removed_bins binary forwarder(s) from $BIN_DIR"
+[ "$removed_bins" -gt 0 ] && ok "Removed $removed_bins stale PATH file(s) from $BIN_DIR"
 
 # 5. Clone dir. Last, since the steps above call into airc + read
 # from the clone for the skill walk. Once this runs, `airc` is gone.

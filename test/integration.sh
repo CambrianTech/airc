@@ -4431,7 +4431,7 @@ scenario_invite_human() {
   # This scenario tests the END-TO-END user flow Joel calls "Toby's
   # case for humans" — friend pastes the block, ends up in the room.
   # We can't actually run the install one-liner in the test (would
-  # touch the real ~/.local/bin/airc and pull from main), but we
+  # touch the real ~/.airc/src/airc and pull from main), but we
   # CAN extract the connect line and execute its substantive part:
   # (1) the paste-block has the right shape, and (2) the connect
   # command in it actually puts a fresh joiner scope into the host's
@@ -4520,12 +4520,12 @@ scenario_invite_human() {
     fail "paste-block gist ($connect_gid) NOT reachable via gh api — the receiver's 'airc connect' would fail"
   fi
 
-  # The paste-block uses absolute paths (~/.local/bin/airc) rather
-  # than bare 'airc'. PATH may not include ~/.local/bin in the same
+  # The paste-block uses absolute paths (~/.airc/src/airc) rather
+  # than bare 'airc'. PATH may not include ~/.airc/src in the same
   # shell that just curl|bash'd install.sh, so bare 'airc' would fail
   # for fresh installs. Absolute paths protect against that.
-  printf '%s\n' "$block" | grep -q "~/.local/bin/airc" \
-    && pass "paste-block uses absolute path (~/.local/bin/airc) so PATH-not-yet-refreshed shells still find airc" \
+  printf '%s\n' "$block" | grep -q "~/.airc/src/airc" \
+    && pass "paste-block uses absolute path (~/.airc/src/airc) so PATH-not-yet-refreshed shells still find airc" \
     || fail "paste-block missing absolute airc path — would fail in a shell that just installed airc"
 
   trap - EXIT

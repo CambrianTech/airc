@@ -427,13 +427,13 @@ _cmd_invite_human() {
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 
 # 2) Join my room.
-~/.local/bin/airc join ${primary_gid}
+~/.airc/src/airc join ${primary_gid}
 
 # 3) Say hi so we know you made it.
-~/.local/bin/airc msg "hello, I'm \$(whoami)"
+~/.airc/src/airc msg "hello, I'm \$(whoami)"
 
 # 4) When you're done, leave cleanly.
-#    ~/.local/bin/airc part
+#    ~/.airc/src/airc part
 PASTE
 }
 

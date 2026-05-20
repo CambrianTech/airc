@@ -52,7 +52,7 @@ airc invite --human
 Prints a multi-line shell-runnable paste-block. The block includes:
 
 1. The canonical curl|bash install one-liner — safe to re-run if they already have airc.
-2. `airc join <gist-id>` using the absolute path `~/.local/bin/airc` (PATH may not include it in the same shell that just installed airc).
+2. `airc join <gist-id>` using the absolute path `~/.airc/src/airc` (PATH may not include it in the same shell that just installed airc).
 3. A "say hi" first-message hint that preserves literal `$(whoami)` so it expands on the receiver's shell, not the host's.
 4. A clean-exit hint (`airc part`).
 
