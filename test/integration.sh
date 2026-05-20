@@ -4075,7 +4075,6 @@ scenario_gist_rotates_under_size_limit() {
   fi
 
   cleanup_all
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
 
   # Build a synthetic messages.jsonl with N lines (each ~300 bytes) so
   # total content is right at the rotation threshold. Then create a
@@ -4512,7 +4511,6 @@ scenario_bearer_gh() {
   fi
 
   cleanup_all
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
 
   # Create a private gist with a non-empty seed line. gh refuses gists
   # whose only file is blank (or even a bare newline). The bearer's
@@ -4542,33 +4540,27 @@ scenario_bearer_gh() {
   local marker="gh-bearer-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
 
-  # Send via GhBearer.send (through the resolver, asserts kind=gh).
+  # Send via the Rust bearer CLI. This is the same gh path airc msg uses.
   local send_out
-  send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
-import sys
-sys.path.insert(0, '$_lib_dir')
-from airc_core.bearer_resolver import resolve
+  send_out=$(printf '%s' "$probe" | AIRC_DISABLE_LOCAL_BUS=1 "$(airc_rs_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
+  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
 
-bearer = resolve({'room_gist_id': '$gist_id'})
-print(f'KIND={bearer.KIND}')
-bearer.open('alpha')
-out = bearer.send('alpha', 'general', b'$probe')
-print(f'SEND_KIND={out.kind}')
-if out.detail:
-    print(f'SEND_DETAIL={out.detail}')
-bearer.close()
-" 2>&1)
-
-  if echo "$send_out" | grep -q '^KIND=gh$'; then
-    pass "resolver picks GhBearer for room_gist_id-only peer_meta"
+  if "$(airc_rs_bin)" bearer kinds | grep -qx 'gh'; then
+    pass "Rust bearer registry exposes gh"
   else
-    fail "resolver did NOT pick GhBearer (got: $send_out)"
+    fail "Rust bearer registry missing gh"
     return
   fi
-  if echo "$send_out" | grep -q '^SEND_KIND=delivered$'; then
-    pass "GhBearer.send returns delivered"
+  if [ "$send_kind" = "secondary_rate_limit" ]; then
+    echo "  (skipped — gh secondary rate limit/backoff active; local bus disabled so remote delivery is not falsely accepted)"
+    trap - EXIT
+    _bearer_gh_cleanup
+    cleanup_all
+    return
+  elif [ "$send_kind" = "delivered" ]; then
+    pass "airc-rs bearer send returns delivered"
   else
-    fail "GhBearer.send did not deliver (got: $send_out)"
+    fail "airc-rs bearer send did not deliver (got: $send_out)"
     return
   fi
 
@@ -4582,40 +4574,21 @@ bearer.close()
     return
   fi
 
-  # Now exercise recv_stream: append a SECOND probe to the gist via gh
-  # CLI directly (simulating another peer's send), then verify
-  # GhBearer.recv_stream picks it up. Use poll_interval=1 to keep the
-  # test fast — production default is 15s.
+  # Now exercise recv: append a SECOND probe to the gist via gh CLI
+  # directly (simulating another peer's send), then verify airc-rs
+  # bearer recv picks it up. Use poll_interval=1 to keep the test fast
+  # — production default is 15s.
   local marker2="gh-bearer-recv-marker-$(date +%s%N)"
   local probe2='{"from":"beta","to":"all","ts":"2026-04-29T00:00:01Z","channel":"general","msg":"'"$marker2"'","sig":"x"}'
   local recv_out; recv_out=$(mktemp -t airc-it-bg-recv.XXXXXX)
-
   local recv_err; recv_err=$(mktemp -t airc-it-bg-recv-err.XXXXXX)
-  PYTHONPATH="$_lib_dir" python3 -c "
-import sys, signal, time
-sys.path.insert(0, '$_lib_dir')
-from airc_core.bearer_resolver import resolve
-
-bearer = resolve({'room_gist_id': '$gist_id', 'poll_interval': 1})
-bearer.open('alpha')
-
-signal.alarm(30)
-out = open('$recv_out', 'w', buffering=1)
-try:
-    for ev in bearer.recv_stream():
-        env = ev.bearer_metadata.get('envelope', {})
-        if env.get('msg') == '$marker2':
-            live = bearer.liveness('alpha')
-            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 30
-            out.write('FOUND\n')
-            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
-            break
-except Exception as e:
-    out.write(f'ERROR: {e}\n')
-finally:
-    out.close()
-    bearer.close()
-" >/dev/null 2>"$recv_err" &
+  local recv_state; recv_state=$(mktemp -t airc-it-bg-state.XXXXXX)
+  local recv_offset; recv_offset=$(mktemp -t airc-it-bg-offset.XXXXXX); rm -f "$recv_offset"
+  AIRC_DISABLE_LOCAL_BUS=1 AIRC_GH_POLL_INTERVAL=1 "$(airc_rs_bin)" bearer recv alpha \
+    --room-gist-id "$gist_id" \
+    --offset-file "$recv_offset" \
+    --state-file "$recv_state" \
+    >"$recv_out" 2>"$recv_err" &
   local recv_pid=$!
 
   # Give the bearer's first poll a beat, then append the marker.
@@ -4643,22 +4616,27 @@ finally:
   local i
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     sleep 1
-    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+    grep -q "$marker2" "$recv_out" 2>/dev/null && break
   done
-  wait "$recv_pid" 2>/dev/null
+  kill "$recv_pid" 2>/dev/null || true
+  wait "$recv_pid" 2>/dev/null || true
 
-  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
-    pass "GhBearer.recv_stream picked up the appended marker"
+  if grep -q "$marker2" "$recv_out" 2>/dev/null; then
+    pass "airc-rs bearer recv picked up the appended marker"
   else
-    fail "GhBearer.recv_stream did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
+    fail "airc-rs bearer recv did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
   fi
-  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
-    pass "GhBearer.liveness reports fresh ts after recv event"
+  local recv_kind; recv_kind=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+  local recv_sender; recv_sender=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .last_sender 2>/dev/null)
+  local recv_ts; recv_ts=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .last_recv_ts 2>/dev/null)
+  if [ "$recv_kind" = "gh" ] && [ "$recv_sender" = "beta" ] && \
+     awk "BEGIN { exit !(($recv_ts > 0) && ($(date +%s) - $recv_ts < 30)) }" 2>/dev/null; then
+    pass "airc-rs bearer state reports fresh gh recv event"
   else
-    fail "GhBearer.liveness not fresh (out: $(cat "$recv_out" 2>/dev/null))"
+    fail "airc-rs bearer state not fresh (state: $(cat "$recv_state" 2>/dev/null))"
   fi
 
-  rm -f "$recv_out" "$recv_err"
+  rm -f "$recv_out" "$recv_err" "$recv_state" "$recv_offset" "$recv_offset.local.bytes"
   # cleanup
   trap - EXIT
   _bearer_gh_cleanup
