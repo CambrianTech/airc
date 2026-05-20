@@ -29,7 +29,7 @@ struct MessagePresence {
 pub fn run_peers(default_home: &Path, args: CollaborationScopeArgs) -> Result<(), Box<dyn Error>> {
     let home = args.home.as_deref().unwrap_or(default_home);
     let peers = peer_records(home);
-    let presence = message_presence(home);
+    let presence = message_presence(home, &args.my_name, &args.client_id);
     if peers.is_empty() {
         print_broadcast_or_empty(&presence, &args.my_name);
         return Ok(());
@@ -122,14 +122,14 @@ fn peer_record_from_path(path: &Path) -> Option<PeerRecord> {
     })
 }
 
-fn message_presence(home: &Path) -> MessagePresence {
+fn message_presence(home: &Path, my_name: &str, my_client_id: &str) -> MessagePresence {
     let mut presence = MessagePresence::default();
     let raw = fs::read_to_string(home.join("messages.jsonl")).unwrap_or_default();
     for message in raw
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
-        let Some(who) = message.get("from").and_then(Value::as_str) else {
+        let Some(who) = message_sender(&message, my_name, my_client_id) else {
             continue;
         };
         let Some(ts) = message.get("ts").and_then(Value::as_str).and_then(epoch) else {
@@ -141,11 +141,29 @@ fn message_presence(home: &Path) -> MessagePresence {
             &mut presence.last_message
         };
         target
-            .entry(who.to_string())
+            .entry(who)
             .and_modify(|current| *current = (*current).max(ts))
             .or_insert(ts);
     }
     presence
+}
+
+fn message_sender(message: &Value, my_name: &str, my_client_id: &str) -> Option<String> {
+    let sender = message.get("from").and_then(Value::as_str)?;
+    let client_id = message
+        .get("client_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !my_client_id.is_empty() && client_id == my_client_id {
+        return None;
+    }
+    if sender == my_name {
+        if client_id.is_empty() {
+            return None;
+        }
+        return Some(format!("{sender} [{client_id}]"));
+    }
+    Some(sender.to_string())
 }
 
 fn print_peer_records(home: &Path, peers: &[PeerRecord], presence: &MessagePresence) {
@@ -331,5 +349,22 @@ mod tests {
         let rows = broadcast_rows(&presence, &rendered, "me");
 
         assert_eq!(rows, vec![("alice".to_string(), now)]);
+    }
+
+    #[test]
+    fn message_presence_keeps_same_name_different_client() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("messages.jsonl"),
+            r#"{"from":"me","client_id":"mine","ts":"2026-05-19T12:00:00Z"}"#.to_string()
+                + "\n"
+                + r#"{"from":"me","client_id":"peer-tab","ts":"2026-05-19T12:00:01Z"}"#,
+        )
+        .unwrap();
+
+        let presence = message_presence(dir.path(), "me", "mine");
+
+        assert!(!presence.last_message.contains_key("me"));
+        assert!(presence.last_message.contains_key("me [peer-tab]"));
     }
 }

@@ -2883,7 +2883,7 @@ JSON
     || fail "doctor --health did not accept broadcast peer presence ($doctor_out)"
 
   peers_out=$(AIRC_HOME="$home" "$AIRC" peers 2>&1)
-  echo "$peers_out" | grep -q 'remote-agent → broadcast room' \
+  echo "$peers_out" | grep -q 'remote-agent -> broadcast room' \
     && pass "airc peers falls back to recent broadcast-only traffic" \
     || fail "airc peers hid recent remote traffic when peer records were empty ($peers_out)"
 
@@ -2898,7 +2898,7 @@ JSON
     && pass "doctor distinguishes same-nick peers by client_id" \
     || fail "doctor treated same-nick peer traffic as self ($doctor_out)"
   peers_out=$(AIRC_CLIENT_ID="agent:self" AIRC_HOME="$home" "$AIRC" peers 2>&1)
-  echo "$peers_out" | grep -q 'solo-host \[agent:other\] → broadcast room' \
+  echo "$peers_out" | grep -q 'solo-host \[agent:other\] -> broadcast room' \
     && pass "airc peers lists same-nick broadcast peer by client_id" \
     || fail "airc peers hid same-nick broadcast peer ($peers_out)"
 
@@ -2906,7 +2906,7 @@ JSON
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$home/messages.jsonl"
   local whois_out
   whois_out=$(AIRC_HOME="$home" "$AIRC" whois remote-agent 2>&1)
-  echo "$whois_out" | grep -q 'role: *broadcast peer' \
+  echo "$whois_out" | grep -q 'role: *observed room participant' \
     && pass "airc whois returns limited identity for broadcast peer" \
     || fail "airc whois did not resolve broadcast peer ($whois_out)"
 

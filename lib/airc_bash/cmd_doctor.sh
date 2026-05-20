@@ -395,8 +395,9 @@ _doctor_health() {
   local issues=0 warns=0
   local now; now=$(date +%s 2>/dev/null || echo 0)
 
-  # ── gh API headroom (rate-limit). Cheap; reveals whether we're near
-  # the cliff that wedged the bus pre-#416/#419.
+  # ── gh API headroom (rate-limit). GitHub is rendezvous/bootstrap
+  # infrastructure, not the live-health source of truth. A local or LAN
+  # mesh must stay healthy while gh is throttled, offline, or backing off.
   if command -v gh >/dev/null 2>&1; then
     local rate_json
     if rate_json=$(airc_gh_rate_limit_json_cached); then
@@ -417,21 +418,20 @@ _doctor_health() {
         printf "  [info] gh rate_limit reachable but parse failed (skipping)\n"
       fi
     else
-      printf "  [BLOCKED] gh API not reachable — can't probe rate-limit\n"
-      printf "         Fix: airc doctor (full env probe will diagnose)\n"
-      issues=$((issues+1))
+      printf "  [WARN] gh API not reachable — GitHub rendezvous/bootstrap unavailable\n"
+      printf "         Live local/LAN transport health is evaluated below\n"
+      warns=$((warns+1))
     fi
   fi
 
-  # ── gh request governor. This is the product-facing surface for the
-  # per-user cross-process guard. Keep `airc gh-audit` as an advanced
-  # escape hatch, but doctor owns the normal diagnosis so users/agents
-  # don't need another public verb.
+  # ── gh request governor. This protects the GitHub adapter only. It must
+  # never make same-machine or LAN chat look down when bearer/local health
+  # proves the live bus is still moving.
   local _gov_rc=0 _gov_out
   _gov_out=$("$(airc_rs_bin)" gh doctor --count 80 2>&1) || _gov_rc=$?
   printf '%s\n' "$_gov_out"
   case "$_gov_out" in
-    *"[BLOCKED]"*) issues=$((issues+1)) ;;
+    *"[BLOCKED]"*) warns=$((warns+1)) ;;
     *) [ "$_gov_rc" -ne 0 ] && warns=$((warns+1)) ;;
   esac
 
