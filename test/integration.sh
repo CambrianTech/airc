@@ -4084,21 +4084,12 @@ scenario_gist_rotates_under_size_limit() {
   # total content is right at the rotation threshold. Then create a
   # gist seeded with that content.
   local seed; seed=$(mktemp -d -t airc-it-rot-seed.XXXXXX)
-  python3 - "$seed/messages.jsonl" <<'PYEOF'
-import sys, json
-out = sys.argv[1]
-with open(out, "w") as f:
-    for i in range(50):
-        env = {
-            "from": "seed",
-            "to": "all",
-            "ts": f"2026-04-29T00:00:{i:02d}Z",
-            "channel": "general",
-            "msg": f"line {i:04d} " + "x" * 200,
-            "sig": "x",
-        }
-        f.write(json.dumps(env) + "\n")
-PYEOF
+  local filler; filler=$(printf '%0200d' 0 | tr '0' 'x')
+  local i
+  for i in $(seq 0 49); do
+    printf '{"from":"seed","to":"all","ts":"2026-04-29T00:00:%02dZ","channel":"general","msg":"line %04d %s","sig":"x"}\n' \
+      "$i" "$i" "$filler" >> "$seed/messages.jsonl"
+  done
   if [ ! -s "$seed/messages.jsonl" ]; then
     fail "could not generate seed messages.jsonl"
     rm -rf "$seed"; return
@@ -4124,9 +4115,24 @@ PYEOF
   # ≈ 12.5KB) far exceeds the threshold; one send rotates.
   local marker="rot-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"rotation-test","msg":"'"$marker"'","sig":"x"}'
-  AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
+  local send_out
+  send_out=$(AIRC_DISABLE_LOCAL_BUS=1 AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
     "$(airc_rs_bin)" bearer send all rotation-test \
-      --room-gist-id "$gist_id" <<< "$probe" >/dev/null 2>&1
+      --room-gist-id "$gist_id" <<< "$probe" 2>&1)
+  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+  if [ "$send_kind" = "secondary_rate_limit" ]; then
+    echo "  (skipped — gh secondary rate limit/backoff active; local bus disabled so rotation is not falsely accepted)"
+    trap - EXIT
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    cleanup_all
+    return
+  elif [ "$send_kind" != "delivered" ]; then
+    fail "rotation send did not deliver (got: $send_out)"
+    trap - EXIT
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    cleanup_all
+    return
+  fi
 
   sleep 1
   local post_content; post_content=$(gh api "gists/$gist_id" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
