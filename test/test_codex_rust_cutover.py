@@ -85,6 +85,21 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("AIRC_PYTHON", body)
         self.assertNotIn("python3", body)
 
+    def test_integration_top_level_config_edits_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        queue_start = source.index("scenario_queue()")
+        queue_end = source.index("scenario_status()", queue_start)
+        queue_body = source[queue_start:queue_end]
+        teardown_start = source.index("airc nick post-sanitization")
+        teardown_end = source.index("cleanup_all", teardown_start)
+        teardown_body = source[teardown_start:teardown_end]
+
+        self.assertIn('"$(airc_rs_bin)" config get --config /tmp/airc-it-q-j/state/config.json host_target', queue_body)
+        self.assertIn('"$(airc_rs_bin)" config set --config /tmp/airc-it-q-j/state/config.json', queue_body)
+        self.assertIn('"$(airc_rs_bin)" config get --config "$home/state/config.json" name', teardown_body)
+        self.assertNotIn("python3 -c", queue_body)
+        self.assertNotIn("python3 -c", teardown_body)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 

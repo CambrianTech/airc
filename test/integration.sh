@@ -734,16 +734,11 @@ scenario_queue() {
 
   # Snapshot the real host_target, then flip to an unreachable address.
   local real_target
-  real_target=$(python3 -c "import json; print(json.load(open('/tmp/airc-it-q-j/state/config.json'))['host_target'])")
+  real_target=$("$(airc_rs_bin)" config get --config /tmp/airc-it-q-j/state/config.json host_target)
   [ -n "$real_target" ] || { fail "no host_target recorded in joiner config"; return; }
 
-  python3 -c "
-import json
-p = '/tmp/airc-it-q-j/state/config.json'
-c = json.load(open(p))
-c['host_target'] = 'nobody@198.51.100.99'
-json.dump(c, open(p, 'w'))
-"
+  "$(airc_rs_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
+    --key host_target --value nobody@198.51.100.99
   # Also fake the peer record so resolution doesn't fail on @qhost
   echo '{"name":"qhost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' \
     > /tmp/airc-it-q-j/state/peers/qhost.json
@@ -765,13 +760,8 @@ json.dump(c, open(p, 'w'))
     || fail "send during outage: no [QUEUED] marker in local messages.jsonl"
 
   # ── Recovery: restore real host_target, wait for flush loop ─────────
-  python3 -c "
-import json
-p = '/tmp/airc-it-q-j/state/config.json'
-c = json.load(open(p))
-c['host_target'] = '$real_target'
-json.dump(c, open(p, 'w'))
-"
+  "$(airc_rs_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
+    --key host_target --value "$real_target"
   pass "joiner: host_target restored (recovery simulation)"
 
   # Flush loop on joiner polls every ~5s; give up to 25s.
@@ -1355,7 +1345,7 @@ scenario_identity() {
   # nick that would have triggered the bug and asserting the stored
   # name has no leading dash.
   AIRC_HOME="$home/state" "$AIRC" nick ".dottyname" >/dev/null 2>&1 || true
-  local renamed; renamed=$(python3 -c "import json; print(json.load(open('$home/state/config.json')).get('name',''))" 2>/dev/null)
+  local renamed; renamed=$("$(airc_rs_bin)" config get --config "$home/state/config.json" name)
   case "$renamed" in
     -*) fail "airc nick produced leading-dash name '$renamed' — sanitization regression" ;;
     "") fail "airc nick wrote empty name — sanitization regression" ;;
