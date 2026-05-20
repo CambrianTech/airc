@@ -17,8 +17,8 @@ mod tests;
 
 pub use headers::{
     work_event_headers, HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID,
-    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_REPO,
-    HEADER_FORGE_WORK_WORKSPACE_ID,
+    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID,
+    HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
 };
 
 pub const BODY_HINT_FORGE_WORK_EVENT: &str = "forge.work.event.v1";
@@ -93,6 +93,9 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::WorkspaceAllocated(_) => "workspace_allocated",
         WorkEvent::WorkspaceHeartbeat(_) => "workspace_heartbeat",
         WorkEvent::WorkspaceReleased(_) => "workspace_released",
+        WorkEvent::WorkspacePressureReported(_) => "workspace_pressure_reported",
+        WorkEvent::WorkspaceDrainRequested(_) => "workspace_drain_requested",
+        WorkEvent::WorkspaceDrainCompleted(_) => "workspace_drain_completed",
         WorkEvent::PullRequestLinked(_) => "pull_request_linked",
         WorkEvent::PullRequestMerged(_) => "pull_request_merged",
         WorkEvent::HygieneReportRecorded(_) => "hygiene_report_recorded",

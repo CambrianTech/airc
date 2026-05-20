@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use airc_core::PeerId;
 
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
-use crate::model::{BranchName, CardState, HygieneReport, LaneState, Priority, PullRequestRef};
+use crate::model::{
+    BranchName, CardState, DrainCandidate, DrainOutcome, HygieneReport, LaneState, PressureLevel,
+    Priority, PullRequestRef,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -21,6 +24,9 @@ pub enum WorkEvent {
     WorkspaceAllocated(WorkspaceAllocated),
     WorkspaceHeartbeat(WorkspaceHeartbeat),
     WorkspaceReleased(WorkspaceReleased),
+    WorkspacePressureReported(WorkspacePressureReported),
+    WorkspaceDrainRequested(WorkspaceDrainRequested),
+    WorkspaceDrainCompleted(WorkspaceDrainCompleted),
     PullRequestLinked(PullRequestLinked),
     PullRequestMerged(PullRequestMerged),
     HygieneReportRecorded(HygieneReportRecorded),
@@ -42,6 +48,9 @@ impl WorkEvent {
             WorkEvent::WorkspaceAllocated(e) => e.allocated_at_ms,
             WorkEvent::WorkspaceHeartbeat(e) => e.heartbeat_at_ms,
             WorkEvent::WorkspaceReleased(e) => e.released_at_ms,
+            WorkEvent::WorkspacePressureReported(e) => e.reported_at_ms,
+            WorkEvent::WorkspaceDrainRequested(e) => e.requested_at_ms,
+            WorkEvent::WorkspaceDrainCompleted(e) => e.completed_at_ms,
             WorkEvent::PullRequestLinked(e) => e.linked_at_ms,
             WorkEvent::PullRequestMerged(e) => e.merged_at_ms,
             WorkEvent::HygieneReportRecorded(e) => e.report.recorded_at_ms,
@@ -146,6 +155,55 @@ pub struct WorkspaceHeartbeat {
 pub struct WorkspaceReleased {
     pub workspace_id: WorkspaceId,
     pub released_at_ms: u64,
+}
+
+/// Disk pressure observation for a workspace. Telemetry event; the
+/// emitter is whichever peer has visibility into the workspace's disk
+/// state. Workspace-id keyed and intentionally independent of the
+/// card/claim lease flow — pressure can be observed and reported on
+/// any known `WorkspaceId`, leased or not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePressureReported {
+    pub workspace_id: WorkspaceId,
+    pub repo: RepoId,
+    pub reporter: PeerId,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub level: PressureLevel,
+    pub reported_at_ms: u64,
+}
+
+/// Drain request. Captures the candidate list at decision time so the
+/// completion outcome can be compared against intent in record/replay.
+/// Workspace-id keyed; no card/claim coupling required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDrainRequested {
+    pub workspace_id: WorkspaceId,
+    pub repo: RepoId,
+    pub requester: PeerId,
+    /// Stable identifier of the policy rule that emitted this request
+    /// (e.g. `"default.rebuildable"`, `"user.aggressive"`). Lets the
+    /// runtime correlate outcomes to rules over time.
+    pub policy_rule_id: String,
+    /// True = inspection only, no paths are touched. Completion must
+    /// echo `dry_run = true` and `paths_touched` must be empty.
+    pub dry_run: bool,
+    pub candidates: Vec<DrainCandidate>,
+    pub requested_at_ms: u64,
+}
+
+/// Drain completion. Honest about partial outcomes — see [`DrainOutcome`]
+/// for the bytes/paths/errors fields. `performer` records which peer
+/// actually executed the cleanup so audit can attribute reclaim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDrainCompleted {
+    pub workspace_id: WorkspaceId,
+    pub repo: RepoId,
+    pub performer: PeerId,
+    pub policy_rule_id: String,
+    pub dry_run: bool,
+    pub outcome: DrainOutcome,
+    pub completed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

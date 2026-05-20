@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 
+use crate::event::{WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspacePressureReported};
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 use crate::model::{HygieneReport, LaneState, WorkCard, WorkspaceLease};
 
@@ -16,8 +17,50 @@ pub struct WorkBoardProjection {
     pub(super) cards: BTreeMap<WorkCardId, WorkCard>,
     pub(super) lanes: BTreeMap<LaneId, LaneRecord>,
     pub(super) workspaces: BTreeMap<WorkspaceId, WorkspaceRecord>,
+    /// Latest pressure observation per workspace. Independent of
+    /// [`WorkspaceRecord`] — pressure is keyed by `WorkspaceId`
+    /// regardless of lease state, so consumers without leases can
+    /// participate in hygiene.
+    pub(super) workspace_pressure: BTreeMap<WorkspaceId, WorkspacePressureReported>,
+    /// In-flight drain requests, keyed by `(workspace_id, policy_rule_id)`.
+    /// Removed when the matching `WorkspaceDrainCompleted` lands. Same
+    /// rule cannot have two concurrent requests on one workspace; if it
+    /// does, the latter request replaces the former — that's a policy
+    /// bug the projection surfaces by overwriting, not by erroring.
+    pub(super) pending_drains: BTreeMap<(WorkspaceId, String), WorkspaceDrainRequested>,
+    /// Append-only history of completed drains across all workspaces.
+    /// Consumers paginate / filter by `workspace_id` via accessors.
+    pub(super) drain_history: Vec<WorkspaceDrainCompleted>,
     pub(super) manager_hats: BTreeMap<RepoId, ManagerHat>,
     pub(super) hygiene_reports: Vec<HygieneReport>,
+}
+
+impl WorkBoardProjection {
+    /// Latest pressure observation for a workspace, if any reporter has
+    /// emitted one.
+    pub fn workspace_pressure(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<&WorkspacePressureReported> {
+        self.workspace_pressure.get(workspace_id)
+    }
+
+    /// Drain requests awaiting completion for a workspace.
+    pub fn pending_drains_for(&self, workspace_id: &WorkspaceId) -> Vec<&WorkspaceDrainRequested> {
+        self.pending_drains
+            .iter()
+            .filter(|((ws, _), _)| ws == workspace_id)
+            .map(|(_, request)| request)
+            .collect()
+    }
+
+    /// Completed drains for a workspace, in event-stream order.
+    pub fn drain_history_for(&self, workspace_id: &WorkspaceId) -> Vec<&WorkspaceDrainCompleted> {
+        self.drain_history
+            .iter()
+            .filter(|d| &d.workspace_id == workspace_id)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,9 @@
 use super::*;
 use crate::event::*;
-use crate::model::{BranchName, CardState, Priority, PullRequestRef, WorkspaceStatus};
+use crate::model::{
+    BranchName, CardState, DrainCandidate, DrainCandidateCategory, DrainOutcome, PressureLevel,
+    Priority, PullRequestRef, WorkspaceStatus,
+};
 
 fn repo() -> RepoId {
     RepoId::new("CambrianTech/airc").unwrap()
@@ -168,6 +171,132 @@ fn workspace_lease_lifecycle_projects_status_and_disk() {
     assert_eq!(workspace.lease.status, WorkspaceStatus::Released);
     assert_eq!(workspace.lease.disk_bytes, Some(4096));
     assert_eq!(workspace.lease.released_at_ms, Some(5));
+}
+
+#[test]
+fn pressure_then_drain_request_then_completion_flows_through_projection() {
+    let workspace_id = WorkspaceId::from_u128(42);
+    let reporter = peer(7);
+    let mut projection = WorkBoardProjection::new();
+
+    // A reporter emits pressure on a workspace_id with no lease record.
+    // The projection accepts it — pressure is keyed by workspace_id
+    // independent of the card+claim lease flow.
+    projection
+        .apply(&WorkEvent::WorkspacePressureReported(
+            WorkspacePressureReported {
+                workspace_id,
+                repo: repo(),
+                reporter,
+                total_bytes: 1_000_000_000,
+                available_bytes: 50_000_000,
+                level: PressureLevel::High,
+                reported_at_ms: 1,
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        projection.workspace_pressure(&workspace_id).unwrap().level,
+        PressureLevel::High,
+    );
+
+    // Policy emits a drain request listing what would be reclaimed.
+    let candidates = vec![
+        DrainCandidate {
+            path: "/tmp/work/target".to_string(),
+            category: DrainCandidateCategory::RebuildableCache,
+            est_bytes: 800_000_000,
+        },
+        DrainCandidate {
+            path: "/tmp/work/.gradle".to_string(),
+            category: DrainCandidateCategory::DownloadedDependency,
+            est_bytes: 100_000_000,
+        },
+    ];
+    projection
+        .apply(&WorkEvent::WorkspaceDrainRequested(
+            WorkspaceDrainRequested {
+                workspace_id,
+                repo: repo(),
+                requester: reporter,
+                policy_rule_id: "default.rebuildable".to_string(),
+                dry_run: false,
+                candidates: candidates.clone(),
+                requested_at_ms: 2,
+            },
+        ))
+        .unwrap();
+    let pending = projection.pending_drains_for(&workspace_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].candidates, candidates);
+
+    // Cleanup completes. Honest outcome — partial success modeled.
+    projection
+        .apply(&WorkEvent::WorkspaceDrainCompleted(
+            WorkspaceDrainCompleted {
+                workspace_id,
+                repo: repo(),
+                performer: reporter,
+                policy_rule_id: "default.rebuildable".to_string(),
+                dry_run: false,
+                outcome: DrainOutcome {
+                    bytes_reclaimed: 750_000_000,
+                    paths_touched: vec!["/tmp/work/target".to_string()],
+                    paths_skipped: vec!["/tmp/work/.gradle".to_string()],
+                    errors: vec!["gradle lock contention".to_string()],
+                },
+                completed_at_ms: 3,
+            },
+        ))
+        .unwrap();
+
+    assert!(
+        projection.pending_drains_for(&workspace_id).is_empty(),
+        "completion must clear matching pending request",
+    );
+    let history = projection.drain_history_for(&workspace_id);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].outcome.bytes_reclaimed, 750_000_000);
+    assert_eq!(history[0].outcome.paths_skipped, vec!["/tmp/work/.gradle"]);
+    assert_eq!(history[0].outcome.errors.len(), 1);
+}
+
+#[test]
+fn drain_candidate_safe_by_default_is_conservative() {
+    assert!(DrainCandidateCategory::RebuildableCache.safe_by_default());
+    assert!(DrainCandidateCategory::DownloadedDependency.safe_by_default());
+    // Everything else requires opt-in. No silent destruction.
+    assert!(!DrainCandidateCategory::GeneratedArtifact.safe_by_default());
+    assert!(!DrainCandidateCategory::DockerLayer.safe_by_default());
+    assert!(!DrainCandidateCategory::ModelCache.safe_by_default());
+    assert!(!DrainCandidateCategory::TraceArtifact.safe_by_default());
+    assert!(!DrainCandidateCategory::Unknown.safe_by_default());
+}
+
+#[test]
+fn two_concurrent_drain_requests_for_same_workspace_and_rule_overwrites() {
+    // Surfacing policy bug by overwrite (not erroring) — the projection
+    // is a derived view, errors here would hide the bug from observers.
+    let workspace_id = WorkspaceId::from_u128(99);
+    let mut projection = WorkBoardProjection::new();
+    let req = |requested_at_ms| WorkspaceDrainRequested {
+        workspace_id,
+        repo: repo(),
+        requester: peer(1),
+        policy_rule_id: "default.rebuildable".to_string(),
+        dry_run: false,
+        candidates: vec![],
+        requested_at_ms,
+    };
+    projection
+        .apply(&WorkEvent::WorkspaceDrainRequested(req(10)))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::WorkspaceDrainRequested(req(20)))
+        .unwrap();
+    let pending = projection.pending_drains_for(&workspace_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].requested_at_ms, 20);
 }
 
 #[test]

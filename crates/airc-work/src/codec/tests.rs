@@ -3,8 +3,9 @@ use airc_protocol::{FrameKind, HEADER_FORGE_BODY_HINT};
 
 use super::*;
 use crate::{
-    BranchName, CardCreated, ClaimId, LaneId, Priority, RepoId, WorkCardId, WorkEvent, WorkspaceId,
-    WorkspaceRequested,
+    BranchName, CardCreated, ClaimId, DrainCandidate, DrainCandidateCategory, DrainOutcome, LaneId,
+    PressureLevel, Priority, RepoId, WorkCardId, WorkEvent, WorkspaceDrainCompleted,
+    WorkspaceDrainRequested, WorkspaceId, WorkspacePressureReported, WorkspaceRequested,
 };
 
 fn card_created() -> WorkEvent {
@@ -80,6 +81,99 @@ fn decode_rejects_wrong_hint_and_non_json_body() {
         decode_work_event(&headers, Some(&Body::Binary(vec![1, 2, 3]))),
         Err(WorkEventCodecError::NonJsonBody)
     ));
+}
+
+#[test]
+fn drain_events_roundtrip_and_carry_workspace_repo_and_policy_rule_headers() {
+    let workspace_id = WorkspaceId::from_u128(0xa1);
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+    let reporter = PeerId::from_u128(0xb2);
+    let policy_rule_id = "default.rebuildable".to_string();
+
+    let pressure = WorkEvent::WorkspacePressureReported(WorkspacePressureReported {
+        workspace_id,
+        repo: repo.clone(),
+        reporter,
+        total_bytes: 1_000_000,
+        available_bytes: 50_000,
+        level: PressureLevel::High,
+        reported_at_ms: 1,
+    });
+    let (headers, body) = encode_work_event(&pressure).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), pressure);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("workspace_pressure_reported")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_WORKSPACE_ID)
+            .map(String::as_str),
+        Some("00000000-0000-0000-0000-0000000000a1")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_REPO).map(String::as_str),
+        Some("CambrianTech/airc")
+    );
+
+    let request = WorkEvent::WorkspaceDrainRequested(WorkspaceDrainRequested {
+        workspace_id,
+        repo: repo.clone(),
+        requester: reporter,
+        policy_rule_id: policy_rule_id.clone(),
+        dry_run: true,
+        candidates: vec![DrainCandidate {
+            path: "/tmp/work/target".to_string(),
+            category: DrainCandidateCategory::RebuildableCache,
+            est_bytes: 500_000,
+        }],
+        requested_at_ms: 2,
+    });
+    let (headers, body) = encode_work_event(&request).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), request);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("workspace_drain_requested")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_POLICY_RULE_ID)
+            .map(String::as_str),
+        Some("default.rebuildable")
+    );
+
+    let completed = WorkEvent::WorkspaceDrainCompleted(WorkspaceDrainCompleted {
+        workspace_id,
+        repo,
+        performer: reporter,
+        policy_rule_id: policy_rule_id.clone(),
+        dry_run: false,
+        outcome: DrainOutcome {
+            bytes_reclaimed: 450_000,
+            paths_touched: vec!["/tmp/work/target".to_string()],
+            paths_skipped: vec![],
+            errors: vec![],
+        },
+        completed_at_ms: 3,
+    });
+    let (headers, body) = encode_work_event(&completed).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), completed);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("workspace_drain_completed")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_POLICY_RULE_ID)
+            .map(String::as_str),
+        Some("default.rebuildable")
+    );
 }
 
 #[test]

@@ -139,6 +139,93 @@ pub struct HygieneReport {
     pub recorded_at_ms: u64,
 }
 
+/// Categorizes drain candidates by destruction-safety. Closed set so
+/// policy code (PR 4 hygiene cleaner) can pattern-match exhaustively.
+///
+/// `Unknown` is the catch-all for anything a future adapter discovers
+/// that doesn't fit existing categories. Default policy MUST treat
+/// `Unknown` as non-rebuildable and refuse to drain without explicit
+/// opt-in — that's the "no silent destruction" half of the drain rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainCandidateCategory {
+    /// e.g. Cargo `target/`, Gradle `build/`, sccache — rebuilt by
+    /// tooling on next invocation. Safe to drain by default.
+    RebuildableCache,
+    /// e.g. compiled artifacts checked into worktrees, generated docs,
+    /// rendered media. Reproducible but the regeneration may be expensive
+    /// or require manual steps. Not safe-by-default.
+    GeneratedArtifact,
+    /// e.g. `~/.cargo/registry`, `~/.npm`, `~/.gradle/caches`, Maven
+    /// local. Re-downloads on next build. Safe to drain by default
+    /// (network cost only).
+    DownloadedDependency,
+    /// Docker image layers + buildkit caches. Re-pulls/rebuilds on next
+    /// docker run. Network + CPU cost; not safe-by-default because the
+    /// rebuild may be slow.
+    DockerLayer,
+    /// Model weights and inference caches. Re-downloads can be very
+    /// large; not safe-by-default.
+    ModelCache,
+    /// Test recordings, Playwright traces, instrumentation captures.
+    /// Often single-purpose; deletion may break in-flight debugging.
+    /// Not safe-by-default.
+    TraceArtifact,
+    /// Unrecognized. Policy must NOT touch by default.
+    Unknown,
+}
+
+impl DrainCandidateCategory {
+    /// Whether the default policy treats this category as safe to drain
+    /// without explicit user confirmation. Conservative by design — only
+    /// rebuildable/downloaded categories are safe-by-default. Anything
+    /// else requires opt-in so policy never silently destroys work.
+    pub fn safe_by_default(self) -> bool {
+        matches!(self, Self::RebuildableCache | Self::DownloadedDependency)
+    }
+}
+
+/// A single drain candidate identified by a workspace inventory pass.
+/// Recorded in `WorkspaceDrainRequested` so the decision is inspectable
+/// after the fact (record/replay).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainCandidate {
+    pub path: String,
+    pub category: DrainCandidateCategory,
+    /// Best-effort size estimate at request time. Actual reclaim shows
+    /// up on the completion event as `DrainOutcome.bytes_reclaimed`.
+    pub est_bytes: u64,
+}
+
+/// Severity of disk pressure. Distinguished so policy can escalate
+/// gracefully (telemetry → drain rebuildable → drain aggressive →
+/// block new work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureLevel {
+    /// Comfortable headroom. Telemetry only.
+    Nominal,
+    /// Approaching policy thresholds; consider draining rebuildable caches.
+    Elevated,
+    /// At policy thresholds; drain rebuildable caches now.
+    High,
+    /// Below safety floor; drain everything safe + require explicit
+    /// confirmation for Unknown/non-rebuildable categories.
+    Critical,
+}
+
+/// Per-drain outcome carried by `WorkspaceDrainCompleted`. Partial
+/// drains are first-class — a drain that reclaimed half its candidates
+/// reports the half that succeeded AND the reasons the rest didn't.
+/// "It worked" without specifics is not an acceptable completion record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainOutcome {
+    pub bytes_reclaimed: u64,
+    pub paths_touched: Vec<String>,
+    pub paths_skipped: Vec<String>,
+    pub errors: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
