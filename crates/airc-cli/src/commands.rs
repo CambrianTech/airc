@@ -6,8 +6,9 @@
 //! grievance §5 / Codex audit finding #4.
 //!
 //! Daemon-host commands construct daemon state directly because they
-//! host the service. Daemon-client commands (`ping`, `status`, `stop`,
-//! `msg`, `inbox`) use `airc_daemon::DaemonClient` directly.
+//! host the service. CLI commands that consume daemon-backed messaging
+//! go through `airc_lib::Airc::attach` so apps and CLI share the same
+//! SDK surface.
 //!
 //! `VerificationPolicy::Strict` is the only policy used in CLI paths.
 
@@ -20,10 +21,9 @@ use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use futures::stream::StreamExt;
 
 use airc_daemon::{
-    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, InboxRequest,
-    LocalIdentity, SendRequest, SubscribeRequest,
+    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, LocalIdentity,
 };
-use airc_lib::{room, Airc, Body, PeerSpec};
+use airc_lib::{Airc, Body, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
 
 /// `init` — open the substrate at `<home>`. `Airc::open` loads or
@@ -242,15 +242,9 @@ pub async fn run_msg(
     socket: PathBuf,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let current = room::load_or_default(home)?;
-    let client = DaemonClient::new(socket);
-    client
-        .send(SendRequest {
-            wire: current.wire,
-            channel: current.channel.as_uuid(),
-            text: text.to_string(),
-        })
-        .await?;
+    let airc = Airc::attach(home, socket).await?;
+    let current = airc.current_room().await?;
+    airc.say(text).await?;
     println!("sent to {} ({}).", current.name, current.channel);
     Ok(())
 }
@@ -262,13 +256,7 @@ pub async fn run_inbox(
     since_event_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let current = room::load_or_default(home)?;
-    let client = DaemonClient::new(socket);
-    client
-        .subscribe(SubscribeRequest {
-            wire: current.wire.clone(),
-        })
-        .await?;
+    let airc = Airc::attach(home, socket).await?;
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
     let since = match (since_lamport, since_event_id) {
@@ -284,27 +272,19 @@ pub async fn run_inbox(
             );
         }
     };
-    let inbox = client
-        .inbox(InboxRequest {
-            since,
-            channel: Some(current.channel),
-            limit,
-        })
-        .await?;
-    if inbox.events.is_empty() {
-        match &inbox.newest {
-            Some(c) => println!(
-                "(no new events; cursor lamport={} event_id={})",
-                c.lamport, c.event_id
-            ),
-            None => println!("(no events yet — store is empty)"),
-        }
+    let effective_limit = limit.unwrap_or(32);
+    let events = match since {
+        Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
+        None => airc.page_recent(effective_limit).await?,
+    };
+    if events.is_empty() {
+        println!("(no events)");
         return Ok(());
     }
-    for event in &inbox.events {
+    for event in &events {
         print_event(event);
     }
-    if let Some(cursor) = inbox.newest {
+    if let Some(cursor) = events.last().map(airc_core::TranscriptEvent::cursor) {
         println!();
         println!(
             "cursor: lamport={} event_id={} — pass both as --since-lamport / --since-event-id",
