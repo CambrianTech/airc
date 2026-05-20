@@ -74,6 +74,17 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.bearer_resolver", body)
         self.assertNotIn("python3", body)
 
+    def test_integration_identity_scaffold_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scaffold_identity()")
+        end = source.index("# airc send from a given home.", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" identity bootstrap-ed25519', body)
+        self.assertNotIn("airc_core.identity", body)
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("python3", body)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 
