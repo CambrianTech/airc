@@ -456,9 +456,20 @@ cmd_codex_hook() {
   shift || true
   case "$sub" in
     user-prompt-submit)
-      "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit \
-        --cursor-file "$AIRC_WRITE_DIR/codex_hook_cursor.json" \
-        "$@"
+      local _has_cursor_file=0
+      local _arg
+      for _arg in "$@"; do
+        case "$_arg" in
+          --cursor-file|--cursor-file=*) _has_cursor_file=1 ;;
+        esac
+      done
+      if [ "$_has_cursor_file" = "1" ]; then
+        "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit "$@"
+      else
+        "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit \
+          --cursor-file "$AIRC_WRITE_DIR/codex_hook_cursor.json" \
+          "$@"
+      fi
       ;;
     install-hooks|uninstall-hooks)
       "$_airc_rs" codex-hook "$sub" "$@"

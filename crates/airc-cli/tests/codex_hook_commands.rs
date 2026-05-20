@@ -139,8 +139,60 @@ fn codex_hook_installer_replaces_legacy_python_hook() {
             .expect("hooks json");
     let commands = hook_commands(&hooks);
     assert!(commands.contains(&"echo existing".to_string()));
-    assert!(commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()));
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with("codex-hook user-prompt-submit")),
+        "installer must add a Rust hook command, got {commands:?}"
+    );
+    assert!(
+        !commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()),
+        "installer should pin the resolved airc-rs executable instead of relying on PATH"
+    );
     assert!(!commands.contains(&"airc codex-hook user-prompt-submit".to_string()));
+}
+
+#[test]
+fn codex_hook_installer_replaces_prior_absolute_rust_hook() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(codex_home.join("config.toml"), "[features]\nhooks = true\n")
+        .expect("write config");
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/old/install/bin/airc-rs codex-hook user-prompt-submit"}]}]}}"#,
+    )
+    .expect("write hooks");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "install-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let hooks: Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("hooks.json")).unwrap())
+            .expect("hooks json");
+    let commands = hook_commands(&hooks);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.ends_with("codex-hook user-prompt-submit"))
+            .count(),
+        1,
+        "install must replace older managed hook commands, got {commands:?}"
+    );
+    assert!(
+        commands[0].contains(env!("CARGO_BIN_EXE_airc-rs")),
+        "hook command should pin current executable, got {:?}",
+        commands
+    );
 }
 
 #[test]
