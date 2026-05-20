@@ -167,35 +167,11 @@ _cmd_lane_list() {
   touch "$registry"
 
   if [ "$output_json" -eq 1 ]; then
-    "$AIRC_PYTHON" - "$registry" <<'PYEOF'
-import json, sys
-items = []
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    for line in f:
-        try:
-            items.append(json.loads(line))
-        except Exception:
-            pass
-print(json.dumps({"lanes": items}, indent=2))
-PYEOF
-    return $?
+    "$(airc_rs_bin)" worktree-lane list --registry "$registry" --json
+    return
   fi
 
-  printf '# airc lanes\n'
-  if [ ! -s "$registry" ]; then
-    printf 'No recorded lanes yet.\n'
-  else
-    "$AIRC_PYTHON" - "$registry" <<'PYEOF'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    for line in f:
-        try:
-            lane = json.loads(line)
-        except Exception:
-            continue
-        print(f"- {lane.get('issue','?')} owner={lane.get('owner','?')} branch={lane.get('branch','?')} dir={lane.get('dir','?')} base={lane.get('base','?')}")
-PYEOF
-  fi
+  "$(airc_rs_bin)" worktree-lane list --registry "$registry"
 }
 
 _cmd_lane_remove() {
@@ -225,32 +201,14 @@ _cmd_lane_remove() {
 
   [ -n "$target" ] || die "lane remove: pass a lane dir or issue ref"
 
-  local registry lane_json
+  local registry
   registry=$(_airc_lane_registry)
-  lane_json=$("$AIRC_PYTHON" - "$registry" "$target" <<'PYEOF'
-import json, os, sys
-registry, target = sys.argv[1:3]
-matches = []
-try:
-    with open(registry, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                lane = json.loads(line)
-            except Exception:
-                continue
-            if target in {lane.get("issue"), lane.get("dir"), os.path.basename(lane.get("dir", ""))}:
-                matches.append(lane)
-except FileNotFoundError:
-    pass
-if not matches:
-    sys.exit(1)
-print(json.dumps(matches[-1]))
-PYEOF
-) || die "lane remove: no recorded lane matches: $target"
+  "$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" >/dev/null \
+    || die "lane remove: no recorded lane matches: $target"
 
   local repo_root lane_dir
-  repo_root=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1])["repo"])' "$lane_json")
-  lane_dir=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1])["dir"])' "$lane_json")
+  repo_root=$("$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" --field repo)
+  lane_dir=$("$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" --field dir)
 
   case "$lane_dir" in
     "$repo_root"|"$repo_root"/*)
@@ -276,11 +234,11 @@ _airc_lane_registry() {
 }
 
 _airc_lane_abs_path() {
-  "$AIRC_PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$1"
+  "$(airc_rs_bin)" worktree-lane abs-path "$1"
 }
 
 _airc_lane_slug() {
-  "$AIRC_PYTHON" -c 'import re,sys; s=re.sub(r"[^A-Za-z0-9._-]+","-",sys.argv[1]).strip("-").lower(); print(s or "lane")' "$1"
+  "$(airc_rs_bin)" worktree-lane slug "$1"
 }
 
 _airc_lane_resolve_base() {
@@ -300,19 +258,14 @@ _airc_lane_record() {
   local registry
   registry=$(_airc_lane_registry)
   mkdir -p "$(dirname "$registry")"
-  "$AIRC_PYTHON" - "$issue_ref" "$repo_root" "$lane_dir" "$branch" "$base" "$owner" >>"$registry" <<'PYEOF'
-import datetime, json, sys
-issue, repo, lane_dir, branch, base, owner = sys.argv[1:7]
-print(json.dumps({
-    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
-    "issue": issue,
-    "repo": repo,
-    "dir": lane_dir,
-    "branch": branch,
-    "base": base,
-    "owner": owner,
-}, sort_keys=True))
-PYEOF
+  "$(airc_rs_bin)" worktree-lane record \
+    --registry "$registry" \
+    --issue "$issue_ref" \
+    --repo "$repo_root" \
+    --dir "$lane_dir" \
+    --branch "$branch" \
+    --base "$base" \
+    --owner "$owner"
 }
 
 _airc_lane_help() {
