@@ -620,8 +620,27 @@ scenario_resilience() {
   # must exit 0 and clear the pidfile.
   [ -f "$td_home/state/airc.pid" ] && fail "dead-pidfile teardown: airc.pid not removed" \
                                    || pass "dead-pidfile teardown: pidfile cleared without wedging"
-  echo "$td_out" | grep -q 'Teardown complete' && pass "dead-pidfile teardown: reached 'Teardown complete'" \
-                                               || fail "dead-pidfile teardown: aborted before completion ($td_out)"
+  echo "$td_out" | grep -Eq 'No airc processes running|Teardown complete' \
+    && pass "dead-pidfile teardown: completed without phantom kill report" \
+    || fail "dead-pidfile teardown: aborted before completion ($td_out)"
+
+  # ── Regression for #831 scoped orphan reaping under canonical path aliases ──
+  # macOS reports /tmp as /private/tmp in canonical scope paths, while live argv
+  # often contains the user's original /tmp spelling. Teardown must match both
+  # through the shared path-variant helper and still leave non-macOS paths alone.
+  local alias_home=/tmp/airc-it-pathalias/state
+  mkdir -p "$alias_home"
+  touch "$alias_home/messages.jsonl"
+  tail -n 0 -F "$alias_home/messages.jsonl" >/tmp/airc-it-pathalias.out 2>/tmp/airc-it-pathalias.err &
+  local alias_tail_pid=$!
+  sleep 0.2
+  AIRC_HOME="$alias_home" "$AIRC" teardown >/dev/null 2>&1
+  if kill -0 "$alias_tail_pid" 2>/dev/null; then
+    kill -9 "$alias_tail_pid" 2>/dev/null || true
+    fail "teardown left scope-path orphan alive across /tmp path alias"
+  else
+    pass "teardown reaps scope-path orphan across /tmp path alias"
+  fi
 
   # ── Regression for #9 peers-with-malformed-record ────────────────────
   # Malformed peer records used to abort the whole loop under set -e.
