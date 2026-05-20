@@ -4710,6 +4710,15 @@ JSON
     fail "airc status did not surface Rust local truth (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
   fi
 
+  local explicit_cursor="$home/explicit-codex-hook-cursor.json"
+  if printf '{"hook_event_name":"UserPromptSubmit"}' | AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" codex-hook user-prompt-submit --cursor-file "$explicit_cursor" --include-self >"$out" 2>"$err" \
+      && grep -q "$marker" "$out" \
+      && [ -f "$explicit_cursor" ]; then
+    pass "codex-hook wrapper respects explicit cursor file on Rust event stream"
+  else
+    fail "codex-hook wrapper explicit cursor failed (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null); cursor: $(cat "$explicit_cursor" 2>/dev/null))"
+  fi
+
   rm -rf "$root"
 }
 

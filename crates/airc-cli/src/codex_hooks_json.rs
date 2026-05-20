@@ -1,20 +1,22 @@
 //! Codex hooks.json mutation for AIRC hook installation.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
 const RUST_HOOK_COMMAND: &str = "airc-rs codex-hook user-prompt-submit";
+const HOOK_COMMAND_SUFFIX: &str = "codex-hook user-prompt-submit";
 const LEGACY_HOOK_COMMAND: &str = "airc codex-hook user-prompt-submit";
 const HOOK_STATUS: &str = "Checking AIRC inbox";
 
-pub fn install(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn install(path: &Path, airc_rs: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let original = read_json(path)?;
     let mut data = ensure_root_object(original);
     let user_prompt = ensure_user_prompt_array(&mut data)?;
     let before = user_prompt.clone();
     remove_managed_hook_entries(user_prompt);
-    user_prompt.push(hook_group());
+    user_prompt.push(hook_group(&hook_command(airc_rs)));
 
     let changed = *user_prompt != before;
     if changed {
@@ -77,21 +79,49 @@ fn remove_managed_hook_entries(groups: &mut Vec<Value>) {
         };
         hooks.retain(|hook| {
             let command = hook.get("command").and_then(Value::as_str);
-            command != Some(RUST_HOOK_COMMAND) && command != Some(LEGACY_HOOK_COMMAND)
+            !is_managed_hook_command(command)
         });
         !hooks.is_empty()
     });
 }
 
-fn hook_group() -> Value {
+fn is_managed_hook_command(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    command == RUST_HOOK_COMMAND
+        || command == LEGACY_HOOK_COMMAND
+        || command.ends_with(HOOK_COMMAND_SUFFIX)
+}
+
+fn hook_group(command: &str) -> Value {
     json!({
         "hooks": [{
             "type": "command",
-            "command": RUST_HOOK_COMMAND,
+            "command": command,
             "timeout": 5,
             "statusMessage": HOOK_STATUS
         }]
     })
+}
+
+fn hook_command(airc_rs: &Path) -> String {
+    format!("{} {HOOK_COMMAND_SUFFIX}", shell_quote_path(airc_rs))
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path_to_string(path);
+    if raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+    {
+        return raw;
+    }
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+fn path_to_string(path: &Path) -> String {
+    PathBuf::from(path).to_string_lossy().into_owned()
 }
 
 fn read_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
