@@ -171,6 +171,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("json.load(sys.stdin).get(\"kind\"", body)
         self.assertNotIn("| python3 -c", body)
 
+    def test_integration_bearer_cli_recv_jsonl_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_bearer_cli_recv()")
+        end = source.index("scenario_gh_send_creates_messages_jsonl()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" gist get .msg', body)
+        self.assertNotIn("json.loads(line)", body)
+        self.assertNotIn("python3 -c", body)
+
     def test_integration_bearer_gist_file_content_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_gh()")
@@ -180,6 +190,20 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" gist file-content --filename messages.jsonl', body)
         self.assertNotIn("json.load(sys.stdin)['files']['messages.jsonl']['content']", body)
         self.assertNotIn("| python3 -c", body)
+
+    def test_integration_e2e_json_predicates_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_e2e_encryption()")
+        end = source.index("scenario_bearer_observability()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config get --config "$h_peer" x25519_pub', body)
+        self.assertIn('"$(airc_rs_bin)" config get --config "$j_peer" x25519_pub', body)
+        self.assertIn('"$(airc_rs_bin)" gist get .enc', body)
+        self.assertIn('"$(airc_rs_bin)" gist get .nonce', body)
+        self.assertNotIn("d=json.load(open('$h_peer'))", body)
+        self.assertNotIn("d=json.load(open('$j_peer'))", body)
+        self.assertNotIn("d=json.load(sys.stdin)", body)
 
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
