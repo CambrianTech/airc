@@ -51,37 +51,50 @@ pub fn run_pr_meta(pr_file: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_staleness_analyze(
-    repo_root: &Path,
-    pr_repo: &str,
-    pr_num: &str,
-    base_ref: &str,
-    head_ref: &str,
-    base_git_ref: &str,
-    head_git_ref: &str,
-    merge_base: &str,
-    pr_url: &str,
-    limit: usize,
-    output_json: bool,
-    files_file: &Path,
-    diff_file: &Path,
-    base_new_file: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let touched_files = read_nonempty_lines(files_file)?;
-    let diff_lines = read_lines_lossy(diff_file)?;
-    let base_new_lines = read_lines_lossy(base_new_file)?;
+pub struct StalenessAnalyzeInput<'a> {
+    pub repo_root: &'a Path,
+    pub pr_repo: &'a str,
+    pub pr_num: &'a str,
+    pub base_ref: &'a str,
+    pub head_ref: &'a str,
+    pub base_git_ref: &'a str,
+    pub head_git_ref: &'a str,
+    pub merge_base: &'a str,
+    pub pr_url: &'a str,
+    pub limit: usize,
+    pub output_json: bool,
+    pub files_file: &'a Path,
+    pub diff_file: &'a Path,
+    pub base_new_file: &'a Path,
+}
+
+pub fn run_staleness_analyze(input: StalenessAnalyzeInput<'_>) -> Result<(), Box<dyn Error>> {
+    let touched_files = read_nonempty_lines(input.files_file)?;
+    let diff_lines = read_lines_lossy(input.diff_file)?;
+    let base_new_lines = read_lines_lossy(input.base_new_file)?;
     let base_added = plus_lines_by_file(&base_new_lines);
-    let warnings = stale_warnings(repo_root, base_git_ref, &diff_lines, &base_added, limit);
+    let warnings = stale_warnings(
+        input.repo_root,
+        input.base_git_ref,
+        &diff_lines,
+        &base_added,
+        input.limit,
+    );
     let payload = json_obj([
-        ("repo", Value::String(pr_repo.to_string())),
-        ("pr", Value::String(pr_num.to_string())),
-        ("url", Value::String(pr_url.to_string())),
-        ("base", Value::String(base_ref.to_string())),
-        ("head", Value::String(head_ref.to_string())),
-        ("base_git_ref", Value::String(base_git_ref.to_string())),
-        ("head_git_ref", Value::String(head_git_ref.to_string())),
-        ("merge_base", Value::String(merge_base.to_string())),
+        ("repo", Value::String(input.pr_repo.to_string())),
+        ("pr", Value::String(input.pr_num.to_string())),
+        ("url", Value::String(input.pr_url.to_string())),
+        ("base", Value::String(input.base_ref.to_string())),
+        ("head", Value::String(input.head_ref.to_string())),
+        (
+            "base_git_ref",
+            Value::String(input.base_git_ref.to_string()),
+        ),
+        (
+            "head_git_ref",
+            Value::String(input.head_git_ref.to_string()),
+        ),
+        ("merge_base", Value::String(input.merge_base.to_string())),
         (
             "touched_files",
             Value::Array(touched_files.iter().cloned().map(Value::String).collect()),
@@ -95,28 +108,32 @@ pub fn run_staleness_analyze(
             Value::Array(warnings.iter().map(StaleWarning::json).collect()),
         ),
     ]);
-    if output_json {
+    if input.output_json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if warnings.is_empty() {
-        let label = if !pr_repo.is_empty() && !pr_num.is_empty() {
-            format!("{pr_repo}#{pr_num}")
+        let label = if !input.pr_repo.is_empty() && !input.pr_num.is_empty() {
+            format!("{}#{}", input.pr_repo, input.pr_num)
         } else {
-            head_ref.to_string()
+            input.head_ref.to_string()
         };
         println!("OK: no stale conflicts detected for {label}.");
         println!(
-            "base={base_ref} head={head_ref} files_touched={}",
+            "base={} head={} files_touched={}",
+            input.base_ref,
+            input.head_ref,
             touched_files.len()
         );
     } else {
-        let label = if !pr_repo.is_empty() && !pr_num.is_empty() {
-            format!("{pr_repo}#{pr_num}")
+        let label = if !input.pr_repo.is_empty() && !input.pr_num.is_empty() {
+            format!("{}#{}", input.pr_repo, input.pr_num)
         } else {
-            head_ref.to_string()
+            input.head_ref.to_string()
         };
         println!("WARN: {label} branch may erase current-base work.");
         println!(
-            "base={base_ref} head={head_ref} files_touched={} missing_base_lines_sample={}",
+            "base={} head={} files_touched={} missing_base_lines_sample={}",
+            input.base_ref,
+            input.head_ref,
             touched_files.len(),
             warnings.len()
         );

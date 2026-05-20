@@ -2007,7 +2007,7 @@ _cmd_queue_staleness() {
   )
   [ "$output_json" -eq 1 ] && analyze_args+=(--json)
   "$(airc_rs_bin)" "${analyze_args[@]}"
-  local py_status=$?
+  local analyze_status=$?
   rm -f "$files_file" "$diff_file" "$base_new_file"
-  return "$py_status"
+  return "$analyze_status"
 }
