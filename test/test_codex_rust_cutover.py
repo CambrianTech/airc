@@ -305,6 +305,8 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn("queue-card next", combined)
         self.assertIn("queue-card pongs", combined)
         self.assertIn("queue-card availability", combined)
+        self.assertIn("queue-card review-refs", combined)
+        self.assertIn("queue-card pr-meta", combined)
 
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(

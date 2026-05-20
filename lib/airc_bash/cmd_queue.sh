@@ -593,42 +593,7 @@ _airc_queue_list_staleness_sweep() {
   refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list-stale-refs.XXXXXX") || { rm -f "$raw_json_file"; return 1; }
   printf '%s' "$raw_json" >"$raw_json_file"
 
-  "$AIRC_PYTHON" - "$target_repo" "$raw_json_file" >"$refs_file" <<'PYEOF'
-import json, re, sys
-repo, path = sys.argv[1:3]
-with open(path, "r", encoding="utf-8") as f:
-    issues = json.load(f)
-card_re = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-for issue in issues:
-    card = {}
-    for m in card_re.finditer(issue.get("body", "") or ""):
-        try:
-            parsed = json.loads(m.group(1).strip())
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-            card = parsed
-            break
-    if (card.get("status") or "").strip() != "review":
-        continue
-    text = "\n".join([
-        str(issue.get("title") or ""),
-        str(issue.get("body") or ""),
-        str(card.get("next_action") or ""),
-        str(card.get("evidence") or ""),
-    ])
-    refs = []
-    for m in re.finditer(r'https://github\.com/([^/]+/[^/]+)/(?:pull|pulls)/(\d+)|\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b|(?<![A-Za-z0-9_/])#(\d+)\b', text):
-        if m.group(1):
-            refs.append(f"{m.group(1)}#{m.group(2)}")
-        elif m.group(3):
-            refs.append(f"{m.group(3)}/{m.group(4)}#{m.group(5)}")
-        elif m.group(6):
-            refs.append(f"{repo}#{m.group(6)}")
-    for ref in dict.fromkeys(refs):
-        print(ref)
-        break
-PYEOF
+  "$(airc_rs_bin)" queue-card review-refs --repo "$target_repo" --raw-json-file "$raw_json_file" >"$refs_file"
 
   if [ -s "$refs_file" ]; then
     printf '\n# staleness sweep — review cards\n'
@@ -1963,13 +1928,7 @@ _cmd_queue_staleness() {
     local pr_file pr_meta
     pr_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-pr.XXXXXX") || die "queue staleness: mktemp failed"
     printf '%s' "$pr_blob" >"$pr_file"
-    if ! pr_meta=$("$AIRC_PYTHON" - "$pr_file" <<'PYEOF'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    pr = json.load(f)
-print(f"{pr.get('baseRefName') or ''}\t{pr.get('headRefName') or ''}\t{pr.get('url') or ''}")
-PYEOF
-    ); then
+    if ! pr_meta=$("$(airc_rs_bin)" queue-card pr-meta --pr-file "$pr_file"); then
       rm -f "$pr_file"
       die "queue staleness: PR JSON parse failed"
     fi
