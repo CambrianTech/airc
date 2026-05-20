@@ -25,6 +25,7 @@ pub mod headers_keys;
 pub mod keypair;
 pub mod media;
 pub mod policy;
+pub mod rtc_signal;
 pub mod signature;
 pub mod subscription;
 pub mod transcript_conv;
@@ -41,6 +42,7 @@ pub use headers_keys::{
 pub use keypair::PeerKeypair;
 pub use media::MediaRef;
 pub use policy::{AlwaysLift, LiftPolicy, NeverLift, SizeThresholdPolicy};
+pub use rtc_signal::{WebRtcSignal, WebRtcSignalKind, WEBRTC_SIGNAL_BODY_HINT};
 pub use signature::{
     verify, KeyError, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy,
 };

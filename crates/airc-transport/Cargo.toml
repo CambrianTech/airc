@@ -23,6 +23,7 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 rustls-pki-types = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 x509-parser = "0.18"
+webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
