@@ -540,84 +540,13 @@ _cmd_queue_list() {
     die "queue list: gh issue list failed: $raw_json"
   fi
 
-  # Parse + filter + render via python (more robust than bash jq + grep
-  # gymnastics on multi-line bodies). The issue JSON goes through a temp
-  # file because `python - <<'PYEOF'` already consumes stdin for the script.
   local raw_json_file
   raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list.XXXXXX") || die "queue list: mktemp failed"
   printf '%s' "$raw_json" >"$raw_json_file"
 
-  "$AIRC_PYTHON" - \
-      "$target_repo" "$filter_owner" "$filter_status" "$output_json" "$raw_json_file" \
-      <<'PYEOF'
-import datetime, json, re, sys
-repo = sys.argv[1]
-filter_owner = sys.argv[2]
-filter_status = sys.argv[3]
-output_json = sys.argv[4] == "1"
-raw_json_file = sys.argv[5]
-now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-
-with open(raw_json_file, "r", encoding="utf-8") as f:
-    data = json.loads(f.read())
-
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-
-def parse_card(body: str) -> dict:
-    """Find the first ```json``` block that looks like a queue card."""
-    for match in CARD_BLOCK_RE.finditer(body or ""):
-        try:
-            parsed = json.loads(match.group(1).strip())
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-            return parsed
-    return {}
-
-cards = []
-for issue in data:
-    card = parse_card(issue.get("body", ""))
-    if filter_owner and card.get("owner", "") != filter_owner:
-        continue
-    if filter_status and card.get("status", "") != filter_status:
-        continue
-    cards.append({
-        "number": issue.get("number"),
-        "title": issue.get("title", "").replace("airc-queue: ", "", 1),
-        "url": issue.get("url"),
-        "createdAt": issue.get("createdAt"),
-        "updatedAt": issue.get("updatedAt"),
-        "card": card,
-    })
-
-if output_json:
-    print(json.dumps({"now_utc": now_utc, "repo": repo, "cards": cards}, indent=2))
-else:
-    if not cards:
-        suffix = ""
-        if filter_owner: suffix += f" owner={filter_owner}"
-        if filter_status: suffix += f" status={filter_status}"
-        print(f"# airc-queue — {repo}")
-        print(f"now_utc: {now_utc}")
-        print(f"No open airc-queue cards on {repo}{suffix}.")
-        sys.exit(0)
-    print(f"# airc-queue — {repo} ({len(cards)} open)")
-    print(f"now_utc: {now_utc}")
-    for entry in cards:
-        c = entry["card"]
-        print()
-        print(f"## #{entry['number']} — {entry['title']}")
-        print(f"  url:           {entry['url']}")
-        if c.get("id"):              print(f"  id:            {c['id']}")
-        if c.get("branch"):          print(f"  branch:        {c['branch']}")
-        if c.get("owner"):           print(f"  owner:         {c['owner']}")
-        if c.get("status"):          print(f"  status:        {c['status']}")
-        if c.get("blockers"):        print(f"  blockers:      {c['blockers']}")
-        if c.get("env"):             print(f"  env:           {c['env']}")
-        if c.get("evidence"):        print(f"  evidence:      {c['evidence']}")
-        if c.get("next_action"):     print(f"  next:          {c['next_action']}")
-        if c.get("last_heartbeat"):  print(f"  last heartbeat:{c['last_heartbeat']}")
-PYEOF
+  local list_args=(queue-card list --repo "$target_repo" --owner "$filter_owner" --status "$filter_status" --raw-json-file "$raw_json_file")
+  [ "$output_json" -eq 1 ] && list_args+=(--json)
+  "$(airc_rs_bin)" "${list_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   if [ "$py_status" -eq 0 ] && [ "$output_json" -eq 0 ] && [ "$check_staleness" -eq 1 ]; then
@@ -1136,114 +1065,9 @@ _cmd_queue_stale() {
   raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-stale.XXXXXX") || die "queue stale: mktemp failed"
   printf '%s' "$raw_json" >"$raw_json_file"
 
-  "$AIRC_PYTHON" - "$target_repo" "$stale_after" "$output_json" "$raw_json_file" <<'PYEOF'
-import json, re, sys
-from datetime import datetime, timezone, timedelta
-
-repo, stale_after, output_json_s, path = sys.argv[1:5]
-output_json = output_json_s == "1"
-
-def parse_duration(value: str) -> timedelta:
-    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", value or "")
-    if not m:
-        print(f"queue stale: cannot parse --stale-after '{value}' (use 30m, 2h, 1d)", file=sys.stderr)
-        sys.exit(2)
-    amount = int(m.group(1))
-    unit = m.group(2)
-    if unit == "s":
-        return timedelta(seconds=amount)
-    if unit == "m":
-        return timedelta(minutes=amount)
-    if unit == "h":
-        return timedelta(hours=amount)
-    return timedelta(days=amount)
-
-def parse_card(body: str):
-    for m in re.finditer(r"```json\s*\n(.*?)\n\s*```", body or "", re.DOTALL):
-        try:
-            parsed = json.loads(m.group(1).strip())
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-            return parsed
-    return None
-
-def parse_heartbeat(value: str):
-    if not value:
-        return None
-    m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)", value)
-    if not m:
-        return None
-    raw = m.group(1)
-    fmt = "%Y-%m-%dT%H:%M:%SZ" if raw.count(":") == 2 else "%Y-%m-%dT%H:%MZ"
-    return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-
-with open(path, "r", encoding="utf-8") as f:
-    issues = json.load(f)
-
-threshold = parse_duration(stale_after)
-now = datetime.now(timezone.utc)
-rows = []
-for issue in issues:
-    card = parse_card(issue.get("body", ""))
-    if not card:
-        continue
-    status = (card.get("status") or "").strip()
-    owner = (card.get("owner") or "").strip()
-    if owner == "unclaimed":
-        owner = ""
-    if status not in {"claimed", "in-progress", "review"}:
-        continue
-    reason = ""
-    heartbeat = (card.get("last_heartbeat") or "").strip()
-    hb_dt = parse_heartbeat(heartbeat)
-    age_seconds = None
-    if not owner:
-        reason = "missing-owner"
-    elif not hb_dt:
-        reason = "missing-heartbeat"
-    else:
-        age = now - hb_dt
-        age_seconds = int(age.total_seconds())
-        if age > threshold:
-            reason = "stale-heartbeat"
-    if not reason:
-        continue
-    rows.append({
-        "number": issue.get("number"),
-        "title": issue.get("title") or "",
-        "url": issue.get("url") or "",
-        "status": status or "unknown",
-        "owner": owner,
-        "last_heartbeat": heartbeat,
-        "age_seconds": age_seconds,
-        "reason": reason,
-        "next_action": card.get("next_action") or "",
-    })
-
-if output_json:
-    print(json.dumps({"repo": repo, "now": now.isoformat().replace("+00:00", "Z"), "stale_after": stale_after, "cards": rows}, indent=2))
-else:
-    print(f"# airc-queue stale — {repo}")
-    print(f"now_utc: {now.isoformat().replace('+00:00', 'Z')}")
-    print(f"stale_after: {stale_after}")
-    if not rows:
-        print("No stale owned cards found.")
-    for row in rows:
-        print()
-        print(f"## #{row['number']} — {row['title']}")
-        print(f"  url:            {row['url']}")
-        print(f"  status:         {row['status']}")
-        if row["owner"]:
-            print(f"  owner:          {row['owner']}")
-        if row["last_heartbeat"]:
-            print(f"  last heartbeat: {row['last_heartbeat']}")
-        if row["age_seconds"] is not None:
-            print(f"  heartbeat age:  {row['age_seconds']}s")
-        print(f"  reason:         {row['reason']}")
-        if row["next_action"]:
-            print(f"  next:           {row['next_action']}")
-PYEOF
+  local stale_args=(queue-card stale --repo "$target_repo" --stale-after "$stale_after" --raw-json-file "$raw_json_file")
+  [ "$output_json" -eq 1 ] && stale_args+=(--json)
+  "$(airc_rs_bin)" "${stale_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   return "$py_status"
@@ -1325,109 +1149,9 @@ _cmd_queue_next() {
   raw_json_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-next.XXXXXX") || die "queue next: mktemp failed"
   printf '%s' "$raw_json" >"$raw_json_file"
 
-  AIRC_QUEUE_NEXT_OWNER="$owner" \
-  AIRC_QUEUE_NEXT_BASE="$base" \
-  AIRC_QUEUE_NEXT_REPO_ROOT="$repo_root" \
-  "$AIRC_PYTHON" - "$target_repo" "$output_json" "$raw_json_file" <<'PYEOF'
-import json, os, re, sys
-
-repo, output_json_raw, path = sys.argv[1:4]
-output_json = output_json_raw == "1"
-owner = os.environ.get("AIRC_QUEUE_NEXT_OWNER", "anonymous")
-base = os.environ.get("AIRC_QUEUE_NEXT_BASE", "canary")
-repo_root = os.environ.get("AIRC_QUEUE_NEXT_REPO_ROOT", "")
-
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-
-def parse_card(body: str):
-    for m in CARD_BLOCK_RE.finditer(body or ""):
-        try:
-            parsed = json.loads(m.group(1).strip())
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-            return parsed
-    return None
-
-def shquote(value: str) -> str:
-    return "'" + value.replace("'", "'\"'\"'") + "'"
-
-def score(status: str, card_owner: str) -> int:
-    if status == "claimed" and not card_owner:
-        return 0
-    if status == "claimed":
-        return 1
-    if status == "blocked" and not card_owner:
-        return 2
-    if status == "review":
-        return 3
-    if status == "in-progress" and card_owner == owner:
-        return 4
-    return 9
-
-with open(path, "r", encoding="utf-8") as f:
-    issues = json.load(f)
-
-rows = []
-for issue in issues:
-    card = parse_card(issue.get("body", "") or "")
-    if not card:
-        continue
-    status = (card.get("status") or "claimed").strip()
-    card_owner = (card.get("owner") or "").strip()
-    if card_owner == "unclaimed":
-        card_owner = ""
-    rank = score(status, card_owner)
-    if rank >= 9:
-        continue
-    ref = f"{repo}#{issue.get('number')}"
-    branch = (card.get("branch") or "").strip()
-    lane_cmd = f"airc lane create {shquote(ref)} --base {shquote(base)}"
-    if branch:
-        lane_cmd += f" --branch {shquote(branch)}"
-    if repo_root:
-        lane_cmd += f" --repo {shquote(repo_root)}"
-    claim_cmd = f"airc queue claim {shquote(ref)} --owner {shquote(owner)}"
-    rows.append({
-        "rank": rank,
-        "number": issue.get("number"),
-        "title": (issue.get("title") or "").replace("airc-queue: ", "", 1),
-        "url": issue.get("url") or "",
-        "ref": ref,
-        "status": status,
-        "owner": card_owner,
-        "branch": branch,
-        "env": card.get("env") or "",
-        "next_action": card.get("next_action") or "",
-        "claim_command": claim_cmd,
-        "lane_command": lane_cmd,
-    })
-
-rows.sort(key=lambda r: (r["rank"], r["number"] or 0))
-payload = {"repo": repo, "owner": owner, "candidates": rows}
-
-if output_json:
-    print(json.dumps(payload, indent=2))
-else:
-    print(f"# airc-queue next — {repo}")
-    print(f"owner: {owner}")
-    if not rows:
-        print("No claimable queue cards found.")
-        print(f"Try: airc queue nudge {repo} --message \"idle agent looking for work\"")
-    for idx, row in enumerate(rows[:10], start=1):
-        owner_label = row["owner"] or "(unowned)"
-        print()
-        print(f"## {idx}. {row['ref']} — {row['title']}")
-        print(f"  status: {row['status']} owner={owner_label}")
-        if row["env"]:
-            print(f"  env:    {row['env']}")
-        if row["branch"]:
-            print(f"  branch: {row['branch']}")
-        if row["next_action"]:
-            print(f"  next:   {row['next_action']}")
-        print(f"  claim:  {row['claim_command']}")
-        print(f"  lane:   {row['lane_command']}")
-PYEOF
+  local next_args=(queue-card next --repo "$target_repo" --owner "$owner" --base "$base" --repo-root "$repo_root" --raw-json-file "$raw_json_file")
+  [ "$output_json" -eq 1 ] && next_args+=(--json)
+  "$(airc_rs_bin)" "${next_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   if [ "$py_status" -ne 0 ]; then

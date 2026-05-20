@@ -301,7 +301,7 @@ struct FoundCard {
     card: Map<String, Value>,
 }
 
-fn parse_card(body: &str) -> Option<Map<String, Value>> {
+pub(crate) fn parse_card(body: &str) -> Option<Map<String, Value>> {
     find_card_block(body).map(|found| found.card)
 }
 
@@ -331,7 +331,7 @@ fn find_card_block(body: &str) -> Option<FoundCard> {
     None
 }
 
-fn read_json(path: &Path) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn read_json(path: &Path) -> Result<Value, Box<dyn Error>> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
@@ -341,7 +341,7 @@ fn insert_nonempty(card: &mut Map<String, Value>, key: &str, value: &str) {
     }
 }
 
-fn string_field(value: &Value, key: &str) -> String {
+pub(crate) fn string_field(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -350,7 +350,7 @@ fn string_field(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn value_text(value: &Value) -> String {
+pub(crate) fn value_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Number(number) => number.to_string(),
@@ -368,7 +368,7 @@ fn nonempty_prefix(prefix: &str, value: &str) -> String {
     }
 }
 
-fn nonempty_or(value: &str, fallback: &str) -> String {
+pub(crate) fn nonempty_or(value: &str, fallback: &str) -> String {
     if value.is_empty() {
         fallback.to_string()
     } else {
@@ -382,6 +382,14 @@ fn truncate_chars(value: &str, max: usize) -> String {
     } else {
         value.chars().take(max).collect()
     }
+}
+
+pub(crate) fn json_obj<const N: usize>(items: [(&str, Value); N]) -> Value {
+    let mut object = Map::new();
+    for (key, value) in items {
+        object.insert(key.to_string(), value);
+    }
+    Value::Object(object)
 }
 
 #[cfg(test)]
