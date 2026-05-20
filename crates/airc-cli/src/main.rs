@@ -58,6 +58,7 @@ mod pending_cli;
 mod pending_commands;
 mod queue_card_cli;
 mod queue_card_commands;
+mod queue_card_plan;
 mod queue_card_projection;
 mod queue_card_runtime;
 mod queue_card_staleness;
@@ -997,6 +998,20 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             QueueCardAction::CardStatus { body_file } => {
                 queue_card_commands::run_card_status(&body_file)
             }
+            QueueCardAction::Plan {
+                repo,
+                owner,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_plan::run_plan(&repo, &owner, &stale_after, json, &raw_json_file),
+            QueueCardAction::Steward {
+                repo,
+                owner,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_plan::run_steward(&repo, &owner, &stale_after, json, &raw_json_file),
         },
 
         Command::Humanhash { hex_input, words } => {

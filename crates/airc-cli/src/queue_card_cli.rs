@@ -223,4 +223,32 @@ pub enum QueueCardAction {
         #[arg(long)]
         body_file: PathBuf,
     },
+
+    /// Render the cohesive queue plan from gh issue-list JSON.
+    Plan {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value = "30m")]
+        stale_after: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
+
+    /// Render the read-only queue steward recommendations.
+    Steward {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value = "30m")]
+        stale_after: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
 }

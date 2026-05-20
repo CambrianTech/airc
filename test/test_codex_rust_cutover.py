@@ -290,6 +290,8 @@ class CodexRustCutoverTests(unittest.TestCase):
                 REPO / "lib/airc_bash/cmd_queue.sh",
                 REPO / "lib/airc_bash/cmd_queue_card.sh",
                 REPO / "lib/airc_bash/cmd_queue_close_merged.sh",
+                REPO / "lib/airc_bash/cmd_queue_plan.sh",
+                REPO / "lib/airc_bash/cmd_queue_steward.sh",
             ]
         )
 
@@ -312,6 +314,10 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn("queue-card close-merged-meta", combined)
         self.assertIn("queue-card close-merged-refs", combined)
         self.assertIn("queue-card card-status", combined)
+        self.assertIn("queue-card plan", combined)
+        self.assertIn("queue-card steward", combined)
+        self.assertNotIn("AIRC_PYTHON", (REPO / "lib/airc_bash/cmd_queue_plan.sh").read_text(encoding="utf-8"))
+        self.assertNotIn("AIRC_PYTHON", (REPO / "lib/airc_bash/cmd_queue_steward.sh").read_text(encoding="utf-8"))
 
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
