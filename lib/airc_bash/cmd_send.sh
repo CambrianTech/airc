@@ -11,8 +11,8 @@
 #
 # External cross-references (resolved at call time): die, ensure_init,
 # get_config_val, set_config_val, relay_ssh, AIRC_HOME, MESSAGES,
-# resolve_name, get_host, _hash, plus airc_core.* python modules
-# (airc_core.message, airc_core.queue) for envelope construction.
+# resolve_name, get_host, _hash, and airc-rs helpers for envelope
+# construction and transport calls.
 #
 # Extracted from airc as part of #152 Phase 3 file split. Joel 2026-04-27:
 # "1) simplify and modularize 2) build host logic correctly 3) never
@@ -75,7 +75,7 @@ cmd_send() {
   #       to that peer; the whole point is per-peer process-down detection)
   #   (2) the envelope's `kind` field is set to "heartbeat" so the
   #       monitor formatter filters it out of UI rendering and cmd_peers
-  #       tracks it separately from chat (per airc_core.heartbeat)
+  #       tracks it separately from chat.
   # Empty msg body is intended — all the signal is in metadata (from + ts
   # + kind).
   local heartbeat=0
@@ -379,7 +379,7 @@ cmd_send() {
     fi
 
     # Hand the wire to the bearer abstraction. ALL transport-specific
-    # knowledge lives in lib/airc_core/bearer_*.py. cmd_send only:
+    # knowledge lives in the Rust bearer implementation. cmd_send only:
     #   1. Builds the signed envelope (above)
     #   2. Wraps with envelope-layer crypto if recipient supports it
     #   3. Hands payload + peer_meta to bearer_cli

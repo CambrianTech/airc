@@ -26,31 +26,20 @@ export AIRC_SELF
 # every supported platform ships a working version.
 
 # MSYS Git Bash on Windows translates argv VALUES that look like
-# Unix-rooted paths when bash invokes a Windows-native binary. So
-# `--host-airc-home /Users/joelteply/.airc` arrives at python.exe as
-# `--host-airc-home C:/Program Files/Git/Users/joelteply/.airc` —
-# silently corrupting paths that the joiner later sends back over SSH
-# to a real Unix host. Traced + fixed 2026-04-27;
+# Unix-rooted paths when bash invokes a Windows-native binary. That
+# used to corrupt cross-platform host paths passed through helper
+# commands; keep the targeted exclude until the shell wrapper is gone.
 # the targeted exclude covers macOS / Linux / root home prefixes
 # without breaking `/tmp/` or `/c/` paths (which DO need translation
 # for `--config "$CONFIG"` where $CONFIG is on the local Windows
-# filesystem). Set once at airc startup, exported, every airc_core
-# invocation inherits the same translation policy.
+# filesystem).
 export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:-/Users/;/home/;/root/}"
 
-# Legacy Python modules still exist during cutover, but the wrapper no
-# longer resolves or requires Python at startup. Any remaining legacy
-# command must handle its own dependency until it is deleted or ported.
-export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
-
-# Resolve the airc install dir's lib/ path and prepend to PYTHONPATH so
-# Python heredocs + module invocations can import airc_core (the
-# Python truth-layer #152). Three resolution paths, first hit wins:
+# Resolve the airc install dir's lib/ path so the shell wrapper can
+# source its remaining bash modules. Three resolution paths, first hit wins:
 #   1. $AIRC_DIR (explicit override / install.sh's working dir)
 #   2. dirname of this script (dev checkout — running from repo)
 #   3. $HOME/.airc-src (install.sh default)
-# When the lib/ dir doesn't exist (e.g. older install before this PR
-# landed), PYTHONPATH stays unmodified — heredocs still work.
 _airc_resolve_lib_dir() {
   local _candidate _abs
   for _candidate in \
@@ -58,9 +47,9 @@ _airc_resolve_lib_dir() {
       "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")/lib" \
       "$(dirname "$0")/lib" \
       "$HOME/.airc-src/lib"; do
-    if [ -d "$_candidate/airc_core" ]; then
-      # Canonicalize to absolute path so PYTHONPATH stays valid even
-      # if cwd changes mid-script (heredocs that cd elsewhere). cd +
+    if [ -d "$_candidate/airc_bash" ]; then
+      # Canonicalize to absolute path so module sourcing stays valid even
+      # if cwd changes mid-script. cd +
       # pwd is the portable canonicalize idiom — `realpath` and
       # `readlink -f` are not available everywhere (BSD readlink
       # lacks -f, busybox lacks realpath).
@@ -71,13 +60,6 @@ _airc_resolve_lib_dir() {
   done
 }
 _airc_lib_dir=$(_airc_resolve_lib_dir)
-if [ -n "${_airc_lib_dir:-}" ]; then
-  if [ -n "${PYTHONPATH:-}" ]; then
-    export PYTHONPATH="$_airc_lib_dir:$PYTHONPATH"
-  else
-    export PYTHONPATH="$_airc_lib_dir"
-  fi
-fi
 
 # One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
 # is on vanilla defaults, the old dir exists as a real dir (not a symlink we
@@ -498,11 +480,11 @@ _airc_scope_monitor_formatter_pids() {
   local scope_dir="${1:-}"
   [ -n "$scope_dir" ] || return 0
   local p cmd
-  proc_airc_pids_matching 'airc-rs.*monitor.*format|airc_core\.monitor_formatter' 2>/dev/null | while IFS= read -r p; do
+  proc_airc_pids_matching 'airc-rs.*monitor.*format' 2>/dev/null | while IFS= read -r p; do
     case "$p" in ''|*[!0-9]*) continue ;; esac
     cmd=$(proc_cmdline "$p" 2>/dev/null || true)
     case "$cmd" in
-      *airc-rs*monitor*format*|*airc_core.monitor_formatter*) ;;
+      *airc-rs*monitor*format*) ;;
       *) continue ;;
     esac
     _airc_cmdline_mentions_scope "$cmd" "$scope_dir/peers" || continue
@@ -1133,11 +1115,8 @@ sign_message() {
 
 # ── Platform adapters ───────────────────────────────────────────────────
 # Decomposed into lib/airc_bash/platform_adapters.sh (#152 Phase 3 — file
-# split). Sourced via the lib-dir resolver set at the top of airc. The
-# resolver's lib_dir already covers airc_core/ (Python truth-layer);
-# airc_bash/ is the bash-side companion that holds extracted adapters
-# and command files. Same precedence: AIRC_DIR / readlink / dirname /
-# $HOME/.airc-src.
+# split). Sourced via the lib-dir resolver set at the top of airc.
+# Same precedence: AIRC_DIR / readlink / dirname / $HOME/.airc-src.
 if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/platform_adapters.sh" ]; then
   # shellcheck source=lib/airc_bash/platform_adapters.sh
   source "$_airc_lib_dir/airc_bash/platform_adapters.sh"
@@ -1336,10 +1315,7 @@ resolve_name() {
 init_identity() {
   local name="$1"
   mkdir -p "$AIRC_WRITE_DIR" "$IDENTITY_DIR" "$PEERS_DIR"
-  # Ed25519 envelope-signing keypair via the venv cryptography path
-  # (issue #341 — the prior shell openssl path broke on macOS LibreSSL
-  # silently). Idempotent: airc_core.identity.bootstrap_ed25519 returns
-  # cleanly without rewriting if the files already exist. Same on-disk
+  # Ed25519 envelope-signing keypair via the Rust CLI. Same on-disk
   # PEM format the openssl path produced, so existing scopes upgrade
   # in place without rotating keys.
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
@@ -2048,8 +2024,7 @@ reminder_timer_loop() {
   # the loop emits a kind=heartbeat broadcast. Peers track these in
   # `airc peers` SEPARATELY from chat — a silent peer with fresh
   # heartbeats is alive but heads-down; a silent peer with stale
-  # heartbeats is process-down. Default 60s matches the constant in
-  # lib/airc_core/heartbeat.py (STALE_HEARTBEAT_SEC = 2x = 120s).
+  # heartbeats is process-down. Default 60s gives a 120s stale threshold.
   #
   # Emission is best-effort via `airc msg --heartbeat`. If the send
   # path fails (no bearer, gh rate-limited, etc.) the silence becomes
@@ -2369,7 +2344,6 @@ EOF
     channels=$(airc_config_list_channel_gists "$CONFIG" | awk -F'\t' '{print $1}')
     while IFS= read -r ch; do
       [ -z "$ch" ] && continue
-      # The CLI flag is --gist-id (see lib/airc_core/config.py:325).
       # Pre-fix this was --gist (silently rejected → rotation self-heal
       # never updated config). Surface non-zero exit to stderr so a
       # subsequent bearer mismatch is debuggable; do NOT swallow with
