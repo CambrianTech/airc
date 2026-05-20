@@ -59,7 +59,7 @@ function Resolve-BashExe {
 # git checkout). Linux/Mac sidesteps this with a symlink at $BIN_DIR/airc;
 # Windows can't symlink reliably, so we resolve via env var instead. The
 # convention matches the bash side: $env:AIRC_DIR overrides, default is
-# $HOME\.airc-src.
+# $HOME\.airc\src.
 #
 # Fallback: if airc.ps1 is invoked directly from a source checkout (rare,
 # usually devs), prefer a sibling `airc` script — that's the dev workflow.
@@ -68,7 +68,8 @@ $siblingAirc = Join-Path $psDir 'airc'
 if (Test-Path -LiteralPath $siblingAirc) {
     $bashAirc = $siblingAirc
 } else {
-    $aircDir = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { Join-Path $env:USERPROFILE '.airc-src' }
+    $defaultAircRoot = Join-Path $env:USERPROFILE '.airc'
+    $aircDir = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { Join-Path $defaultAircRoot 'src' }
     $bashAirc = Join-Path $aircDir 'airc'
     if (-not (Test-Path -LiteralPath $bashAirc)) {
         Write-Error "airc.ps1: cannot find bash 'airc' script at $bashAirc (set `$env:AIRC_DIR or reinstall via install.ps1)."

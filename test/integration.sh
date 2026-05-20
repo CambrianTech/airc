@@ -3561,7 +3561,7 @@ scenario_platform_adapters() {
 
 # ── Scenario: windows_cmd_shim_prefers_wsl_single_source ───────────────
 # Windows Claude Code Monitor invokes `airc` through the .cmd shim. Keep
-# dual Windows+WSL installs single-source: if WSL has ~/.airc-src, route
+# dual Windows+WSL installs single-source: if WSL has ~/.airc/src, route
 # there. Otherwise fall back to the native Git Bash clone.
 scenario_windows_cmd_shim_direct_bash() {
   section "windows_cmd_shim_direct_bash: airc.cmd prefers WSL single-source, then Git Bash"

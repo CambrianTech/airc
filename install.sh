@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
-CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
+CLONE_DIR="${AIRC_DIR:-$HOME/.airc/src}"
 # BIN_DIR + SKILLS_TARGET respect env-var overrides so test harnesses
 # (and packagers, distros, etc.) can point install.sh at a sandbox
 # instead of stomping ~/.local/bin and ~/.claude/skills.
@@ -606,7 +606,7 @@ TOML
   fi
 
   # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
-  # to ~/.airc-src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
+  # to ~/.airc/src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
   # block — Codex's runtime hard-rejected the profile at startup with:
   #   "permissions profile requests filesystem writes outside the
   #   workspace root, which is not supported until the runtime enforces

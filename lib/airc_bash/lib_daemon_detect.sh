@@ -104,7 +104,7 @@ airc_daemon_is_installed() {
 # (post-disconnect tip, status banner). It returns true even when the
 # registered daemon is wired to a DIFFERENT scope from the one being
 # bootstrapped. b69f 2026-05-02 hit this: installed daemon while in
-# /c/.airc-src, then re-ran AIRC_INSTALL_YES=1 install.sh from
+# /c/.airc/src, then re-ran AIRC_INSTALL_YES=1 install.sh from
 # ~/continuum — install.sh saw "any airc daemon registered" → no-op'd
 # the prompt → ~/continuum had no daemon serving it. The fix is for
 # install.sh to ask scope-aware: "does the registered daemon point at

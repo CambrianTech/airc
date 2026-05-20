@@ -22,8 +22,8 @@
 #
 # Or clone + run:
 #
-#   git clone https://github.com/CambrianTech/airc.git $HOME\.airc-src
-#   powershell -ExecutionPolicy Bypass -File $HOME\.airc-src\install.ps1
+#   git clone https://github.com/CambrianTech/airc.git $HOME\.airc\src
+#   powershell -ExecutionPolicy Bypass -File $HOME\.airc\src\install.ps1
 #
 # After install: open a NEW shell so PATH refreshes, then `airc join`.
 
@@ -35,7 +35,9 @@ $ErrorActionPreference = 'Stop'
 # airc.cmd / airc.ps1 land (added to user PATH); SKILLS_TARGET is where
 # Claude Code looks for slash-command skills. All three honor env-var
 # overrides for tests + isolated installs (parity with install.sh).
-$CLONE_DIR     = if ($env:AIRC_DIR)      { $env:AIRC_DIR }      else { Join-Path $env:USERPROFILE '.airc-src' }
+$DEFAULT_AIRC_ROOT = Join-Path $env:USERPROFILE '.airc'
+$DEFAULT_CLONE_DIR = Join-Path $DEFAULT_AIRC_ROOT 'src'
+$CLONE_DIR     = if ($env:AIRC_DIR)      { $env:AIRC_DIR }      else { $DEFAULT_CLONE_DIR }
 $BIN_TARGET    = if ($env:BIN_TARGET)    { $env:BIN_TARGET }    else { Join-Path $env:USERPROFILE 'AppData\Local\Programs\airc' }
 $SKILLS_TARGET = if ($env:SKILLS_TARGET) { $env:SKILLS_TARGET } else { Join-Path $env:USERPROFILE '.claude\skills' }
 $REPO_URL      = 'https://github.com/CambrianTech/airc.git'
@@ -274,15 +276,15 @@ setlocal
 if not defined AIRC_WINDOWS_NATIVE if not defined AIRC_DIR (
   where wsl.exe >nul 2>nul
   if not errorlevel 1 (
-    wsl.exe sh -lc "test -x \"$HOME/.airc-src/airc\"" >nul 2>nul
+    wsl.exe sh -lc "test -x \"$HOME/.airc/src/airc\"" >nul 2>nul
     if not errorlevel 1 (
-      wsl.exe sh -lc "exec \"$HOME/.airc-src/airc\" \"$@\"" airc %*
+      wsl.exe sh -lc "exec \"$HOME/.airc/src/airc\" \"$@\"" airc %*
       exit /b %ERRORLEVEL%
     )
   )
 )
 set "AIRC_SRC=%AIRC_DIR%"
-if not defined AIRC_SRC set "AIRC_SRC=%USERPROFILE%\.airc-src"
+if not defined AIRC_SRC set "AIRC_SRC=%USERPROFILE%\.airc\src"
 set "AIRC_SCRIPT=%AIRC_SRC%\airc"
 if not exist "%AIRC_SCRIPT%" (
   echo airc.cmd: cannot find bash airc script at "%AIRC_SCRIPT%" 1>&2

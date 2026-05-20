@@ -14,14 +14,14 @@ setlocal
 
 REM Single-source rule for dual Windows+WSL dev boxes: if the user has a
 REM WSL airc install, run THAT clone. Otherwise Windows Monitor can run
-REM %USERPROFILE%\.airc-src while WSL `airc update` updates
-REM /home/<user>/.airc-src, leaving two drifting implementations.
+REM %USERPROFILE%\.airc\src while WSL `airc update` updates
+REM /home/<user>/.airc/src, leaving two drifting implementations.
 REM Set AIRC_WINDOWS_NATIVE=1 or AIRC_DIR=... to force the native
 REM Windows/Git-Bash clone.
 if not defined AIRC_WINDOWS_NATIVE if not defined AIRC_DIR (
   where wsl.exe >nul 2>nul
   if not errorlevel 1 (
-    wsl.exe bash -lc "test -x \"$HOME/.airc-src/airc\"" >nul 2>nul
+    wsl.exe bash -lc "test -x \"$HOME/.airc/src/airc\"" >nul 2>nul
     if not errorlevel 1 (
       REM Forwarding-args fix (post-#543): the previous shape
       REM    wsl.exe sh -lc "...\"$@\"..." airc %*
@@ -39,14 +39,14 @@ if not defined AIRC_WINDOWS_NATIVE if not defined AIRC_DIR (
       REM so positional args become part of the script string before
       REM wsl.exe sees them. bash (not sh) matches the airc script's
       REM `#!/bin/bash` shebang and avoids subtle sh/dash divergence.
-      wsl.exe bash -lc "exec \"$HOME/.airc-src/airc\" %*"
+      wsl.exe bash -lc "exec \"$HOME/.airc/src/airc\" %*"
       exit /b %ERRORLEVEL%
     )
   )
 )
 
 set "AIRC_SRC=%AIRC_DIR%"
-if not defined AIRC_SRC set "AIRC_SRC=%USERPROFILE%\.airc-src"
+if not defined AIRC_SRC set "AIRC_SRC=%USERPROFILE%\.airc\src"
 set "AIRC_SCRIPT=%AIRC_SRC%\airc"
 
 if not exist "%AIRC_SCRIPT%" (

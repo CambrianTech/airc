@@ -105,8 +105,8 @@ _daemon_airc_path() {
   local airc_link="${HOME}/.local/bin/airc"
   if [ -L "$airc_link" ] || [ -x "$airc_link" ]; then
     echo "$airc_link"
-  elif [ -x "${AIRC_DIR:-$HOME/.airc-src}/airc" ]; then
-    echo "${AIRC_DIR:-$HOME/.airc-src}/airc"
+  elif [ -x "${AIRC_DIR:-$HOME/.airc/src}/airc" ]; then
+    echo "${AIRC_DIR:-$HOME/.airc/src}/airc"
   else
     echo "/usr/local/bin/airc"  # last-resort guess; install will fail loud if wrong
   fi
