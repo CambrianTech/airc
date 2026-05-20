@@ -88,7 +88,7 @@ _cmd_lane_create() {
   fi
 
   if [ -z "$lane_dir" ]; then
-    lane_dir="$HOME/.airc-worktrees/${repo_name}-${issue_token}-${owner_token}"
+    lane_dir="$HOME/.airc/worktrees/${repo_name}-${issue_token}-${owner_token}"
   fi
   lane_dir=$(_airc_lane_abs_path "$lane_dir")
 
@@ -294,7 +294,7 @@ OPTIONS
   --repo PATH       Source checkout. Default: current git repo.
   --branch NAME     Lane branch. Default: feat/<issue>-<owner>.
   --base NAME       Branch/ref to base from. Default: canary.
-  --dir PATH        Worktree directory. Default: ~/.airc-worktrees/<repo>-<issue>-<owner>.
+  --dir PATH        Worktree directory. Default: ~/.airc/worktrees/<repo>-<issue>-<owner>.
   --owner HANDLE    Lane owner. Default: current AIRC identity.
   --dry-run         Print without creating the worktree.
 EOF

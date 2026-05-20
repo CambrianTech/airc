@@ -113,11 +113,20 @@ fn abs_path(path: &str) -> Result<PathBuf, Box<dyn Error>> {
     } else {
         PathBuf::from(path)
     };
-    if expanded.is_absolute() {
-        Ok(expanded)
+    let absolute = if expanded.is_absolute() {
+        expanded
     } else {
-        Ok(std::env::current_dir()?.join(expanded))
+        std::env::current_dir()?.join(expanded)
+    };
+    if absolute.exists() {
+        return Ok(fs::canonicalize(absolute)?);
     }
+    if let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) {
+        if parent.exists() {
+            return Ok(fs::canonicalize(parent)?.join(file_name));
+        }
+    }
+    Ok(absolute)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -175,6 +184,17 @@ mod tests {
         assert_eq!(slug("#1234: Rust Lane!"), "1234-rust-lane");
         assert_eq!(slug(""), "lane");
         assert_eq!(slug("A_B.C-D"), "a_b.c-d");
+    }
+
+    #[test]
+    fn abs_path_canonicalizes_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_dot = dir.path().join(".");
+
+        assert_eq!(
+            abs_path(&with_dot.to_string_lossy()).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
     }
 
     #[test]
