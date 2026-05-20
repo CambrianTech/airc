@@ -4702,6 +4702,14 @@ JSON
     fail "airc inbox did not read Rust local transcript (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
   fi
 
+  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" status >"$out" 2>"$err" \
+      && grep -q 'data-plane:  rust-local active (#airc' "$out" \
+      && grep -q 'gh auth:.*rust-local unaffected' "$out"; then
+    pass "airc status reports Rust local data-plane before gh health"
+  else
+    fail "airc status did not surface Rust local truth (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
+  fi
+
   rm -rf "$root"
 }
 

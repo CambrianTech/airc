@@ -29,6 +29,39 @@ _airc_collaboration_health_report() {
     --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id"
 }
 
+_airc_rust_local_status_report() {
+  local _rs
+  _rs=$(airc_rs_bin)
+
+  local _room_out
+  if ! _room_out=$("$_rs" --home "$AIRC_WRITE_DIR" room 2>/dev/null); then
+    echo "  data-plane:  rust-local unavailable (run: airc-rs init)"
+    return 0
+  fi
+
+  local _room _wire _channel
+  _room=$(printf '%s\n' "$_room_out" | sed -n 's/^room:[[:space:]]*//p' | head -1)
+  _wire=$(printf '%s\n' "$_room_out" | sed -n 's/^wire:[[:space:]]*//p' | head -1)
+  _channel=$(printf '%s\n' "$_room_out" | sed -n 's/^channel:[[:space:]]*//p' | head -1)
+  [ -z "$_room" ] && _room="?"
+  [ -z "$_channel" ] && _channel="?"
+
+  local _frame_count=0
+  if [ -n "$_wire" ] && [ -f "$_wire/frames.jsonl" ]; then
+    _frame_count=$(grep -c '^.' "$_wire/frames.jsonl" 2>/dev/null || echo 0)
+  fi
+
+  local _peer_count=0
+  local _peer_out
+  _peer_out=$("$_rs" --home "$AIRC_WRITE_DIR" peer list 2>/dev/null || true)
+  _peer_count=$(printf '%s\n' "$_peer_out" | grep -Ec '^[0-9a-fA-F-]{36}[[:space:]]' 2>/dev/null || echo 0)
+
+  echo "  data-plane:  rust-local active (#${_room}, channel ${_channel})"
+  if [ -n "$_wire" ]; then
+    echo "  rust wire:   ${_wire} (${_frame_count} frame(s), ${_peer_count} peer(s) enrolled)"
+  fi
+}
+
 cmd_status() {
   # Human-readable liveness view. Fast — no network calls by default; `--probe`
   # opts into a 3s SSH reachability check.
@@ -75,6 +108,7 @@ cmd_status() {
     fi
   fi
   _airc_collaboration_health_report
+  _airc_rust_local_status_report
 
   # Scope monitor alive? Use the shared sandbox-robust helper
   # (_monitor_alive_with_bearer_fallback in airc top-level). Phase 1 =
@@ -153,34 +187,24 @@ cmd_status() {
     echo "  last send:   never"
   fi
 
-  # Last receive: read the bearer-attested state file written by
-  # bearer_cli recv on each event (Phase 2c, #270 fix). The previous
-  # implementation parsed messages.jsonl for the most recent inbound
-  # ts, but that lied for a 30+ minute mesh outage in #270 — the local
-  # mirror said "fresh" while the bearer was actually wedged. The
-  # bearer-state file is the truth: it's only updated when an event
-  # actually flows off the wire.
+  # Legacy bearer state is not the routine data plane anymore. Plain
+  # messages and inbox reads use the Rust local substrate above; the gh
+  # bearer remains visible here because it still covers invite/remote
+  # migration paths and stale pending queues.
   local bearer_state="$AIRC_WRITE_DIR/bearer_state.json"
   if [ -f "$bearer_state" ]; then
     local _bs_summary
     _bs_summary=$("$(airc_rs_bin)" bearer-state --summary "$bearer_state" 2>/dev/null)
-    echo "  bearer:      ${_bs_summary:-unreadable}"
+    echo "  bearer:      ${_bs_summary:-unreadable} (legacy gh invite/remote)"
   elif [ -n "$host_target" ]; then
-    # Joiner with no bearer state — monitor never came up or hasn't
-    # opened the bearer yet. This was previously a silent gap: status
-    # claimed "monitor running" while the inbound path was dead.
-    echo "  bearer:      no state file ($AIRC_WRITE_DIR/bearer_state.json) — monitor not yet streaming"
+    echo "  bearer:      no state file ($AIRC_WRITE_DIR/bearer_state.json) — legacy gh invite/remote not yet streaming"
   else
-    # Host: no inbound bearer (we ARE the host). The bearer-state file
-    # is a joiner-side artifact; on a host the local messages.jsonl IS
-    # the source of truth, but we still surface that explicitly.
-    echo "  bearer:      n/a (this scope is hosting; inbound is local log)"
+    echo "  bearer:      n/a (rust-local is routine data-plane; gh only invite/remote)"
   fi
 
-  # gh auth health — surface mid-session token expiry so users have
-  # a one-line diagnostic instead of mysterious silent failures.
-  # The substrate is gh-as-bearer; when gh's keyring goes invalid,
-  # everything stops working but nothing surfaces unless they look here.
+  # gh auth health. This is deliberately labelled as invite/remote
+  # health so a GitHub secondary limit does not read as "AIRC chat is
+  # down" when same-machine Rust-local delivery is working.
   if command -v gh >/dev/null 2>&1; then
     # Use the centralized auth detector instead of raw `gh auth status`
     # so status reads the OK cache and does not turn frequent health
@@ -189,24 +213,24 @@ cmd_status() {
     _gh_state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
     case "$_gh_state" in
       ok)
-        echo "  gh auth:     ok"
+        echo "  gh auth:     ok (invite/remote only; rust-local unaffected)"
         ;;
       rate_limited)
-        echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
+        echo "  gh auth:     RATE-LIMITED (invite/remote only; rust-local unaffected)"
         ;;
       env_token_invalid)
-        echo "  gh auth:     ✗ INVALID GH_TOKEN — unset/fix GH_TOKEN, then retry"
+        echo "  gh auth:     ✗ INVALID GH_TOKEN (invite/remote only) — unset/fix GH_TOKEN"
         ;;
       *)
-        echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
+        echo "  gh auth:     ✗ INVALID (invite/remote only) — run 'gh auth login -h github.com'"
         ;;
     esac
   else
-    echo "  gh auth:     gh CLI not installed"
+    echo "  gh auth:     gh CLI not installed (invite/remote unavailable; rust-local unaffected)"
   fi
 
-  # Pending queue — how many sends are waiting for a drain. Populated by
-  # cmd_send's wire-failure branch; drained by flush_pending_loop.
+  # Pending queue is legacy gh bearer work waiting for remote/invite
+  # drain. Plain local sends do not use this queue.
   local pending="$AIRC_WRITE_DIR/pending.jsonl"
   local pending_count=0
   [ -f "$pending" ] && pending_count=$(grep -c '^.' "$pending" 2>/dev/null || echo 0)
@@ -214,9 +238,9 @@ cmd_status() {
     local _gh_wait=0
     _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
-      echo "  queue:       ${pending_count} pending (paused by gh governor for ${_gh_wait}s)"
+      echo "  queue:       ${pending_count} pending legacy gh item(s) (paused for ${_gh_wait}s; rust-local unaffected)"
     else
-      echo "  queue:       ${pending_count} pending (governed auto-drain)"
+      echo "  queue:       ${pending_count} pending legacy gh item(s) (governed auto-drain; rust-local unaffected)"
     fi
   else
     echo "  queue:       empty"
