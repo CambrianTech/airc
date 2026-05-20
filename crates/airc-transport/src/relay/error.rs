@@ -21,6 +21,9 @@ pub enum RelayClientError {
     /// Outbound channel closed mid-send — relay went away or the
     /// connection task exited.
     ConnectionClosed,
+    /// Relay certificate server name could not be constructed from
+    /// the relay peer id.
+    InvalidServerName(String),
 }
 
 impl std::fmt::Display for RelayClientError {
@@ -35,6 +38,9 @@ impl std::fmt::Display for RelayClientError {
                 write!(f, "frame size {actual} exceeds per-frame limit {limit}")
             }
             Self::ConnectionClosed => f.write_str("relay connection closed by remote"),
+            Self::InvalidServerName(name) => {
+                write!(f, "relay server name is invalid: {name}")
+            }
         }
     }
 }
@@ -45,7 +51,11 @@ impl std::error::Error for RelayClientError {
             Self::Tls(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
-            _ => None,
+            Self::NotConnected
+            | Self::AlreadyConnected
+            | Self::FrameTooLarge { .. }
+            | Self::ConnectionClosed
+            | Self::InvalidServerName(_) => None,
         }
     }
 }

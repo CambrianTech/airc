@@ -92,7 +92,7 @@ impl RelayAdapter {
         // The relay's DNS name in its cert is `<relay_peer_id>.airc.local`
         // (cf. lan_tcp `generate_self_signed_cert`). rustls requires a
         // SNI / server-name on the client side that matches the cert SAN.
-        let server_name = relay_server_name(self.inner.config.relay_peer_id);
+        let server_name = relay_server_name(self.inner.config.relay_peer_id)?;
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -111,13 +111,15 @@ impl RelayAdapter {
     }
 }
 
-fn relay_server_name(relay_peer_id: airc_core::PeerId) -> rustls::pki_types::ServerName<'static> {
+fn relay_server_name(
+    relay_peer_id: airc_core::PeerId,
+) -> Result<rustls::pki_types::ServerName<'static>, RelayClientError> {
     // The relay's self-signed cert SANs are produced by
     // `airc_transport::lan_tcp::cert::generate_self_signed_cert`, which
     // emits a single DNS name of the form `<peer-id>.airc.local`.
     let host = format!("{}.airc.local", relay_peer_id);
     rustls::pki_types::ServerName::try_from(host)
-        .expect("PeerId-derived host must be a valid DNS name")
+        .map_err(|error| RelayClientError::InvalidServerName(error.to_string()))
 }
 
 async fn read_loop<R>(inner: Arc<Inner>, mut read_half: R)
