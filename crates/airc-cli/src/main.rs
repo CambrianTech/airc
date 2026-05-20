@@ -59,6 +59,7 @@ mod pending_commands;
 mod queue_card_cli;
 mod queue_card_commands;
 mod queue_card_projection;
+mod queue_card_runtime;
 mod route_cli;
 mod route_commands;
 mod scope_cli;
@@ -873,6 +874,38 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &repo_root,
                 json,
                 &raw_json_file,
+            ),
+            QueueCardAction::Pongs {
+                repo,
+                sweep_id,
+                since,
+                json,
+                cards_file,
+                messages_file,
+            } => queue_card_runtime::run_pongs(
+                &repo,
+                &sweep_id,
+                &since,
+                json,
+                &cards_file,
+                &messages_file,
+            ),
+            QueueCardAction::Availability {
+                repo,
+                sweep_id,
+                since,
+                stale_after,
+                json,
+                cards_file,
+                messages_file,
+            } => queue_card_runtime::run_availability(
+                &repo,
+                &sweep_id,
+                &since,
+                &stale_after,
+                json,
+                &cards_file,
+                &messages_file,
             ),
         },
 
