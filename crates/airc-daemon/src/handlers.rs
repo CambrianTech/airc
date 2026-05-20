@@ -129,7 +129,14 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
 
 async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
     let transport = state.local_fs_for(&send.wire).await;
-    let frame = build_message_frame(&state, send.channel, &send.text);
+    let frame = match build_message_frame(&state, send.channel, &send.text) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Response::Error {
+                message: format!("send: clock before UNIX_EPOCH: {error}"),
+            };
+        }
+    };
     match transport.send(frame).await {
         Ok(()) => Response::Ok,
         Err(error) => Response::Error {
@@ -200,12 +207,15 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
     Response::Peers(PeersResponse { peers: entries })
 }
 
-fn build_message_frame(state: &DaemonState, channel: uuid::Uuid, text: &str) -> Frame {
+fn build_message_frame(
+    state: &DaemonState,
+    channel: uuid::Uuid,
+    text: &str,
+) -> Result<Frame, std::time::SystemTimeError> {
     let lamport = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    Frame {
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    Ok(Frame {
         kind: FrameKind::Message,
         envelope: Envelope {
             event_id: EventId::new(),
@@ -223,7 +233,7 @@ fn build_message_frame(state: &DaemonState, channel: uuid::Uuid, text: &str) -> 
             // with Ed25519 on the way out.
             signature: Signature::Unsigned,
         },
-    }
+    })
 }
 
 #[cfg(test)]
