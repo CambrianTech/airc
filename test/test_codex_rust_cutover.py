@@ -216,6 +216,20 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 - <<", body)
         self.assertNotIn("python3 -c", body)
 
+    def test_integration_gone_gist_fake_uses_airc_rs_not_python(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_send_gone_gist_does_not_claim_delivery()")
+        end = source.index("scenario_monitor_gone_gist_stops_respawn()", start)
+        body = source[start:end]
+
+        self.assertIn('cat > "$fakebin/airc-rs"', body)
+        self.assertIn('AIRC_RS_BIN="$fakebin/airc-rs"', body)
+        self.assertIn('"$real_airc_rs" config get-channel-gist', body)
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("airc_core.bearer_cli", body)
+        self.assertNotIn("airc_core.config", body)
+        self.assertNotIn("python3", body)
+
     def test_integration_bearer_gist_file_content_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_gh()")
