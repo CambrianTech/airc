@@ -19,8 +19,8 @@ A gist can publish enough signed information for a peer to join a mesh:
 - revocation or rotation notices
 
 After that, live frames move through AIRC transports selected by the route
-resolver: same-process, same-host local-fs/IPC, LAN/Tailscale TCP, relay,
-WebRTC datachannel, Reticulum, or future adapters. Consumers publish and
+resolver: same-process, same-host local-fs/IPC, LAN/Tailscale TCP, UDP,
+relay, WebRTC datachannel, Reticulum, or future adapters. Consumers publish and
 subscribe to events; they do not know or care which transport carried a frame.
 
 ## Why
@@ -49,7 +49,7 @@ route resolver
   chooses admissible route set from health, capabilities, policy, and scope
 
 transport adapters
-  local-fs/IPC, LAN/Tailscale TCP, relay, WebRTC datachannel, Reticulum, gh-gist invite
+  local-fs/IPC, LAN/Tailscale TCP, UDP, relay, WebRTC datachannel, Reticulum, gh-gist invite
 
 invite store
   signed beacons for bootstrap and rendezvous only
@@ -83,11 +83,11 @@ Initial admissibility:
 | --- | --- |
 | `InviteAdvertise` | gh-gist, static file, QR/text export, future public relay |
 | `PeerRendezvous` | gh-gist, relay, Reticulum announce, mDNS/LAN discovery |
-| `ControlInteractive` | local, LAN/Tailscale, relay, WebRTC datachannel, Reticulum |
-| `DataInteractive` | local, LAN/Tailscale, relay, WebRTC datachannel, Reticulum |
+| `ControlInteractive` | local, LAN/Tailscale, UDP, relay, WebRTC datachannel, Reticulum |
+| `DataInteractive` | local, LAN/Tailscale, UDP, relay, WebRTC datachannel, Reticulum |
 | `DataBulk` | local, LAN/Tailscale, relay, Reticulum, blob store handoff |
-| `MediaSignaling` | local, LAN/Tailscale, relay, WebRTC datachannel, Reticulum |
-| `PresenceEphemeral` | local, LAN/Tailscale, relay, WebRTC datachannel, Reticulum |
+| `MediaSignaling` | local, LAN/Tailscale, UDP, relay, WebRTC datachannel, Reticulum |
+| `PresenceEphemeral` | local, LAN/Tailscale, UDP, relay, WebRTC datachannel, Reticulum |
 
 `gh-gist` is not admissible for `ControlInteractive`, `DataInteractive`,
 `DataBulk`, `MediaSignaling`, or `PresenceEphemeral` unless a future explicit
@@ -106,7 +106,7 @@ requiring SSHD:
 | Same LAN | TLS-pinned LAN-TCP | Direct, signed, OS-neutral Rust. No Windows SSHD setup. |
 | Same Tailscale tailnet | TLS-pinned TCP over Tailscale address | Same route contract as LAN; Tailscale is reachability, not identity. |
 | Different tailnets / NAT boundary | `airc-relay` store-and-forward, then WebRTC/Reticulum where possible | Relay is the dependable baseline; direct routes can be promoted after discovery. |
-| Browser / live-mode control | WebRTC datachannel with relay/TURN when needed | AIRC carries signaling and control events, not media frames. |
+| Browser / live-mode control | UDP or WebRTC datachannel with relay/TURN when needed | AIRC carries signaling and control events, not media frames. |
 | Offline or intermittent mesh | Reticulum or relay-backed queue | Route state is explicit: queued until an admissible route exists. |
 
 SSH can exist as a future adapter for admin workflows, but it is not a required
@@ -180,7 +180,7 @@ pub trait EventBus {
 Subscriptions filter by channel, peer, frame kind, and headers. They do not
 filter by transport. A Continuum room, OpenClaw chat bridge, Hermes agent, or
 Codex monitor receives the same envelopes whether the bytes arrived over
-local-fs, Tailscale, relay, WebRTC, or Reticulum.
+local-fs, Tailscale, UDP, relay, WebRTC, or Reticulum.
 
 This is the boundary Continuum needs:
 
@@ -194,7 +194,7 @@ This is the boundary Continuum needs:
 ## GitHub Governor Semantics
 
 The GitHub governor only gates GitHub-backed invite and rendezvous operations.
-It must not mark local, LAN, Tailscale, relay, WebRTC, or Reticulum delivery as
+It must not mark local, LAN, Tailscale, UDP, relay, WebRTC, or Reticulum delivery as
 degraded.
 
 Allowed governor effects:

@@ -11,6 +11,7 @@
 //!   when multiple AI agents share one Mac.
 //! - **lan-tcp** (PR-3) — same-LAN peer-to-peer via TLS-wrapped TCP.
 //! - **tailscale** (PR-4) — mesh transport for cross-network peers.
+//! - **udp** — future low-latency realtime/game/live control path.
 //! - **gh-gist** — bootstrap/rendezvous adapter only. It must not become
 //!   a primary runtime path; GitHub is acceptable for identity exchange,
 //!   address publication, and invitations, not sustained chat transport.

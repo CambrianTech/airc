@@ -42,7 +42,7 @@ pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
 pub use route_health::{TransportHealthSample, TransportHealthState};
 pub use route_policy::{
-    RouteDecision, RoutePolicy, RoutePurpose, TransportCandidate, TransportKind, TransportRole,
+    RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind, TransportRole,
 };
 pub use route_resolver::{TransportResolver, TransportRoute};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};

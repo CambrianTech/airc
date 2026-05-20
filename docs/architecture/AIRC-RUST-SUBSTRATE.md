@@ -62,7 +62,7 @@ APIs; route resolution sits below them.
    directly. No shell-out from runtime code.
 4. **Persist** durably with proper cursors, archive drain, and SQLite/
    Postgres backends via SeaORM.
-5. **Multi-transport** — same-host, same-LAN, Tailscale, relay,
+5. **Multi-transport** — same-host, same-LAN, Tailscale, UDP, relay,
    WebRTC datachannel, Reticulum, and gh-gist invite/rendezvous.
    Pluggable, capability-resolved.
 6. **Be more secure** than today's airc: per-message forward secrecy,
@@ -340,7 +340,7 @@ The transport layer is a control plane, not a pile of special-case
 adapters. Local and remote delivery are the same product behavior:
 the caller submits one signed envelope, gets one delivery contract,
 and observes one transcript/replay model. Whether the bytes moved
-through local filesystem, LAN-TCP, Tailscale, Reticulum, a relay, or
+through local filesystem, LAN-TCP, Tailscale, UDP, Reticulum, a relay, or
 WebRTC datachannel is invisible above the substrate boundary.
 
 This is the telecom shape: separate the service contract from the
@@ -577,8 +577,8 @@ pub trait TransportHandle: Send + Sync {
 ```
 
 There is no adapter-specific caller API. A local-fs adapter, LAN-TCP
-adapter, Tailscale adapter, Reticulum adapter, relay adapter, and WebRTC
-datachannel adapter all implement the same contract. Adapter-specific
+adapter, Tailscale adapter, UDP adapter, Reticulum adapter, relay adapter,
+and WebRTC datachannel adapter all implement the same contract. Adapter-specific
 configuration lives below `open`; adapter-specific errors are normalized
 into scheduler states above it.
 
@@ -625,6 +625,8 @@ In the doc as anchors; not all in the v1 ship:
 - `local-fs` — same-host, same-scope. Ship v1.
 - `lan-tcp` — same-LAN direct. Ship v1.
 - `tailscale` — same-tailnet cross-network mesh. Ship v1.
+- `udp` — low-latency control/game/live packets where policy admits
+  unordered or partially ordered delivery. Future plugin.
 - `gh-gist-invite` — public invite/rendezvous beacon only. Ship v1.
   Not admissible for live chat/event data-plane classes.
 - `airc-relay` — own-hosted cross-network store-and-forward. Future
