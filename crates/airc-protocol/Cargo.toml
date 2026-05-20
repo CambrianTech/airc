@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 serde = { version = "1", features = ["derive"] }

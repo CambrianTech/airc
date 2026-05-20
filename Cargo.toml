@@ -12,3 +12,6 @@ members = [
     "crates/airc-cli",
 ]
 resolver = "2"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -51,6 +51,9 @@ fn normalize_join_args(args: Vec<String>) -> Vec<String> {
 fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
+    // SAFETY: `pre_exec` runs in the child after fork and before exec. The
+    // closure only calls `setsid` and constructs an OS error from errno on
+    // failure; it does not allocate, lock, or touch shared process state.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {

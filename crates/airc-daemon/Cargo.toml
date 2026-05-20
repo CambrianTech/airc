@@ -15,6 +15,9 @@ publish = false
 # layout (grievance §5: CLI/Daemon Accumulating Policy → airc-cli
 # is the client, airc-daemon is the runtime).
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }

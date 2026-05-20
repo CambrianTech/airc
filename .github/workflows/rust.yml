@@ -9,6 +9,8 @@ name: rust
 #              library/binary code cannot use unwrap/expect/panic/todo/
 #              unimplemented or wildcard enum matches.
 #   test     — `cargo test --all-features` (every test green)
+#   quality  — repo policy guard for Rust lint inheritance and banned
+#              fallback/cutover command surfaces
 #
 # Per Joel's direction (2026-05-18): "use rust conventions and obsession
 # with tests. clippy, fmt etc." These three gates are the substrate-quality
@@ -24,6 +26,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
   push:
     branches: [canary, main, rust-rewrite]
@@ -31,6 +34,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
 
 env:
@@ -80,6 +84,14 @@ jobs:
           -D clippy::todo
           -D clippy::unimplemented
           -D clippy::wildcard_enum_match_arm
+
+  quality:
+    name: rust quality guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust quality guard
+        run: bash test/rust_quality_guard.sh
 
   test:
     # Cross-platform matrix — the substrate must run on Linux, macOS,

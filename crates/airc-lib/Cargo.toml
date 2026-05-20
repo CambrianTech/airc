@@ -17,6 +17,9 @@ publish = false
 # `airc.join(room).await`, `airc.say("hi").await`, `airc.page_recent(...)`
 # without shelling out to the CLI or parsing prose.
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }

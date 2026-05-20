@@ -9,6 +9,9 @@ publish = false
 # Rust substrate contracts; GitHub, CLI, Codex hooks, and Continuum
 # are adapters on top.
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }
