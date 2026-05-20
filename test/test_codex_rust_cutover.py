@@ -248,6 +248,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("python3 <<", body)
         self.assertIn('"$(airc_rs_bin)" identity pretty', body)
 
+    def test_kick_peer_ssh_pub_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_kick.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("AIRC_PYTHON", source)
+        self.assertIn('"$(airc_rs_bin)" identity peer-ssh-pub', source)
+
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
             path.read_text(encoding="utf-8")
