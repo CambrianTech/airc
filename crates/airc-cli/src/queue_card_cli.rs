@@ -203,4 +203,24 @@ pub enum QueueCardAction {
         #[arg(long)]
         base_new_file: PathBuf,
     },
+
+    /// Print close-merged metadata from gh pr view JSON.
+    CloseMergedMeta {
+        #[arg(long)]
+        pr_file: PathBuf,
+    },
+
+    /// Extract close-merged queue refs from gh pr view JSON.
+    CloseMergedRefs {
+        #[arg(long)]
+        pr_file: PathBuf,
+        #[arg(long)]
+        repo: String,
+    },
+
+    /// Print queue-card status from an issue body file.
+    CardStatus {
+        #[arg(long)]
+        body_file: PathBuf,
+    },
 }

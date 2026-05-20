@@ -76,20 +76,7 @@ _cmd_queue_close_merged() {
   printf '%s' "$pr_blob" >"$pr_file"
 
   local pr_meta
-  if ! pr_meta=$("$AIRC_PYTHON" - "$pr_file" <<'PYEOF'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    pr = json.load(f)
-merged_at = pr.get("mergedAt") or ""
-base_ref = pr.get("baseRefName") or ""
-merge_commit = pr.get("mergeCommit") or {}
-sha = (merge_commit.get("oid") if isinstance(merge_commit, dict) else "") or ""
-body = pr.get("body") or ""
-title = pr.get("title") or ""
-url = pr.get("url") or ""
-print(f"{merged_at}\t{base_ref}\t{sha}\t{url}\t{len(title)}\t{len(body)}")
-PYEOF
-  ); then
+  if ! pr_meta=$("$(airc_rs_bin)" queue-card close-merged-meta --pr-file "$pr_file"); then
     rm -f "$pr_file"
     die "queue close-merged: PR JSON parse failed"
   fi
@@ -121,53 +108,7 @@ PYEOF
 
   local refs_file
   refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-refs.XXXXXX") || die "queue close-merged: mktemp failed"
-  if ! "$AIRC_PYTHON" - "$pr_file" "$pr_repo" >"$refs_file" <<'PYEOF'
-import json, re, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    pr = json.load(f)
-default_repo = sys.argv[2]
-body = pr.get("body") or ""
-title = pr.get("title") or ""
-text = f"{title}\n{body}"
-
-CLOSING_KEYWORD_RE = re.compile(
-    r'\b(?:close[sd]?|fix(?:e[sd]|ed)?|resolve[sd]?)\b\s*:?\s*',
-    re.IGNORECASE,
-)
-REF_RE = re.compile(
-    r'\b([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d+)\b'
-    r'|(?<![A-Za-z0-9_/])#(\d+)\b'
-)
-
-seen = set()
-for keyword in CLOSING_KEYWORD_RE.finditer(text):
-    # Match GitHub-style close intent. Refs must appear immediately after the
-    # closing keyword, with optional comma/"and" continuations. This avoids
-    # closing cards for prose like "Fix the UI. See #100 for follow-up."
-    pos = keyword.end()
-    first = True
-    while True:
-        tail = text[pos:]
-        if not first:
-            sep = re.match(r'\s*(?:,|and)\s+', tail, re.IGNORECASE)
-            if not sep:
-                break
-            pos += sep.end()
-            tail = text[pos:]
-        ref = REF_RE.match(tail)
-        if not ref:
-            break
-        if ref.group(4):
-            key = f"{default_repo}#{ref.group(4)}"
-        else:
-            key = f"{ref.group(1)}/{ref.group(2)}#{ref.group(3)}"
-        if key not in seen:
-            seen.add(key)
-            print(key)
-        pos += ref.end()
-        first = False
-PYEOF
-  then
+  if ! "$(airc_rs_bin)" queue-card close-merged-refs --pr-file "$pr_file" --repo "$pr_repo" >"$refs_file"; then
     rm -f "$pr_file" "$refs_file"
     die "queue close-merged: ref-parser failed"
   fi
@@ -218,21 +159,11 @@ PYEOF
       continue
     fi
 
-    local envelope_status
-    envelope_status=$(printf '%s' "$issue_body" | "$AIRC_PYTHON" -c '
-import json, re, sys
-body = sys.stdin.read()
-CARD_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL)
-for m in CARD_BLOCK_RE.finditer(body):
-    try:
-        parsed = json.loads(m.group(1).strip())
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-        print((parsed.get("status") or "").strip() or "unknown")
-        sys.exit(0)
-print("not-a-card")
-')
+    local issue_body_file envelope_status
+    issue_body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-issue.XXXXXX") || die "queue close-merged: mktemp failed"
+    printf '%s' "$issue_body" >"$issue_body_file"
+    envelope_status=$("$(airc_rs_bin)" queue-card card-status --body-file "$issue_body_file")
+    rm -f "$issue_body_file"
 
     case "$envelope_status" in
       not-a-card)
