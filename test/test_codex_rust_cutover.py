@@ -254,6 +254,22 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("AIRC_PYTHON", source)
         self.assertIn('"$(airc_rs_bin)" identity peer-ssh-pub', source)
 
+    def test_identity_local_state_uses_airc_rs(self):
+        source = (REPO / "lib/airc_bash/cmd_identity.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("AIRC_PYTHON", source)
+        self.assertIn('"$(airc_rs_bin)" identity session-file', source)
+        self.assertIn('"$(airc_rs_bin)" identity default-work-name', source)
+        self.assertIn('"$(airc_rs_bin)" identity read-work-name', source)
+        self.assertIn('"$(airc_rs_bin)" identity write-work-session', source)
+        self.assertIn('"$(airc_rs_bin)" identity nudge-needed', source)
+        self.assertIn('"$(airc_rs_bin)" identity show-config', source)
+        self.assertIn("identity set-config --config", source)
+        self.assertIn('"$(airc_rs_bin)" identity link-config', source)
+        self.assertIn('"$(airc_rs_bin)" identity import-continuum', source)
+        self.assertIn('"$(airc_rs_bin)" identity continuum-handle', source)
+        self.assertIn('"$(airc_rs_bin)" identity push-continuum', source)
+
     def test_lane_registry_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/cmd_lane.sh").read_text(encoding="utf-8")
 
