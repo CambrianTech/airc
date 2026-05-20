@@ -1,4 +1,4 @@
-//! Clap argument shapes for `airc-rs lane ...`.
+//! Clap argument shapes for `airc lane ...`.
 
 use clap::{Args, Subcommand, ValueEnum};
 

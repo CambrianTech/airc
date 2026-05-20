@@ -1,4 +1,4 @@
-//! `airc-rs lane ...` handlers.
+//! `airc lane ...` handlers.
 
 use std::path::Path;
 

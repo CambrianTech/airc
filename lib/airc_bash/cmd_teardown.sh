@@ -25,7 +25,7 @@ _airc_teardown_is_live_airc_pid() {
 
   local cmd
   cmd=$(proc_cmdline "$pid" || true)
-  echo "$cmd" | grep -Eq '(^|[[:space:]])([^[:space:]]*/)?airc([[:space:]]+(join|connect)|$)|(^|[[:space:]])([^[:space:]]*/)?airc-rs([[:space:]]|$)'
+  echo "$cmd" | grep -Eq '(^|[[:space:]])([^[:space:]]*/)?airc([[:space:]]+(join|connect)|$)|(^|[[:space:]])([^[:space:]]*/)?airc-core([[:space:]]|$)'
 }
 
 _airc_teardown_live_only() {
@@ -495,7 +495,7 @@ cmd_disconnect() {
   esac
   cmd_teardown >/dev/null 2>&1 || true
   if [ -f "$CONFIG" ]; then
-    "$(airc_rs_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" \
+    "$(airc_core_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" \
       host_target host_name host_airc_home host_port host_ssh_pub >/dev/null 2>&1 || true
   fi
   echo "  Disconnected. Identity preserved. Next 'airc join' starts fresh."

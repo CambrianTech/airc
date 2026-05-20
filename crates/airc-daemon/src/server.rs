@@ -6,7 +6,7 @@
 //!
 //! Transport varies by platform via `IpcListener`:
 //!   - Unix: Unix-domain socket at `<home>/daemon.sock`
-//!   - Windows: named pipe at `\\.\pipe\airc-rs-<home>`
+//!   - Windows: named pipe at `\\.\pipe\airc-core-<home>`
 //!
 //! Shutdown: the state's `shutdown` notifier wakes the accept loop;
 //! the loop runs the transport's `cleanup` (unlinks the socket file

@@ -398,7 +398,7 @@ _cmd_invite_human() {
   local primary_chan primary_gid
   primary_chan=$(airc_config_default_channel "$CONFIG" || true)
   if [ -n "$primary_chan" ]; then
-    primary_gid=$("$(airc_rs_bin)" config get-channel-gist \
+    primary_gid=$("$(airc_core_bin)" config get-channel-gist \
       --home "$AIRC_WRITE_DIR" \
       --config "$CONFIG" \
       --channel "$primary_chan" 2>/dev/null || true)
@@ -515,7 +515,7 @@ cmd_peers() {
   # newer record (cruft left from rename chain-breaks before the stable-host
   # matching logic landed).
   if [ "${1:-}" = "--prune" ]; then
-    "$(airc_rs_bin)" collaboration prune-peers \
+    "$(airc_core_bin)" collaboration prune-peers \
       --home "$AIRC_WRITE_DIR" \
       --my-name "$(get_name)" \
       --client-id "$(airc_client_id 2>/dev/null || true)"
@@ -534,7 +534,7 @@ cmd_peers() {
   # is what was missing when "5 peers earlier today, 1 now" looked
   # identical to "5 peers, all silent for 30 min" in the listing —
   # silent records persist on disk regardless of liveness.
-  "$(airc_rs_bin)" collaboration peers \
+  "$(airc_core_bin)" collaboration peers \
     --home "$AIRC_WRITE_DIR" \
     --my-name "$(get_name)" \
     --client-id "$(airc_client_id 2>/dev/null || true)"

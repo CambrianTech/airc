@@ -1,4 +1,4 @@
-//! `airc-rs codex-hook ...` handlers.
+//! `airc codex-hook ...` handlers.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -166,7 +166,7 @@ fn render_digest(events: &[TranscriptEvent], max_items: usize) -> String {
         ));
     }
     if hidden > 0 {
-        lines.push("more: airc-rs codex-hook user-prompt-submit --raw".to_string());
+        lines.push("more: airc codex-hook user-prompt-submit --raw".to_string());
     }
     lines.join("\n")
 }

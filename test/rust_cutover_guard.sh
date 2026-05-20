@@ -25,3 +25,15 @@ for path in install.sh uninstall.sh airc lib/airc_bash skills integrations READM
     fail "live path still references Python runtime: $path"
   fi
 done
+
+if git grep -nE 'airc-rs|airc_rs|AIRC_RS' -- . ':!test/rust_cutover_guard.sh'; then
+  fail "old Rust-language command suffix remains"
+fi
+
+if git grep -nE 'ln -s[f]?[[:space:]].*BIN_DIR.*/airc|ln -s[f]?[[:space:]].*CLONE_DIR.*/airc' -- install.sh; then
+  fail "install.sh must install the public airc command as a forwarder file, not a symlink"
+fi
+
+if git grep -nE 'BIN_DIR.*/relay|for f in airc relay|[,{]airc,relay|relay-[*]' -- install.sh uninstall.sh skills; then
+  fail "relay command alias install/uninstall surface remains"
+fi

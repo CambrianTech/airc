@@ -61,16 +61,6 @@ _airc_resolve_lib_dir() {
 }
 _airc_lib_dir=$(_airc_resolve_lib_dir)
 
-# One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
-# is on vanilla defaults, the old dir exists as a real dir (not a symlink we
-# already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
-# so running monitors + tails pointing at the old path keep working.
-if [ -z "${AIRC_HOME:-}" ] && [ -d "$HOME/.agent-relay" ] && [ ! -L "$HOME/.agent-relay" ] && [ ! -e "$HOME/.airc" ]; then
-  mv "$HOME/.agent-relay" "$HOME/.airc" 2>/dev/null && \
-    ln -s "$HOME/.airc" "$HOME/.agent-relay" 2>/dev/null && \
-    echo "  Migrated $HOME/.agent-relay → $HOME/.airc (symlink left for back-compat)" >&2
-fi
-
 # Scope = $PWD/.airc. Your identity is tied to where you are.
 #
 # Run `airc` from the same cwd each time for a persistent identity in that
@@ -329,7 +319,7 @@ fi
 # their own adapter until those transports are deleted.
 if [ -n "$_gh_resolved" ] || command -v gh >/dev/null 2>&1; then
   gh() {
-    "$(airc_rs_bin)" gh run -- "$@"
+    "$(airc_core_bin)" gh run -- "$@"
   }
 fi
 unset _gh_resolved
@@ -480,11 +470,11 @@ _airc_scope_monitor_formatter_pids() {
   local scope_dir="${1:-}"
   [ -n "$scope_dir" ] || return 0
   local p cmd
-  proc_airc_pids_matching 'airc-rs.*monitor.*format' 2>/dev/null | while IFS= read -r p; do
+  proc_airc_pids_matching 'airc-core.*monitor.*format' 2>/dev/null | while IFS= read -r p; do
     case "$p" in ''|*[!0-9]*) continue ;; esac
     cmd=$(proc_cmdline "$p" 2>/dev/null || true)
     case "$cmd" in
-      *airc-rs*monitor*format*) ;;
+      *airc-core*monitor*format*) ;;
       *) continue ;;
     esac
     _airc_cmdline_mentions_scope "$cmd" "$scope_dir/peers" || continue
@@ -636,7 +626,7 @@ _validate_peer_name() {
 ensure_init() {
   if [ -d "$AIRC_WRITE_DIR" ]; then
     local _repair_out
-    if _repair_out=$("$(airc_rs_bin)" --home "$AIRC_WRITE_DIR" scope repair-config \
+    if _repair_out=$("$(airc_core_bin)" --home "$AIRC_WRITE_DIR" scope repair-config \
         --config "$CONFIG" \
         --default-name "$(derive_name)" \
         --host "$(get_host)" 2>&1); then
@@ -648,15 +638,15 @@ ensure_init() {
   die "Not initialized ($AIRC_WRITE_DIR). Run: airc join"
 }
 
-# config CRUD via airc-rs — proper clap --flags so paths are
+# config CRUD via airc-core — proper clap --flags so paths are
 # per-arg-predictable across MSYS path-translation. Each call passes
 # `--config <path>` explicitly.
 get_name() {
-  "$(airc_rs_bin)" config get-name --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || echo "unknown"
+  "$(airc_core_bin)" config get-name --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || echo "unknown"
 }
 
 get_config_val() {
-  "$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
+  "$(airc_core_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"
 }
 set_config_val()   {
   # Empty $2 must reach argparse as the value of --value. The plain
@@ -670,74 +660,74 @@ set_config_val()   {
   # Repro on Windows 11 + WSL2 Ubuntu (issue #511 trace):
   #   set_config_val host "$(get_host)"   # get_host -> ""
   #   → exit 2 + "argument --value: expected one argument"
-  "$(airc_rs_bin)" config set --home "$AIRC_WRITE_DIR" --config "$CONFIG" --key "$1" --value="${2-}"
+  "$(airc_core_bin)" config set --home "$AIRC_WRITE_DIR" --config "$CONFIG" --key "$1" --value="${2-}"
 }
 unset_config_keys() {
-  "$(airc_rs_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$@"
+  "$(airc_core_bin)" config unset-keys --home "$AIRC_WRITE_DIR" --config "$CONFIG" "$@"
 }
 
-airc_rs_bin() {
+airc_core_bin() {
   local _root; _root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  if [ -n "${AIRC_RS_BIN:-}" ]; then
-    [ -x "$AIRC_RS_BIN" ] && { printf '%s\n' "$AIRC_RS_BIN"; return 0; }
-    die "AIRC_RS_BIN is set but not executable: $AIRC_RS_BIN"
+  if [ -n "${AIRC_CORE_BIN:-}" ]; then
+    [ -x "$AIRC_CORE_BIN" ] && { printf '%s\n' "$AIRC_CORE_BIN"; return 0; }
+    die "AIRC_CORE_BIN is set but not executable: $AIRC_CORE_BIN"
   fi
 
   # In a dev checkout, prefer the binary built from this tree so cutover
-  # tests do not accidentally exercise an older installed airc-rs.
-  for _candidate in "$_root/target/debug/airc-rs" "$_root/target/release/airc-rs"; do
+  # tests do not accidentally exercise an older installed airc-core.
+  for _candidate in "$_root/target/debug/airc-core" "$_root/target/release/airc-core"; do
     [ -x "$_candidate" ] && { printf '%s\n' "$_candidate"; return 0; }
   done
 
-  if command -v airc-rs >/dev/null 2>&1; then
-    command -v airc-rs
+  if command -v airc-core >/dev/null 2>&1; then
+    command -v airc-core
     return 0
   fi
-  die "airc-rs is required; run install.sh or cargo build --manifest-path \"$_root/Cargo.toml\" -p airc-cli"
+  die "airc-core is required; run install.sh or cargo build --manifest-path \"$_root/Cargo.toml\" -p airc-cli"
 }
 
 airc_client_id() {
-  "$(airc_rs_bin)" client-id 2>/dev/null
+  "$(airc_core_bin)" client-id 2>/dev/null
 }
 
 airc_config_read_channels() {
   local cfg="${1:-$CONFIG}"
-  "$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+  "$(airc_core_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
 }
 
 airc_config_default_channel() {
   local cfg="${1:-$CONFIG}"
-  "$(airc_rs_bin)" config default-channel --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+  "$(airc_core_bin)" config default-channel --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
 }
 
 airc_config_get_channel_gist() {
   local channel="$1" cfg="${2:-$CONFIG}"
-  "$(airc_rs_bin)" config get-channel-gist --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" 2>/dev/null
+  "$(airc_core_bin)" config get-channel-gist --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" 2>/dev/null
 }
 
 airc_config_list_channel_gists() {
   local cfg="${1:-$CONFIG}"
-  "$(airc_rs_bin)" config list-channel-gists --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
+  "$(airc_core_bin)" config list-channel-gists --home "$AIRC_WRITE_DIR" --config "$cfg" 2>/dev/null
 }
 
 airc_config_subscribe() {
   local channel="$1" cfg="${2:-$CONFIG}" first="${3:-0}"
   if [ "$first" = "1" ]; then
-    "$(airc_rs_bin)" config subscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" --first
+    "$(airc_core_bin)" config subscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" --first
   else
-    "$(airc_rs_bin)" config subscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel"
+    "$(airc_core_bin)" config subscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel"
   fi
 }
 
 airc_config_unsubscribe() {
   local channel="$1" cfg="${2:-$CONFIG}"
-  "$(airc_rs_bin)" config unsubscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel"
+  "$(airc_core_bin)" config unsubscribe --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel"
 }
 
 airc_config_set_channel_gist() {
   local channel="$1" gist_id="${2-}" cfg="${3:-$CONFIG}"
-  "$(airc_rs_bin)" config set-channel-gist --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" --gist-id="$gist_id"
+  "$(airc_core_bin)" config set-channel-gist --home "$AIRC_WRITE_DIR" --config "$cfg" --channel "$channel" --gist-id="$gist_id"
 }
 
 # Same as get_config_val but reads from an arbitrary config.json path.
@@ -745,7 +735,7 @@ airc_config_set_channel_gist() {
 # that need to read sibling-scope state without changing $CONFIG.
 get_config_val_in() {
   local cfg="$1" key="$2" default="${3:-}"
-  "$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$cfg" "$key" "$default" 2>/dev/null || echo "$default"
+  "$(airc_core_bin)" config get --home "$AIRC_WRITE_DIR" --config "$cfg" "$key" "$default" 2>/dev/null || echo "$default"
 }
 
 get_host() {
@@ -766,7 +756,7 @@ get_host() {
   # LAN. Returns 127.0.0.1 if no internet route is available — which we
   # treat as "no LAN" and fall through to hostname.
   local lan_ip
-  lan_ip=$("$(airc_rs_bin)" lan-ip 2>/dev/null || true)
+  lan_ip=$("$(airc_core_bin)" lan-ip 2>/dev/null || true)
   if [ -n "$lan_ip" ]; then
     # Sanity: must look like an IPv4 address (skip exotic surprises).
     case "$lan_ip" in
@@ -978,14 +968,14 @@ peer_pick_address() {
   local addresses_json="${1:-}" host_machine="${2:-}"
   [ -z "$addresses_json" ] || [ "$addresses_json" = "null" ] && return 0
 
-  # Parse through airc-rs instead of jq/Python so routing decisions stay
+  # Parse through airc-core instead of jq/Python so routing decisions stay
   # on the Rust cutover path.
 
   # Same machine: use localhost.
   local my_machine; my_machine=$(host_machine_id)
   if [ -n "$host_machine" ] && [ "$host_machine" = "$my_machine" ]; then
     local pick; pick=$(printf '%s' "$addresses_json" \
-      | "$(airc_rs_bin)" gist pick-addr localhost 2>/dev/null)
+      | "$(airc_core_bin)" gist pick-addr localhost 2>/dev/null)
     if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
   fi
 
@@ -996,13 +986,13 @@ peer_pick_address() {
   if [ -n "$my_lan_ips" ]; then
     local lan_entries
     lan_entries=$(printf '%s' "$addresses_json" \
-      | "$(airc_rs_bin)" gist list-lan-entries 2>/dev/null)
+      | "$(airc_core_bin)" gist list-lan-entries 2>/dev/null)
     if [ -n "$lan_entries" ]; then
       while IFS= read -r entry; do
         [ -z "$entry" ] && continue
-        local subnet; subnet=$(printf '%s' "$entry" | "$(airc_rs_bin)" gist get .subnet 2>/dev/null)
-        local addr;   addr=$(printf '%s' "$entry"   | "$(airc_rs_bin)" gist get .addr 2>/dev/null)
-        local port;   port=$(printf '%s' "$entry"   | "$(airc_rs_bin)" gist get .port 2>/dev/null)
+        local subnet; subnet=$(printf '%s' "$entry" | "$(airc_core_bin)" gist get .subnet 2>/dev/null)
+        local addr;   addr=$(printf '%s' "$entry"   | "$(airc_core_bin)" gist get .addr 2>/dev/null)
+        local port;   port=$(printf '%s' "$entry"   | "$(airc_core_bin)" gist get .port 2>/dev/null)
         # subnet is like "192.168.1.0/24" — match the /24 prefix against my IPs.
         if [ -n "$subnet" ]; then
           local prefix="${subnet%/*}"   # 192.168.1.0
@@ -1032,7 +1022,7 @@ peer_pick_address() {
   # tailscale up but want airc to skip it for routing decisions).
   if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ] && _have_tailscale_locally; then
     local pick; pick=$(printf '%s' "$addresses_json" \
-      | "$(airc_rs_bin)" gist pick-addr tailscale 2>/dev/null)
+      | "$(airc_core_bin)" gist pick-addr tailscale 2>/dev/null)
     if [ -n "$pick" ]; then printf '%s' "$pick"; return 0; fi
   fi
 
@@ -1049,7 +1039,7 @@ peer_pick_address() {
   # gh-bearer-only routing (broadcast still works; direct pair
   # skipped).
   printf '%s' "$addresses_json" \
-    | "$(airc_rs_bin)" gist pick-addr-excluding localhost tailscale 2>/dev/null
+    | "$(airc_core_bin)" gist pick-addr-excluding localhost tailscale 2>/dev/null
 }
 
 # _have_tailscale_locally: do WE currently have a Tailscale interface
@@ -1106,11 +1096,11 @@ _have_tailscale_locally() {
 humanhash() {
   local input="${1:-}"
   [ -z "$input" ] && return 1
-  "$(airc_rs_bin)" humanhash "$input"
+  "$(airc_core_bin)" humanhash "$input"
 }
 
 sign_message() {
-  printf '%s' "$1" | "$(airc_rs_bin)" identity sign-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"
+  printf '%s' "$1" | "$(airc_core_bin)" identity sign-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"
 }
 
 # ── Platform adapters ───────────────────────────────────────────────────
@@ -1235,10 +1225,10 @@ _primary_scope_for() {
 }
 
 # parted_rooms helpers (#136 sticky /part) — thin wrappers; mutation
-# logic lives in airc-rs config.
-_read_parted_rooms()  { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config read-parted --home "$1" --config "$1/config.json" 2>/dev/null; }
-_record_parted_room() { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config record-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
-_clear_parted_room()  { [ -f "$1/config.json" ] && "$(airc_rs_bin)" config clear-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
+# logic lives in airc-core config.
+_read_parted_rooms()  { [ -f "$1/config.json" ] && "$(airc_core_bin)" config read-parted --home "$1" --config "$1/config.json" 2>/dev/null; }
+_record_parted_room() { [ -f "$1/config.json" ] && "$(airc_core_bin)" config record-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
+_clear_parted_room()  { [ -f "$1/config.json" ] && "$(airc_core_bin)" config clear-parted --home "$1" --config "$1/config.json" --room "$2" 2>/dev/null || true; }
 
 # Spawn the #general sidecar (issue #121) — a parallel `airc join`
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
@@ -1319,7 +1309,7 @@ init_identity() {
   # PEM format the openssl path produced, so existing scopes upgrade
   # in place without rotating keys.
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
-    if ! "$(airc_rs_bin)" identity bootstrap-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"; then
+    if ! "$(airc_core_bin)" identity bootstrap-ed25519 --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR"; then
       die "Ed25519 identity bootstrap failed"
     fi
   fi
@@ -1333,7 +1323,7 @@ init_identity() {
     }
   fi
   # Phase E.2: bootstrap X25519 keypair for envelope encryption.
-  "$(airc_rs_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" >/dev/null
+  "$(airc_core_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" >/dev/null
   touch "$MESSAGES"
 }
 
@@ -1347,7 +1337,7 @@ _monitor_multi_channel() {
   # writes to the parent's stdout interleave at line boundaries.
   #
   # Args: my_name, TAB-separated "channel<TAB>gist_id" lines (one per
-  # subscribed channel, from airc-rs config list-channel-gists).
+  # subscribed channel, from airc-core config list-channel-gists).
   local my_name="$1"
   local channel_map="$2"
 
@@ -1387,12 +1377,12 @@ _monitor_multi_channel() {
         local ch="$1" gid="$2"
         [ -z "$ch" ] && return 0
         [ -z "$gid" ] && return 0
-        # airc-rs bearer recv stderr → per-channel log file (CLAUDE.md
+        # airc-core bearer recv stderr → per-channel log file (CLAUDE.md
         # "never swallow errors"). The previous 2>/dev/null hid every
         # transient gh failure, leaving "monitor's fine but no events"
         # undebuggable. Append-mode so a tail of the log shows the
         # actual cause when a channel dies.
-        "$(airc_rs_bin)" bearer recv "self" \
+        "$(airc_core_bin)" bearer recv "self" \
           --room-gist-id "$gid" \
           --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
           --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
@@ -1466,7 +1456,7 @@ _monitor_multi_channel() {
             gid=$(airc_config_list_channel_gists "$CONFIG" | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
             if [ -n "$gid" ]; then
               sleep 3
-              "$(airc_rs_bin)" bearer recv "self" \
+              "$(airc_core_bin)" bearer recv "self" \
                 --room-gist-id "$gid" \
                 --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
                 --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
@@ -1648,7 +1638,7 @@ monitor() {
     local consecutive_timeouts=0
     local ESCALATE_AFTER=4
     while true; do
-      "$(airc_rs_bin)" bearer recv "self" \
+      "$(airc_core_bin)" bearer recv "self" \
         --room-gist-id "$room_gist_id" \
         --offset-file "$offset_file" \
         --state-file "$AIRC_WRITE_DIR/bearer_state.json" \
@@ -1704,19 +1694,19 @@ monitor() {
 # Handles [rename] protocol by updating peer records on disk.
 # Read JSONL from stdin, emit one human-readable line per message.
 # Rust monitor formatter. Same stdin/stdout contract as the retired
-# formatter, but live receive formatting now stays on airc-rs.
+# formatter, but live receive formatting now stays on airc-core.
 monitor_formatter() {
   local my_name="$1"
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-  local _airc_rs; _airc_rs=$(airc_rs_bin 2>/dev/null || true)
-  if [ -z "$_airc_rs" ]; then
-    echo "airc: airc-rs is required for monitor format" >&2
+  local _airc_core; _airc_core=$(airc_core_bin 2>/dev/null || true)
+  if [ -z "$_airc_core" ]; then
+    echo "airc: airc-core is required for monitor format" >&2
     return 127
   fi
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" "$_airc_rs" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
+    AIRC_CLIENT_ID="$_client_id" "$_airc_core" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
   else
-    "$_airc_rs" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
+    "$_airc_core" monitor format --peers-dir "$PEERS_DIR" --my-name "$my_name"
   fi
 }
 
@@ -1764,7 +1754,7 @@ flush_pending_loop() {
     rhome=$(remote_home)
 
     local _gh_wait=0
-    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_core_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
       sleep "$_gh_wait"
@@ -1863,7 +1853,7 @@ flush_pending_host_loop() {
     [ -s "$pending" ] || continue
 
     local _gh_wait=0
-    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_core_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       [ "$_gh_wait" -gt 60 ] 2>/dev/null && _gh_wait=60
       sleep "$_gh_wait"
@@ -1880,16 +1870,16 @@ flush_pending_host_loop() {
     local _fallback_gist=""
     [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _fallback_gist=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
     local _batch_route _batch_ok _batch_channel _batch_gist _batch_count
-    _batch_route=$("$(airc_rs_bin)" pending host-broadcast-route \
+    _batch_route=$("$(airc_core_bin)" pending host-broadcast-route \
       --snapshot "$snapshot" --config "$CONFIG" --fallback-gist "$_fallback_gist" 2>/dev/null || true)
     IFS="$(printf '\t')" read -r _batch_ok _batch_channel _batch_gist _batch_count <<EOF
 $_batch_route
 EOF
     if [ "$_batch_ok" = "ok" ] && [ -n "$_batch_gist" ]; then
       local _batch_outcome _batch_kind
-      _batch_outcome=$(cat "$snapshot" | "$(airc_rs_bin)" bearer send-batch \
+      _batch_outcome=$(cat "$snapshot" | "$(airc_core_bin)" bearer send-batch \
         all "$_batch_channel" --room-gist-id "$_batch_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
-      _batch_kind=$(printf '%s' "$_batch_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+      _batch_kind=$(printf '%s' "$_batch_outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
       if [ "$_batch_kind" = "delivered" ]; then
         cat "$snapshot" >> "$MESSAGES"
         delivered=${_batch_count:-0}
@@ -1908,7 +1898,7 @@ EOF
       # never the wrapped envelope — cmd_send queues pre-wrap so the
       # drain can re-resolve recipient pubkey at retry time).
       local _line_channel
-      _line_channel=$(printf '%s\n' "$line" | "$(airc_rs_bin)" gist get .channel 2>/dev/null)
+      _line_channel=$(printf '%s\n' "$line" | "$(airc_core_bin)" gist get .channel 2>/dev/null)
 
       # Resolve channel → gist. Fall back to legacy room_gist_id only
       # when the line carries no channel (older queued lines may pre-date
@@ -1931,24 +1921,24 @@ EOF
       # Re-resolve recipient pubkey at drain time. Pre-pair queued lines
       # shipped plaintext; post-pair drain wraps them with the new pubkey.
       local _line_to
-      _line_to=$(printf '%s\n' "$line" | "$(airc_rs_bin)" gist get .to 2>/dev/null)
+      _line_to=$(printf '%s\n' "$line" | "$(airc_core_bin)" gist get .to 2>/dev/null)
       local _line_pub=""
       if [ -n "$_line_to" ] && [ "$_line_to" != "all" ]; then
-        _line_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
+        _line_pub=$("$(airc_core_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
           --peers-dir "$PEERS_DIR" --peer-name "$_line_to" 2>/dev/null || true)
       fi
       local _wire="$line"
       if [ -n "$_line_pub" ]; then
-        _wire=$(printf '%s' "$line" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+        _wire=$(printf '%s' "$line" | "$(airc_core_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
           --recipient-pub="$_line_pub" \
           --identity-dir "$IDENTITY_DIR" 2>/dev/null || printf '%s' "$line")
       fi
 
       local _outcome _kind
-      _outcome=$(printf '%s' "$_wire" | "$(airc_rs_bin)" bearer send \
+      _outcome=$(printf '%s' "$_wire" | "$(airc_core_bin)" bearer send \
         "${_line_to:-all}" "$_line_channel" \
         --room-gist-id "$_line_gist" 2>/dev/null || echo '{"kind":"transient_failure"}')
-      _kind=$(printf '%s' "$_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+      _kind=$(printf '%s' "$_outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
 
       case "$_kind" in
         delivered)
@@ -2114,7 +2104,7 @@ reminder_timer_loop() {
               my_name=$(_airc_queue_resolve_name 2>/dev/null || echo "")
             fi
             local roster
-            roster=$("$(airc_rs_bin)" recent-senders \
+            roster=$("$(airc_core_bin)" recent-senders \
               --messages-log "$messages_log" \
               --window-seconds "$qm_roster_window" \
               --exclude-name "$my_name" 2>/dev/null || true)
@@ -2198,7 +2188,7 @@ reminder_timer_loop() {
         sub="${sub#\#}"
         local sf_path="$AIRC_WRITE_DIR/bearer_state.${sub}.json"
         subs_file_glob="${subs_file_glob}${sf_path}|"
-      done < <("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
+      done < <("$(airc_core_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
 
       for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
         [ -f "$sf" ] || continue
@@ -2214,7 +2204,7 @@ reminder_timer_loop() {
         fi
         has_any_state=1
         local ts
-        ts=$("$(airc_rs_bin)" bearer-state "$sf" 2>/dev/null | awk '{print $1}')
+        ts=$("$(airc_core_bin)" bearer-state "$sf" 2>/dev/null | awk '{print $1}')
         if [ -n "$ts" ] && [ "$ts" -gt "$freshest_recv" ] 2>/dev/null; then
           freshest_recv="$ts"
         fi
@@ -2370,7 +2360,7 @@ EOF
     # command lines. Match on that to scope the kill to OUR children
     # only — multi-scope safety, same principle as cmd_teardown's
     # scope-isolation guarantee.
-    pkill -f "airc-rs bearer recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
+    pkill -f "airc-core bearer recv.*${AIRC_WRITE_DIR}" 2>/dev/null || true
   done
 }
 
@@ -2626,7 +2616,7 @@ case "${1:-help}" in
   codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
   codex-start) shift; cmd_codex_start "$@" ;;
   codex-hook) shift; cmd_codex_hook "$@" ;;
-  gh-audit) shift; "$(airc_rs_bin)" gh audit "$@" ;;
+  gh-audit) shift; "$(airc_core_bin)" gh audit "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

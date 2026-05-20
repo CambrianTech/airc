@@ -20,16 +20,16 @@ AIRC="${AIRC:-$(cd "$(dirname "$0")/.." && pwd)/airc}"
 [ -x "$AIRC" ] || { echo "FATAL: $AIRC not executable"; exit 2; }
 AIRC_REPO_ROOT="$(cd "$(dirname "$AIRC")" && pwd)"
 
-airc_rs_bin() {
-  if [ -n "${AIRC_RS_BIN:-}" ]; then
-    [ -x "$AIRC_RS_BIN" ] && { printf '%s\n' "$AIRC_RS_BIN"; return 0; }
+airc_core_bin() {
+  if [ -n "${AIRC_CORE_BIN:-}" ]; then
+    [ -x "$AIRC_CORE_BIN" ] && { printf '%s\n' "$AIRC_CORE_BIN"; return 0; }
     return 1
   fi
-  if command -v airc-rs >/dev/null 2>&1; then
-    command -v airc-rs
+  if command -v airc-core >/dev/null 2>&1; then
+    command -v airc-core
     return 0
   fi
-  for candidate in "$AIRC_REPO_ROOT/target/release/airc-rs" "$AIRC_REPO_ROOT/target/debug/airc-rs"; do
+  for candidate in "$AIRC_REPO_ROOT/target/release/airc-core" "$AIRC_REPO_ROOT/target/debug/airc-core"; do
     if [ -x "$candidate" ]; then
       printf '%s\n' "$candidate"
       return 0
@@ -171,7 +171,7 @@ requires_local_pair_bearer_or_skip() {
   local _scn="$1"
   if [ -z "$_airc_have_local_bearer" ]; then
     local _kinds
-    _kinds=$("$(airc_rs_bin)" bearer kinds 2>/dev/null | tr '\n' ' ' || echo "")
+    _kinds=$("$(airc_core_bin)" bearer kinds 2>/dev/null | tr '\n' ' ' || echo "")
     case " $_kinds " in
       *" local "*|*" ssh "*) _airc_have_local_bearer="yes" ;;
       *)                     _airc_have_local_bearer="no" ;;
@@ -291,7 +291,7 @@ scaffold_identity() {
     ssh-keygen -t ed25519 -f "$identity_dir/ssh_key" -N '' -q -C "$name" 2>/dev/null
   fi
   if [ ! -f "$identity_dir/private.pem" ]; then
-    "$(airc_rs_bin)" identity bootstrap-ed25519 --dir "$identity_dir"
+    "$(airc_core_bin)" identity bootstrap-ed25519 --dir "$identity_dir"
   fi
 }
 
@@ -366,8 +366,8 @@ scenario_tabs() {
   cp /tmp/airc-it-j/state/identity/* "$fake_home/state/identity/" 2>/dev/null
   cp /tmp/airc-it-j/state/config.json "$fake_home/state/config.json"
   # Point host_target at an unreachable host
-  "$(airc_rs_bin)" config set --config "$fake_home/state/config.json" --key host_target --value nobody@198.51.100.99
-  "$(airc_rs_bin)" config set --config "$fake_home/state/config.json" --key host_airc_home --value /tmp/nowhere
+  "$(airc_core_bin)" config set --config "$fake_home/state/config.json" --key host_target --value nobody@198.51.100.99
+  "$(airc_core_bin)" config set --config "$fake_home/state/config.json" --key host_airc_home --value /tmp/nowhere
   # Write a fake peer so resolution doesn't fail
   echo '{"name":"ghost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
   AIRC_HOME=$fake_home/state "$AIRC" send @ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
@@ -417,7 +417,7 @@ scenario_tabs() {
   [ -f "$peer_file" ] && pass "peer record for renamed peer is on disk" \
                       || fail "no peer record for gamma (rename didn't persist)"
   local peer_home
-  peer_home=$("$(airc_rs_bin)" config get --config "$peer_file" airc_home)
+  peer_home=$("$(airc_core_bin)" config get --config "$peer_file" airc_home)
   [ -n "$peer_home" ] && pass "peer record has non-empty airc_home ($peer_home)" \
                       || fail "peer record airc_home is empty — remote_home() fallback would misroute sends"
 
@@ -753,10 +753,10 @@ scenario_queue() {
 
   # Snapshot the real host_target, then flip to an unreachable address.
   local real_target
-  real_target=$("$(airc_rs_bin)" config get --config /tmp/airc-it-q-j/state/config.json host_target)
+  real_target=$("$(airc_core_bin)" config get --config /tmp/airc-it-q-j/state/config.json host_target)
   [ -n "$real_target" ] || { fail "no host_target recorded in joiner config"; return; }
 
-  "$(airc_rs_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
+  "$(airc_core_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
     --key host_target --value nobody@198.51.100.99
   # Also fake the peer record so resolution doesn't fail on @qhost
   echo '{"name":"qhost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' \
@@ -779,7 +779,7 @@ scenario_queue() {
     || fail "send during outage: no [QUEUED] marker in local messages.jsonl"
 
   # ── Recovery: restore real host_target, wait for flush loop ─────────
-  "$(airc_rs_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
+  "$(airc_core_bin)" config set --config /tmp/airc-it-q-j/state/config.json \
     --key host_target --value "$real_target"
   pass "joiner: host_target restored (recovery simulation)"
 
@@ -853,9 +853,9 @@ scenario_status() {
   # Pending queue: simulate an outage by flipping host_target and sending, then assert queue size.
   # Reuse the same fake-target pattern as scenario_queue.
   local real_target
-  real_target=$("$(airc_rs_bin)" config get --config /tmp/airc-it-s-j/state/config.json host_target)
-  "$(airc_rs_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key _real_host_target --value "$real_target"
-  "$(airc_rs_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key host_target --value nobody@198.51.100.99
+  real_target=$("$(airc_core_bin)" config get --config /tmp/airc-it-s-j/state/config.json host_target)
+  "$(airc_core_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key _real_host_target --value "$real_target"
+  "$(airc_core_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key host_target --value nobody@198.51.100.99
   echo '{"name":"shost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
   AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" send @shost "status-queue-probe" >/dev/null 2>&1 || true
   local j_out3; j_out3=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
@@ -1121,10 +1121,10 @@ scenario_events() {
     local event_ok=0 line
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .from 2>/dev/null)" = "airc" ] || continue
-      printf '%s' "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" | grep -q 'beta joined' || continue
-      [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .to 2>/dev/null)" = "all" ] || continue
-      [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .ts 2>/dev/null)" ] || continue
+      [ "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .from 2>/dev/null)" = "airc" ] || continue
+      printf '%s' "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .msg 2>/dev/null)" | grep -q 'beta joined' || continue
+      [ "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .to 2>/dev/null)" = "all" ] || continue
+      [ -n "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .ts 2>/dev/null)" ] || continue
       event_ok=1
       break
     done < /tmp/airc-it-h/state/messages.jsonl
@@ -1358,7 +1358,7 @@ scenario_identity() {
   # nick that would have triggered the bug and asserting the stored
   # name has no leading dash.
   AIRC_HOME="$home/state" "$AIRC" nick ".dottyname" >/dev/null 2>&1 || true
-  local renamed; renamed=$("$(airc_rs_bin)" config get --config "$home/state/config.json" name)
+  local renamed; renamed=$("$(airc_core_bin)" config get --config "$home/state/config.json" name)
   case "$renamed" in
     -*) fail "airc nick produced leading-dash name '$renamed' — sanitization regression" ;;
     "") fail "airc nick wrote empty name — sanitization regression" ;;
@@ -1662,7 +1662,7 @@ scenario_heartbeat() {
   # Original gist must still exist and now advertise beta as host.
   local recovered_name
   recovered_name=$(gh api "gists/$gist_id" --jq ".files[\"airc-room-${rname}.json\"].content" 2>/dev/null \
-    | "$(airc_rs_bin)" gist get .host.name 2>/dev/null || true)
+    | "$(airc_core_bin)" gist get .host.name 2>/dev/null || true)
   if [ "$recovered_name" = "beta" ]; then
     pass "original gist preserved and host lease updated to beta"
   else
@@ -2011,9 +2011,9 @@ JSON
   local sent_ok=0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" = "live monitor probe ascii" ] || continue
-    [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .client_id 2>/dev/null)" ] || continue
-    [ -n "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .sig 2>/dev/null)" ] || continue
+    [ "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .msg 2>/dev/null)" = "live monitor probe ascii" ] || continue
+    [ -n "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .client_id 2>/dev/null)" ] || continue
+    [ -n "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .sig 2>/dev/null)" ] || continue
     sent_ok=1
     break
   done < "$home/messages.jsonl"
@@ -2097,8 +2097,8 @@ JSON
     && pass "status reports recv-side 404 as degraded despite fresh heartbeat" \
     || fail "status treated recv-side 404 as healthy (got: $status_out)"
 
-  local real_airc_rs; real_airc_rs=$(airc_rs_bin)
-  cat > "$fakebin/airc-rs" <<SH
+  local real_airc_core; real_airc_core=$(airc_core_bin)
+  cat > "$fakebin/airc-core" <<SH
 #!/bin/bash
 if [ "\${1:-}" = "bearer" ] && [ "\${2:-}" = "send" ]; then
   cat >/dev/null
@@ -2113,14 +2113,14 @@ if [ "\${1:-}" = "bearer" ] && [ "\${2:-}" = "send" ]; then
       ;;
   esac
 fi
-exec "$real_airc_rs" "\$@"
+exec "$real_airc_core" "\$@"
 SH
-  chmod +x "$fakebin/airc-rs"
+  chmod +x "$fakebin/airc-core"
 
   local out err rc
   out=$(mktemp -t airc-gone-out.XXXXXX)
   err=$(mktemp -t airc-gone-err.XXXXXX)
-  AIRC_HOME="$home" AIRC_RS_BIN="$fakebin/airc-rs" "$AIRC" msg @ghost "lost forever" >"$out" 2>"$err"
+  AIRC_HOME="$home" AIRC_CORE_BIN="$fakebin/airc-core" "$AIRC" msg @ghost "lost forever" >"$out" 2>"$err"
   rc=$?
 
   [ "$rc" -ne 0 ] \
@@ -2138,13 +2138,13 @@ SH
   fi
 
   local mapping
-  mapping=$(AIRC_HOME="$home" "$real_airc_rs" config get-channel-gist \
+  mapping=$(AIRC_HOME="$home" "$real_airc_core" config get-channel-gist \
     --config "$home/config.json" --channel general 2>/dev/null || true)
   [ -z "$mapping" ] \
     && pass "stale channel gist mapping cleared" \
     || fail "stale channel gist mapping still present: $mapping"
 
-  AIRC_FAKE_BEARER_KIND=transient_failure AIRC_HOME="$home" AIRC_RS_BIN="$fakebin/airc-rs" \
+  AIRC_FAKE_BEARER_KIND=transient_failure AIRC_HOME="$home" AIRC_CORE_BIN="$fakebin/airc-core" \
     "$AIRC" msg @ghost "retry later" >"$out" 2>"$err"
   rc=$?
   [ "$rc" -eq 0 ] \
@@ -2222,7 +2222,7 @@ JSON
     && pass "fresh bearer_state alone does not satisfy AIRC process liveness" \
     || fail "fresh bearer_state falsely satisfied AIRC process liveness (got: $status_out)"
 
-  ( exec -a "airc-rs monitor format --peers-dir $other/peers --my-name foreign" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $other/peers --my-name foreign" sleep 60 ) &
   local foreign_pid=$!
   sleep 1
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
@@ -2232,7 +2232,7 @@ JSON
   kill "$foreign_pid" 2>/dev/null || true
   wait "$foreign_pid" 2>/dev/null || true
 
-  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name local" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $home/peers --my-name local" sleep 60 ) &
   local local_pid=$!
   local seen=0 i
   for i in $(seq 1 10); do
@@ -2684,9 +2684,9 @@ scenario_codex_join_waits_for_duplicate_repair() {
   mkdir -p "$home/peers"
 
   echo "99999" > "$home/airc.pid"
-  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
   local stale_one=$!
-  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
   local stale_two=$!
 
   CODEX_THREAD_ID=airc-it-codex-dup AIRC_CODEX_START_WAIT_SEC=25 \
@@ -2730,9 +2730,9 @@ scenario_join_reaps_duplicate_scope_transport() {
   mkdir -p "$home/peers" "$root"
 
   echo "99999" > "$home/airc.pid"
-  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
   local stale_one=$!
-  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  ( exec -a "airc-core monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
   local stale_two=$!
 
   AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_CODEX_DETACH=1 \
@@ -3103,7 +3103,7 @@ scenario_general_sidecar_default() {
     [ -f "$home1/config.json" ] && grep -q 'subscribed_channels' "$home1/config.json" && break
   done
 
-  if [ -f "$home1/config.json" ] && "$(airc_rs_bin)" config read-channels --config "$home1/config.json" | grep -qx "general"; then
+  if [ -f "$home1/config.json" ] && "$(airc_core_bin)" config read-channels --config "$home1/config.json" | grep -qx "general"; then
     pass "subscribed_channels includes 'general'"
   else
     fail "subscribed_channels missing 'general' (config: $(cat "$home1/config.json" 2>/dev/null))"
@@ -3202,7 +3202,7 @@ JSON
 
   # ── Set away with message ──
   AIRC_HOME="$home" "$AIRC" away "in a meeting til 3pm" >/dev/null 2>&1
-  local status; status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status)
+  local status; status=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.status)
   [ "$status" = "in a meeting til 3pm" ] \
     && pass "away <msg> sets status field" \
     || fail "away didn't set status (got: '$status')"
@@ -3215,14 +3215,14 @@ JSON
 
   # ── Multi-word message via positional args ──
   AIRC_HOME="$home" "$AIRC" away getting coffee >/dev/null 2>&1
-  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status)
+  status=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.status)
   [ "$status" = "getting coffee" ] \
     && pass "away with multi-word arg joins with spaces" \
     || fail "multi-word away dropped tokens (got: '$status')"
 
   # ── airc back (no args) clears status ──
   AIRC_HOME="$home" "$AIRC" away >/dev/null 2>&1
-  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
+  status=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
   [ "$status" = "(absent)" ] \
     && pass "away (no arg) clears status field (back)" \
     || fail "away no-arg didn't clear status (got: '$status')"
@@ -3230,7 +3230,7 @@ JSON
   # ── 'back' alias (IRC convention shortcut) ──
   AIRC_HOME="$home" "$AIRC" away "afk" >/dev/null 2>&1
   AIRC_HOME="$home" "$AIRC" back >/dev/null 2>&1
-  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
+  status=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
   [ "$status" = "(absent)" ] \
     && pass "back alias also clears status" \
     || fail "back alias didn't clear (got: '$status')"
@@ -3320,10 +3320,10 @@ JSON
 
   # Identity preserved
   local name pronouns role bio
-  name=$("$(airc_rs_bin)" config get --config "$home/config.json" name)
-  pronouns=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.pronouns)
-  role=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.role)
-  bio=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.bio)
+  name=$("$(airc_core_bin)" config get --config "$home/config.json" name)
+  pronouns=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.pronouns)
+  role=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.role)
+  bio=$("$(airc_core_bin)" config get-path --config "$home/config.json" .identity.bio)
   [ "$name" = "alpha" ] && pass "name survives quit" || fail "name lost (got: '$name')"
   [ "$pronouns" = "they" ] && pass "pronouns survive quit" || fail "pronouns lost (got: '$pronouns')"
   [ "$role" = "agent" ] && pass "role survives quit" || fail "role lost (got: '$role')"
@@ -3331,8 +3331,8 @@ JSON
 
   # Host-pairing fields cleared
   local has_target has_name
-  has_target=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_target)
-  has_name=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_name)
+  has_target=$("$(airc_core_bin)" config has-key --config "$home/config.json" host_target)
+  has_name=$("$(airc_core_bin)" config has-key --config "$home/config.json" host_name)
   [ "$has_target" = "false" ] && pass "host_target cleared by quit" || fail "host_target still present"
   [ "$has_name" = "false" ] && pass "host_name cleared by quit" || fail "host_name still present"
 
@@ -3348,7 +3348,7 @@ JSON
 }
 JSON
   AIRC_HOME="$home" "$AIRC" disconnect >/dev/null 2>&1
-  has_target=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_target)
+  has_target=$("$(airc_core_bin)" config has-key --config "$home/config.json" host_target)
   [ "$has_target" = "false" ] && pass "disconnect alias clears pairing too" || fail "disconnect alias didn't clear"
 
   rm -rf /tmp/airc-it-q-quit
@@ -3406,8 +3406,8 @@ scenario_platform_adapters() {
     return
   fi
   _adapter_call() {
-    local _rs; _rs=$(airc_rs_bin) || return 1
-    AIRC_RS_BIN="$_rs" bash -c "airc_rs_bin() { printf '%s\n' \"\$AIRC_RS_BIN\"; }; source '$_adapters_file'; $*"
+    local _rs; _rs=$(airc_core_bin) || return 1
+    AIRC_CORE_BIN="$_rs" bash -c "airc_core_bin() { printf '%s\n' \"\$AIRC_CORE_BIN\"; }; source '$_adapters_file'; $*"
   }
 
   # ── proc_children ──
@@ -3630,8 +3630,8 @@ scenario_bearer_ssh_send() {
   # Pull the joiner's host_target + remote_home from its config; identity
   # key is at a known path on disk.
   local jstate=/tmp/airc-it-bs-j/state
-  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
-  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
+  local host_target; host_target=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
   # because the actual SSH messaging goes through the system sshd at port 22
   # (the airc port is only used for the pairing handshake). The bearer's
@@ -3646,7 +3646,7 @@ scenario_bearer_ssh_send() {
   local payload='{"from":"gamma","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"bearer-test-payload-78a8c","sig":"x"}'
 
   local outcome
-  outcome=$(printf '%s' "$payload" | "$(airc_rs_bin)" bearer send \
+  outcome=$(printf '%s' "$payload" | "$(airc_core_bin)" bearer send \
     "alpha" "general" \
     --host-target "$host_target" \
     --identity-key "$ikey" \
@@ -3687,8 +3687,8 @@ scenario_bearer_ssh_recv() {
   pass "joiner delta paired with alpha"
 
   local jstate=/tmp/airc-it-br-j/state
-  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
-  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
+  local host_target; host_target=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
   # because the actual SSH messaging goes through the system sshd at port 22
   # (the airc port is only used for the pairing handshake). The bearer's
@@ -3709,7 +3709,7 @@ scenario_bearer_ssh_recv() {
 
   # Run the recv driver in the background. It writes "FOUND" to recv_out
   # when it sees the marker, then exits.
-  "$(airc_rs_bin)" bearer recv alpha \
+  "$(airc_core_bin)" bearer recv alpha \
     --host-target "$host_target" \
     --identity-key "$ikey" \
     --remote-home "$rhome" \
@@ -3744,7 +3744,7 @@ scenario_bearer_ssh_recv() {
 }
 
 scenario_bearer_cli_recv() {
-  # Phase 2b: prove `airc-rs bearer recv` emits one line per envelope,
+  # Phase 2b: prove `airc-core bearer recv` emits one line per envelope,
   # payload-bytes verbatim, suitable for piping straight
   # into monitor_formatter. If this scenario passes but the monitor still
   # misses messages, the bug is in the formatter or in the watchdog —
@@ -3763,8 +3763,8 @@ scenario_bearer_cli_recv() {
   pass "joiner delta paired with alpha"
 
   local jstate=/tmp/airc-it-cli-j/state
-  local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
-  local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
+  local host_target; host_target=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_target)
+  local rhome;       rhome=$("$(airc_core_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   local ikey="$jstate/identity/ssh_key"
   local hstate=/tmp/airc-it-cli-h/state
 
@@ -3773,10 +3773,10 @@ scenario_bearer_cli_recv() {
   local cli_out; cli_out=$(mktemp -t airc-it-cli-recv.XXXXXX)
   local cli_err; cli_err=$(mktemp -t airc-it-cli-err.XXXXXX)
 
-  # Run airc-rs bearer recv in the background, captured to a file. Different
+  # Run airc-core bearer recv in the background, captured to a file. Different
   # offset_file path per invocation so we don't fight the live joiner.
   local off_file; off_file=$(mktemp -t airc-it-cli-off.XXXXXX); rm -f "$off_file"
-  "$(airc_rs_bin)" bearer recv alpha \
+  "$(airc_core_bin)" bearer recv alpha \
     --host-target "$host_target" \
     --identity-key "$ikey" \
     --remote-home "$rhome" \
@@ -3813,7 +3813,7 @@ scenario_bearer_cli_recv() {
   local parsed_found=0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    [ "$(printf '%s' "$line" | "$(airc_rs_bin)" gist get .msg 2>/dev/null)" = "$marker" ] && parsed_found=1 && break
+    [ "$(printf '%s' "$line" | "$(airc_core_bin)" gist get .msg 2>/dev/null)" = "$marker" ] && parsed_found=1 && break
   done < "$cli_out"
   if [ $found -eq 1 ] && [ "$parsed_found" = "1" ]; then
     pass "bearer_cli recv output is parseable JSONL"
@@ -3886,8 +3886,8 @@ scenario_gh_send_creates_messages_jsonl() {
   local marker="tdd-first-send-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
   local outcome
-  outcome=$(printf '%s' "$probe" | "$(airc_rs_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
-  local kind; kind=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+  outcome=$(printf '%s' "$probe" | "$(airc_core_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
+  local kind; kind=$(printf '%s' "$outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
 
   if [ "$kind" = "delivered" ]; then
     pass "bearer_cli send returned 'delivered'"
@@ -4146,9 +4146,9 @@ scenario_gist_rotates_under_size_limit() {
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"rotation-test","msg":"'"$marker"'","sig":"x"}'
   local send_out
   send_out=$(AIRC_DISABLE_LOCAL_BUS=1 AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
-    "$(airc_rs_bin)" bearer send all rotation-test \
+    "$(airc_core_bin)" bearer send all rotation-test \
       --room-gist-id "$gist_id" <<< "$probe" 2>&1)
-  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
   if [ "$send_kind" = "secondary_rate_limit" ]; then
     echo "  (skipped — gh secondary rate limit/backoff active; local bus disabled so rotation is not falsely accepted)"
     trap - EXIT
@@ -4230,7 +4230,7 @@ JSON
   # about to create.)
   sleep 1
   local single_gid
-  single_gid=$("$(airc_rs_bin)" channel-gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
+  single_gid=$("$(airc_core_bin)" channel-gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
 
   if [ -z "$single_gid" ]; then
     fail "channel_gist resolve returned empty"
@@ -4250,7 +4250,7 @@ JSON
   # The new single_gid should be a canonical single-channel gist.
   local single_channels
   single_channels=$(gh api "gists/$single_gid" --jq '.files | to_entries[0].value.content' 2>/dev/null \
-    | "$(airc_rs_bin)" gist get .channels 2>/dev/null)
+    | "$(airc_core_bin)" gist get .channels 2>/dev/null)
   if [ "$single_channels" = '["lobby-target"]' ]; then
     pass "single-channel gist envelope has channels=['lobby-target'] (post-3c canonical shape)"
   else
@@ -4262,7 +4262,7 @@ JSON
   # the legacy. This is the real production scenario where Peer B
   # resolves AFTER Peer A already published the canonical single-channel.
   local second_resolve
-  second_resolve=$("$(airc_rs_bin)" channel-gist resolve --channel lobby-target 2>/dev/null)
+  second_resolve=$("$(airc_core_bin)" channel-gist resolve --channel lobby-target 2>/dev/null)
   if [ "$second_resolve" = "$single_gid" ]; then
     pass "second resolve returns the canonical single-channel gist (substrate converges)"
   else
@@ -4320,7 +4320,7 @@ scenario_general_has_shared_gist() {
   pass "host published project room gist: $proj_gid (for #$rname)"
 
   trap "gh gist delete '$proj_gid' --yes 2>/dev/null || true; \
-        general_gid=\$(\"$(airc_rs_bin)\" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null); \
+        general_gid=\$(\"$(airc_core_bin)\" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null); \
         [ -n \"\$general_gid\" ] && [ \"\$general_gid\" != \"$proj_gid\" ] && gh gist delete \"\$general_gid\" --yes 2>/dev/null || true" EXIT
 
   # Sleep a moment so the sidecar code has had a chance to also resolve
@@ -4330,7 +4330,7 @@ scenario_general_has_shared_gist() {
   # Critical assertion 1: config.json must have a channel_gists map
   # with "general" pointing at a gist id distinct from the project room.
   local general_gid
-  general_gid=$("$(airc_rs_bin)" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null)
+  general_gid=$("$(airc_core_bin)" config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general 2>/dev/null)
 
   if [ -n "$general_gid" ]; then
     pass "config.channel_gists['general'] resolved to: $general_gid"
@@ -4397,7 +4397,7 @@ scenario_custom_room_creates_gist() {
   for i in $(seq 1 30); do
     sleep 1
     [ -f "$home/state/config.json" ] || continue
-    gid=$("$(airc_rs_bin)" config get-channel-gist --config "$home/state/config.json" --channel "$rname" 2>/dev/null)
+    gid=$("$(airc_core_bin)" config get-channel-gist --config "$home/state/config.json" --channel "$rname" 2>/dev/null)
     [ -n "$gid" ] && break
   done
   trap "[ -n '$gid' ] && gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
@@ -4456,7 +4456,7 @@ scenario_invite_human() {
   for i in $(seq 1 60); do
     sleep 1
     [ -f "$home_h/state/config.json" ] || continue
-    host_gid=$("$(airc_rs_bin)" config get-channel-gist --config "$home_h/state/config.json" --channel "$rname" 2>/dev/null)
+    host_gid=$("$(airc_core_bin)" config get-channel-gist --config "$home_h/state/config.json" --channel "$rname" 2>/dev/null)
     [ -n "$host_gid" ] && break
   done
 
@@ -4581,10 +4581,10 @@ scenario_bearer_gh() {
 
   # Send via the Rust bearer CLI. This is the same gh path airc msg uses.
   local send_out
-  send_out=$(printf '%s' "$probe" | AIRC_DISABLE_LOCAL_BUS=1 "$(airc_rs_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
-  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+  send_out=$(printf '%s' "$probe" | AIRC_DISABLE_LOCAL_BUS=1 "$(airc_core_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
+  local send_kind; send_kind=$(printf '%s' "$send_out" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
 
-  if "$(airc_rs_bin)" bearer kinds | grep -qx 'gh'; then
+  if "$(airc_core_bin)" bearer kinds | grep -qx 'gh'; then
     pass "Rust bearer registry exposes gh"
   else
     fail "Rust bearer registry missing gh"
@@ -4597,15 +4597,15 @@ scenario_bearer_gh() {
     cleanup_all
     return
   elif [ "$send_kind" = "delivered" ]; then
-    pass "airc-rs bearer send returns delivered"
+    pass "airc-core bearer send returns delivered"
   else
-    fail "airc-rs bearer send did not deliver (got: $send_out)"
+    fail "airc-core bearer send did not deliver (got: $send_out)"
     return
   fi
 
   # Verify the marker actually landed in the gist.
   local content; content=$(gh api "gists/$gist_id" 2>/dev/null \
-    | "$(airc_rs_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
+    | "$(airc_core_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
   if printf '%s' "$content" | grep -q "$marker"; then
     pass "payload visible in gist's messages.jsonl"
   else
@@ -4614,7 +4614,7 @@ scenario_bearer_gh() {
   fi
 
   # Now exercise recv: append a SECOND probe to the gist via gh CLI
-  # directly (simulating another peer's send), then verify airc-rs
+  # directly (simulating another peer's send), then verify airc-core
   # bearer recv picks it up. Use poll_interval=1 to keep the test fast
   # — production default is 15s.
   local marker2="gh-bearer-recv-marker-$(date +%s%N)"
@@ -4623,7 +4623,7 @@ scenario_bearer_gh() {
   local recv_err; recv_err=$(mktemp -t airc-it-bg-recv-err.XXXXXX)
   local recv_state; recv_state=$(mktemp -t airc-it-bg-state.XXXXXX)
   local recv_offset; recv_offset=$(mktemp -t airc-it-bg-offset.XXXXXX); rm -f "$recv_offset"
-  AIRC_DISABLE_LOCAL_BUS=1 AIRC_GH_POLL_INTERVAL=1 "$(airc_rs_bin)" bearer recv alpha \
+  AIRC_DISABLE_LOCAL_BUS=1 AIRC_GH_POLL_INTERVAL=1 "$(airc_core_bin)" bearer recv alpha \
     --room-gist-id "$gist_id" \
     --offset-file "$recv_offset" \
     --state-file "$recv_state" \
@@ -4638,7 +4638,7 @@ scenario_bearer_gh() {
   # wholesale, so reconstruct the full content.
   sleep 2
   local prior_content; prior_content=$(gh api "gists/$gist_id" 2>/dev/null \
-    | "$(airc_rs_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
+    | "$(airc_core_bin)" gist file-content --filename messages.jsonl 2>/dev/null)
   local seed2; seed2=$(mktemp -d -t airc-it-bg-seed2.XXXXXX)
   {
     printf '%s' "$prior_content"
@@ -4661,18 +4661,18 @@ scenario_bearer_gh() {
   wait "$recv_pid" 2>/dev/null || true
 
   if grep -q "$marker2" "$recv_out" 2>/dev/null; then
-    pass "airc-rs bearer recv picked up the appended marker"
+    pass "airc-core bearer recv picked up the appended marker"
   else
-    fail "airc-rs bearer recv did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
+    fail "airc-core bearer recv did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
   fi
-  local recv_kind; recv_kind=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
-  local recv_sender; recv_sender=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .last_sender 2>/dev/null)
-  local recv_ts; recv_ts=$(cat "$recv_state" 2>/dev/null | "$(airc_rs_bin)" gist get .last_recv_ts 2>/dev/null)
+  local recv_kind; recv_kind=$(cat "$recv_state" 2>/dev/null | "$(airc_core_bin)" gist get .kind 2>/dev/null)
+  local recv_sender; recv_sender=$(cat "$recv_state" 2>/dev/null | "$(airc_core_bin)" gist get .last_sender 2>/dev/null)
+  local recv_ts; recv_ts=$(cat "$recv_state" 2>/dev/null | "$(airc_core_bin)" gist get .last_recv_ts 2>/dev/null)
   if [ "$recv_kind" = "gh" ] && [ "$recv_sender" = "beta" ] && \
      awk "BEGIN { exit !(($recv_ts > 0) && ($(date +%s) - $recv_ts < 30)) }" 2>/dev/null; then
-    pass "airc-rs bearer state reports fresh gh recv event"
+    pass "airc-core bearer state reports fresh gh recv event"
   else
-    fail "airc-rs bearer state not fresh (state: $(cat "$recv_state" 2>/dev/null))"
+    fail "airc-core bearer state not fresh (state: $(cat "$recv_state" 2>/dev/null))"
   fi
 
   rm -f "$recv_out" "$recv_err" "$recv_state" "$recv_offset" "$recv_offset.local.bytes"
@@ -4695,7 +4695,7 @@ scenario_shell_msg_rust_local() {
 { "name": "rust-shell", "subscribed_channels": ["airc"] }
 JSON
 
-  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" msg "$marker" >"$out" 2>"$err"; then
+  if AIRC_HOME="$home" AIRC_CORE_BIN="$(airc_core_bin)" "$AIRC" msg "$marker" >"$out" 2>"$err"; then
     pass "airc msg returned success through Rust local route"
   else
     fail "airc msg failed (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
@@ -4714,14 +4714,14 @@ JSON
     fail "airc msg leaked into gh bearer path (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null); pending: $(cat "$home/pending.jsonl" 2>/dev/null))"
   fi
 
-  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" inbox --count 5 >"$out" 2>"$err" \
+  if AIRC_HOME="$home" AIRC_CORE_BIN="$(airc_core_bin)" "$AIRC" inbox --count 5 >"$out" 2>"$err" \
       && grep -q "$marker" "$out"; then
     pass "airc inbox reads Rust local transcript"
   else
     fail "airc inbox did not read Rust local transcript (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
   fi
 
-  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" status >"$out" 2>"$err" \
+  if AIRC_HOME="$home" AIRC_CORE_BIN="$(airc_core_bin)" "$AIRC" status >"$out" 2>"$err" \
       && grep -q 'data-plane:  rust-local active (#airc' "$out" \
       && grep -q 'gh auth:.*rust-local unaffected' "$out"; then
     pass "airc status reports Rust local data-plane before gh health"
@@ -4730,7 +4730,7 @@ JSON
   fi
 
   local explicit_cursor="$home/explicit-codex-hook-cursor.json"
-  if printf '{"hook_event_name":"UserPromptSubmit"}' | AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" codex-hook user-prompt-submit --cursor-file "$explicit_cursor" --include-self >"$out" 2>"$err" \
+  if printf '{"hook_event_name":"UserPromptSubmit"}' | AIRC_HOME="$home" AIRC_CORE_BIN="$(airc_core_bin)" "$AIRC" codex-hook user-prompt-submit --cursor-file "$explicit_cursor" --include-self >"$out" 2>"$err" \
       && grep -q "$marker" "$out" \
       && [ -f "$explicit_cursor" ]; then
     pass "codex-hook wrapper respects explicit cursor file on Rust event stream"

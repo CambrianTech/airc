@@ -11,7 +11,7 @@
 #                            print the join string. Manual handoff for
 #                            now; PR-2c automates this via state.
 #
-# External cross-references (resolved at call time): die, airc_rs_bin,
+# External cross-references (resolved at call time): die, airc_core_bin,
 # `gh` CLI.
 #
 # Crypto contract: per-knock + per-approval X25519 ephemerals → ECDH +
@@ -114,7 +114,7 @@ cmd_approve() {
   # The helper generates a per-approval ephemeral keypair internally,
   # runs ECDH, and emits {ver, approver_pub, nonce, ciphertext} JSON.
   local approval_json
-  if ! approval_json=$("$(airc_rs_bin)" knock encrypt-for-knocker \
+  if ! approval_json=$("$(airc_core_bin)" knock encrypt-for-knocker \
         --knocker-pub "$knocker_pub" \
         --plaintext "$invite_string" 2>&1); then
     die "approve: encryption failed: $approval_json"
@@ -234,15 +234,15 @@ cmd_decrypt_approval() {
   fi
 
   local approver_pub nonce ciphertext
-  approver_pub=$("$(airc_rs_bin)" knock approval-field --field approver_pub <<< "$approval_json")
-  nonce=$("$(airc_rs_bin)" knock approval-field --field nonce <<< "$approval_json")
-  ciphertext=$("$(airc_rs_bin)" knock approval-field --field ciphertext <<< "$approval_json")
+  approver_pub=$("$(airc_core_bin)" knock approval-field --field approver_pub <<< "$approval_json")
+  nonce=$("$(airc_core_bin)" knock approval-field --field nonce <<< "$approval_json")
+  ciphertext=$("$(airc_core_bin)" knock approval-field --field ciphertext <<< "$approval_json")
 
   if [ -z "$approver_pub" ] || [ -z "$nonce" ] || [ -z "$ciphertext" ]; then
     die "decrypt-approval: malformed approval envelope (missing approver_pub/nonce/ciphertext)"
   fi
 
-  if ! "$(airc_rs_bin)" knock decrypt-from-approver \
+  if ! "$(airc_core_bin)" knock decrypt-from-approver \
         --knocker-priv "$knocker_priv" \
         --approver-pub "$approver_pub" \
         --nonce "$nonce" \
@@ -313,7 +313,7 @@ _airc_approve_extract_knocker_pub() {
   # Body comes in via $1 as raw markdown; we look for the first JSON
   # block with a "knocker_pub" field.
   local body="$1"
-  "$(airc_rs_bin)" knock extract-knocker-pub <<< "$body" 2>/dev/null || true
+  "$(airc_core_bin)" knock extract-knocker-pub <<< "$body" 2>/dev/null || true
 }
 
 _airc_decrypt_extract_approval() {
@@ -321,7 +321,7 @@ _airc_decrypt_extract_approval() {
   # Returns the most recent envelope (last comment with one), so a
   # repost or correction wins over the original.
   local comments_json="$1"
-  "$(airc_rs_bin)" knock extract-approval <<< "$comments_json" 2>/dev/null || true
+  "$(airc_core_bin)" knock extract-approval <<< "$comments_json" 2>/dev/null || true
 }
 
 _airc_approve_default_invite() {

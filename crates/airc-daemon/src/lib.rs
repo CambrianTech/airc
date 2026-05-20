@@ -5,7 +5,7 @@
 //! CLI invocations; each connection is one request/response round-
 //! trip dispatched against the typed [`Request`] enum. The daemon
 //! owns the peer keypair, registry, and any open transports;
-//! subsequent CLI commands (`airc-rs msg`, `airc-rs status`) become
+//! subsequent CLI commands (`airc msg`, `airc status`) become
 //! cheap RPCs that don't re-load identity or re-handshake transports.
 //!
 //! Module layout (one concern per file):

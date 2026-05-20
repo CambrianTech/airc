@@ -86,7 +86,7 @@ _join_phase_done() {
 #      --first: prepend (sets the scope's default channel).
 #      default: append.
 #   2. Resolve-or-create the canonical gist for the channel on the
-#      user's gh account (airc-rs channel-gist resolve
+#      user's gh account (airc-core channel-gist resolve
 #      --create-if-missing). Idempotent across runs.
 #   3. Persist the channel→gist mapping in channel_gists{} so cmd_send's
 #      route-by-channel and the multi-channel monitor's per-channel
@@ -150,7 +150,7 @@ ensure_channel_subscribed_with_gist() {
     _gid=""
   fi
   if [ -z "$_gid" ]; then
-    _gid=$("$(airc_rs_bin)" channel-gist resolve \
+    _gid=$("$(airc_core_bin)" channel-gist resolve \
            --channel "$channel" --create-if-missing 2>"$_err")
   fi
   if [ -z "$_gid" ]; then
@@ -184,12 +184,12 @@ _join_show_status_and_inbox() {
 _join_transport_health_ok() {
   [ -f "$CONFIG" ] || return 1
   local _channels
-  _channels=$("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || true)
+  _channels=$("$(airc_core_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null || true)
   # Legacy/no-room mode has no gist bearer to heartbeat. If the caller
   # already proved the scope owner is alive, transport_health has no
   # channel rows to evaluate and must not force a duplicate restart.
   [ -n "$_channels" ] || return 0
-  "$(airc_rs_bin)" transport health \
+  "$(airc_core_bin)" transport health \
     --home "$AIRC_WRITE_DIR" \
     --config "$CONFIG" \
     --quiet \
@@ -256,7 +256,7 @@ _join_restart_scope_processes() {
   # Filter rules:
   #   - drop non-numeric / empty entries (already a no-op)
   #   - drop $$ and $PPID (case 1)
-  #   - drop any PID whose cmdline doesn't look like airc/airc-rs
+  #   - drop any PID whose cmdline doesn't look like airc/airc-core
   #     (case 2). Same regex shape as the stale-pidfile check at
   #     ~line 971 and cmd_teardown's parent-chain reaper.
   local _self_filtered_pids="" _candidate _candidate_cmd
@@ -271,7 +271,7 @@ _join_restart_scope_processes() {
     kill -0 "$_candidate" 2>/dev/null || continue
     _candidate_cmd=$(proc_cmdline "$_candidate" 2>/dev/null || true)
     case "$_candidate_cmd" in
-      *airc-rs*monitor*format*|*airc-rs*monitor*attach*|*airc-rs*handshake*|*airc-rs*bearer*recv*) ;;
+      *airc-core*monitor*format*|*airc-core*monitor*attach*|*airc-core*handshake*|*airc-core*bearer*recv*) ;;
       *airc[[:space:]]connect*|*airc[[:space:]]join*|*/airc[[:space:]]*) ;;
       *) continue ;;
     esac
@@ -314,8 +314,8 @@ _join_scope_transport_pids() {
       [ "$_pid" = "$PPID" ] && continue
       _cmd=$(proc_cmdline "$_pid" || true)
       case "$_cmd" in
-        *airc-rs*monitor*attach*) continue ;;
-        *airc-rs*monitor*format*|*airc-rs*handshake*accept-one*|*airc-rs*bearer*recv*)
+        *airc-core*monitor*attach*) continue ;;
+        *airc-core*monitor*format*|*airc-core*handshake*accept-one*|*airc-core*bearer*recv*)
           _pids="$_pids $_pid"
           ;;
         *) continue ;;
@@ -366,7 +366,7 @@ _join_scope_has_duplicate_transport() {
   fi
 
   local _seen_gists="" _pid _cmd _gid
-  for _pid in $(proc_airc_pids_matching 'airc-rs.*bearer[[:space:]]+recv' 2>/dev/null | sort -un || true); do
+  for _pid in $(proc_airc_pids_matching 'airc-core.*bearer[[:space:]]+recv' 2>/dev/null | sort -un || true); do
     _cmd=$(proc_cmdline "$_pid" || true)
     _airc_cmdline_mentions_scope "$_cmd" "$AIRC_WRITE_DIR" || continue
     _gid=$(printf '%s\n' "$_cmd" | awk '{
@@ -392,15 +392,15 @@ _join_attach_local_stream() {
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
   local _tail_name; _tail_name=$(get_name 2>/dev/null || echo "airc")
-  local _airc_rs; _airc_rs=$(airc_rs_bin 2>/dev/null || true)
-  if [ -z "$_airc_rs" ]; then
-    echo "airc: airc-rs is required for monitor attach" >&2
+  local _airc_core; _airc_core=$(airc_core_bin 2>/dev/null || true)
+  if [ -z "$_airc_core" ]; then
+    echo "airc: airc-core is required for monitor attach" >&2
     return 127
   fi
   if [ -n "$_client_id" ]; then
-    AIRC_CLIENT_ID="$_client_id" exec "$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
+    AIRC_CLIENT_ID="$_client_id" exec "$_airc_core" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
   else
-    exec "$_airc_rs" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
+    exec "$_airc_core" --home "$AIRC_WRITE_DIR" monitor attach --my-name "$_tail_name"
   fi
 }
 
@@ -781,7 +781,7 @@ cmd_connect() {
       airc_config_subscribe "$room_name" "$CONFIG" 0 2>/dev/null || true
       # Resolve --create-if-missing: returns the gist id (find existing
       # or create new gist named "airc room: #<channel>").
-      local _new_gist; _new_gist=$("$(airc_rs_bin)" channel-gist resolve \
+      local _new_gist; _new_gist=$("$(airc_core_bin)" channel-gist resolve \
           --channel "$room_name" --create-if-missing 2>&1)
       if [ -n "$_new_gist" ] && printf '%s' "$_new_gist" | grep -qE '^[0-9a-f]{32}$'; then
         # Save the channel→gist mapping in config so cmd_send can route to it.
@@ -831,7 +831,7 @@ cmd_connect() {
       sleep 1
     else
       local _health_out _health_rc=0
-      _health_out=$("$(airc_rs_bin)" transport health \
+      _health_out=$("$(airc_core_bin)" transport health \
         --home "$AIRC_WRITE_DIR" \
         --config "$CONFIG" \
         --fail 2>/dev/null) || _health_rc=$?
@@ -1321,13 +1321,13 @@ cmd_connect() {
       # malformed JSON `"invite": "..."` line (quotes and all), pair
       # handshake failed on garbage host info, and self-heal didn't fire
       # because resolved_room_name was never extracted via the jq path.
-      # gh api → airc-rs extracts
+      # gh api → airc-core extracts
       # the first file's content. This is the rest-API path; it's preferred
       # over the gh gist view --raw path because the latter prepends the
       # gist description as a header line that we'd then have to strip.
       if command -v gh >/dev/null 2>&1; then
         raw_content=$( (gh api "gists/$gist_id" 2>/dev/null \
-                        | "$(airc_rs_bin)" gist gist-content --channel "$room_name" 2>/dev/null) || true )
+                        | "$(airc_core_bin)" gist gist-content --channel "$room_name" 2>/dev/null) || true )
       fi
       # Fallback path 1: gh raw view (description leak handled by the
       # awk strip below at "head -c 1 | grep '{'" cleanup).
@@ -1362,7 +1362,7 @@ cmd_connect() {
       # without gh OR git. Last resort. (#188 — was curl + jq.)
       if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1; then
         raw_content=$( (curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
-                        | "$(airc_rs_bin)" gist gist-content --channel "$room_name" 2>/dev/null) || true )
+                        | "$(airc_core_bin)" gist gist-content --channel "$room_name" 2>/dev/null) || true )
       fi
       # Last-resort cleanup: if raw_content still has the description-header
       # leak from a degraded gh-view path, strip lines before the first '{'
@@ -1384,8 +1384,8 @@ cmd_connect() {
       # #188: was `if command -v jq`; now Python is the truth-layer
       # (always available since #152 Phase 0). Drop the jq gate.
       local airc_ver kind
-      airc_ver=$(printf '%s' "$raw_content" | "$(airc_rs_bin)" gist get .airc 2>/dev/null)
-      kind=$(printf '%s' "$raw_content" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
+      airc_ver=$(printf '%s' "$raw_content" | "$(airc_core_bin)" gist get .airc 2>/dev/null)
+      kind=$(printf '%s' "$raw_content" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
       if [ -n "$airc_ver" ]; then
           # Versioned envelope — dispatch on kind.
           case "$kind" in
@@ -1393,7 +1393,7 @@ cmd_connect() {
               # Single-pair invite (legacy + --no-general flow). Gist is
               # ephemeral; host deletes after pair.
               resolved=$(printf '%s' "$raw_content" \
-                         | "$(airc_rs_bin)" gist get .invite 2>/dev/null \
+                         | "$(airc_core_bin)" gist get .invite 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               ;;
             mesh|room)
@@ -1405,21 +1405,21 @@ cmd_connect() {
               # yet (joiner can read either). The .invite field carries
               # today's name@user@host:port#pubkey string.
               resolved=$(printf '%s' "$raw_content" \
-                         | "$(airc_rs_bin)" gist get .invite 2>/dev/null \
+                         | "$(airc_core_bin)" gist get .invite 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               # New mesh shape: .channels[]; legacy room shape: .name.
               # Prefer channels[0] if present; fall back to .name.
               resolved_room_name=$(printf '%s' "$raw_content" \
-                         | "$(airc_rs_bin)" gist get-first-of '.channels[0]' '.name' 2>/dev/null)
+                         | "$(airc_core_bin)" gist get-first-of '.channels[0]' '.name' 2>/dev/null)
               # Multi-address: capture host.addresses[] + host.machine_id
               # for the joiner's address-picker (peer_pick_address). Empty
               # if the host published a pre-multi-address envelope; in
               # that case JOIN MODE falls back to the parsed-from-invite
               # host:port (legacy single-address path).
               _resolved_addresses_json=$(printf '%s' "$raw_content" \
-                         | "$(airc_rs_bin)" gist get-json .host.addresses 2>/dev/null)
+                         | "$(airc_core_bin)" gist get-json .host.addresses 2>/dev/null)
               _resolved_host_machine_id=$(printf '%s' "$raw_content" \
-                         | "$(airc_rs_bin)" gist get .host.machine_id 2>/dev/null)
+                         | "$(airc_core_bin)" gist get .host.machine_id 2>/dev/null)
 
               # Heartbeat freshness check — the structural fix for
               # orphan-gist class. Hosts update last_heartbeat every
@@ -1432,7 +1432,7 @@ cmd_connect() {
               # compat; their hosts will get caught by the existing
               # SSH-failure self-heal path at line ~1850.
               local _hb_iso _hb_ts _now_ts _hb_stale_sec
-              _hb_iso=$(printf '%s' "$raw_content" | "$(airc_rs_bin)" gist get .last_heartbeat 2>/dev/null)
+              _hb_iso=$(printf '%s' "$raw_content" | "$(airc_core_bin)" gist get .last_heartbeat 2>/dev/null)
               _hb_stale_sec="${AIRC_HEARTBEAT_STALE:-90}"
               if [ -n "$_hb_iso" ]; then
                 # Cross-platform ISO→epoch via the iso_to_epoch adapter.
@@ -1715,16 +1715,16 @@ cmd_connect() {
     # bootstrap is idempotent (no-ops if keypair exists). Empty value
     # if cryptography isn't installed — handshake stays compatible
     # with peers running pre-Phase-E airc.
-    my_x25519_pub=$("$(airc_rs_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
+    my_x25519_pub=$("$(airc_core_bin)" identity bootstrap --home "$AIRC_WRITE_DIR" --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).
-    local my_identity_json; my_identity_json=$("$(airc_rs_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" identity "{}" 2>/dev/null || echo "{}")
+    local my_identity_json; my_identity_json=$("$(airc_core_bin)" config get --home "$AIRC_WRITE_DIR" --config "$CONFIG" identity "{}" 2>/dev/null || echo "{}")
     [ -z "$my_identity_json" ] && my_identity_json="{}"
 
     local response
     local _pair_ok=1
-    response=$("$(airc_rs_bin)" handshake send "$peer_host_only" "$peer_port" \
+    response=$("$(airc_core_bin)" handshake send "$peer_host_only" "$peer_port" \
                   --my-name "$my_name" \
                   --my-host "$(whoami)@$(get_host)" \
                   --my-ssh-pub "$my_ssh_pub" \
@@ -1780,7 +1780,7 @@ cmd_connect() {
     # targeted ssh-keygen -R when a PRIOR real-sshd host key in known_hosts
     # is known stale (e.g. the server rotated sshd host keys).
     local host_ssh_pub
-    host_ssh_pub=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .ssh_pub 2>/dev/null || true)
+    host_ssh_pub=$(printf '%s' "$response" | "$(airc_core_bin)" gist get .ssh_pub 2>/dev/null || true)
     if [ -n "$host_ssh_pub" ]; then
       mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
       grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
@@ -1799,11 +1799,11 @@ cmd_connect() {
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
     local host_airc_home host_x25519_pub
-    host_airc_home=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .airc_home 2>/dev/null || true)
+    host_airc_home=$(printf '%s' "$response" | "$(airc_core_bin)" gist get .airc_home 2>/dev/null || true)
     # Phase E.2: capture host's X25519 pubkey from handshake response
     # so cmd_send can encrypt envelopes destined for this peer.
-    host_x25519_pub=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .x25519_pub 2>/dev/null || true)
-    "$(airc_rs_bin)" identity write-peer-record --home "$AIRC_WRITE_DIR" \
+    host_x25519_pub=$(printf '%s' "$response" | "$(airc_core_bin)" gist get .x25519_pub 2>/dev/null || true)
+    "$(airc_core_bin)" identity write-peer-record --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" \
         --peer-name "$peer_name" \
         --host "$ssh_target" \
@@ -1829,7 +1829,7 @@ cmd_connect() {
     # the join string for onward sharing without a fresh handshake. Also
     # cache the host's identity blob from the handshake response so
     # `airc whois <host-name>` works locally (issue #34 v2).
-    local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
+    local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$(airc_core_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
     [ -z "$host_identity_json" ] && host_identity_json="{}"
     # Pass values as env vars instead of bash-substituted into the
     # python heredoc body. PR #164 retest 2026-04-27
@@ -1842,7 +1842,7 @@ cmd_connect() {
     # to env-var pass — python reads from os.environ; bash never
     # touches the python source. Also emit stderr to surface failures
     # for the future debugger (not /dev/null).
-    "$(airc_rs_bin)" config set-host-block --home "$AIRC_WRITE_DIR" \
+    "$(airc_core_bin)" config set-host-block --home "$AIRC_WRITE_DIR" \
         --config "$CONFIG" \
         --host-airc-home "$host_airc_home" \
         --host-name "$peer_name" \
@@ -1853,7 +1853,7 @@ cmd_connect() {
 
     # Pick up reminder setting from host
     local host_reminder
-    host_reminder=$(printf '%s' "$response" | "$(airc_rs_bin)" gist get .reminder 300 2>/dev/null || echo "300")
+    host_reminder=$(printf '%s' "$response" | "$(airc_core_bin)" gist get .reminder 300 2>/dev/null || echo "300")
     if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
       echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
       date +%s > "$AIRC_WRITE_DIR/last_sent"
@@ -2030,13 +2030,13 @@ cmd_connect() {
             local _configured_gid
             _configured_gid=$(airc_config_get_channel_gist "$room_name" "$CONFIG" || true)
             if [ -n "$_configured_gid" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-              _existing_room_gid=$("$(airc_rs_bin)" channel-gist find \
+              _existing_room_gid=$("$(airc_core_bin)" channel-gist find \
                                    --channel "$room_name" 2>/dev/null || true)
             fi
           fi
           if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             local _host_preflight_rc=0
-            _existing_room_gid=$("$(airc_rs_bin)" channel-gist host-preflight \
+            _existing_room_gid=$("$(airc_core_bin)" channel-gist host-preflight \
                                  --channel "$room_name" --config "$CONFIG" 2>/dev/null) || _host_preflight_rc=$?
             if [ "${_host_preflight_rc:-0}" = "2" ]; then
               die "GitHub room discovery is unavailable for #${room_name}; refusing to create a new solo room. Retry after the GitHub backoff clears."
@@ -2155,7 +2155,7 @@ JSON
         fi
         local _gist_url=""
         if [ -n "${_existing_room_gid:-}" ] && [ "$use_room" = "1" ]; then
-          if "$(airc_rs_bin)" gh patch-gist-file \
+          if "$(airc_core_bin)" gh patch-gist-file \
                --gist-id "$_existing_room_gid" \
                --filename "airc-room-${room_name}.json" \
                --content-file "$_gist_tmp" >/dev/null 2>/dev/null \
@@ -2169,7 +2169,7 @@ JSON
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
           if [ "$use_room" = "1" ]; then
-            "$(airc_rs_bin)" channel-gist remember-created \
+            "$(airc_core_bin)" channel-gist remember-created \
               --channel "$room_name" \
               --gist-id "$_gist_id" \
               --description "$_gist_desc" \
@@ -2280,11 +2280,11 @@ JSON
                 printf '%s\n' "$_hb_payload" > "$_hb_tmp"
                 # Rotate the host's messages.jsonl when it exceeds the
                 # AIRC_LOG_MAX_LINES threshold (default 5000). Trims
-                # in-place via airc-rs log rotate; SSH-tail's -F flag detects
+                # in-place via airc-core log rotate; SSH-tail's -F flag detects
                 # the atomic replace and re-opens. Joiners with offsets
                 # past the new file's line count are caught by #245.
                 # Cheap no-op when under threshold.
-                "$(airc_rs_bin)" log rotate --path "$_hb_messages" \
+                "$(airc_core_bin)" log rotate --path "$_hb_messages" \
                   --max-lines "${AIRC_LOG_MAX_LINES:-5000}" \
                   --keep-lines "${AIRC_LOG_KEEP_LINES:-2500}" >/dev/null 2>&1 || true
                 # Capture stderr to a state file (per never-swallow-errors
@@ -2295,7 +2295,7 @@ JSON
                 # consecutive failures: after N in a row, detect
                 # active-host-evicted (#224) and self-heal.
                 _hb_tried_add=0
-                if "$(airc_rs_bin)" gh patch-gist-file \
+                if "$(airc_core_bin)" gh patch-gist-file \
                      --gist-id "$_gist_id" \
                      --filename "airc-room-${_hb_room}.json" \
                      --content-file "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
@@ -2458,7 +2458,7 @@ JSON
       # --watch-pid hands the same PID to the Rust listener, which exits
       # during accept polling the moment the parent dies.
       while kill -0 "$_orphan_parent_pid" 2>/dev/null; do
-        "$(airc_rs_bin)" handshake accept-one \
+        "$(airc_core_bin)" handshake accept-one \
           --host-port "$host_port" \
           --peers-dir "$PEERS_DIR" \
           --identity-dir "$IDENTITY_DIR" \

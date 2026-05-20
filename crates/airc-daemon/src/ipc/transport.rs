@@ -259,7 +259,7 @@ fn resolve_pipe_name(path: &Path) -> String {
 ///      socket file already exists (the common steady-state case for
 ///      a client connecting to a running daemon).
 ///   2. If that fails, canonicalise just the parent dir (which exists
-///      after `airc-rs init`) and re-join the file basename.
+///      after `airc init`) and re-join the file basename.
 ///   3. If that also fails, fall back to a string-level normalisation:
 ///      backslashes → forward slashes, lowercase. On Windows this
 ///      handles separator + case equivalence; on Unix the function

@@ -33,7 +33,7 @@ const IDENTITY_STATE_VERSION: u32 = 1;
 const IDENTITY_KEY_FILENAME: &str = "identity.key";
 const IDENTITY_STATE_FILENAME: &str = "identity.json";
 
-/// Persisted-state bundle: stable identity for this airc-rs install.
+/// Persisted-state bundle: stable identity for this airc-core install.
 #[derive(Debug, Clone)]
 pub struct LocalIdentity {
     pub keypair: PeerKeypair,

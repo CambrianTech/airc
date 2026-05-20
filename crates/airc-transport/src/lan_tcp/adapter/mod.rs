@@ -89,7 +89,7 @@ impl LanTcpAdapter {
     }
 
     /// Snapshot of currently-connected peers. Useful for diagnostics
-    /// (`airc-rs peers`) + tests.
+    /// (`airc-core peers`) + tests.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.inner
             .connections

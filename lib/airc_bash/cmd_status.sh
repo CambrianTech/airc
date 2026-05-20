@@ -17,7 +17,7 @@ _airc_monitor_health_report() {
   local mode="${1:-all}"
   local args=(transport health --home "$AIRC_WRITE_DIR" --config "$CONFIG")
   [ "$mode" = "degraded-only" ] && args+=(--degraded-only)
-  "$(airc_rs_bin)" "${args[@]}" 2>/dev/null | sed 's/^/  /' || true
+  "$(airc_core_bin)" "${args[@]}" 2>/dev/null | sed 's/^/  /' || true
 }
 
 _airc_collaboration_health_report() {
@@ -25,17 +25,17 @@ _airc_collaboration_health_report() {
   # self-healed host can have fresh bearer heartbeats while nobody else is
   # paired to this mesh. Surface that split-brain shape explicitly.
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-  "$(airc_rs_bin)" collaboration status \
+  "$(airc_core_bin)" collaboration status \
     --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id"
 }
 
 _airc_rust_local_status_report() {
   local _rs
-  _rs=$(airc_rs_bin)
+  _rs=$(airc_core_bin)
 
   local _room_out
   if ! _room_out=$("$_rs" --home "$AIRC_WRITE_DIR" room 2>/dev/null); then
-    echo "  data-plane:  rust-local unavailable (run: airc-rs init)"
+    echo "  data-plane:  rust-local unavailable (run: airc-core init)"
     return 0
   fi
 
@@ -97,7 +97,7 @@ cmd_status() {
   # is config.json's subscribed_channels; first element is the default
   # channel that cmd_send stamps. Display the list with a marker for
   # the default.
-  local _channels; _channels=$("$(airc_rs_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
+  local _channels; _channels=$("$(airc_core_bin)" config read-channels --home "$AIRC_WRITE_DIR" --config "$CONFIG" 2>/dev/null)
   if [ -n "$_channels" ]; then
     local _default; _default=$(echo "$_channels" | head -1)
     local _rest; _rest=$(echo "$_channels" | tail -n +2 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, #/g')
@@ -194,7 +194,7 @@ cmd_status() {
   local bearer_state="$AIRC_WRITE_DIR/bearer_state.json"
   if [ -f "$bearer_state" ]; then
     local _bs_summary
-    _bs_summary=$("$(airc_rs_bin)" bearer-state --summary "$bearer_state" 2>/dev/null)
+    _bs_summary=$("$(airc_core_bin)" bearer-state --summary "$bearer_state" 2>/dev/null)
     echo "  bearer:      ${_bs_summary:-unreadable} (legacy gh invite/remote)"
   elif [ -n "$host_target" ]; then
     echo "  bearer:      no state file ($AIRC_WRITE_DIR/bearer_state.json) — legacy gh invite/remote not yet streaming"
@@ -236,7 +236,7 @@ cmd_status() {
   [ -f "$pending" ] && pending_count=$(grep -c '^.' "$pending" 2>/dev/null || echo 0)
   if [ "$pending_count" -gt 0 ]; then
     local _gh_wait=0
-    _gh_wait=$("$(airc_rs_bin)" gh wait-seconds 2>/dev/null || echo 0)
+    _gh_wait=$("$(airc_core_bin)" gh wait-seconds 2>/dev/null || echo 0)
     if [ "${_gh_wait:-0}" -gt 0 ] 2>/dev/null; then
       echo "  queue:       ${pending_count} pending legacy gh item(s) (paused for ${_gh_wait}s; rust-local unaffected)"
     else
@@ -319,7 +319,7 @@ cmd_logs() {
   if [ "$output_json" -eq 1 ]; then
     set -- "$@" --json
   fi
-  echo "$raw" | "$(airc_rs_bin)" log "$@"
+  echo "$raw" | "$(airc_core_bin)" log "$@"
 }
 
 cmd_inbox() {
@@ -351,7 +351,7 @@ cmd_inbox() {
       --exclude-self)
         exclude_self=1; shift ;;
       --reset)
-        "$(airc_rs_bin)" log inbox-reset \
+        "$(airc_core_bin)" log inbox-reset \
           --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file"
         return 0 ;;
       -h|--help)
@@ -394,7 +394,7 @@ cmd_inbox() {
     fi
 
     local rust_out
-    if ! rust_out=$("$(airc_rs_bin)" "${rust_args[@]}" 2>&1); then
+    if ! rust_out=$("$(airc_core_bin)" "${rust_args[@]}" 2>&1); then
       printf '%s\n' "$rust_out" >&2
       return 2
     fi
@@ -434,7 +434,7 @@ cmd_inbox() {
     local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
     inbox_args+=(--exclude-self --my-name "$(get_name)" --client-id "$_client_id")
   fi
-  if ! out=$("$(airc_rs_bin)" "${inbox_args[@]}" 2>&1); then
+  if ! out=$("$(airc_core_bin)" "${inbox_args[@]}" 2>&1); then
     printf '%s\n' "$out" >&2
     return 1
   fi
@@ -446,10 +446,10 @@ cmd_inbox() {
 cmd_codex_hook() {
   ensure_init
 
-  local _airc_rs
-  _airc_rs=$(command -v airc-rs 2>/dev/null || true)
-  if [ -z "$_airc_rs" ]; then
-    die "airc-rs is required for codex-hook; build/install the Rust CLI first"
+  local _airc_core
+  _airc_core=$(command -v airc-core 2>/dev/null || true)
+  if [ -z "$_airc_core" ]; then
+    die "airc-core is required for codex-hook; build/install the Rust CLI first"
   fi
 
   local sub="${1:-}"
@@ -464,15 +464,15 @@ cmd_codex_hook() {
         esac
       done
       if [ "$_has_cursor_file" = "1" ]; then
-        "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit "$@"
+        "$_airc_core" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit "$@"
       else
-        "$_airc_rs" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit \
+        "$_airc_core" --home "$AIRC_WRITE_DIR" codex-hook user-prompt-submit \
           --cursor-file "$AIRC_WRITE_DIR/codex_hook_cursor.json" \
           "$@"
       fi
       ;;
     install-hooks|uninstall-hooks)
-      "$_airc_rs" codex-hook "$sub" "$@"
+      "$_airc_core" codex-hook "$sub" "$@"
       ;;
     -h|--help|'')
       echo "Usage: airc codex-hook {user-prompt-submit|install-hooks|uninstall-hooks}"
@@ -503,12 +503,12 @@ cmd_codex_start() {
 
   local _started_at
   _started_at=$(date +%s)
-  local _airc_rs
-  _airc_rs=$(command -v airc-rs 2>/dev/null || true)
-  if [ -z "$_airc_rs" ]; then
-    die "airc-rs is required for codex-start; build/install the Rust CLI first"
+  local _airc_core
+  _airc_core=$(command -v airc-core 2>/dev/null || true)
+  if [ -z "$_airc_core" ]; then
+    die "airc-core is required for codex-start; build/install the Rust CLI first"
   fi
-  "$_airc_rs" codex-start \
+  "$_airc_core" codex-start \
     --airc "$0" \
     --home "$AIRC_WRITE_DIR" \
     --log "$_log" \

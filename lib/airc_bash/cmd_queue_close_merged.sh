@@ -76,7 +76,7 @@ _cmd_queue_close_merged() {
   printf '%s' "$pr_blob" >"$pr_file"
 
   local pr_meta
-  if ! pr_meta=$("$(airc_rs_bin)" queue-card close-merged-meta --pr-file "$pr_file"); then
+  if ! pr_meta=$("$(airc_core_bin)" queue-card close-merged-meta --pr-file "$pr_file"); then
     rm -f "$pr_file"
     die "queue close-merged: PR JSON parse failed"
   fi
@@ -108,7 +108,7 @@ _cmd_queue_close_merged() {
 
   local refs_file
   refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-refs.XXXXXX") || die "queue close-merged: mktemp failed"
-  if ! "$(airc_rs_bin)" queue-card close-merged-refs --pr-file "$pr_file" --repo "$pr_repo" >"$refs_file"; then
+  if ! "$(airc_core_bin)" queue-card close-merged-refs --pr-file "$pr_file" --repo "$pr_repo" >"$refs_file"; then
     rm -f "$pr_file" "$refs_file"
     die "queue close-merged: ref-parser failed"
   fi
@@ -162,7 +162,7 @@ _cmd_queue_close_merged() {
     local issue_body_file envelope_status
     issue_body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-issue.XXXXXX") || die "queue close-merged: mktemp failed"
     printf '%s' "$issue_body" >"$issue_body_file"
-    envelope_status=$("$(airc_rs_bin)" queue-card card-status --body-file "$issue_body_file")
+    envelope_status=$("$(airc_core_bin)" queue-card card-status --body-file "$issue_body_file")
     rm -f "$issue_body_file"
 
     case "$envelope_status" in

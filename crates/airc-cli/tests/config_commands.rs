@@ -1,4 +1,4 @@
-//! End-to-end coverage for `airc-rs config ...`.
+//! End-to-end coverage for `airc-core config ...`.
 
 use std::fs;
 use std::path::Path;
@@ -6,8 +6,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -246,15 +246,15 @@ fn config_set_host_block_writes_handshake_fields() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .arg("--home")
         .arg(home)
         .args(args)
         .output()
-        .expect("airc-rs command must spawn");
+        .expect("airc-core command must spawn");
     assert!(
         output.status.success(),
-        "airc-rs {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

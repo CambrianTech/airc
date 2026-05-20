@@ -401,7 +401,7 @@ failed. No hidden success.
 ### PR 5: Presence Projection
 
 - Add endpoint presence events and a projection API.
-- Add `airc-rs presence list` and `airc-lib` presence calls.
+- Add `airc presence list` and `airc-lib` presence calls.
 - Stop rendering configured peers as "online" unless a fresh endpoint
   says so.
 
@@ -438,7 +438,7 @@ failed. No hidden success.
 ## Stop Doing
 
 - Do not add new runtime behavior to Python or shell.
-- Do not make consumers shell out to `airc-rs` as their integration
+- Do not make consumers shell out to `airc` as their integration
   path.
 - Do not add a consumer-specific field to the AIRC envelope when a
   namespaced header will do.

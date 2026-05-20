@@ -1,10 +1,10 @@
 //! Current-room persistence — the default `(wire, channel)` for
-//! short-shape commands like `airc-rs msg "hi"` and `airc-rs inbox`.
+//! short-shape commands like `airc msg "hi"` and `airc inbox`.
 //!
 //! AI peers (and humans) shouldn't have to type `--wire <path>
 //! --channel <uuid>` on every call. Joining a room writes
 //! `<home>/room.json` once; every subsequent command reads it.
-//! `airc-rs join <name>` switches.
+//! `airc join <name>` switches.
 //!
 //! A "room" is a name. The substrate primitives it expands to are
 //! deterministic:
@@ -12,7 +12,7 @@
 //!   - channel = UUIDv5(namespace=oid, name)
 //!
 //! Same name → same channel UUID across machines, so two peers who
-//! both `airc-rs join project-x` land in the same room without
+//! both `airc join project-x` land in the same room without
 //! exchanging the channel UUID.
 
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ const ROOM_VERSION: u32 = 1;
 const DEFAULT_ROOM_NAME: &str = "default";
 
 /// Namespace UUID for deriving channel UUIDs from room names.
-/// Stable across all airc-rs installs so `airc-rs join project-x`
+/// Stable across all airc installs so `airc join project-x`
 /// on different machines produces the same channel.
 const ROOM_NAMESPACE: Uuid = Uuid::from_bytes([
     0xa1, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -89,7 +89,7 @@ impl From<std::time::SystemTimeError> for RoomError {
     }
 }
 
-/// The current room — what `airc-rs msg` / `inbox` / `send` /
+/// The current room — what `airc msg` / `inbox` / `send` /
 /// `listen` default to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Room {
@@ -121,7 +121,7 @@ impl Room {
         })
     }
 
-    /// Default room — auto-created on `airc-rs init`. Name "default",
+    /// Default room — auto-created on `airc init`. Name "default",
     /// derived per `from_name`.
     pub fn default_for(home: &Path) -> Result<Self, RoomError> {
         Self::from_name(home, DEFAULT_ROOM_NAME)

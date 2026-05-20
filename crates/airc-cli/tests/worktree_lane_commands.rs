@@ -1,4 +1,4 @@
-//! End-to-end coverage for `airc-rs worktree-lane ...`.
+//! End-to-end coverage for `airc-core worktree-lane ...`.
 
 use std::path::Path;
 use std::process::Command;
@@ -6,8 +6,8 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -84,15 +84,15 @@ fn worktree_lane_slug_and_abs_path_match_shell_contract() {
 }
 
 fn run_ok(args: &[&str], cwd: Option<&Path>) -> String {
-    let mut command = Command::new(airc_rs());
+    let mut command = Command::new(airc_core());
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output().expect("airc-rs command must spawn");
+    let output = command.output().expect("airc-core command must spawn");
     assert!(
         output.status.success(),
-        "airc-rs {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

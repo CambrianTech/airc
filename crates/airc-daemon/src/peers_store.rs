@@ -2,7 +2,7 @@
 //!
 //! Saves enrolled peers across CLI / daemon restarts so `--peer
 //! <spec>` flags disappear from daily use. Two writers:
-//!   - `airc-rs peer add <spec>` — appends to the file
+//!   - `airc peer add <spec>` — appends to the file
 //!   - The daemon's `AddPeer` handler — appends + reloads its
 //!     in-memory `PeerKeyRegistry`
 //!

@@ -1,6 +1,6 @@
 ---
 name: airc:uninstall
-description: Fully remove airc from this machine — stops processes, removes legacy background registrations if present, deletes the clone, drops binary + skill symlinks. Confirm with the user before running; this is destructive.
+description: Fully remove airc from this machine — stops processes, deletes the clone, drops binary + skill files. Confirm with the user before running; this is destructive.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: "[--yes] [--purge]"
@@ -14,7 +14,7 @@ argument-hint: "[--yes] [--purge]"
 
 - The user says "uninstall airc" / "remove airc" / "I'm done with airc."
 - The user is reinstalling from scratch and wants a clean slate first.
-- A botched install left stale symlinks or a clone in a weird state, and `/repair` isn't enough.
+- A botched install left a clone in a weird state, and `/repair` isn't enough.
 
 ## What it does
 
@@ -25,8 +25,8 @@ airc uninstall
 Walks the full removal in order:
 
 1. `airc teardown --all` — stops every running airc process across all scopes on this machine
-2. Removes any legacy background registration if present
-3. Removes binary forwarders: `~/.local/bin/{airc, relay, airc.cmd, airc.ps1}`
+2. Removes daemon registrations if present
+3. Removes binary files: `~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}`
 4. Removes airc skill symlinks under `~/.claude/skills/`
 5. Removes the clone dir (`~/.airc-src` or `$AIRC_DIR`)
 

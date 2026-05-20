@@ -46,7 +46,7 @@
 # contract field names yet. PR-3/PR-4 will tighten as needed.
 #
 # External cross-references (resolved at call time):
-#   die, resolve_name, airc_rs_bin; `gh` CLI.
+#   die, resolve_name, airc_core_bin; `gh` CLI.
 
 # Help text is split out so cmd_queue.sh keeps behavior logic readable.
 if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/cmd_queue_help.sh" ]; then
@@ -330,7 +330,7 @@ EOF
   # Read the JSON from a tempfile (not stdin) because the heredoc carrying
   # the python source uses fd 0; can't redirect stdin twice.
   local dm_text
-  dm_text=$("$(airc_rs_bin)" queue-card dispatch-message \
+  dm_text=$("$(airc_core_bin)" queue-card dispatch-message \
     --target-agent "$target_agent" \
     --extra-message "$extra_message" \
     --next-json-file "$next_json_file")
@@ -546,7 +546,7 @@ _cmd_queue_list() {
 
   local list_args=(queue-card list --repo "$target_repo" --owner "$filter_owner" --status "$filter_status" --raw-json-file "$raw_json_file")
   [ "$output_json" -eq 1 ] && list_args+=(--json)
-  "$(airc_rs_bin)" "${list_args[@]}"
+  "$(airc_core_bin)" "${list_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   if [ "$py_status" -eq 0 ] && [ "$output_json" -eq 0 ] && [ "$check_staleness" -eq 1 ]; then
@@ -593,7 +593,7 @@ _airc_queue_list_staleness_sweep() {
   refs_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-list-stale-refs.XXXXXX") || { rm -f "$raw_json_file"; return 1; }
   printf '%s' "$raw_json" >"$raw_json_file"
 
-  "$(airc_rs_bin)" queue-card review-refs --repo "$target_repo" --raw-json-file "$raw_json_file" >"$refs_file"
+  "$(airc_core_bin)" queue-card review-refs --repo "$target_repo" --raw-json-file "$raw_json_file" >"$refs_file"
 
   if [ -s "$refs_file" ]; then
     printf '\n# staleness sweep — review cards\n'
@@ -667,7 +667,7 @@ _airc_queue_card_body() {
   local blockers="$5" env="$6" evidence="$7"
   local next_action="$8" last_heartbeat="$9"
 
-  "$(airc_rs_bin)" queue-card body \
+  "$(airc_core_bin)" queue-card body \
     --id "$id" \
     --branch "$branch" \
     --owner "$owner" \
@@ -790,7 +790,7 @@ _airc_queue_claim_guard() {
   printf '%s' "$current_body" >"$body_file"
 
   local fields
-  if ! fields=$("$(airc_rs_bin)" queue-card claim-fields --body-file "$body_file"); then
+  if ! fields=$("$(airc_core_bin)" queue-card claim-fields --body-file "$body_file"); then
     rm -f "$body_file"
     die "$fields"
   fi
@@ -1032,7 +1032,7 @@ _cmd_queue_stale() {
 
   local stale_args=(queue-card stale --repo "$target_repo" --stale-after "$stale_after" --raw-json-file "$raw_json_file")
   [ "$output_json" -eq 1 ] && stale_args+=(--json)
-  "$(airc_rs_bin)" "${stale_args[@]}"
+  "$(airc_core_bin)" "${stale_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   return "$py_status"
@@ -1116,7 +1116,7 @@ _cmd_queue_next() {
 
   local next_args=(queue-card next --repo "$target_repo" --owner "$owner" --base "$base" --repo-root "$repo_root" --raw-json-file "$raw_json_file")
   [ "$output_json" -eq 1 ] && next_args+=(--json)
-  "$(airc_rs_bin)" "${next_args[@]}"
+  "$(airc_core_bin)" "${next_args[@]}"
   local py_status=$?
   rm -f "$raw_json_file"
   if [ "$py_status" -ne 0 ]; then
@@ -1402,7 +1402,7 @@ _cmd_queue_adopt() {
   local adopted_body
   local adopt_args=(queue-card adopt-body --issue-json-file "$issue_json_file" --queue-body-file "$body_file")
   [ "$force" = "1" ] && adopt_args+=(--force)
-  adopted_body=$("$(airc_rs_bin)" "${adopt_args[@]}")
+  adopted_body=$("$(airc_core_bin)" "${adopt_args[@]}")
   local adopt_rc=$?
   if [ "$adopt_rc" -ne 0 ]; then
     rm -f "$issue_json_file" "$body_file"
@@ -1545,7 +1545,7 @@ _cmd_queue_nudge_repo() {
   printf '%s' "$raw_json" >"$raw_json_file"
 
   local summary
-  if ! summary=$("$(airc_rs_bin)" queue-card nudge-summary --raw-json-file "$raw_json_file"); then
+  if ! summary=$("$(airc_core_bin)" queue-card nudge-summary --raw-json-file "$raw_json_file"); then
     rm -f "$raw_json_file"
     die "queue nudge: could not summarize queue cards for $target_repo"
   fi
@@ -1610,7 +1610,7 @@ _cmd_queue_nudge_card() {
   printf '%s' "$issue_blob" >"$issue_file"
 
   local card_meta
-  if ! card_meta=$("$(airc_rs_bin)" queue-card nudge-card-meta --issue-file "$issue_file"); then
+  if ! card_meta=$("$(airc_core_bin)" queue-card nudge-card-meta --issue-file "$issue_file"); then
     rm -f "$issue_file"
     die "queue nudge: $repo#$issue_num is not a valid airc-queue-card-v1 envelope"
   fi
@@ -1753,7 +1753,7 @@ _cmd_queue_pongs() {
 
   local pongs_args=(queue-card pongs --repo "$target_repo" --sweep-id "$sweep_id" --since "$since" --cards-file "$cards_file" --messages-file "$messages_file")
   [ "$output_json" -eq 1 ] && pongs_args+=(--json)
-  "$(airc_rs_bin)" "${pongs_args[@]}"
+  "$(airc_core_bin)" "${pongs_args[@]}"
   local py_status=$?
   rm -f "$cards_file" "$messages_file"
   return "$py_status"
@@ -1841,7 +1841,7 @@ _cmd_queue_availability() {
 
   local availability_args=(queue-card availability --repo "$target_repo" --sweep-id "$sweep_id" --since "$since" --stale-after "$stale_after" --cards-file "$cards_file" --messages-file "$messages_file")
   [ "$output_json" -eq 1 ] && availability_args+=(--json)
-  "$(airc_rs_bin)" "${availability_args[@]}"
+  "$(airc_core_bin)" "${availability_args[@]}"
   local py_status=$?
   rm -f "$cards_file" "$messages_file"
   return "$py_status"
@@ -1928,7 +1928,7 @@ _cmd_queue_staleness() {
     local pr_file pr_meta
     pr_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-staleness-pr.XXXXXX") || die "queue staleness: mktemp failed"
     printf '%s' "$pr_blob" >"$pr_file"
-    if ! pr_meta=$("$(airc_rs_bin)" queue-card pr-meta --pr-file "$pr_file"); then
+    if ! pr_meta=$("$(airc_core_bin)" queue-card pr-meta --pr-file "$pr_file"); then
       rm -f "$pr_file"
       die "queue staleness: PR JSON parse failed"
     fi
@@ -2006,7 +2006,7 @@ _cmd_queue_staleness() {
     --base-new-file "$base_new_file"
   )
   [ "$output_json" -eq 1 ] && analyze_args+=(--json)
-  "$(airc_rs_bin)" "${analyze_args[@]}"
+  "$(airc_core_bin)" "${analyze_args[@]}"
   local analyze_status=$?
   rm -f "$files_file" "$diff_file" "$base_new_file"
   return "$analyze_status"

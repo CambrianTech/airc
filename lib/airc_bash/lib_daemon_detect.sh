@@ -24,10 +24,10 @@ airc_daemon_scope_id() {
   local target_scope="${1:-}"
   [ -n "$target_scope" ] || target_scope="${AIRC_HOME:-$HOME/.airc}"
   local id=""
-  if command -v airc_rs_bin >/dev/null 2>&1; then
-    id=$("$(airc_rs_bin)" daemon-scope-id "$target_scope" 2>/dev/null || true)
-  elif command -v airc-rs >/dev/null 2>&1; then
-    id=$(airc-rs daemon-scope-id "$target_scope" 2>/dev/null || true)
+  if command -v airc_core_bin >/dev/null 2>&1; then
+    id=$("$(airc_core_bin)" daemon-scope-id "$target_scope" 2>/dev/null || true)
+  elif command -v airc-core >/dev/null 2>&1; then
+    id=$(airc-core daemon-scope-id "$target_scope" 2>/dev/null || true)
   fi
   if [ -z "$id" ] && command -v sha1sum >/dev/null 2>&1; then
     id=$(printf '%s' "$target_scope" | sha1sum 2>/dev/null | awk '{print substr($1,1,12)}')

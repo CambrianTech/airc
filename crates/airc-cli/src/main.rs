@@ -1,4 +1,4 @@
-//! airc-rs — Rust substrate CLI binary.
+//! airc — Rust substrate CLI.
 //!
 //! State lives under `<home>` (default `$HOME/.airc`):
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600)
@@ -6,7 +6,7 @@
 //!   - `daemon.sock`    — IPC socket
 //!   - `peers.json`     — (next PR) persisted peer registry
 //!
-//! `airc-rs init` is the only command that creates the identity from
+//! `airc init` is the only command that creates the identity from
 //! nothing. All others load `<home>/identity.{key,json}` (auto-
 //! generating if absent). `VerificationPolicy::Strict` is the only
 //! policy used in CLI paths — no `AllowUnsigned` opt-in.
@@ -128,19 +128,19 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     {
         return match std::thread::Builder::new()
-            .name("airc-rs-main".to_string())
+            .name("airc-main".to_string())
             .stack_size(WINDOWS_MAIN_STACK_BYTES)
             .spawn(run_main)
         {
             Ok(handle) => match handle.join() {
                 Ok(code) => code,
                 Err(_) => {
-                    eprintln!("airc-rs: main thread panicked");
+                    eprintln!("airc: main thread panicked");
                     ExitCode::FAILURE
                 }
             },
             Err(error) => {
-                eprintln!("airc-rs: failed to start main thread: {error}");
+                eprintln!("airc: failed to start main thread: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -157,7 +157,7 @@ fn run_main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("airc-rs: failed to start tokio runtime: {error}");
+            eprintln!("airc: failed to start tokio runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -180,7 +180,7 @@ async fn async_main() -> ExitCode {
             if let Some(code) = identity_commands::command_exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
-            eprintln!("airc-rs: {error}");
+            eprintln!("airc: {error}");
             ExitCode::FAILURE
         }
     }

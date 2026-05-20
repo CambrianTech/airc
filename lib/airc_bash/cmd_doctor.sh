@@ -402,8 +402,8 @@ _doctor_health() {
     local rate_json
     if rate_json=$(airc_gh_rate_limit_json_cached); then
       local core_remaining core_limit
-      core_remaining=$(printf '%s' "$rate_json" | "$(airc_rs_bin)" gist get .resources.core.remaining 2>/dev/null || echo "")
-      core_limit=$(printf '%s' "$rate_json" | "$(airc_rs_bin)" gist get .resources.core.limit 2>/dev/null || echo "")
+      core_remaining=$(printf '%s' "$rate_json" | "$(airc_core_bin)" gist get .resources.core.remaining 2>/dev/null || echo "")
+      core_limit=$(printf '%s' "$rate_json" | "$(airc_core_bin)" gist get .resources.core.limit 2>/dev/null || echo "")
       if [ -n "$core_remaining" ] && [ -n "$core_limit" ]; then
         if [ "$core_remaining" -lt 100 ]; then
           printf "  [WARN] gh core rate-limit: %s/%s remaining — bus may stall soon\n" "$core_remaining" "$core_limit"
@@ -428,7 +428,7 @@ _doctor_health() {
   # never make same-machine or LAN chat look down when bearer/local health
   # proves the live bus is still moving.
   local _gov_rc=0 _gov_out
-  _gov_out=$("$(airc_rs_bin)" gh doctor --count 80 2>&1) || _gov_rc=$?
+  _gov_out=$("$(airc_core_bin)" gh doctor --count 80 2>&1) || _gov_rc=$?
   printf '%s\n' "$_gov_out"
   case "$_gov_out" in
     *"[BLOCKED]"*) warns=$((warns+1)) ;;
@@ -479,7 +479,7 @@ _doctor_health() {
       fi
       found_state=1
       local state_ts last_recv_ts last_heartbeat_ts heartbeat_age
-      state_ts=$("$(airc_rs_bin)" bearer-state "$state_file" 2>/dev/null || echo "0 0")
+      state_ts=$("$(airc_core_bin)" bearer-state "$state_file" 2>/dev/null || echo "0 0")
       last_recv_ts=${state_ts%% *}
       last_heartbeat_ts=${state_ts#* }
       [ "$last_recv_ts" = "$state_ts" ] && last_heartbeat_ts=0
@@ -533,7 +533,7 @@ _doctor_health() {
   if [ "${peer_count:-0}" -eq 0 ] 2>/dev/null; then
     local _collab_rc=0
     local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-    "$(airc_rs_bin)" collaboration doctor \
+    "$(airc_core_bin)" collaboration doctor \
       --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" || _collab_rc=$?
     case "$_collab_rc" in
       1) warns=$((warns+1)) ;;

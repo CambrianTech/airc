@@ -8,7 +8,7 @@ cmd_hygiene() {
       return 0
       ;;
     init|report|clean)
-      "$(airc_rs_bin)" hygiene "$@"
+      "$(airc_core_bin)" hygiene "$@"
       ;;
     *)
       die "hygiene: unknown subcommand: $subcmd (try: init, report, clean)"

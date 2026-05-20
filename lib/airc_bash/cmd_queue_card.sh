@@ -60,7 +60,7 @@ _airc_queue_mutate_card() {
   timestamp=$(date -u +"%Y-%m-%dT%H:%MZ")
 
   local new_body
-  if ! new_body=$("$(airc_rs_bin)" queue-card mutate-body \
+  if ! new_body=$("$(airc_core_bin)" queue-card mutate-body \
     --body-file "$body_file" \
     --mutations-file "$mut_file" \
     --log-msg "$log_msg" \

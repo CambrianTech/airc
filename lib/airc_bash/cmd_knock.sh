@@ -123,8 +123,8 @@ cmd_knock() {
   local knock_keys_json knocker_pub knocker_priv
   knock_keys_json=$(_airc_knock_gen_keys 2>/dev/null || echo "")
   if [ -n "$knock_keys_json" ]; then
-    knocker_pub=$("$(airc_rs_bin)" knock approval-field --field pub <<< "$knock_keys_json" 2>/dev/null || echo "")
-    knocker_priv=$("$(airc_rs_bin)" knock approval-field --field priv <<< "$knock_keys_json" 2>/dev/null || echo "")
+    knocker_pub=$("$(airc_core_bin)" knock approval-field --field pub <<< "$knock_keys_json" 2>/dev/null || echo "")
+    knocker_priv=$("$(airc_core_bin)" knock approval-field --field priv <<< "$knock_keys_json" 2>/dev/null || echo "")
   else
     # Crypto path unavailable. Knock
     # still posts but without an approval pubkey — cmd_approve will
@@ -228,7 +228,7 @@ _airc_knock_identity_json() {
   # name-only envelope if state is missing — knock should work even on
   # a fresh install where identity wasn't populated yet.
   local name="$1"
-  "$(airc_rs_bin)" knock identity-json \
+  "$(airc_core_bin)" knock identity-json \
     --name "$name" \
     --state-dir "$AIRC_WRITE_DIR" 2>/dev/null || _airc_knock_identity_fallback "$name"
 }
@@ -254,7 +254,7 @@ _airc_knock_gen_keys() {
   # Returns JSON {"priv": "<hex>", "pub": "<hex>"} on stdout.
   # Returns non-zero (caller falls back to no-pubkey envelope) when the
   # Rust binary isn't available.
-  "$(airc_rs_bin)" knock gen-keys
+  "$(airc_core_bin)" knock gen-keys
 }
 
 _airc_knock_issue_body() {

@@ -1,4 +1,4 @@
-//! End-to-end integration test for the `airc-rs` binary.
+//! End-to-end integration test for the `airc-core` binary.
 //!
 //! Spawns two real subprocesses (Alice + Bob), has them chat over the
 //! Rust substrate, and asserts the message arrives. No Python anywhere.
@@ -14,19 +14,19 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
-/// Run `airc-rs --home <dir> init` and parse the printed `peer_id:`
+/// Run `airc-core --home <dir> init` and parse the printed `peer_id:`
 /// and `peer_spec:` lines from stdout.
 fn run_init(home: &Path) -> (String, String) {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .arg("--home")
         .arg(home)
         .arg("init")
         .output()
-        .expect("airc-rs init must spawn");
+        .expect("airc-core init must spawn");
     assert!(
         output.status.success(),
         "init failed: stdout={} stderr={}",
@@ -49,8 +49,8 @@ fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 #[test]
-fn two_airc_rs_processes_chat_over_local_fs() {
-    // Alice runs `airc-rs listen`; Bob runs `airc-rs send`; Alice's
+fn two_airc_core_processes_chat_over_local_fs() {
+    // Alice runs `airc-core listen`; Bob runs `airc-core send`; Alice's
     // stdout MUST contain the message body within a few seconds. No
     // Python anywhere.
     let workspace = TempDir::new().expect("tempdir");
@@ -68,7 +68,7 @@ fn two_airc_rs_processes_chat_over_local_fs() {
     run_room(&alice_home, "e2e", &wire);
     run_room(&bob_home, "e2e", &wire);
 
-    let mut alice = Command::new(airc_rs())
+    let mut alice = Command::new(airc_core())
         .args([
             "--home",
             alice_home.to_str().unwrap(),
@@ -84,7 +84,7 @@ fn two_airc_rs_processes_chat_over_local_fs() {
 
     std::thread::sleep(Duration::from_millis(300));
 
-    let bob_send = Command::new(airc_rs())
+    let bob_send = Command::new(airc_core())
         .args([
             "--home",
             bob_home.to_str().unwrap(),
@@ -117,10 +117,10 @@ fn two_airc_rs_processes_chat_over_local_fs() {
     );
 }
 
-/// Run `airc-rs --home <dir> room <name> --wire <wire>`. Used by
+/// Run `airc-core --home <dir> room <name> --wire <wire>`. Used by
 /// tests to pin two peers to the same shared-wire room.
 fn run_room(home: &Path, name: &str, wire: &Path) {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -130,7 +130,7 @@ fn run_room(home: &Path, name: &str, wire: &Path) {
             wire.to_str().unwrap(),
         ])
         .output()
-        .expect("airc-rs room must spawn");
+        .expect("airc-core room must spawn");
     assert!(
         output.status.success(),
         "room setup failed: stderr={}",
@@ -156,7 +156,7 @@ fn listen_rejects_unenrolled_signer() {
     run_room(&alice_home, "e2e", &wire);
     run_room(&mallory_home, "e2e", &wire);
 
-    let mut alice = Command::new(airc_rs())
+    let mut alice = Command::new(airc_core())
         .args(["--home", alice_home.to_str().unwrap(), "listen", "--replay"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -167,7 +167,7 @@ fn listen_rejects_unenrolled_signer() {
 
     // Mallory passes herself as `--peer` so her own registry is
     // non-empty; her CLI signs the frame under her own identity.
-    let _mallory_send = Command::new(airc_rs())
+    let _mallory_send = Command::new(airc_core())
         .args([
             "--home",
             mallory_home.to_str().unwrap(),
@@ -193,7 +193,7 @@ fn listen_rejects_unenrolled_signer() {
 }
 
 #[test]
-fn two_airc_rs_processes_chat_over_lan_via_sdk_route() {
+fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
     // The LAN CLI commands must be thin wrappers over airc-lib. This
     // test spawns real processes and uses `lan-listen` / `lan-send`
     // without a shared local-fs wire.
@@ -204,7 +204,7 @@ fn two_airc_rs_processes_chat_over_lan_via_sdk_route() {
     let (alice_id, alice_spec) = run_init(&alice_home);
     let (_bob_id, bob_spec) = run_init(&bob_home);
 
-    let mut alice = Command::new(airc_rs())
+    let mut alice = Command::new(airc_core())
         .args([
             "--home",
             alice_home.to_str().unwrap(),
@@ -226,7 +226,7 @@ fn two_airc_rs_processes_chat_over_lan_via_sdk_route() {
             .expect("alice must print bound LAN address");
     let bound_addr = parse_listening_addr(&listen_line);
 
-    let bob_send = Command::new(airc_rs())
+    let bob_send = Command::new(airc_core())
         .args([
             "--home",
             bob_home.to_str().unwrap(),
@@ -268,7 +268,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
     let socket = workspace.path().join("daemon.sock");
     run_init(&home);
 
-    let mut daemon = Command::new(airc_rs())
+    let mut daemon = Command::new(airc_core())
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -287,7 +287,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         Duration::from_secs(6),
     );
 
-    let msg = Command::new(airc_rs())
+    let msg = Command::new(airc_core())
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -316,7 +316,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         "inbox did not print daemon-sent message through SDK attach path"
     );
 
-    let stop = Command::new(airc_rs())
+    let stop = Command::new(airc_core())
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -336,7 +336,7 @@ fn inbox_without_socket_reads_in_process_store() {
     let home = workspace.path().join("agent");
     run_init(&home);
 
-    let send = Command::new(airc_rs())
+    let send = Command::new(airc_core())
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -352,7 +352,7 @@ fn inbox_without_socket_reads_in_process_store() {
         String::from_utf8_lossy(&send.stderr),
     );
 
-    let inbox = Command::new(airc_rs())
+    let inbox = Command::new(airc_core())
         .args(["--home", home.to_str().unwrap(), "inbox", "--limit", "16"])
         .output()
         .expect("inbox must spawn");
@@ -371,7 +371,7 @@ fn inbox_without_socket_reads_in_process_store() {
 
 #[test]
 fn rerun_init_returns_same_peer_id() {
-    // The persistence pin: `airc-rs init` must be idempotent. The
+    // The persistence pin: `airc-core init` must be idempotent. The
     // second run reuses the on-disk identity rather than minting a
     // new peer_id.
     let workspace = TempDir::new().expect("tempdir");
@@ -393,7 +393,7 @@ fn wait_for_command_stdout_contains(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        let output = Command::new(airc_rs())
+        let output = Command::new(airc_core())
             .args([
                 "--home",
                 home.to_str().unwrap(),
