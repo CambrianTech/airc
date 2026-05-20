@@ -38,6 +38,8 @@ struct ConfigFile {
     subscribed_channels: Vec<String>,
     #[serde(default)]
     channel_gists: BTreeMap<String, String>,
+    #[serde(default)]
+    host_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,7 +134,16 @@ fn evaluate(home: &Path, config: &Path, fresh_after: u64, now: f64) -> Vec<Chann
 
     channels
         .into_iter()
-        .map(|channel| evaluate_channel(home, &config.channel_gists, &channel, fresh_after, now))
+        .map(|channel| {
+            evaluate_channel(
+                home,
+                &config.channel_gists,
+                &channel,
+                fresh_after,
+                now,
+                config.host_target.is_none(),
+            )
+        })
         .collect()
 }
 
@@ -142,6 +153,7 @@ fn evaluate_channel(
     channel: &str,
     fresh_after: u64,
     now: f64,
+    is_host: bool,
 ) -> ChannelHealth {
     let gist = gists.get(channel).map(String::as_str).unwrap_or("");
     let mut issues = Vec::new();
@@ -180,16 +192,18 @@ fn evaluate_channel(
         issues.push("no bearer_state file".to_string());
     }
 
-    let pid_path = if gist.is_empty() {
-        home.join(format!("bearer_state.{channel}.pid"))
-    } else {
-        home.join(format!("bearer_gist.{}.pid", safe_gist(gist)))
-    };
-    let pid = read_pid(&pid_path);
-    if pid == 0 {
-        issues.push("no bearer pidfile".to_string());
-    } else if !pid_alive(pid) {
-        issues.push(format!("stale bearer pid {pid}"));
+    if !is_host {
+        let pid_path = if gist.is_empty() {
+            home.join(format!("bearer_state.{channel}.pid"))
+        } else {
+            home.join(format!("bearer_gist.{}.pid", safe_gist(gist)))
+        };
+        let pid = read_pid(&pid_path);
+        if pid == 0 {
+            issues.push("no bearer pidfile".to_string());
+        } else if !pid_alive(pid) {
+            issues.push(format!("stale bearer pid {pid}"));
+        }
     }
 
     ChannelHealth {
@@ -219,6 +233,7 @@ fn load_config(path: &Path) -> ConfigFile {
         .unwrap_or_else(|| ConfigFile {
             subscribed_channels: Vec::new(),
             channel_gists: BTreeMap::new(),
+            host_target: None,
         })
 }
 
@@ -368,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_heartbeat_and_stale_pid_is_degraded() {
+    fn host_scope_does_not_require_joiner_bearer_pidfile() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let config = home.join("config.json");
@@ -377,6 +392,58 @@ mod tests {
             &config,
             format!(
                 r#"{{"subscribed_channels":["general"],"channel_gists":{{"general":"{gist}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("bearer_state.general.json"),
+            r#"{"last_heartbeat_ts":1000}"#,
+        )
+        .unwrap();
+
+        let rows = evaluate(home, &config, 90, 1000.0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, HealthStatus::Ok);
+        assert_eq!(rows[0].detail, "fresh heartbeat");
+    }
+
+    #[test]
+    fn joiner_scope_still_requires_bearer_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config = home.join("config.json");
+        let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
+        fs::write(
+            &config,
+            format!(
+                r#"{{"host_target":"joel@example","subscribed_channels":["general"],"channel_gists":{{"general":"{gist}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("bearer_state.general.json"),
+            r#"{"last_heartbeat_ts":1000}"#,
+        )
+        .unwrap();
+
+        let rows = evaluate(home, &config, 90, 1000.0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, HealthStatus::Degraded);
+        assert!(rows[0].detail.contains("no bearer pidfile"));
+    }
+
+    #[test]
+    fn stale_heartbeat_and_stale_pid_is_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config = home.join("config.json");
+        let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
+        fs::write(
+            &config,
+            format!(
+                r#"{{"host_target":"joel@example","subscribed_channels":["general"],"channel_gists":{{"general":"{gist}"}}}}"#
             ),
         )
         .unwrap();
