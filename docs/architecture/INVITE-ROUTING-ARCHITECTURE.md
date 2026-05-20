@@ -270,6 +270,68 @@ diagnosis.
 11. **Next: integration proofs.** Continuum rooms, OpenClaw, Hermes, and opencode
     must embed AIRC through SDK/contracts with no transport-specific hacks.
 
+## PR Grouping
+
+These are the next PR groups. Each group should merge before the next group
+depends on it; parallel work is only clean where write scopes are disjoint.
+
+1. **PR-A: Discovery + health ingestion.**
+   - Scope: `airc-lib::route`, local/LAN discovery probes, route endpoint table,
+     route health updates, SDK diagnostics.
+   - Deliverable: an embedded caller can open AIRC, discover local/LAN candidates,
+     and have `TransportHealthTable` populated without manual test overrides.
+   - Non-goals: relay, UDP, WebRTC, Continuum integration.
+
+2. **PR-B: Gist invite beacon cutover.**
+   - Scope: gh-gist invite/rendezvous adapter only.
+   - Deliverable: gist publication writes signed `InviteBeacon` / route endpoint
+     metadata, never runtime message frames. Consumers can import that invite and
+     enrol peer/endpoints.
+   - Non-goals: gh as data plane, fallback messaging, relay implementation.
+
+3. **PR-C: Persistent subscription hub / daemon-attached SDK.**
+   - Scope: daemon + `airc-lib` attach mode.
+   - Deliverable: short-lived CLI/app calls attach to the daemon-backed event
+     stream and store; subscriptions persist outside individual commands.
+   - Non-goals: new transport adapters.
+
+4. **PR-D: CLI/user commands through SDK.**
+   - Scope: remaining CLI commands that still construct substrate state directly.
+   - Deliverable: command handlers call `airc-lib`/daemon client APIs instead of
+     building registries, stores, transports, or route decisions themselves.
+   - Non-goals: changing user-visible semantics unless needed to remove legacy
+     fallbacks.
+
+5. **PR-E: Relay baseline.**
+   - Scope: `airc-relay` crate/service and relay transport adapter.
+   - Deliverable: two peers behind different tailnets/NAT can exchange AIRC
+     frames through an explicit relay edge with route health and audit state.
+   - Non-goals: treating relay as fallback; it is a selected route edge.
+
+6. **PR-F: UDP adapter.**
+   - Scope: UDP transport crate/adapter, route health probes, low-latency event
+     semantics.
+   - Deliverable: signed/enrolled peers can exchange control/event frames over
+     UDP when policy admits that route.
+   - Non-goals: media frames or full WebRTC.
+
+7. **PR-G: WebRTC datachannel adapter.**
+   - Scope: WebRTC datachannel transport and signaling contracts over AIRC.
+   - Deliverable: AIRC can carry signaling/control and establish a datachannel
+     route for realtime consumers.
+   - Non-goals: audio/video media payload transport; media remains WebRTC/LiveKit.
+
+8. **PR-H: Peer trust rotation.**
+   - Scope: peer registry/store and signed rotation event.
+   - Deliverable: pubkey replacement requires an explicit signed/audited rotation;
+     silent same-`PeerId` replacement is rejected.
+
+9. **PR-I: Integration proofs.**
+   - Scope: Continuum, OpenClaw, Hermes, opencode examples/adapters.
+   - Deliverable: each consumer embeds AIRC through SDK/contracts with no
+     transport-specific hacks. Continuum room chat/events prove replay and live
+     subscription through AIRC.
+
 ## Non-Goals
 
 - No GitHub data-plane compatibility unless explicitly requested for migration.
