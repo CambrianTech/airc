@@ -13,6 +13,8 @@
 //!     it. Postgres-backed deployments would promote to JSONB by
 //!     changing only the `[features]` of sea-orm.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
@@ -57,10 +59,39 @@ impl SqliteEventStore {
         Ok(Self { db })
     }
 
+    /// Open a file-backed SQLite store from a filesystem path.
+    ///
+    /// This keeps platform path rules out of consumers. Windows
+    /// paths must be converted to URI-style forward slashes before
+    /// handing them to SQLx/SeaORM; callers should not build SQLite
+    /// URLs with `Path::display()`.
+    pub async fn open_path(path: &Path) -> Result<Self, StoreError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        Self::open(&sqlite_file_url(path)).await
+    }
+
     /// Open an ephemeral in-memory store. Convenience for tests.
     pub async fn in_memory() -> Result<Self, StoreError> {
         Self::open("sqlite::memory:").await
     }
+}
+
+fn sqlite_file_url(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if has_windows_drive_prefix(&raw) {
+        format!("sqlite:///{raw}?mode=rwc")
+    } else {
+        format!("sqlite://{raw}?mode=rwc")
+    }
+}
+
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
 #[async_trait]
@@ -423,5 +454,25 @@ mod tests {
             .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].event_id, ev_b.event_id);
+    }
+
+    #[test]
+    fn sqlite_file_url_uses_uri_slashes_for_windows_paths() {
+        let path = Path::new(r"C:\Users\agent\.airc-rs\events.sqlite");
+
+        assert_eq!(
+            sqlite_file_url(path),
+            "sqlite:///C:/Users/agent/.airc-rs/events.sqlite?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_url_preserves_unix_absolute_paths() {
+        let path = Path::new("/tmp/airc/events.sqlite");
+
+        assert_eq!(
+            sqlite_file_url(path),
+            "sqlite:///tmp/airc/events.sqlite?mode=rwc"
+        );
     }
 }

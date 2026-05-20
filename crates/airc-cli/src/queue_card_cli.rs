@@ -171,4 +171,36 @@ pub enum QueueCardAction {
         #[arg(long)]
         pr_file: PathBuf,
     },
+
+    /// Analyze a PR branch for current-base lines it would erase.
+    StalenessAnalyze {
+        #[arg(long)]
+        repo_root: PathBuf,
+        #[arg(long, default_value = "")]
+        pr_repo: String,
+        #[arg(long, default_value = "")]
+        pr_num: String,
+        #[arg(long)]
+        base_ref: String,
+        #[arg(long)]
+        head_ref: String,
+        #[arg(long)]
+        base_git_ref: String,
+        #[arg(long)]
+        head_git_ref: String,
+        #[arg(long)]
+        merge_base: String,
+        #[arg(long, default_value = "")]
+        pr_url: String,
+        #[arg(long, default_value_t = 40)]
+        limit_lines: usize,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        files_file: PathBuf,
+        #[arg(long)]
+        diff_file: PathBuf,
+        #[arg(long)]
+        base_new_file: PathBuf,
+    },
 }

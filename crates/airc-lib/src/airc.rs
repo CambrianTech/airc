@@ -106,8 +106,7 @@ impl Airc {
         let identity = LocalIdentity::load_or_generate(&home)?;
 
         let store_path = home.join(EVENTS_DB_FILENAME);
-        let store_url = format!("sqlite://{}?mode=rwc", store_path.display());
-        let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open(&store_url).await?);
+        let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
 
         let mut registry = PeerKeyRegistry::new();
         registry

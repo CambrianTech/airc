@@ -116,8 +116,50 @@ fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     Ok(PeerId::from_uuid(uuid))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+#[cfg(windows)]
+const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    #[cfg(windows)]
+    {
+        return match std::thread::Builder::new()
+            .name("airc-rs-main".to_string())
+            .stack_size(WINDOWS_MAIN_STACK_BYTES)
+            .spawn(run_main)
+        {
+            Ok(handle) => match handle.join() {
+                Ok(code) => code,
+                Err(_) => {
+                    eprintln!("airc-rs: main thread panicked");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("airc-rs: failed to start main thread: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    #[cfg(not(windows))]
+    run_main()
+}
+
+fn run_main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("airc-rs: failed to start tokio runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let parsed = Cli::parse();
@@ -913,6 +955,39 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 raw_json_file,
             } => queue_card_staleness::run_review_refs(&repo, &raw_json_file),
             QueueCardAction::PrMeta { pr_file } => queue_card_staleness::run_pr_meta(&pr_file),
+            QueueCardAction::StalenessAnalyze {
+                repo_root,
+                pr_repo,
+                pr_num,
+                base_ref,
+                head_ref,
+                base_git_ref,
+                head_git_ref,
+                merge_base,
+                pr_url,
+                limit_lines,
+                json,
+                files_file,
+                diff_file,
+                base_new_file,
+            } => queue_card_staleness::run_staleness_analyze(
+                queue_card_staleness::StalenessAnalyzeInput {
+                    repo_root: &repo_root,
+                    pr_repo: &pr_repo,
+                    pr_num: &pr_num,
+                    base_ref: &base_ref,
+                    head_ref: &head_ref,
+                    base_git_ref: &base_git_ref,
+                    head_git_ref: &head_git_ref,
+                    merge_base: &merge_base,
+                    pr_url: &pr_url,
+                    limit: limit_lines,
+                    output_json: json,
+                    files_file: &files_file,
+                    diff_file: &diff_file,
+                    base_new_file: &base_new_file,
+                },
+            ),
         },
 
         Command::Humanhash { hex_input, words } => {
