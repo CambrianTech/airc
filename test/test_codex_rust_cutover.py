@@ -469,6 +469,18 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("airc_core.datetime", body)
         self.assertIn('"$(airc_rs_bin)" iso-to-epoch "$ts"', body)
 
+    def test_integration_platform_adapters_uses_airc_rs_not_python(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_platform_adapters()")
+        end = source.index("scenario_windows_cmd_shim_direct_bash()", start)
+        body = source[start:end]
+
+        self.assertIn('AIRC_RS_BIN="$_rs" bash -c', body)
+        self.assertIn("nc listener", body)
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("PYTHONPATH", body)
+        self.assertNotIn("python3", body)
+
     def test_log_append_and_rotate_use_airc_rs(self):
         send = (REPO / "lib/airc_bash/cmd_send.sh").read_text(encoding="utf-8")
         connect = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
