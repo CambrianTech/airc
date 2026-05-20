@@ -291,7 +291,7 @@ fn check_reply_to_consistency(envelope: &Envelope) -> Result<(), VerificationErr
 }
 
 /// serde adapter for `[u8; 64]` — serde doesn't derive for arrays > 32.
-mod serde_bytes_64 {
+pub(crate) mod serde_bytes_64 {
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
