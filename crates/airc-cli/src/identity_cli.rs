@@ -43,6 +43,22 @@ pub enum IdentityAction {
         peer_name: String,
     },
 
+    /// Exit 0 when a proposed rename collides with a recent foreign sender.
+    RenameCollision {
+        /// Local messages.jsonl path.
+        #[arg(long)]
+        messages_file: PathBuf,
+        /// Sanitized target name being requested.
+        #[arg(long)]
+        target: String,
+        /// Current local name before the rename.
+        #[arg(long = "old-name")]
+        old_name: String,
+        /// Number of recent log lines to inspect.
+        #[arg(long, default_value_t = 200)]
+        tail_lines: usize,
+    },
+
     /// Sign stdin bytes with the legacy Ed25519 PEM identity.
     SignEd25519 {
         /// Legacy identity directory containing private.pem.
