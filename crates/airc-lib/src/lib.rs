@@ -22,6 +22,7 @@
 #![deny(unsafe_code)]
 
 pub mod airc;
+mod daemon;
 pub mod error;
 mod lan;
 mod messaging;

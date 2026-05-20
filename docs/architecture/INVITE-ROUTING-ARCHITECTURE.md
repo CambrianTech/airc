@@ -289,7 +289,7 @@ depends on it; parallel work is only clean where write scopes are disjoint.
      enrol peer/endpoints.
    - Non-goals: gh as data plane, fallback messaging, relay implementation.
 
-3. **PR-C: Persistent subscription hub / daemon-attached SDK.**
+3. **Current PR-C: Persistent subscription hub / daemon-attached SDK.**
    - Scope: daemon + `airc-lib` attach mode.
    - Deliverable: short-lived CLI/app calls attach to the daemon-backed event
      stream and store; subscriptions persist outside individual commands.
