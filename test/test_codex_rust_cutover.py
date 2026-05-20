@@ -177,9 +177,25 @@ class CodexRustCutoverTests(unittest.TestCase):
         end = source.index("scenario_gh_send_creates_messages_jsonl()", start)
         body = source[start:end]
 
+        self.assertIn('"$(airc_rs_bin)" bearer recv alpha', body)
         self.assertIn('"$(airc_rs_bin)" gist get .msg', body)
+        self.assertNotIn("airc_core.bearer_cli recv", body)
         self.assertNotIn("json.loads(line)", body)
         self.assertNotIn("python3 -c", body)
+
+    def test_integration_bearer_and_channel_gist_modules_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_bearer_ssh_send()")
+        end = source.index("scenario_general_has_shared_gist()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" bearer send', body)
+        self.assertIn('"$(airc_rs_bin)" bearer recv alpha', body)
+        self.assertIn('"$(airc_rs_bin)" channel-gist resolve --channel lobby-target', body)
+        self.assertIn('"$(airc_rs_bin)" gist get .channels', body)
+        self.assertNotIn("python3 -m airc_core.bearer_cli", body)
+        self.assertNotIn("python3 -m airc_core.channel_gist", body)
+        self.assertNotIn("airc_core.channel_gist resolve", body)
 
     def test_integration_bearer_gist_file_content_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
