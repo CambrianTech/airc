@@ -24,6 +24,7 @@ pub mod error;
 pub mod gh_gist;
 pub mod lan_tcp;
 pub mod local_fs;
+pub mod relay;
 pub mod signed;
 pub mod transport;
 
