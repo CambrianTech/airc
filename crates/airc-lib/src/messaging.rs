@@ -3,8 +3,7 @@ use airc_protocol::{Envelope, Frame, FrameKind, Signature};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
-use crate::route_policy::{RouteClass, RouteDecision};
-use crate::route_resolver::TransportResolver;
+use crate::route::{RouteClass, RouteDecision, TransportResolver, TransportRoute};
 use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
@@ -59,14 +58,14 @@ impl Airc {
         Ok(event_id)
     }
 
-    fn resolve_send_route(&self, kind: FrameKind) -> Result<crate::TransportRoute, AircError> {
+    fn resolve_send_route(&self, kind: FrameKind) -> Result<TransportRoute, AircError> {
         let class = route_class_for_frame(kind);
         let samples = self
             .inner
             .route_health
             .read()
             .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?
-            .clone();
+            .samples();
         TransportResolver::from_health(samples)
             .resolve(class)
             .map_err(format_route_refusal)

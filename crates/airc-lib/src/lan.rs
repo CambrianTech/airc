@@ -10,8 +10,7 @@ use airc_core::PeerId;
 use airc_transport::LanTcpAdapter;
 
 use crate::error::AircError;
-use crate::route_health::TransportHealthSample;
-use crate::route_policy::TransportKind;
+use crate::route::{RouteEndpoint, TransportHealthSample, TransportKind};
 use crate::Airc;
 
 impl Airc {
@@ -24,9 +23,8 @@ impl Airc {
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
         self.ensure_lan_subscriber().await?;
-        self.replace_transport_health([TransportHealthSample::healthy_direct(
-            TransportKind::LanTcp,
-        )])?;
+        self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
+        self.upsert_route_endpoint(RouteEndpoint::LanTcp { addr: actual })?;
         Ok(actual)
     }
 
@@ -43,9 +41,7 @@ impl Airc {
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
         self.ensure_lan_subscriber().await?;
-        self.replace_transport_health([TransportHealthSample::healthy_direct(
-            TransportKind::LanTcp,
-        )])?;
+        self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         Ok(())
     }
 

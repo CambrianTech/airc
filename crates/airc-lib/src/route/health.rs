@@ -4,7 +4,7 @@
 //! candidates. Keeping the conversion explicit prevents "transport
 //! exists" from being confused with "transport is usable now."
 
-use crate::route_policy::{TransportCandidate, TransportKind, TransportRole};
+use crate::route::policy::{TransportCandidate, TransportKind, TransportRole};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportHealthState {
@@ -55,6 +55,40 @@ impl TransportHealthSample {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportHealthTable {
+    samples: Vec<TransportHealthSample>,
+}
+
+impl TransportHealthTable {
+    pub fn local_default() -> Self {
+        Self {
+            samples: vec![TransportHealthSample::healthy_direct(
+                TransportKind::LocalFs,
+            )],
+        }
+    }
+
+    pub fn replace(&mut self, samples: impl IntoIterator<Item = TransportHealthSample>) {
+        self.samples = samples.into_iter().collect();
+    }
+
+    pub fn upsert(&mut self, sample: TransportHealthSample) {
+        match self
+            .samples
+            .iter_mut()
+            .find(|existing| existing.kind == sample.kind && existing.role == sample.role)
+        {
+            Some(existing) => *existing = sample,
+            None => self.samples.push(sample),
+        }
+    }
+
+    pub fn samples(&self) -> Vec<TransportHealthSample> {
+        self.samples.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +121,25 @@ mod tests {
         .candidate();
 
         assert!(!candidate.healthy);
+    }
+
+    #[test]
+    fn health_table_upsert_replaces_same_kind_and_role() {
+        let mut table = TransportHealthTable::local_default();
+        table.upsert(TransportHealthSample::healthy_direct(TransportKind::LanTcp));
+        table.upsert(TransportHealthSample::down(
+            TransportKind::LanTcp,
+            TransportRole::Direct,
+        ));
+
+        let samples = table.samples();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            samples
+                .iter()
+                .find(|sample| sample.kind == TransportKind::LanTcp)
+                .map(|sample| sample.state),
+            Some(TransportHealthState::Down)
+        );
     }
 }

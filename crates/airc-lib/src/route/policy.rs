@@ -135,8 +135,8 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         RouteClass::ControlInteractive
         | RouteClass::DataInteractive
         | RouteClass::PresenceEphemeral => match kind {
-            TransportKind::LocalFs => 0,
-            TransportKind::LanTcp => 1,
+            TransportKind::LanTcp => 0,
+            TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Udp => 3,
             TransportKind::WebRtcDataChannel => 4,
@@ -155,8 +155,8 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
             TransportKind::Ssh | TransportKind::GhGist => 255,
         },
         RouteClass::DataBulk => match kind {
-            TransportKind::LocalFs => 0,
-            TransportKind::LanTcp => 1,
+            TransportKind::LanTcp => 0,
+            TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Reticulum => 3,
             TransportKind::Relay => 4,
@@ -166,8 +166,8 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
             | TransportKind::GhGist => 255,
         },
         RouteClass::PeerRendezvous => match (kind, role) {
-            (TransportKind::LocalFs, TransportRole::Direct) => 0,
-            (TransportKind::LanTcp, TransportRole::Direct) => 1,
+            (TransportKind::LanTcp, TransportRole::Direct) => 0,
+            (TransportKind::LocalFs, TransportRole::Direct) => 1,
             (TransportKind::Tailscale, TransportRole::Direct) => 2,
             (TransportKind::Reticulum, TransportRole::Direct) => 3,
             (TransportKind::Reticulum, TransportRole::Rendezvous) => 4,
@@ -250,6 +250,20 @@ mod tests {
             RouteClass::PeerRendezvous,
             [
                 candidate(TransportKind::GhGist, TransportRole::Rendezvous),
+                candidate(TransportKind::LanTcp, TransportRole::Direct),
+            ],
+        );
+
+        assert_eq!(decision, RouteDecision::Selected(TransportKind::LanTcp));
+    }
+
+    #[test]
+    fn live_peer_delivery_prefers_lan_over_local_storage_when_both_are_healthy() {
+        let policy = RoutePolicy;
+        let decision = policy.choose(
+            RouteClass::DataInteractive,
+            [
+                candidate(TransportKind::LocalFs, TransportRole::Direct),
                 candidate(TransportKind::LanTcp, TransportRole::Direct),
             ],
         );
