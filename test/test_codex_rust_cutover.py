@@ -58,6 +58,12 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("_doctor_probe_cryptography", source)
         self.assertNotIn("AIRC_PYTHON", source)
 
+    def test_integration_suite_no_longer_runs_python_unit_gate(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("scenario_python_units", source)
+        self.assertNotIn("python units:", source)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 
