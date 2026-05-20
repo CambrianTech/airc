@@ -26,6 +26,11 @@ impl Sandbox {
             self.nonce, self.nonce
         );
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_emitted(&self) -> bool {
+        self.emitted
+    }
 }
 
 pub(crate) struct DropTracker {
