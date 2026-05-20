@@ -6,6 +6,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Local filesystem failure while preparing the database path.
+    #[error("store I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// Underlying database / driver error.
     #[error("store database error: {0}")]
     Database(#[from] sea_orm::DbErr),

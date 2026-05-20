@@ -224,8 +224,7 @@ pub async fn run_daemon(
     // before the daemon was last restarted can resume from the
     // same `(lamport, event_id)` cursor on next boot.
     let store_path = home.join("events.sqlite");
-    let store_url = format!("sqlite://{}?mode=rwc", store_path.display());
-    let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open(&store_url).await?);
+    let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
     let state = Arc::new(DaemonState::new(
         identity.peer_id,
         identity.keypair,
