@@ -3899,7 +3899,7 @@ scenario_gh_send_creates_messages_jsonl() {
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
   local outcome
   outcome=$(printf '%s' "$probe" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all general --room-gist-id "$gist_id" 2>&1)
-  local kind; kind=$(printf '%s' "$outcome" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+  local kind; kind=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
 
   if [ "$kind" = "delivered" ]; then
     pass "bearer_cli send returned 'delivered'"
