@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_selects_udp_for_interactive_data_when_available() {
+    fn resolver_selects_udp_for_interactive_control_when_available() {
         let resolver = TransportResolver::new([
             candidate(GhGist, TransportRole::Rendezvous),
             candidate(Udp, TransportRole::Direct),
@@ -148,8 +148,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            resolver.resolve(RouteClass::DataInteractive),
+            resolver.resolve(RouteClass::ControlInteractive),
             Ok(TransportRoute { kind: Udp })
+        );
+        assert_eq!(
+            resolver.resolve(RouteClass::DataInteractive),
+            Ok(TransportRoute { kind: Relay })
         );
     }
 }
