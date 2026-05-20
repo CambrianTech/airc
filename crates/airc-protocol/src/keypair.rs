@@ -89,6 +89,15 @@ impl PeerKeypair {
         self.signing.verifying_key()
     }
 
+    /// Raw Ed25519 signature over arbitrary bytes. Used by typed
+    /// signed-blob features (e.g. `trust_rotation::sign_rotation`)
+    /// that canonical-encode their own body and need a primitive
+    /// signing op. The 64-byte sig matches the Ed25519 contract.
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing.sign(msg).to_bytes()
+    }
+
     /// Sign an envelope: produces a `Signature::Ed25519` carrying the
     /// signer's PeerId, key_id (for rotation), and 64-byte signature
     /// over the envelope's canonical CBOR encoding.

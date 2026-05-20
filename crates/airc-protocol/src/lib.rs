@@ -29,6 +29,7 @@ pub mod rtc_signal;
 pub mod signature;
 pub mod subscription;
 pub mod transcript_conv;
+pub mod trust_rotation;
 
 // Re-exports — the stable public API surface.
 
@@ -46,3 +47,7 @@ pub use signature::{
     verify, KeyError, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy,
 };
 pub use subscription::Subscription;
+pub use trust_rotation::{
+    canonical_rotation_bytes, sign_rotation, verify_rotation, RotationVerificationError,
+    TrustRotation,
+};
