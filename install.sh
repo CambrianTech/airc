@@ -4,15 +4,15 @@
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
-# Clones the repo, puts `airc` on PATH, and installs AIRC skills.
+# Clones the repo, puts the source `airc` on PATH, and installs AIRC skills.
 
 set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
 CLONE_DIR="${AIRC_DIR:-$HOME/.airc/src}"
-# BIN_DIR + SKILLS_TARGET respect env-var overrides so test harnesses
-# (and packagers, distros, etc.) can point install.sh at a sandbox
-# instead of stomping ~/.local/bin and ~/.claude/skills.
+# BIN_DIR remains for Windows shims. POSIX installs use $CLONE_DIR/airc
+# directly so there is one public command file, not a second POSIX
+# wrapper under BIN_DIR.
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
@@ -437,37 +437,52 @@ fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
 
-_write_airc_forwarder() {
-  local target="$1"
-  mkdir -p "$(dirname "$target")"
-  cat > "$target" <<SH
-#!/usr/bin/env bash
-set -euo pipefail
-export AIRC_DIR="$CLONE_DIR"
-exec "$CLONE_DIR/airc" "\$@"
-SH
-  chmod +x "$target"
-  ok "Installed command: $target"
+_add_path_entry() {
+  local path_entry="$1"
+  if echo "$PATH" | tr ':' '\n' | grep -qx "$path_entry"; then
+    return 0
+  fi
+
+  local rc
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    [ -f "$rc" ] || continue
+    if ! grep -Fq "$path_entry" "$rc"; then
+      echo "export PATH=\"$path_entry:\$PATH\"  # airc" >> "$rc"
+      ok "Added $path_entry to PATH in $(basename "$rc")"
+    fi
+    break
+  done
+  export PATH="$path_entry:$PATH"
 }
 
-mkdir -p "$BIN_DIR"
-# Install exactly one public Unix command: `airc`. It is a stable
-# forwarder into the clone, not a symlink and not a copied implementation
-# script. That keeps `airc update` and clean-room reinstalls honest.
+# POSIX uses the source command directly: ~/.airc/src/airc. Windows still
+# needs PATH shims because Git Bash / PowerShell / cmd resolve different
+# executable suffixes.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
+    mkdir -p "$BIN_DIR"
     if [ -f "$CLONE_DIR/airc.shim" ]; then
       [ -f "$BIN_DIR/airc" ] && rm -f "$BIN_DIR/airc" 2>/dev/null || true
       cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
       chmod +x "$BIN_DIR/airc" 2>/dev/null || true
     else
-      _write_airc_forwarder "$BIN_DIR/airc"
+      cp -f "$CLONE_DIR/airc" "$BIN_DIR/airc"
+      chmod +x "$BIN_DIR/airc" 2>/dev/null || true
     fi
     [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
     [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
+    _add_path_entry "$BIN_DIR"
     ;;
   *)
-    _write_airc_forwarder "$BIN_DIR/airc"
+    chmod +x "$CLONE_DIR/airc"
+    for stale in "$BIN_DIR/airc" "$BIN_DIR/airc-core"; do
+      if [ -L "$stale" ] || [ -f "$stale" ]; then
+        rm -f "$stale"
+        ok "Removed stale PATH forwarder: $stale"
+      fi
+    done
+    _add_path_entry "$CLONE_DIR"
+    ok "Using command: $CLONE_DIR/airc"
     ;;
 esac
 
@@ -486,25 +501,13 @@ _install_airc_core_binary() {
       ok "Installed airc-core: $BIN_DIR/airc-core.exe"
       ;;
     *)
-      cp -f "$built" "$BIN_DIR/airc-core"
-      chmod +x "$BIN_DIR/airc-core"
-      ok "Installed airc-core: $BIN_DIR/airc-core"
+      chmod +x "$built"
+      ok "Built airc-core: $built"
       ;;
   esac
 }
 
 _install_airc_core_binary
-
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    if [ -f "$rc" ] && ! grep -q 'airc' "$rc"; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"  # airc' >> "$rc"
-      ok "Added ~/.local/bin to PATH in $(basename "$rc")"
-      break
-    fi
-  done
-  export PATH="$BIN_DIR:$PATH"
-fi
 
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
 #
@@ -606,7 +609,7 @@ TOML
   fi
 
   # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
-  # to ~/.airc/src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
+  # to ~/.airc/src/ + ~/.airc/ + a :project_roots
   # block — Codex's runtime hard-rejected the profile at startup with:
   #   "permissions profile requests filesystem writes outside the
   #   workspace root, which is not supported until the runtime enforces

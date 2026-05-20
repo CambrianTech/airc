@@ -9,7 +9,7 @@
 #
 # What it does:
 #   1. Runs install.sh if airc isn't already on PATH (handles prereqs +
-#      symlinks the binary into ~/.local/bin).
+#      puts ~/.airc/src/airc on PATH).
 #   2. Runs `airc doctor --connect` to verify the env can pair (catches
 #      Tailscale-down / gh-missing / network-out before they silently fail).
 #   3. Walks gh auth if not already done.
@@ -38,9 +38,9 @@ if ! command -v airc >/dev/null 2>&1; then
   step "airc not on PATH -- running installer (canary channel)"
   curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/canary/install.sh | bash
   # Pick up the freshly-installed binary in this same session.
-  export PATH="$HOME/.local/bin:$PATH"
+  export PATH="$HOME/.airc/src:$PATH"
   if ! command -v airc >/dev/null 2>&1; then
-    die "airc still not on PATH after install. Add ~/.local/bin to PATH and re-run."
+    die "airc still not on PATH after install. Add ~/.airc/src to PATH and re-run."
   fi
   ok "airc installed: $(command -v airc)"
 else

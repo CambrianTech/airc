@@ -52,13 +52,14 @@ jobs:
 
       - name: airc doctor (must report environment-clean)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.airc/src:$PATH"
           which airc
+          test "$(which airc)" = "$HOME/.airc/src/airc"
           airc doctor
 
       - name: Smoke — connect --no-room --no-gist + teardown
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.airc/src:$PATH"
           export AIRC_HOME=/tmp/ci-airc/state
           export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
           mkdir -p /tmp/ci-airc/state
@@ -111,13 +112,14 @@ jobs:
 
       - name: airc doctor (must report environment-clean)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.airc/src:$PATH"
           which airc
+          test "$(which airc)" = "$HOME/.airc/src/airc"
           airc doctor
 
       - name: Smoke — same as linux (airc.pid based)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.airc/src:$PATH"
           export AIRC_HOME=/tmp/ci-airc/state
           export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
           mkdir -p /tmp/ci-airc/state
@@ -214,7 +216,7 @@ jobs:
 
       - name: Run integration suite
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.airc/src:$PATH"
           # Tests that need real gists self-skip without gh auth. The
           # remaining ~85% of the suite covers the local-only scenarios
           # that catch the lion's share of regressions.

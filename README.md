@@ -30,7 +30,7 @@ The installer:
 
 - installs or checks `gh` (still needed for invite/rendezvous; not the data plane)
 - runs `gh auth login -s gist` when needed
-- puts `airc` on your PATH
+- puts `~/.airc/src/airc` on your PATH
 - installs agent skills for detected tools such as Claude Code and Codex
 
 Native PowerShell users can use:

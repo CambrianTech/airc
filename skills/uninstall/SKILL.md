@@ -26,7 +26,7 @@ Walks the full removal in order:
 
 1. `airc teardown --all` — stops every running airc process across all scopes on this machine
 2. Removes daemon registrations if present
-3. Removes binary files: `~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}`
+3. Removes stale POSIX forwarders and Windows shim files under `$BIN_DIR`
 4. Removes airc skill symlinks under `~/.claude/skills/`
 5. Removes the clone dir (`~/.airc/src` or `$AIRC_DIR`)
 

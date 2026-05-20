@@ -34,8 +34,12 @@ if git grep -nE 'airc-src|[.]airc-src' -- . ':!test/rust_cutover_guard.sh'; then
   fail "old split install clone path remains"
 fi
 
+if git grep -nE '~[/][.]local/bin/airc|[.]local/bin[:][$]PATH|[$]HOME/[.]local/bin.*airc' -- install.sh README.md skills .github; then
+  fail "POSIX install must use ~/.airc/src/airc directly, not ~/.local/bin/airc"
+fi
+
 if git grep -nE 'ln -s[f]?[[:space:]].*BIN_DIR.*/airc|ln -s[f]?[[:space:]].*CLONE_DIR.*/airc' -- install.sh; then
-  fail "install.sh must install the public airc command as a forwarder file, not a symlink"
+  fail "install.sh must not symlink public airc"
 fi
 
 if git grep -nE 'BIN_DIR.*/relay|for f in airc relay|[,{]airc,relay|relay-[*]' -- install.sh uninstall.sh skills; then
