@@ -28,6 +28,7 @@ pub mod relay;
 pub mod signed;
 pub mod transport;
 pub mod udp;
+pub mod webrtc_datachannel;
 
 // Re-exports — stable public surface.
 pub use error::LocalFsError;
@@ -41,3 +42,4 @@ pub use local_fs::LocalFsAdapter;
 pub use signed::{SignedError, SignedTransport};
 pub use transport::{FrameStream, Transport};
 pub use udp::{UdpAdapter, UdpConfig, UdpError};
+pub use webrtc_datachannel::{WebRtcDataChannelAdapter, WebRtcDataChannelError};
