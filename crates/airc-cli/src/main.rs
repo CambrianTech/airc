@@ -43,6 +43,8 @@ mod hygiene_cli;
 mod hygiene_commands;
 mod identity_cli;
 mod identity_commands;
+mod knock_cli;
+mod knock_commands;
 mod lane_cli;
 mod lane_commands;
 mod legacy_envelope;
@@ -87,6 +89,7 @@ use gh_cli::GhAction;
 use gist_cli::GistAction;
 use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
+use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use log_cli::LogAction;
 use message_cli::MessageAction;
@@ -531,6 +534,28 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Hygiene(args) => hygiene_commands::run(args),
+
+        Command::Knock(args) => match args.action {
+            KnockAction::GenKeys => knock_commands::run_gen_keys(),
+            KnockAction::EncryptForKnocker {
+                knocker_pub,
+                plaintext,
+            } => knock_commands::run_encrypt_for_knocker(&knocker_pub, &plaintext),
+            KnockAction::DecryptFromApprover {
+                knocker_priv,
+                approver_pub,
+                nonce,
+                ciphertext,
+            } => knock_commands::run_decrypt_from_approver(
+                &knocker_priv,
+                &approver_pub,
+                &nonce,
+                &ciphertext,
+            ),
+            KnockAction::ApprovalField { field } => knock_commands::run_approval_field(&field),
+            KnockAction::ExtractKnockerPub => knock_commands::run_extract_knocker_pub(),
+            KnockAction::ExtractApproval => knock_commands::run_extract_approval(),
+        },
 
         Command::Pending(args) => match args.action {
             PendingAction::HostBroadcastRoute {

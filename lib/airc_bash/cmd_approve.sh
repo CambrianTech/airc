@@ -11,8 +11,8 @@
 #                            print the join string. Manual handoff for
 #                            now; PR-2c automates this via state.
 #
-# External cross-references (resolved at call time): die, AIRC_PYTHON,
-# `gh` CLI; airc_core.knock_crypto module.
+# External cross-references (resolved at call time): die, airc_rs_bin,
+# `gh` CLI.
 #
 # Crypto contract: per-knock + per-approval X25519 ephemerals → ECDH +
 # HKDF-SHA256 (info=b"airc-knock-approve-v1") → ChaCha20-Poly1305 AEAD.
@@ -110,11 +110,11 @@ cmd_approve() {
     die "approve: invite string is empty (refusing to send empty approval)."
   fi
 
-  # Encrypt the invite to the knocker's pubkey via the python helper.
+  # Encrypt the invite to the knocker's pubkey via the Rust helper.
   # The helper generates a per-approval ephemeral keypair internally,
   # runs ECDH, and emits {ver, approver_pub, nonce, ciphertext} JSON.
   local approval_json
-  if ! approval_json=$("$AIRC_PYTHON" -m airc_core.knock_crypto encrypt-for-knocker \
+  if ! approval_json=$("$(airc_rs_bin)" knock encrypt-for-knocker \
         --knocker-pub "$knocker_pub" \
         --plaintext "$invite_string" 2>&1); then
     die "approve: encryption failed: $approval_json"
@@ -234,15 +234,15 @@ cmd_decrypt_approval() {
   fi
 
   local approver_pub nonce ciphertext
-  approver_pub=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("approver_pub",""))' <<< "$approval_json")
-  nonce=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("nonce",""))' <<< "$approval_json")
-  ciphertext=$("$AIRC_PYTHON" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("ciphertext",""))' <<< "$approval_json")
+  approver_pub=$("$(airc_rs_bin)" knock approval-field --field approver_pub <<< "$approval_json")
+  nonce=$("$(airc_rs_bin)" knock approval-field --field nonce <<< "$approval_json")
+  ciphertext=$("$(airc_rs_bin)" knock approval-field --field ciphertext <<< "$approval_json")
 
   if [ -z "$approver_pub" ] || [ -z "$nonce" ] || [ -z "$ciphertext" ]; then
     die "decrypt-approval: malformed approval envelope (missing approver_pub/nonce/ciphertext)"
   fi
 
-  if ! "$AIRC_PYTHON" -m airc_core.knock_crypto decrypt-from-approver \
+  if ! "$(airc_rs_bin)" knock decrypt-from-approver \
         --knocker-priv "$knocker_priv" \
         --approver-pub "$approver_pub" \
         --nonce "$nonce" \
@@ -313,23 +313,7 @@ _airc_approve_extract_knocker_pub() {
   # Body comes in via $1 as raw markdown; we look for the first JSON
   # block with a "knocker_pub" field.
   local body="$1"
-  AIRC_APPROVE_BODY="$body" "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
-import json, os, re, sys
-body = os.environ.get("AIRC_APPROVE_BODY", "")
-# Match ```json ... ``` blocks; check each for knocker_pub.
-for match in re.finditer(r'```json\s*\n(.*?)\n```', body, re.DOTALL):
-    blob = match.group(1).strip()
-    try:
-        parsed = json.loads(blob)
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and "knocker_pub" in parsed:
-        pub = parsed.get("knocker_pub", "")
-        if pub:
-            print(pub)
-            sys.exit(0)
-sys.exit(1)
-PYEOF
+  "$(airc_rs_bin)" knock extract-knocker-pub <<< "$body" 2>/dev/null || true
 }
 
 _airc_decrypt_extract_approval() {
@@ -337,27 +321,7 @@ _airc_decrypt_extract_approval() {
   # Returns the most recent envelope (last comment with one), so a
   # repost or correction wins over the original.
   local comments_json="$1"
-  AIRC_APPROVE_COMMENTS_JSON="$comments_json" "$AIRC_PYTHON" - <<'PYEOF' 2>/dev/null
-import json, os, re, sys
-data = json.loads(os.environ.get("AIRC_APPROVE_COMMENTS_JSON", "{}"))
-comments = data.get("comments", [])
-found = None
-for comment in comments:
-    body = comment.get("body", "")
-    for match in re.finditer(r'```json\s*\n(.*?)\n```', body, re.DOTALL):
-        try:
-            parsed = json.loads(match.group(1).strip())
-        except Exception:
-            continue
-        if (isinstance(parsed, dict)
-                and parsed.get("ver") == "v1"
-                and "approver_pub" in parsed
-                and "nonce" in parsed
-                and "ciphertext" in parsed):
-            found = match.group(1).strip()  # keep last; iteration is chronological
-if found:
-    print(found)
-PYEOF
+  "$(airc_rs_bin)" knock extract-approval <<< "$comments_json" 2>/dev/null || true
 }
 
 _airc_approve_default_invite() {
