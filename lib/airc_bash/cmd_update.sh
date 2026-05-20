@@ -30,7 +30,7 @@ cmd_update() {
   #   airc update --channel canary   # switch to canary + update
   #   airc update --channel main     # switch back to main + update
   #   airc channel                   # show current channel without updating
-  local dir="${AIRC_DIR:-$HOME/.airc-src}"
+  local dir="${AIRC_DIR:-$HOME/.airc/src}"
   local channel_file="$dir/.channel"
   local requested_channel=""
   local force=0
@@ -233,7 +233,7 @@ _airc_update_reset_to_origin() {
 #                            `airc update` after to actually switch)
 # Allows the AI / human to inspect + decide before the heavier update.
 cmd_channel() {
-  local dir="${AIRC_DIR:-$HOME/.airc-src}"
+  local dir="${AIRC_DIR:-$HOME/.airc/src}"
   local channel_file="$dir/.channel"
   local current="main"
   [ -f "$channel_file" ] && current=$(cat "$channel_file" 2>/dev/null | tr -d '[:space:]')
@@ -294,8 +294,8 @@ cmd_version() {
   local dir=""
   if [ -d "$here/.git" ]; then
     dir="$here"
-  elif [ -d "${AIRC_DIR:-$HOME/.airc-src}/.git" ]; then
-    dir="${AIRC_DIR:-$HOME/.airc-src}"
+  elif [ -d "${AIRC_DIR:-$HOME/.airc/src}/.git" ]; then
+    dir="${AIRC_DIR:-$HOME/.airc/src}"
   fi
   if [ -z "$dir" ]; then
     echo "  unknown (no git metadata found)"

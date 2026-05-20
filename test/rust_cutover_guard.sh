@@ -30,6 +30,10 @@ if git grep -nE 'airc-rs|airc_rs|AIRC_RS' -- . ':!test/rust_cutover_guard.sh'; t
   fail "old Rust-language command suffix remains"
 fi
 
+if git grep -nE 'airc-src|[.]airc-src' -- . ':!test/rust_cutover_guard.sh'; then
+  fail "old split install clone path remains"
+fi
+
 if git grep -nE 'ln -s[f]?[[:space:]].*BIN_DIR.*/airc|ln -s[f]?[[:space:]].*CLONE_DIR.*/airc' -- install.sh; then
   fail "install.sh must install the public airc command as a forwarder file, not a symlink"
 fi

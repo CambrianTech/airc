@@ -39,14 +39,14 @@ export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:-/Users/;/home/;/root/}"
 # source its remaining bash modules. Three resolution paths, first hit wins:
 #   1. $AIRC_DIR (explicit override / install.sh's working dir)
 #   2. dirname of this script (dev checkout — running from repo)
-#   3. $HOME/.airc-src (install.sh default)
+#   3. $HOME/.airc/src (install.sh default)
 _airc_resolve_lib_dir() {
   local _candidate _abs
   for _candidate in \
       "${AIRC_DIR:-}/lib" \
       "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")/lib" \
       "$(dirname "$0")/lib" \
-      "$HOME/.airc-src/lib"; do
+      "$HOME/.airc/src/lib"; do
     if [ -d "$_candidate/airc_bash" ]; then
       # Canonicalize to absolute path so module sourcing stays valid even
       # if cwd changes mid-script. cd +
@@ -1106,7 +1106,7 @@ sign_message() {
 # ── Platform adapters ───────────────────────────────────────────────────
 # Decomposed into lib/airc_bash/platform_adapters.sh (#152 Phase 3 — file
 # split). Sourced via the lib-dir resolver set at the top of airc.
-# Same precedence: AIRC_DIR / readlink / dirname / $HOME/.airc-src.
+# Same precedence: AIRC_DIR / readlink / dirname / $HOME/.airc/src.
 if [ -n "${_airc_lib_dir:-}" ] && [ -f "$_airc_lib_dir/airc_bash/platform_adapters.sh" ]; then
   # shellcheck source=lib/airc_bash/platform_adapters.sh
   source "$_airc_lib_dir/airc_bash/platform_adapters.sh"

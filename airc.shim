@@ -1,6 +1,6 @@
 #!/bin/bash
 # airc — polyglot PATH shim. Single source of truth: the canonical
-# bash airc lives at $HOME/.airc-src/airc on the WSL/Linux/macOS host.
+# bash airc lives at $HOME/.airc/src/airc on the WSL/Linux/macOS host.
 # This shim is what gets dropped into Windows-visible PATH locations
 # (e.g. /c/Users/<user>/.local/bin/airc) so Git Bash users get a real
 # command without copying the full script.
@@ -18,9 +18,9 @@
 #   1. AIRC_DIR explicitly set + has airc            → exec that
 #   2. AIRC_WINDOWS_NATIVE=1 + native clone exists   → exec native
 #   3. wsl.exe present + WSL canonical clone exists  → route via wsl.exe
-#   4. Native Windows clone at %USERPROFILE%\.airc-src exists
+#   4. Native Windows clone at %USERPROFILE%\.airc\src exists
 #      (matches install.ps1's CLONE_DIR layout)     → exec native
-#   5. Caller-relative: this shim's dirname/../airc-src/airc (rare)
+#   5. Caller-relative: this shim's dirname/../.airc/src/airc (rare)
 #   6. Fail loud with all paths attempted
 #
 # Override knobs:
@@ -45,8 +45,8 @@ fi
 # back through wsl.exe would be circular and slow; just exec the
 # canonical clone in-place.
 if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-  if [ -x "$HOME/.airc-src/airc" ]; then
-    exec "$HOME/.airc-src/airc" "$@"
+  if [ -x "$HOME/.airc/src/airc" ]; then
+    exec "$HOME/.airc/src/airc" "$@"
   fi
 fi
 
@@ -67,18 +67,18 @@ _airc_quote_args() {
 # 2) AIRC_WINDOWS_NATIVE=1 — skip WSL.
 # 3) Otherwise, prefer the WSL canonical clone if wsl.exe + clone exist.
 if [ -z "${AIRC_WINDOWS_NATIVE:-}" ] && command -v wsl.exe >/dev/null 2>&1; then
-  if wsl.exe bash -lc 'test -x "$HOME/.airc-src/airc"' >/dev/null 2>&1; then
+  if wsl.exe bash -lc 'test -x "$HOME/.airc/src/airc"' >/dev/null 2>&1; then
     _quoted=$(_airc_quote_args "$@")
-    exec wsl.exe bash -lc "exec \"\$HOME/.airc-src/airc\"$_quoted"
+    exec wsl.exe bash -lc "exec \"\$HOME/.airc/src/airc\"$_quoted"
   fi
 fi
 
-# 4) Windows-native fallback at %USERPROFILE%\.airc-src.
+# 4) Windows-native fallback at %USERPROFILE%\.airc\src.
 # Translate USERPROFILE (Windows-style) to a Git Bash path. Pure-bash
 # transform avoids hard-coding /c/Users/... or invoking cygpath.
 _native_dir=""
 if [ -n "${USERPROFILE:-}" ]; then
-  _native_dir=$(printf '%s' "$USERPROFILE" | sed -E 's|\\|/|g; s|^([A-Za-z]):|/\L\1|')/.airc-src
+  _native_dir=$(printf '%s' "$USERPROFILE" | sed -E 's|\\|/|g; s|^([A-Za-z]):|/\L\1|')/.airc/src
 fi
 if [ -n "$_native_dir" ] && [ -x "$_native_dir/airc" ]; then
   exec "$_native_dir/airc" "$@"
@@ -88,9 +88,8 @@ fi
 # checkouts, AIRC_DIR-less custom layouts). Walk up from the shim.
 _shim_self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 for _candidate in \
-  "$_shim_self/../.airc-src/airc" \
-  "$_shim_self/../airc-src/airc" \
-  "$_shim_self/../../.airc-src/airc"; do
+  "$_shim_self/../.airc/src/airc" \
+  "$_shim_self/../../.airc/src/airc"; do
   if [ -x "$_candidate" ]; then
     exec "$_candidate" "$@"
   fi
@@ -102,7 +101,7 @@ echo "airc: cannot locate canonical airc bash binary." >&2
 echo "  Tried:" >&2
 echo "    AIRC_DIR              = ${AIRC_DIR:-(unset)}" >&2
 echo "    AIRC_WINDOWS_NATIVE   = ${AIRC_WINDOWS_NATIVE:-(unset)}" >&2
-echo "    WSL clone             = \$HOME/.airc-src/airc (in WSL)" >&2
+echo "    WSL clone             = \$HOME/.airc/src/airc (in WSL)" >&2
 echo "    Windows-native clone  = ${_native_dir:-(no USERPROFILE)}/airc" >&2
 echo "" >&2
 echo "  Reinstall:" >&2

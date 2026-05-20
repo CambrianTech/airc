@@ -28,7 +28,7 @@ Walks the full removal in order:
 2. Removes daemon registrations if present
 3. Removes binary files: `~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}`
 4. Removes airc skill symlinks under `~/.claude/skills/`
-5. Removes the clone dir (`~/.airc-src` or `$AIRC_DIR`)
+5. Removes the clone dir (`~/.airc/src` or `$AIRC_DIR`)
 
 **Confirmation prompt:** asks the user to type `yes` to proceed. If you're invoking from an agent, pass `--yes` only after the user has explicitly confirmed.
 

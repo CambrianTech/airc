@@ -568,7 +568,7 @@ _doctor_run_tests() {
       echo "  airc doctor --tests     same as 'airc tests'"
       return 0 ;;
   esac
-  local script="${AIRC_DIR:-$HOME/.airc-src}/test/integration.sh"
+  local script="${AIRC_DIR:-$HOME/.airc/src}/test/integration.sh"
   if [ ! -x "$script" ]; then
     local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
     local here; here="$(dirname "$self")"

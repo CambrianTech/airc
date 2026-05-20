@@ -2,7 +2,7 @@
 #
 # AIRC uninstaller — single source of truth for full removal.
 #
-# Direct entry:    bash ~/.airc-src/uninstall.sh
+# Direct entry:    bash ~/.airc/src/uninstall.sh
 # Curl-pipe:       curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/uninstall.sh | bash -s -- --yes
 # Via the verb:    airc uninstall            (preferred; just exec's this script)
 #
@@ -11,7 +11,7 @@
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
 #   - ~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}
 #   - skill symlinks under ~/.claude/skills/ pointing into the clone
-#   - the clone itself (~/.airc-src or $AIRC_DIR)
+#   - the clone itself (~/.airc/src or $AIRC_DIR)
 #
 # What it leaves:
 #   - per-project .airc/ state in every dir you ran `airc join` from
@@ -24,11 +24,11 @@
 #   --purge        also print the list of per-project .airc/ dirs to remove manually
 #   --help / -h    this message
 #
-# AIRC_DIR env var overrides the clone location (default $HOME/.airc-src).
+# AIRC_DIR env var overrides the clone location (default $HOME/.airc/src).
 
 set -euo pipefail
 
-CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
+CLONE_DIR="${AIRC_DIR:-$HOME/.airc/src}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
