@@ -18,7 +18,7 @@
 #
 # External cross-references (call-time): die, ensure_init, get_config_val,
 # set_config_val, unset_config_keys, get_host, resolve_name, relay_ssh,
-# remote_home, AIRC_HOME, AIRC_WRITE_DIR, AIRC_PYTHON, plus cmd_teardown
+# remote_home, AIRC_HOME, AIRC_WRITE_DIR, plus cmd_teardown
 # (which cmd_part calls to do the actual local kill).
 #
 # Extracted from airc as part of #152 Phase 3 file split. Bundled because
@@ -152,7 +152,7 @@ cmd_rooms() {
 # Convert an ISO 8601 timestamp into a relative-time string ("12m ago",
 # "3h ago", "2d ago"). Falls back to the raw timestamp on parse failure.
 # Used by cmd_rooms to display gist activity (#82). Date parsing goes
-# through iso_to_epoch so the BSD/GNU/python fallback chain is shared.
+# through iso_to_epoch so date parsing stays centralized.
 _format_relative_time() {
   local ts="${1:-}"
   [ -z "$ts" ] && { echo "(unknown)"; return; }

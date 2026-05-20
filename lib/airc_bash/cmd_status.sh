@@ -9,7 +9,7 @@
 # Both are read-only introspection and share no helpers, but live in
 # the same conceptual group ("what is happening?"). External cross-
 # references (call-time): die, ensure_init, get_config_val, relay_ssh,
-# remote_home, MESSAGES, AIRC_PYTHON.
+# remote_home, MESSAGES.
 #
 # Extracted from airc as part of #152 Phase 3 file split.
 

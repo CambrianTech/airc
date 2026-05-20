@@ -111,6 +111,13 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("requires a working python", startup)
         self.assertNotIn("python3 --version", startup)
 
+    def test_airc_has_no_python_debug_runtime_path(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+
+        self.assertNotIn("debug-pythonpath", source)
+        self.assertNotIn("AIRC_PYTHON", source)
+        self.assertNotIn("python3", source)
+
     def test_quick_message_roster_uses_airc_rs(self):
         source = (REPO / "airc").read_text(encoding="utf-8")
         start = source.index('if [ "$qm_owner" = "*roster*" ]; then')
