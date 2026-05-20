@@ -10,15 +10,15 @@ description = "Consumer-embedding proof: a downstream crate that links airc-lib 
 workspace = true
 
 [dependencies]
-# This crate consumes airc-lib like any external embedder would.
-# It deliberately depends ONLY on airc-lib for the SDK surface, not
-# on the lower-level airc-core / airc-protocol / airc-store / etc.
-# That constraint is what proves the API is genuinely consumable
-# without reaching into substrate internals.
+# This crate consumes airc-lib like any external embedder would. Its
+# only AIRC dependency is airc-lib, not the lower-level airc-core /
+# airc-protocol / airc-store / etc. That constraint is what proves
+# the API is genuinely consumable without reaching into substrate
+# internals.
 airc-lib = { path = "../../airc-lib" }
+futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
-futures = "0.3"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }

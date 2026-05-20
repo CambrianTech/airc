@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -78,6 +79,7 @@ pub(crate) struct AircInner {
     pub(crate) route_health: RwLock<TransportHealthTable>,
     pub(crate) route_endpoints: RwLock<RouteEndpointTable>,
     pub(crate) imported_invites: RwLock<ImportedInviteTable>,
+    pub(crate) lamport_clock: AtomicU64,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
@@ -159,6 +161,7 @@ impl Airc {
                 route_health: RwLock::new(TransportHealthTable::local_default()),
                 route_endpoints: RwLock::new(RouteEndpointTable::default()),
                 imported_invites: RwLock::new(ImportedInviteTable::default()),
+                lamport_clock: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
@@ -197,6 +200,7 @@ impl Airc {
             route_health: RwLock::new(TransportHealthTable::local_default()),
             route_endpoints: RwLock::new(RouteEndpointTable::default()),
             imported_invites: RwLock::new(ImportedInviteTable::default()),
+            lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             lan_tcp: Mutex::new(None),
             lan_subscriber: Mutex::new(None),
             subscribers: Mutex::new(HashMap::new()),
@@ -280,5 +284,21 @@ impl Airc {
 
     pub(crate) fn event_store(&self) -> &dyn EventStore {
         self.inner.store.as_ref()
+    }
+
+    pub(crate) fn next_lamport(&self, wall_ms: u64) -> u64 {
+        let mut current = self.inner.lamport_clock.load(Ordering::Relaxed);
+        loop {
+            let next = wall_ms.max(current.saturating_add(1));
+            match self.inner.lamport_clock.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }

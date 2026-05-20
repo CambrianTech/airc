@@ -217,6 +217,22 @@ async fn workspace_lifecycle_projects_from_store() {
         .await
         .unwrap();
 
+    let events = airc.page_recent(128).await.unwrap();
+    let lamports: Vec<u64> = events
+        .iter()
+        .filter(|event| {
+            event
+                .headers
+                .get("forge.body_hint")
+                .is_some_and(|hint| hint == "airc.work.event")
+        })
+        .map(|event| event.lamport)
+        .collect();
+    assert!(
+        lamports.windows(2).all(|pair| pair[0] < pair[1]),
+        "work events emitted by one Airc handle must be strictly lamport ordered: {lamports:?}"
+    );
+
     let board = airc.work_board(128).await.unwrap();
     let workspace = board.workspace(workspace_id).unwrap();
     assert_eq!(workspace.lease.status, WorkspaceStatus::Released);
