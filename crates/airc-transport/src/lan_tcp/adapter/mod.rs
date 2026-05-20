@@ -60,6 +60,7 @@ use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
 
 /// Secure same-LAN adapter.
+#[derive(Clone)]
 pub struct LanTcpAdapter {
     inner: Arc<Inner>,
 }

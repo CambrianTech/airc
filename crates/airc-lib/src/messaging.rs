@@ -1,10 +1,9 @@
 use airc_core::{Body, EventId, Headers, MentionTarget, TranscriptCursor, TranscriptEvent};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature};
-use airc_transport::{LocalFsAdapter, Transport};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
-use crate::route_policy::{RouteClass, RouteDecision, TransportKind};
+use crate::route_policy::{RouteClass, RouteDecision};
 use crate::route_resolver::TransportResolver;
 use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
@@ -28,8 +27,7 @@ impl Airc {
         headers: Headers,
     ) -> Result<EventId, AircError> {
         let room = self.current_room().await?;
-        self.resolve_send_route(kind)?;
-        self.ensure_wire_subscriber(&room.wire).await?;
+        let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
         let mut frame = Frame {
@@ -55,16 +53,13 @@ impl Airc {
             .keypair
             .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
             .map_err(|error| AircError::Crypto(error.to_string()))?;
-        let transport = LocalFsAdapter::new(&room.wire);
-        transport
-            .send(frame.clone())
-            .await
-            .map_err(|e| AircError::Transport(e.to_string()))?;
+        self.execute_send_route(route.kind, &room, frame.clone())
+            .await?;
         self.append_sent_frame(frame).await?;
         Ok(event_id)
     }
 
-    fn resolve_send_route(&self, kind: FrameKind) -> Result<(), AircError> {
+    fn resolve_send_route(&self, kind: FrameKind) -> Result<crate::TransportRoute, AircError> {
         let class = route_class_for_frame(kind);
         let samples = self
             .inner
@@ -72,22 +67,9 @@ impl Airc {
             .read()
             .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?
             .clone();
-        let route = TransportResolver::from_health(samples)
+        TransportResolver::from_health(samples)
             .resolve(class)
-            .map_err(format_route_refusal)?;
-        match route.kind {
-            TransportKind::LocalFs => Ok(()),
-            other @ (TransportKind::LanTcp
-            | TransportKind::Tailscale
-            | TransportKind::Udp
-            | TransportKind::WebRtcDataChannel
-            | TransportKind::Reticulum
-            | TransportKind::Relay
-            | TransportKind::Ssh
-            | TransportKind::GhGist) => Err(AircError::Route(format!(
-                "{class:?} selected {other:?}, but this sender has only local-fs execution wired"
-            ))),
-        }
+            .map_err(format_route_refusal)
     }
 
     async fn append_sent_frame(&self, frame: Frame) -> Result<(), AircError> {

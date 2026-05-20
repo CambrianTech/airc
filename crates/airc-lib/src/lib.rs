@@ -23,10 +23,12 @@
 
 pub mod airc;
 pub mod error;
+mod lan;
 mod messaging;
 mod peers;
 pub mod registry;
 pub mod room;
+mod route_execution;
 pub mod route_health;
 pub mod route_policy;
 pub mod route_resolver;
