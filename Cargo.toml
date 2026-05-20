@@ -12,6 +12,7 @@ members = [
     "crates/airc-lib",
     "crates/airc-cli",
     "crates/examples/embedded_consumer_smoke",
+    "crates/examples/consumer_shapes",
 ]
 resolver = "2"
 
