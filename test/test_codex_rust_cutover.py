@@ -119,6 +119,17 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" config set --config /tmp/airc-it-s-j/state/config.json --key host_target', body)
         self.assertNotIn("python3 -c", body)
 
+    def test_integration_bearer_config_probes_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_bearer_ssh_send()")
+        end = source.index("scenario_bearer_local()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config get --config "$jstate/config.json" host_target', body)
+        self.assertIn('"$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc"', body)
+        self.assertNotIn("json.load(open('$jstate/config.json'))", body)
+        self.assertNotIn("python3 -c \"import json; print", body)
+
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_heartbeat()")
