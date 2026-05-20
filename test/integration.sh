@@ -1638,7 +1638,7 @@ scenario_heartbeat() {
   # Original gist must still exist and now advertise beta as host.
   local recovered_name
   recovered_name=$(gh api "gists/$gist_id" --jq ".files[\"airc-room-${rname}.json\"].content" 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("host",{}).get("name",""))' 2>/dev/null || true)
+    | "$(airc_rs_bin)" gist get .host.name 2>/dev/null || true)
   if [ "$recovered_name" = "beta" ]; then
     pass "original gist preserved and host lease updated to beta"
   else
