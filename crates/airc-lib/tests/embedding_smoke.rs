@@ -9,10 +9,13 @@
 
 use std::{net::SocketAddr, time::Duration};
 
+use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
     Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, RouteEndpoint, TranscriptKind,
     TransportHealthSample, TransportKind, TransportRole,
 };
+use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
+use airc_store::{EventStore, SqliteEventStore};
 use futures::stream::StreamExt;
 use tempfile::TempDir;
 
@@ -44,6 +47,56 @@ async fn wait_for_events(
     }
 }
 
+async fn wait_for_text(airc: &Airc, text: &str, timeout: Duration) -> airc_lib::TranscriptEvent {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let page = airc.page_recent(64).await.unwrap();
+        if let Some(event) = page
+            .into_iter()
+            .find(|event| event.body.as_ref().and_then(Body::as_text) == Some(text))
+        {
+            return event;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("wait_for_text: did not see {text:?} in {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn unique_socket() -> std::path::PathBuf {
+    let suffix = uuid::Uuid::new_v4().as_u128() as u32;
+    std::path::PathBuf::from(format!("/tmp/airclib{:x}.sock", suffix))
+}
+
+async fn spawn_daemon(home: &std::path::Path) -> (tokio::task::JoinHandle<()>, std::path::PathBuf) {
+    let identity = LocalIdentity::load_or_generate(home).unwrap();
+    let mut registry = PeerKeyRegistry::new();
+    registry
+        .enrol(identity.peer_id, 0, identity.keypair.public_bytes())
+        .unwrap();
+    let store: std::sync::Arc<dyn EventStore> = std::sync::Arc::new(
+        SqliteEventStore::open_path(&home.join("events.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let state = std::sync::Arc::new(DaemonState::new(
+        identity.peer_id,
+        identity.keypair,
+        std::sync::Arc::new(std::sync::RwLock::new(registry)),
+        VerificationPolicy::Strict,
+        home.to_path_buf(),
+        store,
+    ));
+    let socket = unique_socket();
+    let server_socket = socket.clone();
+    let handle = tokio::spawn(async move {
+        airc_daemon::run(state, server_socket).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (handle, socket)
+}
+
 #[tokio::test]
 async fn open_join_say_and_replay_round_trips_in_process() {
     // Gate-4 minimum: a consumer can link airc-lib, open the substrate,
@@ -72,6 +125,29 @@ async fn open_join_say_and_replay_round_trips_in_process() {
     let cursor = airc.latest_cursor().await.unwrap().unwrap();
     let after = airc.resume_from(&cursor, 10).await.unwrap();
     assert!(after.is_empty(), "nothing strictly after the latest cursor");
+}
+
+#[tokio::test]
+async fn attached_sdk_sends_and_pages_through_daemon() {
+    let home = TempDir::new().unwrap();
+    let setup = Airc::open(home.path()).await.unwrap();
+    setup.join("daemon-sdk").await.unwrap();
+    drop(setup);
+    let (daemon, socket) = spawn_daemon(home.path()).await;
+    let airc = Airc::attach(home.path(), &socket).await.unwrap();
+
+    assert!(airc.is_daemon_attached());
+    airc.say("hello through attached sdk").await.unwrap();
+
+    let event = wait_for_text(&airc, "hello through attached sdk", Duration::from_secs(3)).await;
+    let after = airc.resume_from(&event.cursor(), 10).await.unwrap();
+    assert!(after.is_empty());
+
+    airc_daemon::DaemonClient::new(socket).stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

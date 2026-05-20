@@ -11,6 +11,10 @@ use crate::Airc;
 impl Airc {
     /// Send a plain-text message to the current room.
     pub async fn say(&self, text: &str) -> Result<EventId, AircError> {
+        if self.is_daemon_attached() {
+            let room = self.current_room().await?;
+            return self.daemon_send_text(&room, text).await;
+        }
         self.send(Body::text(text), Headers::new()).await
     }
 
@@ -109,6 +113,9 @@ impl Airc {
     /// Fetch the most recent `limit` events from the current room.
     pub async fn page_recent(&self, limit: usize) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        if self.is_daemon_attached() {
+            return self.daemon_page_recent(&room, limit).await;
+        }
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(self
             .inner
@@ -143,6 +150,9 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        if self.is_daemon_attached() {
+            return self.daemon_resume_from(&room, cursor, limit).await;
+        }
         Ok(self
             .inner
             .store

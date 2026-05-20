@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use airc_core::{ClientId, PeerId, TranscriptEvent};
-use airc_daemon::{peers_store, LocalIdentity};
+use airc_daemon::{peers_store, DaemonClient, LocalIdentity};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::LanTcpAdapter;
@@ -72,6 +72,7 @@ pub(crate) struct AircInner {
     pub(crate) home: PathBuf,
     pub(crate) identity: LocalIdentity,
     pub(crate) store: Arc<dyn EventStore>,
+    pub(crate) daemon_client: Option<Arc<DaemonClient>>,
     pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
     pub(crate) policy: VerificationPolicy,
     pub(crate) route_health: RwLock<TransportHealthTable>,
@@ -101,6 +102,18 @@ impl Airc {
     /// test harness needs a different stance.
     pub async fn open(home: impl Into<PathBuf>) -> Result<Self, AircError> {
         Self::open_with_policy(home, VerificationPolicy::Strict).await
+    }
+
+    /// Attach to an already-running daemon. The handle still opens
+    /// local identity/store state so consumers can inspect identity,
+    /// room, and replay state through the same `Airc` facade, but
+    /// send/inbox operations go through daemon IPC.
+    pub async fn attach(
+        home: impl Into<PathBuf>,
+        socket: impl Into<PathBuf>,
+    ) -> Result<Self, AircError> {
+        let airc = Self::open(home).await?;
+        Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
     }
 
     /// Variant of [`open`] that lets the caller pin the
@@ -140,6 +153,7 @@ impl Airc {
                 home,
                 identity,
                 store,
+                daemon_client: None,
                 registry,
                 policy,
                 route_health: RwLock::new(TransportHealthTable::local_default()),
@@ -166,6 +180,31 @@ impl Airc {
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id
+    }
+
+    pub fn is_daemon_attached(&self) -> bool {
+        self.inner.daemon_client.is_some()
+    }
+
+    fn with_daemon_client(&self, client: DaemonClient) -> Self {
+        let inner = AircInner {
+            home: self.inner.home.clone(),
+            identity: self.inner.identity.clone(),
+            store: self.inner.store.clone(),
+            daemon_client: Some(Arc::new(client)),
+            registry: self.inner.registry.clone(),
+            policy: self.inner.policy,
+            route_health: RwLock::new(TransportHealthTable::local_default()),
+            route_endpoints: RwLock::new(RouteEndpointTable::default()),
+            imported_invites: RwLock::new(ImportedInviteTable::default()),
+            lan_tcp: Mutex::new(None),
+            lan_subscriber: Mutex::new(None),
+            subscribers: Mutex::new(HashMap::new()),
+            live_tx: self.inner.live_tx.clone(),
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Replace the route-health view consumed by the resolver.
