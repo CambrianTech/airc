@@ -4663,6 +4663,41 @@ scenario_bearer_gh() {
   cleanup_all
 }
 
+scenario_shell_msg_rust_local() {
+  section "shell msg uses Rust local substrate"
+  local root home out err frames marker
+  root="$(mktemp -d /tmp/airc-it-rust-msg.XXXXXX)"
+  home="$root/state"
+  out="$root/out"
+  err="$root/err"
+  marker="rust-local-shell-${RANDOM}-${RANDOM}"
+  mkdir -p "$home"
+  cat > "$home/config.json" <<'JSON'
+{ "name": "rust-shell", "subscribed_channels": ["airc"] }
+JSON
+
+  if AIRC_HOME="$home" AIRC_RS_BIN="$(airc_rs_bin)" "$AIRC" msg "$marker" >"$out" 2>"$err"; then
+    pass "airc msg returned success through Rust local route"
+  else
+    fail "airc msg failed (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null))"
+  fi
+
+  frames="$home/wires/airc/frames.jsonl"
+  if [ -f "$frames" ] && grep -q "$marker" "$frames"; then
+    pass "airc msg wrote signed frame to local Rust wire"
+  else
+    fail "airc msg did not write marker to Rust wire (files: $(find "$home" -maxdepth 4 -type f 2>/dev/null | sort | tr '\n' ' '))"
+  fi
+
+  if [ ! -f "$home/pending.jsonl" ] && ! grep -qi 'gh secondary\|rate-limit\|Bearer:' "$out" "$err" 2>/dev/null; then
+    pass "airc msg did not queue through gh bearer"
+  else
+    fail "airc msg leaked into gh bearer path (out: $(cat "$out" 2>/dev/null); err: $(cat "$err" 2>/dev/null); pending: $(cat "$home/pending.jsonl" 2>/dev/null))"
+  fi
+
+  rm -rf "$root"
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -4710,6 +4745,7 @@ case "$MODE" in
   bearer_ssh_recv) scenario_bearer_ssh_recv ;;
   bearer_cli_recv) scenario_bearer_cli_recv ;;
   bearer_gh) scenario_bearer_gh ;;
+  shell_msg_rust_local) scenario_shell_msg_rust_local ;;
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
   inbox) scenario_inbox ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
@@ -4740,12 +4776,13 @@ case "$MODE" in
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters; scenario_windows_cmd_shim_direct_bash
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
+    scenario_shell_msg_rust_local
     scenario_bearer_gh
     scenario_inbox
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|send_gone_gist_does_not_claim_delivery|monitor_gone_gist_stops_respawn|monitor_liveness_process_evidence|attach_starts_background_transport|attach_transport_survives_launcher_hup|attach_spawn_strips_attach_flag|attach_reports_starting_transport|codex_join_detaches_transport|codex_join_idempotent_when_healthy|codex_join_waits_for_duplicate_repair|join_reaps_duplicate_scope_transport|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|windows_cmd_shim_direct_bash|bearer_ssh_send|bearer_ssh_recv|shell_msg_rust_local|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo

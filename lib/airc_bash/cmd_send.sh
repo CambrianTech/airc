@@ -273,6 +273,33 @@ cmd_send() {
     return 0
   }
 
+  _airc_try_rust_broadcast_send() {
+    # Shell is no longer allowed to route ordinary chat through gh. The
+    # Rust SDK owns the local substrate path; this shell wrapper only
+    # preserves the legacy CLI spelling while typed DM/system/heartbeat
+    # surfaces finish moving into airc-rs.
+    [ "$peer_name" = "all" ] || return 1
+    [ "$internal" = "0" ] || return 1
+    [ "$system_event" = "0" ] || return 1
+    [ "$heartbeat" = "0" ] || return 1
+    [ "$plaintext" = "0" ] || return 1
+
+    local _rs; _rs=$(airc_rs_bin)
+    "$_rs" --home "$AIRC_WRITE_DIR" room "$active_channel" >/dev/null \
+      || die "rust message route failed to select #${active_channel}"
+    if "$_rs" --home "$AIRC_WRITE_DIR" ping >/dev/null 2>&1; then
+      "$_rs" --home "$AIRC_WRITE_DIR" msg "$msg" \
+        || die "rust daemon message route failed for #${active_channel}"
+    else
+      "$_rs" --home "$AIRC_WRITE_DIR" send "$msg" \
+        || die "rust local message route failed for #${active_channel}"
+    fi
+
+    date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+    rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+    return 0
+  }
+
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)
@@ -292,6 +319,10 @@ cmd_send() {
     active_channel=$(airc_config_default_channel "$CONFIG" || true)
   fi
   [ -z "$active_channel" ] && active_channel="general"
+
+  if _airc_try_rust_broadcast_send; then
+    return 0
+  fi
 
   local from_name="$my_name"
   [ "$system_event" = "1" ] && from_name="airc"
