@@ -56,6 +56,8 @@ mod message_commands;
 mod monitor;
 mod pending_cli;
 mod pending_commands;
+mod queue_card_cli;
+mod queue_card_commands;
 mod route_cli;
 mod route_commands;
 mod scope_cli;
@@ -97,6 +99,7 @@ use log_cli::LogAction;
 use message_cli::MessageAction;
 use monitor::MonitorAction;
 use pending_cli::PendingAction;
+use queue_card_cli::QueueCardAction;
 use route_cli::RouteAction;
 use scope_cli::ScopeAction;
 use transport_cli::TransportAction;
@@ -784,6 +787,64 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 workspace_commands::run_release(&home, workspace_id).await
             }
             WorkspaceAction::List { limit } => workspace_commands::run_list(&home, limit).await,
+        },
+
+        Command::QueueCard(args) => match args.action {
+            QueueCardAction::Body {
+                id,
+                branch,
+                owner,
+                status,
+                blockers,
+                environment,
+                evidence,
+                next_action,
+                last_heartbeat,
+            } => queue_card_commands::run_body(queue_card_commands::QueueCardInput {
+                id,
+                branch,
+                owner,
+                status,
+                blockers,
+                environment,
+                evidence,
+                next_action,
+                last_heartbeat,
+            }),
+            QueueCardAction::MutateBody {
+                body_file,
+                mutations_file,
+                log_msg,
+                timestamp,
+            } => queue_card_commands::run_mutate_body(
+                &body_file,
+                &mutations_file,
+                &log_msg,
+                &timestamp,
+            ),
+            QueueCardAction::ClaimFields { body_file } => {
+                queue_card_commands::run_claim_fields(&body_file)
+            }
+            QueueCardAction::DispatchMessage {
+                target_agent,
+                extra_message,
+                next_json_file,
+            } => queue_card_commands::run_dispatch_message(
+                &target_agent,
+                &extra_message,
+                &next_json_file,
+            ),
+            QueueCardAction::AdoptBody {
+                issue_json_file,
+                queue_body_file,
+                force,
+            } => queue_card_commands::run_adopt_body(&issue_json_file, &queue_body_file, force),
+            QueueCardAction::NudgeSummary { raw_json_file } => {
+                queue_card_commands::run_nudge_summary(&raw_json_file)
+            }
+            QueueCardAction::NudgeCardMeta { issue_file } => {
+                queue_card_commands::run_nudge_card_meta(&issue_file)
+            }
         },
 
         Command::Humanhash { hex_input, words } => {

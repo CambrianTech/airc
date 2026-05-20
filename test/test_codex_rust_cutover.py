@@ -283,6 +283,24 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" worktree-lane list', source)
         self.assertIn('"$(airc_rs_bin)" worktree-lane find', source)
 
+    def test_queue_card_core_uses_airc_rs(self):
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                REPO / "lib/airc_bash/cmd_queue.sh",
+                REPO / "lib/airc_bash/cmd_queue_card.sh",
+            ]
+        )
+
+        self.assertIn('"$(airc_rs_bin)" queue-card body', combined)
+        self.assertIn('"$(airc_rs_bin)" queue-card mutate-body', combined)
+        self.assertIn('"$(airc_rs_bin)" queue-card claim-fields', combined)
+        self.assertIn('"$(airc_rs_bin)" queue-card dispatch-message', combined)
+        self.assertIn("queue-card adopt-body", combined)
+        self.assertIn('"$(airc_rs_bin)" queue-card nudge-summary', combined)
+        self.assertIn('"$(airc_rs_bin)" queue-card nudge-card-meta', combined)
+        self.assertNotIn("AIRC_PYTHON", (REPO / "lib/airc_bash/cmd_queue_card.sh").read_text(encoding="utf-8"))
+
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
             path.read_text(encoding="utf-8")

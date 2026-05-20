@@ -330,41 +330,10 @@ EOF
   # Read the JSON from a tempfile (not stdin) because the heredoc carrying
   # the python source uses fd 0; can't redirect stdin twice.
   local dm_text
-  dm_text=$("$AIRC_PYTHON" - "$target_agent" "$extra_message" "$next_json_file" <<'PYEOF'
-import json, sys
-target_agent, extra, path = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(path) as f:
-        data = json.loads(f.read())
-except json.JSONDecodeError as e:
-    print(f"ERR:json:{e}", file=sys.stderr)
-    sys.exit(2)
-if isinstance(data, dict):
-    items = data.get("candidates") or data.get("items") or data.get("results") or []
-elif isinstance(data, list):
-    items = data
-else:
-    items = []
-if not items:
-    print("ERR:no-items", file=sys.stderr)
-    sys.exit(3)
-top = items[0]
-number = top.get("number") or "?"
-title = (top.get("title") or "").strip()
-url = top.get("url") or ""
-claim = top.get("claim_command") or top.get("claim") or ""
-lane = top.get("lane_command") or top.get("lane") or ""
-parts = [
-    f"📋 hand-out for @{target_agent}: #{number} — {title[:80]}",
-    f"   {url}" if url else "",
-    f"   claim: {claim}" if claim else "",
-    f"   lane:  {lane}" if lane else "",
-]
-if extra:
-    parts.append(f"   note: {extra}")
-print("\n".join(p for p in parts if p))
-PYEOF
-  )
+  dm_text=$("$(airc_rs_bin)" queue-card dispatch-message \
+    --target-agent "$target_agent" \
+    --extra-message "$extra_message" \
+    --next-json-file "$next_json_file")
   rm -f "$next_json_file"
   if [ -z "$dm_text" ]; then
     die "queue dispatch: failed to format hand-out from queue-next output"
@@ -804,29 +773,16 @@ _airc_queue_card_body() {
   local blockers="$5" env="$6" evidence="$7"
   local next_action="$8" last_heartbeat="$9"
 
-  # Build the JSON envelope via python so we get correct escaping for
-  # weird characters in evidence/next_action (operator-supplied free text).
-  local card_json
-  card_json=$("$AIRC_PYTHON" - "$id" "$branch" "$owner" "$status" \
-      "$blockers" "$env" "$evidence" "$next_action" "$last_heartbeat" \
-      <<'PYEOF'
-import json, sys
-keys = ["id","branch","owner","status","blockers","env","evidence","next_action","last_heartbeat"]
-values = sys.argv[1:1+len(keys)]
-card = {"kind": "airc-queue-card-v1"}
-for k, v in zip(keys, values):
-    if v:
-        card[k] = v
-print(json.dumps(card, indent=2))
-PYEOF
-)
-
-  # Body uses printf rather than heredoc to dodge bash heredoc parser
-  # edge cases (apostrophes inside $() — same trap that bit cmd_approve).
-  printf '**airc-queue card**\n\n%s\n\n```json\n%s\n```\n\n%s\n' \
-    'Coordinates work via the AIRC queue substrate (airc#562). Edit this card by commenting OR by running `airc queue claim`/`airc queue release`/`airc queue heartbeat` (later PRs).' \
-    "$card_json" \
-    'Close this issue when the work is done (status=merged/abandoned).'
+  "$(airc_rs_bin)" queue-card body \
+    --id "$id" \
+    --branch "$branch" \
+    --owner "$owner" \
+    --status "$status" \
+    --blockers "$blockers" \
+    --env "$env" \
+    --evidence "$evidence" \
+    --next-action "$next_action" \
+    --last-heartbeat "$last_heartbeat"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -940,33 +896,7 @@ _airc_queue_claim_guard() {
   printf '%s' "$current_body" >"$body_file"
 
   local fields
-  if ! fields=$("$AIRC_PYTHON" - "$body_file" <<'PYEOF'
-import json, re, sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = f.read()
-
-card = None
-for match in re.finditer(r'```json\s*\n(.*?)\n\s*```', body, re.DOTALL):
-    try:
-        parsed = json.loads(match.group(1).strip())
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-        card = parsed
-        break
-
-if card is None:
-    print("queue claim: no kind=airc-queue-card-v1 envelope found in body", file=sys.stderr)
-    sys.exit(2)
-
-owner = (card.get("owner") or "").strip()
-if owner == "unclaimed":
-    owner = ""
-print(owner)
-print((card.get("status") or "").strip())
-PYEOF
-  ); then
+  if ! fields=$("$(airc_rs_bin)" queue-card claim-fields --body-file "$body_file"); then
     rm -f "$body_file"
     die "$fields"
   fi
@@ -1781,37 +1711,9 @@ _cmd_queue_adopt() {
   printf '%s' "$queue_body" >"$body_file"
 
   local adopted_body
-  adopted_body=$("$AIRC_PYTHON" - "$issue_json_file" "$body_file" "$force" <<'PYEOF'
-import json, re, sys
-issue_json_path, queue_body_path, force_raw = sys.argv[1:4]
-force = force_raw == "1"
-
-with open(issue_json_path, "r", encoding="utf-8") as f:
-    issue = json.loads(f.read())
-with open(queue_body_path, "r", encoding="utf-8") as f:
-    queue_body = f.read().rstrip()
-
-old_body = issue.get("body") or ""
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-for m in CARD_BLOCK_RE.finditer(old_body):
-    try:
-        parsed = json.loads(m.group(1).strip())
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-        if not force:
-            print("queue adopt: issue already has an airc-queue-card-v1 envelope; pass --force to rewrite", file=sys.stderr)
-            sys.exit(3)
-        break
-
-if old_body.strip():
-    original = "\n\n## Original issue body\n\n<details>\n<summary>Pre-adoption body</summary>\n\n" + old_body.rstrip() + "\n\n</details>\n"
-else:
-    original = "\n\n## Original issue body\n\n_No pre-adoption body._\n"
-
-print(queue_body + original, end="")
-PYEOF
-)
+  local adopt_args=(queue-card adopt-body --issue-json-file "$issue_json_file" --queue-body-file "$body_file")
+  [ "$force" = "1" ] && adopt_args+=(--force)
+  adopted_body=$("$(airc_rs_bin)" "${adopt_args[@]}")
   local adopt_rc=$?
   if [ "$adopt_rc" -ne 0 ]; then
     rm -f "$issue_json_file" "$body_file"
@@ -1954,44 +1856,7 @@ _cmd_queue_nudge_repo() {
   printf '%s' "$raw_json" >"$raw_json_file"
 
   local summary
-  if ! summary=$("$AIRC_PYTHON" - "$raw_json_file" <<'PYEOF'
-import json, re, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-items = []
-for issue in data:
-    card = {}
-    for m in CARD_BLOCK_RE.finditer(issue.get("body", "") or ""):
-        try:
-            parsed = json.loads(m.group(1).strip())
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-            card = parsed
-            break
-    if not card:
-        continue
-    title = (issue.get("title", "") or "").replace("airc-queue: ", "", 1)
-    status = (card.get("status") or "unknown").strip()
-    owner = (card.get("owner") or "").strip()
-    if owner == "unclaimed":
-        owner = ""
-    branch = (card.get("branch") or "").strip()
-    bit = f"#{issue.get('number')} {status}"
-    if owner:
-        bit += f" owner={owner}"
-    if branch:
-        bit += f" branch={branch}"
-    if title:
-        bit += f" '{title[:60]}'"
-    items.append(bit)
-if items:
-    print("; ".join(items[:10]))
-else:
-    print("no open queue cards")
-PYEOF
-  ); then
+  if ! summary=$("$(airc_rs_bin)" queue-card nudge-summary --raw-json-file "$raw_json_file"); then
     rm -f "$raw_json_file"
     die "queue nudge: could not summarize queue cards for $target_repo"
   fi
@@ -2056,42 +1921,16 @@ _cmd_queue_nudge_card() {
   printf '%s' "$issue_blob" >"$issue_file"
 
   local card_meta
-  if ! card_meta=$("$AIRC_PYTHON" - "$issue_file" <<'PYEOF'
-import json, re, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    issue = json.load(f)
-title = issue.get("title", "(no title)")
-body = issue.get("body", "") or ""
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-card = None
-for m in CARD_BLOCK_RE.finditer(body):
-    try:
-        parsed = json.loads(m.group(1).strip())
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-        card = parsed
-        break
-if card is None:
-    print("ERR:no-envelope", file=sys.stderr)
-    sys.exit(2)
-status = (card.get("status") or "").strip() or "unknown"
-owner = (card.get("owner") or "").strip()
-if owner == "unclaimed":
-    owner = ""
-# Tab-separated for shell-friendly parse.
-print(f"{title}\t{status}\t{owner}")
-PYEOF
-  ); then
+  if ! card_meta=$("$(airc_rs_bin)" queue-card nudge-card-meta --issue-file "$issue_file"); then
     rm -f "$issue_file"
     die "queue nudge: $repo#$issue_num is not a valid airc-queue-card-v1 envelope"
   fi
   rm -f "$issue_file"
 
   local card_title card_status card_owner
-  card_title=$(printf '%s' "$card_meta" | awk -F'\t' '{print $1}')
-  card_status=$(printf '%s' "$card_meta" | awk -F'\t' '{print $2}')
-  card_owner=$(printf '%s' "$card_meta" | awk -F'\t' '{print $3}')
+  card_title=$(printf '%s\n' "$card_meta" | sed -n '1p')
+  card_status=$(printf '%s\n' "$card_meta" | sed -n '2p')
+  card_owner=$(printf '%s\n' "$card_meta" | sed -n '3p')
 
   local actor
   actor=$(_airc_queue_resolve_name)

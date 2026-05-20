@@ -47,10 +47,9 @@ _airc_queue_mutate_card() {
     die "queue: gh issue view failed for $repo#$issue_num: $current_body"
   fi
 
-  # Hand to python: parse envelope, apply mutations, rewrite body with
-  # status-log entry. Python heredoc handles edge cases (escaping, regex)
-  # better than bash here. Body + mutations passed via temp files to
-  # dodge stdin contention with the heredoc.
+  # Hand to Rust: parse envelope, apply mutations, rewrite body with
+  # status-log entry. Body + mutations pass via temp files so shell only
+  # owns process orchestration.
   local body_file mut_file
   body_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-body.XXXXXX") || die "queue: mktemp failed"
   mut_file=$(mktemp "${TMPDIR:-/tmp}/airc-queue-muts.XXXXXX") || die "queue: mktemp failed"
@@ -61,75 +60,13 @@ _airc_queue_mutate_card() {
   timestamp=$(date -u +"%Y-%m-%dT%H:%MZ")
 
   local new_body
-  if ! new_body=$("$AIRC_PYTHON" - "$body_file" "$mut_file" "$log_msg" "$timestamp" <<'PYEOF'
-import json, re, sys
-body_path, mut_path, log_msg, timestamp = sys.argv[1:5]
-
-with open(body_path, "r", encoding="utf-8") as f:
-    body = f.read()
-with open(mut_path, "r", encoding="utf-8") as f:
-    mutations_raw = f.read().strip().splitlines()
-
-# Find the kind=airc-queue-card-v1 JSON block.
-CARD_BLOCK_RE = re.compile(r'```json\s*\n(.*?)\n\s*```', re.DOTALL)
-match = None
-for m in CARD_BLOCK_RE.finditer(body):
-    try:
-        parsed = json.loads(m.group(1).strip())
-    except Exception:
-        continue
-    if isinstance(parsed, dict) and parsed.get("kind") == "airc-queue-card-v1":
-        match = m
-        card = parsed
-        break
-if match is None:
-    print("queue mutate: no kind=airc-queue-card-v1 envelope found in body", file=sys.stderr)
-    sys.exit(2)
-
-# Apply mutations.
-for raw in mutations_raw:
-    if raw.startswith("set:"):
-        keyval = raw[4:]
-        if "=" not in keyval:
-            print(f"queue mutate: malformed --set: {keyval}", file=sys.stderr)
-            sys.exit(2)
-        k, v = keyval.split("=", 1)
-        card[k.strip()] = v.strip()
-    elif raw.startswith("clear:"):
-        k = raw[6:].strip()
-        if k in card:
-            del card[k]
-    else:
-        # Empty line from trailing newline; ignore.
-        if raw.strip():
-            print(f"queue mutate: malformed mutation: {raw}", file=sys.stderr)
-            sys.exit(2)
-
-new_envelope = json.dumps(card, indent=2)
-new_block = "```json\n" + new_envelope + "\n```"
-
-# Replace the original block with the new one.
-body_with_new_envelope = body[:match.start()] + new_block + body[match.end():]
-
-# Append to ## Status log section. If it doesn't exist yet, create it.
-log_line = f"- {timestamp} — {log_msg}"
-LOG_HEADER = "## Status log"
-if LOG_HEADER in body_with_new_envelope:
-    # Append to existing section: insert after the header line.
-    body_with_log = body_with_new_envelope.replace(
-        LOG_HEADER, LOG_HEADER + "\n\n" + log_line, 1
-    )
-    # Above replaces the FIRST match; entries pile in reverse-chrono
-    # at the top of the section. Newest-first reads better at a glance.
-else:
-    # Create the section at the end of the body.
-    body_with_log = body_with_new_envelope.rstrip() + "\n\n" + LOG_HEADER + "\n\n" + log_line + "\n"
-
-print(body_with_log, end="")
-PYEOF
-); then
+  if ! new_body=$("$(airc_rs_bin)" queue-card mutate-body \
+    --body-file "$body_file" \
+    --mutations-file "$mut_file" \
+    --log-msg "$log_msg" \
+    --timestamp "$timestamp"); then
     rm -f "$body_file" "$mut_file"
-    die "queue mutate: python helper failed: $new_body"
+    die "queue mutate: Rust helper failed: $new_body"
   fi
   rm -f "$body_file" "$mut_file"
 
