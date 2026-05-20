@@ -624,8 +624,9 @@ scenario_resilience() {
                                                || fail "dead-pidfile teardown: aborted before completion ($td_out)"
 
   # ── Regression for #9 peers-with-malformed-record ────────────────────
-  # cmd_peers' `python3 -c json.load(...)[key]` exits 1 on malformed JSON,
-  # which under set -e aborted the whole loop. Fix adds || true so one bad
+  # Malformed peer records used to abort the whole loop under set -e.
+  # The Rust config/peer readers must keep one bad record from hiding all
+  # the good ones.
   # record doesn't hide all the good ones.
   local pr_home=/tmp/airc-it-peersbad
   mkdir -p "$pr_home/state/peers" "$pr_home/state/identity"
@@ -1158,7 +1159,7 @@ scenario_get_host() {
       pass "fallback is an IPv4 ($fallback_host) — non-RFC1918 but routable"
       ;;
     *)
-      pass "fallback returned hostname-style value ($fallback_host) — UDP-trick path skipped (no internet route or no python3)"
+      pass "fallback returned hostname-style value ($fallback_host) — UDP-trick path skipped (no internet route)"
       ;;
   esac
 
@@ -2202,7 +2203,7 @@ JSON
     && pass "fresh bearer_state alone does not satisfy AIRC process liveness" \
     || fail "fresh bearer_state falsely satisfied AIRC process liveness (got: $status_out)"
 
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $other/peers --my-name foreign" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $other/peers --my-name foreign" sleep 60 ) &
   local foreign_pid=$!
   sleep 1
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
@@ -2212,7 +2213,7 @@ JSON
   kill "$foreign_pid" 2>/dev/null || true
   wait "$foreign_pid" 2>/dev/null || true
 
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name local" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name local" sleep 60 ) &
   local local_pid=$!
   local seen=0 i
   for i in $(seq 1 10); do
@@ -2664,9 +2665,9 @@ scenario_codex_join_waits_for_duplicate_repair() {
   mkdir -p "$home/peers"
 
   echo "99999" > "$home/airc.pid"
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
   local stale_one=$!
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
   local stale_two=$!
 
   CODEX_THREAD_ID=airc-it-codex-dup AIRC_CODEX_START_WAIT_SEC=25 \
@@ -2710,9 +2711,9 @@ scenario_join_reaps_duplicate_scope_transport() {
   mkdir -p "$home/peers" "$root"
 
   echo "99999" > "$home/airc.pid"
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-one" sleep 60 ) &
   local stale_one=$!
-  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
+  ( exec -a "airc-rs monitor format --peers-dir $home/peers --my-name stale-two" sleep 60 ) &
   local stale_two=$!
 
   AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_CODEX_DETACH=1 \
