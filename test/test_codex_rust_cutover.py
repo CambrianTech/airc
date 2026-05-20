@@ -140,6 +140,27 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("subscribed_channels',[]", body)
         self.assertNotIn("python3 -c", body)
 
+    def test_integration_channel_gist_probes_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_general_has_shared_gist()")
+        end = source.index("scenario_invite_human()", start)
+        body = source[start:end]
+
+        self.assertIn("config get-channel-gist --config /tmp/airc-it-tdd283-h/state/config.json --channel general", body)
+        self.assertIn('"$(airc_rs_bin)" config get-channel-gist --config "$home/state/config.json" --channel "$rname"', body)
+        self.assertNotIn("channel_gists',{}).get", body)
+        self.assertNotIn("python3 -c", body)
+
+    def test_integration_invite_human_channel_gist_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_invite_human()")
+        end = source.index("scenario_bearer_local()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config get-channel-gist --config "$home_h/state/config.json" --channel "$rname"', body)
+        self.assertNotIn("channel_gists', {}).get", body)
+        self.assertNotIn("python3 -c", body)
+
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_heartbeat()")
