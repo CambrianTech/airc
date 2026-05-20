@@ -11,6 +11,8 @@
 //!   3. both join the same room/wire
 //!   4. both keep a live subscription open
 //!   5. each sends and the other receives through persisted state
+//!   6. Monitor attach receives from the same Rust event stream, without
+//!      legacy messages.jsonl mirroring
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -106,6 +108,60 @@ fn installed_codex_and_claude_identities_hold_bidirectional_live_room() {
     let _ = claude_listener.wait();
 }
 
+#[test]
+fn monitor_attach_streams_rust_events_without_legacy_log() {
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let codex_user_home = workspace.path().join("codex-user");
+    let claude_user_home = workspace.path().join("claude-user");
+    let shared_wire = workspace.path().join("shared-agent-wire");
+
+    std::fs::create_dir_all(&codex_user_home).expect("codex user home");
+    std::fs::create_dir_all(&claude_user_home).expect("claude user home");
+
+    let codex_spec = installed_init(&codex_user_home).peer_spec;
+    let claude_spec = installed_init(&claude_user_home).peer_spec;
+    installed_peer_add(&codex_user_home, &claude_spec);
+    installed_peer_add(&claude_user_home, &codex_spec);
+    installed_room(&codex_user_home, "monitor-dogfood", &shared_wire);
+    installed_room(&claude_user_home, "monitor-dogfood", &shared_wire);
+
+    let mut claude_monitor = installed_monitor_attach(&claude_user_home);
+    let monitor_lines = spawn_line_reader(claude_monitor.stdout.take().expect("monitor stdout"));
+    assert!(
+        wait_for_channel_line_contains(
+            &monitor_lines,
+            "attached to Rust event stream",
+            Duration::from_secs(6)
+        )
+        .is_some(),
+        "monitor attach did not start"
+    );
+
+    installed_send(
+        &codex_user_home,
+        "codex -> claude monitor through rust events",
+    );
+    let saw_monitor_message = wait_for_channel_line_contains(
+        &monitor_lines,
+        "codex -&gt; claude monitor through rust events",
+        Duration::from_secs(6),
+    )
+    .is_some();
+    assert!(
+        saw_monitor_message,
+        "monitor attach did not receive the Rust event"
+    );
+
+    let legacy_log = claude_user_home.join(".airc").join("messages.jsonl");
+    assert!(
+        !legacy_log.exists(),
+        "monitor proof must not depend on legacy messages.jsonl"
+    );
+
+    let _ = claude_monitor.kill();
+    let _ = claude_monitor.wait();
+}
+
 struct InitOutput {
     peer_spec: String,
 }
@@ -167,6 +223,15 @@ fn installed_listen(user_home: &Path) -> std::process::Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("airc-rs listen must spawn")
+}
+
+fn installed_monitor_attach(user_home: &Path) -> std::process::Child {
+    installed_command(user_home)
+        .args(["monitor", "attach", "--my-name", "claude-test"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("airc monitor attach must spawn")
 }
 
 fn installed_send(user_home: &Path, text: &str) {

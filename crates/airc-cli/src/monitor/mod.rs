@@ -24,6 +24,6 @@ pub fn run_format(peers_dir: &Path, my_name: &str) -> Result<(), Box<dyn Error>>
     }
 }
 
-pub fn run_attach(home: &Path, my_name: &str) -> Result<(), Box<dyn Error>> {
-    attach::run(home, my_name)
+pub async fn run_attach(home: &Path, my_name: &str) -> Result<(), Box<dyn Error>> {
+    attach::run(home, my_name).await
 }

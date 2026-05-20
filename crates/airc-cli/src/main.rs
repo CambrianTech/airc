@@ -838,7 +838,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             MonitorAction::Format { peers_dir, my_name } => {
                 monitor::run_format(&peers_dir, &my_name)
             }
-            MonitorAction::Attach { my_name } => monitor::run_attach(&home, &my_name),
+            MonitorAction::Attach { my_name } => monitor::run_attach(&home, &my_name).await,
         },
 
         Command::Workspace(args) => match args.action {
