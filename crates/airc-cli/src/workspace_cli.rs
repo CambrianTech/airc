@@ -1,4 +1,4 @@
-//! Clap argument shapes for `airc-rs workspace ...`.
+//! Clap argument shapes for `airc workspace ...`.
 
 use clap::{Args, Subcommand};
 

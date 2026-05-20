@@ -1,4 +1,4 @@
-//! Clap argument shapes for `airc-rs work ...`.
+//! Clap argument shapes for `airc work ...`.
 
 use clap::{Args, Subcommand, ValueEnum};
 

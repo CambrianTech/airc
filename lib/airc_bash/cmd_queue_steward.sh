@@ -80,7 +80,7 @@ _cmd_queue_steward() {
     steward_args+=(--json)
   fi
 
-  "$(airc_rs_bin)" "${steward_args[@]}"
+  "$(airc_core_bin)" "${steward_args[@]}"
   local steward_status=$?
   rm -f "$raw_json_file"
   return "$steward_status"

@@ -240,7 +240,7 @@ That is acceptable for a first CLI, but not as the integration surface for Conti
 
 Needed split:
 
-- `airc-core`: IDs, identity, headers, basic types;
+- `airc-core` crate: IDs, identity, headers, basic types;
 - `airc-protocol`: envelopes, frames, signatures, subscriptions;
 - `airc-transport`: adapters and resolver;
 - `airc-store`: durable event/projection store;
@@ -794,11 +794,14 @@ Disk hygiene, stale-branch cleanup, and "who is doing what" all derive from the 
 
 Workspace sanitation is not optional polish. A machine may host 20+ local agents, each with lanes, worktrees, Rust targets, Docker layers, model caches, browser traces, and project sandboxes. AIRC must know what it allocated and provide a drain path for anything rebuildable. The feature shape:
 
+- AIRC-created git worktrees live under the single home root `~/.airc/worktrees/<repo>/<lease-or-branch>` by default. Repo-local `.airc/` remains project scope state; ad hoc sibling roots such as `~/Development/.../airc-worktrees` are not the convention.
+- every workspace allocation records its root path, repo, branch, owner peer, lease id, created timestamp, heartbeat timestamp, and expected PR/issue links;
+- worktree drains are policy-backed: merged/closed PRs, released leases, expired heartbeats, and clean git status may be deleted automatically; dirty or unknown worktrees are report-only until an explicit policy admits them;
 - every workspace lease records disk usage and cache roots it owns;
 - every drain candidate is typed as `RebuildableCache`, `GeneratedArtifact`, `DownloadedDependency`, `DockerLayer`, `ModelCache`, `TraceArtifact`, or `Unknown`;
 - default policy may drain only safe rebuildable caches;
 - destructive or ambiguous drains require explicit policy opt-in;
-- `airc-rs workspace report` and `airc-rs hygiene report` expose the same projection;
+- `airc workspace report` and `airc hygiene report` expose the same projection;
 - low-space pressure emits `WorkspacePressureReported`, then policy may emit `WorkspaceDrainRequested`;
 - completed cleanup records bytes reclaimed, paths touched, and policy rule id;
 - dry-run and record/replay are required so cleanup decisions can be inspected after the fact.
@@ -839,9 +842,9 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
    - **Sub-PR 3a — drain typing (this PR).** Typed events: `WorkspacePressureReported`, `WorkspaceDrainRequested`, `WorkspaceDrainCompleted`. Typed model: `DrainCandidateCategory` (closed enum incl. `Unknown`), `DrainCandidate`, `PressureLevel`, `DrainOutcome`. Projection extends `WorkBoardProjection` with `workspace_pressure`, `pending_drains`, `drain_history` — all keyed by `WorkspaceId` independent of the card+claim lease flow so peers without leases can participate in hygiene. Codec roundtrip + projection sequence tests. No runtime detector or executor; that's the next sub-PR.
    - **Sub-PR 3b — workspace lease decoupling (follow-up).** Today's `WorkspaceLease` requires `card_id` + `claim_id`. Peers that allocate workspaces outside the card flow can emit pressure/drain events but cannot register the workspace itself. Needed: a lightweight workspace registration event without card/claim, plus a `WorkspaceStatus::External` (or equivalent) variant. Out of scope for 3a — it's a wider model change with downstream impact on `WorkspaceRequested`.
    - **Sub-PR 3c — pressure detector + drain executor.** Runtime that probes disk, emits `WorkspacePressureReported`, evaluates policy (default = `RebuildableCache` + `DownloadedDependency`), and executes `WorkspaceDrainRequested` → `WorkspaceDrainCompleted`. Dry-run path lands first.
-4. **PR 4 — CLI thin wrapper.** `airc-rs work list`, `airc-rs work claim`, `airc-rs lane status`, `airc-rs workspace list`, `airc-rs workspace report`, `airc-rs hygiene report`, `airc-rs hygiene clean --dry-run` — all backed by `airc-work`, no Python touched.
+4. **PR 4 — CLI thin wrapper.** `airc work list`, `airc work claim`, `airc lane status`, `airc workspace list`, `airc workspace report`, `airc hygiene report`, `airc hygiene clean --dry-run` — all backed by `airc-work`, no Python touched.
 5. **PR 5 — GitHub adapter.** Mirror card state to issues/PRs; reconcile PR status into events; GitHub is adapter-only.
-6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc-rs codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
+6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
 7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 
 ### What this replaces in the previous plan

@@ -1,4 +1,4 @@
-//! Clap argument shapes for `airc-rs log ...`.
+//! Clap argument shapes for `airc log ...`.
 
 use std::path::PathBuf;
 

@@ -2,7 +2,7 @@
 //!
 //! This test intentionally does NOT pass `--home` and does NOT pass
 //! ad-hoc `--peer` flags to listen/send. Each subprocess receives a
-//! distinct fake user HOME, so `airc-rs` resolves state through the
+//! distinct fake user HOME, so `airc-core` resolves state through the
 //! default installed path: `<HOME>/.airc`.
 //!
 //! The proof shape mirrors the real Codex/Claude target:
@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn installed_init(user_home: &Path) -> InitOutput {
     let output = installed_command(user_home)
         .arg("init")
         .output()
-        .expect("airc-rs init must spawn");
+        .expect("airc-core init must spawn");
     assert!(
         output.status.success(),
         "init failed: stdout={} stderr={}",
@@ -194,7 +194,7 @@ fn installed_peer_add(user_home: &Path, peer_spec: &str) {
     let output = installed_command(user_home)
         .args(["peer", "add", peer_spec])
         .output()
-        .expect("airc-rs peer add must spawn");
+        .expect("airc-core peer add must spawn");
     assert!(
         output.status.success(),
         "peer add failed: stdout={} stderr={}",
@@ -207,7 +207,7 @@ fn installed_room(user_home: &Path, room: &str, wire: &Path) {
     let output = installed_command(user_home)
         .args(["room", room, "--wire", wire.to_str().expect("wire utf-8")])
         .output()
-        .expect("airc-rs room must spawn");
+        .expect("airc-core room must spawn");
     assert!(
         output.status.success(),
         "room failed: stdout={} stderr={}",
@@ -222,7 +222,7 @@ fn installed_listen(user_home: &Path) -> std::process::Child {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("airc-rs listen must spawn")
+        .expect("airc-core listen must spawn")
 }
 
 fn installed_monitor_attach(user_home: &Path) -> std::process::Child {
@@ -238,7 +238,7 @@ fn installed_send(user_home: &Path, text: &str) {
     let output = installed_command(user_home)
         .args(["send", text])
         .output()
-        .expect("airc-rs send must spawn");
+        .expect("airc-core send must spawn");
     assert!(
         output.status.success(),
         "send failed: stdout={} stderr={}",
@@ -251,7 +251,7 @@ fn installed_inbox(user_home: &Path) -> String {
     let output = installed_command(user_home)
         .args(["inbox", "--limit", "16"])
         .output()
-        .expect("airc-rs inbox must spawn");
+        .expect("airc-core inbox must spawn");
     assert!(
         output.status.success(),
         "inbox failed: stdout={} stderr={}",
@@ -262,7 +262,7 @@ fn installed_inbox(user_home: &Path) -> String {
 }
 
 fn installed_command(user_home: &Path) -> Command {
-    let mut command = Command::new(airc_rs());
+    let mut command = Command::new(airc_core());
     command.env("HOME", user_home);
     command.env("USERPROFILE", user_home);
     command

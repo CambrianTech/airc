@@ -1,4 +1,4 @@
-//! `airc-rs events ...` handlers.
+//! `airc events ...` handlers.
 
 use std::path::Path;
 

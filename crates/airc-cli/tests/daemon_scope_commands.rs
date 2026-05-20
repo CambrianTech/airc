@@ -1,15 +1,15 @@
 use std::process::Command;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
 fn daemon_scope_id_matches_legacy_sha1_prefix() {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .args(["daemon-scope-id", "/tmp/airc"])
         .output()
-        .expect("airc-rs daemon-scope-id must spawn");
+        .expect("airc-core daemon-scope-id must spawn");
 
     assert!(
         output.status.success(),

@@ -1,11 +1,11 @@
-//! End-to-end coverage for `airc-rs message ...`.
+//! End-to-end coverage for `airc-core message ...`.
 
 use std::process::Command;
 
 use serde_json::Value;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn message_build_legacy_alias_matches_build_output() {
 }
 
 fn run_ok(prefix: &[&str]) -> String {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .args(prefix)
         .args([
             "--from",
@@ -42,7 +42,7 @@ fn run_ok(prefix: &[&str]) -> String {
             "chat",
         ])
         .output()
-        .expect("run airc-rs");
+        .expect("run airc-core");
 
     assert!(
         output.status.success(),

@@ -1,4 +1,4 @@
-//! End-to-end coverage for `airc-rs codex-hook ...`.
+//! End-to-end coverage for `airc-core codex-hook ...`.
 
 use std::io::Write;
 use std::path::Path;
@@ -7,8 +7,8 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 use tempfile::TempDir;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn codex_hook_raw_mode_preserves_full_event_lines() {
 }
 
 #[test]
-fn codex_hook_installer_replaces_legacy_python_hook() {
+fn codex_hook_installer_replaces_existing_managed_hook() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
@@ -143,17 +143,19 @@ fn codex_hook_installer_replaces_legacy_python_hook() {
         commands
             .iter()
             .any(|command| command.ends_with("codex-hook user-prompt-submit")),
-        "installer must add a Rust hook command, got {commands:?}"
+        "installer must add the public hook command, got {commands:?}"
     );
-    assert!(
-        !commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()),
-        "installer should pin the resolved airc-rs executable instead of relying on PATH"
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.as_str() == "airc codex-hook user-prompt-submit")
+            .count(),
+        1
     );
-    assert!(!commands.contains(&"airc codex-hook user-prompt-submit".to_string()));
 }
 
 #[test]
-fn codex_hook_installer_replaces_prior_absolute_rust_hook() {
+fn codex_hook_installer_replaces_existing_managed_hook_command() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
@@ -162,7 +164,7 @@ fn codex_hook_installer_replaces_prior_absolute_rust_hook() {
         .expect("write config");
     std::fs::write(
         codex_home.join("hooks.json"),
-        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/old/install/bin/airc-rs codex-hook user-prompt-submit"}]}]}}"#,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"airc codex-hook user-prompt-submit"}]}]}}"#,
     )
     .expect("write hooks");
 
@@ -186,17 +188,16 @@ fn codex_hook_installer_replaces_prior_absolute_rust_hook() {
             .filter(|command| command.ends_with("codex-hook user-prompt-submit"))
             .count(),
         1,
-        "install must replace older managed hook commands, got {commands:?}"
+        "install must replace existing managed hook commands, got {commands:?}"
     );
-    assert!(
-        commands[0].contains(env!("CARGO_BIN_EXE_airc-rs")),
-        "hook command should pin current executable, got {:?}",
-        commands
+    assert_eq!(
+        commands,
+        vec!["airc codex-hook user-prompt-submit".to_string()]
     );
 }
 
 #[test]
-fn codex_hook_installer_removes_stale_filesystem_profile() {
+fn codex_hook_installer_removes_managed_filesystem_profile() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
@@ -250,7 +251,7 @@ fn codex_hook_uninstaller_removes_managed_hooks_only() {
     .expect("write config");
     std::fs::write(
         codex_home.join("hooks.json"),
-        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo existing"},{"type":"command","command":"airc-rs codex-hook user-prompt-submit"}]}]}}"#,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo existing"},{"type":"command","command":"airc-core codex-hook user-prompt-submit"}]}]}}"#,
     )
     .expect("write hooks");
 
@@ -273,19 +274,19 @@ fn codex_hook_uninstaller_removes_managed_hooks_only() {
             .expect("hooks json");
     let commands = hook_commands(&hooks);
     assert!(commands.contains(&"echo existing".to_string()));
-    assert!(!commands.contains(&"airc-rs codex-hook user-prompt-submit".to_string()));
+    assert!(!commands.contains(&"airc-core codex-hook user-prompt-submit".to_string()));
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .arg("--home")
         .arg(home)
         .args(args)
         .output()
-        .expect("airc-rs command must spawn");
+        .expect("airc-core command must spawn");
     assert!(
         output.status.success(),
-        "airc-rs {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -294,7 +295,7 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
 }
 
 fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
-    let mut child = Command::new(airc_rs())
+    let mut child = Command::new(airc_core())
         .arg("--home")
         .arg(home)
         .args(args)
@@ -302,7 +303,7 @@ fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("airc-rs hook must spawn");
+        .expect("airc-core hook must spawn");
     child
         .stdin
         .as_mut()
@@ -312,7 +313,7 @@ fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
     let output = child.wait_with_output().expect("wait for hook");
     assert!(
         output.status.success(),
-        "airc-rs {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

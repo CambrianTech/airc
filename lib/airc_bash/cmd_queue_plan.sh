@@ -84,7 +84,7 @@ _cmd_queue_plan() {
     plan_args+=(--json)
   fi
 
-  "$(airc_rs_bin)" "${plan_args[@]}"
+  "$(airc_core_bin)" "${plan_args[@]}"
   local plan_status=$?
   rm -f "$raw_json_file"
   return "$plan_status"

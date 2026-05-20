@@ -24,7 +24,8 @@ name: auto-close-queue-cards
 #
 #   Runs `airc queue close-merged` from the checkout — no install
 #   step required because the `./airc` dispatcher works from a clone
-#   when gh + bash + airc-rs are present (all on ubuntu-latest).
+#   when gh + bash + the AIRC implementation binary are present (all on
+#   ubuntu-latest).
 #
 # Scope:
 #   - Same-repo only. Cross-repo refs (e.g. airc PR closing

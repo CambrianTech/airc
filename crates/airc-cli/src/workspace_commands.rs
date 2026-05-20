@@ -1,4 +1,4 @@
-//! `airc-rs workspace ...` handlers.
+//! `airc workspace ...` handlers.
 
 use std::path::Path;
 

@@ -1,4 +1,4 @@
-//! `airc-rs work ...` handlers.
+//! `airc work ...` handlers.
 //!
 //! The CLI stays intentionally thin: it parses human input, calls the
 //! consumer-facing `airc_lib::Airc` work API, and prints stable lines

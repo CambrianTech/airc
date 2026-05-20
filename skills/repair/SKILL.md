@@ -19,10 +19,10 @@ If `$ARGUMENTS` contains an invite string (looks like `name@user@host[:port]#<ba
 ```bash
 # Grab the pieces the host wrote into config during the last pair.
 SCOPE=$(airc debug-scope)
-HOST_NAME=$(airc-rs config get --config "$SCOPE/config.json" host_name 2>/dev/null || true)
-HOST_TARGET=$(airc-rs config get --config "$SCOPE/config.json" host_target 2>/dev/null || true)
-HOST_PORT=$(airc-rs config get --config "$SCOPE/config.json" host_port 7547 2>/dev/null || true)
-HOST_PUB=$(airc-rs config get --config "$SCOPE/config.json" host_ssh_pub 2>/dev/null || true)
+HOST_NAME=$(airc config get --config "$SCOPE/config.json" host_name 2>/dev/null || true)
+HOST_TARGET=$(airc config get --config "$SCOPE/config.json" host_target 2>/dev/null || true)
+HOST_PORT=$(airc config get --config "$SCOPE/config.json" host_port 7547 2>/dev/null || true)
+HOST_PUB=$(airc config get --config "$SCOPE/config.json" host_ssh_pub 2>/dev/null || true)
 PUB_B64=$(printf '%s\n' "$HOST_PUB" | base64 | tr -d '\n')
 
 if [ -n "$HOST_NAME" ] && [ -n "$HOST_TARGET" ] && [ -n "$HOST_PUB" ]; then

@@ -167,11 +167,11 @@ _cmd_lane_list() {
   touch "$registry"
 
   if [ "$output_json" -eq 1 ]; then
-    "$(airc_rs_bin)" worktree-lane list --registry "$registry" --json
+    "$(airc_core_bin)" worktree-lane list --registry "$registry" --json
     return
   fi
 
-  "$(airc_rs_bin)" worktree-lane list --registry "$registry"
+  "$(airc_core_bin)" worktree-lane list --registry "$registry"
 }
 
 _cmd_lane_remove() {
@@ -203,12 +203,12 @@ _cmd_lane_remove() {
 
   local registry
   registry=$(_airc_lane_registry)
-  "$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" >/dev/null \
+  "$(airc_core_bin)" worktree-lane find --registry "$registry" "$target" >/dev/null \
     || die "lane remove: no recorded lane matches: $target"
 
   local repo_root lane_dir
-  repo_root=$("$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" --field repo)
-  lane_dir=$("$(airc_rs_bin)" worktree-lane find --registry "$registry" "$target" --field dir)
+  repo_root=$("$(airc_core_bin)" worktree-lane find --registry "$registry" "$target" --field repo)
+  lane_dir=$("$(airc_core_bin)" worktree-lane find --registry "$registry" "$target" --field dir)
 
   case "$lane_dir" in
     "$repo_root"|"$repo_root"/*)
@@ -234,11 +234,11 @@ _airc_lane_registry() {
 }
 
 _airc_lane_abs_path() {
-  "$(airc_rs_bin)" worktree-lane abs-path "$1"
+  "$(airc_core_bin)" worktree-lane abs-path "$1"
 }
 
 _airc_lane_slug() {
-  "$(airc_rs_bin)" worktree-lane slug "$1"
+  "$(airc_core_bin)" worktree-lane slug "$1"
 }
 
 _airc_lane_resolve_base() {
@@ -258,7 +258,7 @@ _airc_lane_record() {
   local registry
   registry=$(_airc_lane_registry)
   mkdir -p "$(dirname "$registry")"
-  "$(airc_rs_bin)" worktree-lane record \
+  "$(airc_core_bin)" worktree-lane record \
     --registry "$registry" \
     --issue "$issue_ref" \
     --repo "$repo_root" \

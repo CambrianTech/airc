@@ -1,9 +1,9 @@
-//! End-to-end coverage for `airc-rs route ...`.
+//! End-to-end coverage for `airc-core route ...`.
 
 use std::process::Command;
 
-fn airc_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-rs")
+fn airc_core() -> &'static str {
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]
@@ -51,13 +51,13 @@ fn route_status_down_override_removes_candidate() {
 }
 
 fn run_ok(args: &[&str]) -> String {
-    let output = Command::new(airc_rs())
+    let output = Command::new(airc_core())
         .args(args)
         .output()
-        .expect("airc-rs command must spawn");
+        .expect("airc-core command must spawn");
     assert!(
         output.status.success(),
-        "airc-rs {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

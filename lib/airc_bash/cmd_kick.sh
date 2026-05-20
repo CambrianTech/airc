@@ -59,7 +59,7 @@ cmd_kick() {
   # peer could keep authenticating despite the "kick" — caught by
   # Copilot review on PR #73.
   local peer_ssh_pub
-  peer_ssh_pub=$("$(airc_rs_bin)" identity peer-ssh-pub \
+  peer_ssh_pub=$("$(airc_core_bin)" identity peer-ssh-pub \
     --peers-dir "$PEERS_DIR" \
     --peer-name "$target" 2>/dev/null || echo "")
 

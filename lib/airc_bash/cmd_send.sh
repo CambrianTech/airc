@@ -11,7 +11,7 @@
 #
 # External cross-references (resolved at call time): die, ensure_init,
 # get_config_val, set_config_val, relay_ssh, AIRC_HOME, MESSAGES,
-# resolve_name, get_host, _hash, and airc-rs helpers for envelope
+# resolve_name, get_host, _hash, and airc-core helpers for envelope
 # construction and transport calls.
 #
 # Extracted from airc as part of #152 Phase 3 file split. Joel 2026-04-27:
@@ -252,7 +252,7 @@ cmd_send() {
   ensure_init
 
   _airc_append_local_signed() {
-    if ! printf '%s\n' "$1" | "$(airc_rs_bin)" log append --path "$MESSAGES" >/dev/null; then
+    if ! printf '%s\n' "$1" | "$(airc_core_bin)" log append --path "$MESSAGES" >/dev/null; then
       echo "$1" >> "$MESSAGES"
     fi
   }
@@ -277,14 +277,14 @@ cmd_send() {
     # Shell is no longer allowed to route ordinary chat through gh. The
     # Rust SDK owns the local substrate path; this shell wrapper only
     # preserves the legacy CLI spelling while typed DM/system/heartbeat
-    # surfaces finish moving into airc-rs.
+    # surfaces finish moving into airc-core.
     [ "$peer_name" = "all" ] || return 1
     [ "$internal" = "0" ] || return 1
     [ "$system_event" = "0" ] || return 1
     [ "$heartbeat" = "0" ] || return 1
     [ "$plaintext" = "0" ] || return 1
 
-    local _rs; _rs=$(airc_rs_bin)
+    local _rs; _rs=$(airc_core_bin)
     "$_rs" --home "$AIRC_WRITE_DIR" room "$active_channel" >/dev/null \
       || die "rust message route failed to select #${active_channel}"
     if "$_rs" --home "$AIRC_WRITE_DIR" ping >/dev/null 2>&1; then
@@ -332,7 +332,7 @@ cmd_send() {
   local message_kind=""
   [ "$heartbeat" = "1" ] && message_kind="heartbeat"
   local payload
-  payload=$("$(airc_rs_bin)" message build \
+  payload=$("$(airc_core_bin)" message build \
       --from "$from_name" \
       --to "$peer_name" \
       --ts "$ts_val" \
@@ -361,7 +361,7 @@ cmd_send() {
     # this send; they are never converted into plaintext wire traffic.
     local recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
-      recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
+      recipient_pub=$("$(airc_core_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local wire_msg="$full_msg"
@@ -369,7 +369,7 @@ cmd_send() {
       die "missing X25519 key for '$peer_name' — refusing plaintext DM"
     fi
     if [ -n "$recipient_pub" ]; then
-      wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+      wire_msg=$(printf '%s' "$full_msg" | "$(airc_core_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
         --recipient-pub="$recipient_pub" \
         --identity-dir "$IDENTITY_DIR")
       if [ -n "${AIRC_E2E_DEBUG:-}" ]; then
@@ -395,14 +395,14 @@ cmd_send() {
     fi
 
     local outcome
-    outcome=$(printf '%s' "$wire_msg" | "$(airc_rs_bin)" bearer send \
+    outcome=$(printf '%s' "$wire_msg" | "$(airc_core_bin)" bearer send \
       "$peer_name" "$active_channel" \
       --host-target "$host_target" \
       --remote-home "$rhome" \
       --room-gist-id "$room_gist_id")
     local kind detail
-    kind=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
-    detail=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
+    kind=$(printf '%s' "$outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
+    detail=$(printf '%s' "$outcome" | "$(airc_core_bin)" gist get .detail 2>/dev/null)
 
     case "$kind" in
       delivered)
@@ -438,13 +438,13 @@ cmd_send() {
           # set -euo pipefail). Re-invoke the same bearer_cli pipeline
           # the initial send used (lines ~316-320) so the retry path is
           # exactly the original send path replayed against fresh auth.
-          retry_outcome=$(printf '%s' "$wire_msg" | "$(airc_rs_bin)" bearer send \
+          retry_outcome=$(printf '%s' "$wire_msg" | "$(airc_core_bin)" bearer send \
             "$peer_name" "$active_channel" \
             --host-target "$host_target" \
             --remote-home "$rhome" \
             --room-gist-id "$room_gist_id" 2>&1) || true
-          retry_kind=$(printf '%s' "$retry_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
-          retry_detail=$(printf '%s' "$retry_outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
+          retry_kind=$(printf '%s' "$retry_outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
+          retry_detail=$(printf '%s' "$retry_outcome" | "$(airc_core_bin)" gist get .detail 2>/dev/null)
           if [ "$retry_kind" = "delivered" ]; then
             echo "  ✓ Sent post-heal." >&2
             return 0
@@ -580,7 +580,7 @@ cmd_send() {
     # group encryption is a separate protocol, not an implicit fallback.
     local _host_recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
-      _host_recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
+      _host_recipient_pub=$("$(airc_core_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local _host_wire_msg="$full_msg"
@@ -588,7 +588,7 @@ cmd_send() {
       die "missing X25519 key for '$peer_name' — refusing plaintext DM"
     fi
     if [ -n "$_host_recipient_pub" ]; then
-      _host_wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
+      _host_wire_msg=$(printf '%s' "$full_msg" | "$(airc_core_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
         --recipient-pub="$_host_recipient_pub" \
         --identity-dir "$IDENTITY_DIR")
     fi
@@ -603,12 +603,12 @@ cmd_send() {
 
     if [ -n "$_host_room_gist_id" ]; then
       local _host_outcome
-      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$(airc_rs_bin)" bearer send \
+      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$(airc_core_bin)" bearer send \
         "$peer_name" "$active_channel" \
         --room-gist-id "$_host_room_gist_id")
       local _host_kind _host_detail
-      _host_kind=$(printf '%s' "$_host_outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
-      _host_detail=$(printf '%s' "$_host_outcome" | "$(airc_rs_bin)" gist get .detail 2>/dev/null)
+      _host_kind=$(printf '%s' "$_host_outcome" | "$(airc_core_bin)" gist get .kind 2>/dev/null)
+      _host_detail=$(printf '%s' "$_host_outcome" | "$(airc_core_bin)" gist get .detail 2>/dev/null)
       case "$_host_kind" in
         delivered)
           # Append to local audit log only on confirmed delivery. Pre-fix
@@ -750,7 +750,7 @@ cmd_send() {
     fi
     if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
       local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-      "$(airc_rs_bin)" collaboration send-warning \
+      "$(airc_core_bin)" collaboration send-warning \
         --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" --client-id "$_client_id" 2>/dev/null || true
     fi
     _airc_codex_poll_after_user_send
@@ -806,7 +806,7 @@ cmd_ping() {
   ensure_init
 
   local ping_id
-  ping_id=$("$(airc_rs_bin)" uuid-v4)
+  ping_id=$("$(airc_core_bin)" uuid-v4)
 
   local start_time
   start_time=$(date +%s)

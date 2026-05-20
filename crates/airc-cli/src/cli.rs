@@ -58,15 +58,14 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
     home.join("daemon.sock")
 }
 
-/// airc-rs — Rust substrate CLI. Replaces the Python `airc` step by
-/// step; each subcommand exercises one slice of the substrate.
+/// AIRC substrate CLI.
 #[derive(Debug, Parser)]
 #[command(
-    name = "airc-rs",
+    name = "airc",
     version,
-    about = "AIRC substrate CLI (Rust)",
+    about = "AIRC substrate CLI",
     long_about = "Cross-process / cross-machine AI chat over the airc substrate. \
-                  Replaces the Python airc CLI as the Rust path matures."
+                  Provides the public AIRC command surface."
 )]
 pub struct Cli {
     /// State directory for persisted identity + IPC socket. Default
@@ -77,7 +76,7 @@ pub struct Cli {
 
     /// Ad-hoc peers to enrol for this invocation only, repeatable.
     /// Format: `<uuid>:<base64-pubkey-no-padding>`. Persistent peers
-    /// come from `<home>/peers.json` (managed via `airc-rs peer add`);
+    /// come from `<home>/peers.json` (managed via `airc peer add`);
     /// this flag unions on top for one-shot use.
     #[arg(long = "peer", value_name = "SPEC", global = true)]
     pub peers: Vec<PeerSpec>,
@@ -139,7 +138,7 @@ pub enum Command {
 
     /// Send a single text Message frame to the current room and exit.
     /// The current room lives in `<home>/room.json`; switch with
-    /// `airc-rs room <name>`.
+    /// `airc room <name>`.
     Send {
         /// Message body.
         text: String,
@@ -233,7 +232,7 @@ pub enum Command {
     /// Print or switch the current room. With no name, prints the
     /// current room's name + wire + channel. With a name, derives a
     /// deterministic `(wire, channel)` from the name and sets it as
-    /// the current room — two peers who run `airc-rs room project-x`
+    /// the current room — two peers who run `airc room project-x`
     /// land in the same channel without sharing the UUID.
     Room {
         /// Room name. Omit to just print the current room.
@@ -349,7 +348,7 @@ pub enum PeerAction {
     /// registry stays in sync — no daemon restart required.
     Add {
         /// Peer spec: `<uuid>:<base64-pubkey-no-padding>` (the
-        /// `peer_spec:` line from the other side's `airc-rs init`).
+        /// `peer_spec:` line from the other side's `airc init`).
         spec: PeerSpec,
         /// Override the default socket (`<home>/daemon.sock`).
         #[arg(long)]

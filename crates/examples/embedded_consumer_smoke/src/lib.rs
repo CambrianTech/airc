@@ -3,7 +3,7 @@
 //! This crate has no runtime code. Its purpose is to PROVE — by being
 //! a downstream consumer of `airc-lib` — that a small consumer app
 //! can embed AIRC without reaching into substrate internals or
-//! shelling out to the `airc-rs` CLI.
+//! shelling out to the `airc-core` CLI.
 //!
 //! That's the audit's [Gate 4](Consumer Embedding) and grievance §13
 //! ("Consumer Integration Is Not Proven"):

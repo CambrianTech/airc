@@ -1,4 +1,4 @@
-//! `airc-rs log ...` handlers for legacy shell log paths.
+//! `airc log ...` handlers for legacy shell log paths.
 
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};

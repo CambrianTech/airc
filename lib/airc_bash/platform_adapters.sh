@@ -180,7 +180,7 @@ detect_platform() {
 iso_to_epoch() {
   local ts="${1:-}"
   [ -z "$ts" ] && return 0
-  "$(airc_rs_bin)" iso-to-epoch "$ts" 2>/dev/null || true
+  "$(airc_core_bin)" iso-to-epoch "$ts" 2>/dev/null || true
 }
 
 # MSYS / Git Bash path conversion. Six callsites in airc + three in

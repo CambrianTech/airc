@@ -33,7 +33,7 @@ use airc_store::{EventStore, SqliteEventStore};
 pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     // Auto-join "default" room on first init so subsequent
-    // `airc-rs msg` / `say` work without explicit room selection.
+    // `airc msg` / `say` work without explicit room selection.
     if airc.current_room().await?.name != "default" {
         // load_or_default returns the synthesised default when
         // room.json is missing; if a different room name comes back
@@ -49,8 +49,8 @@ pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("peer_spec:   {}", airc.peer_spec());
     println!();
     println!(
-        "Share peer_spec with peers; enrol theirs via `airc-rs peer add <spec>`. \
-         Use `airc-rs room <name>` to switch rooms; `airc-rs msg \"hi\"` sends \
+        "Share peer_spec with peers; enrol theirs via `airc peer add <spec>`. \
+         Use `airc room <name>` to switch rooms; `airc msg \"hi\"` sends \
          to the current room."
     );
     Ok(())
@@ -204,12 +204,12 @@ pub async fn run_daemon(
         store,
     ));
     println!(
-        "airc-rs daemon: peer_id={} listening on {}",
+        "airc daemon: peer_id={} listening on {}",
         identity.peer_id,
         socket.display()
     );
     run_daemon_server(state, socket).await?;
-    println!("airc-rs daemon: stopped.");
+    println!("airc daemon: stopped.");
     Ok(())
 }
 
@@ -408,7 +408,7 @@ pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>
     let airc = Airc::open(home).await?;
     let peers = airc.peers().await?;
     if peers.is_empty() {
-        println!("(no enroled peers — use `airc-rs peer add <spec>` to enrol)");
+        println!("(no enroled peers — use `airc peer add <spec>` to enrol)");
         return Ok(());
     }
     for peer in &peers {

@@ -1,8 +1,8 @@
-//! IPC between the `airc-rs` CLI and the running daemon.
+//! IPC between the `airc-core` CLI and the running daemon.
 //!
 //! Wire protocol = newline-delimited JSON over a local IPC primitive.
 //! On Unix that's a Unix-domain socket at `<home>/daemon.sock`. On
-//! Windows it's a named pipe (`\\.\pipe\airc-rs-<home>`). The
+//! Windows it's a named pipe (`\\.\pipe\airc-core-<home>`). The
 //! `transport` module abstracts both behind one `IpcListener` /
 //! `IpcStream` API; everything above (request/response types,
 //! dispatch, handlers) stays platform-agnostic.

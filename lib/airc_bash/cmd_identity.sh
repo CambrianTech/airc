@@ -17,7 +17,7 @@
 #     adapters for continuum (the only platform implemented today).
 #
 # External cross-references (call-time): die, ensure_init, get_config_val,
-# set_config_val, resolve_name, airc_rs_bin, AIRC_HOME, CONFIG, plus the
+# set_config_val, resolve_name, airc_core_bin, AIRC_HOME, CONFIG, plus the
 # continuum CLI on PATH for import/push.
 #
 # Extracted from airc as part of #152 Phase 3 file split. The bundle is
@@ -103,25 +103,25 @@ _identity_session_file() {
   local transport_name="${1:-}"
   [ -z "$transport_name" ] && transport_name="anonymous"
   mkdir -p "$AIRC_WRITE_DIR/sessions" 2>/dev/null || true
-  "$(airc_rs_bin)" identity session-file --write-dir "$AIRC_WRITE_DIR" --transport-name "$transport_name"
+  "$(airc_core_bin)" identity session-file --write-dir "$AIRC_WRITE_DIR" --transport-name "$transport_name"
 }
 
 _identity_default_work_name() {
   local transport_name="${1:-anonymous}"
   local session_file="${2:-}"
-  "$(airc_rs_bin)" identity default-work-name --transport-name "$transport_name" --session-file "$session_file"
+  "$(airc_core_bin)" identity default-work-name --transport-name "$transport_name" --session-file "$session_file"
 }
 
 _identity_read_work_name() {
   local session_file="$1"
   [ -f "$session_file" ] || return 1
-  "$(airc_rs_bin)" identity read-work-name --session-file "$session_file"
+  "$(airc_core_bin)" identity read-work-name --session-file "$session_file"
 }
 
 _identity_write_work_session() {
   local session_file="$1" name="$2" transport_name="$3"
   _validate_peer_name "$name"
-  "$(airc_rs_bin)" identity write-work-session --session-file "$session_file" --name "$name" --transport-name "$transport_name"
+  "$(airc_core_bin)" identity write-work-session --session-file "$session_file" --name "$name" --transport-name "$transport_name"
 }
 
 _identity_resolve_work_name() {
@@ -204,7 +204,7 @@ _identity_register() {
 _identity_bootstrap_nudge_if_unset() {
   local nudge_file="$AIRC_WRITE_DIR/.identity_nudged_v1"
   [ -f "$nudge_file" ] && return 0
-  "$(airc_rs_bin)" identity nudge-needed --config "$CONFIG"
+  "$(airc_core_bin)" identity nudge-needed --config "$CONFIG"
   local nudge_status=$?
   if [ "$nudge_status" = "2" ]; then
     echo ""
@@ -219,7 +219,7 @@ _identity_bootstrap_nudge_if_unset() {
 }
 
 _identity_show() {
-  "$(airc_rs_bin)" identity show-config --config "$CONFIG"
+  "$(airc_core_bin)" identity show-config --config "$CONFIG"
 }
 
 _identity_set() {
@@ -261,13 +261,13 @@ _identity_set() {
   [ "$set_role" = 1 ] && args+=(--role "$role")
   [ "$set_bio" = 1 ] && args+=(--bio "$bio")
   [ "$set_status" = 1 ] && args+=(--status "$status")
-  "$(airc_rs_bin)" "${args[@]}"
+  "$(airc_core_bin)" "${args[@]}"
 }
 
 _identity_link() {
   local platform="${1:-}" handle="${2:-}"
   [ -z "$platform" ] && die "Usage: airc identity link <platform> [handle] (omit/blank handle to unlink)"
-  "$(airc_rs_bin)" identity link-config --config "$CONFIG" --platform "$platform" --handle "$handle"
+  "$(airc_core_bin)" identity link-config --config "$CONFIG" --platform "$platform" --handle "$handle"
 }
 
 # WHOIS: prints identity for self, host, paired peer, or other peer of
@@ -322,7 +322,7 @@ cmd_whois() {
     return 0
   fi
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-  if "$(airc_rs_bin)" collaboration observed-whois \
+  if "$(airc_core_bin)" collaboration observed-whois \
       --home "$AIRC_WRITE_DIR" --my-name "$my_name" --peer-name "$target" --client-id "$_client_id"; then
     return 0
   fi
@@ -340,7 +340,7 @@ _whois_in_scope() {
   [ -f "$scope_config" ] || return 1
 
   # All scope-local config + peer file reads route through
-  # get_config_val_in / airc-rs config. Pre-migration
+  # get_config_val_in / airc-core config. Pre-migration
   # this function had six inline JSON snippets reading individual
   # JSON fields — each a silent-fail vector with bash-substituted
   # SCOPE_CONFIG / PEER_FILE env vars. Now: one CLI per read.
@@ -375,8 +375,8 @@ _whois_in_scope() {
     local remote_blob
     remote_blob=$(IDENTITY_DIR="$scope/identity" relay_ssh "$host_target_addr" "cat $host_airc_home/peers/$target.json 2>/dev/null" 2>/dev/null || true)
     if [ -n "$remote_blob" ]; then
-      local peer_id; peer_id=$(printf '%s' "$remote_blob" | "$(airc_rs_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
-      local peer_host; peer_host=$(printf '%s' "$remote_blob" | "$(airc_rs_bin)" gist get .host 2>/dev/null || echo "")
+      local peer_id; peer_id=$(printf '%s' "$remote_blob" | "$(airc_core_bin)" gist get .identity "{}" 2>/dev/null || echo "{}")
+      local peer_host; peer_host=$(printf '%s' "$remote_blob" | "$(airc_core_bin)" gist get .host 2>/dev/null || echo "")
       _whois_pretty "$target" "$peer_id" "$peer_host"
       return 0
     fi
@@ -389,7 +389,7 @@ _whois_in_scope() {
 # Args: name, identity-json, host (any may be empty).
 _whois_pretty() {
   local name="$1" blob="${2:-{\}}" host="${3:-}"
-  "$(airc_rs_bin)" identity pretty --name "$name" --identity-json "$blob" --host "$host"
+  "$(airc_core_bin)" identity pretty --name "$name" --identity-json "$blob" --host "$host"
 }
 
 # cmd_kick extracted to lib/airc_bash/cmd_kick.sh
@@ -474,14 +474,14 @@ _identity_import_continuum() {
   fi
   # Parse the JSON; merge into our identity. Empty fields skip; existing
   # fields get overwritten (the user's intent: "I want to BE this persona").
-  "$(airc_rs_bin)" identity import-continuum --config "$CONFIG" --blob "$blob"
+  "$(airc_core_bin)" identity import-continuum --config "$CONFIG" --blob "$blob"
 }
 
 _identity_push_continuum() {
   if ! command -v continuum >/dev/null 2>&1; then
     die "continuum CLI not on PATH — install continuum before pushing."
   fi
-  local handle; handle=$("$(airc_rs_bin)" identity continuum-handle --config "$CONFIG" 2>/dev/null)
+  local handle; handle=$("$(airc_core_bin)" identity continuum-handle --config "$CONFIG" 2>/dev/null)
   [ -z "$handle" ] && die "No continuum handle linked. Run: airc identity link continuum <name>"
-  "$(airc_rs_bin)" identity push-continuum --config "$CONFIG" --handle "$handle"
+  "$(airc_core_bin)" identity push-continuum --config "$CONFIG" --handle "$handle"
 }

@@ -9,7 +9,7 @@
 # What it removes:
 #   - running airc processes (via airc teardown --all, if airc is on PATH)
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
-#   - ~/.local/bin/{airc, relay, airc.cmd, airc.ps1}
+#   - ~/.local/bin/{airc, airc-core, airc-core.exe, airc.cmd, airc.ps1}
 #   - skill symlinks under ~/.claude/skills/ pointing into the clone
 #   - the clone itself (~/.airc-src or $AIRC_DIR)
 #
@@ -58,7 +58,7 @@ cd "$HOME" 2>/dev/null || cd /
 
 cat <<EOF
 This will remove airc from this machine:
-  binary symlinks   $BIN_DIR/{airc,relay,airc.cmd,airc.ps1}
+  binary files      $BIN_DIR/{airc,airc-core,airc-core.exe,airc.cmd,airc.ps1}
   skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
@@ -98,8 +98,7 @@ if command -v airc >/dev/null 2>&1; then
 fi
 
 # 3. Skill symlinks. Walk every entry in the skills dir and drop any
-# symlink that resolves into the clone — covers both current names and
-# any stale ones from prior installs (relay-*, etc.). install.sh writes
+# symlink that resolves into the clone. install.sh writes
 # into both ~/.claude/skills (Claude Code) and ~/.codex/skills (Codex)
 # when both agents are present, so we walk both on uninstall.
 _remove_clone_owned_skill_symlinks() {
@@ -139,30 +138,30 @@ if [ -f "$codex_config" ]; then
     mv "$_tmp" "$codex_config"
     ok "Removed airc command-rules pre-approval from $codex_config"
   fi
-  _airc_rs=""
-  if command -v airc-rs >/dev/null 2>&1; then
-    _airc_rs=$(command -v airc-rs)
-  elif [ -x "$CLONE_DIR/target/release/airc-rs" ]; then
-    _airc_rs="$CLONE_DIR/target/release/airc-rs"
-  elif [ -x "$CLONE_DIR/target/debug/airc-rs" ]; then
-    _airc_rs="$CLONE_DIR/target/debug/airc-rs"
+  _airc_core=""
+  if command -v airc-core >/dev/null 2>&1; then
+    _airc_core=$(command -v airc-core)
+  elif [ -x "$CLONE_DIR/target/release/airc-core" ]; then
+    _airc_core="$CLONE_DIR/target/release/airc-core"
+  elif [ -x "$CLONE_DIR/target/debug/airc-core" ]; then
+    _airc_core="$CLONE_DIR/target/debug/airc-core"
   fi
-  if [ -n "$_airc_rs" ]; then
-    if out=$("$_airc_rs" codex-hook uninstall-hooks --codex-home "$HOME/.codex" 2>&1); then
+  if [ -n "$_airc_core" ]; then
+    if out=$("$_airc_core" codex-hook uninstall-hooks --codex-home "$HOME/.codex" 2>&1); then
       if [ -n "$out" ]; then
         printf '%s\n' "$out" | while IFS= read -r line; do
           ok "Codex AIRC hook: $line"
         done
       fi
     else
-      warn "Could not uninstall Codex AIRC hook through airc-rs: $out"
+      warn "Could not uninstall Codex AIRC hook through airc-core: $out"
     fi
   fi
 fi
 
 # 4. Binary forwarders on PATH.
 removed_bins=0
-for f in airc relay airc.cmd airc.ps1; do
+for f in airc airc-core airc-core.exe airc.cmd airc.ps1; do
   if [ -L "$BIN_DIR/$f" ] || [ -f "$BIN_DIR/$f" ]; then
     # Symlinks: drop unconditionally (we own them).
     # Real files (airc.cmd / airc.ps1 on Windows): drop only if their

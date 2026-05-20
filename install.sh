@@ -4,7 +4,7 @@
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
-# Clones the repo, puts `airc` on PATH, symlinks skills into ~/.claude/skills/
+# Clones the repo, puts `airc` on PATH, and installs AIRC skills.
 
 set -euo pipefail
 
@@ -12,10 +12,7 @@ REPO_URL="https://github.com/CambrianTech/airc.git"
 CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
 # BIN_DIR + SKILLS_TARGET respect env-var overrides so test harnesses
 # (and packagers, distros, etc.) can point install.sh at a sandbox
-# instead of stomping ~/.local/bin and ~/.claude/skills. Pre-fix, a
-# test passing BIN_DIR=/tmp/foo would be silently ignored and the
-# real ~/.local/bin/airc symlink would get rewritten to point at the
-# test dir — caught when our own canary test corrupted the real install.
+# instead of stomping ~/.local/bin and ~/.claude/skills.
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
@@ -342,7 +339,7 @@ ensure_prereqs
 
 # ── Clone or update ─────────────────────────────────────────────────────
 
-if [ -d "$CLONE_DIR/.git" ]; then
+if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
   # AIRC_INSTALL_NO_PULL=1: trust CLONE_DIR's checked-out tree exactly
   # as-is — no branch switch, no pull. CI uses this when it has already
   # staged the PR's tree at $CLONE_DIR via `cp -r .` and wants the
@@ -440,68 +437,63 @@ fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
 
+_write_airc_forwarder() {
+  local target="$1"
+  mkdir -p "$(dirname "$target")"
+  cat > "$target" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+export AIRC_DIR="$CLONE_DIR"
+exec "$CLONE_DIR/airc" "\$@"
+SH
+  chmod +x "$target"
+  ok "Installed command: $target"
+}
+
 mkdir -p "$BIN_DIR"
-# Single-source rule (#543/#544 follow-up): on real Linux/macOS the
-# symlink is fine — the kernel resolves it to $CLONE_DIR/airc each
-# invocation, so `airc update` propagates instantly. On Git Bash for
-# Windows (MINGW), `ln -sf` falls back to a literal COPY because
-# Developer Mode is off by default; that copy goes stale the moment
-# `airc update` (run from WSL) refreshes the canonical clone, and
-# Claude Code's Monitor running this stale copy was the root cause
-# of months of "Windows runs old code while airc version reports new
-# SHA" diagnoses. Use the polyglot shim on Windows instead — it
-# delegates to whichever live install (WSL canonical, then native)
-# is present at runtime. No copies, no drift.
+# Install exactly one public Unix command: `airc`. It is a stable
+# forwarder into the clone, not a symlink and not a copied implementation
+# script. That keeps `airc update` and clean-room reinstalls honest.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
     if [ -f "$CLONE_DIR/airc.shim" ]; then
-      # Replace any pre-existing full-script copy that earlier installs
-      # might have left in PATH. Failing soft is fine — best-effort
-      # cleanup is enough to fix dual-install drift.
       [ -f "$BIN_DIR/airc" ] && rm -f "$BIN_DIR/airc" 2>/dev/null || true
-      [ -f "$BIN_DIR/relay" ] && rm -f "$BIN_DIR/relay" 2>/dev/null || true
       cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
-      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/relay"
-      chmod +x "$BIN_DIR/airc" "$BIN_DIR/relay" 2>/dev/null || true
+      chmod +x "$BIN_DIR/airc" 2>/dev/null || true
     else
-      # Repo predates the shim (transitional). Symlink-or-copy the full
-      # script as before; clean the duplicate next install.
-      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
+      _write_airc_forwarder "$BIN_DIR/airc"
     fi
     [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
     [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
     ;;
   *)
-    # Real Linux/macOS: symlink is right.
-    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-    # Back-compat: `relay` still works for muscle-memory and stale docs.
-    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
+    _write_airc_forwarder "$BIN_DIR/airc"
     ;;
 esac
 
-_install_airc_rs_binary() {
-  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc-rs build"; return 0; }
+_install_airc_core_binary() {
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc-core build"; return 0; }
   if ! command -v cargo >/dev/null 2>&1; then
-    fail "cargo is required to build airc-rs. Install Rust, then re-run install.sh."
+    fail "cargo is required to build airc-core. Install Rust, then re-run install.sh."
   fi
-  info "Building Rust CLI: airc-rs"
+  info "Building Rust CLI: airc-core"
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
-  local built="$CLONE_DIR/target/release/airc-rs"
-  [ -x "$built" ] || fail "airc-rs build completed but binary is missing: $built"
+  local built="$CLONE_DIR/target/release/airc-core"
+  [ -x "$built" ] || fail "airc-core build completed but binary is missing: $built"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      cp -f "$built" "$BIN_DIR/airc-rs.exe"
-      ok "Installed airc-rs: $BIN_DIR/airc-rs.exe"
+      cp -f "$built" "$BIN_DIR/airc-core.exe"
+      ok "Installed airc-core: $BIN_DIR/airc-core.exe"
       ;;
     *)
-      ln -sf "$built" "$BIN_DIR/airc-rs"
-      ok "Installed airc-rs: $BIN_DIR/airc-rs"
+      cp -f "$built" "$BIN_DIR/airc-core"
+      chmod +x "$BIN_DIR/airc-core"
+      ok "Installed airc-core: $BIN_DIR/airc-core"
       ;;
   esac
 }
 
-_install_airc_rs_binary
+_install_airc_core_binary
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
@@ -534,28 +526,14 @@ _install_airc_skills_into() {
   [ -d "$CLONE_DIR/skills" ] || return 0
   mkdir -p "$skills_target"
 
-  # Clean up old symlinks from previous installs.
-  # Includes the airc-classic skill names (connect/send/rename/disconnect) that
-  # were renamed to IRC-canonical (join/msg/nick/quit) — leaving the old symlinks
-  # in place would shadow the new skills with stale content. (`uninstall` was
-  # previously listed here when the skill didn't exist; now that we ship a real
-  # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
-  # this list omits it.)
-  local old
-  for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
-             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect \
-             "$skills_target"/inbox "$skills_target"/tests; do
-    [ -L "$old" ] && rm "$old" 2>/dev/null
-  done
-
   local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
     [ -f "$skill_dir/SKILL.md" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$skills_target/$skill_name"
-    # If the target is a real directory (from a pre-rename hand-install
-    # or an old copy-based installer), it shadows the new symlink. Nuke it.
+    # If the target is a real directory, it shadows the current skill
+    # link. Remove it and install the current skill.
     if [ -d "$target" ] && [ ! -L "$target" ]; then
       rm -rf "$target"
     elif [ -L "$target" ]; then
@@ -641,7 +619,7 @@ TOML
   # When Codex's runtime supports outside-workspace filesystem profiles,
   # restore the block (history at git log -- install.sh).
 
-  # Cleanup for stale [permissions.airc.filesystem] blocks lives in the
+  # Cleanup for managed [permissions.airc.filesystem] blocks lives in the
   # Rust Codex hook installer below. Keep this profile function focused
   # on the network profile it owns.
 
@@ -696,14 +674,13 @@ _install_airc_codex_developer_instructions() {
 
   if grep -qE '^[[:space:]]*(hooks|codex_hooks)[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
      && [ -f "$hooks_json" ] \
-     && { grep -qF 'airc-rs codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null \
-          || grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; }; then
+     && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
     if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
       local _tmp; _tmp=$(mktemp)
       sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
       mv "$_tmp" "$config"
     fi
-    info "  Codex AIRC hook already installed; skipping legacy developer_instructions polling contract"
+    info "  Codex AIRC hook already installed; skipping developer_instructions polling contract"
     return 0
   fi
 
@@ -754,20 +731,20 @@ _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _airc_rs=""
-  if command -v airc-rs >/dev/null 2>&1; then
-    _airc_rs=$(command -v airc-rs)
-  elif [ -x "$CLONE_DIR/target/release/airc-rs" ]; then
-    _airc_rs="$CLONE_DIR/target/release/airc-rs"
-  elif [ -x "$CLONE_DIR/target/debug/airc-rs" ]; then
-    _airc_rs="$CLONE_DIR/target/debug/airc-rs"
+  local _airc_core=""
+  if [ -x "$CLONE_DIR/target/release/airc-core" ]; then
+    _airc_core="$CLONE_DIR/target/release/airc-core"
+  elif [ -x "$CLONE_DIR/target/debug/airc-core" ]; then
+    _airc_core="$CLONE_DIR/target/debug/airc-core"
+  elif command -v airc-core >/dev/null 2>&1; then
+    _airc_core=$(command -v airc-core)
   else
-    warn "Could not install Codex AIRC hook: airc-rs not found"
+    warn "Could not install Codex AIRC hook: airc-core not found"
     return 0
   fi
 
   local out
-  if out=$("$_airc_rs" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
+  if out=$("$_airc_core" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | while IFS= read -r line; do
         ok "Codex AIRC hook: $line"

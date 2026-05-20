@@ -40,7 +40,7 @@ _mesh_desc() {
 # Production invariant: the gist envelope content is the source of
 # truth, not the human description. Pre-fix this matched only gists
 # whose description was exactly "airc mesh"; meanwhile
-# airc-rs channel-gist discovery found older "airc room: ..." gists
+# airc-core channel-gist discovery found older "airc room: ..." gists
 # by envelope content. Two discovery systems, two answers, split-brain.
 #
 # Delegate lookup to channel_gist.find_existing so connect, subscribe,
@@ -62,7 +62,7 @@ _mesh_find() {
       return 0
     fi
   fi
-  "$(airc_rs_bin)" channel-gist find --channel "$channel" --require-invite 2>/dev/null || true
+  "$(airc_core_bin)" channel-gist find --channel "$channel" --require-invite 2>/dev/null || true
 }
 
 # Find the canonical channel gist whether or not it currently has a host
@@ -84,7 +84,7 @@ _mesh_find_any() {
       return 0
     fi
   fi
-  "$(airc_rs_bin)" channel-gist find --channel "$channel" 2>/dev/null || true
+  "$(airc_core_bin)" channel-gist find --channel "$channel" 2>/dev/null || true
 }
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.
@@ -130,13 +130,13 @@ _mesh_age_secs() {
   local content
   if [ -n "$channel" ]; then
     content=$(gh api "gists/$gist_id" 2>/dev/null \
-      | "$(airc_rs_bin)" gist gist-content --channel "$channel" 2>/dev/null || true)
+      | "$(airc_core_bin)" gist gist-content --channel "$channel" 2>/dev/null || true)
   else
     content=$(gh api "gists/$gist_id" 2>/dev/null \
-      | "$(airc_rs_bin)" gist gist-content 2>/dev/null || true)
+      | "$(airc_core_bin)" gist gist-content 2>/dev/null || true)
   fi
   [ -z "$content" ] && return 0
-  local hb; hb=$(printf '%s' "$content" | "$(airc_rs_bin)" gist get .last_heartbeat 2>/dev/null || true)
+  local hb; hb=$(printf '%s' "$content" | "$(airc_core_bin)" gist get .last_heartbeat 2>/dev/null || true)
   [ -z "$hb" ] && return 0
   local hb_epoch; hb_epoch=$(iso_to_epoch "$hb")
   [ -z "$hb_epoch" ] && return 0
