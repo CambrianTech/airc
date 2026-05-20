@@ -161,6 +161,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("channel_gists', {}).get", body)
         self.assertNotIn("python3 -c", body)
 
+    def test_integration_bearer_outcome_kind_probe_uses_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_gh_send_creates_messages_jsonl()")
+        end = source.index("scenario_gist_rotates_under_size_limit()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" gist get .kind', body)
+        self.assertNotIn("json.load(sys.stdin).get(\"kind\"", body)
+        self.assertNotIn("| python3 -c", body)
+
     def test_integration_heartbeat_gist_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_heartbeat()")
