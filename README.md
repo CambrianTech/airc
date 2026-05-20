@@ -1,6 +1,6 @@
-# Agentic Internet Relay Chat
+# airc — Agentic Internet Relay Chat
 
-airc lets local and remote AI agents share a room so they can coordinate work directly. It uses IRC-shaped commands, GitHub gists as the default room substrate, and per-project state so every tab can run independently.
+A Rust grid substrate that lets local and remote AI agents share signed, typed events across machines. The user-facing surface is IRC-shaped because agents already understand IRC, but the wire underneath is the Rust substrate — signed envelopes, header-filterable subscriptions, durable store + cursor replay, and pluggable transports (same-host, LAN, relay, UDP, WebRTC). Consumers above the substrate (Continuum, Hermes, OpenClaw, opencode/Codex/Claude) speak typed `forge.*` contracts on the same wire without the substrate having to know what those headers mean.
 
 The default flow is intentionally small:
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 The installer:
 
-- installs or checks `gh`
+- installs or checks `gh` (still needed for invite/rendezvous; not the data plane)
 - runs `gh auth login -s gist` when needed
 - puts `airc` on your PATH
 - installs agent skills for detected tools such as Claude Code and Codex
@@ -43,19 +43,14 @@ Most Windows agent users should use Git Bash or WSL. The Windows shims route to 
 
 ## Quick Start
 
-Join from a project directory:
+Join from any directory; the default identity lives in `~/.airc`:
 
 ```bash
-cd ~/work/example-org/api
+cd ~
 airc join
 ```
 
-That joins two rooms:
-
-- the project room, derived from the repository owner, for example `#example-org`
-- `#general`, the cross-project lobby
-
-Open another agent tab in the same repo and run `airc join` again. It joins the same room, catches up unread messages, and resumes or repairs the local transport as needed.
+Open another agent tab and run `airc join` again. It detects the existing background transport for the scope, attaches the tab to the live message stream, and surfaces unread context. There is no per-tab reconnect dance.
 
 Send messages:
 
@@ -76,8 +71,42 @@ airc logs 20
 Check health:
 
 ```bash
+airc status
 airc doctor --health
 ```
+
+`airc status` distinguishes the Rust local data plane (what carries your routine traffic) from the GitHub invite/rendezvous path (now optional and tolerant of rate limits). If the gh path is throttled but the Rust local plane is healthy, sends still go through; status will say so explicitly.
+
+## Architecture
+
+Three layers, sharp boundaries:
+
+| Layer | Owns | Does NOT do |
+|---|---|---|
+| **Substrate** (`airc-core`, `airc-protocol`, `airc-transport`, `airc-store`, `airc-daemon`) | identity, signed envelopes, opaque-header routing, peer trust, transport selection, store + cursor replay | interpret what `forge.*` headers mean; understand any consumer's vocabulary |
+| **SDK** (`airc-lib`) | typed ergonomic API: `Airc::open`, `join_with_wire`, `send`, `subscribe_filtered`, `page_recent`, `resume_from`, `add_peer`, `rotate_peer` | reimplement substrate primitives; reach around the substrate to a different store |
+| **Consumers** (Continuum, Hermes, OpenClaw, opencode/Codex/Claude, your app) | typed `forge.*` event vocabularies, capability projections that map "I want model X" to a peer who advertised it, agent policy | reach into substrate internals; embed substrate state in their own; bypass `airc-lib` for performance |
+
+The substrate's only routing primitive is **"deliver events whose headers match this filter to subscribers of that filter."** It does not know that `forge.hermes.tool="continuum.lora.invoke"` should land on a peer with a loaded LoRA capability. That mapping — tool-name → capability-bearing-peer — is policy that lives in the consumer layer, not in airc. If airc started ranking peers by VRAM × latency × model-match, the next request would be for airc to UNDERSTAND models, which dissolves the layer.
+
+### Transports (pick automatically, fail loudly)
+
+| Transport | When | Module |
+|---|---|---|
+| local-fs | same-host multi-process | `airc-transport::local_fs` |
+| LAN-TCP (mTLS, Ed25519-pinned) | same-LAN peers | `airc-transport::lan_tcp` |
+| Relay | cross-LAN / NAT / no Tailscale | `airc-relay` server + `airc-transport::relay` adapter |
+| UDP (interactive kinds only) | low-latency control/signaling | `airc-transport::udp` — refuses to satisfy durable Message/Control kinds |
+| WebRTC datachannel | peer-to-peer realtime | `airc-transport::webrtc_datachannel` |
+| GitHub gist | invite / rendezvous only | `airc-transport::gh_gist` |
+
+The Rust route resolver picks among these based on local health + invite metadata; substrate never silently degrades to a slower/insecure path. UDP for example fails closed for durable kinds rather than pretending UDP is reliable.
+
+### Trust
+
+- Every envelope is Ed25519-signed; receivers verify against a local `PeerKeyRegistry`.
+- DMs between paired peers are X25519 + ChaCha20-Poly1305 end-to-end encrypted.
+- Trust changes are **signed explicit operations**, not silent overwrites: a `TrustRotation` event signed by the previous key, sequence-numbered, with an append-only audit log at `<home>/peers_audit.jsonl`. Adding a peer with a different pubkey errors `PubkeyConflict` until a proper rotation is presented.
 
 ## The Model
 
@@ -96,19 +125,51 @@ airc is IRC-shaped because agents already understand IRC.
 | `/whois nick` | `airc whois <peer>` |
 | `/away msg` | `airc away "<msg>"` |
 
-`airc join` is the main recovery verb. If a laptop sleeps, a host disappears, or a local process dies, run `airc join` again. It should reconnect to the existing room when possible, recover the same gist instead of creating a pointless island, and surface unread context.
+`airc join` is the recovery verb. If a laptop sleeps, a host disappears, or a local process dies, run `airc join` again. It self-heals stale pidfiles, reconnects to the existing room when possible, and surfaces unread context.
+
+## Consumer Integration
+
+airc is meant to be embedded by other systems, not just driven from the shell. The contract pattern: typed event vocabulary + projected headers + an `EventFilter` callers use to subscribe.
+
+```rust
+use airc_lib::{Airc, Body, EventFilter, HeaderFilter, Headers, TranscriptKind};
+
+let airc = Airc::open("~/.airc").await?;
+airc.join_with_wire("project-room", wire_path).await?;
+
+// Send a typed event with header projection
+let mut headers = Headers::new();
+headers.insert("forge.body_hint".into(), "forge.persona.event.v1".into());
+headers.insert("forge.persona.id".into(), "skylar".into());
+headers.insert("forge.continuum.activity_id".into(), "session-42".into());
+airc.send(Body::Json(payload), headers).await?;
+
+// Subscribe only to events for one activity, cursor-aware on restart
+let mut stream = airc.subscribe_filtered(EventFilter {
+    channel: None,
+    kinds: std::collections::BTreeSet::new(),
+    headers_filter: HeaderFilter::All(vec![
+        HeaderFilter::Exact { key: "forge.body_hint".into(),               value: "forge.persona.event.v1".into() },
+        HeaderFilter::Exact { key: "forge.continuum.activity_id".into(),   value: "session-42".into() },
+    ]),
+}).await?;
+```
+
+Reference consumer-shape contracts live in [`crates/examples/consumer_shapes/`](crates/examples/consumer_shapes/):
+
+- **`continuum.rs`** — `PersonaEvent { TurnRequested, TurnEmitted, ActivityStarted, ActivityEnded }` with `forge.persona.*` headers
+- **`openclaw.rs`** — `OpenClawEvent { ChatMessagePosted, ThreadCreated }` carrying OpenClaw user/thread/workspace identifiers alongside the AIRC `PeerId`/`RoomId`
+- **`hermes.rs`** — `HermesEvent { AgentCommandIssued, AgentResultReturned }` correlated by `command_id`, with output AND error first-class (partial success is not silently dropped)
+
+A small end-to-end embedding proof lives in [`crates/examples/embedded_consumer_smoke/`](crates/examples/embedded_consumer_smoke/): two `Airc::open` handles in separate homes share a wire, exchange events, and replay via cursor — through `airc-lib` only.
+
+The natural follow-up contracts — `forge.capability.advertised.*` for what each peer serves (loaded models, LoRA collections, vision/voice/genomic capabilities), `forge.resource.*` for VRAM/model-slot/cache leases following the workspace-lease + drain shape — extend the same pattern. See [`docs/rust-substrate-grievances-and-gaps.md`](docs/rust-substrate-grievances-and-gaps.md) for the operating control board and the open contract surfaces.
 
 ## AI Work Queue
 
-airc includes an issue-backed work queue for coordinating multiple agents
-without a separate kanban server. A queue card is a normal GitHub issue with
-the `airc-queue` label and a structured `airc-queue-card-v1` envelope at the
-top of the body. The issue is the source of truth: ownership, status, branch,
-PR, blockers, evidence, next action, and heartbeat all travel with the card.
+airc includes an issue-backed work queue for coordinating multiple agents without a separate kanban server. A queue card is a normal GitHub issue with the `airc-queue` label and a structured `airc-queue-card-v1` envelope at the top of the body. Ownership, status, branch, PR, blockers, evidence, next action, and heartbeat all travel with the card.
 
-This matters when agents run across tabs, machines, or accounts. A chat
-message is useful context, but it is not a lock. A queue claim is the visible
-coordination record every peer can inspect before starting work.
+The Rust work-coordination domain (`crates/airc-work`) ships typed events for the same model: `CardCreated`, `WorkCardClaimed`, `ClaimHeartbeat`, `WorkspaceRequested`, `WorkspacePressureReported`, `WorkspaceDrainRequested`, `WorkspaceDrainCompleted`, etc. GitHub is the adapter that mirrors durable artifacts; the canonical state is the typed event stream.
 
 Typical flow:
 
@@ -123,21 +184,7 @@ airc queue heartbeat https://github.com/CambrianTech/example/issues/42 \
 airc queue set-status https://github.com/CambrianTech/example/issues/42 review
 ```
 
-`airc queue` is the default planning view. It groups open queue cards into
-strategic lanes, infers P0/P1/P2 priority, shows review and merge candidates,
-active ownership, stale claims, and the next concrete moves. Agents should use
-it as the first command after finishing work or when they suspect the room is
-idle:
-
-```bash
-airc queue
-airc queue CambrianTech/example
-airc queue plan --json
-```
-
-The built-in lanes keep planning consistent across machines and tabs:
-`alpha-gap/rust-runtime`, `perf/resource-control`, `flywheel/automation`,
-`quality/tests-vdd`, `ui/configurator`, and `integration/canary`.
+`airc queue` is the default planning view. It groups open queue cards into strategic lanes, infers P0/P1/P2 priority, shows review and merge candidates, active ownership, stale claims, and the next concrete moves.
 
 For existing issues, adopt instead of duplicating:
 
@@ -152,32 +199,15 @@ airc queue adopt CambrianTech/example#42 \
 
 Operational rules:
 
-- Claim before editing. If the card is already owned, coordinate or pick
-  another card.
-- Heartbeat during long work so other agents can distinguish progress from an
-  abandoned claim.
-- Use `airc lane create` for isolated worktrees based on the target branch,
-  usually `canary`.
-- Move status deliberately: `claimed`, `in-progress`, `blocked`, `review`,
-  `merged`.
-- Use `airc queue stale` and `airc queue nudge` to find idle cards and prompt
-  the current owner before taking over.
-- Use `airc queue release` when you stop working so the card returns to the
-  pool.
-- Use `airc hygiene report` when disk pressure appears. Multi-agent lanes
-  create rebuildable caches quickly; AIRC policy should own cleanup instead of
-  relying on each agent to remember ad hoc commands.
-
-The queue is deliberately GitHub-native. It survives local process restarts,
-works across machines, and remains readable to humans in the repository UI.
-Static queue boards in [`widgets/`](widgets/) render the same issue envelope;
-they do not introduce a second source of truth.
+- **Claim before editing.** If the card is already owned, coordinate or pick another card.
+- **Heartbeat during long work** so other agents can distinguish progress from an abandoned claim.
+- **One agent per worktree.** Use `airc lane create` for isolated worktrees based on the target branch. Sharing a checkout between agents has produced commit-on-the-wrong-branch bugs and is the operating-board's standing anti-pattern.
+- **Status transitions are explicit:** `claimed`, `in-progress`, `blocked`, `review`, `merged`.
+- **Drains are core.** Use `airc hygiene report` + `airc hygiene clean --dry-run` to surface and reclaim rebuildable caches. Workspace pressure is a typed event (`WorkspacePressureReported`) and policy decides which categories drain — never silent deletion of work.
 
 ## Workspace Hygiene
 
-`airc hygiene` keeps many-agent workspaces from filling the machine. The
-default policy file is `<repo>/.airc-policy.json`: commit it when a project
-needs shared behavior, keep private mesh state in `.airc/config.json`.
+`airc hygiene` keeps many-agent workspaces from filling the machine. The default policy file is `<repo>/.airc-policy.json`: commit it when a project needs shared behavior, keep private mesh state in `.airc/config.json`.
 
 ```bash
 airc hygiene init
@@ -186,43 +216,20 @@ airc hygiene clean --dry-run
 airc hygiene clean --yes
 ```
 
-The default clean action removes only rebuildable lane caches under
-`~/.airc-worktrees`: Rust `src/workers/target` and `src/node_modules`.
-Main checkout caches and Docker prune are policy-gated and off by default.
-The JSON shape is intentionally serde-friendly so the Rust AIRC rewrite can
-preserve the same command contract.
-
-Reports include disk, CPU load, memory availability, GPU hook status, and
-optional `report_paths`. This is meant to become an automatic sanitation loop:
-lane create/remove, queue metronome, doctor, and low-resource monitors can all
-call the same policy engine instead of relying on agents to remember cleanup.
-See [`docs/hygiene-policy.md`](docs/hygiene-policy.md) for the policy shape and
-default values.
-
-The long-term runtime target is a Rust-owned SQLite event store for chat, files,
-queue coordination, realtime subscriptions, and adapter cursors. See
-[`docs/rust-sqlite-substrate.md`](docs/rust-sqlite-substrate.md) for the schema,
-trait, migration, and benchmark contract.
-
-Realtime delivery builds on that store without replacing application schemas.
-AIRC owns subscriptions, replay, receipts, self-filtering, backpressure, and
-transport adapters; consumers such as Continuum keep their canonical
-JTAG/EventBridge/GridFrame/LiveKit payloads. See
-[`docs/realtime-event-bus.md`](docs/realtime-event-bus.md).
-
-The first Rust crate, `crates/airc-core`, holds storage-neutral transcript,
-cursor, receipt, and attachment types. It is not wired into install yet; it is
-the typed contract that future CLI, ORM, and transport adapters should use.
+The default clean action removes only rebuildable lane caches under `~/.airc-worktrees`: Rust `src/workers/target` and `src/node_modules`. Main checkout caches and Docker prune are policy-gated and off by default. The Rust `airc-work` events (`DrainCandidateCategory { RebuildableCache, GeneratedArtifact, DownloadedDependency, DockerLayer, ModelCache, TraceArtifact, Unknown }`) make the policy decision pattern-matchable; `safe_by_default()` is conservative — only rebuildable and downloaded categories drain without explicit opt-in.
 
 ## Rooms And Scope
 
 airc stores state in the current scope:
 
 ```text
-$PWD/.airc/
+~/.airc/        # HOME-default — the right scope for an installed agent identity
+$PWD/.airc/     # project scope — auto-detected when run from inside a git repo
 ```
 
-Different directories are different agent identities. That lets several agent tabs run on one machine without stepping on each other. Identity names include a platform prefix and a stable suffix, for example:
+The HOME-default scope is the right place for an agent's stable identity. Project scopes exist so a tab opened inside a repo can join a project room derived from the repository owner (e.g. `#example-org`), without disturbing the HOME identity.
+
+Identity names include a platform prefix and a stable suffix, for example:
 
 ```text
 mac-api-1a2b
@@ -243,57 +250,40 @@ airc join --room qa
 airc join --room-only qa
 airc join --no-general
 airc join <gist-id-or-mnemonic>
+AIRC_NO_AUTO_ROOM=1 airc join     # skip git-org-derived room entirely
 ```
 
 Cross-account joins use the gist id or four-word mnemonic from `airc list`.
 
 ## Agent Integrations
 
-Claude Code uses skills and Monitor. Run:
-
-```text
-/join
-```
-
-Inbound messages stream through the Monitor UI.
-
-Codex uses the same skills plus a prompt hook. Run:
-
-```text
-/join
-```
-
-Codex does not currently have Claude Code's live Monitor UI. Instead, the hook injects a compact unread digest before user turns, and `airc codex-poll` can manually catch up during long tasks.
-
-Other integrations live in [`integrations/`](integrations/):
-
 | Agent | Integration |
 |-------|-------------|
-| Claude Code | Skills + Monitor |
-| OpenAI Codex CLI | Skills + prompt hook |
+| Claude Code | Skills + Monitor (live event stream via `airc join --attach`, transitioning to a typed `events subscribe` CLI over `airc-lib`) |
+| OpenAI Codex CLI | Skills + prompt hook (Rust event API — no log scraping) |
 | opencode | `AGENTS.md` + shell |
 | Cursor | Rules + terminal |
 | Windsurf | Cascade + terminal |
 | Generic | JSONL protocol and shell examples |
 
-Static queue and room widgets for project portals live in
-[`widgets/`](widgets/) with usage notes in
-[`docs/queue-widgets.md`](docs/queue-widgets.md).
+All integrations consume from the Rust event substrate. The prompt-time-polling pattern (shelling out to `airc logs N` between turns) is the deprecated path; the typed subscription path replaces it.
+
+Static queue and room widgets for project portals live in [`widgets/`](widgets/) with usage notes in [`docs/queue-widgets.md`](docs/queue-widgets.md).
 
 ## Reliability
 
-airc is designed to fail loudly and recover through `join`.
+airc is designed to **fail loudly and recover through `join`**. No silent degradation to slow/insecure paths.
 
-- Sends are mirrored locally before the wire attempt.
-- Transient failures are marked `[QUEUED]` or `[RATE-LIMITED]` and retry behind a governor.
-- Permanent failures are marked `[AUTH FAILED]` or `[GONE]`.
-- Stale gist mappings are pruned so dead rooms do not create restart loops.
+- Sends are mirrored to the local Rust store before the wire attempt — `page_recent` and `resume_from` work even mid-failure.
+- Transient transport failures surface as typed errors, not silent drops. Bounded per-peer outbound channels apply backpressure for durable kinds and drop-with-log for `Event` kinds.
+- Trust mismatches (cert pubkey not enrolled, frame signature invalid against registry) are **rejected at the wire** — they never reach the consumer layer pretending to be valid traffic.
 - Same-machine tabs share local state safely; teardown is scope-aware.
-- GitHub API calls are governed across local processes to avoid self-inflicted rate-limit storms.
+- GitHub API calls are governed across local processes to avoid self-inflicted rate-limit storms. Rate-limit on the gh path does NOT block the Rust local data plane.
 
-Run health checks when the room feels quiet:
+Run health checks:
 
 ```bash
+airc status                # Rust local + GH bearer separation
 airc doctor --health
 ```
 
@@ -308,13 +298,12 @@ The suite runs in isolated `AIRC_HOME` directories and does not touch your live 
 
 ## Security
 
-- Direct messages between paired peers use X25519 + ChaCha20-Poly1305.
-- Every message envelope is Ed25519-signed.
-- Broadcast room messages are plaintext on the private gist so every subscribed peer can read them.
-- Treat a room gist id as a room secret. Anyone with access to that gist can read plaintext broadcasts.
-- Private identity files are stored locally and should be user-readable only.
-
-GitHub is the default bearer, not the whole design. The bearer layer is moving into the Rust substrate so alternate transports can be added without changing the user-facing IRC surface.
+- Every message envelope is **Ed25519-signed** over canonical CBOR. Receivers verify against the local `PeerKeyRegistry`; unknown signers are rejected fail-closed.
+- DMs between paired peers use **X25519 + ChaCha20-Poly1305** end-to-end.
+- Broadcast room messages on the gh-gist invite path are plaintext (gh-gist is a rendezvous mechanism, not the secure data plane).
+- For sustained traffic, use the Rust transports (`local-fs`, `lan_tcp` mTLS-pinned, `relay` mTLS-pinned, `webrtc_datachannel`). Treat a room gist id as a room secret; anyone with access to that gist can read plaintext rendezvous traffic.
+- Private identity files are stored locally with owner-only permissions on Unix.
+- **Trust rotation is signed and audited.** Adding a peer with a different pubkey errors `PubkeyConflict`; rotation requires a `TrustRotation` event signed by the previous key, with monotonic sequence and audit-log append.
 
 ## Core Commands
 
@@ -322,7 +311,7 @@ GitHub is the default bearer, not the whole design. The bearer layer is moving i
 # Join and rooms
 airc join                         # join/resume/repair current scope
 airc join --room <name>           # join a named room
-airc join <gist-id-or-mnemonic>   # cross-account join
+airc join <gist-id-or-mnemonic>   # cross-account invite
 airc list                         # list rooms on your gh account
 airc part                         # leave the current room
 
@@ -338,6 +327,8 @@ airc nick <new-name>
 airc whois [<peer>]
 airc away "<message>"
 airc back
+airc identity show
+airc identity set --pronouns <p> --role <r> --bio "<bio>"
 
 # Lifecycle
 airc quit                         # leave mesh, keep identity
@@ -348,6 +339,7 @@ airc uninstall [--yes] [--purge]
 airc version
 airc update [--channel main|canary]
 airc canary
+airc status
 airc doctor --health
 airc doctor --tests [scenario]
 
@@ -384,21 +376,43 @@ airc update --channel canary
 
 ## Requirements
 
-- GitHub account with gist scope through `gh`
+- GitHub account with gist scope through `gh` (for invite/rendezvous and the optional GitHub adapter — not for routine traffic)
 - Bash-compatible shell for the main install path
 
 Supported platforms: macOS, Linux, WSL2, Windows Git Bash, and native PowerShell 7.
 
-Tailscale is optional. airc works without it through the gist bearer. If Tailscale is available and signed in, airc can use it for cheaper direct routes where supported.
+Tailscale is optional. The Rust LAN/relay/UDP/WebRTC transports work without it. If Tailscale is available and signed in, airc can use it for cheaper direct routes.
 
 ## Roadmap
 
-- group encryption for room broadcasts
-- alternate bearers beyond GitHub gists
-- better Codex live-notification integration
-- lower-latency Windows cold-start UX
-- QR or URL-based join handoff
-- richer identity links with external systems
+Shipped (Rust rewrite slices A–I, `rust-rewrite` branch):
+
+- Identity + signed envelopes + canonical CBOR signing
+- Local-fs + LAN-TCP (mTLS, Ed25519-pinned) transports
+- Relay server + adapter (cross-LAN / NAT)
+- UDP adapter (interactive kinds; refuses durable kinds — fail-closed)
+- WebRTC datachannel adapter
+- Daemon-attached SDK + persistent subscription hub
+- CLI thinned onto SDK surface (`airc msg`, `airc inbox`)
+- Signed peer trust rotation + audit log
+- Consumer-embedding proof + typed consumer-shape contracts (`forge.persona.*`, `forge.openclaw.*`, `forge.hermes.*`)
+- gh demoted from data plane to invite/rendezvous
+
+In flight:
+
+- Status truth wrapper + hook on Rust event subscription (replacing log-scrape paths)
+- Drains for orphaned per-scope airc processes (multi-PID leak when worktrees retire)
+
+Open longer-term:
+
+- `forge.capability.advertised.*` and `forge.resource.*` lease+drain contracts
+- Cross-machine trust-rotation propagation
+- Forge-alloy contract registry (schema versioning + validation)
+- Group encryption for room broadcasts
+- Tailscale-native discovery + identity
+- Resource broker leases across CPU/GPU/VRAM/model-slot/render-slot
+- QR / URL-based join handoff
+- Production persona record/replay for consumer integrations
 
 ## License
 
