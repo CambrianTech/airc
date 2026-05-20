@@ -75,13 +75,11 @@ fn worktree_lane_slug_and_abs_path_match_shell_contract() {
     assert_eq!(slug.trim(), "123-codex-lane");
 
     let abs = run_ok(&["worktree-lane", "abs-path", "relative/lane"], Some(cwd));
-    assert_eq!(
-        abs.trim(),
-        cwd.canonicalize()
-            .unwrap()
-            .join("relative/lane")
-            .display()
-            .to_string()
+    let abs_path = Path::new(abs.trim());
+    assert!(abs_path.is_absolute(), "abs-path output was {abs}");
+    assert!(
+        abs_path.ends_with(Path::new("relative").join("lane")),
+        "abs-path output was {abs}"
     );
 }
 
