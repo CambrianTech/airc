@@ -27,6 +27,7 @@ pub mod local_fs;
 pub mod relay;
 pub mod signed;
 pub mod transport;
+pub mod udp;
 
 // Re-exports — stable public surface.
 pub use error::LocalFsError;
@@ -39,3 +40,4 @@ pub use lan_tcp::{
 pub use local_fs::LocalFsAdapter;
 pub use signed::{SignedError, SignedTransport};
 pub use transport::{FrameStream, Transport};
+pub use udp::{UdpAdapter, UdpConfig, UdpError};

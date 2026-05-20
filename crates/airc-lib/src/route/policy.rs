@@ -94,7 +94,6 @@ fn allows(class: RouteClass, candidate: TransportCandidate) -> bool {
                 && matches!(
                     class,
                     RouteClass::ControlInteractive
-                        | RouteClass::DataInteractive
                         | RouteClass::MediaSignaling
                         | RouteClass::PresenceEphemeral
                 )
@@ -132,9 +131,7 @@ fn is_live_class(class: RouteClass) -> bool {
 
 fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
     match class {
-        RouteClass::ControlInteractive
-        | RouteClass::DataInteractive
-        | RouteClass::PresenceEphemeral => match kind {
+        RouteClass::ControlInteractive | RouteClass::PresenceEphemeral => match kind {
             TransportKind::LanTcp => 0,
             TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
@@ -143,6 +140,17 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
             TransportKind::Reticulum => 5,
             TransportKind::Relay => 6,
             TransportKind::Ssh | TransportKind::GhGist => 255,
+        },
+        RouteClass::DataInteractive => match kind {
+            TransportKind::LanTcp => 0,
+            TransportKind::LocalFs => 1,
+            TransportKind::Tailscale => 2,
+            TransportKind::Reticulum => 3,
+            TransportKind::Relay => 4,
+            TransportKind::Udp
+            | TransportKind::WebRtcDataChannel
+            | TransportKind::Ssh
+            | TransportKind::GhGist => 255,
         },
         RouteClass::MediaSignaling => match kind {
             TransportKind::LocalFs => 0,
@@ -334,9 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn udp_is_interactive_not_bulk() {
+    fn udp_is_realtime_not_durable_data() {
         let policy = RoutePolicy;
 
+        assert_eq!(
+            policy.choose(
+                RouteClass::ControlInteractive,
+                [candidate(TransportKind::Udp, TransportRole::Direct)],
+            ),
+            RouteDecision::Selected(TransportKind::Udp)
+        );
         assert_eq!(
             policy.choose(
                 RouteClass::MediaSignaling,
@@ -351,6 +366,15 @@ mod tests {
             ),
             RouteDecision::NoRoute {
                 class: RouteClass::DataBulk
+            }
+        );
+        assert_eq!(
+            policy.choose(
+                RouteClass::DataInteractive,
+                [candidate(TransportKind::Udp, TransportRole::Direct)],
+            ),
+            RouteDecision::NoRoute {
+                class: RouteClass::DataInteractive
             }
         );
     }

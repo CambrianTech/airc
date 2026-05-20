@@ -22,6 +22,7 @@ pub const INVITE_BEACON_SCHEMA_VERSION: u16 = 1;
 pub enum RouteEndpoint {
     LanTcp { addr: SocketAddr },
     TailscaleTcp { addr: SocketAddr },
+    Udp { addr: SocketAddr },
     Relay { url: String },
     Reticulum { destination: String },
     WebRtcSignaling { url: String },
@@ -183,6 +184,7 @@ fn same_endpoint_kind(left: &RouteEndpoint, right: &RouteEndpoint) -> bool {
                 RouteEndpoint::TailscaleTcp { .. },
                 RouteEndpoint::TailscaleTcp { .. }
             )
+            | (RouteEndpoint::Udp { .. }, RouteEndpoint::Udp { .. })
             | (RouteEndpoint::Relay { .. }, RouteEndpoint::Relay { .. })
             | (
                 RouteEndpoint::Reticulum { .. },
@@ -237,6 +239,29 @@ mod tests {
             vec![RouteEndpoint::LanTcp {
                 addr: SocketAddr::from(([127, 0, 0, 1], 2000))
             }]
+        );
+    }
+
+    #[test]
+    fn endpoint_table_tracks_udp_separately_from_lan_tcp() {
+        let mut table = RouteEndpointTable::default();
+        table.upsert(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+        });
+        table.upsert(RouteEndpoint::Udp {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+        });
+
+        assert_eq!(
+            table.endpoints(),
+            vec![
+                RouteEndpoint::LanTcp {
+                    addr: SocketAddr::from(([127, 0, 0, 1], 1000))
+                },
+                RouteEndpoint::Udp {
+                    addr: SocketAddr::from(([127, 0, 0, 1], 1000))
+                }
+            ]
         );
     }
 
