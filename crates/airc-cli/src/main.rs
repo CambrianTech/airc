@@ -553,6 +553,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &ciphertext,
             ),
             KnockAction::ApprovalField { field } => knock_commands::run_approval_field(&field),
+            KnockAction::IdentityJson { name, state_dir } => {
+                knock_commands::run_identity_json(&name, &state_dir)
+            }
             KnockAction::ExtractKnockerPub => knock_commands::run_extract_knocker_pub(),
             KnockAction::ExtractApproval => knock_commands::run_extract_approval(),
         },

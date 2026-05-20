@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
 
 #[derive(Debug, Args)]
@@ -32,6 +34,13 @@ pub enum KnockAction {
     ApprovalField {
         #[arg(long)]
         field: String,
+    },
+    /// Emit the identity JSON embedded in a public knock issue.
+    IdentityJson {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        state_dir: PathBuf,
     },
     /// Extract knocker_pub from a knock issue markdown body on stdin.
     ExtractKnockerPub,

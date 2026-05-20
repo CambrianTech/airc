@@ -21,8 +21,8 @@
 #   - Repo-local `.airc/` discovery manifest (continuum#1109 pilots that)
 #
 # External cross-references (resolved at call time):
-#   die, ensure_init, resolve_name, get_config_val, AIRC_HOME, AIRC_PYTHON,
-#   _airc_lib_dir; `gh` CLI; `airc_core.identity`.
+#   die, ensure_init, resolve_name, get_config_val, AIRC_HOME,
+#   AIRC_WRITE_DIR; `gh` CLI.
 
 cmd_knock() {
   # Public-facing entrypoint. Args:
@@ -224,51 +224,13 @@ EOF
 }
 
 _airc_knock_identity_json() {
-  # Read identity fields if airc_core.identity is reachable. Falls back
-  # to a minimal name-only envelope if it isn't — knock should work
-  # even on a fresh install where identity wasn't populated yet.
+  # Read identity fields through the Rust CLI. Falls back to a minimal
+  # name-only envelope if state is missing — knock should work even on
+  # a fresh install where identity wasn't populated yet.
   local name="$1"
-  if [ -n "${AIRC_PYTHON:-}" ] && [ -d "${_airc_lib_dir:-}" ]; then
-    "$AIRC_PYTHON" - "$name" "$AIRC_WRITE_DIR" <<'PYEOF' 2>/dev/null || _airc_knock_identity_fallback "$name"
-import json, os, sys
-name = sys.argv[1]
-home = sys.argv[2]
-pronouns = ""
-role = ""
-bio = ""
-gh_login = ""
-identity_path = os.path.join(home, "identity.json")
-if os.path.exists(identity_path):
-    try:
-        with open(identity_path) as f:
-            data = json.load(f) or {}
-        pronouns = data.get("pronouns", "")
-        role = data.get("role", "")
-        bio = data.get("bio", "")
-        gh_login = data.get("gh_login", "")
-    except Exception:
-        pass
-# Fall back to gh CLI if gh_login isn't in identity.json.
-if not gh_login:
-    try:
-        import subprocess
-        gh_login = subprocess.run(
-            ["gh", "api", "user", "--jq", ".login"],
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip() or ""
-    except Exception:
-        gh_login = ""
-print(json.dumps({
-    "name": name,
-    "pronouns": pronouns,
-    "role": role,
-    "bio": bio,
-    "gh_login": gh_login,
-}))
-PYEOF
-  else
-    _airc_knock_identity_fallback "$name"
-  fi
+  "$(airc_rs_bin)" knock identity-json \
+    --name "$name" \
+    --state-dir "$AIRC_WRITE_DIR" 2>/dev/null || _airc_knock_identity_fallback "$name"
 }
 
 _airc_knock_identity_fallback() {
@@ -278,10 +240,7 @@ _airc_knock_identity_fallback() {
 }
 
 _airc_knock_json_str() {
-  # Minimal JSON string escaper for the bash fallback path. Real callers
-  # go through the python heredoc which handles edge cases properly.
-  # Escapes backslash, double-quote, newline, tab — sufficient for typical
-  # name/role/bio content. Anything weirder uses the python path.
+  # Minimal JSON string escaper for the bash fallback path.
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
