@@ -988,6 +988,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     base_new_file: &base_new_file,
                 },
             ),
+            QueueCardAction::CloseMergedMeta { pr_file } => {
+                queue_card_commands::run_close_merged_meta(&pr_file)
+            }
+            QueueCardAction::CloseMergedRefs { pr_file, repo } => {
+                queue_card_commands::run_close_merged_refs(&pr_file, &repo)
+            }
+            QueueCardAction::CardStatus { body_file } => {
+                queue_card_commands::run_card_status(&body_file)
+            }
         },
 
         Command::Humanhash { hex_input, words } => {

@@ -90,6 +90,53 @@ pub fn run_nudge_card_meta(issue_file: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub fn run_close_merged_meta(pr_file: &Path) -> Result<(), Box<dyn Error>> {
+    let pr = read_json(pr_file)?;
+    let merge_commit = pr.get("mergeCommit").and_then(Value::as_object);
+    let sha = merge_commit
+        .and_then(|commit| commit.get("oid"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let title = string_field(&pr, "title");
+    let body = string_field(&pr, "body");
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        string_field(&pr, "mergedAt"),
+        string_field(&pr, "baseRefName"),
+        sha,
+        string_field(&pr, "url"),
+        title.chars().count(),
+        body.chars().count()
+    );
+    Ok(())
+}
+
+pub fn run_close_merged_refs(pr_file: &Path, default_repo: &str) -> Result<(), Box<dyn Error>> {
+    let pr = read_json(pr_file)?;
+    let title = string_field(&pr, "title");
+    let body = string_field(&pr, "body");
+    for reference in close_merged_refs(&format!("{title}\n{body}"), default_repo) {
+        println!("{reference}");
+    }
+    Ok(())
+}
+
+pub fn run_card_status(body_file: &Path) -> Result<(), Box<dyn Error>> {
+    let body = fs::read_to_string(body_file)?;
+    match parse_card(&body) {
+        Some(card) => {
+            let status = string_field(&Value::Object(card), "status");
+            if status.is_empty() {
+                println!("unknown");
+            } else {
+                println!("{status}");
+            }
+        }
+        None => println!("not-a-card"),
+    }
+    Ok(())
+}
+
 fn build_body(input: QueueCardInput) -> Result<String, Box<dyn Error>> {
     let mut card = Map::new();
     card.insert("kind".to_string(), Value::String(CARD_KIND.to_string()));
@@ -292,6 +339,180 @@ fn nudge_card_meta(issue: &Value) -> Result<(String, String, String, String), Bo
         string_field(&card_value, "owner"),
         string_field(&card_value, "branch"),
     ))
+}
+
+fn close_merged_refs(text: &str, default_repo: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some((keyword_start, keyword_end)) = next_closing_keyword(text, cursor) else {
+            break;
+        };
+        let mut pos = skip_spaces_and_colon(text, keyword_end);
+        let mut first = true;
+        loop {
+            if !first {
+                let Some(next_pos) = skip_ref_separator(text, pos) else {
+                    break;
+                };
+                pos = next_pos;
+            }
+            let Some((reference, end)) = parse_close_ref(text, pos, default_repo) else {
+                break;
+            };
+            if seen.insert(reference.clone()) {
+                refs.push(reference);
+            }
+            pos = end;
+            first = false;
+        }
+        if pos == skip_spaces_and_colon(text, keyword_end) {
+            cursor = keyword_start
+                + text[keyword_start..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8);
+        } else {
+            cursor = pos;
+        }
+    }
+    refs
+}
+
+fn next_closing_keyword(text: &str, start: usize) -> Option<(usize, usize)> {
+    let lower = text[start..].to_ascii_lowercase();
+    let keywords = [
+        "closes", "closed", "close", "fixes", "fixed", "fix", "resolves", "resolved", "resolve",
+    ];
+    let mut best: Option<(usize, usize)> = None;
+    for keyword in keywords {
+        let mut search_from = 0;
+        while let Some(relative) = lower[search_from..].find(keyword) {
+            let begin = start + search_from + relative;
+            let end = begin + keyword.len();
+            if is_word_start_boundary(text, begin) && is_word_end_boundary(text, end) {
+                match best {
+                    Some((best_begin, _)) if begin >= best_begin => {}
+                    _ => best = Some((begin, end)),
+                }
+                break;
+            }
+            search_from += relative + keyword.len();
+        }
+    }
+    best
+}
+
+fn is_word_start_boundary(text: &str, index: usize) -> bool {
+    !matches!(
+        text[..index].chars().next_back(),
+        Some(ch) if ch.is_ascii_alphanumeric() || ch == '_'
+    )
+}
+
+fn is_word_end_boundary(text: &str, index: usize) -> bool {
+    !matches!(
+        text[index..].chars().next(),
+        Some(ch) if ch.is_ascii_alphanumeric() || ch == '_'
+    )
+}
+
+fn skip_spaces_and_colon(text: &str, mut pos: usize) -> usize {
+    while let Some(ch) = text[pos..].chars().next() {
+        if ch.is_whitespace() || ch == ':' {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+fn skip_ref_separator(text: &str, mut pos: usize) -> Option<usize> {
+    while let Some(ch) = text[pos..].chars().next() {
+        if ch.is_whitespace() {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if text[pos..].starts_with(',') {
+        pos += 1;
+        while let Some(ch) = text[pos..].chars().next() {
+            if ch.is_whitespace() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return Some(pos);
+    }
+    let rest = &text[pos..];
+    if rest.len() >= 3
+        && rest[..3].eq_ignore_ascii_case("and")
+        && is_word_end_boundary(text, pos + 3)
+    {
+        pos += 3;
+        while let Some(ch) = text[pos..].chars().next() {
+            if ch.is_whitespace() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return Some(pos);
+    }
+    None
+}
+
+fn parse_close_ref(text: &str, pos: usize, default_repo: &str) -> Option<(String, usize)> {
+    if text[pos..].starts_with('#') {
+        let (num, end) = parse_digits(text, pos + 1)?;
+        return Some((format!("{default_repo}#{num}"), end));
+    }
+    let (owner, after_owner) = parse_repo_part(text, pos)?;
+    if !text[after_owner..].starts_with('/') {
+        return None;
+    }
+    let (repo, after_repo) = parse_repo_part(text, after_owner + 1)?;
+    if !text[after_repo..].starts_with('#') {
+        return None;
+    }
+    let (num, end) = parse_digits(text, after_repo + 1)?;
+    Some((format!("{owner}/{repo}#{num}"), end))
+}
+
+fn parse_repo_part(text: &str, mut pos: usize) -> Option<(String, usize)> {
+    let start = pos;
+    while let Some(ch) = text[pos..].chars().next() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if pos == start {
+        None
+    } else {
+        Some((text[start..pos].to_string(), pos))
+    }
+}
+
+fn parse_digits(text: &str, mut pos: usize) -> Option<(String, usize)> {
+    let start = pos;
+    while let Some(ch) = text[pos..].chars().next() {
+        if ch.is_ascii_digit() {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if pos == start {
+        None
+    } else {
+        Some((text[start..pos].to_string(), pos))
+    }
 }
 
 #[derive(Debug)]
@@ -499,5 +720,42 @@ mod tests {
                 "b".to_string()
             )
         );
+    }
+
+    #[test]
+    fn close_merged_refs_require_closing_keyword() {
+        let refs = close_merged_refs(
+            "feat(#576): document queue cards\nBody has unrelated #561.",
+            "CambrianTech/airc",
+        );
+
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn close_merged_refs_accept_same_repo_cross_repo_and_continuations() {
+        let refs = close_merged_refs(
+            "Closes #100, CambrianTech/continuum#1130 and #102.",
+            "CambrianTech/airc",
+        );
+
+        assert_eq!(
+            refs,
+            vec![
+                "CambrianTech/airc#100",
+                "CambrianTech/continuum#1130",
+                "CambrianTech/airc#102",
+            ]
+        );
+    }
+
+    #[test]
+    fn close_merged_refs_dedupes_and_ignores_prose_after_keyword() {
+        let refs = close_merged_refs(
+            "Fix the queue docs. See #100.\nFixes #100. Also see #100.",
+            "CambrianTech/airc",
+        );
+
+        assert_eq!(refs, vec!["CambrianTech/airc#100"]);
     }
 }

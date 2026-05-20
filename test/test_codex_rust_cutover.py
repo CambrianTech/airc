@@ -289,6 +289,7 @@ class CodexRustCutoverTests(unittest.TestCase):
             for path in [
                 REPO / "lib/airc_bash/cmd_queue.sh",
                 REPO / "lib/airc_bash/cmd_queue_card.sh",
+                REPO / "lib/airc_bash/cmd_queue_close_merged.sh",
             ]
         )
 
@@ -308,6 +309,9 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn("queue-card review-refs", combined)
         self.assertIn("queue-card pr-meta", combined)
         self.assertIn("queue-card staleness-analyze", combined)
+        self.assertIn("queue-card close-merged-meta", combined)
+        self.assertIn("queue-card close-merged-refs", combined)
+        self.assertIn("queue-card card-status", combined)
 
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
