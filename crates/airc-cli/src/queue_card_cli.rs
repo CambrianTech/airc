@@ -157,4 +157,18 @@ pub enum QueueCardAction {
         #[arg(long)]
         messages_file: PathBuf,
     },
+
+    /// Extract PR refs from review-status queue cards for staleness sweeps.
+    ReviewRefs {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
+
+    /// Print base/head/url metadata from gh pr view JSON.
+    PrMeta {
+        #[arg(long)]
+        pr_file: PathBuf,
+    },
 }

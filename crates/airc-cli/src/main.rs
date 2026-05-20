@@ -60,6 +60,7 @@ mod queue_card_cli;
 mod queue_card_commands;
 mod queue_card_projection;
 mod queue_card_runtime;
+mod queue_card_staleness;
 mod route_cli;
 mod route_commands;
 mod scope_cli;
@@ -907,6 +908,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &cards_file,
                 &messages_file,
             ),
+            QueueCardAction::ReviewRefs {
+                repo,
+                raw_json_file,
+            } => queue_card_staleness::run_review_refs(&repo, &raw_json_file),
+            QueueCardAction::PrMeta { pr_file } => queue_card_staleness::run_pr_meta(&pr_file),
         },
 
         Command::Humanhash { hex_input, words } => {
