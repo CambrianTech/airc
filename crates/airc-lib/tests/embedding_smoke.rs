@@ -9,7 +9,10 @@
 
 use std::time::Duration;
 
-use airc_lib::{Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, TranscriptKind};
+use airc_lib::{
+    Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, TranscriptKind,
+    TransportHealthSample, TransportKind, TransportRole,
+};
 use futures::stream::StreamExt;
 use tempfile::TempDir;
 
@@ -179,6 +182,29 @@ async fn send_typed_body_with_headers_round_trips() {
     assert_eq!(
         page[0].headers.get("forge.body_hint").map(String::as_str),
         Some("application/json")
+    );
+}
+
+#[tokio::test]
+async fn send_refuses_github_invite_only_route() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("route-gate").await.unwrap();
+    airc.replace_transport_health([TransportHealthSample {
+        kind: TransportKind::GhGist,
+        role: TransportRole::InviteBeacon,
+        state: airc_lib::TransportHealthState::Healthy,
+        rtt_ms: None,
+        success_ppm: None,
+    }])
+    .unwrap();
+
+    let err = airc.say("must not go through gist").await.unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("DataInteractive has no admissible live route"),
+        "unexpected error: {err}"
     );
 }
 

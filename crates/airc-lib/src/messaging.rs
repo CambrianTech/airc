@@ -4,6 +4,8 @@ use airc_transport::{LocalFsAdapter, Transport};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
+use crate::route_policy::{RouteClass, RouteDecision, TransportKind};
+use crate::route_resolver::TransportResolver;
 use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
@@ -26,6 +28,7 @@ impl Airc {
         headers: Headers,
     ) -> Result<EventId, AircError> {
         let room = self.current_room().await?;
+        self.resolve_send_route(kind)?;
         self.ensure_wire_subscriber(&room.wire).await?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
@@ -59,6 +62,32 @@ impl Airc {
             .map_err(|e| AircError::Transport(e.to_string()))?;
         self.append_sent_frame(frame).await?;
         Ok(event_id)
+    }
+
+    fn resolve_send_route(&self, kind: FrameKind) -> Result<(), AircError> {
+        let class = route_class_for_frame(kind);
+        let samples = self
+            .inner
+            .route_health
+            .read()
+            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?
+            .clone();
+        let route = TransportResolver::from_health(samples)
+            .resolve(class)
+            .map_err(format_route_refusal)?;
+        match route.kind {
+            TransportKind::LocalFs => Ok(()),
+            other @ (TransportKind::LanTcp
+            | TransportKind::Tailscale
+            | TransportKind::Udp
+            | TransportKind::WebRtcDataChannel
+            | TransportKind::Reticulum
+            | TransportKind::Relay
+            | TransportKind::Ssh
+            | TransportKind::GhGist) => Err(AircError::Route(format!(
+                "{class:?} selected {other:?}, but this sender has only local-fs execution wired"
+            ))),
+        }
     }
 
     async fn append_sent_frame(&self, frame: Frame) -> Result<(), AircError> {
@@ -184,5 +213,23 @@ impl Airc {
     async fn ensure_current_room_subscriber(&self) -> Result<(), AircError> {
         let room = self.current_room().await?;
         self.ensure_wire_subscriber(&room.wire).await
+    }
+}
+
+fn route_class_for_frame(kind: FrameKind) -> RouteClass {
+    match kind {
+        FrameKind::Message => RouteClass::DataInteractive,
+        FrameKind::Event | FrameKind::Control => RouteClass::ControlInteractive,
+    }
+}
+
+fn format_route_refusal(decision: RouteDecision) -> AircError {
+    match decision {
+        RouteDecision::NoRoute { class } => {
+            AircError::Route(format!("{class:?} has no admissible live route"))
+        }
+        RouteDecision::Selected(kind) => AircError::Route(format!(
+            "unexpected selected route returned as refusal: {kind:?}"
+        )),
     }
 }
