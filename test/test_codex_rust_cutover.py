@@ -171,6 +171,17 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertNotIn("json.load(sys.stdin).get(\"kind\"", body)
         self.assertNotIn("| python3 -c", body)
 
+    def test_integration_gist_rotation_seed_generation_is_shell_not_python(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_gist_rotates_under_size_limit()")
+        end = source.index("scenario_general_has_shared_gist()", start)
+        body = source[start:end]
+
+        self.assertIn('for i in $(seq 0 49); do', body)
+        self.assertIn('"$(airc_rs_bin)" bearer send all rotation-test', body)
+        self.assertNotIn("python3", body)
+        self.assertNotIn("json.dumps", body)
+
     def test_integration_bearer_cli_recv_jsonl_probe_uses_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_bearer_cli_recv()")
