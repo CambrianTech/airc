@@ -265,14 +265,16 @@ fn stale_cards(
             "missing-owner".to_string()
         } else if hb_dt.is_none() {
             "missing-heartbeat".to_string()
-        } else {
-            let age = now - hb_dt.unwrap();
+        } else if let Some(heartbeat_at) = hb_dt {
+            let age = now - heartbeat_at;
             age_seconds = Some(age.num_seconds());
             if age > threshold {
                 "stale-heartbeat".to_string()
             } else {
                 String::new()
             }
+        } else {
+            "missing-heartbeat".to_string()
         };
         if reason.is_empty() {
             continue;

@@ -13,7 +13,7 @@ fn detect_lan_ip() -> Option<Ipv4Addr> {
     socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if is_routable_lan_ipv4(ip) => Some(ip),
-        _ => None,
+        IpAddr::V4(_) | IpAddr::V6(_) => None,
     }
 }
 

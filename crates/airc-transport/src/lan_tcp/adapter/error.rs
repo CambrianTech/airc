@@ -66,7 +66,11 @@ impl std::error::Error for LanTcpError {
             LanTcpError::Io(error) | LanTcpError::TlsHandshake(error) => Some(error),
             LanTcpError::Json(error) => Some(error),
             LanTcpError::TlsConfig(error) => Some(error),
-            _ => None,
+            LanTcpError::PeerNotInRegistry
+            | LanTcpError::FrameTooLarge { .. }
+            | LanTcpError::NoActivePeers
+            | LanTcpError::AlreadyConnectedTo(_)
+            | LanTcpError::AlreadyListening => None,
         }
     }
 }

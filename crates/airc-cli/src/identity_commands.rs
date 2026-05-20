@@ -148,7 +148,7 @@ pub fn run_set_config(
     validate_len("status", status.as_deref(), STATUS_MAX)?;
 
     let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity");
+    let ident = object_field_mut(&mut root, "identity")?;
     set_optional_string(ident, "pronouns", pronouns);
     set_optional_string(ident, "role", role);
     set_optional_string(ident, "bio", bio);
@@ -160,8 +160,8 @@ pub fn run_set_config(
 
 pub fn run_link_config(config: &Path, platform: &str, handle: &str) -> Result<(), Box<dyn Error>> {
     let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity");
-    let integrations = object_map_field_mut(ident, "integrations");
+    let ident = object_field_mut(&mut root, "identity")?;
+    let integrations = object_map_field_mut(ident, "integrations")?;
     let previous = integrations
         .get(platform)
         .and_then(Value::as_str)
@@ -212,7 +212,7 @@ pub fn run_nudge_needed(config: &Path) -> Result<(), Box<dyn Error>> {
 pub fn run_import_continuum(config: &Path, blob: &str) -> Result<(), Box<dyn Error>> {
     let source: Value = serde_json::from_str(blob).unwrap_or(Value::Null);
     let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity");
+    let ident = object_field_mut(&mut root, "identity")?;
     for key in ["pronouns", "role", "bio"] {
         if let Some(value) = source
             .get(key)
@@ -227,7 +227,7 @@ pub fn run_import_continuum(config: &Path, blob: &str) -> Result<(), Box<dyn Err
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let integrations = object_map_field_mut(ident, "integrations");
+    let integrations = object_map_field_mut(ident, "integrations")?;
     integrations.insert("continuum".to_string(), Value::String(name.clone()));
     save_config(config, &root)?;
     println!(
@@ -524,24 +524,39 @@ fn save_config(config: &Path, root: &Value) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn object_field_mut<'a>(root: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {
-    let object = root
-        .as_object_mut()
-        .expect("load_config_required validates config root object");
+fn object_field_mut<'a>(
+    root: &'a mut Value,
+    key: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>, Box<dyn Error>> {
+    let Value::Object(object) = root else {
+        return Err("config JSON root must be an object".into());
+    };
     if !object.get(key).is_some_and(Value::is_object) {
         object.insert(key.to_string(), Value::Object(Default::default()));
     }
-    object.get_mut(key).unwrap().as_object_mut().unwrap()
+    match object.get_mut(key) {
+        Some(Value::Object(field)) => Ok(field),
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
+        )
+        | None => Err(format!("failed to initialize {key} object").into()),
+    }
 }
 
 fn object_map_field_mut<'a>(
     object: &'a mut serde_json::Map<String, Value>,
     key: &str,
-) -> &'a mut serde_json::Map<String, Value> {
+) -> Result<&'a mut serde_json::Map<String, Value>, Box<dyn Error>> {
     if !object.get(key).is_some_and(Value::is_object) {
         object.insert(key.to_string(), Value::Object(Default::default()));
     }
-    object.get_mut(key).unwrap().as_object_mut().unwrap()
+    match object.get_mut(key) {
+        Some(Value::Object(field)) => Ok(field),
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
+        )
+        | None => Err(format!("failed to initialize {key} object").into()),
+    }
 }
 
 fn set_optional_string(

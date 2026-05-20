@@ -55,7 +55,8 @@ impl std::error::Error for PeersStoreError {
             PeersStoreError::Io(error) => Some(error),
             PeersStoreError::Json(error) => Some(error),
             PeersStoreError::Base64(error) => Some(error),
-            _ => None,
+            PeersStoreError::SchemaVersionMismatch { .. }
+            | PeersStoreError::WrongPubkeyLength(_) => None,
         }
     }
 }

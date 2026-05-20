@@ -66,7 +66,7 @@ pub fn run_set(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    object_mut(&mut root).insert(key.to_string(), Value::String(value.to_string()));
+    object_mut(&mut root)?.insert(key.to_string(), Value::String(value.to_string()));
     save_value(&config, &root)
 }
 
@@ -85,7 +85,7 @@ pub fn run_unset_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    let object = object_mut(&mut root);
+    let object = object_mut(&mut root)?;
     for key in keys {
         object.remove(key);
     }
@@ -111,7 +111,7 @@ pub fn run_record_parted(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    let rooms = parted_rooms_mut(&mut root);
+    let rooms = parted_rooms_mut(&mut root)?;
     if !rooms.iter().any(|value| value.as_str() == Some(room)) {
         rooms.push(Value::String(room.to_string()));
     }
@@ -125,7 +125,7 @@ pub fn run_clear_parted(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    parted_rooms_mut(&mut root).retain(|value| value.as_str() != Some(room));
+    parted_rooms_mut(&mut root)?.retain(|value| value.as_str() != Some(room));
     save_value(&config, &root)
 }
 
@@ -194,7 +194,7 @@ pub fn run_subscribe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    let channels = subscribed_channels_mut(&mut root);
+    let channels = subscribed_channels_mut(&mut root)?;
     channels.retain(|value| value.as_str() != Some(channel));
     let value = Value::String(channel.to_string());
     if first {
@@ -212,7 +212,7 @@ pub fn run_unsubscribe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    subscribed_channels_mut(&mut root).retain(|value| value.as_str() != Some(channel));
+    subscribed_channels_mut(&mut root)?.retain(|value| value.as_str() != Some(channel));
     save_value(&config, &root)
 }
 
@@ -224,7 +224,7 @@ pub fn run_set_channel_gist(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     let mut root = load_value(&config);
-    let gists = channel_gists_mut(&mut root);
+    let gists = channel_gists_mut(&mut root)?;
     if gist_id.is_empty() {
         gists.remove(channel);
     } else {
@@ -261,7 +261,7 @@ pub fn run_set_host_block(
     let host_port = update.parsed_port();
     let host_identity = update.parsed_identity();
     let mut root = load_value(&config);
-    let object = object_mut(&mut root);
+    let object = object_mut(&mut root)?;
     object.insert(
         "host_airc_home".to_string(),
         Value::String(update.host_airc_home),
@@ -306,48 +306,68 @@ fn save_value(path: &Path, value: &Value) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn object_mut(value: &mut Value) -> &mut Map<String, Value> {
-    if !value.is_object() {
+fn object_mut(value: &mut Value) -> Result<&mut Map<String, Value>, Box<dyn std::error::Error>> {
+    if !matches!(value, Value::Object(_)) {
         *value = Value::Object(Map::new());
     }
-    value
-        .as_object_mut()
-        .expect("value was converted to object")
+    match value {
+        Value::Object(object) => Ok(object),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
+            Err("failed to initialize config root object".into())
+        }
+    }
 }
 
-fn subscribed_channels_mut(value: &mut Value) -> &mut Vec<Value> {
-    let object = object_mut(value);
+fn subscribed_channels_mut(
+    value: &mut Value,
+) -> Result<&mut Vec<Value>, Box<dyn std::error::Error>> {
+    let object = object_mut(value)?;
     let entry = object
         .entry("subscribed_channels")
         .or_insert_with(|| Value::Array(Vec::new()));
     if !entry.is_array() {
         *entry = Value::Array(Vec::new());
     }
-    entry.as_array_mut().expect("entry was converted to array")
+    match entry {
+        Value::Array(items) => Ok(items),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+            Err("failed to initialize subscribed_channels array".into())
+        }
+    }
 }
 
-fn channel_gists_mut(value: &mut Value) -> &mut Map<String, Value> {
-    let object = object_mut(value);
+fn channel_gists_mut(
+    value: &mut Value,
+) -> Result<&mut Map<String, Value>, Box<dyn std::error::Error>> {
+    let object = object_mut(value)?;
     let entry = object
         .entry("channel_gists")
         .or_insert_with(|| Value::Object(Map::new()));
     if !entry.is_object() {
         *entry = Value::Object(Map::new());
     }
-    entry
-        .as_object_mut()
-        .expect("entry was converted to object")
+    match entry {
+        Value::Object(object) => Ok(object),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
+            Err("failed to initialize channel_gists object".into())
+        }
+    }
 }
 
-fn parted_rooms_mut(value: &mut Value) -> &mut Vec<Value> {
-    let object = object_mut(value);
+fn parted_rooms_mut(value: &mut Value) -> Result<&mut Vec<Value>, Box<dyn std::error::Error>> {
+    let object = object_mut(value)?;
     let entry = object
         .entry("parted_rooms")
         .or_insert_with(|| Value::Array(Vec::new()));
     if !entry.is_array() {
         *entry = Value::Array(Vec::new());
     }
-    entry.as_array_mut().expect("entry was converted to array")
+    match entry {
+        Value::Array(items) => Ok(items),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+            Err("failed to initialize parted_rooms array".into())
+        }
+    }
 }
 
 fn config_value(path: &Path, key: &str, default: &str) -> String {
@@ -358,9 +378,11 @@ fn config_value(path: &Path, key: &str, default: &str) -> String {
         Some(Value::String(value)) => value.clone(),
         Some(Value::Bool(value)) => value.to_string(),
         Some(Value::Number(value)) => value.to_string(),
-        Some(Value::Array(_)) | Some(Value::Object(_)) => {
-            serde_json::to_string(root.get(key).expect("matched value exists"))
-                .unwrap_or_else(|_| default.to_string())
+        Some(Value::Array(value)) => {
+            serde_json::to_string(value).unwrap_or_else(|_| default.to_string())
+        }
+        Some(Value::Object(value)) => {
+            serde_json::to_string(value).unwrap_or_else(|_| default.to_string())
         }
     }
 }

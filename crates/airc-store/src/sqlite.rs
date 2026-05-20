@@ -240,11 +240,7 @@ fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
         "presence" => TranscriptKind::Presence,
         "session_control" => TranscriptKind::SessionControl,
         "system" => TranscriptKind::System,
-        // Unknown kind in a stored row = forward-compat case. Treat
-        // as System rather than failing the page — a future server
-        // version may have written a kind this older binary doesn't
-        // know about, and silently dropping it would lose data.
-        _ => TranscriptKind::System,
+        other => return Err(StoreError::UnknownTranscriptKind(other.to_string())),
     };
     let target: MentionTarget = serde_json::from_value(m.target)?;
     let headers: Headers = serde_json::from_value(m.headers)?;
@@ -286,6 +282,8 @@ fn _json_value_keepalive(_: JsonValue) {}
 mod tests {
     use super::*;
     use airc_core::transcript::MentionTarget;
+    use serde_json::json;
+    use uuid::Uuid;
 
     fn make_event(lamport: u64, room: RoomId, body: &str) -> TranscriptEvent {
         TranscriptEvent {
@@ -303,6 +301,34 @@ mod tests {
             receipt: None,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn model_with_kind(kind: &str) -> event::Model {
+        event::Model {
+            event_id: Uuid::new_v4(),
+            room_id: Uuid::new_v4(),
+            peer_id: Uuid::new_v4(),
+            client_id: Uuid::new_v4(),
+            kind: kind.to_string(),
+            occurred_at_ms: 1_700_000_000_000,
+            lamport: 1,
+            target: json!(MentionTarget::All),
+            headers: json!(Headers::new()),
+            body: None,
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn unknown_transcript_kind_fails_closed() {
+        let result = from_model(model_with_kind("future_kind"));
+
+        assert!(
+            matches!(result, Err(StoreError::UnknownTranscriptKind(ref kind)) if kind == "future_kind"),
+            "expected UnknownTranscriptKind, got {result:?}"
+        );
     }
 
     #[tokio::test]

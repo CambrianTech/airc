@@ -18,9 +18,9 @@ pub fn run_build_legacy(
         "channel": channel,
         "msg": msg,
     });
-    let object = payload
-        .as_object_mut()
-        .expect("json object literal is an object");
+    let Value::Object(object) = &mut payload else {
+        return Err("legacy message payload must be a JSON object".into());
+    };
     if !client_id.is_empty() {
         object.insert(
             "client_id".to_string(),

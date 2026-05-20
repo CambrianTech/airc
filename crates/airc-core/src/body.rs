@@ -54,7 +54,13 @@ impl Body {
                 // surface as text.
                 Some(s.as_str())
             }
-            _ => None,
+            Body::Json(
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Array(_),
+            )
+            | Body::Binary(_) => None,
         }
     }
 }

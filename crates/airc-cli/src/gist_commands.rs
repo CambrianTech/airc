@@ -19,7 +19,11 @@ pub fn run_get_json(path: &str) -> Result<(), Box<dyn Error>> {
         .unwrap_or(Value::Null);
     match value {
         Value::Null => println!(),
-        other => println!("{}", serde_json::to_string(&other)?),
+        other @ (Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_)
+        | Value::Object(_)) => println!("{}", serde_json::to_string(&other)?),
     }
     Ok(())
 }

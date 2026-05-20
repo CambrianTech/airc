@@ -55,7 +55,7 @@ fn int_timestamp(value: Option<&Value>) -> u64 {
     let parsed = match value {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.parse::<f64>().ok(),
-        _ => None,
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
     };
     parsed
         .filter(|value| value.is_finite() && *value > 0.0)

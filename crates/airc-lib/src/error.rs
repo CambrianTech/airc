@@ -25,6 +25,9 @@ pub enum AircError {
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 
+    #[error("system clock before UNIX_EPOCH: {0}")]
+    Clock(#[from] std::time::SystemTimeError),
+
     #[error("peer spec: {0}")]
     PeerSpec(#[from] crate::registry::PeerSpecError),
 

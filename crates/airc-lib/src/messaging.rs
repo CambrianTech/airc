@@ -28,7 +28,7 @@ impl Airc {
         let room = self.current_room().await?;
         self.ensure_wire_subscriber(&room.wire).await?;
         let event_id = EventId::new();
-        let occurred_at_ms = now_ms();
+        let occurred_at_ms = now_ms()?;
         let mut frame = Frame {
             kind,
             envelope: Envelope {

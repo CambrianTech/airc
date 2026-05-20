@@ -38,6 +38,7 @@ const ROOM_NAMESPACE: Uuid = Uuid::from_bytes([
 pub enum RoomError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Clock(std::time::SystemTimeError),
     /// Schema version mismatch — refuse to misinterpret old / future
     /// room files.
     SchemaVersionMismatch {
@@ -51,6 +52,7 @@ impl std::fmt::Display for RoomError {
         match self {
             RoomError::Io(error) => write!(f, "room I/O: {error}"),
             RoomError::Json(error) => write!(f, "room JSON: {error}"),
+            RoomError::Clock(error) => write!(f, "room timestamp clock error: {error}"),
             RoomError::SchemaVersionMismatch { found, expected } => {
                 write!(f, "room.json version {found}, expected {expected}")
             }
@@ -63,7 +65,8 @@ impl std::error::Error for RoomError {
         match self {
             RoomError::Io(error) => Some(error),
             RoomError::Json(error) => Some(error),
-            _ => None,
+            RoomError::Clock(error) => Some(error),
+            RoomError::SchemaVersionMismatch { .. } => None,
         }
     }
 }
@@ -77,6 +80,12 @@ impl From<std::io::Error> for RoomError {
 impl From<serde_json::Error> for RoomError {
     fn from(error: serde_json::Error) -> Self {
         RoomError::Json(error)
+    }
+}
+
+impl From<std::time::SystemTimeError> for RoomError {
+    fn from(error: std::time::SystemTimeError) -> Self {
+        RoomError::Clock(error)
     }
 }
 
@@ -100,21 +109,21 @@ impl Room {
     /// Derive a `Room` from a name + home dir. Deterministic — same
     /// (home, name) always produces the same `Room`. Doesn't read
     /// or write disk.
-    pub fn from_name(home: &Path, name: &str) -> Self {
+    pub fn from_name(home: &Path, name: &str) -> Result<Self, RoomError> {
         let wire = home.join("wires").join(sanitise_name(name));
         let channel = RoomId::from_uuid(Uuid::new_v5(&ROOM_NAMESPACE, name.as_bytes()));
-        Self {
+        Ok(Self {
             version: ROOM_VERSION,
             name: name.to_string(),
             wire,
             channel,
-            joined_at_ms: now_ms(),
-        }
+            joined_at_ms: now_ms()?,
+        })
     }
 
     /// Default room — auto-created on `airc-rs init`. Name "default",
     /// derived per `from_name`.
-    pub fn default_for(home: &Path) -> Self {
+    pub fn default_for(home: &Path) -> Result<Self, RoomError> {
         Self::from_name(home, DEFAULT_ROOM_NAME)
     }
 }
@@ -130,7 +139,7 @@ pub fn path_in(home: &Path) -> PathBuf {
 pub fn load_or_default(home: &Path) -> Result<Room, RoomError> {
     let path = path_in(home);
     if !path.exists() {
-        return Ok(Room::default_for(home));
+        return Room::default_for(home);
     }
     let text = std::fs::read_to_string(&path)?;
     let room: Room = serde_json::from_str(&text)?;
@@ -182,11 +191,10 @@ fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH violates AIRC room timestamp contract")
-        .as_millis() as u64
+fn now_ms() -> Result<u64, std::time::SystemTimeError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64)
 }
 
 #[cfg(test)]

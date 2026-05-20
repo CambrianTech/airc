@@ -160,7 +160,7 @@ impl Airc {
     /// background subscriber on the new room's wire if one isn't
     /// already running, so subsequent `say`s land in the store.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
-        let room = Room::from_name(&self.inner.home, name);
+        let room = Room::from_name(&self.inner.home, name)?;
         room::save(&self.inner.home, &room)?;
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
@@ -171,7 +171,7 @@ impl Airc {
     /// processes on one machine tail the same `frames.jsonl`).
     /// Production users want [`join`].
     pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
-        let mut room = Room::from_name(&self.inner.home, name);
+        let mut room = Room::from_name(&self.inner.home, name)?;
         room.wire = wire;
         room::save(&self.inner.home, &room)?;
         self.ensure_wire_subscriber(&room.wire).await?;

@@ -29,7 +29,9 @@ pub fn emit_value(value: &Value, default: &str) -> Result<(), Box<dyn Error>> {
         Value::String(text) => println!("{text}"),
         Value::Bool(true) => println!("true"),
         Value::Bool(false) => println!("false"),
-        other => println!("{}", serde_json::to_string(other)?),
+        other @ (Value::Number(_) | Value::Array(_) | Value::Object(_)) => {
+            println!("{}", serde_json::to_string(other)?)
+        }
     }
     Ok(())
 }

@@ -354,10 +354,14 @@ fn availability_cards(
                 "missing-owner".to_string()
             } else if heartbeat_dt.is_none() {
                 "missing-heartbeat".to_string()
-            } else if now - heartbeat_dt.unwrap() > stale_after {
-                "stale-heartbeat".to_string()
+            } else if let Some(heartbeat_at) = heartbeat_dt {
+                if now - heartbeat_at > stale_after {
+                    "stale-heartbeat".to_string()
+                } else {
+                    String::new()
+                }
             } else {
-                String::new()
+                "missing-heartbeat".to_string()
             }
         } else {
             String::new()
