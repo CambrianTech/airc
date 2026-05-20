@@ -105,7 +105,14 @@ mod tests {
                 assert_eq!(m["text"], "hi");
                 assert_eq!(m.len(), 1, "text helper produces exactly {{text: ...}}");
             }
-            _ => panic!("text() should produce Body::Json with object shape"),
+            Body::Json(
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_)
+                | serde_json::Value::Array(_),
+            )
+            | Body::Binary(_) => panic!("text() should produce Body::Json with object shape"),
         }
         assert_eq!(body.as_text(), Some("hi"));
     }

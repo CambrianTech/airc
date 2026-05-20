@@ -10,6 +10,9 @@ publish = false
 # the first backing; the trait surface is generic enough that
 # Postgres / MySQL drop in via sea-orm's DatabaseBackend.
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 async-trait = "0.1"

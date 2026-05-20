@@ -281,6 +281,8 @@ pub(crate) fn cwd() -> String {
 fn state_prefix() -> String {
     #[cfg(unix)]
     {
+        // SAFETY: `getuid` has no preconditions, does not dereference pointers,
+        // and returns the numeric user id for the current process.
         unsafe { libc::getuid().to_string() }
     }
     #[cfg(not(unix))]

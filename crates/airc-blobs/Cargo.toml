@@ -6,6 +6,9 @@ license = "MIT"
 publish = false
 description = "Content-addressed blob storage for airc — large bodies live here, frames carry MediaRef pointers."
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

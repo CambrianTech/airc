@@ -9,6 +9,9 @@ publish = false
 # and lets CLI/hooks/Continuum query persisted work state through the
 # generic EventStore contract.
 
+[lints]
+workspace = true
+
 [dependencies]
 airc-core = { path = "../airc-core" }
 airc-store = { path = "../airc-store" }
