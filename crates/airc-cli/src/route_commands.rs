@@ -24,7 +24,6 @@ pub fn run_status(args: RouteStatusArgs) -> Result<(), Box<dyn std::error::Error
         RoutePurpose::Data,
         RoutePurpose::LiveEvent,
         RoutePurpose::Bootstrap,
-        RoutePurpose::Migration,
     ] {
         match resolver.resolve(purpose) {
             Ok(route) => println!(
@@ -94,7 +93,6 @@ fn format_purpose(purpose: RoutePurpose) -> &'static str {
         RoutePurpose::Data => "data",
         RoutePurpose::LiveEvent => "live-event",
         RoutePurpose::Bootstrap => "bootstrap",
-        RoutePurpose::Migration => "migration",
     }
 }
 

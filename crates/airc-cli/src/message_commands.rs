@@ -1,8 +1,8 @@
 use std::error::Error;
 
-use serde_json::{json, Value};
+use airc_core::ChatLogEnvelope;
 
-pub fn run_build_legacy(
+pub fn run_build(
     from: &str,
     to: &str,
     ts: &str,
@@ -11,25 +11,9 @@ pub fn run_build_legacy(
     client_id: &str,
     kind: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut payload = json!({
-        "from": from,
-        "to": to,
-        "ts": ts,
-        "channel": channel,
-        "msg": msg,
-    });
-    let Value::Object(object) = &mut payload else {
-        return Err("legacy message payload must be a JSON object".into());
-    };
-    if !client_id.is_empty() {
-        object.insert(
-            "client_id".to_string(),
-            Value::String(client_id.to_string()),
-        );
-    }
-    if !kind.is_empty() {
-        object.insert("kind".to_string(), Value::String(kind.to_string()));
-    }
+    let payload = ChatLogEnvelope::new(from, to, ts, channel, msg)
+        .with_client_id(client_id)
+        .with_kind(kind);
     println!("{}", serde_json::to_string(&payload)?);
     Ok(())
 }
@@ -37,32 +21,23 @@ pub fn run_build_legacy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
-    fn build_legacy_owns_json_serialization() {
-        let mut out = Vec::new();
-        let payload = json!({
-            "from": "alice",
-            "to": "all",
-            "ts": "2026-05-19T00:00:00Z",
-            "channel": "general",
-            "msg": "line\nquote \" slash \\",
-            "client_id": "client",
-            "kind": "heartbeat",
-        });
-        serde_json::to_writer(&mut out, &payload).unwrap();
-        let parsed: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed["msg"], "line\nquote \" slash \\");
-
-        run_build_legacy(
-            "alice",
-            "all",
-            "2026-05-19T00:00:00Z",
-            "general",
-            "line\nquote \" slash \\",
-            "client",
-            "heartbeat",
+    fn command_uses_core_chat_log_shape() {
+        let encoded = serde_json::to_string(
+            &ChatLogEnvelope::new(
+                "alice",
+                "all",
+                "2026-05-19T00:00:00Z",
+                "general",
+                "line\nquote \" slash \\",
+            )
+            .with_client_id("client")
+            .with_kind("heartbeat"),
         )
         .unwrap();
+        let parsed: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["msg"], "line\nquote \" slash \\");
     }
 }

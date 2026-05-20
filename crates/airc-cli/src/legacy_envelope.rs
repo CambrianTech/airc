@@ -24,13 +24,9 @@ pub fn wrap_stdin(recipient_pub: &str, identity_dir: &Path) -> Result<(), Box<dy
         return Ok(());
     }
 
-    let Ok(mut envelope) = serde_json::from_str::<Value>(trimmed) else {
-        println!("{trimmed}");
-        return Ok(());
-    };
+    let mut envelope: Value = serde_json::from_str(trimmed)?;
     if recipient_pub.is_empty() {
-        println!("{}", serde_json::to_string(&envelope)?);
-        return Ok(());
+        return Err("envelope wrap requires --recipient-pub".into());
     }
 
     let sender_priv = legacy_identity::load_x25519_private(identity_dir)?;
@@ -60,7 +56,7 @@ pub fn unwrap_stdin(sender_pub: &str, identity_dir: &Path) -> Result<(), Box<dyn
         return Ok(());
     }
     if sender_pub.is_empty() {
-        return Err("legacy envelope unwrap requires --sender-pub for encrypted input".into());
+        return Err("envelope unwrap requires --sender-pub for encrypted input".into());
     }
 
     let recipient_priv = legacy_identity::load_x25519_private(identity_dir)?;
@@ -84,23 +80,23 @@ pub fn unwrap_value(
     let enc = envelope
         .get("enc")
         .and_then(Value::as_str)
-        .ok_or("legacy envelope has no enc field")?;
+        .ok_or("encrypted envelope has no enc field")?;
     if enc != ENC_VERSION {
-        return Err(format!("unsupported legacy envelope enc version: {enc}").into());
+        return Err(format!("unsupported envelope enc version: {enc}").into());
     }
     let ciphertext = envelope
         .get("msg")
         .and_then(Value::as_str)
-        .ok_or("encrypted legacy envelope msg must be a string")?;
+        .ok_or("encrypted envelope msg must be a string")?;
     let nonce = envelope
         .get("nonce")
         .and_then(Value::as_str)
-        .ok_or("encrypted legacy envelope missing nonce")?;
+        .ok_or("encrypted envelope missing nonce")?;
     let ciphertext = legacy_identity::b64_url_decode(ciphertext)?;
     let nonce = legacy_identity::b64_url_decode(nonce)?;
-    let nonce: [u8; 12] = nonce.try_into().map_err(|data: Vec<u8>| {
-        format!("legacy envelope nonce is {} bytes; expected 12", data.len())
-    })?;
+    let nonce: [u8; 12] = nonce
+        .try_into()
+        .map_err(|data: Vec<u8>| format!("envelope nonce is {} bytes; expected 12", data.len()))?;
     let ad = associated_data(envelope)?;
     let key = derive_pairwise_key(recipient_priv, sender_pub)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
@@ -112,12 +108,12 @@ pub fn unwrap_value(
                 aad: ad.as_bytes(),
             },
         )
-        .map_err(|_| "legacy envelope decryption failed")?;
+        .map_err(|_| "envelope decryption failed")?;
     let msg = String::from_utf8(plaintext)?;
 
     let object = envelope
         .as_object_mut()
-        .ok_or("legacy envelope must be a JSON object")?;
+        .ok_or("envelope must be a JSON object")?;
     object.insert("msg".to_string(), Value::String(msg));
     object.remove("enc");
     object.remove("nonce");
@@ -153,11 +149,11 @@ fn wrap_value(
                 aad: ad.as_bytes(),
             },
         )
-        .map_err(|_| "legacy envelope encryption failed")?;
+        .map_err(|_| "envelope encryption failed")?;
 
     let object = envelope
         .as_object_mut()
-        .ok_or("legacy envelope must be a JSON object")?;
+        .ok_or("envelope must be a JSON object")?;
     object.insert(
         "msg".to_string(),
         Value::String(b64_url_no_pad(&ciphertext)),

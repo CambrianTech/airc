@@ -344,15 +344,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             CollaborationAction::SendWarning(args) => {
                 collaboration_commands::run_send_warning(&home, args)
             }
-            CollaborationAction::PeersFallback(args) => {
-                collaboration_commands::run_peers_fallback(&home, args)
-            }
             CollaborationAction::Peers(args) => collaboration_peers::run_peers(&home, args),
             CollaborationAction::PrunePeers(args) => {
                 collaboration_peers::run_prune_peers(&home, args)
             }
-            CollaborationAction::WhoisFallback { scope, peer_name } => {
-                collaboration_commands::run_whois_fallback(&home, scope, &peer_name)
+            CollaborationAction::ObservedWhois { scope, peer_name } => {
+                collaboration_commands::run_observed_whois(&home, scope, &peer_name)
             }
         },
 
@@ -604,7 +601,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Message(args) => match args.action {
-            MessageAction::BuildLegacy {
+            MessageAction::Build {
                 from,
                 to,
                 ts,
@@ -612,9 +609,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 msg,
                 client_id,
                 kind,
-            } => message_commands::run_build_legacy(
-                &from, &to, &ts, &channel, &msg, &client_id, &kind,
-            ),
+            } => message_commands::run_build(&from, &to, &ts, &channel, &msg, &client_id, &kind),
         },
 
         Command::Gh(args) => match args.action {

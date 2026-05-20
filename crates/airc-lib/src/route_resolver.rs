@@ -4,7 +4,7 @@
 //! It does not open sockets, poll GitHub, or probe Reticulum. It
 //! accepts measured candidates and applies [`RoutePolicy`]. Later
 //! slices can add health probes/discovery without changing the rule
-//! that GitHub is bootstrap/migration only.
+//! that GitHub is bootstrap/rendezvous only.
 
 use crate::route_health::TransportHealthSample;
 use crate::route_policy::{

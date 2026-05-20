@@ -24,7 +24,7 @@ fn route_status_keeps_github_bootstrap_only() {
     assert!(output.contains("- data -> no-route"));
     assert!(output.contains("- live-event -> no-route"));
     assert!(output.contains("- bootstrap -> gh-gist"));
-    assert!(output.contains("- migration -> gh-gist"));
+    assert!(!output.contains("migration"));
 }
 
 #[test]

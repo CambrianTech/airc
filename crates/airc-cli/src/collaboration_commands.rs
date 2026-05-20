@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
@@ -141,28 +140,7 @@ pub fn run_send_warning(
     Ok(())
 }
 
-pub fn run_peers_fallback(
-    default_home: &Path,
-    args: CollaborationScopeArgs,
-) -> Result<(), Box<dyn Error>> {
-    let home = args.home.as_deref().unwrap_or(default_home);
-    let speakers = recent_remote_speakers(home, &args.my_name, &args.client_id);
-    if speakers.is_empty() {
-        return Err(command_exit(1));
-    }
-    println!("  Recent broadcast peers:");
-    let mut speaker_entries = speakers.iter().collect::<Vec<_>>();
-    speaker_entries.sort_by_key(|(_, ts)| Reverse(**ts));
-    for (who, ts) in speaker_entries {
-        println!(
-            "  {who} → broadcast room   [(from signed messages.jsonl)]   last seen {}",
-            fmt_age(*ts)
-        );
-    }
-    Ok(())
-}
-
-pub fn run_whois_fallback(
+pub fn run_observed_whois(
     default_home: &Path,
     args: CollaborationScopeArgs,
     peer_name: &str,
@@ -174,11 +152,14 @@ pub fn run_whois_fallback(
     };
     println!("  name:      {peer_name}");
     println!("  pronouns:  (unknown)");
-    println!("  role:      broadcast peer");
+    println!("  role:      observed room participant");
     println!("  bio:       seen in recent signed room traffic");
     println!("  status:    (unknown)");
     println!("  integrations: (none)");
-    println!("  presence:  broadcast-only, last seen {}", fmt_age(*ts));
+    println!(
+        "  presence:  observed from room traffic, last seen {}",
+        fmt_age(*ts)
+    );
     Ok(())
 }
 
