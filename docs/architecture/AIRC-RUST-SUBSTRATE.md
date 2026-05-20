@@ -35,6 +35,11 @@ The three roles airc-rust plays for consumers:
 - **Event bus** — interrupt-driven fan-out for things consumers need to
   wake on, not poll for.
 
+See [`INVITE-ROUTING-ARCHITECTURE.md`](INVITE-ROUTING-ARCHITECTURE.md) for the
+transport boundary: gh-gist is an invite/rendezvous beacon, not the live
+message/event data plane. Consumers see publish, subscribe, replay, and ack
+APIs; route resolution sits below them.
+
 ## What airc-rust is not
 
 - Not an opinion about what consumers say to each other. Payloads are
@@ -57,8 +62,9 @@ The three roles airc-rust plays for consumers:
    directly. No shell-out from runtime code.
 4. **Persist** durably with proper cursors, archive drain, and SQLite/
    Postgres backends via SeaORM.
-5. **Multi-transport** — same-host, same-LAN, Tailscale, gh-gist
-   (legacy bridge). Pluggable, capability-resolved.
+5. **Multi-transport** — same-host, same-LAN, Tailscale, relay,
+   WebRTC datachannel, Reticulum, and gh-gist invite/rendezvous.
+   Pluggable, capability-resolved.
 6. **Be more secure** than today's airc: per-message forward secrecy,
    hardware-backed identity keys, at-rest encryption.
 7. **No multimedia in the body** — protocol enforces media-ref
@@ -264,7 +270,7 @@ airc-rust/
 │   │   ├── local-fs/     # same-host peers via shared FS
 │   │   ├── lan-tcp/      # same-LAN direct peer connection
 │   │   ├── tailscale/    # cross-network via Tailscale
-│   │   └── gh-gist/      # legacy bridge (deprecated)
+│   │   └── gh-gist/      # invite/rendezvous beacon only
 │   ├── airc-blobs/       # content-addressed media storage
 │   ├── airc-daemon/      # long-running: workers, drain, fan-out
 │   ├── airc-lib/         # high-level Rust API — consumers depend on this
@@ -335,7 +341,7 @@ adapters. Local and remote delivery are the same product behavior:
 the caller submits one signed envelope, gets one delivery contract,
 and observes one transcript/replay model. Whether the bytes moved
 through local filesystem, LAN-TCP, Tailscale, Reticulum, a relay, or
-temporary gh-gist is invisible above the substrate boundary.
+WebRTC datachannel is invisible above the substrate boundary.
 
 This is the telecom shape: separate the service contract from the
 bearers underneath it. A room can contain a same-host Codex process,
@@ -571,8 +577,8 @@ pub trait TransportHandle: Send + Sync {
 ```
 
 There is no adapter-specific caller API. A local-fs adapter, LAN-TCP
-adapter, Tailscale adapter, Reticulum adapter, relay adapter, and gh-gist
-migration adapter all implement the same contract. Adapter-specific
+adapter, Tailscale adapter, Reticulum adapter, relay adapter, and WebRTC
+datachannel adapter all implement the same contract. Adapter-specific
 configuration lives below `open`; adapter-specific errors are normalized
 into scheduler states above it.
 
@@ -592,8 +598,8 @@ pub struct TransportCapabilities {
 
 ### Resilient to bearer changes
 
-The point: when gh-gist stops being viable (rate limits get worse,
-GitHub deprecates gists, our trust assumptions shift, whatever) —
+The point: when any bearer stops being viable (rate limits get worse,
+an upstream deprecates an API, our trust assumptions shift, whatever) —
 we **don't get stuck**. Adapter design means:
 
 - Roll a new bearer (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
@@ -618,17 +624,20 @@ In the doc as anchors; not all in the v1 ship:
 
 - `local-fs` — same-host, same-scope. Ship v1.
 - `lan-tcp` — same-LAN direct. Ship v1.
-- `tailscale` — cross-network mesh. Ship v1.
-- `gh-gist` — legacy bridge. Ship v1 (for migration); deprecate
-  when we have a non-gh cross-network bearer.
+- `tailscale` — same-tailnet cross-network mesh. Ship v1.
+- `gh-gist-invite` — public invite/rendezvous beacon only. Ship v1.
+  Not admissible for live chat/event data-plane classes.
 - `airc-relay` — own-hosted cross-network store-and-forward. Future
-  ship; the gh-gist replacement.
+  ship; the cross-tailnet and NAT-boundary baseline.
 - `reticulum` — Mark Qvist's mesh networking stack. Future plugin.
   Useful for unreliable / radio / off-grid mesh.
 - `nats` or `mqtt` — for ops integration where consumers already run
   a broker. Future plugin.
-- `webrtc-data-channel` — direct browser ↔ desktop without TURN.
-  Future plugin.
+- `webrtc-data-channel` — direct browser, desktop, and live-mode
+  control traffic; TURN/relay when direct ICE fails. Future plugin.
+- `ssh` — optional administrative/debug adapter only. Not required
+  for install, pairing, chat, event delivery, Windows support, or
+  cross-machine operation.
 
 ## Identifiers — UUIDv4 everywhere
 
@@ -930,7 +939,7 @@ Built-in primitives:
 
 - **Keep-alive heartbeats** at the transport layer, separate from
   application heartbeats. Configurable cadence per transport (more
-  frequent for UDP/RTC paths, slower for gh-gist).
+  frequent for UDP/RTC paths, slower for store-and-forward relays).
 - **Dead-host detection**: if N consecutive heartbeats fail, the
   peer is marked impaired; if N+M, marked dead. Subscribers get a
   structured event. The scheduler refuses new admissions on impaired
