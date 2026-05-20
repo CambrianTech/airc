@@ -9,6 +9,7 @@ pub struct MessageArgs {
 #[derive(Debug, Subcommand)]
 pub enum MessageAction {
     /// Build an outbound chat log envelope as JSON.
+    #[command(alias = "build-legacy")]
     Build {
         #[arg(long)]
         from: String,
