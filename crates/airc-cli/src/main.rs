@@ -58,6 +58,7 @@ mod pending_cli;
 mod pending_commands;
 mod queue_card_cli;
 mod queue_card_commands;
+mod queue_card_projection;
 mod route_cli;
 mod route_commands;
 mod scope_cli;
@@ -845,6 +846,34 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             QueueCardAction::NudgeCardMeta { issue_file } => {
                 queue_card_commands::run_nudge_card_meta(&issue_file)
             }
+            QueueCardAction::List {
+                repo,
+                owner,
+                status,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_list(&repo, &owner, &status, json, &raw_json_file),
+            QueueCardAction::Stale {
+                repo,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_stale(&repo, &stale_after, json, &raw_json_file),
+            QueueCardAction::Next {
+                repo,
+                owner,
+                base,
+                repo_root,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_next(
+                &repo,
+                &owner,
+                &base,
+                &repo_root,
+                json,
+                &raw_json_file,
+            ),
         },
 
         Command::Humanhash { hex_input, words } => {

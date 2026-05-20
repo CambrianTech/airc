@@ -81,4 +81,46 @@ pub enum QueueCardAction {
         #[arg(long)]
         issue_file: PathBuf,
     },
+
+    /// Render and optionally filter open queue cards.
+    List {
+        #[arg(long)]
+        repo: String,
+        #[arg(long, default_value = "")]
+        owner: String,
+        #[arg(long, default_value = "")]
+        status: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
+
+    /// Render stale owned queue cards.
+    Stale {
+        #[arg(long)]
+        repo: String,
+        #[arg(long, default_value = "30m")]
+        stale_after: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
+
+    /// Rank claimable next queue cards for an owner.
+    Next {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value = "canary")]
+        base: String,
+        #[arg(long, default_value = "")]
+        repo_root: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        raw_json_file: PathBuf,
+    },
 }

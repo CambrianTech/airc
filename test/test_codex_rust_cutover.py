@@ -300,6 +300,9 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" queue-card nudge-summary', combined)
         self.assertIn('"$(airc_rs_bin)" queue-card nudge-card-meta', combined)
         self.assertNotIn("AIRC_PYTHON", (REPO / "lib/airc_bash/cmd_queue_card.sh").read_text(encoding="utf-8"))
+        self.assertIn("queue-card list", combined)
+        self.assertIn("queue-card stale", combined)
+        self.assertIn("queue-card next", combined)
 
     def test_message_crypto_helpers_use_airc_rs(self):
         combined = "\n".join(
