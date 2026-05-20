@@ -196,7 +196,8 @@ async fn send_refuses_github_invite_only_route() {
         state: airc_lib::TransportHealthState::Healthy,
         rtt_ms: None,
         success_ppm: None,
-    }]);
+    }])
+    .unwrap();
 
     let err = airc.say("must not go through gist").await.unwrap_err();
 

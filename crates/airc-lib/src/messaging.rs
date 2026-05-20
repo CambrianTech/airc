@@ -70,14 +70,21 @@ impl Airc {
             .inner
             .route_health
             .read()
-            .expect("route health lock poisoned")
+            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?
             .clone();
         let route = TransportResolver::from_health(samples)
             .resolve(class)
             .map_err(format_route_refusal)?;
         match route.kind {
             TransportKind::LocalFs => Ok(()),
-            other => Err(AircError::Route(format!(
+            other @ (TransportKind::LanTcp
+            | TransportKind::Tailscale
+            | TransportKind::Udp
+            | TransportKind::WebRtcDataChannel
+            | TransportKind::Reticulum
+            | TransportKind::Relay
+            | TransportKind::Ssh
+            | TransportKind::GhGist) => Err(AircError::Route(format!(
                 "{class:?} selected {other:?}, but this sender has only local-fs execution wired"
             ))),
         }

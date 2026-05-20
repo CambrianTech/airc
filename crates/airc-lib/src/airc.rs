@@ -166,13 +166,14 @@ impl Airc {
     pub fn replace_transport_health(
         &self,
         samples: impl IntoIterator<Item = TransportHealthSample>,
-    ) {
+    ) -> Result<(), AircError> {
         let mut route_health = self
             .inner
             .route_health
             .write()
-            .expect("route health lock poisoned");
+            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?;
         *route_health = samples.into_iter().collect();
+        Ok(())
     }
 
     /// Switch the current room to one derived from `name`. Same name
