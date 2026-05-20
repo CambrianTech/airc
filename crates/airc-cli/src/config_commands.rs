@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::json_path::{emit_value, navigate};
+
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -22,6 +24,28 @@ pub fn run_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config.unwrap_or_else(|| home.join("config.json"));
     println!("{}", config_value(&config, key, default));
+    Ok(())
+}
+
+pub fn run_get_path(
+    home: &Path,
+    config: Option<PathBuf>,
+    path: &str,
+    default: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    let root = load_value(&config);
+    let value = navigate(&root, path).unwrap_or(&Value::Null);
+    emit_value(value, default)
+}
+
+pub fn run_has_key(
+    home: &Path,
+    config: Option<PathBuf>,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config.unwrap_or_else(|| home.join("config.json"));
+    println!("{}", config_has_key(&config, key));
     Ok(())
 }
 
@@ -341,6 +365,13 @@ fn config_value(path: &Path, key: &str, default: &str) -> String {
     }
 }
 
+fn config_has_key(path: &Path, key: &str) -> bool {
+    load_value(path)
+        .as_object()
+        .map(|object| object.contains_key(key))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +410,46 @@ mod tests {
 
         assert_eq!(config_value(&path, "identity", "{}"), r#"{"role":"agent"}"#);
         assert_eq!(config_value(&path, "rooms", "[]"), r#"["general"]"#);
+    }
+
+    #[test]
+    fn get_path_reads_nested_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"identity":{"role":"agent","enabled":true},"rooms":["general"]}"#,
+        )
+        .unwrap();
+
+        let root = load_value(&path);
+        assert_eq!(
+            navigate(&root, ".identity.role").and_then(Value::as_str),
+            Some("agent")
+        );
+        assert_eq!(
+            navigate(&root, ".identity.enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            navigate(&root, ".rooms[0]").and_then(Value::as_str),
+            Some("general")
+        );
+    }
+
+    #[test]
+    fn has_key_reports_top_level_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"host_target":"","identity":{"role":"agent"}}"#).unwrap();
+
+        assert!(config_has_key(&path, "host_target"));
+        assert!(config_has_key(&path, "identity"));
+        assert!(!config_has_key(&path, "missing"));
+        assert!(!config_has_key(
+            &dir.path().join("missing.json"),
+            "host_target"
+        ));
     }
 
     #[test]

@@ -3326,10 +3326,10 @@ JSON
 
   # Identity preserved
   local name pronouns role bio
-  name=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('name',''))" 2>/dev/null)
-  pronouns=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('pronouns',''))" 2>/dev/null)
-  role=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('role',''))" 2>/dev/null)
-  bio=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('bio',''))" 2>/dev/null)
+  name=$("$(airc_rs_bin)" config get --config "$home/config.json" name)
+  pronouns=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.pronouns)
+  role=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.role)
+  bio=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.bio)
   [ "$name" = "alpha" ] && pass "name survives quit" || fail "name lost (got: '$name')"
   [ "$pronouns" = "they" ] && pass "pronouns survive quit" || fail "pronouns lost (got: '$pronouns')"
   [ "$role" = "agent" ] && pass "role survives quit" || fail "role lost (got: '$role')"
@@ -3337,10 +3337,10 @@ JSON
 
   # Host-pairing fields cleared
   local has_target has_name
-  has_target=$(python3 -c "import json; print('host_target' in json.load(open('$home/config.json')))" 2>/dev/null)
-  has_name=$(python3 -c "import json; print('host_name' in json.load(open('$home/config.json')))" 2>/dev/null)
-  [ "$has_target" = "False" ] && pass "host_target cleared by quit" || fail "host_target still present"
-  [ "$has_name" = "False" ] && pass "host_name cleared by quit" || fail "host_name still present"
+  has_target=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_target)
+  has_name=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_name)
+  [ "$has_target" = "false" ] && pass "host_target cleared by quit" || fail "host_target still present"
+  [ "$has_name" = "false" ] && pass "host_name cleared by quit" || fail "host_name still present"
 
   # SSH key file preserved (identity material)
   [ -f "$home/identity/ssh_key" ] && pass "ssh_key preserved (identity material)" || fail "ssh_key lost"
@@ -3354,8 +3354,8 @@ JSON
 }
 JSON
   AIRC_HOME="$home" "$AIRC" disconnect >/dev/null 2>&1
-  has_target=$(python3 -c "import json; print('host_target' in json.load(open('$home/config.json')))" 2>/dev/null)
-  [ "$has_target" = "False" ] && pass "disconnect alias clears pairing too" || fail "disconnect alias didn't clear"
+  has_target=$("$(airc_rs_bin)" config has-key --config "$home/config.json" host_target)
+  [ "$has_target" = "false" ] && pass "disconnect alias clears pairing too" || fail "disconnect alias didn't clear"
 
   rm -rf /tmp/airc-it-q-quit
   cleanup_all
