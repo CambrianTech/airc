@@ -78,6 +78,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" client-id', body)
         self.assertIn('"$(airc_rs_bin)" humanhash "$input"', body)
 
+    def test_lan_ip_probe_uses_airc_rs(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        start = source.index("get_host()")
+        end = source.index("resolve_tailscale_bin()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" lan-ip', body)
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("socket.socket", body)
+
     def test_scope_repair_uses_airc_rs(self):
         source = (REPO / "airc").read_text(encoding="utf-8")
         start = source.index("ensure_init()")
