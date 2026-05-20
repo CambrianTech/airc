@@ -29,7 +29,7 @@ struct HygienePolicy {
 impl Default for HygienePolicy {
     fn default() -> Self {
         Self {
-            workspace_root: "~/.airc-worktrees".to_string(),
+            workspace_root: "~/.airc/worktrees".to_string(),
             report_paths: Vec::new(),
             hooks: Vec::new(),
             warn_free_gb: 50.0,
@@ -530,6 +530,11 @@ mod tests {
         write_policy(&path, &HygienePolicy::default()).unwrap();
 
         assert_eq!(load_policy(&path).unwrap(), HygienePolicy::default());
+    }
+
+    #[test]
+    fn default_workspace_root_lives_under_airc_home() {
+        assert_eq!(HygienePolicy::default().workspace_root, "~/.airc/worktrees");
     }
 
     #[test]

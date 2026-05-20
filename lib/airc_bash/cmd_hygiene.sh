@@ -39,8 +39,8 @@ RESOURCE REPORTING
 
 SAFE CLEANUP
   By default, clean only removes rebuildable per-lane caches:
-    - ~/.airc-worktrees/*/src/workers/target
-    - ~/.airc-worktrees/*/src/node_modules
+    - ~/.airc/worktrees/*/src/workers/target
+    - ~/.airc/worktrees/*/src/node_modules
 
   Main checkout caches and Docker prune are policy-gated and off by default.
 EOF

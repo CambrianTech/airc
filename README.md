@@ -216,7 +216,7 @@ airc hygiene clean --dry-run
 airc hygiene clean --yes
 ```
 
-The default clean action removes only rebuildable lane caches under `~/.airc-worktrees`: Rust `src/workers/target` and `src/node_modules`. Main checkout caches and Docker prune are policy-gated and off by default. The Rust `airc-work` events (`DrainCandidateCategory { RebuildableCache, GeneratedArtifact, DownloadedDependency, DockerLayer, ModelCache, TraceArtifact, Unknown }`) make the policy decision pattern-matchable; `safe_by_default()` is conservative — only rebuildable and downloaded categories drain without explicit opt-in.
+The default clean action removes only rebuildable lane caches under `~/.airc/worktrees`: Rust `src/workers/target` and `src/node_modules`. Main checkout caches and Docker prune are policy-gated and off by default. The Rust `airc-work` events (`DrainCandidateCategory { RebuildableCache, GeneratedArtifact, DownloadedDependency, DockerLayer, ModelCache, TraceArtifact, Unknown }`) make the policy decision pattern-matchable; `safe_by_default()` is conservative — only rebuildable and downloaded categories drain without explicit opt-in.
 
 ## Rooms And Scope
 
