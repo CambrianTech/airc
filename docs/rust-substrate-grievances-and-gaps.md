@@ -625,10 +625,13 @@ Verified strengths:
 Critical remaining gaps:
 
 - The public `airc` product path now routes through Rust for identity, config, bearer, logs, monitor formatting, Codex hooks, queue/work helpers, and install-time setup. Remaining shell should keep shrinking toward install/bootstrap only.
-- `airc-lib` does not yet provide a live subscription stream or daemon-attached mode. The embedding smoke test manually appends to the store after `say()` because pure embedding has no background subscriber.
-- `airc-cli` still owns too much policy. The daemon split helped, but command handlers still build registries, manage rooms, open stores, wire transports, and print user semantics.
+- `airc-lib` now owns in-process send/subscribe/replay, route selection, local-fs execution, LAN/Tailscale-class TCP execution, route health, and invite endpoint metadata. Daemon-attached mode and persistent subscription hub are still not complete.
+- `airc-cli` is thinner for local and LAN send/listen, but it still owns too much product policy in other commands. Remaining user-facing commands must move onto SDK surfaces instead of constructing substrate state directly.
 - Peer trust rotation is still too permissive: `peers_store::add` silently replaces a pubkey for the same `PeerId`. That must become an explicit signed rotation/audit operation.
-- There is no transport resolver yet. Local-fs and LAN-TCP exist, but consumers cannot ask for "best route to peer/channel" across same-host, LAN, Tailscale, relay, or migration transports.
+- Route resolver basics exist, and LAN listen/connect feed health. Missing: real discovery/probing that populates route health/endpoints for same-host, LAN, optional Tailscale, relay, UDP/WebRTC, and Reticulum without manual flags.
+- Gist is modeled as invite/rendezvous only, but the actual gist publication flow still needs to publish signed invite/endpoint metadata instead of legacy message content.
+- Relay for different tailnets/NAT is not implemented. This is required before cross-grid and unreliable-network claims are credible.
+- UDP and WebRTC datachannel adapters are modeled but not implemented. They are required before Continuum live-mode, game, and realtime control integration can be considered ready.
 - Presence/live roster/responder-ready state is not implemented as a Rust projection.
 - Queue/lane/workspace/kanban are still legacy operational surfaces, not Rust substrate objects.
 - No Continuum/OpenClaw/Hermes/opencode Rust embedding examples prove future integrations.

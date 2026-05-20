@@ -244,18 +244,31 @@ diagnosis.
 
 ## Migration Slices
 
-1. **Policy constants:** encode route classes and gh-gist admissibility in Rust.
-2. **Invite beacon type:** move gist payloads to a signed invite structure.
-3. **Resolver gate:** route plans fail closed when no admissible data route
-   exists; no implicit gist data path.
-4. **Doctor split:** expose live bus health separately from invite health.
-5. **Local route proof:** two local agents exchange events without any GitHub
-   call in the publish/subscribe path.
-6. **Tailscale/LAN proof:** same API, remote peer, no consumer changes.
-7. **Continuum integration proof:** one Continuum room uses AIRC subscribe/replay
-   for chat/events while retaining Continuum-owned payload semantics.
-8. **OpenClaw/Hermes adapter proof:** native clients appear as peers/channels
-   through adapter-owned schemas, not transport-specific hacks.
+1. **Done: policy constants.** Route classes and gh-gist admissibility live in
+   Rust under `airc-lib::route`; gh-gist is invite/rendezvous only.
+2. **Done: resolver gate.** Runtime data fails closed when no admissible live
+   route exists; no implicit gist data path.
+3. **Done: local route proof.** Local-fs and LAN subprocess tests exchange
+   events without GitHub in the publish/subscribe path.
+4. **Done: SDK route execution for LAN/Tailscale-class TCP.** `airc-lib::send`
+   resolves routes and executes local-fs or TLS LAN/Tailscale-class TCP through
+   adapters. Tailscale is optional reachability, not required for local use.
+5. **Done: route subsystem organization.** Health, policy, resolver, execution,
+   and invite metadata live under `crates/airc-lib/src/route/`.
+6. **Partial: route health and invite beacon.** `TransportHealthTable` and
+   `InviteBeacon` exist; LAN listen/connect feed health/endpoints. Gist still
+   needs to publish this invite structure instead of legacy message content.
+7. **Partial: CLI path through SDK.** Local send/listen and LAN send/listen use
+   `airc-lib`; remaining user-facing commands must continue moving onto SDK
+   surfaces instead of owning policy.
+8. **Next: discovery.** Add real local/LAN discovery feeding `TransportHealthTable`
+   and route endpoints without manual peer/address flags.
+9. **Next: relay.** Build `airc-relay` and relay adapter for different tailnets,
+   NAT boundaries, and intermittent peers.
+10. **Next: UDP/WebRTC.** Build UDP and WebRTC datachannel adapters for low-latency
+    control/signaling paths needed before Continuum live-mode integration.
+11. **Next: integration proofs.** Continuum rooms, OpenClaw, Hermes, and opencode
+    must embed AIRC through SDK/contracts with no transport-specific hacks.
 
 ## Non-Goals
 
