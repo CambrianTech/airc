@@ -13,6 +13,7 @@
 //! - [`ids`]        — newtype wrappers for identifier strings
 //! - [`identity`]   — the per-peer Identity card (the user/account abstraction)
 //! - [`body`]       — opaque payload (Json | Binary) consumers carry
+//! - [`chat_log`]   — current text-chat log envelope at the shell edge
 //! - [`transcript`] — TranscriptEvent + TranscriptKind + MentionTarget
 //! - [`cursor`]     — cursor + paging primitives for transcript fetch
 //! - [`datetime`]   — fixed-format UTC timestamp parsing
@@ -27,6 +28,7 @@
 
 pub mod attachment;
 pub mod body;
+pub mod chat_log;
 pub mod cursor;
 pub mod datetime;
 pub mod filter;
@@ -43,6 +45,7 @@ pub mod transcript;
 
 pub use attachment::AttachmentManifest;
 pub use body::Body;
+pub use chat_log::ChatLogEnvelope;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
 pub use filter::{filter_self_echoes, SelfFilter};

@@ -1,9 +1,9 @@
 //! Transport route policy for consumer-facing AIRC embeddings.
 //!
 //! The important invariant is negative: GitHub is not a transparent
-//! runtime fallback. It can carry rendezvous / migration frames when a
-//! caller explicitly chooses that purpose, but normal chat/data routing
-//! must use direct transports or fail loudly.
+//! runtime fallback. It can carry bootstrap/rendezvous frames when a caller
+//! explicitly chooses that purpose, but normal chat/data routing must use
+//! direct transports or fail loudly.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoutePurpose {
@@ -13,8 +13,6 @@ pub enum RoutePurpose {
     LiveEvent,
     /// Initial peer discovery / rendezvous metadata.
     Bootstrap,
-    /// Temporary interop with the legacy gist wire during cutover.
-    Migration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,8 +67,7 @@ impl RoutePolicy {
 fn allows(purpose: RoutePurpose, candidate: TransportCandidate) -> bool {
     match candidate.kind {
         TransportKind::GhGist => {
-            matches!(purpose, RoutePurpose::Bootstrap | RoutePurpose::Migration)
-                && candidate.role == TransportRole::BootstrapOnly
+            purpose == RoutePurpose::Bootstrap && candidate.role == TransportRole::BootstrapOnly
         }
         TransportKind::LocalFs
         | TransportKind::LanTcp
@@ -90,7 +87,7 @@ fn priority(purpose: RoutePurpose, kind: TransportKind) -> u8 {
             TransportKind::Relay => 4,
             TransportKind::GhGist => 255,
         },
-        RoutePurpose::Bootstrap | RoutePurpose::Migration => match kind {
+        RoutePurpose::Bootstrap => match kind {
             TransportKind::LocalFs => 0,
             TransportKind::LanTcp => 1,
             TransportKind::Tailscale => 2,

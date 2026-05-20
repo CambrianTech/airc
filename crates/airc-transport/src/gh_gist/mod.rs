@@ -1,4 +1,4 @@
-//! GitHub gist bootstrap/migration transport.
+//! GitHub gist bootstrap/rendezvous transport.
 //!
 //! This adapter exists to contain the old gist-backed message wire
 //! behind the same `Transport` trait while AIRC moves to real peer
@@ -6,7 +6,7 @@
 //! GitHub can help peers discover each other and exchange bootstrap
 //! metadata, then LAN/Tailscale/relay transports should carry the
 //! runtime stream. Nothing in this module is wired as automatic
-//! fallback; consumers must opt into it deliberately for migration or
+//! fallback; consumers must opt into it deliberately for bootstrap or
 //! rendezvous work.
 
 mod adapter;

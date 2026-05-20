@@ -72,7 +72,7 @@ real system:
   frontend over `airc-lib`/`airc-daemon`, not the place where
   integration semantics accumulate.
 - GitHub still appears as runtime messaging in older docs and paths.
-  It must become bootstrap/mirror/migration only. Same-device and
+  It must become bootstrap/rendezvous only. Same-device and
   same-LAN communication must never depend on GitHub budget.
 - There are remaining runtime defaults that should be reviewed even if
   they compile, especially `unwrap_or(...)` in timestamp, limit, route,

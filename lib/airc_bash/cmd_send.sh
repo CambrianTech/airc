@@ -37,33 +37,17 @@ cmd_send() {
   # message body — exactly the evidence-eating shape the project rejects).
   #
   # Implementation: parse --room here. If it names a sibling sidecar scope
-  # (e.g. ${AIRC_WRITE_DIR}.<name>), re-exec ourselves with AIRC_HOME
-  # pointed at that scope so the rest of the function runs there. Errors
-  # loudly when the requested room isn't in the user's subscription set
-  # — never silently broadcasts to the wrong place.
+  # --room is now an alias for --channel; it stamps the channel field
+  # inside the single active scope.
   local target_room=""
-  # --channel <name> (Phase 2B): post-substrate flag that ONLY stamps
-  # the envelope's channel field; no scope re-exec. Same scope, same
-  # SSH wire, different channel tag. Coexists with --room for now;
-  # Phase 2B.3 deletes --room's re-exec path and makes --room an
-  # alias for --channel.
+  # --channel <name>: stamp the envelope's channel field. The route must
+  # have an exact channel mapping later in this function.
   local channel_override=""
-  # _explicit_channel: user used --room/--channel to target a specific
-  # channel. When set, we MUST find a gist mapping for that channel —
-  # silently falling back to the scope's primary room_gist_id has the
-  # phantom-room failure mode (banner says "→ #qa-experiment", message
-  # actually goes to #general's gist with channel field "qa-experiment",
-  # no new gist ever created). User reported 2026-04-29: "I sent to
-  # #qa-experiment, #qa-sub-room-test, #x — all 'succeeded' with banner,
-  # NONE created a gist."
-  local _explicit_channel=0
   # --internal: best-effort send for internal informational broadcasts
   # ([rename], etc.) where the monitor-down guard is the wrong UX. Append
   # to the local log + return 0 even when the monitor isn't running.
-  # Receivers heal via monitor_formatter's host-fallback / next-traffic
-  # passes, so missing one event in a quiet scope isn't a correctness
-  # issue. Exposed as a flag (not an env var) so call sites are
-  # grep-able and the pattern matches the rest of the airc CLI surface.
+  # Exposed as a flag (not an env var) so call sites are grep-able and
+  # the pattern matches the rest of the airc CLI surface.
   local internal=0
   # --system: protocol/system event. Uses the same send path as chat so
   # peers see lifecycle state on gh/local transports, but stamps from=airc
@@ -106,12 +90,10 @@ cmd_send() {
       --room|-room)
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
-        _explicit_channel=1
         shift 2 ;;
       --channel|-c)
         channel_override="${2:-}"
         [ -z "$channel_override" ] && die "Usage: airc send --channel <name> <message>"
-        _explicit_channel=1
         shift 2 ;;
       --internal)
         internal=1
@@ -297,13 +279,11 @@ cmd_send() {
   local client_id; client_id=$(airc_client_id 2>/dev/null || true)
 
   # Channel: stamp every outbound envelope with the active channel so the
-  # monitor display can route by channel uniformly (Phase 2 mesh
-  # substrate). Resolution priority (Phase 2B.1):
+  # monitor display can route by channel uniformly.
+  # Resolution order:
   #   1. --channel / -c flag (explicit per-call override)
   #   2. config.json subscribed_channels[0]
-  #      (Phase 2B substrate — replaces sidecar scopes)
-  #   3. legacy room_name file (back-compat for users mid-rollover)
-  #   4. literal "general" fallback
+  #   3. literal "general" default
   local active_channel=""
   if [ -n "$channel_override" ]; then
     active_channel="$channel_override"
@@ -311,21 +291,17 @@ cmd_send() {
   if [ -z "$active_channel" ]; then
     active_channel=$(airc_config_default_channel "$CONFIG" || true)
   fi
-  if [ -z "$active_channel" ] && [ -f "$AIRC_WRITE_DIR/room_name" ]; then
-    active_channel=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || true)
-  fi
   [ -z "$active_channel" ] && active_channel="general"
 
   local from_name="$my_name"
   [ "$system_event" = "1" ] && from_name="airc"
-  # airc#644 PR-2: stamp kind=heartbeat when --heartbeat was passed so
-  # cmd_peers can track separately + monitor_formatter can filter from
-  # UI. Default kind (chat) is implicit — pre-#644 peers don't emit kind
-  # and downstream code treats absent kind as chat for back-compat.
+  # Stamp kind=heartbeat when --heartbeat was passed so cmd_peers can
+  # track separately and monitor_formatter can filter from UI. Default
+  # chat kind remains implicit on the wire.
   local message_kind=""
   [ "$heartbeat" = "1" ] && message_kind="heartbeat"
   local payload
-  payload=$("$(airc_rs_bin)" message build-legacy \
+  payload=$("$(airc_rs_bin)" message build \
       --from "$from_name" \
       --to "$peer_name" \
       --ts "$ts_val" \
@@ -349,30 +325,22 @@ cmd_send() {
     # encrypted below if the recipient has a stored x25519_pub.
     _airc_append_local_signed "$full_msg"
 
-    # Phase E.3: wrap the wire envelope with envelope-layer encryption
-    # if we have the recipient's X25519 pubkey on file. Empty pubkey =
-    # peer is on pre-Phase-E airc (or never paired with us under E),
-    # in which case the wrap CLI passes through unchanged. Failures
-    # also pass through (loud stderr, no silent encryption skip).
-    # Phase E.3: look up recipient's X25519 pubkey for envelope encryption.
-    # Empty result = peer hasn't paired under E2E (or our cryptography
-    # package isn't installed). The wrap CLI passes through plaintext in
-    # that case, transparently.
+    # Direct messages require an enrolled recipient X25519 key unless
+    # the caller explicitly asked for plaintext. Encryption errors abort
+    # this send; they are never converted into plaintext wire traffic.
     local recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local wire_msg="$full_msg"
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ] && [ -z "$recipient_pub" ]; then
+      die "missing X25519 key for '$peer_name' — refusing plaintext DM"
+    fi
     if [ -n "$recipient_pub" ]; then
-      # Stderr unredirected — wrap failures surface loud (CLAUDE.md "never swallow").
       wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
         --recipient-pub="$recipient_pub" \
-        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
-      # Diagnostic: emit the wire shape to stderr so test logs surface
-      # whether encryption actually engaged. Phase E debug aid; remove
-      # once production has verified the path. (Doubles as a sanity
-      # check for `airc doctor`.)
+        --identity-dir "$IDENTITY_DIR")
       if [ -n "${AIRC_E2E_DEBUG:-}" ]; then
         echo "[airc:e2e] wire_msg: $wire_msg" >&2
       fi
@@ -386,24 +354,13 @@ cmd_send() {
     #   4. Branches on the structured SendOutcome.kind
     # Adding a new transport doesn't touch this file — only the
     # resolver registers it. (Phases 1-3 of bearer rewrite; #269 #270.)
-    # Phase 3c+ (#283): route by channel. The active_channel's gist
-    # comes from channel_gists in config (populated at subscribe time).
-    # If the channel has no mapping, fall back to the scope's primary
-    # room_gist_id so single-room scopes keep working unchanged.
+    # Route by channel. The active_channel's gist comes from
+    # channel_gists in config (populated at subscribe time). Missing
+    # mapping is a routing error, not permission to publish elsewhere.
     local room_gist_id=""
     room_gist_id=$(airc_config_get_channel_gist "$active_channel" "$CONFIG" || true)
-    # Phantom-room guard: when --room/--channel was used explicitly,
-    # NEVER fall back to the scope's primary room_gist_id — that publishes
-    # to the wrong gist with the right channel-tag, creating an invisible
-    # mis-route ("phantom success"). Only the no-override path falls back
-    # for back-compat with single-channel scopes.
     if [ -z "$room_gist_id" ]; then
-      if [ "$_explicit_channel" = "1" ]; then
-        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
-      fi
-      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-        room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
-      fi
+      die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
     fi
 
     local outcome
@@ -558,11 +515,9 @@ cmd_send() {
       # die is appropriate UX for explicit `airc send` — it surfaces
       # "you're broadcasting to nobody" loudly so the user doesn't wait
       # for a reply that can't arrive. For [rename] the broadcast is
-      # informational; receivers heal via monitor_formatter's host-
-      # fallback on next traffic, so noisily failing the rename in any
-      # scope whose monitor isn't running today (a perfectly normal
-      # multi-scope state) would give the rename feature a worse UX
-      # than no-propagation had.
+      # informational, so noisily failing the rename in any scope whose
+      # monitor isn't running today would give the rename feature worse
+      # behavior than no propagation.
       if [ "$internal" = "1" ]; then
         _airc_append_local_signed "$full_msg"
         date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
@@ -589,36 +544,30 @@ cmd_send() {
     # — local-only append disappears into a void. Worst silent-loss
     # class until this fix landed.
     #
-    # Same wrap-if-recipient-known logic as the joiner branch above:
-    # encrypt msg field with recipient's X25519 pub when it's a DM and
-    # we have their pubkey on file; broadcasts go plaintext (group
-    # encryption is a future Phase E.4).
+    # Same policy as the joiner branch above: direct messages require
+    # recipient encryption unless --plaintext was explicit. Broadcast
+    # group encryption is a separate protocol, not an implicit fallback.
     local _host_recipient_pub=""
     if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ]; then
       _host_recipient_pub=$("$(airc_rs_bin)" identity peer-pub --home "$AIRC_WRITE_DIR" \
         --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
     fi
     local _host_wire_msg="$full_msg"
+    if [ "$peer_name" != "all" ] && [ "$plaintext" != "1" ] && [ -z "$_host_recipient_pub" ]; then
+      die "missing X25519 key for '$peer_name' — refusing plaintext DM"
+    fi
     if [ -n "$_host_recipient_pub" ]; then
       _host_wire_msg=$(printf '%s' "$full_msg" | "$(airc_rs_bin)" envelope wrap --home "$AIRC_WRITE_DIR" \
         --recipient-pub="$_host_recipient_pub" \
-        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
+        --identity-dir "$IDENTITY_DIR")
     fi
 
-    # Route by channel via channel_gists (post-#283); fall back to the
-    # scope's primary room_gist_id so single-room hosts keep working —
-    # but only when the user did NOT explicitly target a different room
-    # (otherwise the fallback turns --room into a phantom success that
-    # silently mis-routes to the primary gist; see _explicit_channel).
+    # Route by channel via channel_gists. Missing mapping is a routing
+    # error, not permission to publish elsewhere.
     local _host_room_gist_id=""
     _host_room_gist_id=$(airc_config_get_channel_gist "$active_channel" "$CONFIG" || true)
     if [ -z "$_host_room_gist_id" ]; then
-      if [ "$_explicit_channel" = "1" ]; then
-        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
-      fi
-      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-        _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
-      fi
+      die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
     fi
 
     if [ -n "$_host_room_gist_id" ]; then

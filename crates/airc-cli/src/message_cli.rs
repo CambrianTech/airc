@@ -8,8 +8,8 @@ pub struct MessageArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum MessageAction {
-    /// Build a legacy messages.jsonl chat envelope as JSON.
-    BuildLegacy {
+    /// Build an outbound chat log envelope as JSON.
+    Build {
         #[arg(long)]
         from: String,
         #[arg(long)]

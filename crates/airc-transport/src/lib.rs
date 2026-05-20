@@ -11,10 +11,9 @@
 //!   when multiple AI agents share one Mac.
 //! - **lan-tcp** (PR-3) — same-LAN peer-to-peer via TLS-wrapped TCP.
 //! - **tailscale** (PR-4) — mesh transport for cross-network peers.
-//! - **gh-gist** (legacy migration adapter only) — lets Rust peers
-//!   interoperate with the old gist wire long enough to delete it.
-//!   It must not become a primary runtime path; GitHub is acceptable
-//!   for bootstrap/discovery, not sustained chat transport.
+//! - **gh-gist** — bootstrap/rendezvous adapter only. It must not become
+//!   a primary runtime path; GitHub is acceptable for identity exchange,
+//!   address publication, and invitations, not sustained chat transport.
 //!
 //! Designed agent-first. The canonical caller is an AI peer sending
 //! frames to other AI peers; human-chat features (typing, presence)

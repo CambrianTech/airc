@@ -16,14 +16,12 @@ pub enum CollaborationAction {
     Doctor(CollaborationScopeArgs),
     /// Warn when sends are likely isolated.
     SendWarning(CollaborationScopeArgs),
-    /// Print recent broadcast peers when peer records are empty.
-    PeersFallback(CollaborationScopeArgs),
     /// Print paired peers plus recent broadcast-only peers.
     Peers(CollaborationScopeArgs),
     /// Remove stale duplicate peer records for the same host.
     PrunePeers(CollaborationScopeArgs),
-    /// Print a broadcast-only whois fallback.
-    WhoisFallback {
+    /// Print identity evidence observed from signed room traffic.
+    ObservedWhois {
         #[command(flatten)]
         scope: CollaborationScopeArgs,
         #[arg(long)]
