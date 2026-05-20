@@ -3196,10 +3196,7 @@ JSON
 
   # ── Set away with message ──
   AIRC_HOME="$home" "$AIRC" away "in a meeting til 3pm" >/dev/null 2>&1
-  local status; status=$(python3 -c "
-import json
-print(json.load(open('$home/config.json')).get('identity', {}).get('status', ''))
-" 2>/dev/null)
+  local status; status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status)
   [ "$status" = "in a meeting til 3pm" ] \
     && pass "away <msg> sets status field" \
     || fail "away didn't set status (got: '$status')"
@@ -3212,20 +3209,14 @@ print(json.load(open('$home/config.json')).get('identity', {}).get('status', '')
 
   # ── Multi-word message via positional args ──
   AIRC_HOME="$home" "$AIRC" away getting coffee >/dev/null 2>&1
-  status=$(python3 -c "
-import json
-print(json.load(open('$home/config.json')).get('identity', {}).get('status', ''))
-" 2>/dev/null)
+  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status)
   [ "$status" = "getting coffee" ] \
     && pass "away with multi-word arg joins with spaces" \
     || fail "multi-word away dropped tokens (got: '$status')"
 
   # ── airc back (no args) clears status ──
   AIRC_HOME="$home" "$AIRC" away >/dev/null 2>&1
-  status=$(python3 -c "
-import json
-print(json.load(open('$home/config.json')).get('identity', {}).get('status', '(absent)'))
-" 2>/dev/null)
+  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
   [ "$status" = "(absent)" ] \
     && pass "away (no arg) clears status field (back)" \
     || fail "away no-arg didn't clear status (got: '$status')"
@@ -3233,10 +3224,7 @@ print(json.load(open('$home/config.json')).get('identity', {}).get('status', '(a
   # ── 'back' alias (IRC convention shortcut) ──
   AIRC_HOME="$home" "$AIRC" away "afk" >/dev/null 2>&1
   AIRC_HOME="$home" "$AIRC" back >/dev/null 2>&1
-  status=$(python3 -c "
-import json
-print(json.load(open('$home/config.json')).get('identity', {}).get('status', '(absent)'))
-" 2>/dev/null)
+  status=$("$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status "(absent)")
   [ "$status" = "(absent)" ] \
     && pass "back alias also clears status" \
     || fail "back alias didn't clear (got: '$status')"

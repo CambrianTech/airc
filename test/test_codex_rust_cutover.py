@@ -111,6 +111,16 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" config has-key --config "$home/config.json" host_target', body)
         self.assertNotIn("python3 -c", body)
 
+    def test_integration_away_status_probes_use_airc_rs(self):
+        source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
+        start = source.index("scenario_away()")
+        end = source.index("scenario_quit()", start)
+        body = source[start:end]
+
+        self.assertIn('"$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status', body)
+        self.assertIn('"$(airc_rs_bin)" config get-path --config "$home/config.json" .identity.status "(absent)"', body)
+        self.assertNotIn("python3 -c", body)
+
     def test_uninstaller_uses_rust_codex_hook_uninstaller(self):
         source = (REPO / "uninstall.sh").read_text(encoding="utf-8")
 
