@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
@@ -194,7 +195,7 @@ fn collect_candidates(policy: &HygienePolicy, repo_root: &Path) -> Vec<CleanupCa
             candidates.push(candidate("main-rust-target", path));
         }
     }
-    candidates.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+    candidates.sort_by_key(|candidate| Reverse(candidate.bytes));
     candidates
 }
 
