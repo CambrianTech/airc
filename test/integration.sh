@@ -3620,12 +3620,10 @@ scenario_bearer_ssh_send() {
   [ -f "$ikey" ] && pass "joiner has identity key at $ikey" \
                  || { fail "joiner identity key missing"; return; }
 
-  # PYTHONPATH so airc_core is importable when invoking Python directly.
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
   local payload='{"from":"gamma","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"bearer-test-payload-78a8c","sig":"x"}'
 
   local outcome
-  outcome=$(printf '%s' "$payload" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send \
+  outcome=$(printf '%s' "$payload" | "$(airc_rs_bin)" bearer send \
     "alpha" "general" \
     --host-target "$host_target" \
     --identity-key "$ikey" \
@@ -3675,7 +3673,6 @@ scenario_bearer_ssh_recv() {
   # never use one — preserved here.
   local ikey="$jstate/identity/ssh_key"
 
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
   local hstate=/tmp/airc-it-br-h/state
 
   # Test plan: start recv_stream in the background, wait for ssh to
@@ -3689,35 +3686,11 @@ scenario_bearer_ssh_recv() {
 
   # Run the recv driver in the background. It writes "FOUND" to recv_out
   # when it sees the marker, then exits.
-  PYTHONPATH="$_lib_dir" python3 -c "
-import sys, signal, time
-sys.path.insert(0, '$_lib_dir')
-from airc_core.bearer_resolver import resolve
-
-bearer = resolve({
-    'host_target': '$host_target',
-    'remote_home': r'''$rhome''',
-    'identity_key': '$ikey',
-})
-bearer.open('alpha')
-
-signal.alarm(15)
-out = open('$recv_out', 'w', buffering=1)
-try:
-    for ev in bearer.recv_stream():
-        env = ev.bearer_metadata.get('envelope', {})
-        if env.get('msg') == '$marker':
-            live = bearer.liveness('alpha')
-            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 10
-            out.write('FOUND\n')
-            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
-            break
-except Exception as e:
-    out.write(f'ERROR: {e}\n')
-finally:
-    out.close()
-    bearer.close()
-" >/dev/null 2>&1 &
+  "$(airc_rs_bin)" bearer recv alpha \
+    --host-target "$host_target" \
+    --identity-key "$ikey" \
+    --remote-home "$rhome" \
+    >"$recv_out" 2>&1 &
   local recv_pid=$!
 
   # Give ssh ~3s to connect and start tailing.
@@ -3748,9 +3721,8 @@ finally:
 }
 
 scenario_bearer_cli_recv() {
-  # Phase 2b: prove `python -m airc_core.bearer_cli recv` (the bridge the
-  # bash monitor now uses instead of an inline ssh-tail) emits one line
-  # per envelope, payload-bytes verbatim, suitable for piping straight
+  # Phase 2b: prove `airc-rs bearer recv` emits one line per envelope,
+  # payload-bytes verbatim, suitable for piping straight
   # into monitor_formatter. If this scenario passes but the monitor still
   # misses messages, the bug is in the formatter or in the watchdog —
   # not in the bearer-CLI seam.
@@ -3771,7 +3743,6 @@ scenario_bearer_cli_recv() {
   local host_target; host_target=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_target)
   local rhome;       rhome=$("$(airc_rs_bin)" config get --config "$jstate/config.json" host_airc_home "$HOME/.airc")
   local ikey="$jstate/identity/ssh_key"
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
   local hstate=/tmp/airc-it-cli-h/state
 
   local marker="cli-recv-marker-$(date +%s%N)"
@@ -3779,10 +3750,10 @@ scenario_bearer_cli_recv() {
   local cli_out; cli_out=$(mktemp -t airc-it-cli-recv.XXXXXX)
   local cli_err; cli_err=$(mktemp -t airc-it-cli-err.XXXXXX)
 
-  # Run bearer_cli recv in the background, captured to a file. Different
+  # Run airc-rs bearer recv in the background, captured to a file. Different
   # offset_file path per invocation so we don't fight the live joiner.
   local off_file; off_file=$(mktemp -t airc-it-cli-off.XXXXXX); rm -f "$off_file"
-  PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli recv alpha \
+  "$(airc_rs_bin)" bearer recv alpha \
     --host-target "$host_target" \
     --identity-key "$ikey" \
     --remote-home "$rhome" \
@@ -3862,8 +3833,6 @@ scenario_gh_send_creates_messages_jsonl() {
   fi
 
   cleanup_all
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
-
   # Seed the gist the way `airc join` actually does: a file named like
   # airc-invite.* (NOT messages.jsonl). The first send must add
   # messages.jsonl as a new file.
@@ -3894,7 +3863,7 @@ scenario_gh_send_creates_messages_jsonl() {
   local marker="tdd-first-send-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
   local outcome
-  outcome=$(printf '%s' "$probe" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all general --room-gist-id "$gist_id" 2>&1)
+  outcome=$(printf '%s' "$probe" | "$(airc_rs_bin)" bearer send all general --room-gist-id "$gist_id" 2>&1)
   local kind; kind=$(printf '%s' "$outcome" | "$(airc_rs_bin)" gist get .kind 2>/dev/null)
 
   if [ "$kind" = "delivered" ]; then
@@ -4163,7 +4132,7 @@ PYEOF
   local marker="rot-marker-$(date +%s%N)"
   local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"rotation-test","msg":"'"$marker"'","sig":"x"}'
   AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
-    PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all rotation-test \
+    "$(airc_rs_bin)" bearer send all rotation-test \
       --room-gist-id "$gist_id" <<< "$probe" >/dev/null 2>&1
 
   sleep 1
@@ -4208,8 +4177,6 @@ scenario_channel_gist_prefers_single_channel() {
   fi
 
   cleanup_all
-  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
-
   # Publish a LEGACY multi-channel mesh gist FIRST (so it has older
   # updated_at than the single-channel one — exactly the order that
   # caused #290 in production).
@@ -4235,7 +4202,7 @@ JSON
   # about to create.)
   sleep 1
   local single_gid
-  single_gid=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
+  single_gid=$("$(airc_rs_bin)" channel-gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
 
   if [ -z "$single_gid" ]; then
     fail "channel_gist resolve returned empty"
@@ -4255,8 +4222,8 @@ JSON
   # The new single_gid should be a canonical single-channel gist.
   local single_channels
   single_channels=$(gh api "gists/$single_gid" --jq '.files | to_entries[0].value.content' 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('channels'))" 2>/dev/null)
-  if [ "$single_channels" = "['lobby-target']" ]; then
+    | "$(airc_rs_bin)" gist get .channels 2>/dev/null)
+  if [ "$single_channels" = '["lobby-target"]' ]; then
     pass "single-channel gist envelope has channels=['lobby-target'] (post-3c canonical shape)"
   else
     fail "single-channel gist envelope shape unexpected: $single_channels"
@@ -4267,7 +4234,7 @@ JSON
   # the legacy. This is the real production scenario where Peer B
   # resolves AFTER Peer A already published the canonical single-channel.
   local second_resolve
-  second_resolve=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target 2>/dev/null)
+  second_resolve=$("$(airc_rs_bin)" channel-gist resolve --channel lobby-target 2>/dev/null)
   if [ "$second_resolve" = "$single_gid" ]; then
     pass "second resolve returns the canonical single-channel gist (substrate converges)"
   else
