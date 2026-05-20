@@ -106,8 +106,15 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" collaboration status', combined)
         self.assertIn('"$(airc_rs_bin)" collaboration send-warning', combined)
         self.assertIn('"$(airc_rs_bin)" collaboration whois-fallback', combined)
-        self.assertIn('"$(airc_rs_bin)" collaboration peers-fallback', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration peers', combined)
+        self.assertIn('"$(airc_rs_bin)" collaboration prune-peers', combined)
         self.assertIn('"$(airc_rs_bin)" collaboration doctor', combined)
+
+        rooms = (REPO / "lib/airc_bash/cmd_rooms.sh").read_text(encoding="utf-8")
+        start = rooms.index("cmd_peers()")
+        body = rooms[start:]
+        self.assertNotIn("AIRC_PYTHON", body)
+        self.assertNotIn("python", body.lower())
 
     def test_inbox_uses_airc_rs(self):
         source = (REPO / "lib/airc_bash/cmd_status.sh").read_text(encoding="utf-8")

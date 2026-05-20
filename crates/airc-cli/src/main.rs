@@ -25,6 +25,7 @@ mod codex_install;
 mod codex_start;
 mod collaboration_cli;
 mod collaboration_commands;
+mod collaboration_peers;
 mod commands;
 mod config_cli;
 mod config_commands;
@@ -322,6 +323,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             CollaborationAction::PeersFallback(args) => {
                 collaboration_commands::run_peers_fallback(&home, args)
+            }
+            CollaborationAction::Peers(args) => collaboration_peers::run_peers(&home, args),
+            CollaborationAction::PrunePeers(args) => {
+                collaboration_peers::run_prune_peers(&home, args)
             }
             CollaborationAction::WhoisFallback { scope, peer_name } => {
                 collaboration_commands::run_whois_fallback(&home, scope, &peer_name)
