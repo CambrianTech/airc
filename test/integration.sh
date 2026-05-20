@@ -1586,11 +1586,17 @@ scenario_heartbeat() {
   # power-off. Include any recorded child PIDs when present.
   local host_pids host_parent
   host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null || true)
-  host_parent=$(pgrep -f "AIRC_HOME=/tmp/airc-it-h/state.*connect --room $rname" 2>/dev/null | head -1 || true)
+  host_parent=$(pgrep -f "airc connect --room $rname" 2>/dev/null || true)
   [ -n "$host_parent" ] && host_pids="$host_pids $host_parent"
+  host_pids="$host_pids $(pgrep -f "bearer recv .*--room-gist-id $gist_id" 2>/dev/null || true)"
   [ -n "$(printf '%s' "$host_pids" | tr -d '[:space:]')" ] || { fail "no host process found"; gh gist delete "$gist_id" --yes 2>/dev/null; cleanup_all; return; }
   kill -9 $host_pids 2>/dev/null || true
   sleep 1
+  if pgrep -f "airc connect --room $rname" >/dev/null 2>&1; then
+    fail "host process survived kill -9"
+    gh gist delete "$gist_id" --yes 2>/dev/null
+    cleanup_all; return
+  fi
   pass "host kill -9'd ($host_pids)"
 
   # Wait past the stale window. Use the earlier hb2 timestamp as our

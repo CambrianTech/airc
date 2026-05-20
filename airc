@@ -371,7 +371,8 @@ _reexec_into() {
   if [ -d "$AIRC_WRITE_DIR" ]; then
     printf '%d:%d\n' "$$" "$(date +%s)" > "$AIRC_WRITE_DIR/airc.reexec-marker" 2>/dev/null || true
   fi
-  local _name; _name=$(get_config_val name "")
+  local _name="${AIRC_NAME:-}"
+  [ -z "$_name" ] && _name=$(get_config_val name "")
   # Preserve user's --room intent across exec when set (see
   # _self_heal_stale_host). Without this, an explicit `airc join --room
   # qa-foo` that triggers stale-host takeover loses --room and
@@ -380,6 +381,9 @@ _reexec_into() {
   if [ "$mode" = "host" ]; then
     exec env AIRC_NO_DISCOVERY=1 \
       ${_name:+AIRC_NAME="$_name"} \
+      ${AIRC_ADOPT_GIST:+AIRC_ADOPT_GIST="$AIRC_ADOPT_GIST"} \
+      ${AIRC_HEARTBEAT_SEC:+AIRC_HEARTBEAT_SEC="$AIRC_HEARTBEAT_SEC"} \
+      ${AIRC_HEARTBEAT_STALE:+AIRC_HEARTBEAT_STALE="$AIRC_HEARTBEAT_STALE"} \
       ${_intent:+AIRC_ROOM_INTENT="$_intent"} \
       "$0" join "$@"
   else

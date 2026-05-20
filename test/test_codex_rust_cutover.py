@@ -118,6 +118,24 @@ class CodexRustCutoverTests(unittest.TestCase):
         self.assertIn('"$(airc_rs_bin)" gist get .host.name', body)
         self.assertNotIn("python3 -c", body)
 
+    def test_heartbeat_gist_edits_select_canonical_filename(self):
+        source = (REPO / "lib/airc_bash/cmd_connect.sh").read_text(encoding="utf-8")
+
+        self.assertIn('"$(airc_rs_bin)" gh patch-gist-file', source)
+        self.assertIn('--filename "airc-room-${room_name}.json"', source)
+        self.assertIn('--filename "airc-room-${_hb_room}.json"', source)
+
+    def test_stale_host_reexec_preserves_takeover_env(self):
+        source = (REPO / "airc").read_text(encoding="utf-8")
+        start = source.index("_reexec_into()")
+        end = source.index("# Stale-host self-heal", start)
+        body = source[start:end]
+
+        self.assertIn('local _name="${AIRC_NAME:-}"', body)
+        self.assertIn('${AIRC_ADOPT_GIST:+AIRC_ADOPT_GIST="$AIRC_ADOPT_GIST"}', body)
+        self.assertIn('${AIRC_HEARTBEAT_SEC:+AIRC_HEARTBEAT_SEC="$AIRC_HEARTBEAT_SEC"}', body)
+        self.assertIn('${AIRC_HEARTBEAT_STALE:+AIRC_HEARTBEAT_STALE="$AIRC_HEARTBEAT_STALE"}', body)
+
     def test_integration_quit_config_probes_use_airc_rs(self):
         source = (REPO / "test/integration.sh").read_text(encoding="utf-8")
         start = source.index("scenario_quit()")

@@ -15,6 +15,16 @@ pub enum GhAction {
         gh_args: Vec<String>,
     },
 
+    /// Patch one file in a gist using the GitHub API.
+    PatchGistFile {
+        #[arg(long)]
+        gist_id: String,
+        #[arg(long)]
+        filename: String,
+        #[arg(long)]
+        content_file: std::path::PathBuf,
+    },
+
     /// Print current shared backoff wait in seconds.
     WaitSeconds,
 
