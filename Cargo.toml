@@ -11,6 +11,7 @@ members = [
     "crates/airc-daemon",
     "crates/airc-lib",
     "crates/airc-cli",
+    "crates/examples/embedded_consumer_smoke",
 ]
 resolver = "2"
 
