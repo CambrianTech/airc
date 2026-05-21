@@ -447,7 +447,7 @@ cmd_codex_hook() {
   ensure_init
 
   local _airc_core
-  _airc_core=$(command -v airc-core 2>/dev/null || true)
+  _airc_core=$(airc_core_bin 2>/dev/null || true)
   if [ -z "$_airc_core" ]; then
     die "airc-core is required for codex-hook; build/install the Rust CLI first"
   fi
@@ -504,7 +504,7 @@ cmd_codex_start() {
   local _started_at
   _started_at=$(date +%s)
   local _airc_core
-  _airc_core=$(command -v airc-core 2>/dev/null || true)
+  _airc_core=$(airc_core_bin 2>/dev/null || true)
   if [ -z "$_airc_core" ]; then
     die "airc-core is required for codex-start; build/install the Rust CLI first"
   fi
