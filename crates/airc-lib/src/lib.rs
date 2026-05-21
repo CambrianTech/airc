@@ -28,6 +28,7 @@ mod coordinator_lock;
 mod daemon;
 pub mod error;
 mod fs_permissions;
+pub mod gh_account_registry;
 pub mod join_context;
 mod lan;
 pub mod mesh_identity;
@@ -57,6 +58,7 @@ pub use coordinator::{
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
 };
 pub use error::AircError;
+pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use mesh_identity::{
     load_cached as load_cached_mesh_identity, path_in as mesh_identity_path,
