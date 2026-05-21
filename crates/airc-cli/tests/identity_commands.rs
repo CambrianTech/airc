@@ -4,7 +4,7 @@ use base64::{engine::general_purpose, Engine};
 use tempfile::TempDir;
 
 fn airc_core() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-core")
+    env!("CARGO_BIN_EXE_airc")
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use std::process::Command;
 
 fn airc_core() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-core")
+    env!("CARGO_BIN_EXE_airc")
 }
 
 #[test]

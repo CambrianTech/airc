@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn airc_core() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-core")
+    env!("CARGO_BIN_EXE_airc")
 }
 
 fn command_for_home(home: &Path) -> Command {
