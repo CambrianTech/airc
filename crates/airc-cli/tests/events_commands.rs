@@ -46,6 +46,19 @@ fn events_list_filters_by_kind_and_header_prefix() {
     assert!(!output.contains("plain chat"));
 }
 
+#[test]
+fn send_receipt_distinguishes_local_store_from_peer_delivery() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let output = run_ok(&home, &["send", "not delivered to a peer"]);
+
+    assert!(output.contains("stored locally"));
+    assert!(output.contains("no enrolled peers"));
+    assert!(output.contains("not delivered to another agent"));
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = Command::new(airc_core())
         .arg("--home")
