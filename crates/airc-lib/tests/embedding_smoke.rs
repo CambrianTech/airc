@@ -229,7 +229,7 @@ async fn peer_spec_round_trips_via_add_peer() {
 #[test]
 fn same_machine_scopes_share_account_wire_and_registry() {
     let machine = TempDir::new().unwrap();
-    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -276,7 +276,7 @@ fn same_machine_scopes_share_account_wire_and_registry() {
 #[test]
 fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire() {
     let machine = TempDir::new().unwrap();
-    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -394,10 +394,14 @@ fn repo_with_origin(path: &std::path::Path, origin: &str) -> std::path::PathBuf 
 }
 
 fn seed_mesh_identity(home: &std::path::Path, identity: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     resolve_mesh_identity_with(
         home,
         || Some((identity.to_string(), MeshIdentitySource::Operator)),
-        1,
+        now_ms,
     )
     .unwrap();
 }
