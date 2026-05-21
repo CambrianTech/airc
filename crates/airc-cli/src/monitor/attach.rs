@@ -4,6 +4,7 @@ use std::path::Path;
 
 use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, EventFilter};
+use airc_protocol::HEADER_AIRC_CLIENT;
 use futures::StreamExt;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
@@ -31,7 +32,7 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
 }
 
 fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut Sandbox) {
-    if client_id.is_some_and(|id| event.client_id.to_string() == id) {
+    if is_own_runtime_event(event, client_id) {
         return;
     }
 
@@ -43,7 +44,7 @@ fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut 
     let channel = normalize_channel(&event.room_id.to_string());
     let mut attrs = vec![
         format!("from=\"{}\"", xml_escape(&event.peer_id.to_string())),
-        format!("client=\"{}\"", xml_escape(&event.client_id.to_string())),
+        format!("client=\"{}\"", xml_escape(&display_client(event))),
         format!("channel=\"{}\"", xml_escape(&channel)),
         format!("ts=\"{}\"", event.occurred_at_ms),
     ];
@@ -63,6 +64,24 @@ fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut 
         attrs = attrs.join(" "),
         body = xml_escape(body)
     );
+}
+
+fn is_own_runtime_event(event: &TranscriptEvent, client_id: Option<&str>) -> bool {
+    let Some(client_id) = client_id else {
+        return false;
+    };
+    if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
+        return event_client == client_id;
+    }
+    event.client_id.to_string() == client_id
+}
+
+fn display_client(event: &TranscriptEvent) -> String {
+    event
+        .headers
+        .get(HEADER_AIRC_CLIENT)
+        .cloned()
+        .unwrap_or_else(|| event.client_id.to_string())
 }
 
 fn body_text(body: &Body) -> Option<&str> {
@@ -90,6 +109,33 @@ mod tests {
         render_event(&event, Some(&event.client_id.to_string()), &mut sandbox);
 
         assert!(!sandbox.has_emitted());
+    }
+
+    #[test]
+    fn render_event_filters_same_runtime_client_header() {
+        let mut event = event("hello");
+        event
+            .headers
+            .insert(HEADER_AIRC_CLIENT.to_string(), "codex:thread-1".to_string());
+        let mut sandbox = Sandbox::new();
+
+        render_event(&event, Some("codex:thread-1"), &mut sandbox);
+
+        assert!(!sandbox.has_emitted());
+    }
+
+    #[test]
+    fn render_event_keeps_different_runtime_client_header() {
+        let mut event = event("hello");
+        event.headers.insert(
+            HEADER_AIRC_CLIENT.to_string(),
+            "claude:session-1".to_string(),
+        );
+        let mut sandbox = Sandbox::new();
+
+        render_event(&event, Some("codex:thread-1"), &mut sandbox);
+
+        assert!(sandbox.has_emitted());
     }
 
     fn event(text: &str) -> TranscriptEvent {

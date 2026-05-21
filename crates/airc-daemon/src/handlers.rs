@@ -129,7 +129,7 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
 
 async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
     let transport = state.local_fs_for(&send.wire).await;
-    let frame = match build_message_frame(&state, send.channel, &send.text) {
+    let frame = match build_message_frame(&state, send.channel, &send.text, send.headers) {
         Ok(frame) => frame,
         Err(error) => {
             return Response::Error {
@@ -211,6 +211,7 @@ fn build_message_frame(
     state: &DaemonState,
     channel: uuid::Uuid,
     text: &str,
+    headers: Headers,
 ) -> Result<Frame, std::time::SystemTimeError> {
     let lamport = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -226,7 +227,7 @@ fn build_message_frame(
             lamport,
             occurred_at_ms: lamport,
             reply_to: None,
-            headers: Headers::new(),
+            headers,
             body: Some(Body::text(text)),
             media: Vec::new(),
             // Unsigned at this layer — SignedTransport replaces it
@@ -327,6 +328,7 @@ mod tests {
                 wire: dir.path().to_path_buf(),
                 channel: Uuid::nil(),
                 text: "hello".to_string(),
+                headers: Headers::new(),
             }),
         )
         .await;

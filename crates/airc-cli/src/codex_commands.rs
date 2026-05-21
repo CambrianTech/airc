@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use airc_core::{Body, TranscriptCursor, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, EventFilter};
+use airc_protocol::HEADER_AIRC_CLIENT;
 use serde::Serialize;
+
+use crate::client_id::current_client_id;
 
 const DEFAULT_CURSOR_FILENAME: &str = "codex_hook_cursor.json";
 
@@ -39,9 +42,10 @@ pub async fn run_user_prompt_submit(
         write_cursor(&cursor_path, &newest)?;
     }
 
+    let runtime_client = current_client_id()?;
     let visible: Vec<_> = events
         .into_iter()
-        .filter(|event| include_self || event.peer_id != airc.peer_id())
+        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
         .collect();
     if visible.is_empty() {
         return Ok(());
@@ -54,6 +58,15 @@ pub async fn run_user_prompt_submit(
     };
     print_hook_payload(&context)?;
     Ok(())
+}
+
+fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&str>) -> bool {
+    if let Some(runtime_client) = runtime_client {
+        if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
+            return event_client == runtime_client;
+        }
+    }
+    event.client_id == airc.client_id() || event.peer_id == airc.peer_id()
 }
 
 fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {

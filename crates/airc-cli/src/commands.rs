@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
-use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
+use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
 use airc_daemon::{
     peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, LocalIdentity,
 };
-use airc_lib::{Airc, Body, PeerSpec};
+use airc_lib::{Airc, Body, Headers, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
 
 /// `init` — open the substrate at `<home>`. `Airc::open` loads or
@@ -182,7 +182,7 @@ pub async fn run_send(
         airc.enrol_volatile_peer(peer)?;
     }
     let current = airc.current_room().await?;
-    airc.say(text).await?;
+    airc.say_with_headers(text, runtime_headers()?).await?;
     let peer_count = airc.peers().await?.len();
     // `Airc::say` returned Ok — the frame is signed, persisted to the
     // local store, and written to the wire. Any scope tailing this
@@ -257,7 +257,7 @@ pub async fn run_lan_send(
     }
     let current = airc.current_room().await?;
     airc.connect_lan(to, expected_peer).await?;
-    airc.say(text).await?;
+    airc.say_with_headers(text, runtime_headers()?).await?;
     println!(
         "sent over lan-tcp to {} ({}).",
         current.name, current.channel
@@ -352,7 +352,7 @@ pub async fn run_msg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
-    airc.say(text).await?;
+    airc.say_with_headers(text, runtime_headers()?).await?;
     let peer_count = airc.peers().await?.len();
     // See run_send for the rationale — same message-honesty fix
     // for the daemon-attached send path.
@@ -546,3 +546,11 @@ pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>
 // file. Keeping the import explicit makes the dep graph readable.
 #[allow(dead_code)]
 fn _client_id_kept_in_scope(_: ClientId) {}
+
+fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
+    let mut headers = Headers::new();
+    if let Some(client) = crate::client_id::current_client_id()? {
+        headers.insert(HEADER_AIRC_CLIENT.to_string(), client);
+    }
+    Ok(headers)
+}

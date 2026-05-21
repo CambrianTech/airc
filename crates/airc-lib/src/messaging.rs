@@ -11,11 +11,20 @@ use crate::Airc;
 impl Airc {
     /// Send a plain-text message to the current room.
     pub async fn say(&self, text: &str) -> Result<EventId, AircError> {
+        self.say_with_headers(text, Headers::new()).await
+    }
+
+    /// Send a plain-text message with envelope headers.
+    pub async fn say_with_headers(
+        &self,
+        text: &str,
+        headers: Headers,
+    ) -> Result<EventId, AircError> {
         if self.is_daemon_attached() {
             let room = self.current_room().await?;
-            return self.daemon_send_text(&room, text).await;
+            return self.daemon_send_text(&room, text, headers).await;
         }
-        self.send(Body::text(text), Headers::new()).await
+        self.send(Body::text(text), headers).await
     }
 
     /// Send a frame with typed body and arbitrary headers.

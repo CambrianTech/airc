@@ -295,6 +295,7 @@ mod tests {
                 wire: wire.clone(),
                 channel,
                 text: "hello from daemon".to_string(),
+                headers: airc_core::Headers::new(),
             })
             .await
             .unwrap();

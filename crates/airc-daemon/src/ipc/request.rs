@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use airc_core::PeerId;
+use airc_core::{Headers, PeerId};
 
 /// A single client-issued operation. Wire-tagged by `op`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +89,10 @@ pub struct SendRequest {
     pub channel: Uuid,
     /// Body text.
     pub text: String,
+    /// Optional envelope headers supplied by the caller. Used for
+    /// runtime consumer metadata such as `airc.client`.
+    #[serde(default)]
+    pub headers: Headers,
 }
 
 #[cfg(test)]
@@ -111,6 +115,7 @@ mod tests {
             wire: PathBuf::from("/tmp/wire"),
             channel: Uuid::nil(),
             text: "hello".to_string(),
+            headers: Headers::new(),
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();

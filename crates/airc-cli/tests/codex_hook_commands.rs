@@ -79,6 +79,32 @@ fn codex_hook_excludes_self_echoes_but_still_advances_cursor() {
 }
 
 #[test]
+fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+    let cursor = workspace.path().join("cursor.json");
+
+    run_ok(&home, &["init"]);
+    run_ok_with_client(&home, "codex:thread-1", &["send", "own runtime"]);
+    run_ok_with_client(&home, "claude:session-1", &["send", "peer runtime"]);
+
+    let output = run_hook_with_client(
+        &home,
+        "codex:thread-1",
+        &[
+            "codex-hook",
+            "user-prompt-submit",
+            "--cursor-file",
+            cursor.to_str().unwrap(),
+        ],
+        "{}",
+    );
+    let context = additional_context(&output);
+    assert!(!context.contains("own runtime"));
+    assert!(context.contains("peer runtime"));
+}
+
+#[test]
 fn codex_hook_raw_mode_preserves_full_event_lines() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
@@ -286,8 +312,54 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
+fn run_ok_with_client(home: &Path, client_id: &str, args: &[&str]) -> String {
+    let output = command_for_home(home)
+        .env("AIRC_CLIENT_ID", client_id)
+        .args(["--home"])
+        .arg(home)
+        .args(args)
+        .output()
+        .expect("airc-core command must spawn");
+    assert!(
+        output.status.success(),
+        "airc-core {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("stdout utf-8")
+}
+
 fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
     let mut child = command_for_home(home)
+        .args(["--home"])
+        .arg(home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("airc-core hook must spawn");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("write hook stdin");
+    let output = child.wait_with_output().expect("wait for hook");
+    assert!(
+        output.status.success(),
+        "airc-core {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("stdout utf-8")
+}
+
+fn run_hook_with_client(home: &Path, client_id: &str, args: &[&str], stdin: &str) -> String {
+    let mut child = command_for_home(home)
+        .env("AIRC_CLIENT_ID", client_id)
         .args(["--home"])
         .arg(home)
         .args(args)
