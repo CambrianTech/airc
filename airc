@@ -2576,6 +2576,9 @@ _airc_should_use_codex_start() {
 }
 
 _airc_join_or_start() {
+  if _airc_rust_join_or_attach "$@"; then
+    return 0
+  fi
   if _airc_should_use_codex_start "$@"; then
     cmd_codex_start "$@"
   else
@@ -2583,10 +2586,127 @@ _airc_join_or_start() {
   fi
 }
 
+_airc_rust_join_or_attach() {
+  local _attach=0
+  local _room=""
+  local _arg
+
+  while [ "$#" -gt 0 ]; do
+    _arg="$1"
+    case "$_arg" in
+      --attach|-attach)
+        _attach=1
+        shift ;;
+      --no-gist|-no-gist|--gist|-gist|--no-tailscale|-no-tailscale|--general|-general)
+        shift ;;
+      --room|--room-only|-room|-room-only)
+        [ "$#" -ge 2 ] || return 1
+        _room="$2"
+        shift 2 ;;
+      --no-general|-no-general)
+        # Project-only join is still owned by the shell room-gist path
+        # until the Rust join API has an explicit no-general contract.
+        return 1 ;;
+      --takeover|-takeover|--no-room|-no-room)
+        return 1 ;;
+      -*)
+        return 1 ;;
+      *@*@*#*|[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+        # Explicit invite/gist flows still use the existing bootstrap
+        # path. Named rooms, including hyphenated rooms, stay on Rust.
+        return 1 ;;
+      *)
+        [ -z "$_room" ] || return 1
+        _room="$_arg"
+        shift ;;
+    esac
+  done
+
+  local _airc_core
+  _airc_core=$(airc_core_bin 2>/dev/null || true)
+  [ -n "$_airc_core" ] || return 1
+
+  if [ -n "$_room" ]; then
+    "$_airc_core" --home "$AIRC_WRITE_DIR" join "$_room" || return $?
+  else
+    "$_airc_core" --home "$AIRC_WRITE_DIR" join || return $?
+  fi
+
+  if [ -f "$AIRC_WRITE_DIR/airc.pid" ] \
+      && [ "$(_monitor_alive_with_bearer_fallback "$AIRC_WRITE_DIR/airc.pid")" != "yes" ]; then
+    rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || true
+  fi
+
+  if [ "$_attach" = "1" ]; then
+    _join_attach_local_stream
+    return $?
+  fi
+
+  echo ""
+  echo "Status"
+  echo "------"
+  cmd_status
+  echo ""
+  echo "Inbox"
+  echo "-----"
+  AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 10 || true
+  return 0
+}
+
+_airc_msg_or_send() {
+  local _orig_args=("$@")
+  local _channel=""
+  local _internal=0
+  local _positional=()
+  local _arg
+
+  while [ "$#" -gt 0 ]; do
+    _arg="$1"
+    case "$_arg" in
+      --channel|-c|--room|-room)
+        [ "$#" -ge 2 ] || { cmd_send "${_orig_args[@]}"; return $?; }
+        _channel="$2"
+        shift 2 ;;
+      --internal|--system|--heartbeat|--plaintext)
+        _internal=1
+        break ;;
+      --*)
+        cmd_send "${_orig_args[@]}"
+        return $? ;;
+      *)
+        _positional+=("$_arg")
+        shift ;;
+    esac
+  done
+
+  [ "$_internal" = "0" ] || { cmd_send "${_orig_args[@]}"; return $?; }
+  [ "${#_positional[@]}" -gt 0 ] || { cmd_send "${_orig_args[@]}"; return $?; }
+  case "${_positional[0]}" in
+    @*) cmd_send "${_orig_args[@]}"; return $? ;;
+  esac
+
+  local _airc_core
+  _airc_core=$(airc_core_bin 2>/dev/null || true)
+  [ -n "$_airc_core" ] || { cmd_send "${_orig_args[@]}"; return $?; }
+
+  local _text
+  printf -v _text '%s ' "${_positional[@]}"
+  _text="${_text% }"
+
+  if [ -n "$_channel" ]; then
+    "$_airc_core" --home "$AIRC_WRITE_DIR" join "$_channel" >/dev/null \
+      || die "rust message route failed to select #${_channel}"
+  fi
+  "$_airc_core" --home "$AIRC_WRITE_DIR" send "$_text" \
+    || die "rust local message route failed"
+  date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null || true
+  rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null || true
+}
+
 case "${1:-help}" in
   connect|setup|start) shift; cmd_connect "$@" ;;
   join|resume) shift; _airc_join_or_start "$@" ;;
-  send|msg|say)   shift; cmd_send "$@" ;;
+  send|msg|say)   shift; _airc_msg_or_send "$@" ;;
   privmsg)   shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
   ping)      shift; cmd_ping "$@" ;;
