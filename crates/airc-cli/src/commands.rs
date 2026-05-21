@@ -118,14 +118,27 @@ pub async fn run_send(
     let current = airc.current_room().await?;
     airc.say(text).await?;
     let peer_count = airc.peers().await?.len();
+    // `Airc::say` returned Ok — the frame is signed, persisted to the
+    // local store, and written to the wire. Any scope tailing this
+    // channel's wire will receive it. The peer-registry count
+    // (`peers()`) reflects cryptographically-paired *remote* peers;
+    // a count of 0 does NOT mean "no readers." Two scopes on the
+    // same machine share the wire via the account-home convention
+    // and deliver to each other without any peer enrollment.
+    //
+    // The previous "stored locally — not delivered to another
+    // agent" wording was a lie in exactly that case (caught by
+    // Codex's criterion #3): the message DID deliver to same-
+    // machine same-HOME tailers. Replace with a description that
+    // matches what actually happened.
     if peer_count == 0 {
         println!(
-            "stored locally in {} ({}) - no enrolled peers; not delivered to another agent.",
+            "sent to {} ({}). 0 paired remote peers; any scope tailing this channel on this machine will receive it.",
             current.name, current.channel
         );
     } else {
         println!(
-            "sent to {} ({}) for {peer_count} enrolled peer(s).",
+            "sent to {} ({}) — {peer_count} paired peer(s) + any local scope tailing this channel.",
             current.name, current.channel
         );
     }
@@ -275,14 +288,16 @@ pub async fn run_msg(
     let current = airc.current_room().await?;
     airc.say(text).await?;
     let peer_count = airc.peers().await?.len();
+    // See run_send for the rationale — same message-honesty fix
+    // for the daemon-attached send path.
     if peer_count == 0 {
         println!(
-            "stored locally in {} ({}) - no enrolled peers; not delivered to another agent.",
+            "sent to {} ({}). 0 paired remote peers; any scope tailing this channel on this machine will receive it.",
             current.name, current.channel
         );
     } else {
         println!(
-            "sent to {} ({}) for {peer_count} enrolled peer(s).",
+            "sent to {} ({}) — {peer_count} paired peer(s) + any local scope tailing this channel.",
             current.name, current.channel
         );
     }
