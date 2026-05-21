@@ -303,7 +303,8 @@ Already landed in rust-rewrite:
   stale `airc-core`, runs two fresh project scopes through public `airc join`,
   proves they converge on the same account-home `#general` RoomId and wire,
   sends through public `airc msg`, and proves the second scope reads that
-  message through the Rust event surface;
+  message through the Rust event surface, live `airc join --attach` monitor,
+  and `airc codex-hook user-prompt-submit`;
 - machine-global coordinator/cache under `~/.airc/accounts/<identity>/` with
   typed presence beacons, TTL partitioning, and atomic refresh singleflight;
 - `Airc::join` / `Airc::join_default_context()` publish coordinator beacons for
@@ -316,8 +317,6 @@ Current rust-rewrite still has account-mesh gaps:
 
 - CLI `room` language still needs final cleanup so it reads as subscription
   management rather than single-room switching;
-- monitor and hook reliability must be proven through public installed
-  commands using the same coordinator-backed join path;
 - cross-machine account-mesh discovery still needs the rare remote registry
   publisher/refresh path.
 
@@ -348,33 +347,35 @@ Required corrections:
    worktrees under `~/.airc/worktrees`, and no stale language-suffixed binaries
    or hidden alternate source roots.
 
-## Handoff: Monitor And Hook Proof
+## Handoff: Cross-Machine Registry Proof
 
-The coordinator foundation and join wiring are landed. Claude should not
-reimplement `join_default_context`, wrapper seeding, PATH shim, coordinator
-locks, or wire replay. The next slice is the automatic delivery surface.
+The local same-account path is proven through public installed commands:
+`airc join`, `airc msg`, `airc events`, `airc join --attach`, and
+`airc codex-hook user-prompt-submit`. Claude should not reimplement
+`join_default_context`, wrapper seeding, PATH shim, coordinator locks, wire
+replay, monitor attach, or hook reads.
 
 Scope:
 
-- validate `airc join --attach` from a clean installed source, no manual binary
-  copy and no test-only environment override;
-- prove a second fresh scope sends via public `airc msg` and the first scope's
-  monitor emits the inbound event live;
-- prove `airc codex-hook user-prompt-submit` reads the same message through the
-  Rust subscribed event surface;
-- keep all monitor and hook reads scoped to the subscription set, not a
-  single current room;
-- do not add shell log scraping, gist polling, symlink workarounds, or
-  alternate source roots.
+- implement the rare remote registry publisher/refresh path for account mesh
+  discovery;
+- keep GitHub/gist limited to registry/bootstrap metadata, never message
+  delivery;
+- use the coordinator singleflight/backoff so concurrent local joins cause one
+  remote refresh at most;
+- publish route beacons for direct transports (local/LAN/Tailscale/relay/etc.)
+  without changing channel semantics;
+- prove two clean scopes that do not share a local machine account can discover
+  the same account channels through the registry and then use the selected
+  data plane.
 
-Acceptance for the monitor/hook PR:
+Acceptance for the cross-machine PR:
 
-- `test/public_installed_runtime_proof.sh` or a sibling public-install proof
-  starts two fresh scopes, runs bare `airc join`, sends from one, and observes
-  the other through monitor or hook delivery without peer pre-seeding and
-  without GitHub;
-- one-shot event reads remain deterministic through SDK wire replay, not
-  sleeps around background tailers;
+- public installed proof or integration test creates two isolated machine homes
+  for the same mesh identity, runs bare `airc join`, and verifies they derive
+  the same `#general` and inferred org channel without a pasted invite;
+- the test asserts routine chat does not use GitHub as a data plane;
+- same-machine proof remains green without network access;
 - the public command remains `airc`; no hidden language-suffixed runtime path
   or alternate source root is introduced.
 

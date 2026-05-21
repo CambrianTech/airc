@@ -42,7 +42,11 @@ case "$(uname -s 2>/dev/null)" in
 esac
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/airc-public-proof.XXXXXX")"
+MONITOR_PID=""
 cleanup() {
+  if [ -n "$MONITOR_PID" ]; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+  fi
   for scope in \
     "$ROOT/home/continuum/.airc" \
     "$ROOT/home/openclaw/.airc"; do
@@ -208,25 +212,35 @@ PROOF_MESSAGE="public installed runtime proof $(date +%s)"
 }
 
 wait_for_message() {
+  local repo="$1"
+  local scope="$2"
+  local message="$3"
+  local out="$4"
+  local err="$5"
   local deadline=$((SECONDS + 12))
   while [ "$SECONDS" -lt "$deadline" ]; do
     (
-      cd "$OPENCLAW_REPO" || exit 1
+      cd "$repo" || exit 1
       HOME="$MACHINE_HOME" \
-        AIRC_HOME="$OPENCLAW_SCOPE" \
+        AIRC_HOME="$scope" \
         AIRC_NO_DISCOVERY=1 \
         AIRC_NO_GENERAL=1 \
         AIRC_BACKGROUND_OK=1 \
         AIRC_NO_ATTACH=1 \
         "$AIRC_BIN" events list --kind message --limit 32
-    ) >"$ROOT/events.out" 2>"$ROOT/events.err" || return 1
-    grep -q "$PROOF_MESSAGE" "$ROOT/events.out" && return 0
+    ) >"$out" 2>"$err" || return 1
+    grep -q "$message" "$out" && return 0
     sleep 1
   done
   return 1
 }
 
-if ! wait_for_message; then
+if ! wait_for_message \
+  "$OPENCLAW_REPO" \
+  "$OPENCLAW_SCOPE" \
+  "$PROOF_MESSAGE" \
+  "$ROOT/events.out" \
+  "$ROOT/events.err"; then
   echo "--- events stdout ---" >&2
   cat "$ROOT/events.out" >&2 || true
   echo "--- events stderr ---" >&2
@@ -234,4 +248,129 @@ if ! wait_for_message; then
   fail "second fresh scope did not read public airc msg from account wire"
 fi
 
-log "public airc command, account-room derivation, same-machine #general wire, and message delivery are coherent"
+wait_for_file_text() {
+  local file="$1"
+  local needle="$2"
+  local deadline=$((SECONDS + 12))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ -f "$file" ] && grep -q "$needle" "$file" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+start_monitor_for_scope() {
+  local repo="$1"
+  local scope="$2"
+  local out="$3"
+  local err="$4"
+  (
+    cd "$repo" || exit 1
+    HOME="$MACHINE_HOME" \
+      AIRC_HOME="$scope" \
+      AIRC_NO_DISCOVERY=1 \
+      AIRC_NO_GENERAL=1 \
+      AIRC_BACKGROUND_OK=1 \
+      "$AIRC_BIN" join --attach --no-gist >"$out" 2>"$err"
+  ) &
+  MONITOR_PID=$!
+  if ! wait_for_file_text "$out" "attached to Rust event stream"; then
+    echo "--- monitor stdout ---" >&2
+    cat "$out" >&2 || true
+    echo "--- monitor stderr ---" >&2
+    cat "$err" >&2 || true
+    fail "public airc join --attach did not attach monitor to Rust event stream"
+  fi
+}
+
+MONITOR_MESSAGE="monitor public proof $(date +%s)"
+start_monitor_for_scope "$OPENCLAW_REPO" "$OPENCLAW_SCOPE" "$ROOT/monitor.out" "$ROOT/monitor.err"
+(
+  cd "$CONTINUUM_REPO" || exit 1
+  HOME="$MACHINE_HOME" \
+    AIRC_HOME="$CONTINUUM_SCOPE" \
+    AIRC_NO_DISCOVERY=1 \
+    AIRC_NO_GENERAL=1 \
+    AIRC_BACKGROUND_OK=1 \
+    AIRC_NO_ATTACH=1 \
+    "$AIRC_BIN" msg --channel general "$MONITOR_MESSAGE" >"$ROOT/monitor-msg.out" 2>"$ROOT/monitor-msg.err"
+) || {
+  echo "--- monitor msg stdout ---" >&2
+  cat "$ROOT/monitor-msg.out" >&2 || true
+  echo "--- monitor msg stderr ---" >&2
+  cat "$ROOT/monitor-msg.err" >&2 || true
+  fail "public airc msg for monitor proof failed"
+}
+
+if ! wait_for_file_text "$ROOT/monitor.out" "$MONITOR_MESSAGE"; then
+  echo "--- monitor stdout ---" >&2
+  cat "$ROOT/monitor.out" >&2 || true
+  echo "--- monitor stderr ---" >&2
+  cat "$ROOT/monitor.err" >&2 || true
+  fail "public airc join --attach did not render inbound peer message"
+fi
+
+kill "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=""
+
+HOOK_MESSAGE="codex hook public proof $(date +%s)"
+(
+  cd "$CONTINUUM_REPO" || exit 1
+  HOME="$MACHINE_HOME" \
+    AIRC_HOME="$CONTINUUM_SCOPE" \
+    AIRC_NO_DISCOVERY=1 \
+    AIRC_NO_GENERAL=1 \
+    AIRC_BACKGROUND_OK=1 \
+    AIRC_NO_ATTACH=1 \
+    "$AIRC_BIN" msg --channel general "$HOOK_MESSAGE" >"$ROOT/hook-msg.out" 2>"$ROOT/hook-msg.err"
+) || {
+  echo "--- hook msg stdout ---" >&2
+  cat "$ROOT/hook-msg.out" >&2 || true
+  echo "--- hook msg stderr ---" >&2
+  cat "$ROOT/hook-msg.err" >&2 || true
+  fail "public airc msg for codex-hook proof failed"
+}
+
+if ! wait_for_message \
+  "$OPENCLAW_REPO" \
+  "$OPENCLAW_SCOPE" \
+  "$HOOK_MESSAGE" \
+  "$ROOT/hook-events.out" \
+  "$ROOT/hook-events.err"; then
+  echo "--- hook warmup events stdout ---" >&2
+  cat "$ROOT/hook-events.out" >&2 || true
+  echo "--- hook warmup events stderr ---" >&2
+  cat "$ROOT/hook-events.err" >&2 || true
+  fail "second fresh scope did not persist hook proof message before codex-hook"
+fi
+
+(
+  cd "$OPENCLAW_REPO" || exit 1
+  printf '{"hook_event_name":"UserPromptSubmit"}' | \
+    HOME="$MACHINE_HOME" \
+    AIRC_HOME="$OPENCLAW_SCOPE" \
+    AIRC_NO_DISCOVERY=1 \
+    AIRC_NO_GENERAL=1 \
+    AIRC_BACKGROUND_OK=1 \
+    AIRC_NO_ATTACH=1 \
+    "$AIRC_BIN" codex-hook user-prompt-submit \
+      --cursor-file "$ROOT/codex-hook-cursor.json" \
+      --count 64 \
+      --raw
+) >"$ROOT/codex-hook.out" 2>"$ROOT/codex-hook.err" || {
+  echo "--- codex-hook stdout ---" >&2
+  cat "$ROOT/codex-hook.out" >&2 || true
+  echo "--- codex-hook stderr ---" >&2
+  cat "$ROOT/codex-hook.err" >&2 || true
+  fail "public airc codex-hook user-prompt-submit failed"
+}
+
+if ! grep -q "$HOOK_MESSAGE" "$ROOT/codex-hook.out"; then
+  echo "--- codex-hook stdout ---" >&2
+  cat "$ROOT/codex-hook.out" >&2 || true
+  echo "--- codex-hook stderr ---" >&2
+  cat "$ROOT/codex-hook.err" >&2 || true
+  fail "public airc codex-hook did not include inbound Rust event context"
+fi
+
+log "public airc command, account-room derivation, same-machine #general wire, message delivery, monitor attach, and codex-hook are coherent"

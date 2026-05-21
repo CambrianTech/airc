@@ -897,7 +897,9 @@ cmd_connect() {
   if [ "$#" -ge 1 ] && [[ "$1" == *@*@*#* ]]; then
     _looks_like_invite=1
   fi
-  if [ "$use_room" = "1" ] && [ "$_looks_like_invite" = "0" ] \
+  if [ "$use_room" = "1" ] && [ "$use_gist" = "1" ] \
+     && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] \
+     && [ "$_looks_like_invite" = "0" ] \
      && command -v gh >/dev/null 2>&1; then
     # Pre-flight via the centralized state machine (lib_auth.sh).
     # ok → proceed; rate_limited → proceed degraded so the monitor can
