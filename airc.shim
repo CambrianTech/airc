@@ -1,8 +1,8 @@
 #!/bin/bash
-# airc — polyglot PATH shim. Single source of truth: the canonical
-# bash airc lives at $HOME/.airc/src/airc on the WSL/Linux/macOS host.
-# This shim is what gets dropped into Windows-visible PATH locations
-# (e.g. /c/Users/<user>/.local/bin/airc) so Git Bash users get a real
+# airc — polyglot PATH shim. Single source of truth: the canonical bash
+# airc lives at $HOME/.airc/src/airc. This shim is what gets dropped
+# into PATH-visible locations (e.g. ~/.local/bin/airc or
+# /c/Users/<user>/.local/bin/airc) so users and agents get a real
 # command without copying the full script.
 #
 # Why a shim instead of a symlink: install.sh on Git Bash for Windows
@@ -16,12 +16,13 @@
 #
 # Resolution order:
 #   1. AIRC_DIR explicitly set + has airc            → exec that
-#   2. AIRC_WINDOWS_NATIVE=1 + native clone exists   → exec native
-#   3. wsl.exe present + WSL canonical clone exists  → route via wsl.exe
-#   4. Native Windows clone at %USERPROFILE%\.airc\src exists
+#   2. Native POSIX clone at $HOME/.airc/src exists → exec native
+#   3. AIRC_WINDOWS_NATIVE=1 + native clone exists   → exec native
+#   4. wsl.exe present + WSL canonical clone exists  → route via wsl.exe
+#   5. Native Windows clone at %USERPROFILE%\.airc\src exists
 #      (matches install.ps1's CLONE_DIR layout)     → exec native
-#   5. Caller-relative: this shim's dirname/../.airc/src/airc (rare)
-#   6. Fail loud with all paths attempted
+#   6. Caller-relative: this shim's dirname/../.airc/src/airc (rare)
+#   7. Fail loud with all paths attempted
 #
 # Override knobs:
 #   AIRC_DIR=/path        — force a specific install dir
@@ -38,16 +39,9 @@ if [ -n "${AIRC_DIR:-}" ] && [ -x "$AIRC_DIR/airc" ]; then
   exec "$AIRC_DIR/airc" "$@"
 fi
 
-# 1.5) If WE are running inside WSL ourselves, prefer the canonical
-# clone in this WSL home directly. Reaches the right place even when
-# the user invoked a Windows-side path like /mnt/c/Users/<u>/.local/
-# bin/airc (Joel: "users could be dumb like me — don't break"). Going
-# back through wsl.exe would be circular and slow; just exec the
-# canonical clone in-place.
-if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-  if [ -x "$HOME/.airc/src/airc" ]; then
-    exec "$HOME/.airc/src/airc" "$@"
-  fi
+# 2) Native POSIX / WSL-internal canonical clone.
+if [ -x "$HOME/.airc/src/airc" ]; then
+  exec "$HOME/.airc/src/airc" "$@"
 fi
 
 # Helpers for the WSL routing path. Building a properly-quoted command
@@ -64,8 +58,8 @@ _airc_quote_args() {
   printf '%s' "$out"
 }
 
-# 2) AIRC_WINDOWS_NATIVE=1 — skip WSL.
-# 3) Otherwise, prefer the WSL canonical clone if wsl.exe + clone exist.
+# 3) AIRC_WINDOWS_NATIVE=1 — skip WSL.
+# 4) Otherwise, prefer the WSL canonical clone if wsl.exe + clone exist.
 if [ -z "${AIRC_WINDOWS_NATIVE:-}" ] && command -v wsl.exe >/dev/null 2>&1; then
   if wsl.exe bash -lc 'test -x "$HOME/.airc/src/airc"' >/dev/null 2>&1; then
     _quoted=$(_airc_quote_args "$@")
@@ -73,7 +67,7 @@ if [ -z "${AIRC_WINDOWS_NATIVE:-}" ] && command -v wsl.exe >/dev/null 2>&1; then
   fi
 fi
 
-# 4) Windows-native fallback at %USERPROFILE%\.airc\src.
+# 5) Windows-native fallback at %USERPROFILE%\.airc\src.
 # Translate USERPROFILE (Windows-style) to a Git Bash path. Pure-bash
 # transform avoids hard-coding /c/Users/... or invoking cygpath.
 _native_dir=""
@@ -84,7 +78,7 @@ if [ -n "$_native_dir" ] && [ -x "$_native_dir/airc" ]; then
   exec "$_native_dir/airc" "$@"
 fi
 
-# 5) Caller-relative fallback for esoteric installs (developer-tree
+# 6) Caller-relative fallback for esoteric installs (developer-tree
 # checkouts, AIRC_DIR-less custom layouts). Walk up from the shim.
 _shim_self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 for _candidate in \
@@ -95,7 +89,7 @@ for _candidate in \
   fi
 done
 
-# 6) Loud failure. No silent help banner — that's the failure mode
+# 7) Loud failure. No silent help banner — that's the failure mode
 # this shim was written to eliminate.
 echo "airc: cannot locate canonical airc bash binary." >&2
 echo "  Tried:" >&2
