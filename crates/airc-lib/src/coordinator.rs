@@ -55,6 +55,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -366,16 +368,37 @@ struct LockFileContents {
     holder_pid: u32,
 }
 
+/// Bounded retry budget for the takeover loop. Without a bound, a
+/// pathological adversary that constantly recreates a stale lock
+/// could spin a caller forever. After exhausting the budget we
+/// surface as `HeldFresh` (safety-valve: the caller treats it like
+/// somebody else won and re-uses cached snapshot).
+const REFRESH_LOCK_MAX_RETRIES: u32 = 8;
+
 /// Try to acquire the remote-refresh lock. Singleflight pattern:
 /// only one caller at a time should hammer the remote registry
 /// (GitHub gist), so subsequent callers within
 /// `refresh_interval_ms` see `HeldFresh` and re-use the lock-holder's
 /// snapshot.
 ///
-/// The lock file's `held_at_ms` is updated atomically via
-/// write-tmp + rename so a stale lock from a crashed holder doesn't
-/// pin forever — any caller past the holder's `refresh_interval_ms`
-/// can take it over.
+/// Atomicity is provided by `OpenOptions::create_new(true)` —
+/// `O_CREAT|O_EXCL` semantics on POSIX, the equivalent on Windows.
+/// Exactly one caller wins the creation; others get
+/// `ErrorKind::AlreadyExists` and inspect the existing lock to
+/// decide fresh vs stale.
+///
+/// Stale-takeover path: when the existing lock's `held_at_ms` is
+/// past `refresh_interval_ms`, the loser does a best-effort
+/// `remove_file` and retries `create_new`. The remove is "best
+/// effort" because two losers can race to remove the same stale
+/// lock; whichever loses the remove sees `NotFound` and retries the
+/// create from scratch. The retry loop is bounded by
+/// [`REFRESH_LOCK_MAX_RETRIES`] so an adversary can't pin a caller.
+///
+/// (Earlier revision of this function did a read-then-write without
+/// any atomicity primitive — two concurrent callers could both see
+/// "no lock" and both succeed, violating singleflight. Fixed in
+/// response to PR #850 review.)
 pub fn try_acquire_refresh_lock(
     airc_home: &Path,
     identity: &MeshIdentity,
@@ -386,27 +409,71 @@ pub fn try_acquire_refresh_lock(
     let root = account_root(airc_home, identity);
     fs::create_dir_all(&root)?;
     let lock_path = refresh_lock_path(airc_home, identity);
-    if let Ok(text) = fs::read_to_string(&lock_path) {
-        if let Ok(existing) = serde_json::from_str::<LockFileContents>(&text) {
-            // Lock is fresh enough that the existing holder is
-            // still expected to be doing the refresh. Skip.
-            if now_ms.saturating_sub(existing.held_at_ms) < config.refresh_interval_ms {
-                return Ok(RefreshLockOutcome::HeldFresh {
-                    held_at_ms: existing.held_at_ms,
-                });
-            }
-        }
-    }
-    // Take or replace the lock. Atomic via tmp + rename.
-    let tmp_path = root.join(".refresh.lock.tmp");
     let contents = LockFileContents {
         held_at_ms: now_ms,
         holder_pid,
     };
-    fs::write(&tmp_path, serde_json::to_string_pretty(&contents)?)?;
-    set_owner_only_permissions(&tmp_path)?;
-    fs::rename(&tmp_path, &lock_path)?;
-    Ok(RefreshLockOutcome::Acquired)
+    let payload = serde_json::to_string_pretty(&contents)?;
+
+    for _ in 0..REFRESH_LOCK_MAX_RETRIES {
+        // Atomic create-or-fail. Exactly one caller wins.
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(payload.as_bytes())?;
+                file.sync_all()?;
+                set_owner_only_permissions(&lock_path)?;
+                return Ok(RefreshLockOutcome::Acquired);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lock exists. Read it to decide whether we should
+                // wait (fresh) or attempt takeover (stale).
+                match fs::read_to_string(&lock_path) {
+                    Ok(text) => {
+                        match serde_json::from_str::<LockFileContents>(&text) {
+                            Ok(existing) => {
+                                if now_ms.saturating_sub(existing.held_at_ms)
+                                    < config.refresh_interval_ms
+                                {
+                                    return Ok(RefreshLockOutcome::HeldFresh {
+                                        held_at_ms: existing.held_at_ms,
+                                    });
+                                }
+                                // Stale. Try takeover: best-effort remove,
+                                // then retry create_new. Multiple losers
+                                // racing to remove the same stale lock is
+                                // fine — at most one create_new wins on the
+                                // next pass.
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                            Err(_) => {
+                                // Unparseable / in-transition file (winner
+                                // hasn't finished writing yet). Treat as
+                                // held by the still-writing winner; the
+                                // caller re-uses cached snapshot.
+                                return Ok(RefreshLockOutcome::HeldFresh { held_at_ms: now_ms });
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // The holder removed it between our AlreadyExists
+                        // and our read. Retry create_new.
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Retry budget exhausted. Bounded safety valve: report HeldFresh
+    // so the caller falls back to the cached snapshot. They can try
+    // again on the next join cycle.
+    Ok(RefreshLockOutcome::HeldFresh { held_at_ms: now_ms })
 }
 
 /// Release the refresh lock — best-effort delete. Idempotent: a
@@ -739,6 +806,98 @@ mod tests {
         let canon_root = root.canonicalize().unwrap();
         let canon_home = dir.path().canonicalize().unwrap();
         assert!(canon_root.starts_with(canon_home));
+    }
+
+    #[test]
+    fn refresh_lock_singleflights_under_concurrent_acquire() {
+        // Race N threads at the same time against an empty lock.
+        // Exactly ONE must return Acquired; the rest see HeldFresh.
+        // Validates the create_new atomicity vs. the older
+        // read-then-write race that PR review caught.
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 16;
+        let dir = Arc::new(tempdir().unwrap());
+        let mesh = Arc::new(id());
+        let cfg = Arc::new(CoordinatorConfig {
+            heartbeat_ttl_ms: 1_000,
+            refresh_interval_ms: 10_000, // big window so no takeover races
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let dir = Arc::clone(&dir);
+                let mesh = Arc::clone(&mesh);
+                let cfg = Arc::clone(&cfg);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // Sync all threads so they hit the lock simultaneously.
+                    barrier.wait();
+                    try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 1_000, i as u32).unwrap()
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let acquired = outcomes
+            .iter()
+            .filter(|o| matches!(o, RefreshLockOutcome::Acquired))
+            .count();
+        let held_fresh = outcomes
+            .iter()
+            .filter(|o| matches!(o, RefreshLockOutcome::HeldFresh { .. }))
+            .count();
+        assert_eq!(
+            acquired, 1,
+            "exactly one acquire across {N} racers, got {acquired} (outcomes: {outcomes:?})"
+        );
+        assert_eq!(held_fresh, N - 1, "remaining racers must see HeldFresh");
+    }
+
+    #[test]
+    fn refresh_lock_takeover_under_concurrent_stale() {
+        // After a stale lock, race N threads. Exactly one should
+        // succeed the takeover; the rest see HeldFresh on the new
+        // holder's just-written timestamp. Validates the
+        // remove-then-retry path under contention.
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 8;
+        let dir = Arc::new(tempdir().unwrap());
+        let mesh = Arc::new(id());
+        let cfg = Arc::new(CoordinatorConfig {
+            heartbeat_ttl_ms: 1_000,
+            refresh_interval_ms: 100,
+        });
+        // Plant a stale lock (held_at_ms=0, now=10_000, window=100 → stale).
+        try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 0, 999).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let dir = Arc::clone(&dir);
+                let mesh = Arc::clone(&mesh);
+                let cfg = Arc::clone(&cfg);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 10_000, i as u32).unwrap()
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let acquired = outcomes
+            .iter()
+            .filter(|o| matches!(o, RefreshLockOutcome::Acquired))
+            .count();
+        assert_eq!(
+            acquired, 1,
+            "exactly one takeover across {N} racers, got {acquired} (outcomes: {outcomes:?})"
+        );
     }
 
     #[test]
