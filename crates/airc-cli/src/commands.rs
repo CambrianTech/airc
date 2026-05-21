@@ -124,24 +124,49 @@ fn print_scope_context(home: &Path, wire: &Path) {
     let wire_root_canon = wire_root
         .as_ref()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    let canonical_account_home = canonical_machine_account_home();
     println!("scope:   {}", scope.display());
-    match &wire_root_canon {
-        Some(root) if root == &scope => {
+    match (&wire_root_canon, &canonical_account_home) {
+        // Scope IS the canonical $HOME/.airc machine-account home.
+        // It IS the wire root by definition — but that's the
+        // intended "everybody on this machine routes here" home,
+        // NOT a "project-local isolated" scope. Label accordingly.
+        (Some(root), Some(account_home)) if root == &scope && &scope == account_home => {
+            println!(
+                "mesh:    machine-account home (this is the canonical `{}` — all scopes on this user's machine route here)",
+                scope.display()
+            );
+        }
+        // Scope is its own wire root AND not the canonical machine-
+        // account home — genuinely isolated (tempdirs, CI harnesses,
+        // explicit AIRC_HOME=/tmp/... overrides).
+        (Some(root), _) if root == &scope => {
             println!(
                 "mesh:    project-local (this scope's identity AND wire live in `{}` — sends are isolated to this dir)",
                 scope.display()
             );
         }
-        Some(root) => {
+        // Scope is a subdir under $HOME but the wire is promoted up
+        // to $HOME/.airc — the common "agent ran airc join from a
+        // project" case.
+        (Some(root), _) => {
             println!(
                 "mesh:    machine-account (this scope shares wire at `{}` with every other scope on this user's machine)",
                 root.display()
             );
         }
-        None => {
+        (None, _) => {
             println!("mesh:    unknown (could not resolve wire root)");
         }
     }
+}
+
+fn canonical_machine_account_home() -> Option<PathBuf> {
+    let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let user_home_canon = user_home.canonicalize().unwrap_or(user_home);
+    Some(user_home_canon.join(".airc"))
 }
 
 /// `send` — local-fs single-shot send to the current room. Routes
