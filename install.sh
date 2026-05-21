@@ -446,10 +446,27 @@ _add_path_entry() {
   local rc
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     [ -f "$rc" ] || continue
-    if ! grep -Fq "$path_entry" "$rc"; then
-      echo "export PATH=\"$path_entry:\$PATH\"  # airc" >> "$rc"
-      ok "Added $path_entry to PATH in $(basename "$rc")"
+    # Strip any pre-existing airc-managed PATH lines (marked with the
+    # trailing `# airc` comment) so reruns are idempotent and stale
+    # entries pointing at retired install dirs (e.g., ~/.local/bin from
+    # the pre-rust-rewrite install) don't accumulate. We only touch
+    # lines we ourselves wrote; user-managed PATH lines stay put.
+    if grep -qE '^export PATH=.*# airc$' "$rc"; then
+      local tmp; tmp="$(mktemp "${rc}.airc.XXXXXX")"
+      grep -vE '^export PATH=.*# airc$' "$rc" > "$tmp" && mv "$tmp" "$rc"
     fi
+    # Ensure rc ends with a newline so the append starts on its own
+    # line. Without this, an rc that ends with `alias foo="bar"` (no
+    # trailing \n) produces the broken line
+    # `alias foo="bar"export PATH="...:$PATH"  # airc`
+    # which zsh parses as one malformed alias declaration and never
+    # sets PATH. Caught live 2026-05-20 — Joel's `airc` resolved fine
+    # from a manually-augmented PATH but new shells got nothing.
+    if [ -s "$rc" ] && [ "$(tail -c1 "$rc")" != "$(printf '\n')" ]; then
+      printf '\n' >> "$rc"
+    fi
+    printf 'export PATH="%s:$PATH"  # airc\n' "$path_entry" >> "$rc"
+    ok "Added $path_entry to PATH in $(basename "$rc")"
     break
   done
   export PATH="$path_entry:$PATH"
