@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shell syntax
-        run: bash -n install.sh uninstall.sh airc airc.shim lib/airc_bash/*.sh
+        run: bash -n install.sh uninstall.sh
       - name: Rust cutover guards
         run: bash test/rust_cutover_guard.sh
       - name: Rust quality guards
@@ -48,4 +48,4 @@ jobs:
       - name: Public installed runtime proof
         run: |
           cargo build --manifest-path Cargo.toml -p airc-cli
-          AIRC_BIN="$PWD/airc" AIRC_EXPECT_BIN="$PWD/airc" bash test/public_installed_runtime_proof.sh
+          AIRC_BIN="$PWD/target/debug/airc" AIRC_EXPECT_BIN="$PWD/target/debug/airc" bash test/public_installed_runtime_proof.sh
