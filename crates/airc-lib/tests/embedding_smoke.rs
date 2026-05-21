@@ -222,6 +222,45 @@ async fn peer_spec_round_trips_via_add_peer() {
     );
 }
 
+#[test]
+fn same_machine_scopes_share_account_wire_and_registry() {
+    let machine = TempDir::new().unwrap();
+
+    temp_env::with_var("HOME", Some(machine.path()), || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alice_home = machine.path().join("repo-a").join(".airc");
+            let bob_home = machine.path().join("repo-b").join(".airc");
+            std::fs::create_dir_all(alice_home.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(bob_home.parent().unwrap()).unwrap();
+
+            let alice = Airc::open(&alice_home).await.unwrap();
+            alice.join("general").await.unwrap();
+
+            let bob = Airc::open(&bob_home).await.unwrap();
+            bob.join("general").await.unwrap();
+
+            let alice_room = alice.current_room().await.unwrap();
+            let bob_room = bob.current_room().await.unwrap();
+            assert_eq!(alice_room.channel, bob_room.channel);
+            assert_eq!(alice_room.wire, bob_room.wire);
+            assert_eq!(alice_room.wire, machine.path().join(".airc/wires/general"));
+
+            let peers = airc_daemon::peers_store::load(&machine.path().join(".airc")).unwrap();
+            assert_eq!(
+                peers.len(),
+                2,
+                "opening two local scopes must publish both identities into the machine registry"
+            );
+
+            alice.say("same-machine account wire").await.unwrap();
+            let event =
+                wait_for_text(&bob, "same-machine account wire", Duration::from_secs(3)).await;
+            assert_eq!(event.peer_id, alice.peer_id());
+        });
+    });
+}
+
 #[tokio::test]
 async fn open_is_idempotent_across_handles() {
     // Two Airc::open calls on the same home recover the same

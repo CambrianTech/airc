@@ -241,6 +241,19 @@ impl Subscription {
         Self::with_wire(identity, name, wire)
     }
 
+    /// Construct a subscription whose local-fs wire is rooted at the
+    /// account-wide machine home instead of the caller's scope home.
+    /// This is what makes `~/.airc`, `repo/.airc`, and other scopes on
+    /// the same OS account converge on one local data plane.
+    pub fn new_with_wire_root(
+        wire_root: &Path,
+        identity: &MeshIdentity,
+        name: ChannelName,
+    ) -> Result<Self, SubscriptionError> {
+        let wire = wire_root.join("wires").join(name.as_str());
+        Self::with_wire(identity, name, wire)
+    }
+
     pub fn with_wire(
         identity: &MeshIdentity,
         name: ChannelName,
@@ -313,6 +326,26 @@ impl SubscriptionSet {
             return Ok(existing.clone());
         }
         let sub = Subscription::new(home, identity, name.clone())?;
+        self.subscribed.insert(name.clone(), sub.clone());
+        if self.default.is_none() {
+            self.default = Some(name);
+        }
+        Ok(sub)
+    }
+
+    /// Add or replace a subscription using an account-wide local wire
+    /// root. See [`Subscription::new_with_wire_root`].
+    pub fn subscribe_with_wire_root(
+        &mut self,
+        wire_root: &Path,
+        identity: &MeshIdentity,
+        name: ChannelName,
+    ) -> Result<Subscription, SubscriptionError> {
+        self.parted.remove(&name);
+        if let Some(existing) = self.subscribed.get(&name) {
+            return Ok(existing.clone());
+        }
+        let sub = Subscription::new_with_wire_root(wire_root, identity, name.clone())?;
         self.subscribed.insert(name.clone(), sub.clone());
         if self.default.is_none() {
             self.default = Some(name);
@@ -436,11 +469,12 @@ impl Airc {
         }
 
         if room_ids.is_empty() {
+            let identity = self.mesh_identity()?;
             push_unique(
                 &mut room_ids,
-                Subscription::new(
-                    &self.inner.home,
-                    &MeshIdentity::unset(),
+                Subscription::new_with_wire_root(
+                    &self.inner.wire_root,
+                    &identity,
                     ChannelName::new("general").map_err(SubscriptionError::from)?,
                 )?
                 .room_id,
@@ -456,11 +490,12 @@ impl Airc {
             push_unique_path(&mut wires, subscription.wire.clone());
         }
         if wires.is_empty() {
+            let identity = self.mesh_identity()?;
             push_unique_path(
                 &mut wires,
-                Subscription::new(
-                    &self.inner.home,
-                    &MeshIdentity::unset(),
+                Subscription::new_with_wire_root(
+                    &self.inner.wire_root,
+                    &identity,
                     ChannelName::new("general").map_err(SubscriptionError::from)?,
                 )?
                 .wire,
@@ -636,6 +671,35 @@ mod tests {
         // First subscription stays as default.
         assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
         assert_eq!(set.subscribed.len(), 2);
+    }
+
+    #[test]
+    fn subscribe_with_wire_root_uses_machine_account_wire() {
+        let scope_a = tempdir().unwrap();
+        let scope_b = tempdir().unwrap();
+        let machine_home = tempdir().unwrap();
+        let id = MeshIdentity::new("joelteply");
+        let channel = ChannelName::new("general").unwrap();
+        let mut a = SubscriptionSet::empty();
+        let mut b = SubscriptionSet::empty();
+
+        let a_sub = a
+            .subscribe_with_wire_root(machine_home.path(), &id, channel.clone())
+            .unwrap();
+        let b_sub = b
+            .subscribe_with_wire_root(machine_home.path(), &id, channel)
+            .unwrap();
+
+        assert_eq!(a_sub.room_id, b_sub.room_id);
+        assert_eq!(a_sub.wire, b_sub.wire);
+        assert_eq!(
+            a_sub.wire,
+            machine_home.path().join("wires").join("general")
+        );
+        assert!(
+            !a_sub.wire.starts_with(scope_a.path()) && !b_sub.wire.starts_with(scope_b.path()),
+            "same-machine account mesh must not isolate local data-plane per project scope"
+        );
     }
 
     #[test]
