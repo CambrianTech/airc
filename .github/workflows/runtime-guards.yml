@@ -14,6 +14,7 @@ on:
       - "install.sh"
       - "uninstall.sh"
       - "lib/airc_bash/**"
+      - "test/public_installed_runtime_proof.sh"
       - "test/rust_cutover_guard.sh"
       - "test/rust_quality_guard.sh"
       - ".github/workflows/ci.yml"
@@ -26,6 +27,7 @@ on:
       - "install.sh"
       - "uninstall.sh"
       - "lib/airc_bash/**"
+      - "test/public_installed_runtime_proof.sh"
       - "test/rust_cutover_guard.sh"
       - "test/rust_quality_guard.sh"
       - ".github/workflows/ci.yml"
@@ -43,3 +45,7 @@ jobs:
         run: bash test/rust_cutover_guard.sh
       - name: Rust quality guards
         run: bash test/rust_quality_guard.sh
+      - name: Public installed runtime proof
+        run: |
+          cargo build --manifest-path Cargo.toml -p airc-cli
+          AIRC_BIN="$PWD/airc" AIRC_EXPECT_BIN="$PWD/airc" bash test/public_installed_runtime_proof.sh
