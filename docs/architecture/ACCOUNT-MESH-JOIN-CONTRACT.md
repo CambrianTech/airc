@@ -64,6 +64,66 @@ built artifact for that exact source checkout. It must fail loudly if
 resolution is ambiguous. It must not copy the full command implementation,
 search arbitrary old install locations, or expose a second product command.
 
+### Curl-Install Contract For AI Agents
+
+AIRC is installed into human and AI-operated shells with a curl-style
+bootstrap. That is acceptable only if the resulting system is deterministic,
+inspectable, and agent-friendly. The installer must treat AI runtimes as
+first-class users, not as an afterthought layered on top of an interactive
+human terminal.
+
+Required properties:
+
+- one-line install works from a clean machine and leaves one public command:
+  `airc`;
+- non-interactive shells work without sourcing `.zshrc`, `.bashrc`, or an IDE
+  profile;
+- `airc version` identifies the exact installed source checkout that will
+  execute subsequent commands;
+- `airc doctor` distinguishes install failure, PATH failure, source-checkout
+  mismatch, stale process state, broken monitor/hook state, transport failure,
+  and remote registry/rate-limit failure;
+- install registers Claude skills, Codex skills/hooks, and future agent
+  adapters through explicit generated state, not hidden runtime fallbacks;
+- reinstall/update is idempotent and never leaves an older public command on
+  PATH;
+- uninstall removes only AIRC-owned install artifacts and managed skills/hooks,
+  while reporting any remaining project/account state rather than guessing;
+- the installer does not require Python, Node, SSHD, or GitHub for same-machine
+  runtime proof;
+- GitHub is allowed for fetching source and rare account-mesh rendezvous, not
+  for proving local runtime health.
+
+Trust hardening path:
+
+1. For development channels, the install may track a named branch but must
+   report branch and commit in `airc version`.
+2. For release channels, install should support a pinned tag/SHA mode.
+3. Release install should verify a published checksum or signature before
+   executing downloaded artifacts.
+4. Update should refuse ambiguous local edits unless explicitly told how to
+   reconcile them.
+
+The minimum clean-install proof is:
+
+```text
+fresh HOME
+install
+which airc == platform user-bin shim
+airc version -> ~/.airc/src at the expected commit
+no stale public airc-core / language-suffixed commands
+airc join
+airc msg
+airc inbox or monitor/hook receive
+airc teardown
+```
+
+For AI agents specifically, a passing install is not enough. Claude must be
+able to attach a live monitor using plain `airc join --attach`. Codex must be
+able to receive unread events through the installed hook or an equivalent
+subscription surface. Both paths must be tested through public `airc` commands,
+not absolute source paths or test-only environment variables.
+
 For version 1 there is no legacy runtime surface. Old Python, shell, gist-chat,
 and language-suffixed compatibility paths should be deleted when their Rust
 replacement exists. If a fresh install would never create a file or symlink,
@@ -223,40 +283,87 @@ The foolproof order is:
 5. relay / WebRTC / Reticulum for non-tailnet or NAT boundaries;
 6. GitHub gist only to publish or discover the account mesh and route beacons.
 
-## Rust Gaps To Close
+## Rust Status And Gaps To Close
+
+Already landed in rust-rewrite:
+
+- `SubscriptionSet` with subscribed/default/parted channel state;
+- stable `(mesh identity, channel name) -> RoomId` derivation;
+- mesh identity resolution and cache;
+- `Airc::join_default_context()` for `#general` plus inferred org/project;
+- public wrapper seeding Rust account-room subscriptions on bare `airc join`;
+- same-machine account local wire sharing;
+- POSIX PATH shim at the user-bin command surface, dispatching to
+  `~/.airc/src/airc`;
+- clean-install/runtime guards that reject stale language-suffixed commands and
+  exercise the public shim path.
 
 Current rust-rewrite still has account-mesh gaps:
 
-- CLI `room` language says "switch current room";
-- install and wrapper paths have historically allowed stale language-suffixed
-  binaries, split source roots, and symlink resolution to mask the actual
-  binary under test.
-- `Airc::join_default_context()` is not implemented yet;
-- mesh identity still uses the unset sentinel until the machine-global
-  coordinator resolves the authenticated Git/GitHub user identity.
+- CLI `room` language still needs final cleanup so it reads as subscription
+  management rather than single-room switching;
+- machine-global coordinator/cache is not implemented yet;
+- same-machine peer discovery still relies on peer records being present rather
+  than a coordinator-owned local presence registry;
+- monitor and hook reliability must be proven through public installed
+  commands after coordinator discovery lands;
+- cross-machine account-mesh discovery still needs the rare remote registry
+  publisher/refresh path.
 
 Required corrections:
 
 1. Keep `SubscriptionSet` as the runtime source of truth:
    subscribed channels, default channel, parted channels, and stable
    `(mesh identity, channel name) -> RoomId` derivation.
-2. Make `Airc::join_default_context()` or equivalent subscribe to `general`
-   plus inferred org/project channel.
-3. Make `Airc::join_channel(name)` add/promote a channel without removing the
-   rest.
-4. Make monitor and hooks default to all subscribed channels, not current room.
-5. Add account-mesh registry abstraction for `git user identity + channel ->
+2. Keep `Airc::join_default_context()` wired through the public wrapper and
+   clean-install tests.
+3. Keep `Airc::join_channel(name)` / `airc join --room X` additive: add/promote
+   a channel without removing the rest.
+4. Keep monitor and hooks defaulted to all subscribed channels, not current
+   room.
+5. Add machine-global coordinator/cache under `~/.airc/accounts/<identity>/`.
+6. Add account-mesh registry abstraction for `git user identity + channel ->
    beacon`.
-6. Keep the data plane selected by route policy: local, LAN, relay, WebRTC,
+7. Keep the data plane selected by route policy: local, LAN, relay, WebRTC,
    Reticulum, etc. Gist remains registry/bootstrap.
-7. Add Rust Tailscale discovery/login health: detect installed/down/logged-out,
+8. Add Rust Tailscale discovery/login health: detect installed/down/logged-out,
    surface `tailscale up`, and publish Tailscale route candidates when signed
    in.
-8. Add machine-global coordinator/cache keyed by Git/GitHub user identity, with
+9. Add machine-global coordinator/cache keyed by Git/GitHub user identity, with
    TTL, singleflight, and backoff around all remote registry publishers.
-9. Collapse install/runtime naming to `airc`, with source under `~/.airc/src`,
+10. Keep install/runtime naming collapsed to `airc`, with source under
+   `~/.airc/src`,
    worktrees under `~/.airc/worktrees`, and no stale language-suffixed binaries
    or hidden alternate source roots.
+
+## Handoff: Claude Coordinator Slice
+
+Claude should not reimplement `join_default_context`, wrapper seeding, or the
+PATH shim. Those are already landed. Claude's next slice is the machine-global
+coordinator.
+
+Scope:
+
+- new coordinator state under `~/.airc/accounts/<mesh-identity>/`;
+- local presence/beacon registry for this machine;
+- channel subscriptions projected into that registry;
+- TTL and singleflight so ten local agents running `airc join` cause at most
+  one remote refresh;
+- same-machine peer discovery before GitHub/gist;
+- no monitor/hook changes in the first coordinator PR unless the coordinator
+  API is already stable.
+
+Acceptance for Claude's coordinator PR:
+
+- two fresh scopes on the same machine and same mesh identity run public
+  `airc join` and discover the same account channels without an invite;
+- no GitHub access is required for same-machine discovery after the first local
+  coordinator state exists;
+- concurrent joins serialize through the coordinator instead of racing remote
+  registry refresh;
+- coordinator state is typed and inspectable by `airc doctor` / future status
+  commands;
+- no shell-only state machine and no test-only environment variable path.
 
 ## Acceptance Tests
 
