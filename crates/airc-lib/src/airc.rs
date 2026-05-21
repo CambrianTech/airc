@@ -33,6 +33,7 @@ use airc_transport::LanTcpAdapter;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
+use crate::mesh_identity;
 use crate::room::Room;
 use crate::route::health::TransportHealthTable;
 use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
@@ -252,11 +253,21 @@ impl Airc {
         Ok(())
     }
 
+    /// Resolve the mesh identity for this scope, going through the
+    /// cache. Single-flighted at the file level: the cache only
+    /// re-resolves after [`crate::mesh_identity::DEFAULT_TTL_MS`] so
+    /// concurrent callers don't hammer `gh`. See the module docs for
+    /// the resolver chain.
+    fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
+        let cached = mesh_identity::resolve(&self.inner.home)?;
+        Ok(cached.as_mesh_identity())
+    }
+
     /// Subscribe to `name` and make it the default channel for
     /// short-shape commands.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
-        let identity = MeshIdentity::unset();
+        let identity = self.mesh_identity()?;
         let mut set = subscriptions::load_or_init(&self.inner.home)?;
         let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
         set.set_default(channel)?;
@@ -272,7 +283,7 @@ impl Airc {
     /// Production users want [`join`].
     pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
-        let identity = MeshIdentity::unset();
+        let identity = self.mesh_identity()?;
         let mut set = subscriptions::load_or_init(&self.inner.home)?;
         let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
         set.parted.remove(&channel);
@@ -285,14 +296,15 @@ impl Airc {
     }
 
     /// Read the default subscribed channel. Fresh scopes default to
-    /// `#general` through the subscription set.
+    /// `#general` through the subscription set, using the resolved
+    /// mesh identity so the `RoomId` is stable per Git/GitHub user.
     pub async fn current_room(&self) -> Result<Room, AircError> {
         let mut set = subscriptions::load_or_init(&self.inner.home)?;
         if let Some(subscription) = set.default_subscription() {
             return Ok(subscription.as_room());
         }
 
-        let identity = MeshIdentity::unset();
+        let identity = self.mesh_identity()?;
         let channel = ChannelName::new("general")?;
         let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
         set.set_default(channel)?;
