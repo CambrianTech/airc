@@ -87,6 +87,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             println!("joined:  #{}", joined.name);
             println!("wire:    {}", joined.wire.display());
             println!("channel: {}", joined.channel);
+            print_scope_context(home, &joined.wire);
         }
         None => {
             let cwd = std::env::current_dir()?;
@@ -98,9 +99,49 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             }
             println!("default: #{}", current.name);
             println!("wire:    {}", current.wire.display());
+            print_scope_context(home, &current.wire);
         }
     }
     Ok(())
+}
+
+/// Tell the operator which scope they actually joined and whether
+/// it's sharing the machine-account wire or running isolated. The
+/// substrate already routes correctly; this is purely diagnostic so
+/// `airc join` from a project dir doesn't leave anyone wondering
+/// "am I on the same mesh as my HOME tabs?"
+///
+/// Codex's criterion #2: "airc join from a project scope must
+/// converge onto the same usable account mesh or clearly show which
+/// scope it is using."
+fn print_scope_context(home: &Path, wire: &Path) {
+    // wire = <wire_root>/wires/<channel> → wire_root is two parents up.
+    let wire_root = wire
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf());
+    let scope = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let wire_root_canon = wire_root
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    println!("scope:   {}", scope.display());
+    match &wire_root_canon {
+        Some(root) if root == &scope => {
+            println!(
+                "mesh:    project-local (this scope's identity AND wire live in `{}` — sends are isolated to this dir)",
+                scope.display()
+            );
+        }
+        Some(root) => {
+            println!(
+                "mesh:    machine-account (this scope shares wire at `{}` with every other scope on this user's machine)",
+                root.display()
+            );
+        }
+        None => {
+            println!("mesh:    unknown (could not resolve wire root)");
+        }
+    }
 }
 
 /// `send` — local-fs single-shot send to the current room. Routes
