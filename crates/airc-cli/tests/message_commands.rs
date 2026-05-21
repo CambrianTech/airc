@@ -5,7 +5,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn airc_core() -> &'static str {
-    env!("CARGO_BIN_EXE_airc")
+    env!("CARGO_BIN_EXE_airc-core")
 }
 
 #[test]

@@ -63,7 +63,7 @@ mod tests {
     fn send_accepts_multiline_hyphen_leading_public_keys() {
         let pem = "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----";
         let cli = Cli::try_parse_from([
-            "airc",
+            "airc-core",
             "handshake",
             "send",
             "127.0.0.1",
