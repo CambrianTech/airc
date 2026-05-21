@@ -21,6 +21,9 @@ use airc_store::{EventStore, SqliteEventStore};
 use futures::stream::StreamExt;
 use tempfile::TempDir;
 
+static HOME_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Poll `page_recent` until it sees at least `expected` events or
 /// the deadline fires. The wire-side tail loop runs in a background
 /// task; first attaches replay from the start of the wire, but the
@@ -226,6 +229,7 @@ async fn peer_spec_round_trips_via_add_peer() {
 #[test]
 fn same_machine_scopes_share_account_wire_and_registry() {
     let machine = TempDir::new().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap();
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -272,6 +276,7 @@ fn same_machine_scopes_share_account_wire_and_registry() {
 #[test]
 fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire() {
     let machine = TempDir::new().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap();
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
