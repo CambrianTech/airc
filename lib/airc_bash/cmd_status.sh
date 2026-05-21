@@ -164,7 +164,9 @@ cmd_status() {
     if [ "$_elapsed" -le 600 ] 2>/dev/null; then
       monitor_state="starting (airc join cold-start in progress, t+${_elapsed}s)"
     fi
-  elif "$(airc_core_bin)" --home "$AIRC_WRITE_DIR" room >/dev/null 2>&1; then
+  fi
+  if [ "$monitor_state" = "not running" ] \
+      && "$(airc_core_bin)" --home "$AIRC_WRITE_DIR" room >/dev/null 2>&1; then
     monitor_state="not attached (rust-local command mode)"
   fi
   echo "  airc process: $monitor_state"
