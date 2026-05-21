@@ -30,6 +30,12 @@ pub const HEADER_AIRC_PRIORITY: &str = "airc.priority";
 /// a decimal string.
 pub const HEADER_AIRC_DEADLINE: &str = "airc.deadline";
 
+/// Runtime consumer identity. This is the human/agent process label
+/// (`codex:<thread>`, `claude:<session>`, etc.) used by hooks and
+/// monitors to filter their own sends without conflating every process
+/// that shares the same persisted substrate `ClientId`.
+pub const HEADER_AIRC_CLIENT: &str = "airc.client";
+
 /// Body-shape hint from the forge/alloy contract layer. The string names
 /// a forge contract (e.g. `"forge.persona.turn"`); consumers that
 /// recognise the contract decode the body accordingly. Substrate never

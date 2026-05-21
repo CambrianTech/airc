@@ -1,7 +1,7 @@
 //! Command-line interface definitions (clap derive).
 //!
 //! All commands default to the persisted state at `<home>` (default
-//! `$HOME/.airc`), which contains:
+//! the current git project's `.airc`), which contains:
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
 //!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket for the daemon
@@ -10,7 +10,7 @@
 //! The `--home` flag overrides for testing / multi-identity setups.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -38,19 +38,55 @@ use crate::work_cli::WorkArgs;
 /// Default home directory for persisted identity + IPC state.
 ///
 /// Resolution order:
-///   1. `$HOME` (Unix; also Git Bash on Windows) → `<home>/.airc`
-///   2. `%USERPROFILE%` (native Windows cmd / PowerShell) →
-///      `<userprofile>/.airc`
-///   3. fallback to `./.airc` in the current working dir
+///   1. `$AIRC_HOME` → explicit scope override.
+///   2. First `.airc` ancestor when cwd is inside a scope.
+///   3. Git project root `.airc` when cwd is inside a worktree.
+///   4. `./.airc` in the current working dir.
+///
+/// Account-wide state still lives under the canonical machine account
+/// home (`$HOME/.airc`) inside `airc-lib`; this default is the
+/// consumer/project scope. That preserves the original public contract:
+/// running `airc join` in a repo uses that repo's `.airc`.
 pub fn default_home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".airc");
+    if let Some(home) = std::env::var_os("AIRC_HOME") {
+        return PathBuf::from(home);
     }
-    #[cfg(windows)]
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(userprofile).join(".airc");
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    default_home_dir_for(&cwd)
+}
+
+fn default_home_dir_for(cwd: &Path) -> PathBuf {
+    for ancestor in cwd.ancestors() {
+        if ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".airc")
+        {
+            return ancestor.to_path_buf();
+        }
     }
-    PathBuf::from(".airc")
+    git_toplevel(cwd)
+        .map(|root| root.join(".airc"))
+        .unwrap_or_else(|| cwd.join(".airc"))
+}
+
+fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let root = text.trim();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 /// Default Unix socket path inside `home`.
@@ -68,9 +104,9 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
                   Provides the public AIRC command surface."
 )]
 pub struct Cli {
-    /// State directory for persisted identity + IPC socket. Default
-    /// `$HOME/.airc` (Unix) or `%USERPROFILE%/.airc` (Windows).
-    /// Override for tests or multi-identity setups.
+    /// State directory for persisted identity + IPC socket. Defaults
+    /// to the current git project root's `.airc` unless `$AIRC_HOME`
+    /// is set. Override for tests or multi-identity setups.
     #[arg(long, global = true)]
     pub home: Option<PathBuf>,
 
@@ -341,6 +377,40 @@ pub enum Command {
         /// Scope path. Defaults to `$AIRC_HOME`, then `$HOME/.airc`.
         scope: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_home_dir_for;
+
+    #[test]
+    fn default_home_uses_enclosing_airc_scope() {
+        let root = tempfile::TempDir::new().unwrap();
+        let scope = root.path().join(".airc");
+        let nested = scope.join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(default_home_dir_for(&nested), scope);
+    }
+
+    #[test]
+    fn default_home_uses_git_project_root_scope() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let nested = repo.join("src").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(
+            default_home_dir_for(&nested),
+            repo.canonicalize().unwrap().join(".airc")
+        );
+    }
 }
 
 #[derive(Debug, Args)]

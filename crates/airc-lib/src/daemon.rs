@@ -4,7 +4,7 @@
 //! the daemon's typed IPC client instead of making apps construct
 //! daemon requests directly.
 
-use airc_core::{EventId, TranscriptCursor, TranscriptEvent};
+use airc_core::{EventId, Headers, TranscriptCursor, TranscriptEvent};
 use airc_daemon::{InboxRequest, SendRequest, SubscribeRequest};
 
 use crate::error::AircError;
@@ -20,6 +20,7 @@ impl Airc {
         &self,
         room: &Room,
         text: &str,
+        headers: Headers,
     ) -> Result<EventId, AircError> {
         self.daemon_client()
             .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?
@@ -27,6 +28,7 @@ impl Airc {
                 wire: room.wire.clone(),
                 channel: room.channel.as_uuid(),
                 text: text.to_string(),
+                headers,
             })
             .await?;
 

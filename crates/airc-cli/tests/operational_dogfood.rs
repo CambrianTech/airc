@@ -2,8 +2,8 @@
 //!
 //! This test intentionally does NOT pass `--home` and does NOT pass
 //! ad-hoc `--peer` flags to listen/send. Each subprocess receives a
-//! distinct fake user HOME, so `airc-core` resolves state through the
-//! default installed path: `<HOME>/.airc`.
+//! distinct fake project cwd, so `airc-core` resolves state through the
+//! public default project scope: `<cwd>/.airc`.
 //!
 //! The proof shape mirrors the real Codex/Claude target:
 //!   1. each agent initialises its own installed identity
@@ -35,6 +35,8 @@ fn installed_codex_and_claude_identities_hold_bidirectional_live_room() {
 
     std::fs::create_dir_all(&codex_user_home).expect("codex user home");
     std::fs::create_dir_all(&claude_user_home).expect("claude user home");
+    seed_mesh_identity(&codex_user_home);
+    seed_mesh_identity(&claude_user_home);
 
     let codex_spec = installed_init(&codex_user_home).peer_spec;
     let claude_spec = installed_init(&claude_user_home).peer_spec;
@@ -117,6 +119,8 @@ fn monitor_attach_streams_rust_events_without_legacy_log() {
 
     std::fs::create_dir_all(&codex_user_home).expect("codex user home");
     std::fs::create_dir_all(&claude_user_home).expect("claude user home");
+    seed_mesh_identity(&codex_user_home);
+    seed_mesh_identity(&claude_user_home);
 
     let codex_spec = installed_init(&codex_user_home).peer_spec;
     let claude_spec = installed_init(&claude_user_home).peer_spec;
@@ -263,9 +267,29 @@ fn installed_inbox(user_home: &Path) -> String {
 
 fn installed_command(user_home: &Path) -> Command {
     let mut command = Command::new(airc_core());
+    command.current_dir(user_home);
     command.env("HOME", user_home);
     command.env("USERPROFILE", user_home);
+    command.env("AIRC_CLIENT_ID", test_client_id(user_home));
     command
+}
+
+fn test_client_id(user_home: &Path) -> &'static str {
+    match user_home.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name.contains("claude") => "claude:dogfood",
+        Some(name) if name.contains("codex") => "codex:dogfood",
+        _ => "agent:dogfood",
+    }
+}
+
+fn seed_mesh_identity(user_home: &Path) {
+    let airc_home = user_home.join(".airc");
+    std::fs::create_dir_all(&airc_home).expect("airc home");
+    std::fs::write(
+        airc_home.join("mesh_identity.json"),
+        r#"{"version":1,"identity":"dogfood-account","source":"operator","resolved_at_ms":1,"ttl_ms":86400000}"#,
+    )
+    .expect("write mesh identity");
 }
 
 fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
