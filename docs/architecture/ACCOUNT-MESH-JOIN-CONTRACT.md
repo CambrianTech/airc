@@ -369,6 +369,34 @@ Scope:
   the same account channels through the registry and then use the selected
   data plane.
 
+Current slice landed in `airc-lib`:
+
+- `AccountRegistryDocument` is the typed remote-registry payload:
+  mesh identity, generated timestamp, channel list, peer specs, presence
+  beacons, and route endpoints;
+- `AccountRegistryStore` is the adapter boundary. GitHub/gist, relay registry,
+  Reticulum registry, or a local file proof all implement the same interface;
+- `FileAccountRegistryStore` proves the contract without involving GitHub:
+  one isolated machine home can publish registry metadata and another isolated
+  machine home can refresh/import it;
+- `Airc::publish_account_registry` and `Airc::refresh_account_registry`
+  export/import the document through an adapter and enrol imported peers in the
+  account peer registry;
+- tests assert the registry document does not contain messages, transcript
+  bodies, or runtime event payloads.
+
+Remaining cross-machine work:
+
+- add the GitHub/gist `AccountRegistryStore` adapter, using the coordinator
+  refresh lock and backoff so concurrent local joins do not stampede;
+- wire `airc join` to refresh/publish the registry only when the machine cache
+  is stale or the operator explicitly requests remote bootstrap;
+- publish concrete route candidates for LAN/Tailscale/relay/WebRTC as they
+  become known, then let route policy select the data plane;
+- add a public installed-command proof for two isolated machine homes using the
+  registry adapter, while asserting routine message delivery never routes over
+  GitHub.
+
 Acceptance for the cross-machine PR:
 
 - public installed proof or integration test creates two isolated machine homes
