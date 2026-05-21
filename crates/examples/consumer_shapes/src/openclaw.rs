@@ -172,6 +172,7 @@ pub fn decode_openclaw_event(
 pub fn any_openclaw_event_filter() -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::Exact {
             key: HEADER_FORGE_BODY_HINT.to_string(),
@@ -184,6 +185,7 @@ pub fn any_openclaw_event_filter() -> EventFilter {
 pub fn workspace_event_filter(workspace_id: &str) -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::All(vec![
             HeaderFilter::Exact {

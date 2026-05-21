@@ -111,6 +111,23 @@ impl Airc {
         })
     }
 
+    /// Subscribe to live events from all subscribed rooms. This is
+    /// the monitor/hook surface: no hidden narrowing to current room.
+    pub async fn subscribe_subscribed_filtered(
+        &self,
+        filter: EventFilter,
+    ) -> Result<FilteredEventStream, AircError> {
+        let filter = self.subscribed_event_filter(filter).await?;
+        let rx = self.inner.live_tx.subscribe();
+        self.ensure_subscribed_room_subscribers().await?;
+        Ok(FilteredEventStream {
+            inner: EventStream {
+                inner: BroadcastStream::new(rx),
+            },
+            filter,
+        })
+    }
+
     /// Fetch the most recent `limit` events from the current room.
     pub async fn page_recent(&self, limit: usize) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
@@ -134,6 +151,24 @@ impl Airc {
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
         self.ensure_current_room_subscriber().await?;
+        Ok(self
+            .inner
+            .store
+            .page_recent(filter.channel, limit)
+            .await?
+            .into_iter()
+            .filter(|event| filter.matches(event))
+            .collect())
+    }
+
+    /// Fetch recent events from the subscribed room set.
+    pub async fn page_recent_subscribed_filtered(
+        &self,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let filter = self.subscribed_event_filter(filter).await?;
+        self.ensure_subscribed_room_subscribers().await?;
         Ok(self
             .inner
             .store
@@ -171,6 +206,24 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
+        Ok(self
+            .inner
+            .store
+            .resume_from(cursor, filter.channel, limit)
+            .await?
+            .into_iter()
+            .filter(|event| filter.matches(event))
+            .collect())
+    }
+
+    /// Fetch events strictly after `cursor` from the subscribed room set.
+    pub async fn resume_from_subscribed_filtered(
+        &self,
+        cursor: &TranscriptCursor,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let filter = self.subscribed_event_filter(filter).await?;
         Ok(self
             .inner
             .store

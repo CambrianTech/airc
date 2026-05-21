@@ -86,6 +86,7 @@ impl AgentConsumer {
         kinds.insert(TranscriptKind::Message);
         let filter = EventFilter {
             channel: None,
+            channels: Vec::new(),
             kinds,
             headers_filter: HeaderFilter::Exact {
                 key: HEADER_AGENT_KIND.to_string(),
@@ -107,6 +108,7 @@ impl AgentConsumer {
         kinds.insert(TranscriptKind::Message);
         let filter = EventFilter {
             channel: None,
+            channels: Vec::new(),
             kinds,
             headers_filter: HeaderFilter::Exact {
                 key: HEADER_AGENT_KIND.to_string(),

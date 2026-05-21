@@ -208,6 +208,7 @@ pub fn decode_persona_event(
 pub fn any_persona_event_filter() -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::Exact {
             key: HEADER_FORGE_BODY_HINT.to_string(),
@@ -221,6 +222,7 @@ pub fn any_persona_event_filter() -> EventFilter {
 pub fn activity_event_filter(activity_id: &str) -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::All(vec![
             HeaderFilter::Exact {

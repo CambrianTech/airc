@@ -32,15 +32,6 @@ use airc_store::{EventStore, SqliteEventStore};
 /// prints the local peer's spec so the user can share it.
 pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
-    // Auto-join "default" room on first init so subsequent
-    // `airc msg` / `say` work without explicit room selection.
-    if airc.current_room().await?.name != "default" {
-        // load_or_default returns the synthesised default when
-        // room.json is missing; if a different room name comes back
-        // the user has already joined something — leave it.
-    } else if !airc.home().join("room.json").exists() {
-        airc.join("default").await?;
-    }
     let current = airc.current_room().await?;
     println!("home:        {}", airc.home().display());
     println!("peer_id:     {}", airc.peer_id());

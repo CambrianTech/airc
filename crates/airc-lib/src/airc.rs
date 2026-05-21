@@ -33,10 +33,11 @@ use airc_transport::LanTcpAdapter;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
-use crate::room::{self, Room};
+use crate::room::Room;
 use crate::route::health::TransportHealthTable;
 use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
+use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
 use crate::transport::{FrameSubscriber, WireSubscriber};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
@@ -251,14 +252,16 @@ impl Airc {
         Ok(())
     }
 
-    /// Switch the current room to one derived from `name`. Same name
-    /// on two peers yields the same channel UUID via UUIDv5, so they
-    /// converge without exchanging the UUID out-of-band. Spawns a
-    /// background subscriber on the new room's wire if one isn't
-    /// already running, so subsequent `say`s land in the store.
+    /// Subscribe to `name` and make it the default channel for
+    /// short-shape commands.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
-        let room = Room::from_name(&self.inner.home, name)?;
-        room::save(&self.inner.home, &room)?;
+        let channel = ChannelName::new(name)?;
+        let identity = MeshIdentity::unset();
+        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
+        set.set_default(channel)?;
+        subscriptions::save(&self.inner.home, &set)?;
+        let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
     }
@@ -268,18 +271,33 @@ impl Airc {
     /// processes on one machine tail the same `frames.jsonl`).
     /// Production users want [`join`].
     pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
-        let mut room = Room::from_name(&self.inner.home, name)?;
-        room.wire = wire;
-        room::save(&self.inner.home, &room)?;
+        let channel = ChannelName::new(name)?;
+        let identity = MeshIdentity::unset();
+        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
+        set.parted.remove(&channel);
+        set.subscribed.insert(channel.clone(), subscription.clone());
+        set.set_default(channel)?;
+        subscriptions::save(&self.inner.home, &set)?;
+        let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
     }
 
-    /// Read the persisted current room. Returns the default room
-    /// (synthesised on the fly, NOT persisted) if no `room.json`
-    /// has been written yet.
+    /// Read the default subscribed channel. Fresh scopes default to
+    /// `#general` through the subscription set.
     pub async fn current_room(&self) -> Result<Room, AircError> {
-        Ok(room::load_or_default(&self.inner.home)?)
+        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        if let Some(subscription) = set.default_subscription() {
+            return Ok(subscription.as_room());
+        }
+
+        let identity = MeshIdentity::unset();
+        let channel = ChannelName::new("general")?;
+        let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
+        set.set_default(channel)?;
+        subscriptions::save(&self.inner.home, &set)?;
+        Ok(subscription.as_room())
     }
 
     pub(crate) fn event_store(&self) -> &dyn EventStore {
