@@ -17,9 +17,9 @@ pub async fn run_list(
     let filter = EventFilter {
         kinds: kinds.into_iter().map(TranscriptKind::from).collect(),
         headers_filter: parse_header_filters(exact_headers, prefix_headers)?,
-        ..EventFilter::current_room()
+        ..EventFilter::default()
     };
-    let events = airc.page_recent_filtered(filter, limit).await?;
+    let events = airc.page_recent_subscribed_filtered(filter, limit).await?;
     print_events(&events);
     Ok(())
 }

@@ -171,6 +171,7 @@ pub fn decode_hermes_event(
 pub fn any_hermes_event_filter() -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::Exact {
             key: HEADER_FORGE_BODY_HINT.to_string(),
@@ -185,6 +186,7 @@ pub fn any_hermes_event_filter() -> EventFilter {
 pub fn agent_event_filter(agent_id: &str) -> EventFilter {
     EventFilter {
         channel: None,
+        channels: Vec::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::All(vec![
             HeaderFilter::Exact {

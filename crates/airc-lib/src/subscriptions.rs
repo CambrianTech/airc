@@ -1,15 +1,7 @@
 //! Channel-subscription set — the multi-channel model the account-mesh
 //! join contract requires.
 //!
-//! Replaces (atop, not yet under) the single-room
-//! [`crate::room::Room`] model. The old shape persisted exactly one
-//! `(name, RoomId, wire)` in `<home>/room.json`; switching channels
-//! meant overwriting it, so a scope could only ever see one channel's
-//! traffic. That's wrong for monitors and hooks: a scope subscribed to
-//! `#general` AND `#cambriantech` needs to surface events from both
-//! simultaneously.
-//!
-//! The new shape is the **subscription set** — an ordered list of
+//! The shape is the **subscription set** — an ordered list of
 //! channels this scope is subscribed to, plus a "default" pointer for
 //! short-shape commands (`airc msg "hi"`) and a "parted" set so we
 //! don't auto-resubscribe to a channel the user explicitly left when
@@ -27,18 +19,9 @@
 //! identity is supplied by the caller; a follow-up wires it to
 //! `gh api user --jq .login` via the machine-global coordinator.
 //!
-//! Defaulting `identity = ""` reproduces the pre-existing name-only
-//! derivation in `room::Room::from_name` for back-compat during the
-//! migration window.
-//!
 //! ## Storage
 //!
-//! Persisted to `<home>/subscriptions.json`. Schema version 1. On
-//! first load, if `subscriptions.json` is absent but `room.json`
-//! exists, the legacy single-room file is converted to a one-entry
-//! `SubscriptionSet` and saved alongside it (the room file stays for
-//! callers still using [`crate::Airc::current_room`] until the next
-//! slice removes them).
+//! Persisted to `<home>/subscriptions.json`. Schema version 1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,15 +31,16 @@ use uuid::Uuid;
 
 use airc_core::RoomId;
 
-use crate::room::{self, Room, RoomError};
+use crate::error::AircError;
+use crate::room::Room;
+use crate::stream::EventFilter;
+use crate::Airc;
 
 const SUBSCRIPTIONS_FILENAME: &str = "subscriptions.json";
 const SUBSCRIPTIONS_VERSION: u32 = 1;
 
 /// Namespace UUID for deriving channel UUIDs from
-/// `(mesh_identity, channel_name)`. Distinct from `room::ROOM_NAMESPACE`
-/// (which was name-only) so the new derivation can coexist with legacy
-/// rooms during migration without ambiguous collisions.
+/// `(mesh_identity, channel_name)`.
 const SUBSCRIPTIONS_NAMESPACE: Uuid = Uuid::from_bytes([
     0xa1, 0xc2, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ]);
@@ -69,7 +53,6 @@ pub enum SubscriptionError {
     Clock(std::time::SystemTimeError),
     SchemaVersionMismatch { found: u32, expected: u32 },
     InvalidChannelName(ChannelNameError),
-    Room(RoomError),
 }
 
 impl std::fmt::Display for SubscriptionError {
@@ -82,7 +65,6 @@ impl std::fmt::Display for SubscriptionError {
                 write!(f, "subscriptions.json version {found}, expected {expected}")
             }
             Self::InvalidChannelName(error) => write!(f, "invalid channel name: {error}"),
-            Self::Room(error) => write!(f, "subscriptions room migration: {error}"),
         }
     }
 }
@@ -95,7 +77,6 @@ impl std::error::Error for SubscriptionError {
             Self::Clock(error) => Some(error),
             Self::SchemaVersionMismatch { .. } => None,
             Self::InvalidChannelName(error) => Some(error),
-            Self::Room(error) => Some(error),
         }
     }
 }
@@ -121,12 +102,6 @@ impl From<std::time::SystemTimeError> for SubscriptionError {
 impl From<ChannelNameError> for SubscriptionError {
     fn from(value: ChannelNameError) -> Self {
         Self::InvalidChannelName(value)
-    }
-}
-
-impl From<RoomError> for SubscriptionError {
-    fn from(value: RoomError) -> Self {
-        Self::Room(value)
     }
 }
 
@@ -224,8 +199,7 @@ impl MeshIdentity {
         &self.0
     }
 
-    /// Sentinel for callers that don't yet have a real identity (e.g.,
-    /// unit tests, the migration path during the transition window).
+    /// Sentinel for callers that don't yet have a real identity.
     /// Returns a deterministic empty identity.
     pub fn unset() -> Self {
         Self(String::new())
@@ -264,6 +238,14 @@ impl Subscription {
         name: ChannelName,
     ) -> Result<Self, SubscriptionError> {
         let wire = home.join("wires").join(name.as_str());
+        Self::with_wire(identity, name, wire)
+    }
+
+    pub fn with_wire(
+        identity: &MeshIdentity,
+        name: ChannelName,
+        wire: PathBuf,
+    ) -> Result<Self, SubscriptionError> {
         let room_id = derive_room_id(identity, &name);
         Ok(Self {
             name,
@@ -271,6 +253,16 @@ impl Subscription {
             wire,
             joined_at_ms: now_ms()?,
         })
+    }
+
+    pub fn as_room(&self) -> Room {
+        Room {
+            version: 1,
+            name: self.name.as_str().to_string(),
+            wire: self.wire.clone(),
+            channel: self.room_id,
+            joined_at_ms: self.joined_at_ms,
+        }
     }
 }
 
@@ -381,11 +373,8 @@ pub fn path_in(home: &Path) -> PathBuf {
     home.join(SUBSCRIPTIONS_FILENAME)
 }
 
-/// Load the subscription set. If `subscriptions.json` is missing but
-/// `room.json` exists, migrate the single legacy room into a
-/// one-entry subscription set and persist. If neither exists, return
-/// an empty set (not persisted — caller decides whether to seed via
-/// `join_default_context`).
+/// Load the subscription set. If it does not exist yet, return an
+/// empty set; callers decide how to seed it.
 pub fn load_or_init(home: &Path) -> Result<SubscriptionSet, SubscriptionError> {
     let path = path_in(home);
     if path.exists() {
@@ -397,15 +386,6 @@ pub fn load_or_init(home: &Path) -> Result<SubscriptionSet, SubscriptionError> {
                 expected: SUBSCRIPTIONS_VERSION,
             });
         }
-        return Ok(set);
-    }
-
-    // Migration path: legacy room.json present, no subscriptions.json.
-    let room_path = room::path_in(home);
-    if room_path.exists() {
-        let legacy = room::load_or_default(home)?;
-        let set = from_legacy_room(&legacy)?;
-        save(home, &set)?;
         return Ok(set);
     }
 
@@ -424,31 +404,82 @@ pub fn save(home: &Path, set: &SubscriptionSet) -> Result<(), SubscriptionError>
     Ok(())
 }
 
-/// Convert a legacy `Room` into a single-entry `SubscriptionSet`.
-/// The legacy room is preserved verbatim (same wire path and
-/// `joined_at_ms`); only the `RoomId` is re-derived via the new
-/// `(MeshIdentity::unset(), name)` derivation so the migrated entry
-/// is observable by the new derivation path. Old name-only `RoomId`s
-/// from `Room::from_name` won't equal the new ones — which is the
-/// point: the new derivation namespaces by identity, so legacy single-
-/// room scopes get a fresh per-identity `RoomId` on migration. The
-/// transition window's existing in-flight events still live under the
-/// legacy `RoomId`; new sends route to the new one. Joel acknowledged
-/// this discontinuity is acceptable — the rewrite is a clean break.
-pub fn from_legacy_room(legacy: &Room) -> Result<SubscriptionSet, SubscriptionError> {
-    let name = ChannelName::new(&legacy.name)?;
-    let identity = MeshIdentity::unset();
-    let room_id = derive_room_id(&identity, &name);
-    let sub = Subscription {
-        name: name.clone(),
-        room_id,
-        wire: legacy.wire.clone(),
-        joined_at_ms: legacy.joined_at_ms,
-    };
-    let mut set = SubscriptionSet::empty();
-    set.subscribed.insert(name.clone(), sub);
-    set.default = Some(name);
-    Ok(set)
+impl Airc {
+    /// Load this scope's subscription set for consumer surfaces.
+    pub async fn subscription_set(&self) -> Result<SubscriptionSet, AircError> {
+        Ok(load_or_init(&self.inner.home)?)
+    }
+
+    pub(crate) async fn subscribed_event_filter(
+        &self,
+        mut filter: EventFilter,
+    ) -> Result<EventFilter, AircError> {
+        if filter.channel.is_some() || !filter.channels.is_empty() {
+            return Ok(filter);
+        }
+        filter.channels = self.subscribed_room_ids().await?;
+        Ok(filter)
+    }
+
+    pub(crate) async fn ensure_subscribed_room_subscribers(&self) -> Result<(), AircError> {
+        for wire in self.subscribed_wires().await? {
+            self.ensure_wire_subscriber(&wire).await?;
+        }
+        Ok(())
+    }
+
+    async fn subscribed_room_ids(&self) -> Result<Vec<RoomId>, AircError> {
+        let mut room_ids = Vec::new();
+        let set = self.subscription_set().await?;
+        for subscription in set.all() {
+            push_unique(&mut room_ids, subscription.room_id);
+        }
+
+        if room_ids.is_empty() {
+            push_unique(
+                &mut room_ids,
+                Subscription::new(
+                    &self.inner.home,
+                    &MeshIdentity::unset(),
+                    ChannelName::new("general").map_err(SubscriptionError::from)?,
+                )?
+                .room_id,
+            );
+        }
+        Ok(room_ids)
+    }
+
+    async fn subscribed_wires(&self) -> Result<Vec<PathBuf>, AircError> {
+        let mut wires = Vec::new();
+        let set = self.subscription_set().await?;
+        for subscription in set.all() {
+            push_unique_path(&mut wires, subscription.wire.clone());
+        }
+        if wires.is_empty() {
+            push_unique_path(
+                &mut wires,
+                Subscription::new(
+                    &self.inner.home,
+                    &MeshIdentity::unset(),
+                    ChannelName::new("general").map_err(SubscriptionError::from)?,
+                )?
+                .wire,
+            );
+        }
+        Ok(wires)
+    }
+}
+
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
+}
+
+fn push_unique_path(items: &mut Vec<PathBuf>, item: PathBuf) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
 }
 
 #[cfg(unix)]
@@ -608,6 +639,35 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_accepts_arbitrary_user_and_domain_channels() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let id = MeshIdentity::new("joelteply");
+        let mut set = SubscriptionSet::empty();
+
+        for name in [
+            "continuum-activity-7",
+            "openclaw-workspace_alpha",
+            "useideem",
+            "friend-general",
+            "forge-lora-slots",
+        ] {
+            set.subscribe(home, &id, ChannelName::new(name).unwrap())
+                .unwrap();
+        }
+
+        let names = set
+            .channel_names()
+            .map(ChannelName::as_str)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"continuum-activity-7"));
+        assert!(names.contains(&"openclaw-workspace_alpha"));
+        assert!(names.contains(&"useideem"));
+        assert!(names.contains(&"friend-general"));
+        assert!(names.contains(&"forge-lora-slots"));
+    }
+
+    #[test]
     fn unsubscribe_marks_parted_and_falls_back_default() {
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -669,27 +729,6 @@ mod tests {
 
         let loaded = load_or_init(home).unwrap();
         assert_eq!(loaded, set);
-    }
-
-    #[test]
-    fn migrate_from_legacy_room_when_subscriptions_absent() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-
-        // Seed the legacy room.json directly.
-        let legacy = Room::from_name(home, "default").unwrap();
-        room::save(home, &legacy).unwrap();
-        assert!(room::path_in(home).exists());
-        assert!(!path_in(home).exists());
-
-        let set = load_or_init(home).unwrap();
-        assert!(path_in(home).exists(), "migration must persist the set");
-        assert_eq!(set.subscribed.len(), 1);
-        let migrated = set.subscribed.values().next().unwrap();
-        assert_eq!(migrated.name.as_str(), "default");
-        assert_eq!(migrated.wire, legacy.wire);
-        assert_eq!(migrated.joined_at_ms, legacy.joined_at_ms);
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "default");
     }
 
     #[test]

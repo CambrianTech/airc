@@ -24,12 +24,15 @@ pub async fn run_user_prompt_submit(
     let cursor_path = cursor_file.unwrap_or_else(|| home.join(DEFAULT_CURSOR_FILENAME));
     let filter = EventFilter {
         kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
-        ..EventFilter::current_room()
+        ..EventFilter::default()
     };
     let previous = read_cursor_if_present(&cursor_path)?;
     let events = match previous {
-        Some(cursor) => airc.resume_from_filtered(&cursor, filter, count).await?,
-        None => airc.page_recent_filtered(filter, count).await?,
+        Some(cursor) => {
+            airc.resume_from_subscribed_filtered(&cursor, filter, count)
+                .await?
+        }
+        None => airc.page_recent_subscribed_filtered(filter, count).await?,
     };
 
     if let Some(newest) = events.last().map(TranscriptEvent::cursor) {

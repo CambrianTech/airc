@@ -1,10 +1,5 @@
-//! Current-room persistence — the default `(wire, channel)` for
-//! short-shape commands like `airc msg "hi"` and `airc inbox`.
-//!
-//! AI peers (and humans) shouldn't have to type `--wire <path>
-//! --channel <uuid>` on every call. Joining a room writes
-//! `<home>/room.json` once; every subsequent command reads it.
-//! `airc join <name>` switches.
+//! Room value type — the substrate expansion of a channel name into
+//! a wire path and channel id.
 //!
 //! A "room" is a name. The substrate primitives it expands to are
 //! deterministic:
@@ -22,7 +17,6 @@ use uuid::Uuid;
 
 use airc_core::RoomId;
 
-const ROOM_FILENAME: &str = "room.json";
 const ROOM_VERSION: u32 = 1;
 const DEFAULT_ROOM_NAME: &str = "default";
 
@@ -33,29 +27,16 @@ const ROOM_NAMESPACE: Uuid = Uuid::from_bytes([
     0xa1, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ]);
 
-/// What can go wrong loading / saving the current room.
+/// What can go wrong constructing a room value.
 #[derive(Debug)]
 pub enum RoomError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
     Clock(std::time::SystemTimeError),
-    /// Schema version mismatch — refuse to misinterpret old / future
-    /// room files.
-    SchemaVersionMismatch {
-        found: u32,
-        expected: u32,
-    },
 }
 
 impl std::fmt::Display for RoomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RoomError::Io(error) => write!(f, "room I/O: {error}"),
-            RoomError::Json(error) => write!(f, "room JSON: {error}"),
             RoomError::Clock(error) => write!(f, "room timestamp clock error: {error}"),
-            RoomError::SchemaVersionMismatch { found, expected } => {
-                write!(f, "room.json version {found}, expected {expected}")
-            }
         }
     }
 }
@@ -63,23 +44,8 @@ impl std::fmt::Display for RoomError {
 impl std::error::Error for RoomError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            RoomError::Io(error) => Some(error),
-            RoomError::Json(error) => Some(error),
             RoomError::Clock(error) => Some(error),
-            RoomError::SchemaVersionMismatch { .. } => None,
         }
-    }
-}
-
-impl From<std::io::Error> for RoomError {
-    fn from(error: std::io::Error) -> Self {
-        RoomError::Io(error)
-    }
-}
-
-impl From<serde_json::Error> for RoomError {
-    fn from(error: serde_json::Error) -> Self {
-        RoomError::Json(error)
     }
 }
 
@@ -89,13 +55,12 @@ impl From<std::time::SystemTimeError> for RoomError {
     }
 }
 
-/// The current room — what `airc msg` / `inbox` / `send` /
-/// `listen` default to.
+/// A channel's concrete substrate location.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Room {
     /// Schema version.
     pub version: u32,
-    /// Human-readable room name. `default` on fresh init.
+    /// Human-readable room name.
     pub name: String,
     /// Wire directory for this room.
     pub wire: PathBuf,
@@ -128,40 +93,6 @@ impl Room {
     }
 }
 
-/// Path to `<home>/room.json`.
-pub fn path_in(home: &Path) -> PathBuf {
-    home.join(ROOM_FILENAME)
-}
-
-/// Load the current room. Falls back to the default room (`name =
-/// "default"`) if `<home>/room.json` doesn't exist yet — this is
-/// the normal state for a fresh install.
-pub fn load_or_default(home: &Path) -> Result<Room, RoomError> {
-    let path = path_in(home);
-    if !path.exists() {
-        return Room::default_for(home);
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let room: Room = serde_json::from_str(&text)?;
-    if room.version != ROOM_VERSION {
-        return Err(RoomError::SchemaVersionMismatch {
-            found: room.version,
-            expected: ROOM_VERSION,
-        });
-    }
-    Ok(room)
-}
-
-/// Save the current room (overwriting any previous one).
-pub fn save(home: &Path, room: &Room) -> Result<(), RoomError> {
-    std::fs::create_dir_all(home)?;
-    let path = path_in(home);
-    let text = serde_json::to_string_pretty(room)?;
-    std::fs::write(&path, text)?;
-    set_owner_only_permissions(&path)?;
-    Ok(())
-}
-
 /// Sanitise a room name into a path-safe directory component. ASCII
 /// alphanumerics + `-` + `_` survive; everything else becomes `-`.
 /// Multiple names can collide post-sanitisation (`foo/bar` and
@@ -176,19 +107,6 @@ fn sanitise_name(name: &str) -> String {
             }
         })
         .collect()
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {

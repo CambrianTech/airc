@@ -13,14 +13,14 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
     let mut stream = airc
-        .subscribe_filtered(EventFilter {
+        .subscribe_subscribed_filtered(EventFilter {
             kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
-            ..EventFilter::current_room()
+            ..EventFilter::default()
         })
         .await?;
     let mut sandbox = Sandbox::new();
 
-    println!("airc: attached to Rust event stream for this scope");
+    println!("airc: attached to Rust event stream for subscribed channels");
     while let Some(item) = stream.next().await {
         match item {
             Ok(event) => render_event(&event, client_id.as_deref(), &mut sandbox),

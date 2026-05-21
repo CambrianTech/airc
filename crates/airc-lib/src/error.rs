@@ -25,6 +25,12 @@ pub enum AircError {
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 
+    #[error("subscription state: {0}")]
+    Subscription(#[from] crate::subscriptions::SubscriptionError),
+
+    #[error("channel name: {0}")]
+    ChannelName(#[from] crate::subscriptions::ChannelNameError),
+
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 

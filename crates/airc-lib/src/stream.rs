@@ -55,6 +55,7 @@ impl std::error::Error for LiveLag {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
     pub channel: Option<RoomId>,
+    pub channels: Vec<RoomId>,
     pub kinds: BTreeSet<TranscriptKind>,
     pub headers_filter: HeaderFilter,
 }
@@ -63,6 +64,7 @@ impl Default for EventFilter {
     fn default() -> Self {
         Self {
             channel: None,
+            channels: Vec::new(),
             kinds: BTreeSet::new(),
             headers_filter: HeaderFilter::Any,
         }
@@ -79,6 +81,9 @@ impl EventFilter {
             if event.room_id != channel {
                 return false;
             }
+        }
+        if !self.channels.is_empty() && !self.channels.contains(&event.room_id) {
+            return false;
         }
         if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
             return false;

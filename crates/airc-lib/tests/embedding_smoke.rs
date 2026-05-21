@@ -11,8 +11,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    Airc, Body, EventFilter, HeaderFilter, Headers, PeerSpec, RouteEndpoint, TranscriptKind,
-    TransportHealthSample, TransportKind, TransportRole,
+    subscriptions, Airc, Body, ChannelName, EventFilter, HeaderFilter, Headers, MeshIdentity,
+    PeerSpec, RouteEndpoint, SubscriptionSet, TranscriptKind, TransportHealthSample, TransportKind,
+    TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -110,7 +111,10 @@ async fn open_join_say_and_replay_round_trips_in_process() {
     let room = airc.join("project-x").await.unwrap();
     assert_eq!(room.name, "project-x");
     let current = airc.current_room().await.unwrap();
-    assert_eq!(current.channel, room.channel, "join persisted to room.json");
+    assert_eq!(
+        current.channel, room.channel,
+        "join persisted to the subscription set"
+    );
 
     let _event_id = airc.say("hello, consumer").await.unwrap();
 
@@ -221,7 +225,7 @@ async fn peer_spec_round_trips_via_add_peer() {
 #[tokio::test]
 async fn open_is_idempotent_across_handles() {
     // Two Airc::open calls on the same home recover the same
-    // identity (and the same DB without migration conflicts).
+    // identity and event store.
     let home = TempDir::new().unwrap();
     let first = Airc::open(home.path()).await.unwrap();
     let first_peer = first.peer_id();
@@ -416,4 +420,47 @@ async fn filtered_event_queries_match_kind_and_headers_without_body_parse() {
         matches[0].body.as_ref().and_then(Body::as_text),
         Some("persona turn payload")
     );
+}
+
+#[tokio::test]
+async fn subscribed_filter_reads_all_configured_channels_not_current_room_only() {
+    let home = TempDir::new().unwrap();
+    let identity = MeshIdentity::unset();
+    let mut subscription_set = SubscriptionSet::empty();
+    subscription_set
+        .subscribe(home.path(), &identity, ChannelName::new("general").unwrap())
+        .unwrap();
+    subscription_set
+        .subscribe(
+            home.path(),
+            &identity,
+            ChannelName::new("cambriantech").unwrap(),
+        )
+        .unwrap();
+    subscriptions::save(home.path(), &subscription_set).unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+
+    airc.join("general").await.unwrap();
+    airc.say("general lobby message").await.unwrap();
+    wait_for_text(&airc, "general lobby message", Duration::from_secs(2)).await;
+
+    airc.join("cambriantech").await.unwrap();
+    airc.say("project room message").await.unwrap();
+    wait_for_text(&airc, "project room message", Duration::from_secs(2)).await;
+
+    let filter = EventFilter {
+        kinds: std::collections::BTreeSet::from([TranscriptKind::Message]),
+        ..EventFilter::default()
+    };
+    let events = airc
+        .page_recent_subscribed_filtered(filter, 32)
+        .await
+        .unwrap();
+    let texts = events
+        .iter()
+        .filter_map(|event| event.body.as_ref().and_then(Body::as_text))
+        .collect::<Vec<_>>();
+
+    assert!(texts.contains(&"general lobby message"));
+    assert!(texts.contains(&"project room message"));
 }

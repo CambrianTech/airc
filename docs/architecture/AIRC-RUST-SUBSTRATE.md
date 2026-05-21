@@ -40,6 +40,12 @@ transport boundary: gh-gist is an invite/rendezvous beacon, not the live
 message/event data plane. Consumers see publish, subscribe, replay, and ack
 APIs; route resolution sits below them.
 
+See [`ACCOUNT-MESH-JOIN-CONTRACT.md`](ACCOUNT-MESH-JOIN-CONTRACT.md) for the
+join/subscription contract the Rust rewrite must preserve from the working
+system: bare `airc join` enters the account mesh and subscribes the scope to
+`#general` plus the inferred org/project channel. Channels are subscriptions
+on the mesh, not isolated one-room pairing worlds.
+
 ## What airc-rust is not
 
 - Not an opinion about what consumers say to each other. Payloads are
