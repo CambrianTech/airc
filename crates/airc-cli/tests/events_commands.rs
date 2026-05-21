@@ -47,16 +47,29 @@ fn events_list_filters_by_kind_and_header_prefix() {
 }
 
 #[test]
-fn send_receipt_distinguishes_local_store_from_peer_delivery() {
+fn send_receipt_distinguishes_zero_paired_peers_without_lying_about_delivery() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
-    let output = run_ok(&home, &["send", "not delivered to a peer"]);
+    let output = run_ok(&home, &["send", "wire-only send"]);
 
-    assert!(output.contains("stored locally"));
-    assert!(output.contains("no enrolled peers"));
-    assert!(output.contains("not delivered to another agent"));
+    // With zero paired remote peers, the message IS still delivered
+    // to any same-machine scope tailing the channel (post-#857
+    // cross-process broadcast fix). The receipt must not lie about
+    // non-delivery.
+    assert!(
+        output.contains("sent to"),
+        "receipt must lead with 'sent to' — not the old 'stored locally' wording, got: {output}"
+    );
+    assert!(
+        output.contains("0 paired remote peers"),
+        "receipt must surface zero-paired-remote-peers without claiming non-delivery, got: {output}"
+    );
+    assert!(
+        !output.contains("not delivered"),
+        "receipt must NOT claim non-delivery — same-machine tailers will receive it, got: {output}"
+    );
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
