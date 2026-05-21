@@ -131,7 +131,24 @@ pub(crate) struct AircInner {
     /// store is also forwarded here so consumers tailing via
     /// [`Airc::subscribe`] see it immediately.
     pub(crate) live_tx: broadcast::Sender<TranscriptEvent>,
+    /// Event IDs this Airc instance has already broadcast via
+    /// [`live_tx`]. Consulted by the wire subscriber to avoid
+    /// double-delivering a send that was already broadcast in-process
+    /// by `append_sent_frame`. Bounded VecDeque used as a FIFO ring
+    /// — older entries roll off once capacity is exceeded.
+    ///
+    /// Why a per-instance set rather than `(sender, client_id) ==
+    /// self` detection: `client_id` is persisted in `identity.json`,
+    /// so two processes on the same AIRC_HOME share it and the
+    /// equality check would (incorrectly) suppress the cross-process
+    /// peer's frames as "our own."
+    pub(crate) recently_broadcast: std::sync::Mutex<std::collections::VecDeque<airc_core::EventId>>,
 }
+
+/// Capacity of the recently-broadcast ring. Sized to a multiple of
+/// [`LIVE_BROADCAST_CAPACITY`] so even a maximally-lagging consumer
+/// can't push valid events out of the set before they're delivered.
+pub(crate) const RECENTLY_BROADCAST_CAPACITY: usize = LIVE_BROADCAST_CAPACITY * 4;
 
 impl Airc {
     /// Open or initialise an Airc handle at `<home>`. This call:
@@ -220,8 +237,29 @@ impl Airc {
                 lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
+                recently_broadcast: std::sync::Mutex::new(
+                    std::collections::VecDeque::with_capacity(RECENTLY_BROADCAST_CAPACITY),
+                ),
             }),
         })
+    }
+
+    /// Record `event_id` as broadcast in-process so the wire
+    /// subscriber's later re-read doesn't double-deliver. Returns
+    /// `true` if the event was added (not already present).
+    pub(crate) fn mark_broadcast(&self, event_id: airc_core::EventId) -> bool {
+        let mut ring = match self.inner.recently_broadcast.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if ring.contains(&event_id) {
+            return false;
+        }
+        if ring.len() >= RECENTLY_BROADCAST_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(event_id);
+        true
     }
 
     /// Return the home directory backing this handle.
@@ -260,6 +298,9 @@ impl Airc {
             lan_subscriber: Mutex::new(None),
             subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
+            recently_broadcast: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                RECENTLY_BROADCAST_CAPACITY,
+            )),
         };
         Self {
             inner: Arc::new(inner),

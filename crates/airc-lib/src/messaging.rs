@@ -78,13 +78,34 @@ impl Airc {
     }
 
     async fn append_sent_frame(&self, frame: Frame) -> Result<(), AircError> {
+        // Persist to the local store AND fan out to live_tx for
+        // in-process subscribers. Record the event_id in the
+        // recently-broadcast ring so the wire subscriber's later
+        // re-read of the same frame (we just wrote it to disk) skips
+        // a duplicate fan-out.
+        //
+        // Without the ring, two paths would broadcast the same
+        // event: here (fast, synchronous with send), and the
+        // wire-subscriber's tail-loop (50ms later). Subscribers
+        // would see every locally-originated message twice.
+        //
+        // The pair to this is `append_received_frame`, which DOES
+        // fan out on duplicate-id when the event isn't in the ring
+        // — that's the cross-process delivery path (another
+        // process on the same AIRC_HOME wrote the frame, our wire
+        // subscriber reads it, the store says DuplicateEventId
+        // because the sender already persisted, but our local
+        // subscribers haven't seen it).
         let event = frame.into_transcript_event();
-        match self.inner.store.append(event.clone()).await {
-            Ok(()) => {
-                let _ = self.inner.live_tx.send(event);
+        let event_id = event.event_id;
+        let persist_result = self.inner.store.append(event.clone()).await;
+        match persist_result {
+            Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                if self.mark_broadcast(event_id) {
+                    let _ = self.inner.live_tx.send(event);
+                }
                 Ok(())
             }
-            Err(airc_store::StoreError::DuplicateEventId(_)) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }

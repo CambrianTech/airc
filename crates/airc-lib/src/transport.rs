@@ -87,12 +87,11 @@ impl Airc {
     where
         E: std::fmt::Display + Send + 'static,
     {
-        let store = self.inner.store.clone();
-        let live_tx = self.inner.live_tx.clone();
+        let airc = self.clone();
         tokio::spawn(async move {
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(frame) => append_received_frame(frame, store.as_ref(), &live_tx).await,
+                    Ok(frame) => airc.append_received_frame(frame).await,
                     Err(verify_err) => {
                         eprintln!("airc-lib subscriber: frame verification failed: {verify_err}");
                     }
@@ -100,21 +99,37 @@ impl Airc {
             }
         })
     }
-}
 
-async fn append_received_frame(
-    frame: Frame,
-    store: &dyn airc_store::EventStore,
-    live_tx: &tokio::sync::broadcast::Sender<airc_core::TranscriptEvent>,
-) {
-    let event = frame.into_transcript_event();
-    match store.append(event.clone()).await {
-        Ok(()) => {
-            let _ = live_tx.send(event);
-        }
-        Err(airc_store::StoreError::DuplicateEventId(_)) => {}
-        Err(err) => {
-            eprintln!("airc-lib subscriber: store append failed: {err}");
+    pub(crate) async fn append_received_frame(&self, frame: Frame) {
+        let event = frame.into_transcript_event();
+        let event_id = event.event_id;
+        // The store dedups persistence by event_id —
+        // `DuplicateEventId` just means another writer already
+        // persisted this event. Two common cases:
+        //
+        // 1. SELF: this process sent via `append_sent_frame` (which
+        //    already persisted + already broadcast). The wire
+        //    subscriber re-reads the same frame ~50ms later. The
+        //    `recently_broadcast` ring tells us this event_id was
+        //    already fanned out in-process — skip to avoid
+        //    double-delivery to local subscribers.
+        //
+        // 2. CROSS-PROCESS SAME HOME: another scope on the same
+        //    `~/.airc/` wrote the frame via its own
+        //    `append_sent_frame`. Our store sees DuplicateEventId
+        //    because the file is shared (SQLite WAL). The ring is
+        //    EMPTY for this event_id in our process — so we DO fan
+        //    out. That's how Claude and Codex talking on the same
+        //    HOME actually deliver to each other's subscribers.
+        match self.inner.store.append(event.clone()).await {
+            Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                if self.mark_broadcast(event_id) {
+                    let _ = self.inner.live_tx.send(event);
+                }
+            }
+            Err(err) => {
+                eprintln!("airc-lib subscriber: store append failed: {err}");
+            }
         }
     }
 }

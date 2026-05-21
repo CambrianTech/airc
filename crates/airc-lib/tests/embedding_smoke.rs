@@ -273,6 +273,112 @@ fn same_machine_scopes_share_account_wire_and_registry() {
     });
 }
 
+/// Regression: cross-instance (= cross-process in production) sends
+/// must reach the receiver's LIVE BROADCAST stream, not only its
+/// persistent store.
+///
+/// Previously, when two Airc instances shared a HOME (the
+/// account-mesh convention), the receiver's wire subscriber re-read
+/// the frame from disk, tried to persist it, got `DuplicateEventId`
+/// (the sender had already persisted it via the shared SQLite store),
+/// and silently dropped it without firing `live_tx`. Result: `inbox`
+/// / `page_recent` showed the message but `subscribe` / `listen` /
+/// `attach` / Monitor never narrated it. Cross-AI chat over the
+/// public surface didn't work, even with the substrate fully wired.
+///
+/// Fix: `append_received_frame` fans out to `live_tx` on
+/// `DuplicateEventId` too, with a `recently_broadcast` ring to avoid
+/// double-delivery of locally-sent events.
+///
+/// This test models the production scenario via two distinct
+/// `Airc::open` calls on the same home (each open allocates its own
+/// `recently_broadcast` ring, mirroring two separate processes).
+#[test]
+fn cross_instance_send_reaches_receiver_subscribe_stream() {
+    let machine = TempDir::new().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+    temp_env::with_var("HOME", Some(machine.path()), || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Two scopes pointing at separate home dirs that share
+            // the same machine-account wire root (mirrors how two
+            // Claude/Codex tabs on Joel's machine end up using
+            // `~/.airc/wires/<channel>/` even when they were
+            // launched from different repos).
+            let alice_home = machine.path().join("repo-a").join(".airc");
+            let bob_home = machine.path().join("repo-b").join(".airc");
+            std::fs::create_dir_all(alice_home.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(bob_home.parent().unwrap()).unwrap();
+
+            let alice = Airc::open(&alice_home).await.unwrap();
+            alice.join("general").await.unwrap();
+
+            let bob = Airc::open(&bob_home).await.unwrap();
+            bob.join("general").await.unwrap();
+
+            // Subscribe BEFORE alice sends so the live stream is
+            // armed and ready to receive. Bob is the "listener" /
+            // "monitor attach" role.
+            let mut bob_stream = bob.subscribe().await.unwrap();
+
+            alice.say("live chat across instances").await.unwrap();
+
+            // Wait up to 3s for the event to flow through the wire
+            // subscriber → bob's live_tx → bob_stream.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut got_text: Option<String> = None;
+            while std::time::Instant::now() < deadline {
+                let next = tokio::time::timeout(Duration::from_millis(100), bob_stream.next())
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(Ok(event)) = next {
+                    if let Some(text) = event.body.as_ref().and_then(Body::as_text) {
+                        if text == "live chat across instances" {
+                            got_text = Some(text.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                got_text.as_deref(),
+                Some("live chat across instances"),
+                "bob's subscribe stream must see alice's send live — \
+                 NOT just via store/inbox. This is the cross-process \
+                 live-broadcast path that the public `airc msg` / \
+                 `airc attach` chat surface depends on."
+            );
+
+            // No duplicate delivery for alice's own send into her
+            // own subscribe stream.
+            let mut alice_stream = alice.subscribe().await.unwrap();
+            alice.say("alice-only echo").await.unwrap();
+            let mut count = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                let next = tokio::time::timeout(Duration::from_millis(100), alice_stream.next())
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(Ok(event)) = next {
+                    if event.body.as_ref().and_then(Body::as_text) == Some("alice-only echo") {
+                        count += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                count, 1,
+                "alice's own send must reach her subscribe stream EXACTLY ONCE — \
+                 not twice (once via send-side fan-out, once via wire-subscriber \
+                 re-read). recently_broadcast ring de-dupes this."
+            );
+        });
+    });
+}
+
 #[test]
 fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire() {
     let machine = TempDir::new().unwrap();
