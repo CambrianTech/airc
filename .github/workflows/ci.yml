@@ -59,6 +59,11 @@ jobs:
           test ! -e "$HOME/.local/bin/airc-core"
           airc doctor
 
+      - name: Public installed runtime proof
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          AIRC_EXPECT_BIN="$HOME/.local/bin/airc" bash "$HOME/.airc/src/test/public_installed_runtime_proof.sh"
+
       - name: Smoke — connect --no-room --no-gist + teardown
         run: |
           export PATH="$HOME/.local/bin:$PATH"
@@ -120,6 +125,11 @@ jobs:
           airc version
           test ! -e "$HOME/.local/bin/airc-core"
           airc doctor
+
+      - name: Public installed runtime proof
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          AIRC_EXPECT_BIN="$HOME/.local/bin/airc" bash "$HOME/.airc/src/test/public_installed_runtime_proof.sh"
 
       - name: Smoke — same as linux (airc.pid based)
         run: |

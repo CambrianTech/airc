@@ -112,10 +112,11 @@ install
 which airc == platform user-bin shim
 airc version -> ~/.airc/src at the expected commit
 no stale public airc-core / language-suffixed commands
-airc join
-airc msg
-airc inbox or monitor/hook receive
-airc teardown
+two fresh project scopes run public airc join
+both scopes subscribe #general and their inferred project channel
+both scopes derive the same identity-namespaced #general RoomId
+both scopes use the same account-home #general wire
+airc teardown cleans the scope processes
 ```
 
 For AI agents specifically, a passing install is not enough. Claude must be
@@ -296,7 +297,11 @@ Already landed in rust-rewrite:
 - POSIX PATH shim at the user-bin command surface, dispatching to
   `~/.airc/src/airc`;
 - clean-install/runtime guards that reject stale language-suffixed commands and
-  exercise the public shim path.
+  exercise the public shim path;
+- public installed runtime proof for Linux/macOS clean-install CI:
+  `test/public_installed_runtime_proof.sh` validates `airc` from PATH, rejects
+  stale `airc-core`, runs two fresh project scopes through public `airc join`,
+  and proves they converge on the same account-home `#general` RoomId and wire.
 
 Current rust-rewrite still has account-mesh gaps:
 
@@ -365,6 +370,15 @@ Acceptance for Claude's coordinator PR:
   commands;
 - no shell-only state machine and no test-only environment variable path.
 
+Codex's parallel proof-gate slice does not implement coordinator behavior. It
+adds the installed-command test harness that coordinator wiring must satisfy.
+When Claude's wiring PR publishes beacons from `Airc::join` and reads the local
+snapshot for same-machine discovery, extend
+`test/public_installed_runtime_proof.sh` rather than adding another ad-hoc
+manual test. The next assertion to add there is: after both fresh scopes join,
+a public `airc msg` from one scope is visible to the other through monitor or
+hook delivery without peer pre-seeding and without GitHub.
+
 ## Acceptance Tests
 
 The rewrite is not correct until these pass:
@@ -398,3 +412,5 @@ The rewrite is not correct until these pass:
   roots, parallel worktree roots, and old PATH shims, a fresh install produces
   exactly one public command, `airc`, and `airc version` reports the same
   source checkout that the command executes.
+- Clean-install CI runs the installed public-command proof on Linux and macOS,
+  not just direct `airc-core` cargo tests.
