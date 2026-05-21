@@ -37,6 +37,9 @@ pub enum AircError {
     #[error("account coordinator: {0}")]
     Coordinator(#[from] crate::coordinator::CoordinatorError),
 
+    #[error("account registry: {0}")]
+    AccountRegistry(#[from] crate::account_registry::AccountRegistryError),
+
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 

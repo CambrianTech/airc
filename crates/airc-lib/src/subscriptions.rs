@@ -154,6 +154,25 @@ impl std::fmt::Display for ChannelName {
     }
 }
 
+impl Serialize for MeshIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MeshIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::new(raw))
+    }
+}
+
 impl Serialize for ChannelName {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

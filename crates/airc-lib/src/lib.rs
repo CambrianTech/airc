@@ -21,6 +21,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod account_registry;
 pub mod airc;
 pub mod coordinator;
 mod coordinator_lock;
@@ -42,6 +43,10 @@ mod transport;
 mod wire_replay;
 pub mod work;
 
+pub use account_registry::{
+    AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
+    FileAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
+};
 pub use airc::Airc;
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now, drain_stale as coordinator_drain_stale,
