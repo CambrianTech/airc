@@ -34,6 +34,9 @@ pub enum AircError {
     #[error("mesh identity: {0}")]
     MeshIdentity(#[from] crate::mesh_identity::MeshIdentityError),
 
+    #[error("account coordinator: {0}")]
+    Coordinator(#[from] crate::coordinator::CoordinatorError),
+
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 

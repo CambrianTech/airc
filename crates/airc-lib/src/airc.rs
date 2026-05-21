@@ -41,6 +41,7 @@ use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
 use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
 use crate::transport::{FrameSubscriber, WireSubscriber};
+use crate::{coordinator, time};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
 
@@ -315,6 +316,43 @@ impl Airc {
         Ok(cached.as_mesh_identity())
     }
 
+    pub(crate) fn sync_account_peer_registry(&self) -> Result<(), AircError> {
+        let peers = load_peer_registries(&self.inner.home, &self.inner.wire_root)?;
+        let mut registry = self
+            .inner
+            .registry
+            .write()
+            .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
+        for peer in peers {
+            registry
+                .enrol(
+                    peer.peer_id,
+                    0,
+                    peer.pubkey_bytes()
+                        .map_err(|e| AircError::Crypto(e.to_string()))?,
+                )
+                .map_err(|e| AircError::Crypto(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn publish_presence(
+        &self,
+        identity: &MeshIdentity,
+        set: &subscriptions::SubscriptionSet,
+    ) -> Result<(), AircError> {
+        let channels = set.channel_names().cloned().collect();
+        let beacon = coordinator::beacon_now(
+            self.inner.identity.peer_id,
+            self.inner.home.clone(),
+            channels,
+            std::process::id(),
+            time::now_ms()?,
+        );
+        coordinator::publish(&self.inner.wire_root, identity, &beacon)?;
+        Ok(())
+    }
+
     /// Subscribe to `name` and make it the default channel for
     /// short-shape commands.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
@@ -325,6 +363,7 @@ impl Airc {
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(&self.inner.home, &set)?;
+        self.publish_presence(&identity, &set)?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
@@ -366,6 +405,7 @@ impl Airc {
             set.set_default(context.default)?;
         }
         subscriptions::save(&self.inner.home, &set)?;
+        self.publish_presence(&identity, &set)?;
 
         for room in &rooms {
             self.ensure_wire_subscriber(&room.wire).await?;
@@ -386,6 +426,7 @@ impl Airc {
         set.subscribed.insert(channel.clone(), subscription.clone());
         set.set_default(channel)?;
         subscriptions::save(&self.inner.home, &set)?;
+        self.publish_presence(&identity, &set)?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
@@ -406,6 +447,7 @@ impl Airc {
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(&self.inner.home, &set)?;
+        self.publish_presence(&identity, &set)?;
         Ok(subscription.as_room())
     }
 

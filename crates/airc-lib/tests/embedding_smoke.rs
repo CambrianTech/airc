@@ -11,9 +11,10 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName, EventFilter, HeaderFilter,
-    Headers, MeshIdentity, MeshIdentitySource, PeerSpec, RouteEndpoint, SubscriptionSet,
-    TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
+    coordinator_snapshot, resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName,
+    CoordinatorConfig, EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource,
+    PeerSpec, RouteEndpoint, SubscriptionSet, TranscriptKind, TransportHealthSample, TransportKind,
+    TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -310,6 +311,41 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
             assert_eq!(
                 alice.current_room().await.unwrap().channel,
                 bob.current_room().await.unwrap().channel
+            );
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let snapshot = coordinator_snapshot(
+                &machine.path().join(".airc"),
+                &MeshIdentity::new("joelteply"),
+                &CoordinatorConfig::default(),
+                now_ms,
+            )
+            .unwrap();
+            assert_eq!(snapshot.live.len(), 2);
+            assert_eq!(
+                snapshot
+                    .live_channels
+                    .iter()
+                    .map(ChannelName::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["cambriantech", "general"]
+            );
+            assert!(
+                snapshot
+                    .live
+                    .iter()
+                    .any(|beacon| beacon.scope_home == alice_home),
+                "join_default_context must publish Alice's scope beacon"
+            );
+            assert!(
+                snapshot
+                    .live
+                    .iter()
+                    .any(|beacon| beacon.scope_home == bob_home),
+                "join_default_context must publish Bob's scope beacon"
             );
 
             alice.say("default account context works").await.unwrap();

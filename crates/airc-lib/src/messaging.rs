@@ -29,6 +29,7 @@ impl Airc {
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
+        self.sync_account_peer_registry()?;
         let room = self.current_room().await?;
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
@@ -134,6 +135,7 @@ impl Airc {
         if self.is_daemon_attached() {
             return self.daemon_page_recent(&room, limit).await;
         }
+        self.replay_wire_once(&room.wire).await?;
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(self
             .inner
@@ -150,6 +152,8 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
+        let room = self.current_room().await?;
+        self.replay_wire_once(&room.wire).await?;
         self.ensure_current_room_subscriber().await?;
         Ok(self
             .inner
@@ -168,6 +172,7 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
+        self.replay_subscribed_wires_once().await?;
         self.ensure_subscribed_room_subscribers().await?;
         Ok(self
             .inner
@@ -189,6 +194,7 @@ impl Airc {
         if self.is_daemon_attached() {
             return self.daemon_resume_from(&room, cursor, limit).await;
         }
+        self.replay_wire_once(&room.wire).await?;
         Ok(self
             .inner
             .store
@@ -206,6 +212,8 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
+        let room = self.current_room().await?;
+        self.replay_wire_once(&room.wire).await?;
         Ok(self
             .inner
             .store
@@ -224,6 +232,7 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
+        self.replay_subscribed_wires_once().await?;
         Ok(self
             .inner
             .store

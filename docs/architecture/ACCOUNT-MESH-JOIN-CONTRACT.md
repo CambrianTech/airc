@@ -301,17 +301,23 @@ Already landed in rust-rewrite:
 - public installed runtime proof for Linux/macOS clean-install CI:
   `test/public_installed_runtime_proof.sh` validates `airc` from PATH, rejects
   stale `airc-core`, runs two fresh project scopes through public `airc join`,
-  and proves they converge on the same account-home `#general` RoomId and wire.
+  proves they converge on the same account-home `#general` RoomId and wire,
+  sends through public `airc msg`, and proves the second scope reads that
+  message through the Rust event surface;
+- machine-global coordinator/cache under `~/.airc/accounts/<identity>/` with
+  typed presence beacons, TTL partitioning, and atomic refresh singleflight;
+- `Airc::join` / `Airc::join_default_context()` publish coordinator beacons for
+  the joined subscription set;
+- durable Rust event reads synchronously replay the local-fs wire into the
+  store before querying, so one-shot commands and hooks do not race a
+  background tailer.
 
 Current rust-rewrite still has account-mesh gaps:
 
 - CLI `room` language still needs final cleanup so it reads as subscription
   management rather than single-room switching;
-- machine-global coordinator/cache is not implemented yet;
-- same-machine peer discovery still relies on peer records being present rather
-  than a coordinator-owned local presence registry;
 - monitor and hook reliability must be proven through public installed
-  commands after coordinator discovery lands;
+  commands using the same coordinator-backed join path;
 - cross-machine account-mesh discovery still needs the rare remote registry
   publisher/refresh path.
 
@@ -326,9 +332,10 @@ Required corrections:
    a channel without removing the rest.
 4. Keep monitor and hooks defaulted to all subscribed channels, not current
    room.
-5. Add machine-global coordinator/cache under `~/.airc/accounts/<identity>/`.
-6. Add account-mesh registry abstraction for `git user identity + channel ->
-   beacon`.
+5. Keep machine-global coordinator/cache under `~/.airc/accounts/<identity>/`
+   as the local source of truth for joined scopes and live channels.
+6. Keep account-mesh registry abstraction for `git user identity + channel ->
+   beacon`, and wire public monitor/hook commands through it.
 7. Keep the data plane selected by route policy: local, LAN, relay, WebRTC,
    Reticulum, etc. Gist remains registry/bootstrap.
 8. Add Rust Tailscale discovery/login health: detect installed/down/logged-out,
@@ -341,43 +348,35 @@ Required corrections:
    worktrees under `~/.airc/worktrees`, and no stale language-suffixed binaries
    or hidden alternate source roots.
 
-## Handoff: Claude Coordinator Slice
+## Handoff: Monitor And Hook Proof
 
-Claude should not reimplement `join_default_context`, wrapper seeding, or the
-PATH shim. Those are already landed. Claude's next slice is the machine-global
-coordinator.
+The coordinator foundation and join wiring are landed. Claude should not
+reimplement `join_default_context`, wrapper seeding, PATH shim, coordinator
+locks, or wire replay. The next slice is the automatic delivery surface.
 
 Scope:
 
-- new coordinator state under `~/.airc/accounts/<mesh-identity>/`;
-- local presence/beacon registry for this machine;
-- channel subscriptions projected into that registry;
-- TTL and singleflight so ten local agents running `airc join` cause at most
-  one remote refresh;
-- same-machine peer discovery before GitHub/gist;
-- no monitor/hook changes in the first coordinator PR unless the coordinator
-  API is already stable.
+- validate `airc join --attach` from a clean installed source, no manual binary
+  copy and no test-only environment override;
+- prove a second fresh scope sends via public `airc msg` and the first scope's
+  monitor emits the inbound event live;
+- prove `airc codex-hook user-prompt-submit` reads the same message through the
+  Rust subscribed event surface;
+- keep all monitor and hook reads scoped to the subscription set, not a
+  single current room;
+- do not add shell log scraping, gist polling, symlink workarounds, or
+  alternate source roots.
 
-Acceptance for Claude's coordinator PR:
+Acceptance for the monitor/hook PR:
 
-- two fresh scopes on the same machine and same mesh identity run public
-  `airc join` and discover the same account channels without an invite;
-- no GitHub access is required for same-machine discovery after the first local
-  coordinator state exists;
-- concurrent joins serialize through the coordinator instead of racing remote
-  registry refresh;
-- coordinator state is typed and inspectable by `airc doctor` / future status
-  commands;
-- no shell-only state machine and no test-only environment variable path.
-
-Codex's parallel proof-gate slice does not implement coordinator behavior. It
-adds the installed-command test harness that coordinator wiring must satisfy.
-When Claude's wiring PR publishes beacons from `Airc::join` and reads the local
-snapshot for same-machine discovery, extend
-`test/public_installed_runtime_proof.sh` rather than adding another ad-hoc
-manual test. The next assertion to add there is: after both fresh scopes join,
-a public `airc msg` from one scope is visible to the other through monitor or
-hook delivery without peer pre-seeding and without GitHub.
+- `test/public_installed_runtime_proof.sh` or a sibling public-install proof
+  starts two fresh scopes, runs bare `airc join`, sends from one, and observes
+  the other through monitor or hook delivery without peer pre-seeding and
+  without GitHub;
+- one-shot event reads remain deterministic through SDK wire replay, not
+  sleeps around background tailers;
+- the public command remains `airc`; no hidden language-suffixed runtime path
+  or alternate source root is introduced.
 
 ## Acceptance Tests
 

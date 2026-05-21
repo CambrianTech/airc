@@ -189,4 +189,49 @@ openclaw_general_wire="$(json_channel_field "$OPENCLAW_SCOPE/subscriptions.json"
 [ "$continuum_general_wire" = "$MACHINE_HOME_REAL/.airc/wires/general" ] \
   || fail "#general wire must be account-home scoped, got $continuum_general_wire"
 
-log "public airc command, account-room derivation, and same-machine #general wire are coherent"
+PROOF_MESSAGE="public installed runtime proof $(date +%s)"
+(
+  cd "$CONTINUUM_REPO" || exit 1
+  HOME="$MACHINE_HOME" \
+    AIRC_HOME="$CONTINUUM_SCOPE" \
+    AIRC_NO_DISCOVERY=1 \
+    AIRC_NO_GENERAL=1 \
+    AIRC_BACKGROUND_OK=1 \
+    AIRC_NO_ATTACH=1 \
+    "$AIRC_BIN" msg --channel general "$PROOF_MESSAGE" >"$ROOT/msg.out" 2>"$ROOT/msg.err"
+) || {
+  echo "--- msg stdout ---" >&2
+  cat "$ROOT/msg.out" >&2 || true
+  echo "--- msg stderr ---" >&2
+  cat "$ROOT/msg.err" >&2 || true
+  fail "public airc msg failed"
+}
+
+wait_for_message() {
+  local deadline=$((SECONDS + 12))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    (
+      cd "$OPENCLAW_REPO" || exit 1
+      HOME="$MACHINE_HOME" \
+        AIRC_HOME="$OPENCLAW_SCOPE" \
+        AIRC_NO_DISCOVERY=1 \
+        AIRC_NO_GENERAL=1 \
+        AIRC_BACKGROUND_OK=1 \
+        AIRC_NO_ATTACH=1 \
+        "$AIRC_BIN" events list --kind message --limit 32
+    ) >"$ROOT/events.out" 2>"$ROOT/events.err" || return 1
+    grep -q "$PROOF_MESSAGE" "$ROOT/events.out" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+if ! wait_for_message; then
+  echo "--- events stdout ---" >&2
+  cat "$ROOT/events.out" >&2 || true
+  echo "--- events stderr ---" >&2
+  cat "$ROOT/events.err" >&2 || true
+  fail "second fresh scope did not read public airc msg from account wire"
+fi
+
+log "public airc command, account-room derivation, same-machine #general wire, and message delivery are coherent"
