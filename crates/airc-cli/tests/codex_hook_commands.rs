@@ -8,7 +8,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 fn airc_core() -> &'static str {
-    env!("CARGO_BIN_EXE_airc-core")
+    env!("CARGO_BIN_EXE_airc")
 }
 
 #[test]
@@ -420,30 +420,16 @@ fn managed_hook_commands(commands: &[String]) -> Vec<String> {
 }
 
 fn assert_source_command(command: &str) {
-    assert!(
-        command.ends_with(" codex-hook user-prompt-submit"),
-        "managed hook must call the Codex hook subcommand, got {command:?}"
-    );
-    assert!(
-        command.contains(source_airc_command_fragment()),
-        "managed hook must use the source-installed airc command, got {command:?}"
-    );
-    assert!(
-        !command.starts_with("airc "),
-        "managed hook must not depend on PATH, got {command:?}"
+    // Post-demolition contract (PR D): the public command IS the
+    // Rust binary on PATH at `airc`, not a source-tree wrapper
+    // script. The managed hook command resolves to PATH `airc`,
+    // exactly the command a stranger reading the README would type.
+    assert_eq!(
+        command, "airc codex-hook user-prompt-submit",
+        "managed hook must be the PATH `airc` command, got {command:?}"
     );
     assert!(
         !command.starts_with("airc-core "),
-        "managed hook must not call airc-core directly, got {command:?}"
+        "managed hook must not call legacy airc-core suffix, got {command:?}"
     );
-}
-
-#[cfg(windows)]
-fn source_airc_command_fragment() -> &'static str {
-    "\\airc.cmd\" codex-hook user-prompt-submit"
-}
-
-#[cfg(not(windows))]
-fn source_airc_command_fragment() -> &'static str {
-    "/airc' codex-hook user-prompt-submit"
 }

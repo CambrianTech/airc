@@ -58,7 +58,7 @@ cd "$HOME" 2>/dev/null || cd /
 
 cat <<EOF
 This will remove airc from this machine:
-  PATH files        $CLONE_DIR/airc plus stale $BIN_DIR/{airc,airc-core,airc-core.exe,airc.cmd,airc.ps1}
+  PATH files        $BIN_DIR/{airc,airc.exe} plus legacy $BIN_DIR/{airc-core,airc-core.exe,airc.cmd,airc.ps1}
   skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
@@ -138,23 +138,23 @@ if [ -f "$codex_config" ]; then
     mv "$_tmp" "$codex_config"
     ok "Removed airc command-rules pre-approval from $codex_config"
   fi
-  _airc_core=""
-  if command -v airc-core >/dev/null 2>&1; then
-    _airc_core=$(command -v airc-core)
-  elif [ -x "$CLONE_DIR/target/release/airc-core" ]; then
-    _airc_core="$CLONE_DIR/target/release/airc-core"
-  elif [ -x "$CLONE_DIR/target/debug/airc-core" ]; then
-    _airc_core="$CLONE_DIR/target/debug/airc-core"
+  _airc=""
+  if command -v airc >/dev/null 2>&1; then
+    _airc=$(command -v airc)
+  elif [ -x "$CLONE_DIR/target/release/airc" ]; then
+    _airc="$CLONE_DIR/target/release/airc"
+  elif [ -x "$CLONE_DIR/target/debug/airc" ]; then
+    _airc="$CLONE_DIR/target/debug/airc"
   fi
-  if [ -n "$_airc_core" ]; then
-    if out=$("$_airc_core" codex-hook uninstall-hooks --codex-home "$HOME/.codex" 2>&1); then
+  if [ -n "$_airc" ]; then
+    if out=$("$_airc" codex-hook uninstall-hooks --codex-home "$HOME/.codex" 2>&1); then
       if [ -n "$out" ]; then
         printf '%s\n' "$out" | while IFS= read -r line; do
           ok "Codex AIRC hook: $line"
         done
       fi
     else
-      warn "Could not uninstall Codex AIRC hook through airc-core: $out"
+      warn "Could not uninstall Codex AIRC hook through airc: $out"
     fi
   fi
 fi

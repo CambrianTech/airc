@@ -20,8 +20,7 @@ pub async fn run_install_hooks(
             config.display()
         );
     }
-    let airc_core = std::env::current_exe()?;
-    if codex_hooks_json::install(&hooks_json, &airc_core)? {
+    if codex_hooks_json::install(&hooks_json)? {
         println!(
             "installed AIRC UserPromptSubmit hook in {}",
             hooks_json.display()
