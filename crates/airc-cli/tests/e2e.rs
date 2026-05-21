@@ -18,10 +18,17 @@ fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc-core")
 }
 
+fn command_for_home(home: &Path) -> Command {
+    let mut command = Command::new(airc_core());
+    command.env("HOME", home);
+    command.env("USERPROFILE", home);
+    command
+}
+
 /// Run `airc-core --home <dir> init` and parse the printed `peer_id:`
 /// and `peer_spec:` lines from stdout.
 fn run_init(home: &Path) -> (String, String) {
-    let output = Command::new(airc_core())
+    let output = command_for_home(home)
         .arg("--home")
         .arg(home)
         .arg("init")
@@ -68,7 +75,7 @@ fn two_airc_core_processes_chat_over_local_fs() {
     run_room(&alice_home, "e2e", &wire);
     run_room(&bob_home, "e2e", &wire);
 
-    let mut alice = Command::new(airc_core())
+    let mut alice = command_for_home(&alice_home)
         .args([
             "--home",
             alice_home.to_str().unwrap(),
@@ -84,7 +91,7 @@ fn two_airc_core_processes_chat_over_local_fs() {
 
     std::thread::sleep(Duration::from_millis(300));
 
-    let bob_send = Command::new(airc_core())
+    let bob_send = command_for_home(&bob_home)
         .args([
             "--home",
             bob_home.to_str().unwrap(),
@@ -120,7 +127,7 @@ fn two_airc_core_processes_chat_over_local_fs() {
 /// Run `airc-core --home <dir> room <name> --wire <wire>`. Used by
 /// tests to pin two peers to the same shared-wire room.
 fn run_room(home: &Path, name: &str, wire: &Path) {
-    let output = Command::new(airc_core())
+    let output = command_for_home(home)
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -177,6 +184,8 @@ fn join_without_args_uses_default_account_context() {
         std::path::PathBuf::from(wire),
         machine
             .path()
+            .canonicalize()
+            .unwrap()
             .join(".airc")
             .join("wires")
             .join("cambriantech")
@@ -233,7 +242,7 @@ fn listen_rejects_unenrolled_signer() {
     run_room(&alice_home, "e2e", &wire);
     run_room(&mallory_home, "e2e", &wire);
 
-    let mut alice = Command::new(airc_core())
+    let mut alice = command_for_home(&alice_home)
         .args(["--home", alice_home.to_str().unwrap(), "listen", "--replay"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -244,7 +253,7 @@ fn listen_rejects_unenrolled_signer() {
 
     // Mallory passes herself as `--peer` so her own registry is
     // non-empty; her CLI signs the frame under her own identity.
-    let _mallory_send = Command::new(airc_core())
+    let _mallory_send = command_for_home(&mallory_home)
         .args([
             "--home",
             mallory_home.to_str().unwrap(),
@@ -281,7 +290,7 @@ fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
     let (alice_id, alice_spec) = run_init(&alice_home);
     let (_bob_id, bob_spec) = run_init(&bob_home);
 
-    let mut alice = Command::new(airc_core())
+    let mut alice = command_for_home(&alice_home)
         .args([
             "--home",
             alice_home.to_str().unwrap(),
@@ -303,7 +312,7 @@ fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
             .expect("alice must print bound LAN address");
     let bound_addr = parse_listening_addr(&listen_line);
 
-    let bob_send = Command::new(airc_core())
+    let bob_send = command_for_home(&bob_home)
         .args([
             "--home",
             bob_home.to_str().unwrap(),
@@ -345,7 +354,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
     let socket = workspace.path().join("daemon.sock");
     run_init(&home);
 
-    let mut daemon = Command::new(airc_core())
+    let mut daemon = command_for_home(&home)
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -364,7 +373,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         Duration::from_secs(6),
     );
 
-    let msg = Command::new(airc_core())
+    let msg = command_for_home(&home)
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -393,7 +402,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         "inbox did not print daemon-sent message through SDK attach path"
     );
 
-    let stop = Command::new(airc_core())
+    let stop = command_for_home(&home)
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -413,7 +422,7 @@ fn inbox_without_socket_reads_in_process_store() {
     let home = workspace.path().join("agent");
     run_init(&home);
 
-    let send = Command::new(airc_core())
+    let send = command_for_home(&home)
         .args([
             "--home",
             home.to_str().unwrap(),
@@ -429,7 +438,7 @@ fn inbox_without_socket_reads_in_process_store() {
         String::from_utf8_lossy(&send.stderr),
     );
 
-    let inbox = Command::new(airc_core())
+    let inbox = command_for_home(&home)
         .args(["--home", home.to_str().unwrap(), "inbox", "--limit", "16"])
         .output()
         .expect("inbox must spawn");
@@ -470,7 +479,7 @@ fn wait_for_command_stdout_contains(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        let output = Command::new(airc_core())
+        let output = command_for_home(home)
             .args([
                 "--home",
                 home.to_str().unwrap(),

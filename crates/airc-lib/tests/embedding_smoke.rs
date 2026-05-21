@@ -244,7 +244,14 @@ fn same_machine_scopes_share_account_wire_and_registry() {
             let bob_room = bob.current_room().await.unwrap();
             assert_eq!(alice_room.channel, bob_room.channel);
             assert_eq!(alice_room.wire, bob_room.wire);
-            assert_eq!(alice_room.wire, machine.path().join(".airc/wires/general"));
+            assert_eq!(
+                alice_room.wire,
+                machine
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(".airc/wires/general")
+            );
 
             let peers = airc_daemon::peers_store::load(&machine.path().join(".airc")).unwrap();
             assert_eq!(
@@ -294,7 +301,11 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
             assert_eq!(bob.current_room().await.unwrap().name, "cambriantech");
             assert_eq!(
                 alice.current_room().await.unwrap().wire,
-                machine.path().join(".airc/wires/cambriantech")
+                machine
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(".airc/wires/cambriantech")
             );
             assert_eq!(
                 alice.current_room().await.unwrap().channel,

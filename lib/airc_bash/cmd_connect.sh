@@ -73,6 +73,20 @@ _join_phase_done() {
   [ -f "$_t0_file" ] && rm -f "$_t0_file" 2>/dev/null || true
 }
 
+_join_seed_rust_account_context() {
+  [ "$use_room" = "1" ] || return 0
+  [ -z "${target:-}" ] || return 0
+
+  local _airc_core
+  _airc_core="$(airc_core_bin)" || return 1
+
+  if [ "$room_explicit" = "1" ]; then
+    "$_airc_core" --home "$AIRC_WRITE_DIR" join "$room_name" >/dev/null
+  else
+    "$_airc_core" --home "$AIRC_WRITE_DIR" join >/dev/null
+  fi
+}
+
 # ensure_channel_subscribed_with_gist <channel> [--first]
 #
 # Single-concern helper: make this scope a fully-functional subscriber
@@ -966,6 +980,10 @@ cmd_connect() {
 
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
+
+  if ! _join_seed_rust_account_context; then
+    die "Could not seed Rust account-room subscriptions; refusing to join with broken local state"
+  fi
 
   # ── Notification-sink liveness ─────────────────────────────────────
   # `airc connect` is only useful when a CONSUMER is reading our stdout —

@@ -33,8 +33,8 @@ Python/shell/GitHub data plane.
 ### Install And State Layout
 
 AIRC has one public command name: `airc`. The Rust rewrite must not expose a
-parallel `airc-rs` product surface, require users to remember which binary is
-new, or let different wrappers point at different builds.
+parallel language-suffixed product surface, require users to remember which
+binary is new, or let different wrappers point at different builds.
 
 The install layout is:
 
@@ -51,9 +51,9 @@ must not replace the account-wide coordinator under `~/.airc`.
 
 Forbidden install shapes:
 
-- `~/.airc-src` as a second hidden source checkout;
-- `~/.airc-worktrees` as a parallel worktree root;
-- stale `airc-rs` binaries or user-facing symlinks;
+- second hidden source checkouts outside `~/.airc/src`;
+- parallel worktree roots outside `~/.airc/worktrees`;
+- stale language-suffixed binaries or user-facing symlinks;
 - wrappers that silently fall back to an older installed binary;
 - test-only environment variables as the normal user path.
 
@@ -64,7 +64,7 @@ loudly if resolution is ambiguous. It must not search arbitrary old install
 locations.
 
 For version 1 there is no legacy runtime surface. Old Python, shell, gist-chat,
-and `airc-rs` compatibility paths should be deleted when their Rust
+and language-suffixed compatibility paths should be deleted when their Rust
 replacement exists. If a fresh install would never create a file or symlink,
 the runtime should not contain code to keep using it.
 
@@ -227,8 +227,9 @@ The foolproof order is:
 Current rust-rewrite still has account-mesh gaps:
 
 - CLI `room` language says "switch current room";
-- install and wrapper paths have historically allowed stale `airc-rs`,
-  `~/.airc-src`, and symlink resolution to mask the actual binary under test.
+- install and wrapper paths have historically allowed stale language-suffixed
+  binaries, split source roots, and symlink resolution to mask the actual
+  binary under test.
 - `Airc::join_default_context()` is not implemented yet;
 - mesh identity still uses the unset sentinel until the machine-global
   coordinator resolves the authenticated Git/GitHub user identity.
@@ -253,8 +254,8 @@ Required corrections:
 8. Add machine-global coordinator/cache keyed by Git/GitHub user identity, with
    TTL, singleflight, and backoff around all remote registry publishers.
 9. Collapse install/runtime naming to `airc`, with source under `~/.airc/src`,
-   worktrees under `~/.airc/worktrees`, and no stale `airc-rs` or hidden
-   alternate source roots.
+   worktrees under `~/.airc/worktrees`, and no stale language-suffixed binaries
+   or hidden alternate source roots.
 
 ## Acceptance Tests
 
@@ -285,7 +286,7 @@ The rewrite is not correct until these pass:
   refresh at most; the other nine attach through the machine-global coordinator.
 - Monitor and Codex hooks never invoke GitHub while draining subscribed-channel
   events.
-- After deleting `~/.airc`, `~/.airc-src`, `~/.airc-worktrees`, stale `airc-rs`
-  binaries, and old PATH shims, a fresh install produces exactly one public
-  command, `airc`, and `airc version` reports the same source checkout that the
-  command executes.
+- After deleting old AIRC state, stale language-suffixed binaries, split source
+  roots, parallel worktree roots, and old PATH shims, a fresh install produces
+  exactly one public command, `airc`, and `airc version` reports the same
+  source checkout that the command executes.

@@ -54,15 +54,23 @@ const LIVE_BROADCAST_CAPACITY: usize = 1024;
 fn machine_account_home(scope_home: &Path) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        if scope_home.starts_with(&home) {
-            return home.join(".airc");
+        let normalized_home = home.canonicalize().unwrap_or(home);
+        let normalized_scope = scope_home
+            .canonicalize()
+            .unwrap_or_else(|_| scope_home.to_path_buf());
+        if normalized_scope.starts_with(&normalized_home) {
+            return normalized_home.join(".airc");
         }
     }
     #[cfg(windows)]
     if let Some(userprofile) = std::env::var_os("USERPROFILE") {
         let userprofile = PathBuf::from(userprofile);
-        if scope_home.starts_with(&userprofile) {
-            return userprofile.join(".airc");
+        let normalized_userprofile = userprofile.canonicalize().unwrap_or(userprofile);
+        let normalized_scope = scope_home
+            .canonicalize()
+            .unwrap_or_else(|_| scope_home.to_path_buf());
+        if normalized_scope.starts_with(&normalized_userprofile) {
+            return normalized_userprofile.join(".airc");
         }
     }
     scope_home.to_path_buf()
