@@ -50,6 +50,34 @@ const EVENTS_DB_FILENAME: &str = "events.sqlite";
 /// that need durable replay use `Airc::resume_from` against the store.
 const LIVE_BROADCAST_CAPACITY: usize = 1024;
 
+fn machine_account_home(scope_home: &Path) -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if scope_home.starts_with(&home) {
+            return home.join(".airc");
+        }
+    }
+    #[cfg(windows)]
+    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        let userprofile = PathBuf::from(userprofile);
+        if scope_home.starts_with(&userprofile) {
+            return userprofile.join(".airc");
+        }
+    }
+    scope_home.to_path_buf()
+}
+
+fn load_peer_registries(
+    home: &Path,
+    wire_root: &Path,
+) -> Result<Vec<peers_store::StoredPeer>, AircError> {
+    let mut peers = peers_store::load(home)?;
+    if wire_root != home {
+        peers.extend(peers_store::load(wire_root)?);
+    }
+    Ok(peers)
+}
+
 /// In-process AIRC handle. Holds identity, store, per-room
 /// signed-local-fs transports, and a background subscriber per wire
 /// that converts received `Frame`s into `TranscriptEvent`s and
@@ -73,6 +101,7 @@ pub struct Airc {
 
 pub(crate) struct AircInner {
     pub(crate) home: PathBuf,
+    pub(crate) wire_root: PathBuf,
     pub(crate) identity: LocalIdentity,
     pub(crate) store: Arc<dyn EventStore>,
     pub(crate) daemon_client: Option<Arc<DaemonClient>>,
@@ -130,6 +159,13 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(airc_daemon::IdentityError::Io)?;
         let identity = LocalIdentity::load_or_generate(&home)?;
+        let wire_root = machine_account_home(&home);
+        std::fs::create_dir_all(&wire_root).map_err(airc_daemon::IdentityError::Io)?;
+        peers_store::add(
+            &wire_root,
+            identity.peer_id,
+            identity.keypair.public_bytes(),
+        )?;
 
         let store_path = home.join(EVENTS_DB_FILENAME);
         let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
@@ -138,7 +174,12 @@ impl Airc {
         registry
             .enrol(identity.peer_id, 0, identity.keypair.public_bytes())
             .map_err(|e| AircError::Crypto(e.to_string()))?;
-        for stored in peers_store::load(&home)? {
+        let mut enrolled = vec![identity.peer_id];
+        for stored in load_peer_registries(&home, &wire_root)? {
+            if enrolled.contains(&stored.peer_id) {
+                continue;
+            }
+            enrolled.push(stored.peer_id);
             registry
                 .enrol(
                     stored.peer_id,
@@ -154,6 +195,7 @@ impl Airc {
 
         Ok(Self {
             inner: Arc::new(AircInner {
+                wire_root,
                 home,
                 identity,
                 store,
@@ -194,6 +236,7 @@ impl Airc {
     fn with_daemon_client(&self, client: DaemonClient) -> Self {
         let inner = AircInner {
             home: self.inner.home.clone(),
+            wire_root: self.inner.wire_root.clone(),
             identity: self.inner.identity.clone(),
             store: self.inner.store.clone(),
             daemon_client: Some(Arc::new(client)),
@@ -258,7 +301,7 @@ impl Airc {
     /// re-resolves after [`crate::mesh_identity::DEFAULT_TTL_MS`] so
     /// concurrent callers don't hammer `gh`. See the module docs for
     /// the resolver chain.
-    fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
+    pub(crate) fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
         let cached = mesh_identity::resolve(&self.inner.home)?;
         Ok(cached.as_mesh_identity())
     }
@@ -269,7 +312,8 @@ impl Airc {
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity()?;
         let mut set = subscriptions::load_or_init(&self.inner.home)?;
-        let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
+        let subscription =
+            set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(&self.inner.home, &set)?;
         let room = subscription.as_room();
@@ -306,7 +350,8 @@ impl Airc {
 
         let identity = self.mesh_identity()?;
         let channel = ChannelName::new("general")?;
-        let subscription = set.subscribe(&self.inner.home, &identity, channel.clone())?;
+        let subscription =
+            set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(&self.inner.home, &set)?;
         Ok(subscription.as_room())

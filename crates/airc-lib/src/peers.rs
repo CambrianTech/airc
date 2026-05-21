@@ -49,6 +49,7 @@ impl Airc {
         let stored = peers_store::load(&self.inner.home)?;
         Ok(stored
             .into_iter()
+            .filter(|p| p.peer_id != self.inner.identity.peer_id)
             .map(|p| EnrolledPeer {
                 peer_id: p.peer_id,
                 pubkey_b64: p.pubkey_b64,
