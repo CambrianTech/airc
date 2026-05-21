@@ -24,6 +24,7 @@
 pub mod airc;
 mod daemon;
 pub mod error;
+pub mod join_context;
 mod lan;
 pub mod mesh_identity;
 mod messaging;
@@ -39,6 +40,7 @@ pub mod work;
 
 pub use airc::Airc;
 pub use error::AircError;
+pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use mesh_identity::{
     load_cached as load_cached_mesh_identity, path_in as mesh_identity_path,
     resolve as resolve_mesh_identity, resolve_with as resolve_mesh_identity_with, CachedIdentity,

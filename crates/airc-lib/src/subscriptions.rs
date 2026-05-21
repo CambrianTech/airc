@@ -112,6 +112,10 @@ impl From<ChannelNameError> for SubscriptionError {
 pub struct ChannelName(String);
 
 impl ChannelName {
+    pub(crate) fn general() -> Self {
+        Self("general".to_string())
+    }
+
     /// Construct from any user-supplied string. Strips a leading `#`
     /// if present, trims whitespace, lower-cases ASCII, and rejects
     /// anything that wouldn't be safe as both a path component and a

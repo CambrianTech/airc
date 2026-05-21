@@ -601,6 +601,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => message_commands::run_build(&from, &to, &ts, &channel, &msg, &client_id, &kind),
         },
 
+        Command::Join { room } => commands::run_join(&home, room).await,
+
         Command::Gh(args) => match args.action {
             GhAction::Run { gh_args } => gh_commands::run_gh(gh_args),
             GhAction::PatchGistFile {
