@@ -168,6 +168,12 @@ pub fn command_exit_code(error: &(dyn Error + 'static)) -> Option<u8> {
 }
 
 fn peer_record_count(home: &Path) -> usize {
+    legacy_peer_record_count(home) + rust_peer_record_count(home)
+}
+
+/// Count peers from the legacy `<home>/peers/<peer>.json` per-peer
+/// directory (bash-wrapper-era storage).
+fn legacy_peer_record_count(home: &Path) -> usize {
     let peers_dir = home.join("peers");
     let Ok(entries) = fs::read_dir(peers_dir) else {
         return 0;
@@ -182,6 +188,65 @@ fn peer_record_count(home: &Path) -> usize {
                 .is_some()
         })
         .count()
+}
+
+/// Count peers in the Rust substrate's peer registry. Two locations
+/// matter:
+///   1. `<home>/peers.json` — per-scope registry written by the
+///      airc-daemon when a peer is enrolled via this scope.
+///   2. `$HOME/.airc/peers.json` — the machine-account registry
+///      shared by all scopes on this user's machine. `Airc::open`
+///      adds every loaded identity to BOTH, so a scope running from
+///      a project subdir still publishes its peer record into the
+///      machine-wide registry.
+///
+/// Without counting the second path, `airc status` says SOLO even
+/// when another scope on the same machine has enrolled, which made
+/// the substrate look broken when it was actually working.
+fn rust_peer_record_count(home: &Path) -> usize {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<airc_core::PeerId> = HashSet::new();
+    for path in rust_peer_registry_paths(home) {
+        if let Ok(peers) = airc_daemon::peers_store::load(&path) {
+            for peer in peers {
+                seen.insert(peer.peer_id);
+            }
+        }
+    }
+    seen.len()
+}
+
+fn rust_peer_registry_paths(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![home.to_path_buf()];
+    if let Some(machine) = machine_account_home_for(home) {
+        if machine != home {
+            paths.push(machine);
+        }
+    }
+    paths
+}
+
+/// Resolve the machine-account home (`$HOME/.airc`) only if the
+/// inspected scope home is itself under `$HOME`. This mirrors the
+/// `airc-lib` logic: a scope rooted under the user's home dir shares
+/// the machine-account wire + peer registry; a scope in an arbitrary
+/// path (CI tempdirs, hermetic tests) does NOT pull in real-world
+/// state. Keeps `peer_record_count` hermetic in tests while still
+/// surfacing same-machine peers when the user actually runs `airc`.
+fn machine_account_home_for(scope_home: &Path) -> Option<std::path::PathBuf> {
+    let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)?;
+    let canon_user_home = user_home.canonicalize().unwrap_or(user_home);
+    let canon_scope = scope_home
+        .canonicalize()
+        .unwrap_or_else(|_| scope_home.to_path_buf());
+    if canon_scope.starts_with(&canon_user_home) {
+        Some(canon_user_home.join(".airc"))
+    } else {
+        None
+    }
 }
 
 fn collaboration_evidence(home: &Path, my_name: &str, my_client_id: &str) -> CollaborationEvidence {
