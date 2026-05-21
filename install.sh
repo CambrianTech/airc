@@ -10,9 +10,10 @@ set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
 CLONE_DIR="${AIRC_DIR:-$HOME/.airc/src}"
-# BIN_DIR remains for Windows shims. POSIX installs use $CLONE_DIR/airc
-# directly so there is one public command file, not a second POSIX
-# wrapper under BIN_DIR.
+# BIN_DIR holds a tiny command shim. The shim execs $HOME/.airc/src/airc
+# so the canonical source command remains the single implementation,
+# while agent/non-interactive shells that already have ~/.local/bin on
+# PATH can still run plain `airc` without sourcing shell rc files.
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
@@ -479,9 +480,10 @@ _add_path_entry() {
   fi
 }
 
-# POSIX uses the source command directly: ~/.airc/src/airc. Windows still
-# needs PATH shims because Git Bash / PowerShell / cmd resolve different
-# executable suffixes.
+# Put a tiny shim on PATH on every platform. Do not copy the full command
+# implementation and do not install a language-suffixed binary here.
+# The only public POSIX command is `airc`; it dispatches to
+# ~/.airc/src/airc, which is updated in-place by `airc update`.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
     mkdir -p "$BIN_DIR"
@@ -499,14 +501,28 @@ case "$(uname -s 2>/dev/null)" in
     ;;
   *)
     chmod +x "$CLONE_DIR/airc"
-    for stale in "$BIN_DIR/airc" "$BIN_DIR/airc-core"; do
+    mkdir -p "$BIN_DIR"
+    if [ -f "$CLONE_DIR/airc.shim" ]; then
+      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
+    else
+      cat > "$BIN_DIR/airc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${AIRC_DIR:-}" ] && [ -x "$AIRC_DIR/airc" ]; then
+  exec "$AIRC_DIR/airc" "$@"
+fi
+exec "$HOME/.airc/src/airc" "$@"
+EOF
+    fi
+    chmod +x "$BIN_DIR/airc"
+    ok "Installed command shim: $BIN_DIR/airc -> $CLONE_DIR/airc"
+    for stale in "$BIN_DIR/airc-core"; do
       if [ -L "$stale" ] || [ -f "$stale" ]; then
         rm -f "$stale"
         ok "Removed stale PATH forwarder: $stale"
       fi
     done
-    _add_path_entry "$CLONE_DIR"
-    ok "Using command: $CLONE_DIR/airc"
+    _add_path_entry "$BIN_DIR"
     ;;
 esac
 
