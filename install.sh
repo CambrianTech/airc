@@ -439,11 +439,13 @@ fi
 
 _add_path_entry() {
   local path_entry="$1"
-  if echo "$PATH" | tr ':' '\n' | grep -qx "$path_entry"; then
-    return 0
-  fi
-
   local rc
+  # Always reconcile the rc file regardless of current-shell PATH
+  # state. The rc is persistent; $PATH is transient and may have been
+  # manually augmented by the operator in this shell. Conflating them
+  # (early-return when PATH already contains the entry) was the bug
+  # that left stale airc-managed PATH lines in ~/.zshrc after install
+  # re-runs — caught live 2026-05-20.
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     [ -f "$rc" ] || continue
     # Strip any pre-existing airc-managed PATH lines (marked with the
@@ -469,7 +471,12 @@ _add_path_entry() {
     ok "Added $path_entry to PATH in $(basename "$rc")"
     break
   done
-  export PATH="$path_entry:$PATH"
+  # Only export into current env if not already there. Avoids
+  # gratuitously prepending duplicate PATH segments when the operator
+  # has already sourced their rc.
+  if ! echo "$PATH" | tr ':' '\n' | grep -qx "$path_entry"; then
+    export PATH="$path_entry:$PATH"
+  fi
 }
 
 # POSIX uses the source command directly: ~/.airc/src/airc. Windows still
