@@ -139,19 +139,13 @@ fn codex_hook_installer_replaces_existing_managed_hook() {
             .expect("hooks json");
     let commands = hook_commands(&hooks);
     assert!(commands.contains(&"echo existing".to_string()));
-    assert!(
-        commands
-            .iter()
-            .any(|command| command.ends_with("codex-hook user-prompt-submit")),
-        "installer must add the public hook command, got {commands:?}"
-    );
+    let managed = managed_hook_commands(&commands);
     assert_eq!(
-        commands
-            .iter()
-            .filter(|command| command.as_str() == "airc codex-hook user-prompt-submit")
-            .count(),
-        1
+        managed.len(),
+        1,
+        "expected one managed hook, got {commands:?}"
     );
+    assert_source_command(&managed[0]);
 }
 
 #[test]
@@ -190,10 +184,8 @@ fn codex_hook_installer_replaces_existing_managed_hook_command() {
         1,
         "install must replace existing managed hook commands, got {commands:?}"
     );
-    assert_eq!(
-        commands,
-        vec!["airc codex-hook user-prompt-submit".to_string()]
-    );
+    assert_eq!(commands.len(), 1, "expected one command, got {commands:?}");
+    assert_source_command(&commands[0]);
 }
 
 #[test]
@@ -337,4 +329,41 @@ fn hook_commands(hooks: &Value) -> Vec<String> {
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
         .filter_map(|hook| hook["command"].as_str().map(ToString::to_string))
         .collect()
+}
+
+fn managed_hook_commands(commands: &[String]) -> Vec<String> {
+    commands
+        .iter()
+        .filter(|command| command.ends_with("codex-hook user-prompt-submit"))
+        .cloned()
+        .collect()
+}
+
+fn assert_source_command(command: &str) {
+    assert!(
+        command.ends_with(" codex-hook user-prompt-submit"),
+        "managed hook must call the Codex hook subcommand, got {command:?}"
+    );
+    assert!(
+        command.contains(source_airc_command_fragment()),
+        "managed hook must use the source-installed airc command, got {command:?}"
+    );
+    assert!(
+        !command.starts_with("airc "),
+        "managed hook must not depend on PATH, got {command:?}"
+    );
+    assert!(
+        !command.starts_with("airc-core "),
+        "managed hook must not call airc-core directly, got {command:?}"
+    );
+}
+
+#[cfg(windows)]
+fn source_airc_command_fragment() -> &'static str {
+    "\\airc.cmd\" codex-hook user-prompt-submit"
+}
+
+#[cfg(not(windows))]
+fn source_airc_command_fragment() -> &'static str {
+    "/airc' codex-hook user-prompt-submit"
 }
