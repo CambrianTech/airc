@@ -19,7 +19,7 @@ if [ -n "$tracked_py" ]; then
   fail "tracked Python files remain"
 fi
 
-for path in install.sh uninstall.sh airc lib/airc_bash skills integrations README.md .github test/integration.sh; do
+for path in install.sh uninstall.sh skills integrations README.md .github; do
   [ -e "$path" ] || continue
   if git grep -nE 'AIRC_PYTHON|PYTHONPATH|PYTHONIOENCODING|python3|airc_core\.' -- "$path"; then
     fail "live path still references Python runtime: $path"
@@ -34,12 +34,26 @@ if git grep -nE 'airc-src|[.]airc-src' -- . ':!test/rust_cutover_guard.sh'; then
   fail "old split install clone path remains"
 fi
 
-if git grep -nE 'ln -s[f]?[[:space:]].*BIN_DIR.*/airc|ln -s[f]?[[:space:]].*CLONE_DIR.*/airc' -- install.sh; then
-  fail "install.sh must not symlink public airc"
+# Post-demolition contract (PR D): the public `airc` is the Rust
+# binary at $BIN_DIR/airc, installed by install.sh from
+# target/release/airc. No bash wrapper, no .shim/.cmd/.ps1
+# trampolines, no airc-core suffix on the binary. Guards below
+# enforce that the install.sh shape stays consistent with that.
+
+if [ -e airc ] || [ -e airc.shim ] || [ -e airc.cmd ] || [ -e airc.ps1 ]; then
+  fail "legacy bash wrapper/trampoline files must not exist in the repo root"
 fi
 
-if ! git grep -q 'Installed command shim: [$]BIN_DIR/airc -> [$]CLONE_DIR/airc' -- install.sh; then
-  fail "POSIX install must install a tiny PATH shim that dispatches to the canonical source command"
+if [ -e lib/airc_bash ]; then
+  fail "legacy bash command library lib/airc_bash must not exist"
+fi
+
+if ! git grep -q 'Installed airc: [$]BIN_DIR/airc' -- install.sh; then
+  fail "install.sh must install the Rust binary at \$BIN_DIR/airc (or .exe on Windows)"
+fi
+
+if git grep -nE 'Installed command shim:|cat > "[$]BIN_DIR/airc" <<' -- install.sh; then
+  fail "install.sh must not install a bash wrapper shim — the Rust binary is the user surface"
 fi
 
 if git grep -nE 'BIN_DIR.*/relay|for f in airc relay|[,{]airc,relay|relay-[*]' -- install.sh uninstall.sh skills; then

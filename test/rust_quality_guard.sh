@@ -21,12 +21,12 @@ grep_forbid() {
 grep_forbid \
   "public fallback command names must not return" \
   'message build-legacy|whois-fallback|peers-fallback|RoutePurpose::Migration' \
-  crates lib/airc_bash airc test
+  crates test
 
 grep_forbid \
   "envelope encryption failure must not emit the original plaintext payload" \
   "envelope wrap.*\\|\\|[[:space:]]*printf '%s'.*full_msg|\\|\\|[[:space:]]*printf '%s'.*full_msg" \
-  lib/airc_bash crates/airc-cli/src
+  crates/airc-cli/src
 
 grep_forbid \
   "gh-gist is bootstrap/rendezvous only; do not reintroduce migration route policy" \

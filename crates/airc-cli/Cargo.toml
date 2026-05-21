@@ -9,7 +9,7 @@ publish = false
 workspace = true
 
 [[bin]]
-name = "airc-core"
+name = "airc"
 path = "src/main.rs"
 
 [dependencies]

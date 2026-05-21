@@ -482,72 +482,54 @@ _add_path_entry() {
 
 # Put a tiny shim on PATH on every platform. Do not copy the full command
 # implementation and do not install a language-suffixed binary here.
-# The only public POSIX command is `airc`; it dispatches to
-# ~/.airc/src/airc, which is updated in-place by `airc update`.
-case "$(uname -s 2>/dev/null)" in
-  MINGW*|MSYS*|CYGWIN*)
-    mkdir -p "$BIN_DIR"
-    if [ -f "$CLONE_DIR/airc.shim" ]; then
-      [ -f "$BIN_DIR/airc" ] && rm -f "$BIN_DIR/airc" 2>/dev/null || true
-      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
-      chmod +x "$BIN_DIR/airc" 2>/dev/null || true
-    else
-      cp -f "$CLONE_DIR/airc" "$BIN_DIR/airc"
-      chmod +x "$BIN_DIR/airc" 2>/dev/null || true
-    fi
-    [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
-    [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
-    _add_path_entry "$BIN_DIR"
-    ;;
-  *)
-    chmod +x "$CLONE_DIR/airc"
-    mkdir -p "$BIN_DIR"
-    if [ -f "$CLONE_DIR/airc.shim" ]; then
-      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
-    else
-      cat > "$BIN_DIR/airc" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ -n "${AIRC_DIR:-}" ] && [ -x "$AIRC_DIR/airc" ]; then
-  exec "$AIRC_DIR/airc" "$@"
-fi
-exec "$HOME/.airc/src/airc" "$@"
-EOF
-    fi
-    chmod +x "$BIN_DIR/airc"
-    ok "Installed command shim: $BIN_DIR/airc -> $CLONE_DIR/airc"
-    for stale in "$BIN_DIR/airc-core"; do
-      if [ -L "$stale" ] || [ -f "$stale" ]; then
-        rm -f "$stale"
-        ok "Removed stale PATH forwarder: $stale"
-      fi
-    done
-    _add_path_entry "$BIN_DIR"
-    ;;
-esac
-
-_install_airc_core_binary() {
-  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc-core build"; return 0; }
+# Build the Rust binary and place it on PATH as `airc`. No shell
+# wrapper, no .shim/.cmd/.ps1 trampolines — the Rust binary is the
+# user surface. Post-demolition (PR D): one binary, one truth, no
+# legacy bash dispatch layer.
+_install_airc_binary() {
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   if ! command -v cargo >/dev/null 2>&1; then
-    fail "cargo is required to build airc-core. Install Rust, then re-run install.sh."
+    fail "cargo is required to build airc. Install Rust, then re-run install.sh."
   fi
-  info "Building Rust CLI: airc-core"
+  info "Building Rust CLI: airc"
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
-  local built="$CLONE_DIR/target/release/airc-core"
-  [ -x "$built" ] || fail "airc-core build completed but binary is missing: $built"
+  mkdir -p "$BIN_DIR"
+
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      cp -f "$built" "$BIN_DIR/airc-core.exe"
-      ok "Installed airc-core: $BIN_DIR/airc-core.exe"
+      local built="$CLONE_DIR/target/release/airc.exe"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      cp -f "$built" "$BIN_DIR/airc.exe"
+      ok "Installed airc: $BIN_DIR/airc.exe"
       ;;
     *)
-      chmod +x "$built"
-      ok "Built airc-core: $built"
+      local built="$CLONE_DIR/target/release/airc"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      # Symlink so subsequent `airc update` rebuilds are picked up
+      # without a re-install step. Atomic via rename to avoid a
+      # mid-install window where $BIN_DIR/airc is missing.
+      local tmp="$BIN_DIR/.airc.tmp.$$"
+      ln -sf "$built" "$tmp"
+      mv -f "$tmp" "$BIN_DIR/airc"
+      ok "Installed airc: $BIN_DIR/airc -> $built"
       ;;
   esac
+
+  # Reap legacy install-shape leftovers (bash wrapper, airc-core
+  # binary, Windows trampolines). Reruns of install.sh on a machine
+  # that previously had the wrapper-era install converge cleanly to
+  # the redesigned layout.
+  for stale in "$BIN_DIR/airc-core" "$BIN_DIR/airc-core.exe" "$BIN_DIR/airc.cmd" "$BIN_DIR/airc.ps1"; do
+    if [ -L "$stale" ] || [ -e "$stale" ]; then
+      rm -f "$stale"
+      ok "Removed legacy install artifact: $stale"
+    fi
+  done
+
+  _add_path_entry "$BIN_DIR"
 }
 
-_install_airc_core_binary
+_install_airc_binary
 
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
 #
@@ -774,20 +756,20 @@ _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _airc_core=""
-  if [ -x "$CLONE_DIR/target/release/airc-core" ]; then
-    _airc_core="$CLONE_DIR/target/release/airc-core"
-  elif [ -x "$CLONE_DIR/target/debug/airc-core" ]; then
-    _airc_core="$CLONE_DIR/target/debug/airc-core"
-  elif command -v airc-core >/dev/null 2>&1; then
-    _airc_core=$(command -v airc-core)
+  local _airc=""
+  if [ -x "$CLONE_DIR/target/release/airc" ]; then
+    _airc="$CLONE_DIR/target/release/airc"
+  elif [ -x "$CLONE_DIR/target/debug/airc" ]; then
+    _airc="$CLONE_DIR/target/debug/airc"
+  elif command -v airc >/dev/null 2>&1; then
+    _airc=$(command -v airc)
   else
-    warn "Could not install Codex AIRC hook: airc-core not found"
+    warn "Could not install Codex AIRC hook: airc binary not found"
     return 0
   fi
 
   local out
-  if out=$("$_airc_core" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
+  if out=$("$_airc" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | while IFS= read -r line; do
         ok "Codex AIRC hook: $line"
