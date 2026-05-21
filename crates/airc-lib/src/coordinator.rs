@@ -42,7 +42,7 @@
 //! 2. **Remote-refresh singleflight** — when a join needs the
 //!    rare-and-expensive remote registry refresh (GitHub gist pull),
 //!    [`try_acquire_refresh_lock`] takes the `refresh.lock` sentinel.
-//!    Concurrent joins return `None` and re-use the snapshot the
+//!    Concurrent joins return `HeldFresh` and re-use the snapshot the
 //!    lock-holder produces. Without this, ten local agents starting
 //!    `airc join` simultaneously would each hammer GitHub.
 //!
@@ -55,20 +55,21 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 
+use crate::coordinator_lock::RefreshLock;
+use crate::fs_permissions;
 use crate::subscriptions::{ChannelName, MeshIdentity};
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
 const BEACONS_DIR: &str = "beacons";
 const REFRESH_LOCK: &str = "refresh.lock";
+const REFRESH_TAKEOVER_LOCK: &str = "refresh.takeover";
 
 /// Default beacon staleness threshold: 60s. A scope that hasn't
 /// heartbeated within this window is considered stale (process dead
@@ -240,6 +241,10 @@ fn refresh_lock_path(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
     account_root(airc_home, identity).join(REFRESH_LOCK)
 }
 
+fn refresh_takeover_lock_path(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
+    account_root(airc_home, identity).join(REFRESH_TAKEOVER_LOCK)
+}
+
 /// Publish the caller's beacon. Atomic via write-tmp + rename so a
 /// concurrent reader never sees a partial file.
 pub fn publish(
@@ -253,7 +258,7 @@ pub fn publish(
     let tmp_path = dir.join(format!(".{}.tmp", beacon.peer_id));
     let text = serde_json::to_string_pretty(beacon)?;
     fs::write(&tmp_path, text)?;
-    set_owner_only_permissions(&tmp_path)?;
+    fs_permissions::set_owner_only(&tmp_path)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
@@ -362,19 +367,6 @@ pub enum RefreshLockOutcome {
     HeldFresh { held_at_ms: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LockFileContents {
-    held_at_ms: u64,
-    holder_pid: u32,
-}
-
-/// Bounded retry budget for the takeover loop. Without a bound, a
-/// pathological adversary that constantly recreates a stale lock
-/// could spin a caller forever. After exhausting the budget we
-/// surface as `HeldFresh` (safety-valve: the caller treats it like
-/// somebody else won and re-uses cached snapshot).
-const REFRESH_LOCK_MAX_RETRIES: u32 = 8;
-
 /// Try to acquire the remote-refresh lock. Singleflight pattern:
 /// only one caller at a time should hammer the remote registry
 /// (GitHub gist), so subsequent callers within
@@ -388,12 +380,12 @@ const REFRESH_LOCK_MAX_RETRIES: u32 = 8;
 /// decide fresh vs stale.
 ///
 /// Stale-takeover path: when the existing lock's `held_at_ms` is
-/// past `refresh_interval_ms`, the loser does a best-effort
-/// `remove_file` and retries `create_new`. The remove is "best
-/// effort" because two losers can race to remove the same stale
-/// lock; whichever loses the remove sees `NotFound` and retries the
-/// create from scratch. The retry loop is bounded by
-/// [`REFRESH_LOCK_MAX_RETRIES`] so an adversary can't pin a caller.
+/// past `refresh_interval_ms`, the loser first acquires a second
+/// exclusive `refresh.takeover` sentinel. Only that takeover holder
+/// may remove and replace the stale `refresh.lock`. Without this,
+/// several stale readers can delete each other's newly-created fresh
+/// lock on Windows/POSIX under contention. The lock adapter uses a
+/// bounded retry loop so an adversary can't pin a caller.
 ///
 /// (Earlier revision of this function did a read-then-write without
 /// any atomicity primitive — two concurrent callers could both see
@@ -408,72 +400,14 @@ pub fn try_acquire_refresh_lock(
 ) -> Result<RefreshLockOutcome, CoordinatorError> {
     let root = account_root(airc_home, identity);
     fs::create_dir_all(&root)?;
-    let lock_path = refresh_lock_path(airc_home, identity);
-    let contents = LockFileContents {
-        held_at_ms: now_ms,
+    RefreshLock::new(
+        refresh_lock_path(airc_home, identity),
+        refresh_takeover_lock_path(airc_home, identity),
+        config.refresh_interval_ms,
+        now_ms,
         holder_pid,
-    };
-    let payload = serde_json::to_string_pretty(&contents)?;
-
-    for _ in 0..REFRESH_LOCK_MAX_RETRIES {
-        // Atomic create-or-fail. Exactly one caller wins.
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                file.write_all(payload.as_bytes())?;
-                file.sync_all()?;
-                set_owner_only_permissions(&lock_path)?;
-                return Ok(RefreshLockOutcome::Acquired);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lock exists. Read it to decide whether we should
-                // wait (fresh) or attempt takeover (stale).
-                match fs::read_to_string(&lock_path) {
-                    Ok(text) => {
-                        match serde_json::from_str::<LockFileContents>(&text) {
-                            Ok(existing) => {
-                                if now_ms.saturating_sub(existing.held_at_ms)
-                                    < config.refresh_interval_ms
-                                {
-                                    return Ok(RefreshLockOutcome::HeldFresh {
-                                        held_at_ms: existing.held_at_ms,
-                                    });
-                                }
-                                // Stale. Try takeover: best-effort remove,
-                                // then retry create_new. Multiple losers
-                                // racing to remove the same stale lock is
-                                // fine — at most one create_new wins on the
-                                // next pass.
-                                let _ = fs::remove_file(&lock_path);
-                                continue;
-                            }
-                            Err(_) => {
-                                // Unparseable / in-transition file (winner
-                                // hasn't finished writing yet). Treat as
-                                // held by the still-writing winner; the
-                                // caller re-uses cached snapshot.
-                                return Ok(RefreshLockOutcome::HeldFresh { held_at_ms: now_ms });
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        // The holder removed it between our AlreadyExists
-                        // and our read. Retry create_new.
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    // Retry budget exhausted. Bounded safety valve: report HeldFresh
-    // so the caller falls back to the cached snapshot. They can try
-    // again on the next join cycle.
-    Ok(RefreshLockOutcome::HeldFresh { held_at_ms: now_ms })
+    )?
+    .acquire()
 }
 
 /// Release the refresh lock — best-effort delete. Idempotent: a
@@ -517,19 +451,6 @@ fn unique_channels_in(beacons: &[PresenceBeacon]) -> Vec<ChannelName> {
     let mut out: Vec<ChannelName> = by_name.into_values().collect();
     out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     out
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Convenience: construct a presence beacon at a given timestamp.

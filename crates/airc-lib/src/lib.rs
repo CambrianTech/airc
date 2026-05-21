@@ -23,8 +23,10 @@
 
 pub mod airc;
 pub mod coordinator;
+mod coordinator_lock;
 mod daemon;
 pub mod error;
+mod fs_permissions;
 pub mod join_context;
 mod lan;
 pub mod mesh_identity;
