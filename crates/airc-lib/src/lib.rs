@@ -31,6 +31,7 @@ pub mod registry;
 pub mod room;
 pub mod route;
 mod stream;
+pub mod subscriptions;
 mod time;
 mod transport;
 pub mod work;
@@ -46,6 +47,10 @@ pub use route::{
     TransportHealthTable, TransportKind, TransportResolver, TransportRole, TransportRoute,
 };
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
+pub use subscriptions::{
+    derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
+    SubscriptionSet,
+};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
     CreateWorkLane, HeartbeatWorkspace, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
