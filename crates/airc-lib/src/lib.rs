@@ -22,6 +22,7 @@
 #![deny(unsafe_code)]
 
 pub mod airc;
+pub mod coordinator;
 mod daemon;
 pub mod error;
 pub mod join_context;
@@ -39,6 +40,14 @@ mod transport;
 pub mod work;
 
 pub use airc::Airc;
+pub use coordinator::{
+    account_root as coordinator_account_root, beacon_now, drain_stale as coordinator_drain_stale,
+    load_own_beacon as coordinator_load_own_beacon, publish as coordinator_publish,
+    release_refresh_lock as coordinator_release_refresh_lock, snapshot as coordinator_snapshot,
+    try_acquire_refresh_lock, CoordinatorConfig, CoordinatorError, CoordinatorSnapshot,
+    PresenceBeacon, RefreshLockOutcome, DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,
+    DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
+};
 pub use error::AircError;
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use mesh_identity::{
