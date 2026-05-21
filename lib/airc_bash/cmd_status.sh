@@ -15,6 +15,17 @@
 
 _airc_monitor_health_report() {
   local mode="${1:-all}"
+
+  # Rust-local is the routine data-plane. The older transport health
+  # command measures GitHub bearer heartbeat/pidfile state, which is now
+  # invite/remote plumbing. Do not report a missing bearer pidfile as
+  # broken local chat when the Rust room is present.
+  if "$(airc_core_bin)" --home "$AIRC_WRITE_DIR" room >/dev/null 2>&1; then
+    [ "$mode" = "degraded-only" ] && return 0
+    echo "  transport health: ok (rust-local data-plane active)"
+    return 0
+  fi
+
   local args=(transport health --home "$AIRC_WRITE_DIR" --config "$CONFIG")
   [ "$mode" = "degraded-only" ] && args+=(--degraded-only)
   "$(airc_core_bin)" "${args[@]}" 2>/dev/null | sed 's/^/  /' || true
