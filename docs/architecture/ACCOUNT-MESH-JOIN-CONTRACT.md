@@ -57,11 +57,12 @@ Forbidden install shapes:
 - wrappers that silently fall back to an older installed binary;
 - test-only environment variables as the normal user path.
 
-The installer may place a tiny PATH shim if the OS requires it, but the shim
-must resolve to the canonical installed source command in `~/.airc/src/airc`
-or the canonical built artifact for that exact source checkout. It must fail
-loudly if resolution is ambiguous. It must not search arbitrary old install
-locations.
+The installer places a tiny PATH shim at the platform's normal user-bin
+location (for example `~/.local/bin/airc` on POSIX). The shim must resolve to
+the canonical installed source command in `~/.airc/src/airc` or the canonical
+built artifact for that exact source checkout. It must fail loudly if
+resolution is ambiguous. It must not copy the full command implementation,
+search arbitrary old install locations, or expose a second product command.
 
 For version 1 there is no legacy runtime surface. Old Python, shell, gist-chat,
 and language-suffixed compatibility paths should be deleted when their Rust
