@@ -177,6 +177,8 @@ fn join_without_args_uses_default_account_context() {
         std::path::PathBuf::from(wire),
         machine
             .path()
+            .canonicalize()
+            .unwrap()
             .join(".airc")
             .join("wires")
             .join("cambriantech")

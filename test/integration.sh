@@ -2560,6 +2560,115 @@ scenario_join_intent_failure_falls_back_to_host() {
   cleanup_all
 }
 
+scenario_wrapper_join_seeds_rust_account_context() {
+  section "wrapper_join_seeds_rust_account_context: public airc join seeds Rust account rooms"
+  cleanup_all
+
+  local root=/tmp/airc-it-wrapper-join
+  local machine="$root/home"
+  local repo="$machine/continuum"
+  local home="$repo/.airc"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$repo/.git" "$home"
+  cat > "$repo/.git/config" <<'EOF'
+[remote "origin"]
+    url = https://github.com/CambrianTech/continuum.git
+EOF
+  cat > "$home/mesh_identity.json" <<'EOF'
+{
+  "version": 1,
+  "identity": "joelteply",
+  "source": "operator",
+  "resolved_at_ms": 1,
+  "ttl_ms": 86400000
+}
+EOF
+
+  (
+    cd "$repo" || exit 1
+    HOME="$machine" AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+      AIRC_BACKGROUND_OK=1 AIRC_NO_ATTACH=1 "$AIRC" join --no-gist >"$out" 2>"$err" &
+    echo $! > "$root/join.pid"
+  )
+  sleep 3
+  if [ -f "$root/join.pid" ]; then
+    kill "$(cat "$root/join.pid")" 2>/dev/null || true
+  fi
+  if [ -f "$home/airc.pid" ]; then
+    local p
+    for p in $(cat "$home/airc.pid" 2>/dev/null); do
+      kill $(pgrep -P "$p" 2>/dev/null) "$p" 2>/dev/null || true
+    done
+  fi
+  sleep 1
+
+  local subs="$home/subscriptions.json"
+  [ -f "$subs" ] \
+    && pass "public wrapper wrote Rust subscriptions.json" \
+    || fail "public wrapper did not write subscriptions.json; out=$(cat "$out" 2>/dev/null); err=$(cat "$err" 2>/dev/null)"
+
+  grep -q '"general"' "$subs" 2>/dev/null \
+    && pass "default join subscribed #general" \
+    || fail "subscriptions missing #general: $(cat "$subs" 2>/dev/null)"
+
+  grep -q '"cambriantech"' "$subs" 2>/dev/null \
+    && pass "default join subscribed inferred #cambriantech" \
+    || fail "subscriptions missing #cambriantech: $(cat "$subs" 2>/dev/null)"
+
+  grep -q '"default":[[:space:]]*"cambriantech"' "$subs" 2>/dev/null \
+    && pass "inferred repo owner is the default channel" \
+    || fail "default channel was not cambriantech: $(cat "$subs" 2>/dev/null)"
+
+  local machine_real
+  machine_real=$(cd "$machine" && pwd -P)
+  grep -q "\"wire\":[[:space:]]*\"$machine_real/.airc/wires/cambriantech\"" "$subs" 2>/dev/null \
+    && pass "wire is account-home scoped, not project scoped" \
+    || fail "wire is not account-home scoped ($machine_real): $(cat "$subs" 2>/dev/null)"
+
+  local custom_root=/tmp/airc-it-wrapper-join-custom
+  local custom_machine="$custom_root/home"
+  local custom_repo="$custom_machine/openclaw"
+  local custom_home="$custom_repo/.airc"
+  mkdir -p "$custom_repo/.git" "$custom_home"
+  cat > "$custom_repo/.git/config" <<'EOF'
+[remote "origin"]
+    url = https://github.com/OpenClaw/openclaw.git
+EOF
+  cat > "$custom_home/mesh_identity.json" <<'EOF'
+{
+  "version": 1,
+  "identity": "joelteply",
+  "source": "operator",
+  "resolved_at_ms": 1,
+  "ttl_ms": 86400000
+}
+EOF
+  (
+    cd "$custom_repo" || exit 1
+    HOME="$custom_machine" AIRC_HOME="$custom_home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+      AIRC_BACKGROUND_OK=1 AIRC_NO_ATTACH=1 "$AIRC" join --room continuum-activity-7 --no-gist >"$custom_root/out.log" 2>"$custom_root/err.log" &
+    echo $! > "$custom_root/join.pid"
+  )
+  sleep 3
+  if [ -f "$custom_root/join.pid" ]; then
+    kill "$(cat "$custom_root/join.pid")" 2>/dev/null || true
+  fi
+  if [ -f "$custom_home/airc.pid" ]; then
+    local p
+    for p in $(cat "$custom_home/airc.pid" 2>/dev/null); do
+      kill $(pgrep -P "$p" 2>/dev/null) "$p" 2>/dev/null || true
+    done
+  fi
+  sleep 1
+  local custom_subs="$custom_home/subscriptions.json"
+  grep -q '"continuum-activity-7"' "$custom_subs" 2>/dev/null \
+    && pass "explicit --room joins arbitrary channel through Rust coordinator" \
+    || fail "explicit --room did not seed arbitrary channel: $(cat "$custom_subs" 2>/dev/null)"
+
+  cleanup_all
+}
+
 # ── Scenario: codex_join_detaches_transport ────────────────────────────
 # Public Codex flow is plain `airc join`. The shell dispatch detects Codex
 # and routes through the detach adapter, while the spawned child is guarded
@@ -4771,6 +4880,7 @@ case "$MODE" in
   attach_reports_starting_transport) scenario_attach_reports_starting_transport ;;
   join_rejects_unknown_flag) scenario_join_rejects_unknown_flag ;;
   join_intent_failure_falls_back_to_host) scenario_join_intent_failure_falls_back_to_host ;;
+  wrapper_join_seeds_rust_account_context) scenario_wrapper_join_seeds_rust_account_context ;;
   codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
   codex_join_idempotent_when_healthy) scenario_codex_join_idempotent_when_healthy ;;
   codex_join_waits_for_duplicate_repair) scenario_codex_join_waits_for_duplicate_repair ;;
@@ -4809,7 +4919,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_send_gone_gist_does_not_claim_delivery; scenario_monitor_gone_gist_stops_respawn; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_attach_reports_starting_transport; scenario_join_rejects_unknown_flag; scenario_join_intent_failure_falls_back_to_host; scenario_codex_join_detaches_transport
+    scenario_attach_starts_background_transport; scenario_attach_transport_survives_launcher_hup; scenario_attach_spawn_strips_attach_flag; scenario_attach_reports_starting_transport; scenario_join_rejects_unknown_flag; scenario_join_intent_failure_falls_back_to_host; scenario_wrapper_join_seeds_rust_account_context; scenario_codex_join_detaches_transport
     scenario_codex_join_idempotent_when_healthy
     scenario_codex_join_waits_for_duplicate_repair
     scenario_join_reaps_duplicate_scope_transport
