@@ -406,9 +406,12 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
+        let actual = default_home_dir_for(&nested);
+        let expected = repo.join(".airc");
+        std::fs::create_dir_all(&actual).unwrap();
         assert_eq!(
-            default_home_dir_for(&nested),
-            repo.canonicalize().unwrap().join(".airc")
+            actual.canonicalize().unwrap(),
+            expected.canonicalize().unwrap()
         );
     }
 }
