@@ -99,7 +99,18 @@ pub async fn run_send(
     }
     let current = airc.current_room().await?;
     airc.say(text).await?;
-    println!("sent to {} ({}).", current.name, current.channel);
+    let peer_count = airc.peers().await?.len();
+    if peer_count == 0 {
+        println!(
+            "stored locally in {} ({}) - no enrolled peers; not delivered to another agent.",
+            current.name, current.channel
+        );
+    } else {
+        println!(
+            "sent to {} ({}) for {peer_count} enrolled peer(s).",
+            current.name, current.channel
+        );
+    }
     Ok(())
 }
 
@@ -245,7 +256,18 @@ pub async fn run_msg(
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
     airc.say(text).await?;
-    println!("sent to {} ({}).", current.name, current.channel);
+    let peer_count = airc.peers().await?.len();
+    if peer_count == 0 {
+        println!(
+            "stored locally in {} ({}) - no enrolled peers; not delivered to another agent.",
+            current.name, current.channel
+        );
+    } else {
+        println!(
+            "sent to {} ({}) for {peer_count} enrolled peer(s).",
+            current.name, current.channel
+        );
+    }
     Ok(())
 }
 
