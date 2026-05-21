@@ -164,6 +164,8 @@ cmd_status() {
     if [ "$_elapsed" -le 600 ] 2>/dev/null; then
       monitor_state="starting (airc join cold-start in progress, t+${_elapsed}s)"
     fi
+  elif "$(airc_core_bin)" --home "$AIRC_WRITE_DIR" room >/dev/null 2>&1; then
+    monitor_state="not attached (rust-local command mode)"
   fi
   echo "  airc process: $monitor_state"
   _airc_monitor_health_report all
@@ -455,8 +457,6 @@ cmd_inbox() {
 }
 
 cmd_codex_hook() {
-  ensure_init
-
   local _airc_core
   _airc_core=$(airc_core_bin 2>/dev/null || true)
   if [ -z "$_airc_core" ]; then
