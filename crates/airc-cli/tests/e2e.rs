@@ -139,6 +139,83 @@ fn run_room(home: &Path, name: &str, wire: &Path) {
 }
 
 #[test]
+fn join_without_args_uses_default_account_context() {
+    let machine = TempDir::new().expect("tempdir");
+    let repo = machine.path().join("continuum");
+    let home = repo.join(".airc");
+    create_repo_with_origin(&repo, "https://github.com/CambrianTech/continuum.git");
+    seed_mesh_identity(&home, "joelteply");
+
+    let output = Command::new(airc_core())
+        .env("HOME", machine.path())
+        .args(["--home", home.to_str().unwrap(), "join"])
+        .current_dir(&repo)
+        .output()
+        .expect("airc-core join must spawn");
+    assert!(
+        output.status.success(),
+        "join failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("#general"), "{stdout}");
+    assert!(stdout.contains("#cambriantech"), "{stdout}");
+    assert!(stdout.contains("default: #cambriantech"), "{stdout}");
+
+    let subscriptions = std::fs::read_to_string(home.join("subscriptions.json")).unwrap();
+    assert!(subscriptions.contains("\"general\""), "{subscriptions}");
+    assert!(
+        subscriptions.contains("\"cambriantech\""),
+        "{subscriptions}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&subscriptions).unwrap();
+    let wire = json["subscribed"]["cambriantech"]["wire"]
+        .as_str()
+        .expect("cambriantech wire");
+    assert_eq!(
+        std::path::PathBuf::from(wire),
+        machine
+            .path()
+            .join(".airc")
+            .join("wires")
+            .join("cambriantech")
+    );
+}
+
+fn create_repo_with_origin(path: &Path, origin: &str) {
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    std::fs::write(
+        path.join(".git/config"),
+        format!(
+            r#"[core]
+    repositoryformatversion = 0
+[remote "origin"]
+    url = {origin}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn seed_mesh_identity(home: &Path, identity: &str) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("mesh_identity.json"),
+        format!(
+            r#"{{
+  "version": 1,
+  "identity": "{identity}",
+  "source": "operator",
+  "resolved_at_ms": 1,
+  "ttl_ms": 86400000
+}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
 fn listen_rejects_unenrolled_signer() {
     // Mallory's signed frame must be rejected by Alice's listen — she
     // isn't in Alice's peer registry. Stderr surfaces a verification

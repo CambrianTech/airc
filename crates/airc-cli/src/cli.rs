@@ -265,6 +265,14 @@ pub enum Command {
     /// Build and inspect message envelopes during Rust cutover.
     Message(MessageArgs),
 
+    /// Join the account mesh. With no room, subscribes to #general
+    /// and the inferred repo/org channel. With a room, subscribes to
+    /// that channel and makes it the default.
+    Join {
+        /// Optional channel name to join.
+        room: Option<String>,
+    },
+
     /// Shared GitHub request governor.
     Gh(GhArgs),
 

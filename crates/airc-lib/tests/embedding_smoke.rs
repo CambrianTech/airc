@@ -11,9 +11,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    subscriptions, Airc, Body, ChannelName, EventFilter, HeaderFilter, Headers, MeshIdentity,
-    PeerSpec, RouteEndpoint, SubscriptionSet, TranscriptKind, TransportHealthSample, TransportKind,
-    TransportRole,
+    resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName, EventFilter, HeaderFilter,
+    Headers, MeshIdentity, MeshIdentitySource, PeerSpec, RouteEndpoint, SubscriptionSet,
+    TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -261,6 +261,58 @@ fn same_machine_scopes_share_account_wire_and_registry() {
     });
 }
 
+#[test]
+fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire() {
+    let machine = TempDir::new().unwrap();
+
+    temp_env::with_var("HOME", Some(machine.path()), || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alice_repo = repo_with_origin(
+                &machine.path().join("alice-continuum"),
+                "https://github.com/CambrianTech/continuum.git",
+            );
+            let bob_repo = repo_with_origin(
+                &machine.path().join("bob-airc"),
+                "git@github.com:CambrianTech/airc.git",
+            );
+            let alice_home = alice_repo.join(".airc");
+            let bob_home = bob_repo.join(".airc");
+
+            seed_mesh_identity(&alice_home, "joelteply");
+            seed_mesh_identity(&bob_home, "joelteply");
+
+            let alice = Airc::open(&alice_home).await.unwrap();
+            let bob = Airc::open(&bob_home).await.unwrap();
+
+            let alice_rooms = alice.join_default_context(&alice_repo).await.unwrap();
+            let bob_rooms = bob.join_default_context(&bob_repo).await.unwrap();
+
+            assert_eq!(room_names(&alice_rooms), vec!["cambriantech", "general"]);
+            assert_eq!(room_names(&bob_rooms), vec!["cambriantech", "general"]);
+            assert_eq!(alice.current_room().await.unwrap().name, "cambriantech");
+            assert_eq!(bob.current_room().await.unwrap().name, "cambriantech");
+            assert_eq!(
+                alice.current_room().await.unwrap().wire,
+                machine.path().join(".airc/wires/cambriantech")
+            );
+            assert_eq!(
+                alice.current_room().await.unwrap().channel,
+                bob.current_room().await.unwrap().channel
+            );
+
+            alice.say("default account context works").await.unwrap();
+            let event = wait_for_text(
+                &bob,
+                "default account context works",
+                Duration::from_secs(3),
+            )
+            .await;
+            assert_eq!(event.peer_id, alice.peer_id());
+        });
+    });
+}
+
 #[tokio::test]
 async fn open_is_idempotent_across_handles() {
     // Two Airc::open calls on the same home recover the same
@@ -271,6 +323,35 @@ async fn open_is_idempotent_across_handles() {
     drop(first);
     let second = Airc::open(home.path()).await.unwrap();
     assert_eq!(second.peer_id(), first_peer);
+}
+
+fn repo_with_origin(path: &std::path::Path, origin: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    std::fs::write(
+        path.join(".git/config"),
+        format!(
+            r#"[core]
+    repositoryformatversion = 0
+[remote "origin"]
+    url = {origin}
+"#
+        ),
+    )
+    .unwrap();
+    path.to_path_buf()
+}
+
+fn seed_mesh_identity(home: &std::path::Path, identity: &str) {
+    resolve_mesh_identity_with(
+        home,
+        || Some((identity.to_string(), MeshIdentitySource::Operator)),
+        1,
+    )
+    .unwrap();
+}
+
+fn room_names(rooms: &[airc_lib::Room]) -> Vec<&str> {
+    rooms.iter().map(|room| room.name.as_str()).collect()
 }
 
 #[tokio::test]

@@ -33,6 +33,7 @@ use airc_transport::LanTcpAdapter;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::AircError;
+use crate::join_context::JoinContext;
 use crate::mesh_identity;
 use crate::room::Room;
 use crate::route::health::TransportHealthTable;
@@ -319,6 +320,49 @@ impl Airc {
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
+    }
+
+    /// Subscribe this scope to the default account context:
+    /// `#general` plus the repository owner channel inferred from
+    /// `cwd` when the caller is inside a Git checkout.
+    ///
+    /// This is the Rust substrate for bare `airc join`. It creates
+    /// missing local subscriptions idempotently, preserves arbitrary
+    /// user-created channels, and uses the account-wide local wire so
+    /// scopes on the same OS account converge without manual pairing.
+    pub async fn join_default_context(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<Vec<Room>, AircError> {
+        let context = JoinContext::from_cwd(cwd.as_ref());
+        self.ensure_join_context(context).await
+    }
+
+    /// Subscribe to every channel in `context`, set its default, and
+    /// start local subscribers for the resulting wires.
+    pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
+        let identity = self.mesh_identity()?;
+        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let mut rooms = Vec::new();
+
+        for channel in context.channels {
+            if set.parted.contains(&channel) {
+                continue;
+            }
+            let subscription =
+                set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel)?;
+            rooms.push(subscription.as_room());
+        }
+
+        if set.subscribed.contains_key(&context.default) {
+            set.set_default(context.default)?;
+        }
+        subscriptions::save(&self.inner.home, &set)?;
+
+        for room in &rooms {
+            self.ensure_wire_subscriber(&room.wire).await?;
+        }
+        Ok(rooms)
     }
 
     /// Variant of [`join`] that overrides the per-home default wire

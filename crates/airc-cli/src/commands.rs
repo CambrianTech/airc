@@ -76,6 +76,33 @@ pub async fn run_room(
     Ok(())
 }
 
+/// `join` — account-room coordinator entrypoint. With no explicit
+/// room, subscribe to `#general` plus the inferred Git owner channel.
+/// With a room, join that arbitrary channel and make it default.
+pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    match room {
+        Some(room) => {
+            let joined = airc.join(&room).await?;
+            println!("joined:  #{}", joined.name);
+            println!("wire:    {}", joined.wire.display());
+            println!("channel: {}", joined.channel);
+        }
+        None => {
+            let cwd = std::env::current_dir()?;
+            let rooms = airc.join_default_context(cwd).await?;
+            let current = airc.current_room().await?;
+            println!("joined default account context:");
+            for room in rooms {
+                println!("  #{} ({})", room.name, room.channel);
+            }
+            println!("default: #{}", current.name);
+            println!("wire:    {}", current.wire.display());
+        }
+    }
+    Ok(())
+}
+
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
