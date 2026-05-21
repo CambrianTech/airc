@@ -31,6 +31,9 @@ pub enum AircError {
     #[error("channel name: {0}")]
     ChannelName(#[from] crate::subscriptions::ChannelNameError),
 
+    #[error("mesh identity: {0}")]
+    MeshIdentity(#[from] crate::mesh_identity::MeshIdentityError),
+
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 

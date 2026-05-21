@@ -25,6 +25,7 @@ pub mod airc;
 mod daemon;
 pub mod error;
 mod lan;
+pub mod mesh_identity;
 mod messaging;
 mod peers;
 pub mod registry;
@@ -38,6 +39,11 @@ pub mod work;
 
 pub use airc::Airc;
 pub use error::AircError;
+pub use mesh_identity::{
+    load_cached as load_cached_mesh_identity, path_in as mesh_identity_path,
+    resolve as resolve_mesh_identity, resolve_with as resolve_mesh_identity_with, CachedIdentity,
+    MeshIdentityError, Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
+};
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
