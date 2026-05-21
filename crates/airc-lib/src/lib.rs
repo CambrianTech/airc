@@ -39,6 +39,7 @@ mod stream;
 pub mod subscriptions;
 mod time;
 mod transport;
+mod wire_replay;
 pub mod work;
 
 pub use airc::Airc;

@@ -11,14 +11,18 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName, EventFilter, HeaderFilter,
-    Headers, MeshIdentity, MeshIdentitySource, PeerSpec, RouteEndpoint, SubscriptionSet,
-    TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
+    coordinator_snapshot, resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName,
+    CoordinatorConfig, EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource,
+    PeerSpec, RouteEndpoint, SubscriptionSet, TranscriptKind, TransportHealthSample, TransportKind,
+    TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
 use futures::stream::StreamExt;
 use tempfile::TempDir;
+
+static HOME_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// Poll `page_recent` until it sees at least `expected` events or
 /// the deadline fires. The wire-side tail loop runs in a background
@@ -225,6 +229,7 @@ async fn peer_spec_round_trips_via_add_peer() {
 #[test]
 fn same_machine_scopes_share_account_wire_and_registry() {
     let machine = TempDir::new().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -271,6 +276,7 @@ fn same_machine_scopes_share_account_wire_and_registry() {
 #[test]
 fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire() {
     let machine = TempDir::new().unwrap();
+    let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
     temp_env::with_var("HOME", Some(machine.path()), || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -310,6 +316,41 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
             assert_eq!(
                 alice.current_room().await.unwrap().channel,
                 bob.current_room().await.unwrap().channel
+            );
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let snapshot = coordinator_snapshot(
+                &machine.path().join(".airc"),
+                &MeshIdentity::new("joelteply"),
+                &CoordinatorConfig::default(),
+                now_ms,
+            )
+            .unwrap();
+            assert_eq!(snapshot.live.len(), 2);
+            assert_eq!(
+                snapshot
+                    .live_channels
+                    .iter()
+                    .map(ChannelName::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["cambriantech", "general"]
+            );
+            assert!(
+                snapshot
+                    .live
+                    .iter()
+                    .any(|beacon| beacon.scope_home == alice_home),
+                "join_default_context must publish Alice's scope beacon"
+            );
+            assert!(
+                snapshot
+                    .live
+                    .iter()
+                    .any(|beacon| beacon.scope_home == bob_home),
+                "join_default_context must publish Bob's scope beacon"
             );
 
             alice.say("default account context works").await.unwrap();
@@ -353,10 +394,14 @@ fn repo_with_origin(path: &std::path::Path, origin: &str) -> std::path::PathBuf 
 }
 
 fn seed_mesh_identity(home: &std::path::Path, identity: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     resolve_mesh_identity_with(
         home,
         || Some((identity.to_string(), MeshIdentitySource::Operator)),
-        1,
+        now_ms,
     )
     .unwrap();
 }

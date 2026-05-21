@@ -29,6 +29,7 @@ impl Airc {
         if subs.contains_key(wire) {
             return Ok(());
         }
+        self.sync_account_peer_registry()?;
         let transport = SignedTransport::new(
             LocalFsAdapter::new(wire),
             self.inner.identity.keypair.clone(),

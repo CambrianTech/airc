@@ -487,7 +487,7 @@ impl Airc {
         Ok(room_ids)
     }
 
-    async fn subscribed_wires(&self) -> Result<Vec<PathBuf>, AircError> {
+    pub(crate) async fn subscribed_wires(&self) -> Result<Vec<PathBuf>, AircError> {
         let mut wires = Vec::new();
         let set = self.subscription_set().await?;
         for subscription in set.all() {
