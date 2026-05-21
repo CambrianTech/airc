@@ -428,6 +428,17 @@ impl Airc {
 
     /// Subscribe to every channel in `context`, set its default, and
     /// start local subscribers for the resulting wires.
+    ///
+    /// When the local `gh` is authenticated against GitHub, this
+    /// also publishes the scope's account-registry document to a
+    /// per-machine gist and refreshes from any other matching gists
+    /// on the same account — that's the cross-machine bootstrap.
+    /// Both operations are best-effort: if `gh` is missing,
+    /// unauthenticated, rate-limited, or the user has deleted the
+    /// gist out-of-band, the join still completes locally and the
+    /// failure is surfaced via stderr. Cross-machine convergence
+    /// just won't happen until gh recovers — the local mesh
+    /// continues to work.
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
         let identity = self.mesh_identity()?;
         let mut set = subscriptions::load_or_init(&self.inner.home)?;
@@ -450,6 +461,28 @@ impl Airc {
 
         for room in &rooms {
             self.ensure_wire_subscriber(&room.wire).await?;
+        }
+
+        // Cross-machine bootstrap: publish + refresh through gh-gist
+        // if gh is authenticated. Best-effort; never fails the join.
+        if crate::gh_account_registry::gh_auth_ready(None).await {
+            let store = crate::gh_account_registry::GhAccountRegistryStore::new(
+                self.inner.wire_root.clone(),
+            );
+            if let Err(error) = self.publish_account_registry(&store).await {
+                eprintln!(
+                    "airc: cross-machine registry publish failed (local mesh still works): {error}"
+                );
+            }
+            match self.refresh_account_registry(&store).await {
+                Ok(Some(_doc)) => {}
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "airc: cross-machine registry refresh failed (local mesh still works): {error}"
+                    );
+                }
+            }
         }
         Ok(rooms)
     }
