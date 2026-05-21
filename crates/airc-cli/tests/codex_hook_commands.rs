@@ -270,8 +270,8 @@ fn codex_hook_uninstaller_removes_managed_hooks_only() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
-    let output = Command::new(airc_core())
-        .arg("--home")
+    let output = command_for_home(home)
+        .args(["--home"])
         .arg(home)
         .args(args)
         .output()
@@ -287,8 +287,8 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
 }
 
 fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
-    let mut child = Command::new(airc_core())
-        .arg("--home")
+    let mut child = command_for_home(home)
+        .args(["--home"])
         .arg(home)
         .args(args)
         .stdin(Stdio::piped())
@@ -311,6 +311,14 @@ fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
         String::from_utf8_lossy(&output.stderr),
     );
     String::from_utf8(output.stdout).expect("stdout utf-8")
+}
+
+fn command_for_home(home: &Path) -> Command {
+    let mut command = Command::new(airc_core());
+    let account_home = home.parent().unwrap_or(home);
+    command.env("HOME", account_home);
+    command.env("USERPROFILE", account_home);
+    command
 }
 
 fn additional_context(output: &str) -> String {
