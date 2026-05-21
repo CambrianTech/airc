@@ -1,19 +1,20 @@
 //! Codex hooks.json mutation for AIRC hook installation.
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const HOOK_COMMAND_SUFFIX: &str = "codex-hook user-prompt-submit";
 const HOOK_COMMAND: &str = "airc codex-hook user-prompt-submit";
 const HOOK_STATUS: &str = "Checking AIRC inbox";
 
-pub fn install(path: &Path, _airc_core: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn install(path: &Path, airc_core: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let original = read_json(path)?;
     let mut data = ensure_root_object(original);
     let user_prompt = ensure_user_prompt_array(&mut data)?;
     let before = user_prompt.clone();
     remove_managed_hook_entries(user_prompt);
-    user_prompt.push(hook_group(HOOK_COMMAND));
+    let command = hook_command_for(airc_core);
+    user_prompt.push(hook_group(&command));
 
     let changed = *user_prompt != before;
     if changed {
@@ -87,6 +88,49 @@ fn is_managed_hook_command(command: Option<&str>) -> bool {
         return false;
     };
     command == HOOK_COMMAND || command.ends_with(HOOK_COMMAND_SUFFIX)
+}
+
+fn hook_command_for(airc_core: &Path) -> String {
+    source_airc_command_from_core(airc_core)
+        .filter(|airc| airc.is_file())
+        .map(|airc| format!("{} {HOOK_COMMAND_SUFFIX}", shell_quote_path(&airc)))
+        .unwrap_or_else(|| HOOK_COMMAND.to_string())
+}
+
+fn source_airc_command_from_core(airc_core: &Path) -> Option<PathBuf> {
+    // Expected install shape:
+    //   ~/.airc/src/target/release/airc-core
+    //   ~/.airc/src/airc
+    //   ~/.airc/src/airc.cmd        (Windows)
+    //
+    // Cargo test/dev builds use target/debug/airc-core; the same two-level
+    // ascent from target/{profile}/airc-core reaches the source root.
+    let profile_dir = airc_core.parent()?;
+    let target_dir = profile_dir.parent()?;
+    let source_root = target_dir.parent()?;
+    Some(source_root.join(source_airc_filename()))
+}
+
+#[cfg(windows)]
+fn source_airc_filename() -> &'static str {
+    "airc.cmd"
+}
+
+#[cfg(not(windows))]
+fn source_airc_filename() -> &'static str {
+    "airc"
+}
+
+#[cfg(windows)]
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    format!("\"{}\"", raw.replace('"', "\\\""))
+}
+
+#[cfg(not(windows))]
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 fn hook_group(command: &str) -> Value {
