@@ -13,11 +13,16 @@
 use std::path::PathBuf;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::{timeout, Duration};
 
 use crate::ipc::transport::IpcStream;
 
-use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::request::{
+    AddPeerRequest, AttachRequest, InboxRequest, Request, SendRequest, SubscribeRequest,
+};
 use crate::ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
+
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
@@ -28,6 +33,9 @@ pub enum ClientError {
     Io(std::io::Error),
     /// Request or response failed to serialize/deserialize.
     Codec(serde_json::Error),
+    /// The daemon accepted or was contacted, but did not complete
+    /// the request inside the RPC deadline.
+    Timeout,
     /// Daemon returned `Response::Error { message }`.
     Daemon(String),
     /// Daemon returned a response variant inconsistent with the
@@ -44,6 +52,7 @@ impl std::fmt::Display for ClientError {
             }
             ClientError::Io(error) => write!(f, "daemon RPC I/O: {error}"),
             ClientError::Codec(error) => write!(f, "daemon RPC codec: {error}"),
+            ClientError::Timeout => write!(f, "daemon RPC timed out"),
             ClientError::Daemon(message) => write!(f, "daemon error: {message}"),
             ClientError::UnexpectedResponse(response) => {
                 write!(f, "daemon returned unexpected response: {response:?}")
@@ -57,7 +66,9 @@ impl std::error::Error for ClientError {
         match self {
             ClientError::NotConnected(error) | ClientError::Io(error) => Some(error),
             ClientError::Codec(error) => Some(error),
-            ClientError::Daemon(_) | ClientError::UnexpectedResponse(_) => None,
+            ClientError::Timeout | ClientError::Daemon(_) | ClientError::UnexpectedResponse(_) => {
+                None
+            }
         }
     }
 }
@@ -83,6 +94,20 @@ impl DaemonClient {
     /// Unix sockets support `shutdown` half-close but named pipes
     /// don't. Both sides read until `\n`, parse, drop.
     pub async fn call(&self, request: Request) -> Result<Response, ClientError> {
+        self.call_with_timeout(request, DEFAULT_RPC_TIMEOUT).await
+    }
+
+    pub async fn call_with_timeout(
+        &self,
+        request: Request,
+        deadline: Duration,
+    ) -> Result<Response, ClientError> {
+        timeout(deadline, self.call_inner(request))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+
+    async fn call_inner(&self, request: Request) -> Result<Response, ClientError> {
         let stream = IpcStream::connect(&self.socket_path)
             .await
             .map_err(ClientError::NotConnected)?;
@@ -106,16 +131,22 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Ok) => Ok(other),
         }
     }
 
     pub async fn ping(&self) -> Result<(), ClientError> {
-        match self.call(Request::Ping).await? {
+        self.ping_with_timeout(DEFAULT_RPC_TIMEOUT).await
+    }
+
+    pub async fn ping_with_timeout(&self, deadline: Duration) -> Result<(), ClientError> {
+        match self.call_with_timeout(Request::Ping, deadline).await? {
             Response::Pong => Ok(()),
             other @ (Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -127,6 +158,7 @@ impl DaemonClient {
             Response::Status(status) => Ok(status),
             other @ (Response::Pong
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -139,6 +171,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -150,6 +183,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -160,6 +194,7 @@ impl DaemonClient {
             Response::Inbox(response) => Ok(response),
             other @ (Response::Pong
             | Response::Status(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -172,6 +207,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -183,6 +219,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -198,8 +235,26 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Inbox(_)
+            | Response::Event { .. }
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
+    }
+
+    pub async fn attach(&self, request: AttachRequest) -> Result<IpcStream, ClientError> {
+        timeout(Duration::from_secs(5), self.attach_inner(request))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+
+    async fn attach_inner(&self, request: AttachRequest) -> Result<IpcStream, ClientError> {
+        let mut stream = IpcStream::connect(&self.socket_path)
+            .await
+            .map_err(ClientError::NotConnected)?;
+        let mut buffer = serde_json::to_vec(&Request::Attach(request))?;
+        buffer.push(b'\n');
+        stream.write_all(&buffer).await.map_err(ClientError::Io)?;
+        stream.flush().await.map_err(ClientError::Io)?;
+        Ok(stream)
     }
 }

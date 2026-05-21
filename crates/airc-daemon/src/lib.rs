@@ -39,7 +39,9 @@ pub mod state;
 pub use identity::{IdentityError, LocalIdentity};
 
 pub use ipc::client::{ClientError, DaemonClient};
-pub use ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
+pub use ipc::request::{
+    AddPeerRequest, AttachRequest, InboxRequest, Request, SendRequest, SubscribeRequest,
+};
 pub use ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
 pub use server::{run, DaemonError};
 pub use state::DaemonState;

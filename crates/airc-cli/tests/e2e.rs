@@ -153,19 +153,12 @@ fn join_without_args_uses_default_account_context() {
     create_repo_with_origin(&repo, "https://github.com/CambrianTech/continuum.git");
     seed_mesh_identity(&home, "joelteply");
 
-    let output = Command::new(airc_core())
-        .env("HOME", machine.path())
-        // Tests run with the operator's real `gh` auth. The gh-gist
-        // account-registry sync (#862) would iterate the real user's
-        // gist list (`gh api /gists --paginate`), which hangs the
-        // test for high-gist-count accounts. Disable for hermetic
-        // testing; PR 1 of the architecture plan moves this sync to
-        // a background daemon tick.
+    let mut join = Command::new(airc_core());
+    join.env("HOME", machine.path())
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
         .args(["--home", home.to_str().unwrap(), "join"])
-        .current_dir(&repo)
-        .output()
-        .expect("airc-core join must spawn");
+        .current_dir(&repo);
+    let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
     assert!(
         output.status.success(),
         "join failed: stdout={} stderr={}",
@@ -197,6 +190,63 @@ fn join_without_args_uses_default_account_context() {
             .join("wires")
             .join("cambriantech")
     );
+
+    let mut stop_command = Command::new(airc_core());
+    stop_command
+        .env("HOME", machine.path())
+        .args(["--home", home.to_str().unwrap(), "stop"]);
+    let stop = output_with_timeout(stop_command, Duration::from_secs(10), "airc stop");
+    assert!(
+        stop.status.success(),
+        "stop failed after join proof: stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> std::process::Output {
+    let log_dir = TempDir::new().expect("command log tempdir");
+    let stdout_path = log_dir.path().join("stdout.log");
+    let stderr_path = log_dir.path().join("stderr.log");
+    let stdout = std::fs::File::create(&stdout_path).expect("stdout log");
+    let stderr = std::fs::File::create(&stderr_path).expect("stderr log");
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!("{label} must spawn: {error}");
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => panic!("{label} wait failed: {error}"),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+            let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+            panic!(
+                "{label} timed out after {timeout:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn create_repo_with_origin(path: &Path, origin: &str) {

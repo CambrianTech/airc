@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use airc_core::PeerId;
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
@@ -50,6 +50,8 @@ pub struct DaemonState {
     /// is idempotent — repeated calls find the wire here and skip
     /// the spawn.
     pub subscribed_wires: Mutex<HashMap<PathBuf, ()>>,
+    /// Authoritative live fan-out for daemon consumers.
+    pub live_tx: broadcast::Sender<airc_core::TranscriptEvent>,
     /// Notified when the daemon should stop accepting + exit cleanly.
     pub shutdown: Notify,
 }
@@ -67,6 +69,7 @@ impl DaemonState {
         home: PathBuf,
         event_store: Arc<dyn EventStore>,
     ) -> Self {
+        let (live_tx, _) = broadcast::channel(1024);
         Self {
             peer_id,
             keypair,
@@ -77,6 +80,7 @@ impl DaemonState {
             local_fs_transports: Mutex::new(HashMap::new()),
             event_store,
             subscribed_wires: Mutex::new(HashMap::new()),
+            live_tx,
             shutdown: Notify::new(),
         }
     }

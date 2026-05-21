@@ -35,6 +35,9 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Send(send) => handle_send(state, send).await,
         Request::Subscribe(sub) => handle_subscribe(state, sub).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
+        Request::Attach(_) => Response::Error {
+            message: "attach is a streaming request handled by the server".to_string(),
+        },
         Request::AddPeer(add) => handle_add_peer(state, add).await,
         Request::ListPeers => handle_list_peers(state).await,
         Request::Stop => {
@@ -80,18 +83,27 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
             match item {
                 Ok(frame) => {
                     let event = frame.into_transcript_event();
-                    if let Err(err) = store.append(event).await {
-                        // Persistence failures are loud. Most likely
-                        // a duplicate replay (DuplicateEventId), which
-                        // is benign for replay-style subscriptions.
-                        // Anything else (Database, Migration, Codec)
-                        // surfaces here so the operator sees it.
-                        eprintln!("daemon subscriber: store append failed: {err}");
+                    let event_id = event.event_id;
+                    match store.append(event.clone()).await {
+                        Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                            let _ = state.live_tx.send(event);
+                        }
+                        Err(err) => {
+                            // Persistence failures are loud. Most likely
+                            // a duplicate replay (DuplicateEventId), which
+                            // is benign for replay-style subscriptions.
+                            // Anything else (Database, Migration, Codec)
+                            // surfaces here so the operator sees it.
+                            eprintln!(
+                                "daemon subscriber: store append failed for {event_id}: {err}"
+                            );
+                        }
                     }
                 }
-                Err(_verify_error) => {
+                Err(verify_error) => {
                     // Verification failure — don't persist.
                     // Future: surface a counter in Status response.
+                    eprintln!("daemon subscriber: frame verification failed: {verify_error}");
                 }
             }
         }

@@ -46,6 +46,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::account_registry::{
     AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
@@ -313,15 +314,22 @@ fn extract_gist_id(stdout: &str) -> Option<String> {
 /// cleanly when the operator isn't logged in.
 pub async fn gh_auth_ready(gh_bin: Option<&Path>) -> bool {
     let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
-    match Command::new(bin)
+    let mut child = match Command::new(bin)
         .args(["auth", "status"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await
+        .spawn()
     {
-        Ok(status) => status.success(),
-        Err(_) => false,
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    match timeout(Duration::from_millis(750), child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) => false,
+        Err(_) => {
+            let _ = child.kill().await;
+            false
+        }
     }
 }
 

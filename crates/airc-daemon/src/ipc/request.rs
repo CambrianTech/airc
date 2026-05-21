@@ -37,6 +37,10 @@ pub enum Request {
     /// filtered to a single channel. Pass back the response's
     /// `newest` cursor on the next call for consume-once streaming.
     Inbox(InboxRequest),
+    /// Attach to the daemon's live event stream. This is a long-lived
+    /// request: after an initial `Response::Ok`, the daemon writes
+    /// `Response::Event` lines until the client disconnects.
+    Attach(AttachRequest),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.
     Stop,
@@ -69,6 +73,15 @@ pub struct InboxRequest {
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// Parameters for `Attach`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AttachRequest {
+    /// Restrict live events to this channel. `None` streams all
+    /// subscribed daemon events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<airc_core::RoomId>,
 }
 
 /// Parameters for `AddPeer`. `pubkey_b64` is the URL-safe-no-padding

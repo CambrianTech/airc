@@ -15,10 +15,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fs2::FileExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use uuid::Uuid;
 
 use crate::handlers::dispatch;
-use crate::ipc::request::Request;
+use crate::ipc::request::{AttachRequest, Request};
 use crate::ipc::response::Response;
 use crate::ipc::transport::{IpcListener, IpcStream};
 use crate::state::DaemonState;
@@ -26,6 +28,8 @@ use crate::state::DaemonState;
 /// What can go wrong running the daemon.
 #[derive(Debug)]
 pub enum DaemonError {
+    /// Another daemon already owns this IPC endpoint.
+    AlreadyRunning(PathBuf),
     /// Socket bind / accept I/O failure.
     Io(std::io::Error),
     /// Could not remove a stale socket file from a prior daemon
@@ -36,6 +40,9 @@ pub enum DaemonError {
 impl std::fmt::Display for DaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DaemonError::AlreadyRunning(path) => {
+                write!(f, "daemon already running on {}", path.display())
+            }
             DaemonError::Io(error) => write!(f, "daemon I/O: {error}"),
             DaemonError::StaleSocket(error) => {
                 write!(f, "stale socket cleanup: {error}")
@@ -47,6 +54,7 @@ impl std::fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            DaemonError::AlreadyRunning(_) => None,
             DaemonError::Io(error) | DaemonError::StaleSocket(error) => Some(error),
         }
     }
@@ -62,6 +70,7 @@ impl From<std::io::Error> for DaemonError {
 /// shutdown. Returns when the shutdown notifier fires (typically from
 /// a Stop request handler) or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
+    let _guard = DaemonBindGuard::acquire(&socket_path)?;
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
 
@@ -88,6 +97,52 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     // close, so the call is a no-op.
     listener.cleanup();
     Ok(())
+}
+
+struct DaemonBindGuard {
+    file: std::fs::File,
+}
+
+impl DaemonBindGuard {
+    fn acquire(socket_path: &Path) -> Result<Self, DaemonError> {
+        let lock_dir = std::env::temp_dir().join("airc-daemon-locks");
+        std::fs::create_dir_all(&lock_dir)?;
+        let lock_path = lock_dir.join(format!("{}.lock", socket_lock_id(socket_path)));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        if let Err(error) = file.try_lock_exclusive() {
+            if is_lock_contended(&error) {
+                return Err(DaemonError::AlreadyRunning(socket_path.to_path_buf()));
+            }
+            return Err(DaemonError::Io(error));
+        }
+        Ok(Self { file })
+    }
+}
+
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::PermissionDenied
+    ) || error.raw_os_error() == Some(33)
+}
+
+impl Drop for DaemonBindGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn socket_lock_id(socket_path: &Path) -> Uuid {
+    const LOCK_NAMESPACE: Uuid = Uuid::from_bytes([
+        0xa1, 0xc2, 0x70, 0x1b, 0xe0, 0x05, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03,
+    ]);
+    Uuid::new_v5(&LOCK_NAMESPACE, socket_path.to_string_lossy().as_bytes())
 }
 
 /// If the previous daemon left a stale socket file behind, unlink
@@ -151,11 +206,47 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
         }
     };
 
+    if let Request::Attach(attach) = request {
+        return stream_attach(writer, state, attach).await;
+    }
+
     let response = dispatch(state, request).await;
     write_response(&mut writer, &response).await?;
     // Drop reader+writer (and thus the underlying stream) so the
     // client's read sees EOF promptly.
     Ok(())
+}
+
+async fn stream_attach<W>(
+    mut writer: W,
+    state: Arc<DaemonState>,
+    attach: AttachRequest,
+) -> Result<(), DaemonError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_response(&mut writer, &Response::Ok).await?;
+    let mut rx = state.live_tx.subscribe();
+    loop {
+        let event = match rx.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        };
+        if attach
+            .channel
+            .is_some_and(|channel| event.room_id != channel)
+        {
+            continue;
+        }
+        write_response(
+            &mut writer,
+            &Response::Event {
+                event: Box::new(event),
+            },
+        )
+        .await?;
+    }
 }
 
 async fn write_response<W>(writer: &mut W, response: &Response) -> Result<(), DaemonError>
@@ -357,19 +448,9 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_refuses_to_steal_live_socket() {
-        // Pin the cleanup_stale_socket / first_pipe_instance contract:
-        // if a daemon is already live on the path, a second run() must
-        // refuse rather than silently take over. The exact error kind
-        // differs by platform:
-        //   - Unix: cleanup_stale_socket returns DaemonError::StaleSocket
-        //     wrapping AddrInUse (we synthesised the kind when probing
-        //     the live socket).
-        //   - Windows: ServerOptions::first_pipe_instance(true) surfaces
-        //     duplicate-binder via DaemonError::Io with PermissionDenied
-        //     (os error 5 / ERROR_ACCESS_DENIED). The OS chose that error
-        //     code; we honour it rather than fabricate equivalence.
-        // Either error variant constitutes "refused" — the test asserts
-        // refusal, not a specific error shape.
+        // A second daemon must fail before binding the endpoint. The
+        // bind guard normalizes platform lock errors into the daemon
+        // contract so callers do not need OS-specific error matching.
         let state = fresh_state();
         let socket = unique_socket();
         let first = state.clone();
@@ -377,16 +458,12 @@ mod tests {
         let first_handle = tokio::spawn(async move { run(first, socket_for_first).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let second_result = run(fresh_state(), socket.clone()).await;
-        let refused = match &second_result {
-            Err(DaemonError::StaleSocket(_)) => true,
-            Err(DaemonError::Io(io)) if io.kind() == std::io::ErrorKind::PermissionDenied => {
-                cfg!(windows)
-            }
-            _ => false,
-        };
+        let second_result =
+            tokio::time::timeout(Duration::from_secs(2), run(fresh_state(), socket.clone()))
+                .await
+                .expect("second daemon bind attempt must return promptly");
         assert!(
-            refused,
+            matches!(second_result, Err(DaemonError::AlreadyRunning(_))),
             "second daemon must refuse to steal a live socket; got {second_result:?}"
         );
 

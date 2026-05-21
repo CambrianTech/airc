@@ -109,6 +109,7 @@ dependencies = [
  "airc-transport",
  "async-trait",
  "base64",
+ "fs2",
  "futures",
  "serde",
  "serde_json",
