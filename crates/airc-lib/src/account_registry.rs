@@ -247,12 +247,13 @@ impl AccountRegistryStore for SqliteAccountRegistryStore {
 impl Airc {
     pub async fn account_registry_document(&self) -> Result<AccountRegistryDocument, AircError> {
         let identity = self.mesh_identity().await?;
-        let snapshot = crate::coordinator::snapshot(
-            &self.inner.wire_root,
+        let snapshot = crate::coordinator::snapshot_store(
+            self.coordinator_store(),
             &identity,
             &crate::coordinator::CoordinatorConfig::default(),
             crate::time::now_ms()?,
-        )?;
+        )
+        .await?;
         let mut peer_specs = vec![PeerSpec {
             peer_id: self.inner.identity.peer_id,
             pubkey: self.inner.identity.keypair.public_bytes(),
@@ -310,11 +311,12 @@ impl Airc {
             )
             .await?;
             self.enrol_volatile_peer(&peer.peer_spec)?;
-            crate::coordinator::publish(
-                &self.inner.wire_root,
+            crate::coordinator::publish_store(
+                self.coordinator_store(),
                 &document.mesh_identity,
                 &peer.presence,
-            )?;
+            )
+            .await?;
             self.import_invite_beacon(peer.invite_beacon()).await?;
         }
         self.sync_account_peer_registry().await?;
@@ -531,12 +533,13 @@ mod tests {
             .await
             .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == spec.peer_id));
-        let snapshot = crate::coordinator::snapshot(
-            &airc.inner.wire_root,
+        let snapshot = crate::coordinator::snapshot_store(
+            airc.event_store(),
             &mesh(),
             &Default::default(),
             1_000,
         )
+        .await
         .unwrap();
         assert!(snapshot
             .live
@@ -571,12 +574,13 @@ mod tests {
             .await
             .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
-        let snapshot = crate::coordinator::snapshot(
-            &airc_b.inner.wire_root,
+        let snapshot = crate::coordinator::snapshot_store(
+            airc_b.event_store(),
             &mesh(),
             &Default::default(),
             u64::MAX,
         )
+        .await
         .unwrap();
         assert!(snapshot
             .stale

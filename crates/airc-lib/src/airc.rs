@@ -114,6 +114,7 @@ pub(crate) struct AircInner {
     pub(crate) wire_root: PathBuf,
     pub(crate) identity: LocalIdentity,
     pub(crate) store: Arc<dyn EventStore>,
+    pub(crate) coordinator_store: Arc<dyn EventStore>,
     pub(crate) daemon_client: Option<Arc<DaemonClient>>,
     pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
     pub(crate) policy: VerificationPolicy,
@@ -197,6 +198,9 @@ impl Airc {
 
         let store_path = home.join(EVENTS_DB_FILENAME);
         let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
+        let coordinator_store_path = wire_root.join(EVENTS_DB_FILENAME);
+        let coordinator_store: Arc<dyn EventStore> =
+            Arc::new(SqliteEventStore::open_path(&coordinator_store_path).await?);
 
         let mut registry = PeerKeyRegistry::new();
         registry
@@ -227,6 +231,7 @@ impl Airc {
                 home,
                 identity,
                 store,
+                coordinator_store,
                 daemon_client: None,
                 registry,
                 policy,
@@ -288,6 +293,7 @@ impl Airc {
             wire_root: self.inner.wire_root.clone(),
             identity: self.inner.identity.clone(),
             store: self.inner.store.clone(),
+            coordinator_store: self.inner.coordinator_store.clone(),
             daemon_client: Some(Arc::new(client)),
             registry: self.inner.registry.clone(),
             policy: self.inner.policy,
@@ -378,7 +384,7 @@ impl Airc {
         Ok(())
     }
 
-    fn publish_presence(
+    async fn publish_presence(
         &self,
         identity: &MeshIdentity,
         set: &subscriptions::SubscriptionSet,
@@ -391,7 +397,7 @@ impl Airc {
             std::process::id(),
             time::now_ms()?,
         );
-        coordinator::publish(&self.inner.wire_root, identity, &beacon)?;
+        coordinator::publish_store(self.coordinator_store(), identity, &beacon).await?;
         Ok(())
     }
 
@@ -405,7 +411,7 @@ impl Airc {
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set)?;
+        self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
@@ -453,7 +459,7 @@ impl Airc {
             set.set_default(context.default)?;
         }
         subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set)?;
+        self.publish_presence(&identity, &set).await?;
 
         for room in &rooms {
             self.ensure_wire_subscriber(&room.wire).await?;
@@ -475,7 +481,7 @@ impl Airc {
         set.subscribed.insert(channel.clone(), subscription.clone());
         set.set_default(channel)?;
         subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set)?;
+        self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
         Ok(room)
@@ -496,12 +502,16 @@ impl Airc {
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
         subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set)?;
+        self.publish_presence(&identity, &set).await?;
         Ok(subscription.as_room())
     }
 
     pub(crate) fn event_store(&self) -> &dyn EventStore {
         self.inner.store.as_ref()
+    }
+
+    pub(crate) fn coordinator_store(&self) -> &dyn EventStore {
+        self.inner.coordinator_store.as_ref()
     }
 
     /// Load a named runtime consumer checkpoint from the durable

@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
+use airc_core::{PeerId, RoomId, TranscriptCursor, TranscriptEvent};
+use uuid::Uuid;
 
+use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::store::EventStore;
@@ -18,6 +20,7 @@ pub struct InMemoryEventStore {
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
     subscriptions: Mutex<Vec<StoredSubscription>>,
     mesh_identities: Mutex<BTreeMap<String, StoredMeshIdentity>>,
+    beacons: Mutex<BTreeMap<(String, Uuid), StoredBeacon>>,
 }
 
 impl InMemoryEventStore {
@@ -27,6 +30,7 @@ impl InMemoryEventStore {
             runtime_cursors: Mutex::new(BTreeMap::new()),
             subscriptions: Mutex::new(Vec::new()),
             mesh_identities: Mutex::new(BTreeMap::new()),
+            beacons: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -157,6 +161,55 @@ impl EventStore for InMemoryEventStore {
             .map_err(|_| StoreError::LockPoisoned)?;
         identities.insert(entry.scope.clone(), entry);
         Ok(())
+    }
+
+    async fn load_beacon(
+        &self,
+        mesh_identity: &str,
+        peer_id: PeerId,
+    ) -> Result<Option<StoredBeacon>, StoreError> {
+        let beacons = self.beacons.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(beacons
+            .get(&(mesh_identity.to_string(), peer_id.as_uuid()))
+            .cloned())
+    }
+
+    async fn list_beacons(&self, mesh_identity: &str) -> Result<Vec<StoredBeacon>, StoreError> {
+        let beacons = self.beacons.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut rows = beacons
+            .values()
+            .filter(|beacon| beacon.mesh_identity == mesh_identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|beacon| beacon.peer_id.to_string());
+        Ok(rows)
+    }
+
+    async fn save_beacon(&self, beacon: StoredBeacon) -> Result<(), StoreError> {
+        let mut beacons = self.beacons.lock().map_err(|_| StoreError::LockPoisoned)?;
+        beacons.insert(
+            (beacon.mesh_identity.clone(), beacon.peer_id.as_uuid()),
+            beacon,
+        );
+        Ok(())
+    }
+
+    async fn delete_beacons(
+        &self,
+        mesh_identity: &str,
+        peer_ids: &[PeerId],
+    ) -> Result<usize, StoreError> {
+        let mut beacons = self.beacons.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut removed = 0;
+        for peer_id in peer_ids {
+            if beacons
+                .remove(&(mesh_identity.to_string(), peer_id.as_uuid()))
+                .is_some()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 }
 

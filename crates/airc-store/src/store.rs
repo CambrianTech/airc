@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
+use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::subscriptions::StoredSubscription;
@@ -94,4 +95,26 @@ pub trait EventStore: Send + Sync {
 
     /// Upsert the cached mesh identity row for its `scope`.
     async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError>;
+
+    /// Load the caller's own account-mesh beacon for `mesh_identity`,
+    /// if present.
+    async fn load_beacon(
+        &self,
+        mesh_identity: &str,
+        peer_id: airc_core::PeerId,
+    ) -> Result<Option<StoredBeacon>, StoreError>;
+
+    /// List all account-mesh beacons for `mesh_identity`.
+    async fn list_beacons(&self, mesh_identity: &str) -> Result<Vec<StoredBeacon>, StoreError>;
+
+    /// Upsert one account-mesh beacon and replace its channel set in
+    /// the same transaction.
+    async fn save_beacon(&self, beacon: StoredBeacon) -> Result<(), StoreError>;
+
+    /// Delete account-mesh beacons for `mesh_identity`.
+    async fn delete_beacons(
+        &self,
+        mesh_identity: &str,
+        peer_ids: &[airc_core::PeerId],
+    ) -> Result<usize, StoreError>;
 }
