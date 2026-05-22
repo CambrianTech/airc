@@ -105,6 +105,33 @@ fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
 }
 
 #[test]
+fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+    let cursor = workspace.path().join("cursor.json");
+
+    run_ok(&home, &["init"]);
+    run_ok_with_client(
+        &home,
+        "claude:session-1",
+        &["send", "peer despite shared home"],
+    );
+
+    let output = run_hook(
+        &home,
+        &[
+            "codex-hook",
+            "user-prompt-submit",
+            "--cursor-file",
+            cursor.to_str().unwrap(),
+        ],
+        "{}",
+    );
+    let context = additional_context(&output);
+    assert!(context.contains("peer despite shared home"));
+}
+
+#[test]
 fn codex_hook_raw_mode_preserves_full_event_lines() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
