@@ -11,21 +11,22 @@
 //! media, and model payloads are explicitly out of scope.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use airc_store::{SqliteEventStore, StoredAccountRegistry};
 
 use crate::coordinator::{CoordinatorSnapshot, PresenceBeacon};
 use crate::error::AircError;
 use crate::registry::PeerSpec;
 use crate::route::{InviteBeacon, RouteEndpoint};
 use crate::subscriptions::{ChannelName, MeshIdentity};
+use crate::time;
 use crate::Airc;
 
 pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
-const REGISTRY_FILENAME: &str = "registry.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRegistryDocument {
@@ -175,95 +176,72 @@ pub trait AccountRegistryStore: Send + Sync {
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError>;
 }
 
-#[derive(Debug, Clone)]
-pub struct FileAccountRegistryStore {
-    root: PathBuf,
+/// Store-backed local cache of account-registry documents.
+///
+/// Replaces the previous on-disk `<root>/<mesh-identity>/registry.json`
+/// sidecar with a row in the `account_registry` SeaORM table. Pairs
+/// well with remote adapters (e.g. `GhAccountRegistryStore`) — those
+/// publish to a remote rendezvous and use this store as the local
+/// cache of "what we last sent/received."
+#[derive(Clone)]
+pub struct SqliteAccountRegistryStore {
+    store: Arc<SqliteEventStore>,
 }
 
-impl FileAccountRegistryStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn path_for(&self, mesh_identity: &MeshIdentity) -> PathBuf {
-        self.root
-            .join(safe_component(mesh_identity.as_str()))
-            .join(REGISTRY_FILENAME)
+impl SqliteAccountRegistryStore {
+    pub fn new(store: Arc<SqliteEventStore>) -> Self {
+        Self { store }
     }
 }
 
 #[async_trait]
-impl AccountRegistryStore for FileAccountRegistryStore {
+impl AccountRegistryStore for SqliteAccountRegistryStore {
     async fn publish(
         &self,
         document: &AccountRegistryDocument,
     ) -> Result<(), AccountRegistryError> {
         document.validate()?;
-        let path = self.path_for(&document.mesh_identity);
-        let parent = path
-            .parent()
-            .ok_or_else(|| AccountRegistryError::Adapter("registry path has no parent".into()))?;
-        fs::create_dir_all(parent).map_err(|error| {
-            AccountRegistryError::Adapter(format!(
-                "create registry dir {}: {error}",
-                parent.display()
-            ))
-        })?;
-        let tmp = path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(document).map_err(|error| {
+        let document_json = serde_json::to_string(document).map_err(|error| {
             AccountRegistryError::Adapter(format!("serialize registry document: {error}"))
         })?;
-        fs::write(&tmp, text).map_err(|error| {
-            AccountRegistryError::Adapter(format!("write registry tmp {}: {error}", tmp.display()))
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("clock for registry save: {error}"))
         })?;
-        fs::rename(&tmp, &path).map_err(|error| {
-            AccountRegistryError::Adapter(format!(
-                "publish registry {} -> {}: {error}",
-                tmp.display(),
-                path.display()
-            ))
-        })?;
-        Ok(())
+        self.store
+            .save_account_registry(StoredAccountRegistry {
+                mesh_identity: document.mesh_identity.as_str().to_string(),
+                schema_version: document.schema_version,
+                generated_at_ms: document.generated_at_ms,
+                document_json,
+                updated_at_ms: now_ms,
+            })
+            .await
+            .map_err(|error| {
+                AccountRegistryError::Adapter(format!("persist registry document: {error}"))
+            })
     }
 
     async fn refresh(
         &self,
         mesh_identity: &MeshIdentity,
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
-        let path = self.path_for(mesh_identity);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(AccountRegistryError::Adapter(format!(
-                    "read registry {}: {error}",
-                    path.display()
-                )));
-            }
+        let row = self
+            .store
+            .load_account_registry(mesh_identity.as_str())
+            .await
+            .map_err(|error| {
+                AccountRegistryError::Adapter(format!("load registry document: {error}"))
+            })?;
+        let Some(stored) = row else {
+            return Ok(None);
         };
-        let document: AccountRegistryDocument = serde_json::from_str(&text).map_err(|error| {
-            AccountRegistryError::Adapter(format!("parse registry {}: {error}", path.display()))
-        })?;
+        let document: AccountRegistryDocument = serde_json::from_str(&stored.document_json)
+            .map_err(|error| {
+                AccountRegistryError::Adapter(format!("parse registry document: {error}"))
+            })?;
         document.validate()?;
         Ok(Some(document))
     }
-}
-
-fn safe_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 impl Airc {
@@ -479,10 +457,18 @@ mod tests {
         ));
     }
 
+    async fn sqlite_registry_store_at(dir: &std::path::Path) -> SqliteAccountRegistryStore {
+        let path = dir.join("events.sqlite");
+        let event_store = airc_store::SqliteEventStore::open_path(&path)
+            .await
+            .unwrap();
+        SqliteAccountRegistryStore::new(Arc::new(event_store))
+    }
+
     #[tokio::test]
-    async fn file_registry_store_publishes_and_refreshes_document() {
+    async fn sqlite_registry_store_publishes_and_refreshes_document() {
         let dir = tempdir().unwrap();
-        let store = FileAccountRegistryStore::new(dir.path().join("registry"));
+        let store = sqlite_registry_store_at(&dir.path().join("registry")).await;
         let peer_id = PeerId::new();
         let document = AccountRegistryDocument::new(
             mesh(),
@@ -505,7 +491,6 @@ mod tests {
         let refreshed = store.refresh(&mesh()).await.unwrap().unwrap();
 
         assert_eq!(refreshed, document);
-        assert!(store.root().join("joelteply/registry.json").is_file());
     }
 
     #[tokio::test]
@@ -566,13 +551,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_registry_bridges_two_isolated_machine_homes() {
+    async fn sqlite_registry_bridges_two_isolated_machine_homes() {
         let dir = tempdir().unwrap();
         let machine_a = dir.path().join("machine-a/.airc");
         let machine_b = dir.path().join("machine-b/.airc");
         write_identity(&machine_a).await;
         write_identity(&machine_b).await;
-        let store = FileAccountRegistryStore::new(dir.path().join("remote-registry"));
+        let store = sqlite_registry_store_at(&dir.path().join("remote-registry")).await;
 
         let airc_a = Airc::open(&machine_a).await.unwrap();
         airc_a.join("general").await.unwrap();

@@ -29,6 +29,7 @@
 // signature has to match verbatim. Opt out at the crate level rather
 // than scattering `#[allow(elided_lifetimes_in_paths)]` per impl.
 
+pub mod account_registry;
 pub mod entities;
 pub mod error;
 pub mod memory;
@@ -39,6 +40,7 @@ pub mod sqlite;
 pub mod store;
 pub mod subscriptions;
 
+pub use account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 pub use error::StoreError;
 pub use memory::InMemoryEventStore;
 pub use mesh_identity::StoredMeshIdentity;
