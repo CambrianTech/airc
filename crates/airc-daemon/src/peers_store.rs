@@ -161,7 +161,14 @@ impl From<StoreError> for PeersStoreError {
             },
             StoreError::WrongPubkeyLength(got) => PeersStoreError::WrongPubkeyLength(got),
             StoreError::Base64(error) => PeersStoreError::Base64(error),
-            other => PeersStoreError::Store(other),
+            StoreError::Io(_)
+            | StoreError::Database(_)
+            | StoreError::LockPoisoned
+            | StoreError::Migration(_)
+            | StoreError::DuplicateEventId(_)
+            | StoreError::UnknownTranscriptKind(_)
+            | StoreError::InvalidStoredValue { .. }
+            | StoreError::Codec(_) => PeersStoreError::Store(error),
         }
     }
 }
