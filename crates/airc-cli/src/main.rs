@@ -53,7 +53,6 @@ mod log_cli;
 mod log_commands;
 mod message_cli;
 mod message_commands;
-mod metronome_commands;
 mod monitor;
 mod network_commands;
 mod pending_cli;
@@ -187,12 +186,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Init => commands::run_init(&home).await,
 
         Command::LanIp => network_commands::run_lan_ip(),
-
-        Command::RecentSenders {
-            messages_log,
-            window_seconds,
-            exclude_name,
-        } => metronome_commands::run_recent_senders(&messages_log, window_seconds, &exclude_name),
 
         Command::Bearer(args) => match args.action {
             BearerAction::Kinds => {
