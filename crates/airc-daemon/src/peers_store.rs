@@ -397,9 +397,33 @@ pub fn save(home: &Path, peers: &[StoredPeer]) -> Result<(), PeersStoreError> {
         peers: peers.to_vec(),
     };
     let text = serde_json::to_string_pretty(&file)?;
-    std::fs::write(&path, text)?;
+    let tmp = home.join(format!(
+        ".{PEERS_FILENAME}.{}.{}.tmp",
+        std::process::id(),
+        PeerId::new()
+    ));
+    std::fs::write(&tmp, text)?;
+    set_owner_only_permissions(&tmp)?;
+    replace_file(&tmp, &path)?;
     set_owner_only_permissions(&path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            std::fs::rename(tmp, path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
 }
 
 #[cfg(unix)]
