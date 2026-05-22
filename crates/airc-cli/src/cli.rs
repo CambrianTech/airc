@@ -319,10 +319,25 @@ pub enum Command {
     /// Join the account mesh. With no room, subscribes to #general
     /// and the inferred repo/org channel. With a room, subscribes to
     /// that channel and makes it the default.
+    ///
+    /// `--attach` keeps the process alive and streams live events
+    /// from subscribed channels to stdout (same path Monitor wraps).
+    /// Without `--attach`, `join` exits cleanly after subscribing.
     Join {
         /// Optional channel name to join.
         room: Option<String>,
+        /// After joining, attach to the live event stream and print
+        /// events to stdout until interrupted. Equivalent to
+        /// `airc join && airc monitor attach`.
+        #[arg(long)]
+        attach: bool,
     },
+
+    /// Print the installed `airc` build metadata: short commit, branch,
+    /// commit subject, and install dir. Use this to verify two scopes
+    /// are on the same build. (`--version` flag prints just the
+    /// package version.)
+    Version,
 
     /// Shared GitHub request governor.
     Gh(GhArgs),
