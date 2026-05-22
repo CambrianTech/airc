@@ -464,24 +464,57 @@ impl Airc {
         }
 
         // Cross-machine bootstrap: publish + refresh through gh-gist
-        // if gh is authenticated. Best-effort; never fails the join.
-        if crate::gh_account_registry::gh_auth_ready(None).await {
-            let store = crate::gh_account_registry::GhAccountRegistryStore::new(
-                self.inner.wire_root.clone(),
-            );
-            if let Err(error) = self.publish_account_registry(&store).await {
-                eprintln!(
-                    "airc: cross-machine registry publish failed (local mesh still works): {error}"
-                );
-            }
-            match self.refresh_account_registry(&store).await {
-                Ok(Some(_doc)) => {}
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!(
-                        "airc: cross-machine registry refresh failed (local mesh still works): {error}"
+        // if gh is authenticated. Best-effort with a hard deadline so
+        // the join command never blocks indefinitely on slow gh API
+        // (e.g., `gh api /gists --paginate` over a user's full gist
+        // list, which can take minutes for high-gist-count accounts).
+        // Tests and headless flows can skip entirely with
+        // `AIRC_DISABLE_ACCOUNT_REGISTRY=1`.
+        //
+        // Local mesh still works regardless; cross-machine
+        // convergence just doesn't happen on this join. The daemon
+        // (PR 1 of the architecture plan) will own this sync on a
+        // periodic background tick so the CLI never waits on it.
+        let registry_disabled = std::env::var_os("AIRC_DISABLE_ACCOUNT_REGISTRY")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        if !registry_disabled {
+            let timeout_secs: u64 = std::env::var("AIRC_REGISTRY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            let registry_future = async {
+                if crate::gh_account_registry::gh_auth_ready(None).await {
+                    let store = crate::gh_account_registry::GhAccountRegistryStore::new(
+                        self.inner.wire_root.clone(),
                     );
+                    if let Err(error) = self.publish_account_registry(&store).await {
+                        eprintln!(
+                            "airc: cross-machine registry publish failed (local mesh still works): {error}"
+                        );
+                    }
+                    match self.refresh_account_registry(&store).await {
+                        Ok(Some(_doc)) => {}
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "airc: cross-machine registry refresh failed (local mesh still works): {error}"
+                            );
+                        }
+                    }
                 }
+            };
+            if tokio::time::timeout(timeout, registry_future)
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "airc: cross-machine registry sync exceeded {timeout_secs}s — \
+                     continuing without it (local mesh still works). \
+                     Set AIRC_REGISTRY_TIMEOUT_SECS=<n> to extend or \
+                     AIRC_DISABLE_ACCOUNT_REGISTRY=1 to skip entirely."
+                );
             }
         }
         Ok(rooms)
