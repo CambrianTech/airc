@@ -11,9 +11,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    coordinator_snapshot, resolve_mesh_identity_with, Airc, Body, ChannelName, CoordinatorConfig,
-    EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource, PeerSpec, RouteEndpoint,
-    TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
+    coordinator_snapshot_store, resolve_mesh_identity_with, Airc, Body, ChannelName,
+    CoordinatorConfig, EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource,
+    PeerSpec, RouteEndpoint, TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -429,12 +429,17 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            let snapshot = coordinator_snapshot(
-                &machine.path().join(".airc"),
+            let coordinator_store =
+                SqliteEventStore::open_path(&machine.path().join(".airc/events.sqlite"))
+                    .await
+                    .unwrap();
+            let snapshot = coordinator_snapshot_store(
+                &coordinator_store,
                 &MeshIdentity::new("joelteply"),
                 &CoordinatorConfig::default(),
                 now_ms,
             )
+            .await
             .unwrap();
             assert_eq!(snapshot.live.len(), 2);
             assert_eq!(

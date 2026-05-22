@@ -18,8 +18,10 @@
 //!     cache of the published cross-machine registry document and the
 //!     per-mesh-identity gist-id sentinel that the gh adapter uses
 //!     to recognize its own gist across publishes.
-
+//!   - `beacons` / `beacon_channels` — account-mesh presence.
 pub mod account_registry;
+pub mod beacon;
+pub mod beacon_channel;
 pub mod event;
 pub mod local_identity;
 pub mod mesh_identity;

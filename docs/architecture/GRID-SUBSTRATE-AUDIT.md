@@ -197,11 +197,11 @@ Move to SeaORM entities (one row, one table, one transaction):
 | `peers.json` | `peer_trust` + `peer_rotation_audit` (done in #883) |
 | `subscriptions.json` | `subscriptions` table (done in store-backed subscriptions cut) |
 | `room.json` (current room marker) | `subscriptions.is_default` (done in store-backed subscriptions cut) |
-| `identity.json` (singleton) | `identity` table (singleton row) |
+| `identity.json` (singleton metadata) | `local_identity` table (done in store-backed local identity cut; key material stays in `identity.key`) |
 | `mesh_identity` cache file | `mesh_identity` table (done in store-backed mesh identity cut) |
 | `account_registry/*.json` | `account_registry` table |
-| `coordinator/*.beacon` | `beacons` table with `ttl_expires_at` |
-| `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `cursors` table (per-runtime-client, per-channel) |
+| `coordinator/*.beacon` | `beacons` + `beacon_channels` tables (done in store-backed coordinator beacon cut) |
+| `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `runtime_cursors` table (done in cursor cut) |
 
 What dies the day this lands:
 - Every `tmp + rename` pattern (DB transaction is atomic).
@@ -240,10 +240,10 @@ five concrete hotpaths and seven kill-list patterns.
 ### Top 5 perf problems (worst first)
 
 1. **Synchronous file I/O on every CLI/subscribe call** —
-   peer trust moved to SeaORM in #883 and subscriptions/default-room
-   moved to the `subscriptions` table in the store-backed
-   subscriptions cut. Remaining file-backed runtime state is
-   identity, account registry, and coordinator beacons.
+   peer trust moved to SeaORM in #883; subscriptions/default-room,
+   local identity metadata, mesh identity, runtime cursors, and
+   coordinator beacons now use store tables. Remaining file-backed
+   runtime state is the account registry document path.
 
 2. **Double clone of `TranscriptEvent` on every ingest** —
    `messaging.rs:110`, `transport.rs:124`. Each event is cloned
@@ -268,10 +268,10 @@ five concrete hotpaths and seven kill-list patterns.
 
 ### Substrate-wide patterns to kill (priority order)
 
-1. **Synchronous file I/O in async functions** — identity,
-   account registry, and coordinator beacon reads still need SeaORM
-   cuts. Peer trust, subscriptions, and mesh identity are now
-   store-backed.
+1. **Synchronous file I/O in async functions** — account registry
+   reads still need a SeaORM cut. Peer trust, subscriptions, local
+   identity metadata, mesh identity, runtime cursors, and coordinator
+   beacons are now store-backed.
 2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
    route_health, route_endpoints, imported_invites. Switch to
    `DashMap` or sharded RwLock for N-reader scale.

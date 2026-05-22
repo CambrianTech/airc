@@ -30,9 +30,10 @@ use airc_core::{
 };
 
 use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
+use crate::beacon::StoredBeacon;
 use crate::entities::{
-    account_registry, event, local_identity, mesh_identity, peer_rotation_audit, peer_trust,
-    runtime_cursor, subscription,
+    account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
+    peer_rotation_audit, peer_trust, runtime_cursor, subscription,
 };
 use crate::error::StoreError;
 use crate::mesh_identity::StoredMeshIdentity;
@@ -675,6 +676,136 @@ impl EventStore for SqliteEventStore {
             .await?;
         Ok(())
     }
+
+    async fn load_beacon(
+        &self,
+        mesh_identity: &str,
+        peer_id: PeerId,
+    ) -> Result<Option<StoredBeacon>, StoreError> {
+        let row = beacon::Entity::find()
+            .filter(beacon::Column::MeshIdentity.eq(mesh_identity))
+            .filter(beacon::Column::PeerId.eq(peer_id.as_uuid()))
+            .one(&self.db)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(self.beacon_from_model(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_beacons(&self, mesh_identity: &str) -> Result<Vec<StoredBeacon>, StoreError> {
+        let rows = beacon::Entity::find()
+            .filter(beacon::Column::MeshIdentity.eq(mesh_identity))
+            .order_by_asc(beacon::Column::PeerId)
+            .all(&self.db)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.beacon_from_model(row).await?);
+        }
+        Ok(out)
+    }
+
+    async fn save_beacon(&self, entry: StoredBeacon) -> Result<(), StoreError> {
+        let txn = self.db.begin().await?;
+        let peer_uuid = entry.peer_id.as_uuid();
+        let active = beacon::ActiveModel {
+            mesh_identity: ActiveValue::Set(entry.mesh_identity.clone()),
+            peer_id: ActiveValue::Set(peer_uuid),
+            scope_home: ActiveValue::Set(entry.scope_home),
+            pid: ActiveValue::Set(i64::from(entry.pid)),
+            published_at_ms: ActiveValue::Set(u64_to_i64(
+                "beacons.published_at_ms",
+                entry.published_at_ms,
+            )?),
+            heartbeat_at_ms: ActiveValue::Set(u64_to_i64(
+                "beacons.heartbeat_at_ms",
+                entry.heartbeat_at_ms,
+            )?),
+        };
+        beacon::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([beacon::Column::MeshIdentity, beacon::Column::PeerId])
+                    .update_columns([
+                        beacon::Column::ScopeHome,
+                        beacon::Column::Pid,
+                        beacon::Column::PublishedAtMs,
+                        beacon::Column::HeartbeatAtMs,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await?;
+        beacon_channel::Entity::delete_many()
+            .filter(beacon_channel::Column::MeshIdentity.eq(&entry.mesh_identity))
+            .filter(beacon_channel::Column::PeerId.eq(peer_uuid))
+            .exec(&txn)
+            .await?;
+        let mut channels = entry.subscribed_channels;
+        channels.sort();
+        channels.dedup();
+        for channel_name in channels {
+            let active = beacon_channel::ActiveModel {
+                mesh_identity: ActiveValue::Set(entry.mesh_identity.clone()),
+                peer_id: ActiveValue::Set(peer_uuid),
+                channel_name: ActiveValue::Set(channel_name),
+            };
+            beacon_channel::Entity::insert(active).exec(&txn).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_beacons(
+        &self,
+        mesh_identity: &str,
+        peer_ids: &[PeerId],
+    ) -> Result<usize, StoreError> {
+        let txn = self.db.begin().await?;
+        let mut removed = 0;
+        for peer_id in peer_ids {
+            let peer_uuid = peer_id.as_uuid();
+            beacon_channel::Entity::delete_many()
+                .filter(beacon_channel::Column::MeshIdentity.eq(mesh_identity))
+                .filter(beacon_channel::Column::PeerId.eq(peer_uuid))
+                .exec(&txn)
+                .await?;
+            let result = beacon::Entity::delete_many()
+                .filter(beacon::Column::MeshIdentity.eq(mesh_identity))
+                .filter(beacon::Column::PeerId.eq(peer_uuid))
+                .exec(&txn)
+                .await?;
+            removed += result.rows_affected as usize;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+}
+
+impl SqliteEventStore {
+    async fn beacon_from_model(&self, row: beacon::Model) -> Result<StoredBeacon, StoreError> {
+        let channels = beacon_channel::Entity::find()
+            .filter(beacon_channel::Column::MeshIdentity.eq(&row.mesh_identity))
+            .filter(beacon_channel::Column::PeerId.eq(row.peer_id))
+            .order_by_asc(beacon_channel::Column::ChannelName)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| row.channel_name)
+            .collect();
+        Ok(StoredBeacon {
+            mesh_identity: row.mesh_identity,
+            peer_id: PeerId::from_uuid(row.peer_id),
+            scope_home: row.scope_home,
+            subscribed_channels: channels,
+            pid: u32::try_from(row.pid).map_err(|_| StoreError::InvalidStoredValue {
+                field: "beacons.pid",
+                value: row.pid as i128,
+            })?,
+            published_at_ms: i64_to_u64("beacons.published_at_ms", row.published_at_ms)?,
+            heartbeat_at_ms: i64_to_u64("beacons.heartbeat_at_ms", row.heartbeat_at_ms)?,
+        })
+    }
 }
 
 fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreError> {
@@ -1086,6 +1217,60 @@ mod tests {
         assert_eq!(
             reopened.load_mesh_identity("default").await.unwrap(),
             Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn beacons_replace_channels_and_drain_by_peer() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_a = PeerId::from_u128(0xa);
+        let peer_b = PeerId::from_u128(0xb);
+        let first = StoredBeacon {
+            mesh_identity: "joelteply".to_string(),
+            peer_id: peer_a,
+            scope_home: "/home/joel/.airc".to_string(),
+            subscribed_channels: vec!["general".to_string(), "cambriantech".to_string()],
+            pid: 42,
+            published_at_ms: 1_000,
+            heartbeat_at_ms: 1_000,
+        };
+        let updated = StoredBeacon {
+            subscribed_channels: vec!["general".to_string()],
+            heartbeat_at_ms: 2_000,
+            ..first.clone()
+        };
+        let other = StoredBeacon {
+            mesh_identity: "joelteply".to_string(),
+            peer_id: peer_b,
+            scope_home: "/home/joel/project/.airc".to_string(),
+            subscribed_channels: vec!["ideem".to_string()],
+            pid: 43,
+            published_at_ms: 1_500,
+            heartbeat_at_ms: 1_500,
+        };
+
+        store.save_beacon(first).await.unwrap();
+        store.save_beacon(updated.clone()).await.unwrap();
+        store.save_beacon(other.clone()).await.unwrap();
+
+        assert_eq!(
+            store.load_beacon("joelteply", peer_a).await.unwrap(),
+            Some(updated)
+        );
+        let listed = store.list_beacons("joelteply").await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            store.delete_beacons("joelteply", &[peer_a]).await.unwrap(),
+            1
+        );
+        assert!(store
+            .load_beacon("joelteply", peer_a)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.load_beacon("joelteply", peer_b).await.unwrap(),
+            Some(other)
         );
     }
 

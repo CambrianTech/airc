@@ -60,10 +60,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
+use airc_store::{EventStore, StoreError, StoredBeacon};
 
 use crate::coordinator_lock::RefreshLock;
 use crate::fs_permissions;
-use crate::subscriptions::{ChannelName, MeshIdentity};
+use crate::subscriptions::{ChannelName, ChannelNameError, MeshIdentity};
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
@@ -153,6 +154,8 @@ pub struct CoordinatorSnapshot {
 pub enum CoordinatorError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Store(StoreError),
+    Channel(ChannelNameError),
     /// A beacon file existed but its schema version didn't match. We
     /// surface this rather than silently skip so the operator sees
     /// the foreign-version surface.
@@ -168,6 +171,8 @@ impl std::fmt::Display for CoordinatorError {
         match self {
             Self::Io(error) => write!(f, "coordinator I/O: {error}"),
             Self::Json(error) => write!(f, "coordinator JSON: {error}"),
+            Self::Store(error) => write!(f, "coordinator store: {error}"),
+            Self::Channel(error) => write!(f, "coordinator channel: {error}"),
             Self::SchemaVersionMismatch {
                 path,
                 found,
@@ -186,6 +191,8 @@ impl std::error::Error for CoordinatorError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::Channel(error) => Some(error),
             Self::SchemaVersionMismatch { .. } => None,
         }
     }
@@ -200,6 +207,18 @@ impl From<std::io::Error> for CoordinatorError {
 impl From<serde_json::Error> for CoordinatorError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<StoreError> for CoordinatorError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<ChannelNameError> for CoordinatorError {
+    fn from(value: ChannelNameError) -> Self {
+        Self::Channel(value)
     }
 }
 
@@ -263,6 +282,17 @@ pub fn publish(
     Ok(())
 }
 
+pub async fn publish_store(
+    store: &dyn EventStore,
+    identity: &MeshIdentity,
+    beacon: &PresenceBeacon,
+) -> Result<(), CoordinatorError> {
+    store
+        .save_beacon(to_stored_beacon(identity, beacon))
+        .await?;
+    Ok(())
+}
+
 /// Read the caller's own beacon, if it exists. `None` distinguishes
 /// "no prior publish" from "publish exists with stale heartbeat" —
 /// the caller computes freshness from the returned beacon's
@@ -278,6 +308,18 @@ pub fn load_own_beacon(
     }
     let beacon = read_beacon(&path)?;
     Ok(Some(beacon))
+}
+
+pub async fn load_own_beacon_store(
+    store: &dyn EventStore,
+    identity: &MeshIdentity,
+    peer_id: PeerId,
+) -> Result<Option<PresenceBeacon>, CoordinatorError> {
+    store
+        .load_beacon(identity.as_str(), peer_id)
+        .await?
+        .map(from_stored_beacon)
+        .transpose()
 }
 
 /// Build a snapshot of all beacons for a mesh identity. Beacons
@@ -330,6 +372,35 @@ pub fn snapshot(
     })
 }
 
+pub async fn snapshot_store(
+    store: &dyn EventStore,
+    identity: &MeshIdentity,
+    config: &CoordinatorConfig,
+    now_ms: u64,
+) -> Result<CoordinatorSnapshot, CoordinatorError> {
+    let mut live = Vec::new();
+    let mut stale = Vec::new();
+    for beacon in store.list_beacons(identity.as_str()).await? {
+        let beacon = from_stored_beacon(beacon)?;
+        if beacon.is_fresh(now_ms, config.heartbeat_ttl_ms) {
+            live.push(beacon);
+        } else {
+            stale.push(beacon);
+        }
+    }
+    live.sort_by_key(|b| b.peer_id.to_string());
+    stale.sort_by_key(|b| b.peer_id.to_string());
+    let live_channels = unique_channels_in(&live);
+    Ok(CoordinatorSnapshot {
+        mesh_identity: identity.clone(),
+        root: PathBuf::from("airc-store://beacons"),
+        live,
+        stale,
+        live_channels,
+        fetched_at_ms: now_ms,
+    })
+}
+
 /// Delete beacon files for all entries currently in
 /// [`CoordinatorSnapshot::stale`]. Best-effort — missing files
 /// (raced with another draining process) aren't an error. Returns
@@ -352,6 +423,19 @@ pub fn drain_stale(
         }
     }
     Ok(removed)
+}
+
+pub async fn drain_stale_store(
+    store: &dyn EventStore,
+    identity: &MeshIdentity,
+    snapshot: &CoordinatorSnapshot,
+) -> Result<usize, CoordinatorError> {
+    let peer_ids = snapshot
+        .stale
+        .iter()
+        .map(|beacon| beacon.peer_id)
+        .collect::<Vec<_>>();
+    Ok(store.delete_beacons(identity.as_str(), &peer_ids).await?)
 }
 
 /// Outcome of attempting to acquire the remote-refresh lock.
@@ -453,6 +537,39 @@ fn unique_channels_in(beacons: &[PresenceBeacon]) -> Vec<ChannelName> {
     out
 }
 
+fn to_stored_beacon(identity: &MeshIdentity, beacon: &PresenceBeacon) -> StoredBeacon {
+    StoredBeacon {
+        mesh_identity: identity.as_str().to_string(),
+        peer_id: beacon.peer_id,
+        scope_home: beacon.scope_home.to_string_lossy().to_string(),
+        subscribed_channels: beacon
+            .subscribed_channels
+            .iter()
+            .map(|channel| channel.as_str().to_string())
+            .collect(),
+        pid: beacon.pid,
+        published_at_ms: beacon.published_at_ms,
+        heartbeat_at_ms: beacon.heartbeat_at_ms,
+    }
+}
+
+fn from_stored_beacon(beacon: StoredBeacon) -> Result<PresenceBeacon, CoordinatorError> {
+    let subscribed_channels = beacon
+        .subscribed_channels
+        .into_iter()
+        .map(ChannelName::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PresenceBeacon {
+        version: BEACON_VERSION,
+        peer_id: beacon.peer_id,
+        scope_home: PathBuf::from(beacon.scope_home),
+        subscribed_channels,
+        pid: beacon.pid,
+        published_at_ms: beacon.published_at_ms,
+        heartbeat_at_ms: beacon.heartbeat_at_ms,
+    })
+}
+
 /// Convenience: construct a presence beacon at a given timestamp.
 /// Most callers compose this themselves; provided so the common case
 /// (publish-now) is one line.
@@ -537,6 +654,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, beacon);
+    }
+
+    #[tokio::test]
+    async fn store_publish_snapshot_and_drain_round_trip() {
+        let store = airc_store::InMemoryEventStore::new();
+        let mesh = id();
+        let cfg = CoordinatorConfig {
+            heartbeat_ttl_ms: 1_000,
+            refresh_interval_ms: 100,
+        };
+        let fresh = make_beacon(950, vec!["general", "cambriantech"]);
+        let stale = make_beacon(0, vec!["ideem"]);
+
+        publish_store(&store, &mesh, &fresh).await.unwrap();
+        publish_store(&store, &mesh, &stale).await.unwrap();
+
+        let loaded = load_own_beacon_store(&store, &mesh, fresh.peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, fresh);
+
+        let snapshot = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
+        assert_eq!(snapshot.live.len(), 1);
+        assert_eq!(snapshot.stale.len(), 1);
+        assert_eq!(
+            snapshot
+                .live_channels
+                .iter()
+                .map(ChannelName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["cambriantech", "general"]
+        );
+
+        assert_eq!(
+            drain_stale_store(&store, &mesh, &snapshot).await.unwrap(),
+            1
+        );
+        let after = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
+        assert!(after.stale.is_empty());
+        assert_eq!(after.live.len(), 1);
     }
 
     #[test]
