@@ -22,7 +22,7 @@ Codex / non-Monitor runtimes:
 airc join
 ```
 
-`airc join` with no args detects the stored pairing in this scope's config.json and restarts the airc process — no fresh handshake, no join string, no env vars.
+`airc join` with no args opens this scope's ORM-backed identity/subscription state and restarts the airc process — no fresh handshake, no join string, no env vars.
 
 ## When to use
 

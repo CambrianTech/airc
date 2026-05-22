@@ -207,7 +207,7 @@ Operational rules:
 
 ## Workspace Hygiene
 
-`airc hygiene` keeps many-agent workspaces from filling the machine. The default policy file is `<repo>/.airc-policy.json`: commit it when a project needs shared behavior, keep private mesh state in `.airc/config.json`.
+`airc hygiene` keeps many-agent workspaces from filling the machine. The default policy file is `<repo>/.airc-policy.json`: commit it when a project needs shared behavior, keep private mesh state in `.airc/events.sqlite`.
 
 ```bash
 airc hygiene init

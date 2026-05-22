@@ -202,12 +202,14 @@ Move to SeaORM entities (one row, one table, one transaction):
 | `account_registry/*.json` | `account_registry` table (done in store-backed account registry cut) |
 | `coordinator/*.beacon` | `beacons` + `beacon_channels` tables (done in store-backed coordinator beacon cut) |
 | `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `runtime_cursors` table (done in cursor cut) |
+| `airc config ...` JSON editor | removed from the public CLI; typed commands and store APIs own runtime state |
 
 What dies the day this lands:
 - Every `tmp + rename` pattern (DB transaction is atomic).
 - Every "re-read this file on every command" cache miss.
 - The Windows replace-on-rename special-casing.
 - Cursor file sprawl (one row per `(client_id, channel)`).
+- Generic `config.json` mutation as a runtime API.
 - "Which file owns peers" ambiguity (peers are in a table; foreign
   keys make ownership obvious).
 - Drains: `DELETE FROM beacons WHERE ttl_expires_at < ?` replaces

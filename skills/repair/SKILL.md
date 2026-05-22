@@ -12,29 +12,9 @@ The one-command recovery for the most common airc failure: your saved pairing is
 
 ## Execute
 
-If `$ARGUMENTS` contains an invite string (looks like `name@user@host[:port]#<base64>`), use it directly. Otherwise reconstruct from the saved config before wiping.
+If `$ARGUMENTS` contains an invite string, use it directly. Otherwise do a clean local reset and let `airc join` recreate the account-context subscriptions from the ORM-backed identity, subscription, peer, and coordinator stores. Do not reconstruct pairing from `config.json`; that file is not part of the redesigned runtime.
 
-### Step 1 — extract the saved invite before wiping
-
-```bash
-# Grab the pieces the host wrote into config during the last pair.
-SCOPE=$(airc debug-scope)
-HOST_NAME=$(airc config get --config "$SCOPE/config.json" host_name 2>/dev/null || true)
-HOST_TARGET=$(airc config get --config "$SCOPE/config.json" host_target 2>/dev/null || true)
-HOST_PORT=$(airc config get --config "$SCOPE/config.json" host_port 7547 2>/dev/null || true)
-HOST_PUB=$(airc config get --config "$SCOPE/config.json" host_ssh_pub 2>/dev/null || true)
-PUB_B64=$(printf '%s\n' "$HOST_PUB" | base64 | tr -d '\n')
-
-if [ -n "$HOST_NAME" ] && [ -n "$HOST_TARGET" ] && [ -n "$HOST_PUB" ]; then
-  SUFFIX=""
-  [ "$HOST_PORT" != "7547" ] && SUFFIX=":$HOST_PORT"
-  INVITE="${HOST_NAME}@${HOST_TARGET}${SUFFIX}#${PUB_B64}"
-fi
-```
-
-If `$ARGUMENTS` was passed, override `$INVITE` with it — the user may be repairing to a new host.
-
-### Step 2 — teardown --flush
+### Step 1 — teardown --flush
 
 ```bash
 airc teardown --flush
@@ -42,16 +22,16 @@ airc teardown --flush
 
 Wipes identity, peer records, saved pairing, messages. State is gone.
 
-### Step 3 — join with the invite
+### Step 2 — join
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join $INVITE")
+Monitor(persistent=true, description="airc", command="airc join ${ARGUMENTS}")
 ```
 
 Codex / non-Monitor runtimes:
 ```bash
-airc join "$INVITE"
+airc join ${ARGUMENTS:+"$ARGUMENTS"}
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.
@@ -66,7 +46,7 @@ Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, c
 
 ## Failure modes
 
-- No invite reconstructable + none passed — config is too stale (missing `host_ssh_pub` or `host_target`). User needs a fresh invite from the host. Ask them to get `/invite` output from the host and pass it as the argument.
+- No invite passed and the peer is not discoverable through the account coordinator. User needs a fresh invite from the host. Ask them to get `/invite` output from the host and pass it as the argument.
 - Repair succeeds but still no messages — you may genuinely be on the wrong host. Run `airc peers` and confirm the host name matches who you meant to pair with. If not, ask the host to paste their `/invite` output and try `/repair <that-invite>`.
 
 ## Notes

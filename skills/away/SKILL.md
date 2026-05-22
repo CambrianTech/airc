@@ -42,5 +42,5 @@ On set, prints `away: <message>`. On clear, prints `back — away cleared.`.
 ## Notes
 
 - Equivalent verbose form: `airc identity set --status "<msg>"`. Both write to the same `identity.status` field; this skill is the IRC-aligned shortcut.
-- Status persists in `config.json` until cleared. Survives teardown + reconnect (it's identity material, not pairing state).
+- Status persists in the ORM-backed identity store until cleared. Survives teardown + reconnect (it's identity material, not pairing state).
 - Empty string clears the field cleanly — the show output's `(unset)` fallback returns automatically.

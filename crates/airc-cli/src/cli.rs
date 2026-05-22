@@ -3,9 +3,9 @@
 //! All commands default to the persisted state at `<home>` (default
 //! the current git project's `.airc`), which contains:
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
-//!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket for the daemon
-//!   - `events.sqlite`  — ORM-backed event, cursor, and peer trust store
+//!   - `events.sqlite`  — ORM-backed identity metadata, events, cursors, peer
+//!     trust, subscriptions, and coordinator state
 //!
 //! The `--home` flag overrides for testing / multi-identity setups.
 
@@ -20,7 +20,6 @@ use crate::bearer::cli::BearerArgs;
 use crate::channel_gist_cli::ChannelGistArgs;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::collaboration_cli::CollaborationArgs;
-use crate::config_cli::ConfigArgs;
 use crate::envelope_cli::EnvelopeArgs;
 use crate::gh_cli::GhArgs;
 use crate::gist_cli::GistArgs;
@@ -138,8 +137,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create or load the persisted identity (`<home>/identity.key` +
-    /// `<home>/identity.json`), then print this peer's spec for
+    /// Create or load the persisted identity (`<home>/identity.key`
+    /// plus ORM-backed metadata), then print this peer's spec for
     /// out-of-band sharing. Idempotent — repeat runs return the same
     /// peer_id.
     Init,
@@ -171,9 +170,6 @@ pub enum Command {
 
     /// Legacy bearer transport helpers during Rust cutover.
     Bearer(BearerArgs),
-
-    /// Read and update legacy config.json during Rust cutover.
-    Config(ConfigArgs),
 
     /// Inspect collaboration health during Rust cutover.
     Collaboration(CollaborationArgs),
