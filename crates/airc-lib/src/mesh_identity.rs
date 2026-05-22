@@ -165,7 +165,15 @@ where
     F: FnOnce() -> Option<(String, Source)>,
 {
     if let Some(cached) = load_cached(home)? {
-        if !cached.is_expired(now_ms) {
+        // Operator-source caches are trusted as-is and never expire —
+        // they were explicitly set by the user (env var, CLI override,
+        // test seed). Treating them as TTL-bounded forces a fall-through
+        // to gh/git shell-outs that the operator was trying to avoid.
+        // Caught when the e2e join_without_args test seeded
+        // `resolved_at_ms: 1` for hermetic mesh-identity in CI, and
+        // Windows runners hung on the gh shell-out because the
+        // tiny-resolved_at made is_expired return true on every call.
+        if cached.source == Source::Operator || !cached.is_expired(now_ms) {
             return Ok(cached);
         }
     }
@@ -233,15 +241,49 @@ fn default_resolver() -> Option<(String, Source)> {
     None
 }
 
-/// Run a command and return its trimmed stdout if it exits zero.
-/// `None` on any failure path (command missing, non-zero exit,
-/// non-UTF-8 output) — caller decides what to do.
+/// Default deadline for resolver shell-outs (gh, git). Bounds
+/// `gh api user` / `git config user.email` so a hung or slow
+/// gh-auth probe (Windows CI runners, network glitches, gh
+/// rate-limit) can't block the whole `airc join` flow.
+const RESOLVER_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run a command and return its trimmed stdout if it exits zero
+/// within [`RESOLVER_COMMAND_TIMEOUT`]. `None` on any failure path
+/// (command missing, non-zero exit, non-UTF-8 output, timeout) —
+/// caller decides what to do.
+///
+/// Synchronous wait_with_timeout pattern: spawn the child, poll
+/// `try_wait` until the deadline. On timeout, kill the child and
+/// return None so the caller falls through to the next resolver.
 fn run_command(argv: &[&str]) -> Option<String> {
     let (program, args) = argv.split_first()?;
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + RESOLVER_COMMAND_TIMEOUT;
+    let output = loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                let out = child.wait_with_output().ok()?;
+                if !status.success() {
+                    return None;
+                }
+                break out;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
