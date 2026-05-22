@@ -458,19 +458,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Transport(args) => match args.action {
             TransportAction::Health {
-                config,
-                fresh_after,
                 quiet,
                 degraded_only,
                 fail,
-            } => transport_commands::run_health(
-                &home,
-                config,
-                fresh_after,
-                quiet,
-                degraded_only,
-                fail,
-            ),
+            } => transport_commands::run_health(&home, quiet, degraded_only, fail).await,
         },
 
         Command::Events(args) => match args.action {

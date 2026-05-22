@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::{Args, Subcommand};
 
 #[derive(Debug, Args)]
@@ -10,21 +8,13 @@ pub struct TransportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TransportAction {
-    /// Check scope-local transport heartbeat and pid evidence.
+    /// Inspect substrate route health.
     Health {
-        /// Config file. Defaults to `<home>/config.json`.
-        #[arg(long)]
-        config: Option<PathBuf>,
-
-        /// Maximum acceptable heartbeat age in seconds.
-        #[arg(long, default_value_t = 90)]
-        fresh_after: u64,
-
         /// Suppress output; exit code still reports degraded health.
         #[arg(long)]
         quiet: bool,
 
-        /// Print only degraded channel rows.
+        /// Print only degraded route rows.
         #[arg(long)]
         degraded_only: bool,
 
