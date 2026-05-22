@@ -114,16 +114,14 @@ pub async fn run_join(
     subscribe_daemon_to_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
-    // `--attach` keeps the foreground process alive and streams the
-    // live event broadcast. The skills doc has documented this flag
-    // for the longest time but only the bash wrapper implemented it;
-    // post-demolition the Rust binary needs to own it directly. Same
-    // path as `airc monitor attach`, just chained after the join.
+    // `--attach` keeps the foreground process alive on the daemon's
+    // authoritative live stream. Keep this on the exact Monitor path
+    // so Claude Monitor, Codex feed tooling, and humans all observe
+    // the same daemon-backed event surface.
     if attach {
         println!();
         println!("attached — Ctrl-C to detach.");
-        let mut stream = airc.subscribe().await?;
-        print_event_stream_until_signal(&mut stream).await?;
+        crate::monitor::run_daemon_attach(home, "airc").await?;
     }
     Ok(())
 }

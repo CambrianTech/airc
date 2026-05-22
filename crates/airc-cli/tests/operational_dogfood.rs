@@ -167,6 +167,57 @@ fn monitor_attach_streams_rust_events_without_legacy_log() {
     installed_stop(&claude_user_home);
 }
 
+#[test]
+fn join_attach_uses_monitor_daemon_stream() {
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let codex_user_home = workspace.path().join("codex-user");
+    let claude_user_home = workspace.path().join("claude-user");
+    let shared_wire = workspace.path().join("shared-agent-wire");
+
+    std::fs::create_dir_all(&codex_user_home).expect("codex user home");
+    std::fs::create_dir_all(&claude_user_home).expect("claude user home");
+    seed_mesh_identity(&codex_user_home);
+    seed_mesh_identity(&claude_user_home);
+
+    let codex_spec = installed_init(&codex_user_home).peer_spec;
+    let claude_spec = installed_init(&claude_user_home).peer_spec;
+    installed_peer_add(&codex_user_home, &claude_spec);
+    installed_peer_add(&claude_user_home, &codex_spec);
+    installed_room(&codex_user_home, "join-attach-dogfood", &shared_wire);
+    installed_room(&claude_user_home, "join-attach-dogfood", &shared_wire);
+
+    let mut claude_join_attach = installed_join_attach(&claude_user_home);
+    let attach_lines = spawn_line_reader(claude_join_attach.stdout.take().expect("attach stdout"));
+    assert!(
+        wait_for_channel_line_contains(
+            &attach_lines,
+            "attached to Rust event stream",
+            Duration::from_secs(6)
+        )
+        .is_some(),
+        "join --attach did not use the daemon Monitor stream"
+    );
+
+    installed_send(
+        &codex_user_home,
+        "codex -> claude join attach through rust events",
+    );
+    let saw_join_attach_message = wait_for_channel_line_contains(
+        &attach_lines,
+        "codex -&gt; claude join attach through rust events",
+        Duration::from_secs(6),
+    )
+    .is_some();
+    assert!(
+        saw_join_attach_message,
+        "join --attach did not receive the Rust event"
+    );
+
+    let _ = claude_join_attach.kill();
+    let _ = claude_join_attach.wait();
+    installed_stop(&claude_user_home);
+}
+
 struct InitOutput {
     peer_spec: String,
 }
@@ -237,6 +288,15 @@ fn installed_monitor_attach(user_home: &Path) -> std::process::Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("airc monitor attach must spawn")
+}
+
+fn installed_join_attach(user_home: &Path) -> std::process::Child {
+    installed_command(user_home)
+        .args(["join", "--attach"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("airc join --attach must spawn")
 }
 
 fn installed_send(user_home: &Path, text: &str) {

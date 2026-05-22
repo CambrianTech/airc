@@ -5,6 +5,7 @@ mod rename;
 mod render;
 mod scope;
 
+pub(crate) use attach::run as run_daemon_attach;
 pub use cli::{MonitorAction, MonitorArgs};
 
 use std::error::Error;
