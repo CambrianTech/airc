@@ -78,7 +78,7 @@ Final line: `N passed, M failed`.
 | `scope: ...` | Two-tier resolver regression | Bisect against last green sha; file issue |
 | `teardown in different scope killed foreign host` | Scope isolation broke (CRITICAL) | File issue immediately — would let one tab nuke another |
 | `room: alpha unexpectedly wrote room_gist_id under --no-gist` | `--no-gist` not honored on push branch | Regression in `cmd_connect` host-mode gist gate |
-| `room: alpha cmd_part DID NOT identify as host` | `cmd_part` host detection regressed | Host signal = `config.json::host_target` empty; do NOT fall back to gist_id presence |
+| `room: alpha cmd_part DID NOT identify as host` | Host/participant role detection regressed | Host signal must come from typed scope state; do NOT infer it from gist presence |
 | `auth_failure: stderr did NOT mention re-pair` | `cmd_send` auth-class detection regressed | Check regex against `permission denied\|publickey\|host key\|...` |
 | `resume_stale_auth: invite string` | Resume probe didn't reconstruct invite | Regression in `cmd_connect` resume probe failure branch |
 

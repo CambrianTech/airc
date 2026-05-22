@@ -2,14 +2,14 @@
 //!
 //! State lives under `<home>` (default `$HOME/.airc`):
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600)
-//!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket
-//!   - `events.sqlite`  — ORM-backed event, cursor, and peer trust store
+//!   - `events.sqlite`  — ORM-backed identity metadata, events, cursors, peer
+//!     trust, subscriptions, and coordinator state
 //!
-//! `airc init` is the only command that creates the identity from
-//! nothing. All others load `<home>/identity.{key,json}` (auto-
-//! generating if absent). `VerificationPolicy::Strict` is the only
-//! policy used in CLI paths — no `AllowUnsigned` opt-in.
+//! `airc init` is the explicit identity bootstrap command. Other
+//! substrate commands open the same ORM-backed runtime state and
+//! auto-generate missing identity material. `VerificationPolicy::Strict`
+//! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod bearer;
 mod bearer_state;
@@ -27,8 +27,6 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
-mod config_cli;
-mod config_commands;
 mod daemon_scope;
 mod envelope_cli;
 mod events_cli;
@@ -95,7 +93,6 @@ use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
 use collaboration_cli::CollaborationAction;
-use config_cli::ConfigAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
 use gh_cli::GhAction;
@@ -260,82 +257,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 offset_file.as_deref(),
                 state_file.as_deref(),
                 room_gist_id.as_deref(),
-            ),
-        },
-
-        Command::Config(args) => match args.action {
-            ConfigAction::Get {
-                config,
-                key,
-                default,
-            } => config_commands::run_get(&home, config, &key, &default),
-            ConfigAction::GetPath {
-                config,
-                path,
-                default,
-            } => config_commands::run_get_path(&home, config, &path, &default),
-            ConfigAction::HasKey { config, key } => {
-                config_commands::run_has_key(&home, config, &key)
-            }
-            ConfigAction::GetName { config } => config_commands::run_get_name(&home, config),
-            ConfigAction::Set { config, key, value } => {
-                config_commands::run_set(&home, config, &key, &value)
-            }
-            ConfigAction::SetName { config, name } => {
-                config_commands::run_set_name(&home, config, &name)
-            }
-            ConfigAction::UnsetKeys { config, keys } => {
-                config_commands::run_unset_keys(&home, config, &keys)
-            }
-            ConfigAction::ReadParted { config } => config_commands::run_read_parted(&home, config),
-            ConfigAction::RecordParted { config, room } => {
-                config_commands::run_record_parted(&home, config, &room)
-            }
-            ConfigAction::ClearParted { config, room } => {
-                config_commands::run_clear_parted(&home, config, &room)
-            }
-            ConfigAction::ReadChannels { config } => {
-                config_commands::run_read_channels(&home, config)
-            }
-            ConfigAction::DefaultChannel { config } => {
-                config_commands::run_default_channel(&home, config)
-            }
-            ConfigAction::GetChannelGist { config, channel } => {
-                config_commands::run_get_channel_gist(&home, config, &channel)
-            }
-            ConfigAction::ListChannelGists { config } => {
-                config_commands::run_list_channel_gists(&home, config)
-            }
-            ConfigAction::Subscribe {
-                config,
-                channel,
-                first,
-            } => config_commands::run_subscribe(&home, config, &channel, first),
-            ConfigAction::Unsubscribe { config, channel } => {
-                config_commands::run_unsubscribe(&home, config, &channel)
-            }
-            ConfigAction::SetChannelGist {
-                config,
-                channel,
-                gist_id,
-            } => config_commands::run_set_channel_gist(&home, config, &channel, &gist_id),
-            ConfigAction::SetHostBlock {
-                config,
-                host_airc_home,
-                host_name,
-                host_port,
-                host_ssh_pub,
-                host_identity_json,
-            } => config_commands::run_set_host_block(
-                &home,
-                config,
-                config_commands::HostBlockUpdate {
-                    host_airc_home,
-                    host_name,
-                    host_port,
-                    host_ssh_pub,
-                    host_identity_json,
-                },
             ),
         },
 
