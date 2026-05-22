@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::error::StoreError;
+use crate::mesh_identity::StoredMeshIdentity;
 use crate::subscriptions::StoredSubscription;
 
 /// Durable transcript event store.
@@ -84,4 +85,13 @@ pub trait EventStore: Send + Sync {
     /// owns the durable table and never mirrors this into sidecar
     /// files.
     async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError>;
+
+    /// Load the cached mesh identity row for `scope`, if present.
+    async fn load_mesh_identity(
+        &self,
+        scope: &str,
+    ) -> Result<Option<StoredMeshIdentity>, StoreError>;
+
+    /// Upsert the cached mesh identity row for its `scope`.
+    async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError>;
 }

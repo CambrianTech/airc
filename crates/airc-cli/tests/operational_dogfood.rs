@@ -298,12 +298,24 @@ fn test_client_id(user_home: &Path) -> &'static str {
 
 fn seed_mesh_identity(user_home: &Path) {
     let airc_home = user_home.join(".airc");
-    std::fs::create_dir_all(&airc_home).expect("airc home");
-    std::fs::write(
-        airc_home.join("mesh_identity.json"),
-        r#"{"version":1,"identity":"dogfood-account","source":"operator","resolved_at_ms":1,"ttl_ms":86400000}"#,
-    )
-    .expect("write mesh identity");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let store = airc_store::SqliteEventStore::open_path(&airc_home.join("events.sqlite"))
+            .await
+            .unwrap();
+        airc_lib::resolve_mesh_identity_with(
+            &store,
+            || {
+                Some((
+                    "dogfood-account".to_string(),
+                    airc_lib::MeshIdentitySource::Operator,
+                ))
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    });
 }
 
 fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {

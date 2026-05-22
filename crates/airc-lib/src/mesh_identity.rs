@@ -9,7 +9,7 @@
 //!
 //! ## Resolution order
 //!
-//! 1. **Cached value** in `<home>/mesh_identity.json`, if fresh
+//! 1. **Cached value** in the `mesh_identity` ORM table, if fresh
 //!    (`resolved_at_ms` within [`DEFAULT_TTL_MS`]).
 //! 2. **`gh api user --jq .login`** — the canonical GitHub identity
 //!    when `gh` is installed and authenticated.
@@ -21,8 +21,8 @@
 //!
 //! ## Caching
 //!
-//! Persisted to `<home>/mesh_identity.json`. Schema version 1.
-//! Re-resolution kicks in after `DEFAULT_TTL_MS`; cache hits never
+//! Persisted to the `mesh_identity` ORM table. Re-resolution kicks in
+//! after `DEFAULT_TTL_MS`; cache hits never
 //! shell out, so ten local scopes opening at once produce at most
 //! one `gh` call.
 //!
@@ -33,15 +33,14 @@
 //! [`resolve`] which uses the gh+git fallback resolver. Tests pass
 //! a fixed-string closure.
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use airc_store::{EventStore, StoredMeshIdentity};
 use serde::{Deserialize, Serialize};
 
 use crate::subscriptions::MeshIdentity;
 
-const IDENTITY_FILENAME: &str = "mesh_identity.json";
-const IDENTITY_VERSION: u32 = 1;
+const MESH_IDENTITY_SCOPE: &str = "default";
 /// Default cache TTL: 24h. Re-resolution after this re-checks gh /
 /// git in case the operator switched accounts.
 pub const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -91,21 +90,17 @@ impl CachedIdentity {
 /// What can go wrong resolving/persisting the identity.
 #[derive(Debug)]
 pub enum MeshIdentityError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
+    Store(airc_store::StoreError),
     Clock(std::time::SystemTimeError),
-    SchemaVersionMismatch { found: u32, expected: u32 },
+    UnknownSource(String),
 }
 
 impl std::fmt::Display for MeshIdentityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "mesh identity I/O: {error}"),
-            Self::Json(error) => write!(f, "mesh identity JSON: {error}"),
+            Self::Store(error) => write!(f, "mesh identity store: {error}"),
             Self::Clock(error) => write!(f, "mesh identity clock: {error}"),
-            Self::SchemaVersionMismatch { found, expected } => {
-                write!(f, "mesh_identity.json version {found}, expected {expected}")
-            }
+            Self::UnknownSource(source) => write!(f, "unknown mesh identity source: {source}"),
         }
     }
 }
@@ -113,23 +108,16 @@ impl std::fmt::Display for MeshIdentityError {
 impl std::error::Error for MeshIdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
-            Self::Json(error) => Some(error),
+            Self::Store(error) => Some(error),
             Self::Clock(error) => Some(error),
-            Self::SchemaVersionMismatch { .. } => None,
+            Self::UnknownSource(_) => None,
         }
     }
 }
 
-impl From<std::io::Error> for MeshIdentityError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<serde_json::Error> for MeshIdentityError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
+impl From<airc_store::StoreError> for MeshIdentityError {
+    fn from(value: airc_store::StoreError) -> Self {
+        Self::Store(value)
     }
 }
 
@@ -139,15 +127,10 @@ impl From<std::time::SystemTimeError> for MeshIdentityError {
     }
 }
 
-/// On-disk path for the cache.
-pub fn path_in(home: &Path) -> PathBuf {
-    home.join(IDENTITY_FILENAME)
-}
-
 /// Resolve via the default fallback chain (gh → git email → local
 /// hostname/user) and persist. Most callers want this.
-pub fn resolve(home: &Path) -> Result<CachedIdentity, MeshIdentityError> {
-    resolve_with(home, default_resolver, now_ms()?)
+pub async fn resolve(store: &dyn EventStore) -> Result<CachedIdentity, MeshIdentityError> {
+    resolve_with(store, default_resolver, now_ms()?).await
 }
 
 /// Resolve with an injected resolver closure. The closure returns
@@ -156,15 +139,15 @@ pub fn resolve(home: &Path) -> Result<CachedIdentity, MeshIdentityError> {
 ///
 /// Used by tests to bypass `gh` / `git` shell-outs and by production
 /// callers via [`resolve`].
-pub fn resolve_with<F>(
-    home: &Path,
+pub async fn resolve_with<F>(
+    store: &dyn EventStore,
     resolver: F,
     now_ms: u64,
 ) -> Result<CachedIdentity, MeshIdentityError>
 where
     F: FnOnce() -> Option<(String, Source)>,
 {
-    if let Some(cached) = load_cached(home)? {
+    if let Some(cached) = load_cached(store).await? {
         // Operator-source caches are trusted as-is and never expire —
         // they were explicitly set by the user (env var, CLI override,
         // test seed). Treating them as TTL-bounded forces a fall-through
@@ -184,13 +167,13 @@ where
     };
 
     let entry = CachedIdentity {
-        version: IDENTITY_VERSION,
+        version: 1,
         identity,
         source,
         resolved_at_ms: now_ms,
         ttl_ms: DEFAULT_TTL_MS,
     };
-    save(home, &entry)?;
+    save(store, &entry).await?;
     Ok(entry)
 }
 
@@ -198,30 +181,73 @@ where
 /// doesn't exist. Used by code paths that want to know "do we have an
 /// identity?" without triggering a `gh` shell-out (e.g., status
 /// printers).
-pub fn load_cached(home: &Path) -> Result<Option<CachedIdentity>, MeshIdentityError> {
-    let path = path_in(home);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let entry: CachedIdentity = serde_json::from_str(&text)?;
-    if entry.version != IDENTITY_VERSION {
-        return Err(MeshIdentityError::SchemaVersionMismatch {
-            found: entry.version,
-            expected: IDENTITY_VERSION,
-        });
-    }
-    Ok(Some(entry))
+pub async fn load_cached(
+    store: &dyn EventStore,
+) -> Result<Option<CachedIdentity>, MeshIdentityError> {
+    store
+        .load_mesh_identity(MESH_IDENTITY_SCOPE)
+        .await?
+        .map(CachedIdentity::try_from)
+        .transpose()
 }
 
 /// Persist the cache.
-pub fn save(home: &Path, entry: &CachedIdentity) -> Result<(), MeshIdentityError> {
-    std::fs::create_dir_all(home)?;
-    let path = path_in(home);
-    let text = serde_json::to_string_pretty(entry)?;
-    std::fs::write(&path, text)?;
-    set_owner_only_permissions(&path)?;
+pub async fn save(store: &dyn EventStore, entry: &CachedIdentity) -> Result<(), MeshIdentityError> {
+    store
+        .save_mesh_identity(StoredMeshIdentity::from(entry.clone()))
+        .await?;
     Ok(())
+}
+
+impl Source {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GhApiUser => "gh_api_user",
+            Self::GitEmail => "git_email",
+            Self::LocalHostUser => "local_host_user",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+impl TryFrom<&str> for Source {
+    type Error = MeshIdentityError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "gh_api_user" => Ok(Self::GhApiUser),
+            "git_email" => Ok(Self::GitEmail),
+            "local_host_user" => Ok(Self::LocalHostUser),
+            "operator" => Ok(Self::Operator),
+            other => Err(MeshIdentityError::UnknownSource(other.to_string())),
+        }
+    }
+}
+
+impl From<CachedIdentity> for StoredMeshIdentity {
+    fn from(value: CachedIdentity) -> Self {
+        Self {
+            scope: MESH_IDENTITY_SCOPE.to_string(),
+            identity: value.identity,
+            source: value.source.as_str().to_string(),
+            resolved_at_ms: value.resolved_at_ms,
+            ttl_ms: value.ttl_ms,
+        }
+    }
+}
+
+impl TryFrom<StoredMeshIdentity> for CachedIdentity {
+    type Error = MeshIdentityError;
+
+    fn try_from(value: StoredMeshIdentity) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: 1,
+            identity: value.identity,
+            source: Source::try_from(value.source.as_str())?,
+            resolved_at_ms: value.resolved_at_ms,
+            ttl_ms: value.ttl_ms,
+        })
+    }
 }
 
 /// Default resolver: `gh api user --jq .login` then `git config
@@ -302,19 +328,6 @@ fn local_fallback_identity() -> String {
     format!("local:{host}:{user}")
 }
 
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -324,7 +337,7 @@ fn now_ms() -> Result<u64, std::time::SystemTimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use airc_store::InMemoryEventStore;
 
     fn mock_gh(value: &'static str) -> impl FnOnce() -> Option<(String, Source)> {
         move || Some((value.to_string(), Source::GhApiUser))
@@ -334,53 +347,55 @@ mod tests {
         None
     }
 
-    #[test]
-    fn resolve_with_injected_resolver_persists() {
-        let dir = tempdir().unwrap();
-        let entry = resolve_with(dir.path(), mock_gh("joelteply"), 1_000).unwrap();
+    #[tokio::test]
+    async fn resolve_with_injected_resolver_persists() {
+        let store = InMemoryEventStore::new();
+        let entry = resolve_with(&store, mock_gh("joelteply"), 1_000)
+            .await
+            .unwrap();
         assert_eq!(entry.identity, "joelteply");
         assert_eq!(entry.source, Source::GhApiUser);
         assert_eq!(entry.resolved_at_ms, 1_000);
-        assert!(path_in(dir.path()).exists());
+        assert!(load_cached(&store).await.unwrap().is_some());
     }
 
-    #[test]
-    fn resolve_uses_cache_when_fresh() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn resolve_uses_cache_when_fresh() {
+        let store = InMemoryEventStore::new();
         // First resolve writes "alice".
-        resolve_with(dir.path(), mock_gh("alice"), 1_000).unwrap();
+        resolve_with(&store, mock_gh("alice"), 1_000).await.unwrap();
         // Second resolve with a DIFFERENT mock should still see "alice"
         // because the cache is fresh.
-        let entry = resolve_with(dir.path(), mock_gh("bob"), 1_500).unwrap();
+        let entry = resolve_with(&store, mock_gh("bob"), 1_500).await.unwrap();
         assert_eq!(entry.identity, "alice", "cache must short-circuit");
     }
 
-    #[test]
-    fn resolve_re_resolves_after_ttl_expiry() {
-        let dir = tempdir().unwrap();
-        resolve_with(dir.path(), mock_gh("alice"), 1_000).unwrap();
+    #[tokio::test]
+    async fn resolve_re_resolves_after_ttl_expiry() {
+        let store = InMemoryEventStore::new();
+        resolve_with(&store, mock_gh("alice"), 1_000).await.unwrap();
         // 24h + 1ms past resolution.
         let later = 1_000 + DEFAULT_TTL_MS + 1;
-        let entry = resolve_with(dir.path(), mock_gh("bob"), later).unwrap();
+        let entry = resolve_with(&store, mock_gh("bob"), later).await.unwrap();
         assert_eq!(entry.identity, "bob");
     }
 
-    #[test]
-    fn resolve_falls_back_to_local_when_resolver_yields_none() {
-        let dir = tempdir().unwrap();
-        let entry = resolve_with(dir.path(), mock_none, 1_000).unwrap();
+    #[tokio::test]
+    async fn resolve_falls_back_to_local_when_resolver_yields_none() {
+        let store = InMemoryEventStore::new();
+        let entry = resolve_with(&store, mock_none, 1_000).await.unwrap();
         assert_eq!(entry.source, Source::LocalHostUser);
         assert!(entry.identity.starts_with("local:"));
         // Fallback is the SAME on a given machine — second resolve
         // (fresh cache) returns the cached fallback value too.
-        let entry2 = resolve_with(dir.path(), mock_none, 1_100).unwrap();
+        let entry2 = resolve_with(&store, mock_none, 1_100).await.unwrap();
         assert_eq!(entry2.identity, entry.identity);
     }
 
     #[test]
     fn as_mesh_identity_round_trips_to_typed_value() {
         let entry = CachedIdentity {
-            version: IDENTITY_VERSION,
+            version: 1,
             identity: "joelteply".to_string(),
             source: Source::GhApiUser,
             resolved_at_ms: 0,
@@ -389,37 +404,35 @@ mod tests {
         assert_eq!(entry.as_mesh_identity().as_str(), "joelteply");
     }
 
-    #[test]
-    fn load_cached_returns_none_when_file_absent() {
-        let dir = tempdir().unwrap();
-        assert!(load_cached(dir.path()).unwrap().is_none());
+    #[tokio::test]
+    async fn load_cached_returns_none_when_store_has_no_row() {
+        let store = InMemoryEventStore::new();
+        assert!(load_cached(&store).await.unwrap().is_none());
     }
 
-    #[test]
-    fn load_cached_rejects_wrong_schema_version() {
-        let dir = tempdir().unwrap();
-        let bad = serde_json::json!({
-            "version": 999,
-            "identity": "alice",
-            "source": "gh_api_user",
-            "resolved_at_ms": 0,
-            "ttl_ms": DEFAULT_TTL_MS,
-        });
-        std::fs::write(path_in(dir.path()), serde_json::to_string(&bad).unwrap()).unwrap();
-        let err = load_cached(dir.path()).unwrap_err();
-        assert!(matches!(
-            err,
-            MeshIdentityError::SchemaVersionMismatch {
-                found: 999,
-                expected: 1
-            }
-        ));
+    #[tokio::test]
+    async fn load_cached_rejects_unknown_source() {
+        let store = InMemoryEventStore::new();
+        store
+            .save_mesh_identity(StoredMeshIdentity {
+                scope: MESH_IDENTITY_SCOPE.to_string(),
+                identity: "alice".to_string(),
+                source: "surprise".to_string(),
+                resolved_at_ms: 0,
+                ttl_ms: DEFAULT_TTL_MS,
+            })
+            .await
+            .unwrap();
+        let err = load_cached(&store).await.unwrap_err();
+        assert!(
+            matches!(err, MeshIdentityError::UnknownSource(ref source) if source == "surprise")
+        );
     }
 
     #[test]
     fn is_expired_uses_saturating_sub_for_clock_skew() {
         let entry = CachedIdentity {
-            version: IDENTITY_VERSION,
+            version: 1,
             identity: "x".to_string(),
             source: Source::GhApiUser,
             // Future-dated resolved_at — saturating_sub yields 0,
@@ -431,18 +444,18 @@ mod tests {
         assert!(!entry.is_expired(500_000));
     }
 
-    #[test]
-    fn save_load_round_trip_preserves_entry() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn save_load_round_trip_preserves_entry() {
+        let store = InMemoryEventStore::new();
         let entry = CachedIdentity {
-            version: IDENTITY_VERSION,
+            version: 1,
             identity: "joelteply".to_string(),
             source: Source::GhApiUser,
             resolved_at_ms: 42,
             ttl_ms: DEFAULT_TTL_MS,
         };
-        save(dir.path(), &entry).unwrap();
-        let loaded = load_cached(dir.path()).unwrap().unwrap();
+        save(&store, &entry).await.unwrap();
+        let loaded = load_cached(&store).await.unwrap().unwrap();
         assert_eq!(loaded, entry);
     }
 

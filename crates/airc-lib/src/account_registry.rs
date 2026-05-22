@@ -268,7 +268,7 @@ fn safe_component(value: &str) -> String {
 
 impl Airc {
     pub async fn account_registry_document(&self) -> Result<AccountRegistryDocument, AircError> {
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let snapshot = crate::coordinator::snapshot(
             &self.inner.wire_root,
             &identity,
@@ -307,7 +307,7 @@ impl Airc {
         &self,
         store: &dyn AccountRegistryStore,
     ) -> Result<Option<AccountRegistryDocument>, AircError> {
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let Some(document) = store.refresh(&identity).await? else {
             return Ok(None);
         };
@@ -368,19 +368,21 @@ mod tests {
         }
     }
 
-    fn write_identity(home: &std::path::Path) {
-        std::fs::create_dir_all(home).unwrap();
-        std::fs::write(
-            home.join("mesh_identity.json"),
-            r#"{
-  "version": 1,
-  "identity": "joelteply",
-  "source": "operator",
-  "resolved_at_ms": 4102444800000,
-  "ttl_ms": 86400000
-}
-"#,
+    async fn write_identity(home: &std::path::Path) {
+        let store = airc_store::SqliteEventStore::open_path(&home.join("events.sqlite"))
+            .await
+            .unwrap();
+        crate::mesh_identity::resolve_with(
+            &store,
+            || {
+                Some((
+                    "joelteply".to_string(),
+                    crate::mesh_identity::Source::Operator,
+                ))
+            },
+            4_102_444_800_000,
         )
+        .await
         .unwrap();
     }
 
@@ -568,8 +570,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let machine_a = dir.path().join("machine-a/.airc");
         let machine_b = dir.path().join("machine-b/.airc");
-        write_identity(&machine_a);
-        write_identity(&machine_b);
+        write_identity(&machine_a).await;
+        write_identity(&machine_b).await;
         let store = FileAccountRegistryStore::new(dir.path().join("remote-registry"));
 
         let airc_a = Airc::open(&machine_a).await.unwrap();

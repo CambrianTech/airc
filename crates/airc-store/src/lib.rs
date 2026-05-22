@@ -32,6 +32,7 @@
 pub mod entities;
 pub mod error;
 pub mod memory;
+pub mod mesh_identity;
 pub mod migration;
 pub mod peer_trust;
 pub mod sqlite;
@@ -40,6 +41,7 @@ pub mod subscriptions;
 
 pub use error::StoreError;
 pub use memory::InMemoryEventStore;
+pub use mesh_identity::StoredMeshIdentity;
 pub use peer_trust::{RotationAuditEntry, StoredPeer};
 pub use sqlite::{SqliteEventStore, StoredLocalIdentity};
 pub use store::EventStore;

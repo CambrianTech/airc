@@ -503,7 +503,7 @@ impl Airc {
         }
 
         if room_ids.is_empty() {
-            let identity = self.mesh_identity()?;
+            let identity = self.mesh_identity().await?;
             push_unique(
                 &mut room_ids,
                 Subscription::new_with_wire_root(
@@ -524,7 +524,7 @@ impl Airc {
             push_unique_path(&mut wires, subscription.wire.clone());
         }
         if wires.is_empty() {
-            let identity = self.mesh_identity()?;
+            let identity = self.mesh_identity().await?;
             push_unique_path(
                 &mut wires,
                 Subscription::new_with_wire_root(

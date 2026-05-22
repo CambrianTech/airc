@@ -13,9 +13,11 @@
 //!     `identity.key`. Secret material stays on disk; this table
 //!     holds the `peer_id` / `client_id` / version / created_at
 //!     bookkeeping that lived in `identity.json` before Phase 3.5.
+//!   - `mesh_identity` — cached account identity for room derivation.
 
 pub mod event;
 pub mod local_identity;
+pub mod mesh_identity;
 pub mod peer_rotation_audit;
 pub mod peer_trust;
 pub mod runtime_cursor;

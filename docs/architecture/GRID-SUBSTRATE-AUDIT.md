@@ -198,7 +198,7 @@ Move to SeaORM entities (one row, one table, one transaction):
 | `subscriptions.json` | `subscriptions` table (done in store-backed subscriptions cut) |
 | `room.json` (current room marker) | `subscriptions.is_default` (done in store-backed subscriptions cut) |
 | `identity.json` (singleton) | `identity` table (singleton row) |
-| `mesh_identity` cache file | `mesh_identity` table (or column on identity) |
+| `mesh_identity` cache file | `mesh_identity` table (done in store-backed mesh identity cut) |
 | `account_registry/*.json` | `account_registry` table |
 | `coordinator/*.beacon` | `beacons` table with `ttl_expires_at` |
 | `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `cursors` table (per-runtime-client, per-channel) |
@@ -243,8 +243,7 @@ five concrete hotpaths and seven kill-list patterns.
    peer trust moved to SeaORM in #883 and subscriptions/default-room
    moved to the `subscriptions` table in the store-backed
    subscriptions cut. Remaining file-backed runtime state is
-   identity, mesh-identity cache, account registry, and coordinator
-   beacons.
+   identity, account registry, and coordinator beacons.
 
 2. **Double clone of `TranscriptEvent` on every ingest** —
    `messaging.rs:110`, `transport.rs:124`. Each event is cloned
@@ -270,8 +269,8 @@ five concrete hotpaths and seven kill-list patterns.
 ### Substrate-wide patterns to kill (priority order)
 
 1. **Synchronous file I/O in async functions** — identity,
-   mesh-identity cache, account registry, and coordinator beacon
-   reads still need SeaORM cuts. Peer trust and subscriptions are now
+   account registry, and coordinator beacon reads still need SeaORM
+   cuts. Peer trust, subscriptions, and mesh identity are now
    store-backed.
 2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
    route_health, route_endpoints, imported_invites. Switch to

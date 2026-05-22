@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::error::StoreError;
+use crate::mesh_identity::StoredMeshIdentity;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
@@ -16,6 +17,7 @@ pub struct InMemoryEventStore {
     events: Mutex<Vec<TranscriptEvent>>,
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
     subscriptions: Mutex<Vec<StoredSubscription>>,
+    mesh_identities: Mutex<BTreeMap<String, StoredMeshIdentity>>,
 }
 
 impl InMemoryEventStore {
@@ -24,6 +26,7 @@ impl InMemoryEventStore {
             events: Mutex::new(Vec::new()),
             runtime_cursors: Mutex::new(BTreeMap::new()),
             subscriptions: Mutex::new(Vec::new()),
+            mesh_identities: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -133,6 +136,26 @@ impl EventStore for InMemoryEventStore {
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
         *subscriptions = rows;
+        Ok(())
+    }
+
+    async fn load_mesh_identity(
+        &self,
+        scope: &str,
+    ) -> Result<Option<StoredMeshIdentity>, StoreError> {
+        let identities = self
+            .mesh_identities
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(identities.get(scope).cloned())
+    }
+
+    async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError> {
+        let mut identities = self
+            .mesh_identities
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        identities.insert(entry.scope.clone(), entry);
         Ok(())
     }
 }

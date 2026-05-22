@@ -30,9 +30,11 @@ use airc_core::{
 };
 
 use crate::entities::{
-    event, local_identity, peer_rotation_audit, peer_trust, runtime_cursor, subscription,
+    event, local_identity, mesh_identity, peer_rotation_audit, peer_trust, runtime_cursor,
+    subscription,
 };
 use crate::error::StoreError;
+use crate::mesh_identity::StoredMeshIdentity;
 use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
 use crate::store::EventStore;
@@ -502,6 +504,52 @@ impl EventStore for SqliteEventStore {
         txn.commit().await?;
         Ok(())
     }
+
+    async fn load_mesh_identity(
+        &self,
+        scope: &str,
+    ) -> Result<Option<StoredMeshIdentity>, StoreError> {
+        let row = mesh_identity::Entity::find_by_id(scope.to_string())
+            .one(&self.db)
+            .await?;
+        row.map(|row| {
+            Ok(StoredMeshIdentity {
+                scope: row.scope,
+                identity: row.identity,
+                source: row.source,
+                resolved_at_ms: i64_to_u64("mesh_identity.resolved_at_ms", row.resolved_at_ms)?,
+                ttl_ms: i64_to_u64("mesh_identity.ttl_ms", row.ttl_ms)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError> {
+        let active = mesh_identity::ActiveModel {
+            scope: ActiveValue::Set(entry.scope),
+            identity: ActiveValue::Set(entry.identity),
+            source: ActiveValue::Set(entry.source),
+            resolved_at_ms: ActiveValue::Set(u64_to_i64(
+                "mesh_identity.resolved_at_ms",
+                entry.resolved_at_ms,
+            )?),
+            ttl_ms: ActiveValue::Set(u64_to_i64("mesh_identity.ttl_ms", entry.ttl_ms)?),
+        };
+        mesh_identity::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(mesh_identity::Column::Scope)
+                    .update_columns([
+                        mesh_identity::Column::Identity,
+                        mesh_identity::Column::Source,
+                        mesh_identity::Column::ResolvedAtMs,
+                        mesh_identity::Column::TtlMs,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
 }
 
 fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreError> {
@@ -885,6 +933,35 @@ mod tests {
 
         let reopened = SqliteEventStore::open_path(&path).await.unwrap();
         assert_eq!(reopened.load_subscriptions().await.unwrap(), rows);
+    }
+
+    #[tokio::test]
+    async fn mesh_identity_upserts_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let first = StoredMeshIdentity {
+            scope: "default".to_string(),
+            identity: "alice".to_string(),
+            source: "operator".to_string(),
+            resolved_at_ms: 1,
+            ttl_ms: 86_400_000,
+        };
+        let second = StoredMeshIdentity {
+            identity: "bob".to_string(),
+            resolved_at_ms: 2,
+            ..first.clone()
+        };
+
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        assert!(store.load_mesh_identity("default").await.unwrap().is_none());
+        store.save_mesh_identity(first).await.unwrap();
+        store.save_mesh_identity(second.clone()).await.unwrap();
+
+        let reopened = SqliteEventStore::open_path(&path).await.unwrap();
+        assert_eq!(
+            reopened.load_mesh_identity("default").await.unwrap(),
+            Some(second)
+        );
     }
 
     #[tokio::test]
