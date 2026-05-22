@@ -30,7 +30,6 @@ use crate::knock_cli::KnockArgs;
 use crate::message_cli::MessageArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
-use crate::scope_cli::ScopeArgs;
 use crate::transport_cli::TransportArgs;
 use crate::work_cli::WorkArgs;
 
@@ -295,9 +294,6 @@ pub enum Command {
 
     /// Inspect transport route policy and candidate selection.
     Route(RouteArgs),
-
-    /// Repair local scope state during Rust cutover.
-    Scope(ScopeArgs),
 
     /// Inspect transport health and substrate connectivity.
     Transport(TransportArgs),
