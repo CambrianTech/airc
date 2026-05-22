@@ -82,11 +82,7 @@ pub async fn run_room(
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
-pub async fn run_join(
-    home: &Path,
-    room: Option<String>,
-    attach: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match room {
         Some(room) => {
@@ -114,18 +110,74 @@ pub async fn run_join(
     subscribe_daemon_to_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
-    // `--attach` keeps the foreground process alive and streams the
-    // live event broadcast. The skills doc has documented this flag
-    // for the longest time but only the bash wrapper implemented it;
-    // post-demolition the Rust binary needs to own it directly. Same
-    // path as `airc monitor attach`, just chained after the join.
-    if attach {
+    // `airc join` is THE public verb — no separate attach command.
+    // Whether to stream live events after setup is decided by
+    // runtime context, NOT a flag:
+    //   - Agent runtime (Claude Code, Codex): attach, multi-room stream
+    //   - Interactive TTY: attach
+    //   - cargo test / cargo run / pipe / script context: return cleanly
+    //
+    // The cargo signal (`CARGO_BIN_EXE_*` / `CARGO_PKG_NAME` env vars
+    // set on the test binary AND inherited by spawned children)
+    // takes priority — even if Claude Code is the parent process,
+    // a `cargo test` run inside it should not hang the test harness.
+    // `AIRC_NO_ATTACH=1` is an explicit internal opt-out for any
+    // other script that needs setup-only without inheriting cargo
+    // envs.
+    if should_attach_after_join() {
         println!();
         println!("attached — Ctrl-C to detach.");
-        let mut stream = airc.subscribe().await?;
+        let mut stream = airc
+            .subscribe_subscribed_filtered(airc_lib::EventFilter::default())
+            .await?;
         print_event_stream_until_signal(&mut stream).await?;
     }
     Ok(())
+}
+
+/// Decide whether `airc join` should attach to the multi-room live
+/// stream after completing setup. Internal contract, no public
+/// flag. The rule:
+///
+/// 1. `AIRC_NO_ATTACH=1` — explicit opt-out (scripts, smokes).
+///    Highest priority.
+/// 2. Cargo context — `CARGO_BIN_EXE_*` or `CARGO_PKG_NAME` set
+///    means we're inside `cargo test` / `cargo run` and must not
+///    hang the harness. This wins over agent-runtime markers
+///    (which may also be set if Claude Code is the parent shell).
+/// 3. Agent runtime markers — Claude Code (`CLAUDECODE`,
+///    `CLAUDE_CODE_SESSION_ID`, `AI_AGENT`), Codex
+///    (`CODEX_AGENT_ID`, `CODEX_SESSION_ID`,
+///    `AIRC_CODEX_START_CHILD`).
+/// 4. TTY — interactive terminal use.
+/// 5. Otherwise — exit cleanly after setup.
+fn should_attach_after_join() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("AIRC_NO_ATTACH").is_some() {
+        return false;
+    }
+    let cargo_context = std::env::vars_os().any(|(k, _)| {
+        let key = k.to_string_lossy();
+        key.starts_with("CARGO_BIN_EXE_") || key == "CARGO_PKG_NAME"
+    });
+    if cargo_context {
+        return false;
+    }
+    let agent_markers = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "AI_AGENT",
+        "CODEX_AGENT_ID",
+        "CODEX_SESSION_ID",
+        "AIRC_CODEX_START_CHILD",
+    ];
+    if agent_markers
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        return true;
+    }
+    std::io::stdout().is_terminal()
 }
 
 fn ensure_runtime_integrations() {
@@ -604,9 +656,13 @@ pub async fn run_inbox(
     Ok(())
 }
 
-async fn print_event_stream_until_signal(
-    stream: &mut airc_lib::EventStream,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn print_event_stream_until_signal<S>(
+    stream: &mut S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: futures::stream::Stream<Item = Result<airc_core::TranscriptEvent, airc_lib::LiveLag>>
+        + Unpin,
+{
     let sigint = tokio::signal::ctrl_c();
     let mut sigint = Box::pin(sigint);
     loop {

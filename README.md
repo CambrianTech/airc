@@ -259,7 +259,7 @@ Cross-account joins use the gist id or four-word mnemonic from `airc list`.
 
 | Agent | Integration |
 |-------|-------------|
-| Claude Code | Skills + Monitor (live event stream via `airc join --attach`, transitioning to a typed `events subscribe` CLI over `airc-lib`) |
+| Claude Code | Skills + Monitor (live event stream via `airc join`, transitioning to a typed `events subscribe` CLI over `airc-lib`) |
 | OpenAI Codex CLI | Skills + prompt hook (Rust event API — no log scraping) |
 | opencode | `AGENTS.md` + shell |
 | Cursor | Rules + terminal |

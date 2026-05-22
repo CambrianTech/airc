@@ -57,7 +57,7 @@ Then if they had a paired session you should restart the current scope for them.
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 
 Codex / non-Monitor runtimes:

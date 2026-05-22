@@ -120,7 +120,7 @@ airc teardown cleans the scope processes
 ```
 
 For AI agents specifically, a passing install is not enough. Claude must be
-able to attach a live monitor using plain `airc join --attach`. Codex must be
+able to attach a live monitor using plain `airc join`. Codex must be
 able to receive unread events through the installed hook or an equivalent
 subscription surface. Both paths must be tested through public `airc` commands,
 not absolute source paths or test-only environment variables.
@@ -303,7 +303,7 @@ Already landed in rust-rewrite:
   stale `airc-core`, runs two fresh project scopes through public `airc join`,
   proves they converge on the same account-home `#general` RoomId and wire,
   sends through public `airc msg`, and proves the second scope reads that
-  message through the Rust event surface, live `airc join --attach` monitor,
+  message through the Rust event surface, live `airc join` monitor,
   and `airc codex-hook user-prompt-submit`;
 - machine-global coordinator/cache under `~/.airc/accounts/<identity>/` with
   typed presence beacons, TTL partitioning, and atomic refresh singleflight;
@@ -350,7 +350,7 @@ Required corrections:
 ## Handoff: Cross-Machine Registry Proof
 
 The local same-account path is proven through public installed commands:
-`airc join`, `airc msg`, `airc events`, `airc join --attach`, and
+`airc join`, `airc msg`, `airc events`, `airc join`, and
 `airc codex-hook user-prompt-submit`. Claude should not reimplement
 `join_default_context`, wrapper seeding, PATH shim, coordinator locks, wire
 replay, monitor attach, or hook reads.
