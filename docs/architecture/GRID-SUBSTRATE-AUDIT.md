@@ -55,6 +55,10 @@ Priority order matters:
 8. Code organization must preserve the substrate boundary. If a file
    starts naming consumers, move that surface into an integration
    crate/module.
+9. Durable substrate data uses the store/ORM boundary. JSON is allowed
+   for wire payload encoding, install/config bootstrap, and external
+   invite documents; it is not acceptable for runtime cursors, trust
+   state, subscriptions, presence registries, or replay checkpoints.
 
 ## Current Drift
 
@@ -80,8 +84,8 @@ Goal: stop making the substrate name Codex/Claude directly.
 Work:
 
 - Add `integrations-common` crate/module for runtime detection,
-  runtime client identity, cursor files, and hook/feed conventions
-  shared by agent integrations.
+  runtime client identity, store-backed cursor ownership, and hook/feed
+  conventions shared by agent integrations.
 - Move Codex-specific surfaces out of `airc-cli`:
   - `codex_*.rs`
   - Codex hook JSON/config mutation
@@ -249,8 +253,9 @@ Acceptance gates:
 
 1. Extract runtime context detection from `airc-cli::commands` into a
    small typed module. Keep behavior identical.
-2. Add cursor-backed join feed so `airc join` does not replay the
-   whole backlog every attach.
+2. Add store-backed runtime cursors so `airc join` and Codex hook
+   consumers never replay the whole backlog and never write cursor JSON
+   sidecars.
 3. Move Codex hook/feed files behind an integration boundary.
 4. Add lifecycle event types and subscription query API.
 5. Add first command-bus request/reply helper after reviewing

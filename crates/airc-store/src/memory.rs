@@ -3,6 +3,7 @@
 //! all state when dropped.
 
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
@@ -12,12 +13,14 @@ use crate::store::EventStore;
 
 pub struct InMemoryEventStore {
     events: Mutex<Vec<TranscriptEvent>>,
+    runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
 }
 
 impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
+            runtime_cursors: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -86,6 +89,31 @@ impl EventStore for InMemoryEventStore {
             .filter(|e| channel.is_none_or(|room| e.room_id == room))
             .max_by(|a, b| transcript_order(a, b));
         Ok(newest.map(|e| e.cursor()))
+    }
+
+    async fn load_runtime_cursor(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<TranscriptCursor>, StoreError> {
+        let cursors = self
+            .runtime_cursors
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(cursors.get(consumer_id).cloned())
+    }
+
+    async fn save_runtime_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &TranscriptCursor,
+        _updated_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut cursors = self
+            .runtime_cursors
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        cursors.insert(consumer_id.to_string(), cursor.clone());
+        Ok(())
     }
 }
 

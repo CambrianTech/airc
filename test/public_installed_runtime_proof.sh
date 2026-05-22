@@ -314,7 +314,6 @@ fi
   printf '{"hook_event_name":"UserPromptSubmit"}' | \
     HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" AIRC_CLIENT_ID="openclaw-proof-hook" \
     "$AIRC_BIN" --home "$OPENCLAW_SCOPE" codex-hook user-prompt-submit \
-      --cursor-file "$ROOT/codex-hook-cursor.json" \
       --count 64 \
       --raw
 ) >"$ROOT/codex-hook.out" 2>"$ROOT/codex-hook.err" || {

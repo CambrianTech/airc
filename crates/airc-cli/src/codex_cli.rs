@@ -26,9 +26,6 @@ pub enum CodexHookAction {
     },
     /// Emit Codex UserPromptSubmit JSON with unread AIRC context.
     UserPromptSubmit {
-        /// Cursor file. Defaults to `<home>/codex_hook_cursor.json`.
-        #[arg(long)]
-        cursor_file: Option<PathBuf>,
         /// Maximum unread events to fetch from the transcript store.
         #[arg(long, default_value_t = 50)]
         count: usize,

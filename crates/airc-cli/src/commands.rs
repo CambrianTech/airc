@@ -119,16 +119,14 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     //
     // Agent runtime is detected through explicit env markers OR the
     // same runtime client identity resolver used for event stamping
-    // (`airc client-id`). The cargo signal (`CARGO_BIN_EXE_*` /
-    // `CARGO_PKG_NAME` env vars set on the test binary AND inherited
-    // by spawned children) takes priority — even if Claude Code or
-    // Codex is the parent process, a `cargo test` run inside it
-    // should not hang the test harness.
+    // (`airc client-id`). Noninteractive stdout (pipe/redirect/script)
+    // takes priority so install proofs and automation never hang just
+    // because they inherited a Codex/Claude environment.
     // `AIRC_NO_ATTACH=1` is an explicit internal opt-out for any
     // other script that needs setup-only without inheriting cargo
     // envs.
     if should_attach_after_join() {
-        crate::join_feed::run(&airc, home).await?;
+        crate::join_feed::run(&airc).await?;
     }
     Ok(())
 }
@@ -139,16 +137,17 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 ///
 /// 1. `AIRC_NO_ATTACH=1` — explicit opt-out (scripts, smokes).
 ///    Highest priority.
-/// 2. Cargo context — `CARGO_BIN_EXE_*` or `CARGO_PKG_NAME` set
+/// 2. Noninteractive stdout — pipe/redirect/script context returns
+///    after setup. This wins over inherited agent markers.
+/// 3. Cargo context — `CARGO_BIN_EXE_*` or `CARGO_PKG_NAME` set
 ///    means we're inside `cargo test` / `cargo run` and must not
-///    hang the harness. This wins over agent-runtime markers
-///    (which may also be set if Claude Code is the parent shell).
-/// 3. Agent runtime markers — Claude Code (`CLAUDECODE`,
+///    hang the harness.
+/// 4. Agent runtime markers — Claude Code (`CLAUDECODE`,
 ///    `CLAUDE_CODE_SESSION_ID`, `AI_AGENT`), Codex
 ///    (`CODEX_AGENT_ID`, `CODEX_SESSION_ID`,
 ///    `AIRC_CODEX_START_CHILD`).
-/// 4. TTY — interactive terminal use.
-/// 5. Otherwise — exit cleanly after setup.
+/// 5. TTY — interactive terminal use.
+/// 6. Otherwise — exit cleanly after setup.
 fn should_attach_after_join() -> bool {
     use std::io::IsTerminal;
     let runtime_client_detected = crate::client_id::current_client_id()
@@ -211,6 +210,9 @@ where
         }
     }
     if has_opt_out {
+        return false;
+    }
+    if !stdout_is_tty {
         return false;
     }
     if has_cargo_context {
@@ -850,7 +852,7 @@ mod tests {
     fn join_attach_decision_streams_for_codex_agent() {
         assert!(should_attach_after_join_from(
             [("CODEX_SESSION_ID", "thread-1")],
-            false
+            true
         ));
     }
 
@@ -858,7 +860,7 @@ mod tests {
     fn join_attach_decision_streams_for_claude_agent() {
         assert!(should_attach_after_join_from(
             [("CLAUDE_CODE_SESSION_ID", "session-1")],
-            false
+            true
         ));
     }
 
@@ -874,6 +876,15 @@ mod tests {
     fn join_attach_decision_streams_for_detected_runtime_client() {
         assert!(should_attach_after_join_with_client(
             std::iter::empty::<(&str, &str)>(),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_exits_for_redirected_agent_script() {
+        assert!(!should_attach_after_join_with_client(
+            [("CODEX_SESSION_ID", "thread-1")],
             false,
             true
         ));

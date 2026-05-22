@@ -714,21 +714,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 codex_install::run_uninstall_hooks(codex_home).await
             }
             CodexHookAction::UserPromptSubmit {
-                cursor_file,
                 count,
                 max_items,
                 raw,
                 include_self,
             } => {
-                codex_commands::run_user_prompt_submit(
-                    &home,
-                    cursor_file,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                )
-                .await
+                codex_commands::run_user_prompt_submit(&home, count, max_items, raw, include_self)
+                    .await
             }
         },
 

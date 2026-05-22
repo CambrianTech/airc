@@ -29,7 +29,7 @@ use airc_core::{
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
 
-use crate::entities::event;
+use crate::entities::{event, runtime_cursor};
 use crate::error::StoreError;
 use crate::migration::Migrator;
 use crate::store::EventStore;
@@ -194,6 +194,46 @@ impl EventStore for SqliteEventStore {
             lamport: m.lamport as u64,
             event_id: EventId::from_uuid(m.event_id),
         }))
+    }
+
+    async fn load_runtime_cursor(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<TranscriptCursor>, StoreError> {
+        let row = runtime_cursor::Entity::find_by_id(consumer_id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(row.map(|m| TranscriptCursor {
+            lamport: m.lamport as u64,
+            event_id: EventId::from_uuid(m.event_id),
+        }))
+    }
+
+    async fn save_runtime_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &TranscriptCursor,
+        updated_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let active = runtime_cursor::ActiveModel {
+            consumer_id: ActiveValue::Set(consumer_id.to_string()),
+            lamport: ActiveValue::Set(cursor.lamport as i64),
+            event_id: ActiveValue::Set(cursor.event_id.as_uuid()),
+            updated_at_ms: ActiveValue::Set(updated_at_ms as i64),
+        };
+        runtime_cursor::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(runtime_cursor::Column::ConsumerId)
+                    .update_columns([
+                        runtime_cursor::Column::Lamport,
+                        runtime_cursor::Column::EventId,
+                        runtime_cursor::Column::UpdatedAtMs,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 }
 
@@ -432,6 +472,86 @@ mod tests {
         assert_eq!(latest_b, b1.cursor());
         let latest_global = store.latest_cursor(None).await.unwrap().unwrap();
         assert_eq!(latest_global, a2.cursor());
+    }
+
+    #[tokio::test]
+    async fn runtime_cursor_upserts_by_consumer_id() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let first = TranscriptCursor {
+            lamport: 7,
+            event_id: EventId::from_u128(0x7),
+        };
+        let second = TranscriptCursor {
+            lamport: 9,
+            event_id: EventId::from_u128(0x9),
+        };
+
+        assert!(store
+            .load_runtime_cursor("codex-hook:default")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .save_runtime_cursor("codex-hook:default", &first, 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_runtime_cursor("codex-hook:default")
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+
+        store
+            .save_runtime_cursor("codex-hook:default", &second, 1_700_000_000_100)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_runtime_cursor("codex-hook:default")
+                .await
+                .unwrap(),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_cursors_are_isolated_by_consumer_id() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let hook = TranscriptCursor {
+            lamport: 3,
+            event_id: EventId::from_u128(0x3),
+        };
+        let join = TranscriptCursor {
+            lamport: 4,
+            event_id: EventId::from_u128(0x4),
+        };
+
+        store
+            .save_runtime_cursor("codex-hook:default", &hook, 1)
+            .await
+            .unwrap();
+        store
+            .save_runtime_cursor("join-feed:codex:thread-1", &join, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load_runtime_cursor("codex-hook:default")
+                .await
+                .unwrap(),
+            Some(hook)
+        );
+        assert_eq!(
+            store
+                .load_runtime_cursor("join-feed:codex:thread-1")
+                .await
+                .unwrap(),
+            Some(join)
+        );
     }
 
     #[tokio::test]

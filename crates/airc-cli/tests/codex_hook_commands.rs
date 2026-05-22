@@ -15,7 +15,6 @@ fn airc_core() -> &'static str {
 fn codex_hook_emits_context_and_advances_cursor() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
-    let cursor = workspace.path().join("cursor.json");
 
     run_ok(&home, &["init"]);
     run_ok(&home, &["send", "first unread"]);
@@ -23,30 +22,17 @@ fn codex_hook_emits_context_and_advances_cursor() {
 
     let output = run_hook(
         &home,
-        &[
-            "codex-hook",
-            "user-prompt-submit",
-            "--cursor-file",
-            cursor.to_str().unwrap(),
-            "--include-self",
-        ],
+        &["codex-hook", "user-prompt-submit", "--include-self"],
         "{}",
     );
     let context = additional_context(&output);
     assert!(context.contains("AIRC: 2 unread"));
     assert!(context.contains("first unread"));
     assert!(context.contains("second unread"));
-    assert!(cursor.exists(), "hook must persist its transcript cursor");
 
     let second = run_hook(
         &home,
-        &[
-            "codex-hook",
-            "user-prompt-submit",
-            "--cursor-file",
-            cursor.to_str().unwrap(),
-            "--include-self",
-        ],
+        &["codex-hook", "user-prompt-submit", "--include-self"],
         "{}",
     );
     assert_eq!(
@@ -59,30 +45,28 @@ fn codex_hook_emits_context_and_advances_cursor() {
 fn codex_hook_excludes_self_echoes_but_still_advances_cursor() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
-    let cursor = workspace.path().join("cursor.json");
 
     run_ok(&home, &["init"]);
     run_ok(&home, &["send", "own message"]);
 
     let output = run_hook(
         &home,
-        &[
-            "codex-hook",
-            "user-prompt-submit",
-            "--cursor-file",
-            cursor.to_str().unwrap(),
-        ],
+        &["codex-hook", "user-prompt-submit"],
         r#"{"hook_event_name":"UserPromptSubmit"}"#,
     );
     assert_eq!(output, "");
-    assert!(cursor.exists(), "self echoes should not replay forever");
+    let second = run_hook(
+        &home,
+        &["codex-hook", "user-prompt-submit"],
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+    assert_eq!(second, "", "self echoes should not replay forever");
 }
 
 #[test]
 fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
-    let cursor = workspace.path().join("cursor.json");
 
     run_ok(&home, &["init"]);
     run_ok_with_client(&home, "codex:thread-1", &["send", "own runtime"]);
@@ -91,12 +75,7 @@ fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
     let output = run_hook_with_client(
         &home,
         "codex:thread-1",
-        &[
-            "codex-hook",
-            "user-prompt-submit",
-            "--cursor-file",
-            cursor.to_str().unwrap(),
-        ],
+        &["codex-hook", "user-prompt-submit"],
         "{}",
     );
     let context = additional_context(&output);
@@ -108,7 +87,6 @@ fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
 fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
-    let cursor = workspace.path().join("cursor.json");
 
     run_ok(&home, &["init"]);
     run_ok_with_client(
@@ -117,16 +95,7 @@ fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
         &["send", "peer despite shared home"],
     );
 
-    let output = run_hook(
-        &home,
-        &[
-            "codex-hook",
-            "user-prompt-submit",
-            "--cursor-file",
-            cursor.to_str().unwrap(),
-        ],
-        "{}",
-    );
+    let output = run_hook(&home, &["codex-hook", "user-prompt-submit"], "{}");
     let context = additional_context(&output);
     assert!(context.contains("peer despite shared home"));
 }
