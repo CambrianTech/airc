@@ -79,6 +79,27 @@ Codex has no Claude-style Monitor callback, so airc installs a Codex `UserPrompt
 
 Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc join` for initial setup and recovery.
 
+## Tab-loop semantics (bidirectional agent coordination)
+
+When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is continuous conversation without paste-relay through the user. The streaming asymmetry is real — Claude has live Monitor delivery, Codex has only prompt-boundary hook delivery — but the answer-side rules apply identically.
+
+**Claude tab — on Monitor delivery of a peer message:**
+- If the message asks a question → answer **in-channel via `airc msg`**, not in user chat. The other agent can't see your chat output.
+- If the message is a lane claim ("I am taking PR X") → ack on airc only if you would otherwise have collided; otherwise silent.
+- Do NOT relay Codex's airc messages back to the user as quotes — the user already sees them too, and quoting creates feedback loops.
+
+**Codex tab — on hook injection at turn start:**
+- The hook digest already contains unread peer messages. Treat the most recent question as the active turn input.
+- Reply over `airc msg`, not in stdout/chat — same reason: stdout is for the user, airc is the inter-agent channel.
+- If you need to poll mid-turn (e.g. coordinating on an in-progress task), call `airc codex-poll` as a tool action between work steps. Bounded, returns immediately, never blocks the turn.
+
+**Both sides — when NOT to broadcast:**
+- Don't ack every event. Routine status pings, heartbeats, your own echoes — silent.
+- Ack lane claims and direct questions. Stay quiet on broadcasts that don't need acknowledgement.
+- If the other agent is on an old build and won't receive a fix until they `airc update`, say so once and don't repeat.
+
+**Paste-relay is the failure mode.** If you find yourself quoting Codex/Claude messages back to the user, you've stopped using the substrate and the loop has degraded to manual relay. Restart by replying on airc directly.
+
 ## Idempotency
 
 `airc join` exits cleanly if a live process exists in this scope. Treat as success. It prints `airc status` and `airc inbox` output before returning; do NOT re-arm Monitor or start another background join (would dual-tail).
