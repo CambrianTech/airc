@@ -50,12 +50,11 @@ pub use account_registry::{
 };
 pub use airc::Airc;
 pub use coordinator::{
-    account_root as coordinator_account_root, beacon_now, drain_stale as coordinator_drain_stale,
+    account_root as coordinator_account_root, beacon_now,
     drain_stale_store as coordinator_drain_stale_store,
-    load_own_beacon as coordinator_load_own_beacon,
-    load_own_beacon_store as coordinator_load_own_beacon_store, publish as coordinator_publish,
+    load_own_beacon_store as coordinator_load_own_beacon_store,
     publish_store as coordinator_publish_store,
-    release_refresh_lock as coordinator_release_refresh_lock, snapshot as coordinator_snapshot,
+    release_refresh_lock as coordinator_release_refresh_lock,
     snapshot_store as coordinator_snapshot_store, try_acquire_refresh_lock, CoordinatorConfig,
     CoordinatorError, CoordinatorSnapshot, PresenceBeacon, RefreshLockOutcome,
     DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,

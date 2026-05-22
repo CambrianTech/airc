@@ -397,9 +397,9 @@ mod tests {
         assert!(!json.contains("body"));
     }
 
-    #[test]
-    fn document_from_snapshot_exports_only_peers_with_specs() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn document_from_snapshot_exports_only_peers_with_specs() {
+        let store = airc_store::InMemoryEventStore::new();
         let cfg = crate::coordinator::CoordinatorConfig::default();
         let peer_with_spec = PeerId::new();
         let peer_without_spec = PeerId::new();
@@ -417,9 +417,15 @@ mod tests {
             456,
             1_000,
         );
-        crate::coordinator::publish(dir.path(), &mesh(), &with_spec).unwrap();
-        crate::coordinator::publish(dir.path(), &mesh(), &without_spec).unwrap();
-        let snapshot = crate::coordinator::snapshot(dir.path(), &mesh(), &cfg, 1_000).unwrap();
+        crate::coordinator::publish_store(&store, &mesh(), &with_spec)
+            .await
+            .unwrap();
+        crate::coordinator::publish_store(&store, &mesh(), &without_spec)
+            .await
+            .unwrap();
+        let snapshot = crate::coordinator::snapshot_store(&store, &mesh(), &cfg, 1_000)
+            .await
+            .unwrap();
 
         let document = AccountRegistryDocument::from_snapshot(
             &snapshot,

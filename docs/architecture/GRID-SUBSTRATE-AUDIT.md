@@ -199,7 +199,7 @@ Move to SeaORM entities (one row, one table, one transaction):
 | `room.json` (current room marker) | `subscriptions.is_default` (done in store-backed subscriptions cut) |
 | `identity.json` (singleton metadata) | `local_identity` table (done in store-backed local identity cut; key material stays in `identity.key`) |
 | `mesh_identity` cache file | `mesh_identity` table (done in store-backed mesh identity cut) |
-| `account_registry/*.json` | `account_registry` table |
+| `account_registry/*.json` | `account_registry` table (done in store-backed account registry cut) |
 | `coordinator/*.beacon` | `beacons` + `beacon_channels` tables (done in store-backed coordinator beacon cut) |
 | `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `runtime_cursors` table (done in cursor cut) |
 
@@ -241,9 +241,10 @@ five concrete hotpaths and seven kill-list patterns.
 
 1. **Synchronous file I/O on every CLI/subscribe call** —
    peer trust moved to SeaORM in #883; subscriptions/default-room,
-   local identity metadata, mesh identity, runtime cursors, and
-   coordinator beacons now use store tables. Remaining file-backed
-   runtime state is the account registry document path.
+   local identity metadata, mesh identity, account registry,
+   runtime cursors, and coordinator beacons now use store tables.
+   Remaining file-backed surfaces are install/config compatibility
+   helpers and remote wire payloads, not the local runtime truth.
 
 2. **Double clone of `TranscriptEvent` on every ingest** —
    `messaging.rs:110`, `transport.rs:124`. Each event is cloned
@@ -268,16 +269,17 @@ five concrete hotpaths and seven kill-list patterns.
 
 ### Substrate-wide patterns to kill (priority order)
 
-1. **Synchronous file I/O in async functions** — account registry
-   reads still need a SeaORM cut. Peer trust, subscriptions, local
-   identity metadata, mesh identity, runtime cursors, and coordinator
-   beacons are now store-backed.
+1. **Synchronous file I/O in async functions** — local runtime state
+   must stay store-backed. Peer trust, subscriptions, local identity
+   metadata, mesh identity, account registry, runtime cursors, and
+   coordinator beacons are now store-backed.
 2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
    route_health, route_endpoints, imported_invites. Switch to
    `DashMap` or sharded RwLock for N-reader scale.
-3. **Full JSON file rewrites on every mutate** — remaining registry
-   and coordinator saves. Peer trust and subscriptions/default-room
-   are no longer JSON-backed.
+3. **Full JSON file rewrites on every mutate** — removed from peer
+   trust, subscriptions/default-room, account registry, and
+   coordinator beacons. Keep pushing remaining config/install helpers
+   toward typed store-backed or wire-payload-only boundaries.
 4. **`event.clone()` on broadcast hot path** — `Arc<TranscriptEvent>`
    internally; broadcast is `Arc::clone`.
 5. **Linear scans for dedup** — `enrolled.contains`, subscriptions
