@@ -534,7 +534,7 @@ mod tests {
             .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == spec.peer_id));
         let snapshot = crate::coordinator::snapshot_store(
-            airc.event_store(),
+            airc.coordinator_store(),
             &mesh(),
             &Default::default(),
             1_000,
@@ -575,7 +575,7 @@ mod tests {
             .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
         let snapshot = crate::coordinator::snapshot_store(
-            airc_b.event_store(),
+            airc_b.coordinator_store(),
             &mesh(),
             &Default::default(),
             u64::MAX,
