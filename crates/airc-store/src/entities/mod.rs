@@ -12,7 +12,7 @@
 //!   - `local_identity` — singleton metadata paired with the on-disk
 //!     `identity.key`. Secret material stays on disk; this table
 //!     holds the `peer_id` / `client_id` / version / created_at
-//!     bookkeeping that lived in `identity.json` before Phase 3.5.
+//!     bookkeeping plus the user-facing identity card.
 //!   - `mesh_identity` — cached account identity for room derivation.
 //!   - `account_registry` + `account_registry_gist_sentinel` — local
 //!     cache of the published cross-machine registry document and the

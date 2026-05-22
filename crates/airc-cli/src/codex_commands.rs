@@ -69,11 +69,10 @@ fn consumer_id(runtime_client: Option<&str>) -> String {
 fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&str>) -> bool {
     // Header-stamped self-detection is the only reliable signal on a
     // shared HOME. Two scopes (Claude tab + Codex tab) using the
-    // same `~/.airc/` share `identity.json` → share peer_id AND
-    // client_id. The peer_id/client_id equality check would
-    // incorrectly classify EVERY frame from the other runtime as
-    // "self" and filter it out — exactly the symptom that left
-    // Codex's hook silent on Claude's acks.
+    // same `~/.airc/` share the singleton local identity row →
+    // share peer_id AND client_id. The peer_id/client_id equality
+    // check would incorrectly classify EVERY frame from the other
+    // runtime as "self" and filter it out.
     //
     // Rule: if the event has an `airc.client` header, that IS the
     // self attestation. Equal to OUR runtime client tag → self.
@@ -82,14 +81,14 @@ fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&s
     if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
         return runtime_client.is_some_and(|rc| event_client == rc);
     }
-    // No header: legacy/unstamped frame. Drop the peer_id check
+    // No header: unstamped historical frame. Drop the peer_id check
     // entirely (Codex's review on PR #869): peer_id is too coarse
     // for shared-HOME multi-agent operation — every cross-runtime
     // frame would be suppressed. client_id alone is still subject
     // to identity-collision on shared HOME, but it's a tighter
     // signal than peer_id. Current Rust-emitted frames always stamp
     // the airc.client header in send_frame, so this branch only
-    // fires for legacy/historical frames where false-self
+    // fires for historical frames where false-self
     // suppression is the lesser harm.
     event.client_id == airc.client_id()
 }

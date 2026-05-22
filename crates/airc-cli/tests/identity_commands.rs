@@ -58,6 +58,82 @@ fn identity_pretty_defaults_unset_fields() {
 }
 
 #[test]
+fn identity_set_link_and_show_round_trip_through_store() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    run_ok(
+        home,
+        &[
+            "identity",
+            "set",
+            "--pronouns",
+            "they/them",
+            "--role",
+            "rust-cutter",
+            "--bio",
+            "moves runtime identity into the ORM store",
+            "--status",
+            "focused",
+        ],
+        "",
+    );
+    run_ok(
+        home,
+        &[
+            "identity",
+            "link",
+            "--platform",
+            "continuum",
+            "--handle",
+            "clio",
+        ],
+        "",
+    );
+
+    let shown = run_ok(home, &["identity", "show"], "");
+    assert!(shown.contains("  pronouns:   they/them\n"));
+    assert!(shown.contains("  role:       rust-cutter\n"));
+    assert!(shown.contains("  bio:        moves runtime identity into the ORM store\n"));
+    assert!(shown.contains("  status:     focused\n"));
+    assert!(shown.contains("    continuum: clio\n"));
+
+    assert_eq!(
+        run_ok(home, &["identity", "continuum-handle"], ""),
+        "clio\n"
+    );
+}
+
+#[test]
+fn identity_import_continuum_merges_into_store_without_clearing_status() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    run_ok(
+        home,
+        &["identity", "set", "--status", "already-present"],
+        "",
+    );
+    run_ok(
+        home,
+        &[
+            "identity",
+            "import-continuum",
+            "--blob",
+            r#"{"name":"delphi","pronouns":"she/her","role":"planner","bio":"keeps the lane coherent"}"#,
+        ],
+        "",
+    );
+
+    let shown = run_ok(home, &["identity", "show"], "");
+    assert!(shown.contains("  pronouns:   she/her\n"));
+    assert!(shown.contains("  role:       planner\n"));
+    assert!(shown.contains("  bio:        keeps the lane coherent\n"));
+    assert!(shown.contains("  status:     already-present\n"));
+    assert!(shown.contains("    continuum: delphi\n"));
+}
+
+#[test]
 fn legacy_identity_commands_bootstrap_lookup_and_sign() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path();

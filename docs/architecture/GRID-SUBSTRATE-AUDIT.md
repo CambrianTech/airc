@@ -190,14 +190,17 @@ temp-write-and-rename, no index, no transaction, no schema. That's
 
 This phase is the elegance baseline: stop the per-collection drift.
 
-Move to SeaORM entities (one row, one table, one transaction):
+Move to SeaORM entities behind the `airc-store::EventStore` contract
+(one row, one table, one transaction). SQLite is the v1 embedded
+backend, not the architecture; consumers talk to store traits/APIs, not
+backend files:
 
 | Today (JSON file + temp-rename) | Phase 3.5 (SeaORM table) |
 |---|---|
 | `peers.json` | `peer_trust` + `peer_rotation_audit` (done in #883) |
 | `subscriptions.json` | `subscriptions` table (done in store-backed subscriptions cut) |
 | `room.json` (current room marker) | `subscriptions.is_default` (done in store-backed subscriptions cut) |
-| `identity.json` (singleton metadata) | `local_identity` table (done in store-backed local identity cut; key material stays in `identity.key`) |
+| `identity.json` (singleton metadata) | `local_identity` table behind the store API (done in store-backed local identity cut; key material stays in `identity.key`) |
 | `mesh_identity` cache file | `mesh_identity` table (done in store-backed mesh identity cut) |
 | `account_registry/*.json` | `account_registry` table (done in store-backed account registry cut) |
 | `coordinator/*.beacon` | `beacons` + `beacon_channels` tables (done in store-backed coordinator beacon cut) |

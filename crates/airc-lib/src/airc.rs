@@ -139,10 +139,10 @@ pub(crate) struct AircInner {
     /// — older entries roll off once capacity is exceeded.
     ///
     /// Why a per-instance set rather than `(sender, client_id) ==
-    /// self` detection: `client_id` is persisted in `identity.json`,
-    /// so two processes on the same AIRC_HOME share it and the
-    /// equality check would (incorrectly) suppress the cross-process
-    /// peer's frames as "our own."
+    /// self` detection: `client_id` is persisted in the singleton
+    /// local identity row, so two processes on the same AIRC_HOME
+    /// share it and the equality check would (incorrectly) suppress
+    /// the cross-process peer's frames as "our own."
     pub(crate) recently_broadcast: std::sync::Mutex<std::collections::VecDeque<airc_core::EventId>>,
 }
 

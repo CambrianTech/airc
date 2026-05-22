@@ -25,6 +25,7 @@ use sea_orm_migration::MigratorTrait;
 use serde_json::Value as JsonValue;
 
 use airc_core::{
+    identity::Identity,
     transcript::{MentionTarget, TranscriptKind},
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
@@ -36,6 +37,7 @@ use crate::entities::{
     peer_rotation_audit, peer_trust, runtime_cursor, subscription,
 };
 use crate::error::StoreError;
+use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
@@ -247,6 +249,7 @@ impl SqliteEventStore {
                     value: m.version as i128,
                 })?,
                 created_at_ms: i64_to_u64("local_identity.created_at_ms", m.created_at_ms)?,
+                identity: identity_from_row(&m),
             })
         })
         .transpose()
@@ -275,8 +278,36 @@ impl SqliteEventStore {
                 "local_identity.created_at_ms",
                 identity.created_at_ms,
             )?),
+            name: Set(identity.identity.name),
+            pronouns: Set(identity.identity.pronouns),
+            role: Set(identity.identity.role),
+            bio: Set(identity.identity.bio),
+            status: Set(identity.identity.status),
+            fingerprint: Set(identity.identity.fingerprint),
+            integrations_json: Set(serde_json::to_value(identity.identity.integrations)?),
         };
         local_identity::Entity::insert(active)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Replace the user-facing identity card on the singleton row.
+    /// Peer/client ids are not touched.
+    pub async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
+        let row = local_identity::Entity::find_by_id(local_identity::SINGLETON_ID)
+            .one(&self.db)
+            .await?
+            .ok_or(StoreError::NotFound("local_identity"))?;
+        let mut active: local_identity::ActiveModel = row.into();
+        active.name = Set(identity.name);
+        active.pronouns = Set(identity.pronouns);
+        active.role = Set(identity.role);
+        active.bio = Set(identity.bio);
+        active.status = Set(identity.status);
+        active.fingerprint = Set(identity.fingerprint);
+        active.integrations_json = Set(serde_json::to_value(identity.integrations)?);
+        local_identity::Entity::update(active)
             .exec(&self.db)
             .await?;
         Ok(())
@@ -407,13 +438,16 @@ impl SqliteEventStore {
     }
 }
 
-/// Public DTO mirroring the singleton `local_identity` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredLocalIdentity {
-    pub peer_id: PeerId,
-    pub client_id: ClientId,
-    pub version: u32,
-    pub created_at_ms: u64,
+fn identity_from_row(row: &local_identity::Model) -> Identity {
+    Identity {
+        name: row.name.clone(),
+        pronouns: row.pronouns.clone(),
+        role: row.role.clone(),
+        bio: row.bio.clone(),
+        status: row.status.clone(),
+        fingerprint: row.fingerprint.clone(),
+        integrations: serde_json::from_value(row.integrations_json.clone()).unwrap_or_default(),
+    }
 }
 
 fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
@@ -451,6 +485,18 @@ fn has_windows_drive_prefix(path: &str) -> bool {
 
 #[async_trait]
 impl EventStore for SqliteEventStore {
+    async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        SqliteEventStore::load_local_identity(self).await
+    }
+
+    async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError> {
+        SqliteEventStore::insert_local_identity(self, identity).await
+    }
+
+    async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
+        SqliteEventStore::save_local_identity_card(self, identity).await
+    }
+
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
         let active = to_active_model(&ev)?;
         // Insert with explicit "do nothing on conflict" so a replay
@@ -954,6 +1000,48 @@ mod tests {
         let page = store.page_recent(Some(room), 10).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0], ev);
+    }
+
+    #[tokio::test]
+    async fn local_identity_card_round_trips_through_store_trait() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let store_api: &dyn EventStore = &store;
+        let mut identity = Identity::new("alice");
+        identity.pronouns = "they".into();
+        identity.role = "substrate".into();
+        identity
+            .integrations
+            .insert("continuum".into(), "clio".into());
+
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa1),
+                client_id: ClientId::from_u128(0xc1),
+                version: 1,
+                created_at_ms: 42,
+                identity,
+            })
+            .await
+            .unwrap();
+
+        let mut updated = Identity::new("alice");
+        updated.status = "working".into();
+        updated
+            .integrations
+            .insert("openclaw".into(), "alice-ui".into());
+        store_api
+            .save_local_identity_card(updated.clone())
+            .await
+            .unwrap();
+
+        let stored = store_api
+            .load_local_identity()
+            .await
+            .unwrap()
+            .expect("local identity row");
+        assert_eq!(stored.peer_id, PeerId::from_u128(0xa1));
+        assert_eq!(stored.client_id, ClientId::from_u128(0xc1));
+        assert_eq!(stored.identity, updated);
     }
 
     #[tokio::test]

@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
+use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
 pub struct InMemoryEventStore {
+    local_identity: Mutex<Option<StoredLocalIdentity>>,
     events: Mutex<Vec<TranscriptEvent>>,
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
     subscriptions: Mutex<Vec<StoredSubscription>>,
@@ -26,6 +28,7 @@ pub struct InMemoryEventStore {
 impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
+            local_identity: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             runtime_cursors: Mutex::new(BTreeMap::new()),
             subscriptions: Mutex::new(Vec::new()),
@@ -43,6 +46,41 @@ impl Default for InMemoryEventStore {
 
 #[async_trait]
 impl EventStore for InMemoryEventStore {
+    async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        let identity = self
+            .local_identity
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(identity.clone())
+    }
+
+    async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError> {
+        let mut stored = self
+            .local_identity
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        if stored.is_some() {
+            return Err(StoreError::Database(sea_orm::DbErr::RecordNotInserted));
+        }
+        *stored = Some(identity);
+        Ok(())
+    }
+
+    async fn save_local_identity_card(
+        &self,
+        identity: airc_core::identity::Identity,
+    ) -> Result<(), StoreError> {
+        let mut stored = self
+            .local_identity
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let Some(row) = stored.as_mut() else {
+            return Err(StoreError::NotFound("local_identity"));
+        };
+        row.identity = identity;
+        Ok(())
+    }
+
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
         let mut events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         if events.iter().any(|e| e.event_id == ev.event_id) {
@@ -269,6 +307,35 @@ mod tests {
         store.append(ev.clone()).await.unwrap();
         let page = store.page_recent(Some(room), 10).await.unwrap();
         assert_eq!(page, vec![ev]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_local_identity_card_matches_store_trait() {
+        let store = InMemoryEventStore::new();
+        let store_api: &dyn EventStore = &store;
+        let mut identity = airc_core::identity::Identity::new("alice");
+        identity.role = "tester".into();
+
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa1),
+                client_id: ClientId::from_u128(0xc1),
+                version: 1,
+                created_at_ms: 42,
+                identity,
+            })
+            .await
+            .unwrap();
+
+        let mut updated = airc_core::identity::Identity::new("alice");
+        updated.status = "green".into();
+        store_api
+            .save_local_identity_card(updated.clone())
+            .await
+            .unwrap();
+
+        let stored = store_api.load_local_identity().await.unwrap().unwrap();
+        assert_eq!(stored.identity, updated);
     }
 
     #[tokio::test]

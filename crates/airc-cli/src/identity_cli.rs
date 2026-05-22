@@ -133,16 +133,11 @@ pub enum IdentityAction {
         transport_name: String,
     },
 
-    /// Print local identity from config.json.
-    ShowConfig {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    /// Print local identity from the ORM store.
+    Show,
 
-    /// Update local identity fields in config.json.
-    SetConfig {
-        #[arg(long)]
-        config: PathBuf,
+    /// Update local identity fields in the ORM store.
+    Set {
         #[arg(long)]
         pronouns: Option<String>,
         #[arg(long)]
@@ -153,40 +148,28 @@ pub enum IdentityAction {
         status: Option<String>,
     },
 
-    /// Link or unlink a platform handle in config.json.
-    LinkConfig {
-        #[arg(long)]
-        config: PathBuf,
+    /// Link or unlink a platform handle in the ORM store.
+    Link {
         #[arg(long)]
         platform: String,
         #[arg(long, default_value = "")]
         handle: String,
     },
 
-    /// Exit 2 when config identity should show the first-run nudge.
-    NudgeNeeded {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    /// Exit 2 when local identity should show the first-run nudge.
+    NudgeNeeded,
 
-    /// Merge a continuum persona JSON blob into config.json.
+    /// Merge a continuum persona JSON blob into the ORM identity store.
     ImportContinuum {
-        #[arg(long)]
-        config: PathBuf,
         #[arg(long)]
         blob: String,
     },
 
-    /// Print linked continuum handle from config.json.
-    ContinuumHandle {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    /// Print linked continuum handle from the ORM identity store.
+    ContinuumHandle,
 
     /// Push local identity fields to a linked continuum persona.
     PushContinuum {
-        #[arg(long)]
-        config: PathBuf,
         #[arg(long)]
         handle: String,
     },

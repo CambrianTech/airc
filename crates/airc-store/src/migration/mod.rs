@@ -15,6 +15,7 @@ mod m20260522_000005_create_local_identity;
 mod m20260522_000006_create_mesh_identity;
 mod m20260522_000007_create_account_registry;
 mod m20260522_000008_create_beacons;
+mod m20260522_000009_add_local_identity_card;
 
 pub struct Migrator;
 
@@ -30,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260522_000006_create_mesh_identity::Migration),
             Box::new(m20260522_000007_create_account_registry::Migration),
             Box::new(m20260522_000008_create_beacons::Migration),
+            Box::new(m20260522_000009_add_local_identity_card::Migration),
         ]
     }
 }

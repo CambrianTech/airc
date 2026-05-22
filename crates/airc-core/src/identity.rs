@@ -9,19 +9,17 @@
 //! and Hermes bind their user records to airc identities by pubkey rather
 //! than maintaining parallel account semantics.
 //!
-//! Field shape mirrors the Python `airc identity show` output one-to-one
-//! so the Rust port doesn't redesign — same six top-level fields, same
-//! defaults, same serde behavior (missing fields default to empty rather
-//! than fail).
+//! Field shape is the stable `airc identity show` contract: same six
+//! top-level fields, same defaults, same serde behavior (missing fields
+//! default to empty rather than fail).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A peer's user-facing identity card.
 ///
-/// Constructed from the scope's `config.json` identity record (or its Rust-
-/// store equivalent) and exposed by `airc identity show`, `airc whois`,
-/// and presence/event surfaces.
+/// Constructed from the local identity store row and exposed by
+/// `airc identity show`, `airc whois`, and presence/event surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Identity {
     /// Display nick. Other peers see this in `from=` and `whois` output.
@@ -44,7 +42,7 @@ pub struct Identity {
     pub status: String,
     /// Short identity fingerprint derived from the peer's pubkey.
     /// Computed by airc identity tooling, not authored by the user.
-    /// Format: short hex string matching the Python `airc identity show`
+    /// Format: short hex string matching the `airc identity show`
     /// `fingerprint:` line.
     #[serde(default)]
     pub fingerprint: String,
@@ -70,14 +68,13 @@ impl Identity {
 
     /// Is this identity "minimally set up" — has the user provided at
     /// least pronouns + role + bio? Used by the `airc identity` UX prompt
-    /// to decide whether to nudge for completion. Mirrors the Python
-    /// `_identity_needs_setup` heuristic.
+    /// to decide whether to nudge for completion.
     pub fn is_complete(&self) -> bool {
         !self.pronouns.is_empty() && !self.role.is_empty() && !self.bio.is_empty()
     }
 
     /// Mark / clear an "away" status. Empty string clears it (matches the
-    /// Python `airc away ""` and `airc identity set --status ""` semantics).
+    /// `airc away ""` and `airc identity set --status ""` semantics).
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }
@@ -135,9 +132,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrips_with_defaults_for_unset_fields() {
-        // Forward-compat: an Identity stored in scope config.json when only
-        // the nick was set should deserialize cleanly — other fields default
-        // to empty rather than fail.
+        // Forward-compat: an Identity stored when only the nick was set
+        // should deserialize cleanly — other fields default to empty
+        // rather than fail.
         let stored = serde_json::json!({ "name": "bob" });
         let id: Identity = serde_json::from_value(stored).unwrap();
         assert_eq!(id.name, "bob");
