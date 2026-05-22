@@ -74,7 +74,7 @@ fn unique_socket() -> std::path::PathBuf {
 }
 
 async fn spawn_daemon(home: &std::path::Path) -> (tokio::task::JoinHandle<()>, std::path::PathBuf) {
-    let identity = LocalIdentity::load_or_generate(home).unwrap();
+    let identity = LocalIdentity::load_or_generate(home).await.unwrap();
     let mut registry = PeerKeyRegistry::new();
     registry
         .enrol(identity.peer_id, 0, identity.keypair.public_bytes())

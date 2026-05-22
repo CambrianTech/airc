@@ -29,7 +29,9 @@ use airc_core::{
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
 
-use crate::entities::{event, peer_rotation_audit, peer_trust, runtime_cursor, subscription};
+use crate::entities::{
+    event, local_identity, peer_rotation_audit, peer_trust, runtime_cursor, subscription,
+};
 use crate::error::StoreError;
 use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
@@ -222,6 +224,68 @@ impl SqliteEventStore {
             })
             .collect()
     }
+
+    /// Load the singleton local-identity row, if it exists.
+    ///
+    /// Returns `Ok(None)` for a fresh database; the caller pairs this
+    /// with the on-disk `identity.key` to decide whether to load,
+    /// generate, or surface a partial-state error.
+    pub async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        let row = local_identity::Entity::find_by_id(local_identity::SINGLETON_ID)
+            .one(&self.db)
+            .await?;
+        row.map(|m| {
+            Ok(StoredLocalIdentity {
+                peer_id: PeerId::from_uuid(m.peer_id),
+                client_id: ClientId::from_uuid(m.client_id),
+                version: u32::try_from(m.version).map_err(|_| StoreError::InvalidStoredValue {
+                    field: "local_identity.version",
+                    value: m.version as i128,
+                })?,
+                created_at_ms: i64_to_u64("local_identity.created_at_ms", m.created_at_ms)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Persist the singleton local-identity row. Insert-only by
+    /// design — there is no `replace_local_identity` because a
+    /// peer_id / client_id change IS a new identity, not an update.
+    /// Calling this with a row already present returns an error
+    /// from the singleton CHECK + PK collision.
+    pub async fn insert_local_identity(
+        &self,
+        identity: StoredLocalIdentity,
+    ) -> Result<(), StoreError> {
+        let active = local_identity::ActiveModel {
+            id: Set(local_identity::SINGLETON_ID),
+            peer_id: Set(identity.peer_id.as_uuid()),
+            client_id: Set(identity.client_id.as_uuid()),
+            version: Set(i32::try_from(identity.version).map_err(|_| {
+                StoreError::InvalidStoredValue {
+                    field: "local_identity.version",
+                    value: identity.version as i128,
+                }
+            })?),
+            created_at_ms: Set(u64_to_i64(
+                "local_identity.created_at_ms",
+                identity.created_at_ms,
+            )?),
+        };
+        local_identity::Entity::insert(active)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Public DTO mirroring the singleton `local_identity` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLocalIdentity {
+    pub peer_id: PeerId,
+    pub client_id: ClientId,
+    pub version: u32,
+    pub created_at_ms: u64,
 }
 
 fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {

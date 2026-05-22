@@ -9,8 +9,13 @@
 //!   - `peer_trust` / `peer_rotation_audit` — trust anchors and
 //!     signed key-rotation audit rows.
 //!   - `subscriptions` — joined channel/default-channel state.
+//!   - `local_identity` — singleton metadata paired with the on-disk
+//!     `identity.key`. Secret material stays on disk; this table
+//!     holds the `peer_id` / `client_id` / version / created_at
+//!     bookkeeping that lived in `identity.json` before Phase 3.5.
 
 pub mod event;
+pub mod local_identity;
 pub mod peer_rotation_audit;
 pub mod peer_trust;
 pub mod runtime_cursor;

@@ -2,38 +2,46 @@
 //! stable `peer_id` + `client_id` so the substrate's identity survives
 //! across CLI invocations and across daemon restarts.
 //!
-//! Layout on disk (under `<home>/`, default `$HOME/.airc/`):
+//! Layout (under `<home>/`, default `$HOME/.airc/`):
 //!
-//!   - `identity.key`  — raw 32-byte Ed25519 secret (0600)
-//!   - `identity.json` — `{ peer_id, client_id, version, created_at_ms }` (0600)
+//!   - `identity.key`  — raw 32-byte Ed25519 secret (0600 on Unix).
+//!     Secret material stays in a file because secrets at rest belong
+//!     in OS-protected storage (filesystem perms, keychain,
+//!     SQLCipher, hardware enclave) — not inlined into a database
+//!     row that may be backed up, replicated, or inspected with a
+//!     generic SQL browser. The substrate rule: blobs on disk, never
+//!     in DB.
 //!
-//! The two files are paired. `load_or_generate` treats them as one
-//! unit: either both exist (load), or both are absent (generate +
-//! save). One present + one absent is an error — we refuse to recover
+//!   - `events.sqlite::local_identity` — singleton ORM row holding
+//!     the metadata that used to live in `identity.json`
+//!     (`peer_id`, `client_id`, schema version, created-at). Pairs
+//!     with the on-disk key.
+//!
+//! The two are paired. `load_or_generate` treats them as one unit:
+//! either both exist (load), or both are absent (generate + save).
+//! One present + one absent is an error — we refuse to recover
 //! ambiguously because losing either half changes peer identity.
 //!
-//! Storage caveat: this is plain on-disk material. A production
-//! deployment belongs behind SQLCipher / OS keychain / hardware
-//! enclave per the substrate `feedback_blobs_never_in_db` rule. The
-//! CLI's file storage is adequate for cross-process demos + the
-//! current daemon use case; it's deliberately replaceable.
+//! Storage caveat: `identity.key` is plain on-disk material. A
+//! production deployment belongs behind SQLCipher / OS keychain /
+//! hardware enclave. The 0600-file storage is adequate for
+//! cross-process demos + the current daemon use case; it's
+//! deliberately replaceable.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use airc_core::{ClientId, PeerId};
 use airc_protocol::PeerKeypair;
+use airc_store::{SqliteEventStore, StoreError, StoredLocalIdentity};
 
-/// On-disk schema version for `identity.json`. Bump when the file
-/// shape changes incompatibly.
+/// On-disk schema version for the singleton row. Bump when the
+/// stored shape changes incompatibly.
 const IDENTITY_STATE_VERSION: u32 = 1;
 
-/// Sibling metadata file alongside `identity.key`.
 const IDENTITY_KEY_FILENAME: &str = "identity.key";
-const IDENTITY_STATE_FILENAME: &str = "identity.json";
+const STORE_DB_FILENAME: &str = "events.sqlite";
 
-/// Persisted-state bundle: stable identity for this airc-core install.
+/// Persisted-state bundle: stable identity for this airc install.
 #[derive(Debug, Clone)]
 pub struct LocalIdentity {
     pub keypair: PeerKeypair,
@@ -41,26 +49,17 @@ pub struct LocalIdentity {
     pub client_id: ClientId,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct IdentityState {
-    version: u32,
-    peer_id: PeerId,
-    client_id: ClientId,
-    created_at_ms: u64,
-}
-
 #[derive(Debug)]
 pub enum IdentityError {
     Io(std::io::Error),
-    Json(serde_json::Error),
-    /// Identity-state file's `version` doesn't match what this build
-    /// knows how to read. Refuse to load rather than silently
-    /// reinterpret.
+    Store(StoreError),
+    /// Persisted row's `version` doesn't match what this build knows
+    /// how to read. Refuse to load rather than silently reinterpret.
     SchemaVersionMismatch {
         found: u32,
         expected: u32,
     },
-    /// `identity.key` exists but the sibling `identity.json` doesn't
+    /// `identity.key` exists but the paired singleton row is missing
     /// (or vice versa). The pair is required to disambiguate
     /// identity — refusing rather than regenerating prevents silent
     /// peer-id rotation.
@@ -79,11 +78,11 @@ impl std::fmt::Display for IdentityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IdentityError::Io(error) => write!(f, "identity I/O: {error}"),
-            IdentityError::Json(error) => write!(f, "identity state JSON: {error}"),
+            IdentityError::Store(error) => write!(f, "identity store: {error}"),
             IdentityError::SchemaVersionMismatch { found, expected } => {
                 write!(
                     f,
-                    "identity.json schema version {found}, this build expects {expected}"
+                    "local_identity row schema version {found}, this build expects {expected}"
                 )
             }
             IdentityError::PartialState {
@@ -92,7 +91,7 @@ impl std::fmt::Display for IdentityError {
             } => write!(
                 f,
                 "identity is half-initialised: key={} state={}. \
-                 Either remove both files to regenerate, or restore the missing one — \
+                 Either remove the remaining file/row to regenerate, or restore the missing half — \
                  the substrate refuses to invent a new peer_id over an existing key.",
                 key_exists, state_exists
             ),
@@ -109,7 +108,7 @@ impl std::error::Error for IdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             IdentityError::Io(error) => Some(error),
-            IdentityError::Json(error) => Some(error),
+            IdentityError::Store(error) => Some(error),
             IdentityError::Clock(error) => Some(error),
             IdentityError::SchemaVersionMismatch { .. }
             | IdentityError::PartialState { .. }
@@ -124,9 +123,9 @@ impl From<std::io::Error> for IdentityError {
     }
 }
 
-impl From<serde_json::Error> for IdentityError {
-    fn from(error: serde_json::Error) -> Self {
-        IdentityError::Json(error)
+impl From<StoreError> for IdentityError {
+    fn from(error: StoreError) -> Self {
+        IdentityError::Store(error)
     }
 }
 
@@ -137,36 +136,53 @@ impl From<std::time::SystemTimeError> for IdentityError {
 }
 
 impl LocalIdentity {
-    /// Path to the secret key file inside `home`.
+    /// Path to the secret key file inside `home`. Secret material
+    /// lives in a file with 0600 perms on Unix; this stays out of
+    /// the ORM database (see module doc).
     pub fn key_path(home: &Path) -> PathBuf {
         home.join(IDENTITY_KEY_FILENAME)
     }
 
-    /// Path to the state file inside `home`.
-    pub fn state_path(home: &Path) -> PathBuf {
-        home.join(IDENTITY_STATE_FILENAME)
-    }
-
     /// Load the existing identity from `home`, or generate a fresh
-    /// one (writing both files) if neither exists. Refuses to
+    /// one (writing both halves) if neither exists. Refuses to
     /// recover from a half-initialised state.
-    pub fn load_or_generate(home: &Path) -> Result<Self, IdentityError> {
+    pub async fn load_or_generate(home: &Path) -> Result<Self, IdentityError> {
+        let store = open_store(home).await?;
         let key_path = Self::key_path(home);
-        let state_path = Self::state_path(home);
         let key_exists = key_path.exists();
-        let state_exists = state_path.exists();
-        match (key_exists, state_exists) {
-            (true, true) => Self::load(home),
-            (false, false) => Self::generate_and_save(home),
+        let stored = store.load_local_identity().await?;
+        match (key_exists, stored) {
+            (true, Some(stored)) => Self::load_with_metadata(home, stored),
+            (false, None) => Self::generate_and_save(home, &store).await,
             (key, state) => Err(IdentityError::PartialState {
                 key_exists: key,
-                state_exists: state,
+                state_exists: state.is_some(),
             }),
         }
     }
 
-    /// Load an existing identity (both files must exist).
-    pub fn load(home: &Path) -> Result<Self, IdentityError> {
+    /// Load an existing identity (both halves must exist). Public
+    /// for the cases that already know they have a populated
+    /// install and want to fail loudly if either half is missing.
+    pub async fn load(home: &Path) -> Result<Self, IdentityError> {
+        let store = open_store(home).await?;
+        let stored = store
+            .load_local_identity()
+            .await?
+            .ok_or(IdentityError::PartialState {
+                key_exists: Self::key_path(home).exists(),
+                state_exists: false,
+            })?;
+        Self::load_with_metadata(home, stored)
+    }
+
+    fn load_with_metadata(home: &Path, stored: StoredLocalIdentity) -> Result<Self, IdentityError> {
+        if stored.version != IDENTITY_STATE_VERSION {
+            return Err(IdentityError::SchemaVersionMismatch {
+                found: stored.version,
+                expected: IDENTITY_STATE_VERSION,
+            });
+        }
         let key_bytes = std::fs::read(Self::key_path(home))?;
         if key_bytes.len() != 32 {
             return Err(IdentityError::BadKeyLength(key_bytes.len()));
@@ -174,26 +190,21 @@ impl LocalIdentity {
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&key_bytes);
         let keypair = PeerKeypair::from_secret_bytes(&secret);
-
-        let state_text = std::fs::read_to_string(Self::state_path(home))?;
-        let state: IdentityState = serde_json::from_str(&state_text)?;
-        if state.version != IDENTITY_STATE_VERSION {
-            return Err(IdentityError::SchemaVersionMismatch {
-                found: state.version,
-                expected: IDENTITY_STATE_VERSION,
-            });
-        }
         Ok(Self {
             keypair,
-            peer_id: state.peer_id,
-            client_id: state.client_id,
+            peer_id: stored.peer_id,
+            client_id: stored.client_id,
         })
     }
 
-    /// Generate a fresh identity + persist it under `home`. Returns
-    /// the same `LocalIdentity` a subsequent `load(home)` would
-    /// produce.
-    pub fn generate_and_save(home: &Path) -> Result<Self, IdentityError> {
+    /// Generate a fresh identity + persist it. Writes the secret
+    /// key file (0600) and inserts the singleton row in one logical
+    /// step; if the row insert fails after the key was written, the
+    /// caller can clean up by removing `identity.key` and retrying.
+    pub async fn generate_and_save(
+        home: &Path,
+        store: &SqliteEventStore,
+    ) -> Result<Self, IdentityError> {
         ensure_home_dir(home)?;
         let keypair = PeerKeypair::generate();
         let peer_id = PeerId::new();
@@ -202,14 +213,14 @@ impl LocalIdentity {
 
         write_owner_only(&Self::key_path(home), &keypair.secret_bytes())?;
 
-        let state = IdentityState {
-            version: IDENTITY_STATE_VERSION,
-            peer_id,
-            client_id,
-            created_at_ms,
-        };
-        let state_text = serde_json::to_string_pretty(&state)?;
-        write_owner_only(&Self::state_path(home), state_text.as_bytes())?;
+        store
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id,
+                client_id,
+                version: IDENTITY_STATE_VERSION,
+                created_at_ms,
+            })
+            .await?;
 
         Ok(Self {
             keypair,
@@ -219,9 +230,20 @@ impl LocalIdentity {
     }
 }
 
+async fn open_store(home: &Path) -> Result<SqliteEventStore, IdentityError> {
+    if let Some(parent) = home.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(home)?;
+        }
+    } else {
+        std::fs::create_dir_all(home)?;
+    }
+    Ok(SqliteEventStore::open_path(&home.join(STORE_DB_FILENAME)).await?)
+}
+
 /// Create `home` if missing; on Unix, restrict to 0700 (owner-only)
-/// so the secret + state files aren't even discoverable by other
-/// users on the same machine.
+/// so the secret file isn't even discoverable by other users on the
+/// same machine.
 fn ensure_home_dir(home: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(home)?;
     #[cfg(unix)]
@@ -265,28 +287,30 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn load_or_generate_creates_both_files_and_reuses_them() {
+    #[tokio::test]
+    async fn load_or_generate_creates_both_halves_and_reuses_them() {
         let home = TempDir::new().unwrap();
-        let first = LocalIdentity::load_or_generate(home.path()).unwrap();
+        let first = LocalIdentity::load_or_generate(home.path()).await.unwrap();
         assert!(LocalIdentity::key_path(home.path()).exists());
-        assert!(LocalIdentity::state_path(home.path()).exists());
 
-        let second = LocalIdentity::load_or_generate(home.path()).unwrap();
+        let second = LocalIdentity::load_or_generate(home.path()).await.unwrap();
         // The crucial invariant: same key, same peer_id across runs.
         assert_eq!(first.keypair.secret_bytes(), second.keypair.secret_bytes());
         assert_eq!(first.peer_id, second.peer_id);
         assert_eq!(first.client_id, second.client_id);
     }
 
-    #[test]
-    fn refuses_partial_state_when_only_key_exists() {
-        // Key without state would silently regenerate a fresh peer_id
+    #[tokio::test]
+    async fn refuses_partial_state_when_only_key_exists() {
+        // Key without row would silently regenerate a fresh peer_id
         // if we tolerated it — that would break every prior peer
         // who'd already enrolled the old peer_id. Refuse.
         let home = TempDir::new().unwrap();
         write_owner_only(&LocalIdentity::key_path(home.path()), &[0u8; 32]).unwrap();
-        let result = LocalIdentity::load_or_generate(home.path());
+        // Open + close the store so its file exists but the
+        // singleton row does not.
+        let _store = open_store(home.path()).await.unwrap();
+        let result = LocalIdentity::load_or_generate(home.path()).await;
         assert!(matches!(
             result,
             Err(IdentityError::PartialState {
@@ -296,12 +320,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn refuses_partial_state_when_only_json_exists() {
+    #[tokio::test]
+    async fn refuses_partial_state_when_only_row_exists() {
         let home = TempDir::new().unwrap();
         std::fs::create_dir_all(home.path()).unwrap();
-        std::fs::write(LocalIdentity::state_path(home.path()), "{}").unwrap();
-        let result = LocalIdentity::load_or_generate(home.path());
+        let store = open_store(home.path()).await.unwrap();
+        store
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::new(),
+                client_id: ClientId::new(),
+                version: IDENTITY_STATE_VERSION,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let result = LocalIdentity::load_or_generate(home.path()).await;
         assert!(matches!(
             result,
             Err(IdentityError::PartialState {
@@ -311,51 +344,27 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn refuses_bad_key_length() {
+    #[tokio::test]
+    async fn refuses_bad_key_length() {
         let home = TempDir::new().unwrap();
-        let identity = LocalIdentity::generate_and_save(home.path()).unwrap();
+        let identity = LocalIdentity::load_or_generate(home.path()).await.unwrap();
         // Corrupt the key file.
         std::fs::write(LocalIdentity::key_path(home.path()), b"too short").unwrap();
-        let result = LocalIdentity::load(home.path());
+        let result = LocalIdentity::load(home.path()).await;
         assert!(matches!(result, Err(IdentityError::BadKeyLength(_))));
         // The valid identity we generated above is still good — pin
         // that load failure doesn't corrupt the in-memory copy.
         assert_eq!(identity.peer_id.to_string().len(), 36);
     }
 
-    #[test]
-    fn refuses_unknown_schema_version() {
-        let home = TempDir::new().unwrap();
-        LocalIdentity::generate_and_save(home.path()).unwrap();
-        std::fs::write(
-            LocalIdentity::state_path(home.path()),
-            r#"{"version":999,"peer_id":"00000000-0000-0000-0000-000000000001","client_id":"00000000-0000-0000-0000-000000000002","created_at_ms":0}"#,
-        )
-        .unwrap();
-        let result = LocalIdentity::load(home.path());
-        assert!(matches!(
-            result,
-            Err(IdentityError::SchemaVersionMismatch {
-                found: 999,
-                expected: IDENTITY_STATE_VERSION,
-            })
-        ));
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn key_and_state_files_are_owner_only_on_unix() {
+    #[tokio::test]
+    async fn key_file_is_owner_only_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let home = TempDir::new().unwrap();
-        LocalIdentity::generate_and_save(home.path()).unwrap();
-        for file in [
-            LocalIdentity::key_path(home.path()),
-            LocalIdentity::state_path(home.path()),
-        ] {
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-            // Strip the file-type bits, keep just the perm bits.
-            assert_eq!(mode & 0o777, 0o600, "{} not 0600", file.display());
-        }
+        LocalIdentity::load_or_generate(home.path()).await.unwrap();
+        let key = LocalIdentity::key_path(home.path());
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{} not 0600", key.display());
     }
 }

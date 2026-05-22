@@ -185,7 +185,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(airc_daemon::IdentityError::Io)?;
-        let identity = LocalIdentity::load_or_generate(&home)?;
+        let identity = LocalIdentity::load_or_generate(&home).await?;
         let wire_root = machine_account_home(&home);
         std::fs::create_dir_all(&wire_root).map_err(airc_daemon::IdentityError::Io)?;
         peers_store::add(
