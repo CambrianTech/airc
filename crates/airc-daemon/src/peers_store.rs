@@ -168,6 +168,7 @@ impl From<StoreError> for PeersStoreError {
             | StoreError::DuplicateEventId(_)
             | StoreError::UnknownTranscriptKind(_)
             | StoreError::InvalidStoredValue { .. }
+            | StoreError::NotFound(_)
             | StoreError::Codec(_) => PeersStoreError::Store(error),
         }
     }

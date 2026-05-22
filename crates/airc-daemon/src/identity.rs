@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use airc_core::{ClientId, PeerId};
+use airc_core::{identity::Identity, ClientId, PeerId};
 use airc_protocol::PeerKeypair;
 use airc_store::{SqliteEventStore, StoreError, StoredLocalIdentity};
 
@@ -219,6 +219,7 @@ impl LocalIdentity {
                 client_id,
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms,
+                identity: Identity::default(),
             })
             .await?;
 
@@ -331,6 +332,7 @@ mod tests {
                 client_id: ClientId::new(),
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms: 1,
+                identity: Identity::default(),
             })
             .await
             .unwrap();

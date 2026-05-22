@@ -377,28 +377,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 name,
                 transport_name,
             } => identity_commands::run_write_work_session(&session_file, &name, &transport_name),
-            IdentityAction::ShowConfig { config } => identity_commands::run_show_config(&config),
-            IdentityAction::SetConfig {
-                config,
+            IdentityAction::Show => identity_commands::run_show(&home).await,
+            IdentityAction::Set {
                 pronouns,
                 role,
                 bio,
                 status,
-            } => identity_commands::run_set_config(&config, pronouns, role, bio, status),
-            IdentityAction::LinkConfig {
-                config,
-                platform,
-                handle,
-            } => identity_commands::run_link_config(&config, &platform, &handle),
-            IdentityAction::NudgeNeeded { config } => identity_commands::run_nudge_needed(&config),
-            IdentityAction::ImportContinuum { config, blob } => {
-                identity_commands::run_import_continuum(&config, &blob)
+            } => identity_commands::run_set(&home, pronouns, role, bio, status).await,
+            IdentityAction::Link { platform, handle } => {
+                identity_commands::run_link(&home, &platform, &handle).await
             }
-            IdentityAction::ContinuumHandle { config } => {
-                identity_commands::run_continuum_handle(&config)
+            IdentityAction::NudgeNeeded => identity_commands::run_nudge_needed(&home).await,
+            IdentityAction::ImportContinuum { blob } => {
+                identity_commands::run_import_continuum(&home, &blob).await
             }
-            IdentityAction::PushContinuum { config, handle } => {
-                identity_commands::run_push_continuum(&config, &handle)
+            IdentityAction::ContinuumHandle => identity_commands::run_continuum_handle(&home).await,
+            IdentityAction::PushContinuum { handle } => {
+                identity_commands::run_push_continuum(&home, &handle).await
             }
         },
 

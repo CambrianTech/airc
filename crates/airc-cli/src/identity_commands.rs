@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use airc_core::identity::Identity;
+use airc_daemon::LocalIdentity;
+use airc_store::{EventStore, SqliteEventStore};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
@@ -123,17 +126,14 @@ pub fn run_write_work_session(
     write_work_session(session_file, name, transport_name)
 }
 
-pub fn run_show_config(config: &Path) -> Result<(), Box<dyn Error>> {
-    let Some(root) = load_config_opt(config) else {
-        println!("  (no config — run airc join)");
-        return Ok(());
-    };
-    print_config_identity(&root);
+pub async fn run_show(home: &Path) -> Result<(), Box<dyn Error>> {
+    let identity = load_identity_card(home).await?;
+    print_identity(&identity);
     Ok(())
 }
 
-pub fn run_set_config(
-    config: &Path,
+pub async fn run_set(
+    home: &Path,
     pronouns: Option<String>,
     role: Option<String>,
     bio: Option<String>,
@@ -147,34 +147,27 @@ pub fn run_set_config(
     validate_len("bio", bio.as_deref(), BIO_MAX)?;
     validate_len("status", status.as_deref(), STATUS_MAX)?;
 
-    let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity")?;
-    set_optional_string(ident, "pronouns", pronouns);
-    set_optional_string(ident, "role", role);
-    set_optional_string(ident, "bio", bio);
-    set_optional_string(ident, "status", status);
-    save_config(config, &root)?;
+    let mut identity = load_identity_card(home).await?;
+    set_optional_string(&mut identity.pronouns, pronouns);
+    set_optional_string(&mut identity.role, role);
+    set_optional_string(&mut identity.bio, bio);
+    set_optional_string(&mut identity.status, status);
+    save_identity_card(home, identity).await?;
     println!("  identity updated.");
     Ok(())
 }
 
-pub fn run_link_config(config: &Path, platform: &str, handle: &str) -> Result<(), Box<dyn Error>> {
-    let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity")?;
-    let integrations = object_map_field_mut(ident, "integrations")?;
-    let previous = integrations
-        .get(platform)
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+pub async fn run_link(home: &Path, platform: &str, handle: &str) -> Result<(), Box<dyn Error>> {
+    let mut identity = load_identity_card(home).await?;
+    let previous = identity.integrations.get(platform).cloned();
     if handle.trim().is_empty() {
-        integrations.remove(platform);
+        identity.integrations.remove(platform);
     } else {
-        integrations.insert(
-            platform.to_string(),
-            Value::String(handle.trim().to_string()),
-        );
+        identity
+            .integrations
+            .insert(platform.to_string(), handle.trim().to_string());
     }
-    save_config(config, &root)?;
+    save_identity_card(home, identity).await?;
 
     match (handle.trim().is_empty(), previous) {
         (false, Some(prev)) if prev != handle.trim() => {
@@ -191,45 +184,29 @@ pub fn run_link_config(config: &Path, platform: &str, handle: &str) -> Result<()
     Ok(())
 }
 
-pub fn run_nudge_needed(config: &Path) -> Result<(), Box<dyn Error>> {
-    let Some(root) = load_config_opt(config) else {
-        return Ok(());
-    };
-    let ident = root.get("identity").and_then(Value::as_object);
-    let all_unset = ["pronouns", "role", "bio"].iter().all(|field| {
-        ident
-            .and_then(|items| items.get(*field))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .is_none()
-    });
-    if all_unset {
+pub async fn run_nudge_needed(home: &Path) -> Result<(), Box<dyn Error>> {
+    let identity = load_identity_card(home).await?;
+    if !identity.is_complete() {
         return Err(NudgeNeeded.into());
     }
     Ok(())
 }
 
-pub fn run_import_continuum(config: &Path, blob: &str) -> Result<(), Box<dyn Error>> {
+pub async fn run_import_continuum(home: &Path, blob: &str) -> Result<(), Box<dyn Error>> {
     let source: Value = serde_json::from_str(blob).unwrap_or(Value::Null);
-    let mut root = load_config_required(config)?;
-    let ident = object_field_mut(&mut root, "identity")?;
-    for key in ["pronouns", "role", "bio"] {
-        if let Some(value) = source
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            ident.insert(key.to_string(), Value::String(value.to_string()));
-        }
-    }
+    let mut identity = load_identity_card(home).await?;
+    set_from_source(&mut identity.pronouns, &source, "pronouns");
+    set_from_source(&mut identity.role, &source, "role");
+    set_from_source(&mut identity.bio, &source, "bio");
     let name = source
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let integrations = object_map_field_mut(ident, "integrations")?;
-    integrations.insert("continuum".to_string(), Value::String(name.clone()));
-    save_config(config, &root)?;
+    identity
+        .integrations
+        .insert("continuum".to_string(), name.clone());
+    save_identity_card(home, identity).await?;
     println!(
         "  imported continuum:{} -> pronouns={} role={} bio set={}",
         if name.is_empty() { "?" } else { &name },
@@ -244,13 +221,11 @@ pub fn run_import_continuum(config: &Path, blob: &str) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-pub fn run_continuum_handle(config: &Path) -> Result<(), Box<dyn Error>> {
-    let root = load_config_required(config)?;
-    if let Some(handle) = root
-        .get("identity")
-        .and_then(|identity| identity.get("integrations"))
-        .and_then(|integrations| integrations.get("continuum"))
-        .and_then(Value::as_str)
+pub async fn run_continuum_handle(home: &Path) -> Result<(), Box<dyn Error>> {
+    let identity = load_identity_card(home).await?;
+    if let Some(handle) = identity
+        .integrations
+        .get("continuum")
         .filter(|value| !value.is_empty())
     {
         println!("{handle}");
@@ -258,22 +233,21 @@ pub fn run_continuum_handle(config: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn run_push_continuum(config: &Path, handle: &str) -> Result<(), Box<dyn Error>> {
-    let root = load_config_required(config)?;
-    let identity = root.get("identity").unwrap_or(&Value::Null);
+pub async fn run_push_continuum(home: &Path, handle: &str) -> Result<(), Box<dyn Error>> {
+    let identity = load_identity_card(home).await?;
     let mut args = vec![
         "persona".to_string(),
         "update".to_string(),
         handle.to_string(),
     ];
-    for key in ["pronouns", "role", "bio"] {
-        if let Some(value) = identity
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
+    for (key, value) in [
+        ("pronouns", identity.pronouns),
+        ("role", identity.role),
+        ("bio", identity.bio),
+    ] {
+        if !value.is_empty() {
             args.push(format!("--{key}"));
-            args.push(value.to_string());
+            args.push(value);
         }
     }
     let output = Command::new("continuum").args(&args).output()?;
@@ -287,6 +261,29 @@ pub fn run_push_continuum(config: &Path, handle: &str) -> Result<(), Box<dyn Err
     }
     println!("  pushed local identity to continuum:{handle}");
     Ok(())
+}
+
+async fn load_identity_card(home: &Path) -> Result<Identity, Box<dyn Error>> {
+    let _ = LocalIdentity::load_or_generate(home).await?;
+    let store = identity_store(home).await?;
+    let stored = store
+        .load_local_identity()
+        .await?
+        .ok_or("local identity row missing after initialization")?;
+    Ok(stored.identity)
+}
+
+async fn save_identity_card(home: &Path, identity: Identity) -> Result<(), Box<dyn Error>> {
+    let _ = LocalIdentity::load_or_generate(home).await?;
+    let store = identity_store(home).await?;
+    store.save_local_identity_card(identity).await?;
+    Ok(())
+}
+
+async fn identity_store(home: &Path) -> Result<Box<dyn EventStore>, Box<dyn Error>> {
+    Ok(Box::new(
+        SqliteEventStore::open_path(&home.join("events.sqlite")).await?,
+    ))
 }
 
 fn peer_ssh_pub(peers_dir: &Path, peer_name: &str) -> Option<String> {
@@ -505,72 +502,24 @@ fn slug(value: &str) -> String {
     }
 }
 
-fn load_config_opt(config: &Path) -> Option<Value> {
-    fs::read_to_string(config)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-}
-
-fn load_config_required(config: &Path) -> Result<Value, Box<dyn Error>> {
-    let root = load_config_opt(config).ok_or("config JSON is missing or malformed")?;
-    if !root.is_object() {
-        return Err("config JSON root must be an object".into());
-    }
-    Ok(root)
-}
-
-fn save_config(config: &Path, root: &Value) -> Result<(), Box<dyn Error>> {
-    fs::write(config, serde_json::to_string_pretty(root)?)?;
-    Ok(())
-}
-
-fn object_field_mut<'a>(
-    root: &'a mut Value,
-    key: &str,
-) -> Result<&'a mut serde_json::Map<String, Value>, Box<dyn Error>> {
-    let Value::Object(object) = root else {
-        return Err("config JSON root must be an object".into());
-    };
-    if !object.get(key).is_some_and(Value::is_object) {
-        object.insert(key.to_string(), Value::Object(Default::default()));
-    }
-    match object.get_mut(key) {
-        Some(Value::Object(field)) => Ok(field),
-        Some(
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
-        )
-        | None => Err(format!("failed to initialize {key} object").into()),
-    }
-}
-
-fn object_map_field_mut<'a>(
-    object: &'a mut serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<&'a mut serde_json::Map<String, Value>, Box<dyn Error>> {
-    if !object.get(key).is_some_and(Value::is_object) {
-        object.insert(key.to_string(), Value::Object(Default::default()));
-    }
-    match object.get_mut(key) {
-        Some(Value::Object(field)) => Ok(field),
-        Some(
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
-        )
-        | None => Err(format!("failed to initialize {key} object").into()),
-    }
-}
-
-fn set_optional_string(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: Option<String>,
-) {
+fn set_optional_string(field: &mut String, value: Option<String>) {
     if let Some(value) = value {
         let value = value.trim();
         if value.is_empty() {
-            object.remove(key);
+            field.clear();
         } else {
-            object.insert(key.to_string(), Value::String(value.to_string()));
+            *field = value.to_string();
         }
+    }
+}
+
+fn set_from_source(field: &mut String, source: &Value, key: &str) {
+    if let Some(value) = source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        *field = value.to_string();
     }
 }
 
@@ -581,39 +530,28 @@ fn validate_len(name: &str, value: Option<&str>, max: usize) -> Result<(), Box<d
     Ok(())
 }
 
-fn print_config_identity(root: &Value) {
-    let identity = root.get("identity").unwrap_or(&Value::Null);
-    let name = root.get("name").and_then(Value::as_str).unwrap_or("?");
-    print_identity_value("name", name, "");
-    print_identity_field(identity, "pronouns", PRONOUNS_MAX, "(unset)");
-    print_identity_field(identity, "role", ROLE_MAX, "(unset)");
-    print_identity_field(identity, "bio", BIO_MAX, "(unset)");
-    print_identity_field(
-        identity,
+fn print_identity(identity: &Identity) {
+    print_identity_value("name", &identity.name, "");
+    print_identity_value(
+        "pronouns",
+        &truncate_str(&identity.pronouns, PRONOUNS_MAX),
+        "(unset)",
+    );
+    print_identity_value("role", &truncate_str(&identity.role, ROLE_MAX), "(unset)");
+    print_identity_value("bio", &truncate_str(&identity.bio, BIO_MAX), "(unset)");
+    print_identity_value(
         "status",
-        STATUS_MAX,
+        &truncate_str(&identity.status, STATUS_MAX),
         "(unset; airc away <msg> to set)",
     );
-    if let Some(integrations) = identity
-        .get("integrations")
-        .and_then(Value::as_object)
-        .filter(|items| !items.is_empty())
-    {
+    if !identity.integrations.is_empty() {
         println!("  integrations:");
-        for (key, value) in integrations {
-            let text = value
-                .as_str()
-                .map_or_else(|| value.to_string(), str::to_string);
-            println!("    {key}: {text}");
+        for (key, value) in &identity.integrations {
+            println!("    {key}: {value}");
         }
     } else {
         println!("  integrations: (none)");
     }
-}
-
-fn print_identity_field(identity: &Value, key: &str, max: usize, fallback: &str) {
-    let value = truncated(identity, key, max).unwrap_or_default();
-    print_identity_value(key, &value, fallback);
 }
 
 fn print_identity_value(key: &str, value: &str, fallback: &str) {
@@ -622,13 +560,12 @@ fn print_identity_value(key: &str, value: &str, fallback: &str) {
     println!("  {label:<11} {display}");
 }
 
-fn truncated(identity: &Value, key: &str, max: usize) -> Option<String> {
-    let value = identity.get(key)?.as_str()?.to_string();
+fn truncate_str(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
-        Some(value)
+        value.to_string()
     } else {
         let prefix: String = value.chars().take(max.saturating_sub(3)).collect();
-        Some(format!("{prefix}..."))
+        format!("{prefix}...")
     }
 }
 
@@ -767,67 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn set_and_link_config_updates_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config.json");
-        fs::write(&config, r#"{"name":"codex","identity":{}}"#).unwrap();
-
-        run_set_config(
-            &config,
-            Some("they".to_string()),
-            Some("rust-cutter".to_string()),
-            Some("Moves runtime identity state into Rust.".to_string()),
-            None,
-        )
-        .unwrap();
-        run_link_config(&config, "continuum", "clio").unwrap();
-
-        let saved: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
-        assert_eq!(saved["identity"]["pronouns"], "they");
-        assert_eq!(saved["identity"]["role"], "rust-cutter");
-        assert_eq!(
-            saved["identity"]["bio"],
-            "Moves runtime identity state into Rust."
-        );
-        assert_eq!(saved["identity"]["integrations"]["continuum"], "clio");
-
-        run_link_config(&config, "continuum", "").unwrap();
-        let saved: Value = serde_json::from_str(&fs::read_to_string(config).unwrap()).unwrap();
-        assert!(saved["identity"]["integrations"]
-            .as_object()
-            .unwrap()
-            .get("continuum")
-            .is_none());
-    }
-
-    #[test]
-    fn import_continuum_merges_identity_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config.json");
-        fs::write(
-            &config,
-            r#"{"name":"codex","identity":{"status":"reviewing"}}"#,
-        )
-        .unwrap();
-
-        run_import_continuum(
-            &config,
-            r#"{"name":"clio","pronouns":"she/they","role":"memory-architect","bio":"Builds recall."}"#,
-        )
-        .unwrap();
-
-        let saved: Value = serde_json::from_str(&fs::read_to_string(config).unwrap()).unwrap();
-        assert_eq!(saved["identity"]["pronouns"], "she/they");
-        assert_eq!(saved["identity"]["role"], "memory-architect");
-        assert_eq!(saved["identity"]["bio"], "Builds recall.");
-        assert_eq!(saved["identity"]["status"], "reviewing");
-        assert_eq!(saved["identity"]["integrations"]["continuum"], "clio");
-    }
-
-    #[test]
     fn truncated_preserves_utf8_boundary() {
-        let value = json!({"bio":"ééééé"});
-
-        assert_eq!(truncated(&value, "bio", 4).as_deref(), Some("é..."));
+        assert_eq!(truncate_str("ééééé", 4), "é...");
     }
 }

@@ -6,8 +6,8 @@
 //! file storage with 0600 perms or, in production, behind SQLCipher
 //! / OS keychain / hardware enclave). What lives here is the
 //! **metadata that callers need to pair with the on-disk key**:
-//! `peer_id`, `client_id`, schema version, and the originally
-//! recorded creation timestamp.
+//! `peer_id`, `client_id`, schema version, the originally recorded
+//! creation timestamp, and user-facing identity-card fields.
 //!
 //! Singleton: there is exactly zero or one row. The migration uses
 //! an integer primary key fixed at `1` rather than a sentinel string
@@ -31,6 +31,13 @@ pub struct Model {
     pub client_id: Uuid,
     pub version: i32,
     pub created_at_ms: i64,
+    pub name: String,
+    pub pronouns: String,
+    pub role: String,
+    pub bio: String,
+    pub status: String,
+    pub fingerprint: String,
+    pub integrations_json: Json,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

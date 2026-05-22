@@ -38,6 +38,10 @@ pub enum StoreError {
     #[error("invalid stored value for {field}: {value}")]
     InvalidStoredValue { field: &'static str, value: i128 },
 
+    /// Expected row is absent.
+    #[error("store row not found: {0}")]
+    NotFound(&'static str),
+
     /// Peer trust conflict: a stored peer has a different public key.
     #[error(
         "peer {peer_id} is already enrolled with pubkey {stored_pubkey_b64}; cannot replace it with {attempted_pubkey_b64} without signed rotation"

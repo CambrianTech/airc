@@ -10,6 +10,7 @@ use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
+use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::subscriptions::StoredSubscription;
 
@@ -21,6 +22,22 @@ use crate::subscriptions::StoredSubscription;
 /// is the deterministic tiebreaker.
 #[async_trait]
 pub trait EventStore: Send + Sync {
+    /// Load this install's singleton local identity row, if present.
+    async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError>;
+
+    /// Insert this install's singleton local identity row.
+    ///
+    /// Implementations must fail if a row already exists; changing
+    /// peer/client identity is a new identity, not an update.
+    async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError>;
+
+    /// Replace only the user-facing identity card fields on the
+    /// singleton row. Peer/client ids are immutable.
+    async fn save_local_identity_card(
+        &self,
+        identity: airc_core::identity::Identity,
+    ) -> Result<(), StoreError>;
+
     /// Durably persist `event`. On success the event is visible to
     /// every subsequent `page_recent` / `resume_from` call against
     /// the same store handle and to any other handle pointing at the
