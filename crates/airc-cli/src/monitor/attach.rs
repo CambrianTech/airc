@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, EventFilter};
+use airc_daemon::{AttachRequest, DaemonClient, Response, SubscribeRequest};
+use airc_lib::Airc;
 use airc_protocol::HEADER_AIRC_CLIENT;
-use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
 use crate::client_id::current_client_id;
@@ -13,22 +13,39 @@ use crate::client_id::current_client_id;
 pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
-    let mut stream = airc
-        .subscribe_subscribed_filtered(EventFilter {
-            kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
-            ..EventFilter::default()
-        })
-        .await?;
+    let socket = crate::cli::default_socket_path_in(home);
+    let client = DaemonClient::new(socket);
+    let set = airc.subscription_set().await?;
+    for subscription in set.all() {
+        client
+            .subscribe(SubscribeRequest {
+                wire: subscription.as_room().wire,
+            })
+            .await?;
+    }
+    let stream = client.attach(AttachRequest::default()).await?;
+    let mut reader = BufReader::new(stream);
     let mut sandbox = Sandbox::new();
 
     println!("airc: attached to Rust event stream for subscribed channels");
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(event) => render_event(&event, client_id.as_deref(), &mut sandbox),
-            Err(lag) => eprintln!("airc: monitor lagged; {lag}"),
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let response: Response = serde_json::from_str(line.trim_end_matches('\n'))?;
+        match response {
+            Response::Ok => {}
+            Response::Event { event } => {
+                if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
+                    render_event(event.as_ref(), client_id.as_deref(), &mut sandbox);
+                }
+            }
+            Response::Error { message } => return Err(message.into()),
+            Response::Pong | Response::Status(_) | Response::Inbox(_) | Response::Peers(_) => {}
         }
     }
-    Ok(())
 }
 
 fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut Sandbox) {

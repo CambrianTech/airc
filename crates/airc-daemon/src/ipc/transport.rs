@@ -52,9 +52,21 @@ impl IpcStream {
         #[cfg(windows)]
         {
             let pipe_name = resolve_pipe_name(path);
-            tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&pipe_name)
-                .map(IpcStream::WindowsClient)
+            let client = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                tokio::task::spawn_blocking(move || {
+                    tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name)
+                }),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out opening daemon named pipe",
+                )
+            })?
+            .map_err(|error| std::io::Error::other(format!("named-pipe open task: {error}")))??;
+            Ok(IpcStream::WindowsClient(client))
         }
     }
 }

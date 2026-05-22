@@ -13,15 +13,18 @@
 //! `VerificationPolicy::Strict` is the only policy used in CLI paths.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
 use airc_daemon::{
-    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState, LocalIdentity,
+    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState,
+    LocalIdentity, SubscribeRequest,
 };
 use airc_lib::{Airc, Body, Headers, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
@@ -101,6 +104,139 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             println!("wire:    {}", current.wire.display());
             print_scope_context(home, &current.wire);
         }
+    }
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    subscribe_daemon_to_current_rooms(home, socket).await?;
+    Ok(())
+}
+
+pub async fn ensure_daemon_running(
+    home: &Path,
+    socket: PathBuf,
+    _peers: Vec<PeerSpec>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = DaemonClient::new(socket.clone());
+    if client
+        .ping_with_timeout(Duration::from_millis(250))
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(home)?;
+    let log = home.join("airc-daemon.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
+    let stderr = stdout.try_clone()?;
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--home")
+        .arg(home)
+        .arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    detach_daemon(&mut command);
+    command.spawn()?;
+
+    let client = DaemonClient::new(socket);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if client
+            .ping_with_timeout(Duration::from_millis(250))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("daemon did not become ready; see {}", log.display()).into())
+}
+
+#[cfg(unix)]
+fn detach_daemon(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: this closure runs in the child just before exec and
+    // only calls setsid, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_daemon(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+async fn subscribe_daemon_to_current_rooms(
+    home: &Path,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let client = DaemonClient::new(socket);
+    let set = airc.subscription_set().await?;
+    sync_daemon_peers(&client, home, &set).await?;
+    for subscription in set.all() {
+        client
+            .subscribe(SubscribeRequest {
+                wire: subscription.as_room().wire,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn sync_daemon_peers(
+    client: &DaemonClient,
+    home: &Path,
+    set: &airc_lib::SubscriptionSet,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sync_daemon_peers_from_store(client, home).await?;
+    for subscription in set.all() {
+        if let Some(wire_root) = subscription
+            .as_room()
+            .wire
+            .parent()
+            .and_then(|path| path.parent())
+        {
+            if wire_root != home {
+                sync_daemon_peers_from_store(client, wire_root).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn sync_daemon_peers_from_store(
+    client: &DaemonClient,
+    home: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for peer in peers_store::load(home)? {
+        client
+            .add_peer(AddPeerRequest {
+                peer_id: peer.peer_id,
+                pubkey_b64: peer.pubkey_b64,
+            })
+            .await?;
     }
     Ok(())
 }
@@ -350,6 +486,8 @@ pub async fn run_msg(
     socket: PathBuf,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    subscribe_daemon_to_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
     airc.say_with_headers(text, runtime_headers()?).await?;

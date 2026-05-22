@@ -17,6 +17,10 @@ pub enum Response {
     /// caller threads back on the next call to keep the stream
     /// consume-once.
     Inbox(InboxResponse),
+    /// One live event emitted by an `Attach` stream.
+    Event {
+        event: Box<airc_core::TranscriptEvent>,
+    },
     /// Response to `ListPeers` — the daemon's currently-enrolled
     /// peers (peer_id + URL-safe-no-padding base64 pubkey).
     Peers(PeersResponse),
@@ -98,5 +102,35 @@ mod tests {
         assert!(encoded.contains("boom"));
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn event_response_wraps_transcript_without_tag_collision() {
+        use airc_core::{
+            Body, ClientId, EventId, Headers, MentionTarget, RoomId, TranscriptEvent,
+            TranscriptKind,
+        };
+
+        let response = Response::Event {
+            event: Box::new(TranscriptEvent {
+                event_id: EventId::new(),
+                room_id: RoomId::new(),
+                peer_id: PeerId::new(),
+                client_id: ClientId::new(),
+                kind: TranscriptKind::Message,
+                occurred_at_ms: 1,
+                lamport: 1,
+                target: MentionTarget::All,
+                headers: Headers::new(),
+                body: Some(Body::text("hello")),
+                attachment: None,
+                receipt: None,
+                metadata: serde_json::Value::Null,
+            }),
+        };
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 }

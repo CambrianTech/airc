@@ -164,6 +164,7 @@ fn monitor_attach_streams_rust_events_without_legacy_log() {
 
     let _ = claude_monitor.kill();
     let _ = claude_monitor.wait();
+    installed_stop(&claude_user_home);
 }
 
 struct InitOutput {
@@ -263,6 +264,19 @@ fn installed_inbox(user_home: &Path) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("inbox stdout utf-8")
+}
+
+fn installed_stop(user_home: &Path) {
+    let output = installed_command(user_home)
+        .arg("stop")
+        .output()
+        .expect("airc stop must spawn");
+    assert!(
+        output.status.success(),
+        "stop failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn installed_command(user_home: &Path) -> Command {

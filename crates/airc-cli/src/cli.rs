@@ -91,6 +91,21 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 
 /// Default Unix socket path inside `home`.
 pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use sha2::{Digest, Sha256};
+        let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        let hex = digest
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        std::env::temp_dir().join(format!("airc-{hex}.sock"))
+    }
+    #[cfg(not(unix))]
     home.join("daemon.sock")
 }
 
