@@ -128,12 +128,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     // other script that needs setup-only without inheriting cargo
     // envs.
     if should_attach_after_join() {
-        println!();
-        println!("attached — Ctrl-C to detach.");
-        let mut stream = airc
-            .subscribe_subscribed_filtered(airc_lib::EventFilter::default())
-            .await?;
-        print_event_stream_until_signal(&mut stream).await?;
+        crate::join_feed::run(&airc, home).await?;
     }
     Ok(())
 }
