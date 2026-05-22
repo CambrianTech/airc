@@ -1,110 +1,55 @@
-//! End-to-end coverage for `airc-core transport ...`.
+//! End-to-end coverage for `airc transport ...`.
 
-use std::fs;
-use std::path::Path;
 use std::process::Command;
 
 use tempfile::TempDir;
 
-fn airc_core() -> &'static str {
+fn airc() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
 }
 
 #[test]
-fn transport_health_reports_fresh_heartbeat() {
+fn transport_health_reports_route_snapshot_from_substrate() {
     let workspace = TempDir::new().expect("tempdir");
-    let home = workspace.path();
-    let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
-    write_config(home, gist);
-    fs::write(
-        home.join("bearer_state.general.json"),
-        format!(r#"{{"last_heartbeat_ts":{}}}"#, now_seconds()),
-    )
-    .unwrap();
-    fs::write(
-        home.join(format!("bearer_gist.{gist}.pid")),
-        std::process::id().to_string(),
-    )
-    .unwrap();
 
-    let output = run_ok(home, &["transport", "health"]);
+    let output = run_ok(workspace.path(), &["transport", "health"]);
 
-    assert!(output.contains("transport health: ok (1 channel(s) fresh)"));
-    assert!(output.contains("#general: ok"));
+    assert!(output.contains("transport health: ok (1 route(s) healthy)"));
+    assert!(output.contains("- local-fs role=direct state=healthy"));
+    assert!(output.contains("endpoints: none"));
+    assert!(output.contains("lan peers: none"));
 }
 
 #[test]
-fn transport_health_fail_exits_nonzero_when_degraded() {
+fn transport_health_degraded_only_is_silent_when_routes_are_clean() {
     let workspace = TempDir::new().expect("tempdir");
-    let home = workspace.path();
-    let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
-    write_config(home, gist);
-    fs::write(
-        home.join("bearer_state.general.json"),
-        r#"{"last_heartbeat_ts":700}"#,
-    )
-    .unwrap();
-    fs::write(home.join(format!("bearer_gist.{gist}.pid")), "999999").unwrap();
 
-    let output = run_raw(
-        home,
-        &["transport", "health", "--fresh-after", "90", "--fail"],
+    let output = run_ok(
+        workspace.path(),
+        &["transport", "health", "--degraded-only"],
     );
-
-    assert!(!output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("transport health: DEGRADED"));
-    assert!(stdout.contains("stale heartbeat"));
-}
-
-#[test]
-fn transport_health_default_reports_degraded_without_failing() {
-    let workspace = TempDir::new().expect("tempdir");
-    let home = workspace.path();
-    let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
-    write_config(home, gist);
-
-    let output = run_ok(home, &["transport", "health"]);
-
-    assert!(output.contains("transport health: DEGRADED"));
-    assert!(output.contains("no bearer_state file"));
-}
-
-#[test]
-fn transport_health_degraded_only_is_silent_when_clean() {
-    let workspace = TempDir::new().expect("tempdir");
-    let home = workspace.path();
-    let gist = "c68640ec0144b422c16b2d8c83ad5ee5";
-    write_config(home, gist);
-    fs::write(
-        home.join("bearer_state.general.json"),
-        format!(r#"{{"last_heartbeat_ts":{}}}"#, now_seconds()),
-    )
-    .unwrap();
-    fs::write(
-        home.join(format!("bearer_gist.{gist}.pid")),
-        std::process::id().to_string(),
-    )
-    .unwrap();
-
-    let output = run_ok(home, &["transport", "health", "--degraded-only"]);
 
     assert!(output.trim().is_empty());
 }
 
-fn write_config(home: &Path, gist: &str) {
-    fs::write(
-        home.join("config.json"),
-        format!(r#"{{"subscribed_channels":["general"],"channel_gists":{{"general":"{gist}"}}}}"#),
-    )
-    .unwrap();
+#[test]
+fn transport_health_quiet_succeeds_when_routes_are_clean() {
+    let workspace = TempDir::new().expect("tempdir");
+
+    let output = run_raw(
+        workspace.path(),
+        &["transport", "health", "--quiet", "--fail"],
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
 }
 
-fn run_ok(home: &Path, args: &[&str]) -> String {
+fn run_ok(home: &std::path::Path, args: &[&str]) -> String {
     let output = run_raw(home, args);
     assert!(
         output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
+        "airc {:?} failed: stdout={} stderr={}",
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -112,18 +57,11 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
-fn run_raw(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(airc_core())
+fn run_raw(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(airc())
         .arg("--home")
         .arg(home)
         .args(args)
         .output()
-        .expect("airc-core command must spawn")
-}
-
-fn now_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .expect("airc command must spawn")
 }
