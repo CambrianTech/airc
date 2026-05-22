@@ -180,6 +180,171 @@ Acceptance gates:
 - `airc doctor` can report backpressure and stale resource pressure.
 - Workspace drain policy is exercised against real `~/.airc/worktrees`.
 
+## Phase 3.5 — SeaORM End-to-End (Kill the JSON Files)
+
+Goal: one durable, transactional, indexed source of truth for **all**
+substrate state. Today only the events table goes through SeaORM —
+every other persisted collection is a hand-rolled JSON file with
+temp-write-and-rename, no index, no transaction, no schema. That's
+"ORM as append log," not "ORM as the state model."
+
+This phase is the elegance baseline: stop the per-collection drift.
+
+Move to SeaORM entities (one row, one table, one transaction):
+
+| Today (JSON file + temp-rename) | Phase 3.5 (SeaORM table) |
+|---|---|
+| `peers.json` | `peers` (FK from events.peer_id) |
+| `subscriptions.json` | `subscriptions` (FK to rooms) |
+| `room.json` (current room marker) | `rooms` table + `default` flag |
+| `identity.json` (singleton) | `identity` table (singleton row) |
+| `mesh_identity` cache file | `mesh_identity` table (or column on identity) |
+| `account_registry/*.json` | `account_registry` table |
+| `coordinator/*.beacon` | `beacons` table with `ttl_expires_at` |
+| `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `cursors` table (per-runtime-client, per-channel) |
+
+What dies the day this lands:
+- Every `tmp + rename` pattern (DB transaction is atomic).
+- Every "re-read this file on every command" cache miss.
+- The Windows replace-on-rename special-casing.
+- Cursor file sprawl (one row per `(client_id, channel)`).
+- "Which file owns peers" ambiguity (peers are in a table; foreign
+  keys make ownership obvious).
+- Drains: `DELETE FROM beacons WHERE ttl_expires_at < ?` replaces
+  every "scan dir, decode each file, filter, unlink" loop.
+
+What Continuum's bus gets day-1:
+- A `sea_orm::DatabaseConnection` it can hold and query directly
+  through `airc-lib`. No CLI parsing, no JSON file reads.
+- `SELECT * FROM peers WHERE last_seen_at > ?` instead of file globbing.
+- Lifecycle events become rows in the same events table with a
+  typed `kind`, observable via the same subscription stream.
+
+Acceptance gates:
+
+- `crates/airc-lib` contains zero `std::fs::write` calls in hot paths
+  (CLI install/migration helpers excepted).
+- All persisted collections have a SeaORM entity with migration.
+- One transaction can update peers + subscriptions + cursors
+  atomically (e.g. `airc join` is one DB transaction, not 4 separate
+  file rewrites).
+- A consumer (Continuum's bus) can mount the same DB read-only and
+  query peers/subs/rooms without CLI mediation.
+
+## Phase 3.6 — Performance Hotpaths (Make It FAST)
+
+The substrate has to carry Continuum's whole grid — events,
+commands, presence, p2p. Joel's bar: **fast**. The audit found
+five concrete hotpaths and seven kill-list patterns.
+
+### Top 5 perf problems (worst first)
+
+1. **Synchronous file I/O on every CLI/subscribe call** —
+   `peers_store.rs:217`, `subscriptions.rs:437-458`. Every subscribe,
+   send, or join re-reads `peers.json` + `subscriptions.json` from
+   disk. ~5–15ms per JSON read × every invocation. Phase 3.5 (move
+   to SeaORM) kills this.
+
+2. **Double clone of `TranscriptEvent` on every ingest** —
+   `messaging.rs:110`, `transport.rs:124`. Each event is cloned
+   for store and again for broadcast. ~100–200 ns × N events/sec,
+   plus allocator churn. Fix: `Arc<TranscriptEvent>` internally;
+   broadcast becomes `Arc::clone` (cheap).
+
+3. **`RwLock<PeerKeyRegistry>` at process-global granularity** —
+   `airc.rs:118`, `transport/signed.rs:135-145`. Every frame
+   verification acquires a read lock. At 5000 frames/sec on a
+   many-peer grid, that's 5–25 ms/s of contention. Fix: `DashMap`
+   (sharded concurrent map, no global lock).
+
+4. **`event.clone()` on broadcast fan-out** — `messaging.rs:114`.
+   With N=50 subscribers, ~10 µs/event in clones alone. Subsumed
+   by Top #2 once events go through Arc.
+
+5. **Linear peer dedup at startup** — `airc.rs:204-209`.
+   `enrolled.contains()` on a `Vec` is O(N²) during init. At N=500
+   peers (large org grid), ~250 µs per Airc::open. Fix: HashSet,
+   not Vec.
+
+### Substrate-wide patterns to kill (priority order)
+
+1. **Synchronous file I/O in async functions** — peers.json,
+   subscriptions.json reads on event path. (Phase 3.5 deletes
+   these files entirely.)
+2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
+   route_health, route_endpoints, imported_invites. Switch to
+   `DashMap` or sharded RwLock for N-reader scale.
+3. **Full JSON file rewrites on every mutate** — `peers_store`
+   save, `subscriptions` save. Phase 3.5 kills these.
+4. **`event.clone()` on broadcast hot path** — `Arc<TranscriptEvent>`
+   internally; broadcast is `Arc::clone`.
+5. **Linear scans for dedup** — `enrolled.contains`, subscriptions
+   iteration. HashSet / indexed lookup.
+6. **Verification lock held across async I/O** — `signed.rs`
+   `registry.read()` during stream processing. Snapshot the
+   registry once or use `try_read()` with fallback.
+7. **Untracked `tokio::spawn` tasks** — `transport.rs:52`
+   (`spawn_frame_ingest` at line 91). No cancellation, no shutdown
+   signal. Use `JoinSet` + a broadcast shutdown channel; cancel on
+   drop.
+
+### Layering rot (architectural)
+
+- **`airc-lib` imports `airc-daemon::peers_store` + `DaemonClient`**
+  (`airc-lib/src/airc.rs:29-30`). The library reaches into the
+  daemon crate's internals. Clean shape: trait
+  `PersistentStore { async fn load_peers(...) }` and the daemon
+  provides an impl. Library never names daemon types.
+- **`airc-transport::signed` holds an `Arc<RwLock<PeerKeyRegistry>>`**
+  (`transport/signed.rs:129-146`) but doesn't own its lifecycle.
+  Key rotation invalidates lib's registry but transport has a stale
+  reference. Fix: verification is a pure function or a delegate
+  passed per frame; transport does not own crypto state.
+- **Daemon IPC is line-delimited JSON without length-framing**
+  (implied from `airc-daemon/src/ipc/request.rs`). A newline in a
+  message body breaks the parser. No backpressure framing. Fix:
+  length-prefixed CBOR/protobuf, or proper RPC codec (tonic).
+
+### SeaORM perf notes (for Phase 3.5)
+
+If moving peers/subs/rooms/identity/cursors/beacons into SeaORM:
+
+- **Indexes**: `(peer_id)` unique on peers; `(room_id, lamport,
+  event_id)` composite for `resume_from`; `(occurred_at_ms)` for
+  time-range scans; `(ttl_expires_at)` for beacon drains.
+- **Pool sizing**: SQLite is single-writer — `max_connections(1)`
+  on write side; open read-only connections separately with
+  `PRAGMA query_only=ON`. Postgres pool = `(cpu × 2) + spare`.
+- **Batching**: `insert_many()` for high-event-rate workloads
+  (≥100 events per flush). Wrap in a transaction.
+- **JSON columns**: keep `body`/`metadata` JSON, but **don't**
+  store anything you need to query (peer_id, room_id, etc.) as
+  JSON — promote those to typed columns with indexes.
+- **WAL mode**: `PRAGMA journal_mode=WAL` (already on events) —
+  apply to all tables. Allows concurrent readers during write.
+
+### Benchmarks to land BEFORE refactoring
+
+Need numbers we can defend, not vibes. Five baselines to measure
+on the current code, then prove wins:
+
+1. **Throughput**: `events/sec from 1 publisher → 1 subscriber
+   with 0/5/50 broadcast consumers`. Target: 5000 ev/sec at <500 µs
+   p99.
+2. **Peer registry lookup at scale**: `peer_id verification at
+   N=10/100/500 peers under 100 concurrent frame tasks`. Target:
+   <5 µs at N=500.
+3. **Subscription join latency**: `cold first join + 100th join on
+   same wire`. Target: <10 ms cold, <2 ms warm.
+4. **Broadcast lag**: histogram from `append_sent_frame` →
+   subscriber's first read. Target: <100 µs p99.
+5. **Allocation churn**: heap profile at 1000 ev/sec for 10 s.
+   Target: sub-linear RSS growth, <10 allocs/event after warmup.
+
+Bench harness lives in `crates/airc-lib/benches/` (new). Criterion
+or `divan`. Numbers go in `docs/architecture/PERF-BASELINES.md`
+(new).
+
 ## Phase 4 — Command Bus Primitive
 
 Goal: support Continuum/Hermes/OpenClaw command traffic without each
