@@ -9,7 +9,21 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
-CLONE_DIR="${AIRC_DIR:-$HOME/.airc/src}"
+
+_default_clone_dir() {
+  local script="${BASH_SOURCE[0]:-}"
+  local script_dir=""
+  if [ -n "$script" ] && [ -f "$script" ]; then
+    script_dir="$(cd "$(dirname "$script")" && pwd -P)"
+    if [ -f "$script_dir/Cargo.toml" ] && [ -d "$script_dir/crates/airc-cli" ]; then
+      printf '%s\n' "$script_dir"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$HOME/.airc/src"
+}
+
+CLONE_DIR="${AIRC_DIR:-$(_default_clone_dir)}"
 # BIN_DIR holds a tiny command shim. The shim execs $HOME/.airc/src/airc
 # so the canonical source command remains the single implementation,
 # while agent/non-interactive shells that already have ~/.local/bin on

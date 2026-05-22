@@ -52,6 +52,10 @@ if ! git grep -q 'Installed airc: [$]BIN_DIR/airc' -- install.sh; then
   fail "install.sh must install the Rust binary at \$BIN_DIR/airc (or .exe on Windows)"
 fi
 
+if ! git grep -q '_default_clone_dir' -- install.sh; then
+  fail "install.sh must resolve a checked-out source tree before defaulting to ~/.airc/src"
+fi
+
 if git grep -nE 'Installed command shim:|cat > "[$]BIN_DIR/airc" <<' -- install.sh; then
   fail "install.sh must not install a bash wrapper shim — the Rust binary is the user surface"
 fi
