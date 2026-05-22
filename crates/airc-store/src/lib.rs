@@ -1,10 +1,11 @@
-//! `airc-store` — durable event store for AIRC transcripts.
+//! `airc-store` — durable ORM store for AIRC runtime data.
 //!
 //! Closes grievance §5 (CLI/Daemon Is Accumulating Policy — the
 //! needed crate split lists `airc-store` as the source of truth for
-//! events) and §7 (Inbox And Replay Need Stronger Cursor Semantics —
-//! the store owns `(lamport, event_id)` cursoring and channel-aware
-//! filtering rather than the per-wire JSONL append in airc-transport).
+//! runtime data) and §7 (Inbox And Replay Need Stronger Cursor
+//! Semantics — the store owns `(lamport, event_id)` cursoring and
+//! channel-aware filtering rather than the per-wire JSONL append in
+//! airc-transport).
 //!
 //! The trait surface ([`EventStore`]) is the consumer-facing API:
 //!   - `append(event)` durably persists a `TranscriptEvent`;
@@ -12,6 +13,8 @@
 //!   - `resume_from(cursor, channel, limit)` returns events strictly
 //!     after the cursor;
 //!   - `latest_cursor(channel)` returns the newest cursor or None.
+//!   - peer trust tables hold enrolled peer keys and signed rotation
+//!     audit rows.
 //!
 //! Two implementations ship in this crate:
 //!   - [`SqliteEventStore`]: SeaORM-backed SQLite. Production target
@@ -30,10 +33,12 @@ pub mod entities;
 pub mod error;
 pub mod memory;
 pub mod migration;
+pub mod peer_trust;
 pub mod sqlite;
 pub mod store;
 
 pub use error::StoreError;
 pub use memory::InMemoryEventStore;
+pub use peer_trust::{RotationAuditEntry, StoredPeer};
 pub use sqlite::SqliteEventStore;
 pub use store::EventStore;

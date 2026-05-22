@@ -34,7 +34,7 @@ pub struct DaemonState {
     pub registry: Arc<RwLock<PeerKeyRegistry>>,
     pub policy: VerificationPolicy,
     /// Home directory the daemon was started against. Lets handlers
-    /// reach `<home>/peers.json` etc. without re-deriving the path.
+    /// reach the store and IPC state without re-deriving the path.
     pub home: PathBuf,
     /// When the daemon started — used for the Status uptime field.
     pub started_at: Instant,

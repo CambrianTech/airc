@@ -5,7 +5,7 @@
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
 //!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket for the daemon
-//!   - `peers.json`     — (future) persisted peer registry
+//!   - `events.sqlite`  — ORM-backed event, cursor, and peer trust store
 //!
 //! The `--home` flag overrides for testing / multi-identity setups.
 
@@ -127,7 +127,7 @@ pub struct Cli {
 
     /// Ad-hoc peers to enrol for this invocation only, repeatable.
     /// Format: `<uuid>:<base64-pubkey-no-padding>`. Persistent peers
-    /// come from `<home>/peers.json` (managed via `airc peer add`);
+    /// come from the peer trust store (managed via `airc peer add`);
     /// this flag unions on top for one-shot use.
     #[arg(long = "peer", value_name = "SPEC", global = true)]
     pub peers: Vec<PeerSpec>,
@@ -295,7 +295,7 @@ pub enum Command {
         wire: Option<PathBuf>,
     },
 
-    /// Manage the persisted peer registry (`<home>/peers.json`).
+    /// Manage the persisted peer trust registry.
     Peer(PeerArgs),
 
     /// Inspect transport route policy and candidate selection.
@@ -461,7 +461,6 @@ pub enum PeerAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// List enrolled peers. Reads from peers.json on disk (the
-    /// daemon writes the same file, so both views agree).
+    /// List enrolled peers from the peer trust store.
     List,
 }

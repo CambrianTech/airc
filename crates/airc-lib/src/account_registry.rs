@@ -267,7 +267,7 @@ fn safe_component(value: &str) -> String {
 }
 
 impl Airc {
-    pub fn account_registry_document(&self) -> Result<AccountRegistryDocument, AircError> {
+    pub async fn account_registry_document(&self) -> Result<AccountRegistryDocument, AircError> {
         let identity = self.mesh_identity()?;
         let snapshot = crate::coordinator::snapshot(
             &self.inner.wire_root,
@@ -279,7 +279,7 @@ impl Airc {
             peer_id: self.inner.identity.peer_id,
             pubkey: self.inner.identity.keypair.public_bytes(),
         }];
-        for stored in airc_daemon::peers_store::load(&self.inner.wire_root)? {
+        for stored in airc_daemon::peers_store::load(&self.inner.wire_root).await? {
             peer_specs.push(PeerSpec {
                 peer_id: stored.peer_id,
                 pubkey: stored.pubkey_bytes()?,
@@ -298,7 +298,7 @@ impl Airc {
         &self,
         store: &dyn AccountRegistryStore,
     ) -> Result<AccountRegistryDocument, AircError> {
-        let document = self.account_registry_document()?;
+        let document = self.account_registry_document().await?;
         store.publish(&document).await?;
         Ok(document)
     }
@@ -329,7 +329,8 @@ impl Airc {
                 &self.inner.wire_root,
                 peer.peer_spec.peer_id,
                 peer.peer_spec.pubkey,
-            )?;
+            )
+            .await?;
             self.enrol_volatile_peer(&peer.peer_spec)?;
             crate::coordinator::publish(
                 &self.inner.wire_root,
@@ -338,7 +339,7 @@ impl Airc {
             )?;
             self.import_invite_beacon(peer.invite_beacon()).await?;
         }
-        self.sync_account_peer_registry()?;
+        self.sync_account_peer_registry().await?;
         Ok(())
     }
 }
@@ -539,7 +540,9 @@ mod tests {
             .await
             .unwrap();
 
-        let peers = airc_daemon::peers_store::load(&airc.inner.wire_root).unwrap();
+        let peers = airc_daemon::peers_store::load(&airc.inner.wire_root)
+            .await
+            .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == spec.peer_id));
         let snapshot = crate::coordinator::snapshot(
             &airc.inner.wire_root,
@@ -577,7 +580,9 @@ mod tests {
         let refreshed = airc_b.refresh_account_registry(&store).await.unwrap();
 
         assert!(refreshed.is_some());
-        let peers = airc_daemon::peers_store::load(&airc_b.inner.wire_root).unwrap();
+        let peers = airc_daemon::peers_store::load(&airc_b.inner.wire_root)
+            .await
+            .unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
         let snapshot = crate::coordinator::snapshot(
             &airc_b.inner.wire_root,

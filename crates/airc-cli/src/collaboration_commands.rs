@@ -23,9 +23,12 @@ struct CollaborationEvidence {
     any_activity: Option<MessageActivity>,
 }
 
-pub fn run_status(default_home: &Path, args: CollaborationScopeArgs) -> Result<(), Box<dyn Error>> {
+pub async fn run_status(
+    default_home: &Path,
+    args: CollaborationScopeArgs,
+) -> Result<(), Box<dyn Error>> {
     let home = args.home.as_deref().unwrap_or(default_home);
-    let count = peer_record_count(home);
+    let count = peer_record_count(home).await;
     let evidence = collaboration_evidence(home, &args.my_name, &args.client_id);
     let any_recent = evidence
         .recent_activity
@@ -70,9 +73,12 @@ pub fn run_status(default_home: &Path, args: CollaborationScopeArgs) -> Result<(
     Ok(())
 }
 
-pub fn run_doctor(default_home: &Path, args: CollaborationScopeArgs) -> Result<(), Box<dyn Error>> {
+pub async fn run_doctor(
+    default_home: &Path,
+    args: CollaborationScopeArgs,
+) -> Result<(), Box<dyn Error>> {
     let home = args.home.as_deref().unwrap_or(default_home);
-    let count = peer_record_count(home);
+    let count = peer_record_count(home).await;
     let evidence = collaboration_evidence(home, &args.my_name, &args.client_id);
     let now = Utc::now().timestamp();
     if count > 0 {
@@ -125,12 +131,12 @@ pub fn run_doctor(default_home: &Path, args: CollaborationScopeArgs) -> Result<(
     Err(command_exit(2))
 }
 
-pub fn run_send_warning(
+pub async fn run_send_warning(
     default_home: &Path,
     args: CollaborationScopeArgs,
 ) -> Result<(), Box<dyn Error>> {
     let home = args.home.as_deref().unwrap_or(default_home);
-    if peer_record_count(home) == 0
+    if peer_record_count(home).await == 0
         && recent_remote_speakers(home, &args.my_name, &args.client_id).is_empty()
     {
         eprintln!(
@@ -167,8 +173,8 @@ pub fn command_exit_code(error: &(dyn Error + 'static)) -> Option<u8> {
     error.downcast_ref::<CommandExit>().map(|error| error.0)
 }
 
-fn peer_record_count(home: &Path) -> usize {
-    legacy_peer_record_count(home) + rust_peer_record_count(home)
+async fn peer_record_count(home: &Path) -> usize {
+    legacy_peer_record_count(home) + rust_peer_record_count(home).await
 }
 
 /// Count peers from the legacy `<home>/peers/<peer>.json` per-peer
@@ -192,9 +198,9 @@ fn legacy_peer_record_count(home: &Path) -> usize {
 
 /// Count peers in the Rust substrate's peer registry. Two locations
 /// matter:
-///   1. `<home>/peers.json` — per-scope registry written by the
-///      airc-daemon when a peer is enrolled via this scope.
-///   2. `$HOME/.airc/peers.json` — the machine-account registry
+///   1. `<home>/events.sqlite` — per-scope peer trust rows written
+///      when a peer is enrolled via this scope.
+///   2. `$HOME/.airc/events.sqlite` — the machine-account peer trust store
 ///      shared by all scopes on this user's machine. `Airc::open`
 ///      adds every loaded identity to BOTH, so a scope running from
 ///      a project subdir still publishes its peer record into the
@@ -203,12 +209,12 @@ fn legacy_peer_record_count(home: &Path) -> usize {
 /// Without counting the second path, `airc status` says SOLO even
 /// when another scope on the same machine has enrolled, which made
 /// the substrate look broken when it was actually working.
-fn rust_peer_record_count(home: &Path) -> usize {
+async fn rust_peer_record_count(home: &Path) -> usize {
     use std::collections::HashSet;
 
     let mut seen: HashSet<airc_core::PeerId> = HashSet::new();
     for path in rust_peer_registry_paths(home) {
-        if let Ok(peers) = airc_daemon::peers_store::load(&path) {
+        if let Ok(peers) = airc_daemon::peers_store::load(&path).await {
             for peer in peers {
                 seen.insert(peer.peer_id);
             }
@@ -412,14 +418,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn peer_record_count_requires_valid_json_files() {
+    #[tokio::test]
+    async fn peer_record_count_requires_valid_json_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("peers")).unwrap();
         fs::write(dir.path().join("peers").join("alice.json"), "{}").unwrap();
         fs::write(dir.path().join("peers").join("broken.json"), "{").unwrap();
         fs::write(dir.path().join("peers").join("note.txt"), "{}").unwrap();
 
-        assert_eq!(peer_record_count(dir.path()), 1);
+        assert_eq!(peer_record_count(dir.path()).await, 1);
     }
 }

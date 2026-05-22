@@ -38,7 +38,7 @@ impl Airc {
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
-        self.sync_account_peer_registry()?;
+        self.sync_account_peer_registry().await?;
         let room = self.current_room().await?;
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();

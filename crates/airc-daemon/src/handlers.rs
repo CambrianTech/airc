@@ -196,9 +196,9 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
     use base64::Engine;
     // We don't currently expose registry iteration on
     // PeerKeyRegistry (only by-peer lookup + find_peer). Read the
-    // persisted peers.json instead — the source of truth that both
-    // the daemon and CLI write to.
-    let peers = match crate::peers_store::load(&state.home) {
+    // persisted peer trust store instead — the source of truth that
+    // both the daemon and CLI write to.
+    let peers = match crate::peers_store::load(&state.home).await {
         Ok(peers) => peers,
         Err(error) => {
             return Response::Error {
@@ -264,8 +264,8 @@ mod tests {
         let mut registry = PeerKeyRegistry::new();
         registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
         let registry = Arc::new(RwLock::new(registry));
-        // Test home is fresh per-call — empty peers.json is fine for
-        // dispatcher tests; no on-disk state required.
+        // Test home is fresh per-call — empty peer trust store is
+        // fine for dispatcher tests; no preexisting state required.
         let home = tempfile::TempDir::new().unwrap();
         let home_path = home.path().to_path_buf();
         // Keep the TempDir alive for the test's lifetime by leaking

@@ -377,7 +377,7 @@ async fn sync_daemon_peers_from_store(
     client: &DaemonClient,
     home: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for peer in peers_store::load(home)? {
+    for peer in peers_store::load(home).await? {
         client
             .add_peer(AddPeerRequest {
                 peer_id: peer.peer_id,
@@ -572,7 +572,7 @@ pub async fn run_daemon(
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_combined_registry(home, &identity, &peers)?;
+    let registry = build_combined_registry(home, &identity, &peers).await?;
 
     if let Some(parent) = socket.parent() {
         if !parent.as_os_str().is_empty() {
@@ -755,18 +755,18 @@ fn print_event(event: &airc_core::TranscriptEvent) {
 }
 
 /// Build the runtime `PeerKeyRegistry` from persistent peers
-/// (`<home>/peers.json`) + ad-hoc `--peer` flags. Self is always
+/// (store-backed peer trust) + ad-hoc `--peer` flags. Self is always
 /// enroled. Ad-hoc unions on top of persistent — if the same peer_id
 /// appears in both, the ad-hoc pubkey wins (matches "this invocation
 /// is authoritative" intuition).
-fn build_combined_registry(
+async fn build_combined_registry(
     home: &Path,
     identity: &LocalIdentity,
     adhoc: &[PeerSpec],
 ) -> Result<Arc<RwLock<PeerKeyRegistry>>, Box<dyn std::error::Error>> {
     let mut registry = PeerKeyRegistry::new();
     registry.enrol(identity.peer_id, 0, identity.keypair.public_bytes())?;
-    for stored in peers_store::load(home)? {
+    for stored in peers_store::load(home).await? {
         registry.enrol(stored.peer_id, 0, stored.pubkey_bytes()?)?;
     }
     for spec in adhoc {
@@ -775,7 +775,7 @@ fn build_combined_registry(
     Ok(Arc::new(RwLock::new(registry)))
 }
 
-/// `peer add <spec>` — persist a peer to `<home>/peers.json` via
+/// `peer add <spec>` — persist a peer to the trust store via
 /// `Airc::add_peer`. If a daemon is running on the given socket,
 /// also tells it via the AddPeer RPC so the in-memory registry
 /// stays in sync.
@@ -794,7 +794,7 @@ pub async fn run_peer_add(
     println!("enroled peer_id={peer_id} (pubkey 32 bytes)");
 
     // Best-effort daemon sync. If the daemon isn't running, that's
-    // fine — it'll pick up peers.json on next start.
+    // fine — it'll pick up the trust store on next start.
     let client = DaemonClient::new(socket);
     match client
         .add_peer(AddPeerRequest {
@@ -805,14 +805,14 @@ pub async fn run_peer_add(
     {
         Ok(()) => println!("daemon: in-memory registry updated."),
         Err(_) => {
-            println!("daemon: not running (peers.json updated; daemon will load on next start).")
+            println!("daemon: not running (trust store updated; daemon will load on next start).")
         }
     }
     Ok(())
 }
 
 /// `peer list` — print enroled peers via `Airc::peers`. The daemon
-/// writes the same `<home>/peers.json`, so this view stays
+/// writes the same trust store, so this view stays
 /// consistent whether the daemon is running or not.
 pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;

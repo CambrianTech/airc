@@ -258,7 +258,9 @@ fn same_machine_scopes_share_account_wire_and_registry() {
                     .join(".airc/wires/general")
             );
 
-            let peers = airc_daemon::peers_store::load(&machine.path().join(".airc")).unwrap();
+            let peers = airc_daemon::peers_store::load(&machine.path().join(".airc"))
+                .await
+                .unwrap();
             assert_eq!(
                 peers.len(),
                 2,

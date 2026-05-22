@@ -177,6 +177,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "async-trait",
+ "base64",
  "sea-orm",
  "sea-orm-migration",
  "serde",
