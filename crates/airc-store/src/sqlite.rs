@@ -240,7 +240,7 @@ fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, StoreError> {
 fn sqlite_file_url(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
     if has_windows_drive_prefix(&raw) {
-        format!("sqlite:///{raw}?mode=rwc")
+        format!("sqlite:{raw}?mode=rwc")
     } else {
         format!("sqlite://{raw}?mode=rwc")
     }
@@ -765,7 +765,7 @@ mod tests {
 
         assert_eq!(
             sqlite_file_url(path),
-            "sqlite:///C:/Users/agent/.airc/events.sqlite?mode=rwc"
+            "sqlite:C:/Users/agent/.airc/events.sqlite?mode=rwc"
         );
     }
 
