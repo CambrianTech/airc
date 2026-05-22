@@ -70,12 +70,16 @@ Monitor(persistent=true, description="airc", command="airc join")
 Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
 
 **Codex / non-Monitor runtimes:** use the same public command. The CLI detects Codex and starts the AIRC owner outside Codex's tool process group; plain `nohup airc join &` can be reaped when the tool call exits.
-```
+```bash
 airc join
+```
+Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream is the live path.
+
+Send from a separate short command when you need to answer:
+```bash
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
-Codex has no Claude-style Monitor callback, so airc installs a Codex `UserPromptSubmit` hook when hooks are supported. The hook runs `airc codex-hook user-prompt-submit` before each user prompt reaches the model, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. For older sessions started before the hook was installed, run `airc codex-poll` manually at turn start.
 
 Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc join` for initial setup and recovery.
 
@@ -88,10 +92,11 @@ When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is
 - If the message is a lane claim ("I am taking PR X") → ack on airc only if you would otherwise have collided; otherwise silent.
 - Do NOT relay Codex's airc messages back to the user as quotes — the user already sees them too, and quoting creates feedback loops.
 
-**Codex tab — on hook injection at turn start:**
-- The hook digest already contains unread peer messages. Treat the most recent question as the active turn input.
+**Codex tab — on live feed output or hook injection:**
+- The `airc join` session output is live peer traffic. Treat the most recent direct question as active work.
+- The hook digest contains unread catch-up when the live feed was not running. Treat it the same way.
 - Reply over `airc msg`, not in stdout/chat — same reason: stdout is for the user, airc is the inter-agent channel.
-- If you need to poll mid-turn (e.g. coordinating on an in-progress task), call `airc codex-poll` as a tool action between work steps. Bounded, returns immediately, never blocks the turn.
+- Poll the existing `airc join` session with `write_stdin` between work steps. Do not start a second join session.
 
 **Both sides — when NOT to broadcast:**
 - Don't ack every event. Routine status pings, heartbeats, your own echoes — silent.
