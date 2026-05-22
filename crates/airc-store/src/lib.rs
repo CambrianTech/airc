@@ -36,9 +36,11 @@ pub mod migration;
 pub mod peer_trust;
 pub mod sqlite;
 pub mod store;
+pub mod subscriptions;
 
 pub use error::StoreError;
 pub use memory::InMemoryEventStore;
 pub use peer_trust::{RotationAuditEntry, StoredPeer};
 pub use sqlite::SqliteEventStore;
 pub use store::EventStore;
+pub use subscriptions::StoredSubscription;

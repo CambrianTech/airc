@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::error::StoreError;
+use crate::subscriptions::StoredSubscription;
 
 /// Durable transcript event store.
 ///
@@ -73,4 +74,14 @@ pub trait EventStore: Send + Sync {
         cursor: &TranscriptCursor,
         updated_at_ms: u64,
     ) -> Result<(), StoreError>;
+
+    /// Load joined-channel/default-channel state.
+    async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError>;
+
+    /// Replace joined-channel/default-channel state with `rows`.
+    ///
+    /// Callers pass the complete subscription projection; the store
+    /// owns the durable table and never mirrors this into sidecar
+    /// files.
+    async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError>;
 }

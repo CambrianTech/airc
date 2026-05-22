@@ -8,8 +8,10 @@
 //!   - `runtime_cursors` — per-consumer replay cursors.
 //!   - `peer_trust` / `peer_rotation_audit` — trust anchors and
 //!     signed key-rotation audit rows.
+//!   - `subscriptions` — joined channel/default-channel state.
 
 pub mod event;
 pub mod peer_rotation_audit;
 pub mod peer_trust;
 pub mod runtime_cursor;
+pub mod subscription;

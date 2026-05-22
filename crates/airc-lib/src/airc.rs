@@ -400,11 +400,11 @@ impl Airc {
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity()?;
-        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
-        subscriptions::save(&self.inner.home, &set)?;
+        subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set)?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
@@ -437,7 +437,7 @@ impl Airc {
     /// the public join command hang.
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
         let identity = self.mesh_identity()?;
-        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let mut rooms = Vec::new();
 
         for channel in context.channels {
@@ -452,7 +452,7 @@ impl Airc {
         if set.subscribed.contains_key(&context.default) {
             set.set_default(context.default)?;
         }
-        subscriptions::save(&self.inner.home, &set)?;
+        subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set)?;
 
         for room in &rooms {
@@ -469,12 +469,12 @@ impl Airc {
     pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity()?;
-        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
         set.parted.remove(&channel);
         set.subscribed.insert(channel.clone(), subscription.clone());
         set.set_default(channel)?;
-        subscriptions::save(&self.inner.home, &set)?;
+        subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set)?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
@@ -485,7 +485,7 @@ impl Airc {
     /// `#general` through the subscription set, using the resolved
     /// mesh identity so the `RoomId` is stable per Git/GitHub user.
     pub async fn current_room(&self) -> Result<Room, AircError> {
-        let mut set = subscriptions::load_or_init(&self.inner.home)?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
         if let Some(subscription) = set.default_subscription() {
             return Ok(subscription.as_room());
         }
@@ -495,7 +495,7 @@ impl Airc {
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
-        subscriptions::save(&self.inner.home, &set)?;
+        subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set)?;
         Ok(subscription.as_room())
     }

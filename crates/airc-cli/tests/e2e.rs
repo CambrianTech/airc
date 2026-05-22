@@ -170,25 +170,9 @@ fn join_without_args_uses_default_account_context() {
     assert!(stdout.contains("#cambriantech"), "{stdout}");
     assert!(stdout.contains("default: #cambriantech"), "{stdout}");
 
-    let subscriptions = std::fs::read_to_string(home.join("subscriptions.json")).unwrap();
-    assert!(subscriptions.contains("\"general\""), "{subscriptions}");
     assert!(
-        subscriptions.contains("\"cambriantech\""),
-        "{subscriptions}"
-    );
-    let json: serde_json::Value = serde_json::from_str(&subscriptions).unwrap();
-    let wire = json["subscribed"]["cambriantech"]["wire"]
-        .as_str()
-        .expect("cambriantech wire");
-    assert_eq!(
-        std::path::PathBuf::from(wire),
-        machine
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join(".airc")
-            .join("wires")
-            .join("cambriantech")
+        !home.join("subscriptions.json").exists(),
+        "join must not recreate subscriptions.json; subscriptions are ORM-backed"
     );
 
     let mut stop_command = Command::new(airc_core());

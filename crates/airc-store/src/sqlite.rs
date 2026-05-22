@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value as JsonValue;
@@ -29,11 +29,12 @@ use airc_core::{
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
 
-use crate::entities::{event, peer_rotation_audit, peer_trust, runtime_cursor};
+use crate::entities::{event, peer_rotation_audit, peer_trust, runtime_cursor, subscription};
 use crate::error::StoreError;
 use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
 use crate::store::EventStore;
+use crate::subscriptions::StoredSubscription;
 
 pub struct SqliteEventStore {
     db: DatabaseConnection,
@@ -397,6 +398,46 @@ impl EventStore for SqliteEventStore {
             .await?;
         Ok(())
     }
+
+    async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError> {
+        let rows = subscription::Entity::find()
+            .order_by_asc(subscription::Column::ChannelName)
+            .all(&self.db)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredSubscription {
+                    channel_name: row.channel_name,
+                    room_id: RoomId::from_uuid(row.room_id),
+                    wire: row.wire,
+                    joined_at_ms: i64_to_u64("subscriptions.joined_at_ms", row.joined_at_ms)?,
+                    is_default: row.is_default,
+                    parted: row.parted,
+                })
+            })
+            .collect()
+    }
+
+    async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError> {
+        let txn = self.db.begin().await?;
+        subscription::Entity::delete_many().exec(&txn).await?;
+        for row in rows {
+            let active = subscription::ActiveModel {
+                channel_name: ActiveValue::Set(row.channel_name),
+                room_id: ActiveValue::Set(row.room_id.as_uuid()),
+                wire: ActiveValue::Set(row.wire),
+                joined_at_ms: ActiveValue::Set(u64_to_i64(
+                    "subscriptions.joined_at_ms",
+                    row.joined_at_ms,
+                )?),
+                is_default: ActiveValue::Set(row.is_default),
+                parted: ActiveValue::Set(row.parted),
+            };
+            subscription::Entity::insert(active).exec(&txn).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
 }
 
 fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreError> {
@@ -714,6 +755,72 @@ mod tests {
                 .unwrap(),
             Some(join)
         );
+    }
+
+    #[tokio::test]
+    async fn subscriptions_round_trip_through_orm_table() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let rows = vec![
+            StoredSubscription {
+                channel_name: "general".to_string(),
+                room_id: RoomId::from_u128(0x100),
+                wire: "/tmp/airc/wires/general".to_string(),
+                joined_at_ms: 1_700_000_000_000,
+                is_default: false,
+                parted: false,
+            },
+            StoredSubscription {
+                channel_name: "cambriantech".to_string(),
+                room_id: RoomId::from_u128(0x101),
+                wire: "/tmp/airc/wires/cambriantech".to_string(),
+                joined_at_ms: 1_700_000_000_010,
+                is_default: true,
+                parted: false,
+            },
+            StoredSubscription {
+                channel_name: "old-room".to_string(),
+                room_id: RoomId::from_u128(0x102),
+                wire: String::new(),
+                joined_at_ms: 0,
+                is_default: false,
+                parted: true,
+            },
+        ];
+
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| a.channel_name.cmp(&b.channel_name));
+        store.replace_subscriptions(rows).await.unwrap();
+
+        assert_eq!(store.load_subscriptions().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_persist_across_store_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let rows = vec![StoredSubscription {
+            channel_name: "general".to_string(),
+            room_id: RoomId::from_u128(0x200),
+            wire: dir
+                .path()
+                .join("wires")
+                .join("general")
+                .display()
+                .to_string(),
+            joined_at_ms: 1_700_000_000_000,
+            is_default: true,
+            parted: false,
+        }];
+
+        SqliteEventStore::open_path(&path)
+            .await
+            .unwrap()
+            .replace_subscriptions(rows.clone())
+            .await
+            .unwrap();
+
+        let reopened = SqliteEventStore::open_path(&path).await.unwrap();
+        assert_eq!(reopened.load_subscriptions().await.unwrap(), rows);
     }
 
     #[tokio::test]
