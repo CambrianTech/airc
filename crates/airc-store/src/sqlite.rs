@@ -238,12 +238,17 @@ fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, StoreError> {
 }
 
 fn sqlite_file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let raw = normalise_sqlite_path(path);
     if has_windows_drive_prefix(&raw) {
         format!("sqlite:{raw}?mode=rwc")
     } else {
         format!("sqlite://{raw}?mode=rwc")
     }
+}
+
+fn normalise_sqlite_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    raw.strip_prefix("//?/").unwrap_or(&raw).to_string()
 }
 
 fn has_windows_drive_prefix(path: &str) -> bool {
@@ -762,6 +767,16 @@ mod tests {
     #[test]
     fn sqlite_file_url_uses_uri_slashes_for_windows_paths() {
         let path = Path::new(r"C:\Users\agent\.airc\events.sqlite");
+
+        assert_eq!(
+            sqlite_file_url(path),
+            "sqlite:C:/Users/agent/.airc/events.sqlite?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_url_strips_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\Users\agent\.airc\events.sqlite");
 
         assert_eq!(
             sqlite_file_url(path),
