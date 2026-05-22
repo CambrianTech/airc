@@ -353,8 +353,8 @@ impl Airc {
     /// re-resolves after [`crate::mesh_identity::DEFAULT_TTL_MS`] so
     /// concurrent callers don't hammer `gh`. See the module docs for
     /// the resolver chain.
-    pub(crate) fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
-        let cached = mesh_identity::resolve(&self.inner.home)?;
+    pub(crate) async fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
+        let cached = mesh_identity::resolve(self.event_store()).await?;
         Ok(cached.as_mesh_identity())
     }
 
@@ -399,7 +399,7 @@ impl Airc {
     /// short-shape commands.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
@@ -436,7 +436,7 @@ impl Airc {
     /// bounded coordinator task so gh/network latency can never make
     /// the public join command hang.
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let mut rooms = Vec::new();
 
@@ -468,7 +468,7 @@ impl Airc {
     /// Production users want [`join`].
     pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
         let channel = ChannelName::new(name)?;
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
         set.parted.remove(&channel);
@@ -490,7 +490,7 @@ impl Airc {
             return Ok(subscription.as_room());
         }
 
-        let identity = self.mesh_identity()?;
+        let identity = self.mesh_identity().await?;
         let channel = ChannelName::new("general")?;
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;

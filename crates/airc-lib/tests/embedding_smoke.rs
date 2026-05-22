@@ -399,8 +399,8 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
             let alice_home = alice_repo.join(".airc");
             let bob_home = bob_repo.join(".airc");
 
-            seed_mesh_identity(&alice_home, "joelteply");
-            seed_mesh_identity(&bob_home, "joelteply");
+            seed_mesh_identity(&alice_home, "joelteply").await;
+            seed_mesh_identity(&bob_home, "joelteply").await;
 
             let alice = Airc::open(&alice_home).await.unwrap();
             let bob = Airc::open(&bob_home).await.unwrap();
@@ -500,16 +500,20 @@ fn repo_with_origin(path: &std::path::Path, origin: &str) -> std::path::PathBuf 
     path.to_path_buf()
 }
 
-fn seed_mesh_identity(home: &std::path::Path, identity: &str) {
+async fn seed_mesh_identity(home: &std::path::Path, identity: &str) {
+    let store = SqliteEventStore::open_path(&home.join("events.sqlite"))
+        .await
+        .unwrap();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     resolve_mesh_identity_with(
-        home,
+        &store,
         || Some((identity.to_string(), MeshIdentitySource::Operator)),
         now_ms,
     )
+    .await
     .unwrap();
 }
 

@@ -299,20 +299,19 @@ fn create_repo_with_origin(path: &Path, origin: &str) {
 }
 
 fn seed_mesh_identity(home: &Path, identity: &str) {
-    std::fs::create_dir_all(home).unwrap();
-    std::fs::write(
-        home.join("mesh_identity.json"),
-        format!(
-            r#"{{
-  "version": 1,
-  "identity": "{identity}",
-  "source": "operator",
-  "resolved_at_ms": 1,
-  "ttl_ms": 86400000
-}}"#
-        ),
-    )
-    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let store = airc_store::SqliteEventStore::open_path(&home.join("events.sqlite"))
+            .await
+            .unwrap();
+        airc_lib::resolve_mesh_identity_with(
+            &store,
+            || Some((identity.to_string(), airc_lib::MeshIdentitySource::Operator)),
+            1,
+        )
+        .await
+        .unwrap();
+    });
 }
 
 #[test]

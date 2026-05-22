@@ -61,9 +61,9 @@ pub use error::AircError;
 pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use mesh_identity::{
-    load_cached as load_cached_mesh_identity, path_in as mesh_identity_path,
-    resolve as resolve_mesh_identity, resolve_with as resolve_mesh_identity_with, CachedIdentity,
-    MeshIdentityError, Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
+    load_cached as load_cached_mesh_identity, resolve as resolve_mesh_identity,
+    resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
+    Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
 pub use peers::EnrolledPeer;
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
