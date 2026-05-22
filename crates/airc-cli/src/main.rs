@@ -510,7 +510,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Daemon { socket } => {
-            let identity = LocalIdentity::load_or_generate(&home)?;
+            let identity = LocalIdentity::load_or_generate(&home).await?;
             let socket = default_or(socket, &home);
             commands::run_daemon(&home, identity, parsed.peers, socket).await
         }

@@ -11,6 +11,7 @@ mod m20260519_000001_create_events;
 mod m20260522_000002_create_runtime_cursors;
 mod m20260522_000003_create_peer_trust;
 mod m20260522_000004_create_subscriptions;
+mod m20260522_000005_create_local_identity;
 
 pub struct Migrator;
 
@@ -22,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260522_000002_create_runtime_cursors::Migration),
             Box::new(m20260522_000003_create_peer_trust::Migration),
             Box::new(m20260522_000004_create_subscriptions::Migration),
+            Box::new(m20260522_000005_create_local_identity::Migration),
         ]
     }
 }
