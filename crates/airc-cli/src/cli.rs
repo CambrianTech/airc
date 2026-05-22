@@ -142,15 +142,6 @@ pub enum Command {
     /// peer_id.
     Init,
 
-    /// Print legacy bearer state timestamps as `last_recv last_heartbeat`.
-    BearerState {
-        /// bearer_state.<channel>.json path to read.
-        path: PathBuf,
-        /// Print human-readable receive summary for `airc status`.
-        #[arg(long)]
-        summary: bool,
-    },
-
     /// Print the primary non-loopback LAN IPv4 address, if detectable.
     LanIp,
 
