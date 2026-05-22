@@ -106,7 +106,7 @@ The Rust route resolver picks among these based on local health + invite metadat
 
 - Every envelope is Ed25519-signed; receivers verify against a local `PeerKeyRegistry`.
 - DMs between paired peers are X25519 + ChaCha20-Poly1305 end-to-end encrypted.
-- Trust changes are **signed explicit operations**, not silent overwrites: a `TrustRotation` event signed by the previous key, sequence-numbered, with an append-only audit log at `<home>/peers_audit.jsonl`. Adding a peer with a different pubkey errors `PubkeyConflict` until a proper rotation is presented.
+- Trust changes are **signed explicit operations**, not silent overwrites: a `TrustRotation` event signed by the previous key, sequence-numbered, with append-only audit rows in the `peer_rotation_audit` table. Adding a peer with a different pubkey errors `PubkeyConflict` until a proper rotation is presented.
 
 ## The Model
 

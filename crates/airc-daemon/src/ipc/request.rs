@@ -17,8 +17,8 @@ pub enum Request {
     Ping,
     /// Snapshot of daemon state (peer id, uptime, …).
     Status,
-    /// Enrol a peer in the daemon's in-memory registry. The CLI
-    /// writes peers.json itself; this op keeps the running daemon's
+    /// Enrol a peer in the daemon's in-memory registry. Durable peer
+    /// trust lives in the store; this op keeps the running daemon's
     /// registry in sync without a restart.
     AddPeer(AddPeerRequest),
     /// Snapshot of currently-enrolled peers (peer_id + pubkey).

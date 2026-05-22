@@ -77,13 +77,13 @@ fn machine_account_home(scope_home: &Path) -> PathBuf {
     scope_home.to_path_buf()
 }
 
-fn load_peer_registries(
+async fn load_peer_registries(
     home: &Path,
     wire_root: &Path,
 ) -> Result<Vec<peers_store::StoredPeer>, AircError> {
-    let mut peers = peers_store::load(home)?;
+    let mut peers = peers_store::load(home).await?;
     if wire_root != home {
-        peers.extend(peers_store::load(wire_root)?);
+        peers.extend(peers_store::load(wire_root).await?);
     }
     Ok(peers)
 }
@@ -155,7 +155,7 @@ impl Airc {
     ///   - Loads `<home>/identity.{key,json}` (generates if missing).
     ///   - Opens `<home>/events.sqlite` and applies any pending
     ///     event-store migrations.
-    ///   - Loads `<home>/peers.json` into the in-memory trust registry.
+    ///   - Loads peer trust rows into the in-memory trust registry.
     ///
     /// Production policy is always `VerificationPolicy::Strict` —
     /// unsigned frames are rejected. Use `open_with_policy` if a
@@ -192,7 +192,8 @@ impl Airc {
             &wire_root,
             identity.peer_id,
             identity.keypair.public_bytes(),
-        )?;
+        )
+        .await?;
 
         let store_path = home.join(EVENTS_DB_FILENAME);
         let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
@@ -202,7 +203,7 @@ impl Airc {
             .enrol(identity.peer_id, 0, identity.keypair.public_bytes())
             .map_err(|e| AircError::Crypto(e.to_string()))?;
         let mut enrolled = vec![identity.peer_id];
-        for stored in load_peer_registries(&home, &wire_root)? {
+        for stored in load_peer_registries(&home, &wire_root).await? {
             if enrolled.contains(&stored.peer_id) {
                 continue;
             }
@@ -357,8 +358,8 @@ impl Airc {
         Ok(cached.as_mesh_identity())
     }
 
-    pub(crate) fn sync_account_peer_registry(&self) -> Result<(), AircError> {
-        let peers = load_peer_registries(&self.inner.home, &self.inner.wire_root)?;
+    pub(crate) async fn sync_account_peer_registry(&self) -> Result<(), AircError> {
+        let peers = load_peer_registries(&self.inner.home, &self.inner.wire_root).await?;
         let mut registry = self
             .inner
             .registry

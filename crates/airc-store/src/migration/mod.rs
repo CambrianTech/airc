@@ -9,6 +9,7 @@ use sea_orm_migration::prelude::*;
 
 mod m20260519_000001_create_events;
 mod m20260522_000002_create_runtime_cursors;
+mod m20260522_000003_create_peer_trust;
 
 pub struct Migrator;
 
@@ -18,6 +19,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260519_000001_create_events::Migration),
             Box::new(m20260522_000002_create_runtime_cursors::Migration),
+            Box::new(m20260522_000003_create_peer_trust::Migration),
         ]
     }
 }

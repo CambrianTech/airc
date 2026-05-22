@@ -9,7 +9,7 @@ const FRAMES_FILENAME: &str = "frames.jsonl";
 
 impl Airc {
     pub(crate) async fn replay_wire_once(&self, wire: &Path) -> Result<(), AircError> {
-        self.sync_account_peer_registry()?;
+        self.sync_account_peer_registry().await?;
         let path = wire.join(FRAMES_FILENAME);
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,

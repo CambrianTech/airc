@@ -4,7 +4,7 @@
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600)
 //!   - `identity.json`  — stable peer_id + client_id (0600)
 //!   - `daemon.sock`    — IPC socket
-//!   - `peers.json`     — (next PR) persisted peer registry
+//!   - `events.sqlite`  — ORM-backed event, cursor, and peer trust store
 //!
 //! `airc init` is the only command that creates the identity from
 //! nothing. All others load `<home>/identity.{key,json}` (auto-
@@ -340,10 +340,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Collaboration(args) => match args.action {
-            CollaborationAction::Status(args) => collaboration_commands::run_status(&home, args),
-            CollaborationAction::Doctor(args) => collaboration_commands::run_doctor(&home, args),
+            CollaborationAction::Status(args) => {
+                collaboration_commands::run_status(&home, args).await
+            }
+            CollaborationAction::Doctor(args) => {
+                collaboration_commands::run_doctor(&home, args).await
+            }
             CollaborationAction::SendWarning(args) => {
-                collaboration_commands::run_send_warning(&home, args)
+                collaboration_commands::run_send_warning(&home, args).await
             }
             CollaborationAction::Peers(args) => collaboration_peers::run_peers(&home, args),
             CollaborationAction::PrunePeers(args) => {

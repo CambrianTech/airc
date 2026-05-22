@@ -24,14 +24,14 @@ impl Airc {
     }
 
     /// Enrol a peer into the local trust registry and persist it to
-    /// `<home>/peers.json`.
+    /// the peer trust store.
     pub async fn add_peer(&self, spec: PeerSpec) -> Result<(), AircError> {
-        peers_store::add(&self.inner.home, spec.peer_id, spec.pubkey)?;
+        peers_store::add(&self.inner.home, spec.peer_id, spec.pubkey).await?;
         self.enrol_volatile_peer(&spec)
     }
 
     /// Enrol a peer in the in-memory trust registry without writing
-    /// to `peers.json`.
+    /// durable peer trust state.
     pub fn enrol_volatile_peer(&self, spec: &PeerSpec) -> Result<(), AircError> {
         let mut registry = self
             .inner
@@ -46,7 +46,7 @@ impl Airc {
 
     /// Return a list of enrolled peers.
     pub async fn peers(&self) -> Result<Vec<EnrolledPeer>, AircError> {
-        let stored = peers_store::load(&self.inner.home)?;
+        let stored = peers_store::load(&self.inner.home).await?;
         Ok(stored
             .into_iter()
             .filter(|p| p.peer_id != self.inner.identity.peer_id)

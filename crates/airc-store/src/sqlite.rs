@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value as JsonValue;
@@ -29,9 +29,10 @@ use airc_core::{
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
 
-use crate::entities::{event, runtime_cursor};
+use crate::entities::{event, peer_rotation_audit, peer_trust, runtime_cursor};
 use crate::error::StoreError;
 use crate::migration::Migrator;
+use crate::peer_trust::{RotationAuditEntry, StoredPeer};
 use crate::store::EventStore;
 
 pub struct SqliteEventStore {
@@ -78,15 +79,176 @@ impl SqliteEventStore {
     pub async fn in_memory() -> Result<Self, StoreError> {
         Self::open("sqlite::memory:").await
     }
+
+    pub async fn load_peers(&self) -> Result<Vec<StoredPeer>, StoreError> {
+        let rows = peer_trust::Entity::find()
+            .order_by_asc(peer_trust::Column::AddedAtMs)
+            .order_by_asc(peer_trust::Column::PeerId)
+            .all(&self.db)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredPeer {
+                    peer_id: PeerId::from_uuid(row.peer_id),
+                    pubkey_b64: row.pubkey_b64,
+                    added_at_ms: i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn add_peer_trust(
+        &self,
+        peer_id: PeerId,
+        pubkey_b64: String,
+        added_at_ms: u64,
+    ) -> Result<StoredPeer, StoreError> {
+        let active = peer_trust::ActiveModel {
+            peer_id: Set(peer_id.as_uuid()),
+            pubkey_b64: Set(pubkey_b64.clone()),
+            added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
+        };
+        let insert = peer_trust::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(peer_trust::Column::PeerId)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await;
+        match insert {
+            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+            Err(error) => return Err(StoreError::Database(error)),
+        }
+
+        let stored = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Database(sea_orm::DbErr::Custom(
+                    "peer_trust insert returned no stored row".to_string(),
+                ))
+            })?;
+        if stored.pubkey_b64 != pubkey_b64 {
+            return Err(StoreError::PeerPubkeyConflict {
+                peer_id,
+                stored_pubkey_b64: stored.pubkey_b64,
+                attempted_pubkey_b64: pubkey_b64,
+            });
+        }
+        Ok(StoredPeer {
+            peer_id,
+            pubkey_b64: stored.pubkey_b64,
+            added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+        })
+    }
+
+    pub async fn replace_peer_trust(
+        &self,
+        peer_id: PeerId,
+        pubkey_b64: String,
+        added_at_ms: u64,
+    ) -> Result<StoredPeer, StoreError> {
+        let active = peer_trust::ActiveModel {
+            peer_id: Set(peer_id.as_uuid()),
+            pubkey_b64: Set(pubkey_b64.clone()),
+            added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
+        };
+        peer_trust::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(peer_trust::Column::PeerId)
+                    .update_columns([peer_trust::Column::PubkeyB64, peer_trust::Column::AddedAtMs])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(StoredPeer {
+            peer_id,
+            pubkey_b64,
+            added_at_ms,
+        })
+    }
+
+    pub async fn append_peer_rotation_audit(
+        &self,
+        entry: RotationAuditEntry,
+    ) -> Result<(), StoreError> {
+        let active = peer_rotation_audit::ActiveModel {
+            peer_id: Set(entry.peer_id.as_uuid()),
+            sequence: Set(u64_to_i64("peer_rotation_audit.sequence", entry.sequence)?),
+            prev_pubkey_b64: Set(entry.prev_pubkey_b64),
+            next_pubkey_b64: Set(entry.next_pubkey_b64),
+            rotated_at_ms: Set(u64_to_i64(
+                "peer_rotation_audit.rotated_at_ms",
+                entry.rotated_at_ms,
+            )?),
+            applied_at_ms: Set(u64_to_i64(
+                "peer_rotation_audit.applied_at_ms",
+                entry.applied_at_ms,
+            )?),
+        };
+        peer_rotation_audit::Entity::insert(active)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn peer_rotation_audit(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Vec<RotationAuditEntry>, StoreError> {
+        let rows = peer_rotation_audit::Entity::find()
+            .filter(peer_rotation_audit::Column::PeerId.eq(peer_id.as_uuid()))
+            .order_by_asc(peer_rotation_audit::Column::Sequence)
+            .all(&self.db)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RotationAuditEntry {
+                    peer_id: PeerId::from_uuid(row.peer_id),
+                    prev_pubkey_b64: row.prev_pubkey_b64,
+                    next_pubkey_b64: row.next_pubkey_b64,
+                    sequence: i64_to_u64("peer_rotation_audit.sequence", row.sequence)?,
+                    rotated_at_ms: i64_to_u64(
+                        "peer_rotation_audit.rotated_at_ms",
+                        row.rotated_at_ms,
+                    )?,
+                    applied_at_ms: i64_to_u64(
+                        "peer_rotation_audit.applied_at_ms",
+                        row.applied_at_ms,
+                    )?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::InvalidStoredValue {
+        field,
+        value: value as i128,
+    })
+}
+
+fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::InvalidStoredValue {
+        field,
+        value: value as i128,
+    })
 }
 
 fn sqlite_file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let raw = normalise_sqlite_path(path);
     if has_windows_drive_prefix(&raw) {
-        format!("sqlite:///{raw}?mode=rwc")
+        format!("sqlite:{raw}?mode=rwc")
     } else {
         format!("sqlite://{raw}?mode=rwc")
     }
+}
+
+fn normalise_sqlite_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    raw.strip_prefix("//?/").unwrap_or(&raw).to_string()
 }
 
 fn has_windows_drive_prefix(path: &str) -> bool {
@@ -608,7 +770,17 @@ mod tests {
 
         assert_eq!(
             sqlite_file_url(path),
-            "sqlite:///C:/Users/agent/.airc/events.sqlite?mode=rwc"
+            "sqlite:C:/Users/agent/.airc/events.sqlite?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_url_strips_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\Users\agent\.airc\events.sqlite");
+
+        assert_eq!(
+            sqlite_file_url(path),
+            "sqlite:C:/Users/agent/.airc/events.sqlite?mode=rwc"
         );
     }
 

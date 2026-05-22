@@ -1,41 +1,26 @@
-//! Persisted peer registry — `<home>/peers.json`.
+//! Persisted peer trust registry.
 //!
-//! Saves enrolled peers across CLI / daemon restarts so `--peer
-//! <spec>` flags disappear from daily use. Two writers:
-//!   - `airc peer add <spec>` — appends to the file
-//!   - The daemon's `AddPeer` handler — appends + reloads its
-//!     in-memory `PeerKeyRegistry`
-//!
-//! Schema is versioned (`version: 1`) so future shape changes don't
-//! silently misread older files.
-//!
-//! Storage caveat: pubkeys are not secret, but the registry IS the
-//! trust anchor — anyone who can write this file can enrol an
-//! impostor. Permissions match the identity files (0600 on Unix).
+//! Peer trust is durable substrate data. It is backed by
+//! `airc-store`/SeaORM tables, not JSON sidecars.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 use airc_protocol::trust_rotation::{verify_rotation, RotationVerificationError, TrustRotation};
+pub use airc_store::{RotationAuditEntry, StoredPeer};
+use airc_store::{SqliteEventStore, StoreError};
 
-const PEERS_FILENAME: &str = "peers.json";
-const PEERS_AUDIT_FILENAME: &str = "peers_audit.jsonl";
-const PEERS_VERSION: u32 = 1;
+const STORE_DB_FILENAME: &str = "events.sqlite";
 
 #[derive(Debug)]
 pub enum PeersStoreError {
     Io(std::io::Error),
-    Json(serde_json::Error),
     Base64(base64::DecodeError),
     Clock(std::time::SystemTimeError),
-    SchemaVersionMismatch {
-        found: u32,
-        expected: u32,
-    },
+    Store(StoreError),
     WrongPubkeyLength(usize),
     /// Trust gap §8 fix: a peer with this `PeerId` is already in the
     /// store with a different pubkey. To change a stored pubkey, the
@@ -72,15 +57,12 @@ pub enum PeersStoreError {
 impl std::fmt::Display for PeersStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PeersStoreError::Io(error) => write!(f, "peers.json I/O: {error}"),
-            PeersStoreError::Json(error) => write!(f, "peers.json parse: {error}"),
-            PeersStoreError::Base64(error) => write!(f, "peers.json base64: {error}"),
-            PeersStoreError::Clock(error) => write!(f, "peers.json timestamp clock error: {error}"),
-            PeersStoreError::SchemaVersionMismatch { found, expected } => {
-                write!(f, "peers.json version {found}, expected {expected}")
-            }
+            PeersStoreError::Io(error) => write!(f, "peer trust I/O: {error}"),
+            PeersStoreError::Base64(error) => write!(f, "peer trust base64: {error}"),
+            PeersStoreError::Clock(error) => write!(f, "peer trust timestamp clock error: {error}"),
+            PeersStoreError::Store(error) => write!(f, "peer trust store: {error}"),
             PeersStoreError::WrongPubkeyLength(got) => {
-                write!(f, "peers.json pubkey is {got} bytes, expected 32")
+                write!(f, "peer trust pubkey is {got} bytes, expected 32")
             }
             PeersStoreError::PubkeyConflict {
                 peer_id,
@@ -128,12 +110,11 @@ impl std::error::Error for PeersStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PeersStoreError::Io(error) => Some(error),
-            PeersStoreError::Json(error) => Some(error),
             PeersStoreError::Base64(error) => Some(error),
             PeersStoreError::Clock(error) => Some(error),
+            PeersStoreError::Store(error) => Some(error),
             PeersStoreError::RotationVerification(error) => Some(error),
-            PeersStoreError::SchemaVersionMismatch { .. }
-            | PeersStoreError::WrongPubkeyLength(_)
+            PeersStoreError::WrongPubkeyLength(_)
             | PeersStoreError::PubkeyConflict { .. }
             | PeersStoreError::PrevPubkeyMismatch { .. }
             | PeersStoreError::SequenceNotMonotonic { .. }
@@ -154,12 +135,6 @@ impl From<std::io::Error> for PeersStoreError {
     }
 }
 
-impl From<serde_json::Error> for PeersStoreError {
-    fn from(error: serde_json::Error) -> Self {
-        PeersStoreError::Json(error)
-    }
-}
-
 impl From<base64::DecodeError> for PeersStoreError {
     fn from(error: base64::DecodeError) -> Self {
         PeersStoreError::Base64(error)
@@ -172,57 +147,48 @@ impl From<std::time::SystemTimeError> for PeersStoreError {
     }
 }
 
-/// One persisted peer entry — what the file holds. `pubkey_b64` is
-/// the URL-safe-no-padding encoding of the 32-byte Ed25519 pubkey
-/// (matches the `peer add <spec>` argument shape).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StoredPeer {
-    pub peer_id: PeerId,
-    pub pubkey_b64: String,
-    pub added_at_ms: u64,
-}
-
-impl StoredPeer {
-    /// Decode the stored base64 pubkey to its 32-byte form. Used when
-    /// enroling into a `PeerKeyRegistry`.
-    pub fn pubkey_bytes(&self) -> Result<[u8; 32], PeersStoreError> {
-        let bytes = URL_SAFE_NO_PAD.decode(&self.pubkey_b64)?;
-        if bytes.len() != 32 {
-            return Err(PeersStoreError::WrongPubkeyLength(bytes.len()));
+impl From<StoreError> for PeersStoreError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::PeerPubkeyConflict {
+                peer_id,
+                stored_pubkey_b64,
+                attempted_pubkey_b64,
+            } => PeersStoreError::PubkeyConflict {
+                peer_id,
+                stored_pubkey_b64,
+                attempted_pubkey_b64,
+            },
+            StoreError::WrongPubkeyLength(got) => PeersStoreError::WrongPubkeyLength(got),
+            StoreError::Base64(error) => PeersStoreError::Base64(error),
+            StoreError::Io(_)
+            | StoreError::Database(_)
+            | StoreError::LockPoisoned
+            | StoreError::Migration(_)
+            | StoreError::DuplicateEventId(_)
+            | StoreError::UnknownTranscriptKind(_)
+            | StoreError::InvalidStoredValue { .. }
+            | StoreError::Codec(_) => PeersStoreError::Store(error),
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        Ok(out)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct PeersFile {
-    version: u32,
-    peers: Vec<StoredPeer>,
+fn store_path(home: &Path) -> std::path::PathBuf {
+    home.join(STORE_DB_FILENAME)
 }
 
-/// Path to peers.json inside `home`.
-pub fn path_in(home: &Path) -> PathBuf {
-    home.join(PEERS_FILENAME)
+async fn open_store(home: &Path) -> Result<SqliteEventStore, PeersStoreError> {
+    Ok(SqliteEventStore::open_path(&store_path(home)).await?)
 }
 
-/// Load the peer list from `home`. Returns an empty list if the file
-/// doesn't exist (this is the normal state for a fresh install).
-pub fn load(home: &Path) -> Result<Vec<StoredPeer>, PeersStoreError> {
-    let path = path_in(home);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let file: PeersFile = serde_json::from_str(&text)?;
-    if file.version != PEERS_VERSION {
-        return Err(PeersStoreError::SchemaVersionMismatch {
-            found: file.version,
-            expected: PEERS_VERSION,
-        });
-    }
-    Ok(file.peers)
+/// Load the peer list from `home`. Returns an empty list when no
+/// peer trust rows exist yet (normal for a fresh install).
+pub async fn load(home: &Path) -> Result<Vec<StoredPeer>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .load_peers()
+        .await
+        .map_err(Into::into)
 }
 
 /// Enrol a peer's pubkey for the first time (trust-on-first-use).
@@ -235,44 +201,17 @@ pub fn load(home: &Path) -> Result<Vec<StoredPeer>, PeersStoreError> {
 ///   [`PeersStoreError::PubkeyConflict`]. Changing a stored pubkey
 ///   requires an explicit signed [`rotate`] — silent overwrite was
 ///   the trust-store gap §8 fix removed.
-pub fn add(home: &Path, peer_id: PeerId, pubkey: [u8; 32]) -> Result<StoredPeer, PeersStoreError> {
-    let mut peers = load(home)?;
+pub async fn add(
+    home: &Path,
+    peer_id: PeerId,
+    pubkey: [u8; 32],
+) -> Result<StoredPeer, PeersStoreError> {
     let pubkey_b64 = URL_SAFE_NO_PAD.encode(pubkey);
-
-    if let Some(existing) = peers.iter().find(|p| p.peer_id == peer_id) {
-        if existing.pubkey_b64 == pubkey_b64 {
-            return Ok(existing.clone());
-        }
-        return Err(PeersStoreError::PubkeyConflict {
-            peer_id,
-            stored_pubkey_b64: existing.pubkey_b64.clone(),
-            attempted_pubkey_b64: pubkey_b64,
-        });
-    }
-
-    let entry = StoredPeer {
-        peer_id,
-        pubkey_b64,
-        added_at_ms: now_ms()?,
-    };
-    peers.push(entry.clone());
-    save(home, &peers)?;
-    Ok(entry)
-}
-
-/// Audit-log entry recording one applied rotation. Append-only;
-/// inspectable via [`audit_log`]. Persisted in `peers_audit.jsonl`
-/// adjacent to `peers.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RotationAuditEntry {
-    pub peer_id: PeerId,
-    pub prev_pubkey_b64: String,
-    pub next_pubkey_b64: String,
-    pub sequence: u64,
-    /// Producer's `rotated_at_ms` from the rotation event. Audit-only.
-    pub rotated_at_ms: u64,
-    /// Local clock when the rotation was applied to this store.
-    pub applied_at_ms: u64,
+    open_store(home)
+        .await?
+        .add_peer_trust(peer_id, pubkey_b64, now_ms()?)
+        .await
+        .map_err(Into::into)
 }
 
 /// Apply a signed trust rotation:
@@ -284,21 +223,15 @@ pub struct RotationAuditEntry {
 ///    superseded key is rejected.
 /// 3. Check the rotation's `sequence` is strictly greater than the
 ///    last applied sequence for this peer (replay prevention).
-/// 4. Append an [`RotationAuditEntry`] to `peers_audit.jsonl`.
-/// 5. Persist the new pubkey to `peers.json`.
-///
-/// Order matters: audit is appended BEFORE peers.json is rewritten.
-/// If the audit write fails, the store is unchanged — rotation
-/// didn't apply. If peers.json rewrite fails after audit succeeded,
-/// the audit shows an intent that didn't land — `audit_log` and
-/// the on-disk pubkey will disagree and a follow-up reconciliation
-/// pass can detect that. Surfaced as `Io` either way, never silently.
-pub fn rotate(home: &Path, rotation: &TrustRotation) -> Result<StoredPeer, PeersStoreError> {
+/// 4. Insert an audit row into `peer_rotation_audit`.
+/// 5. Persist the new pubkey to `peer_trust`.
+pub async fn rotate(home: &Path, rotation: &TrustRotation) -> Result<StoredPeer, PeersStoreError> {
     // Step 1: crypto.
     verify_rotation(rotation)?;
 
     // Step 2: stored prev_pubkey matches what rotation names.
-    let mut peers = load(home)?;
+    let store = open_store(home).await?;
+    let peers = store.load_peers().await?;
     let stored_idx = peers
         .iter()
         .position(|p| p.peer_id == rotation.peer_id)
@@ -314,7 +247,7 @@ pub fn rotate(home: &Path, rotation: &TrustRotation) -> Result<StoredPeer, Peers
     }
 
     // Step 3: monotonic sequence per peer.
-    let last_seq = last_applied_sequence(home, rotation.peer_id)?;
+    let last_seq = last_applied_sequence(&store, rotation.peer_id).await?;
     if rotation.sequence <= last_seq {
         return Err(PeersStoreError::SequenceNotMonotonic {
             peer_id: rotation.peer_id,
@@ -333,110 +266,44 @@ pub fn rotate(home: &Path, rotation: &TrustRotation) -> Result<StoredPeer, Peers
         rotated_at_ms: rotation.rotated_at_ms,
         applied_at_ms,
     };
-    append_audit(home, &audit_entry)?;
+    store.append_peer_rotation_audit(audit_entry).await?;
 
-    // Step 5: rewrite peers.json with the new pubkey.
-    peers[stored_idx].pubkey_b64 = URL_SAFE_NO_PAD.encode(rotation.next_pubkey);
-    peers[stored_idx].added_at_ms = applied_at_ms;
-    save(home, &peers)?;
-    Ok(peers[stored_idx].clone())
+    // Step 5: replace peer_trust with the new pubkey.
+    store
+        .replace_peer_trust(
+            rotation.peer_id,
+            URL_SAFE_NO_PAD.encode(rotation.next_pubkey),
+            applied_at_ms,
+        )
+        .await
+        .map_err(Into::into)
 }
 
 /// Read all audit entries for `peer_id` in apply-order. Returns an
 /// empty vec if the audit log doesn't exist yet (no rotations have
 /// ever been applied) or the peer has none.
-pub fn audit_log(home: &Path, peer_id: PeerId) -> Result<Vec<RotationAuditEntry>, PeersStoreError> {
-    let path = home.join(PEERS_AUDIT_FILENAME);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let entry: RotationAuditEntry = serde_json::from_str(trimmed)?;
-        if entry.peer_id == peer_id {
-            out.push(entry);
-        }
-    }
-    Ok(out)
+pub async fn audit_log(
+    home: &Path,
+    peer_id: PeerId,
+) -> Result<Vec<RotationAuditEntry>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .peer_rotation_audit(peer_id)
+        .await
+        .map_err(Into::into)
 }
 
-fn last_applied_sequence(home: &Path, peer_id: PeerId) -> Result<u64, PeersStoreError> {
-    Ok(audit_log(home, peer_id)?
+async fn last_applied_sequence(
+    store: &SqliteEventStore,
+    peer_id: PeerId,
+) -> Result<u64, PeersStoreError> {
+    Ok(store
+        .peer_rotation_audit(peer_id)
+        .await?
         .into_iter()
         .map(|e| e.sequence)
         .max()
         .unwrap_or(0))
-}
-
-fn append_audit(home: &Path, entry: &RotationAuditEntry) -> Result<(), PeersStoreError> {
-    use std::io::Write;
-    std::fs::create_dir_all(home)?;
-    let path = home.join(PEERS_AUDIT_FILENAME);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    let line = serde_json::to_string(entry)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    set_owner_only_permissions(&path)?;
-    Ok(())
-}
-
-/// Write the peer list to disk, replacing the existing file.
-pub fn save(home: &Path, peers: &[StoredPeer]) -> Result<(), PeersStoreError> {
-    std::fs::create_dir_all(home)?;
-    let path = path_in(home);
-    let file = PeersFile {
-        version: PEERS_VERSION,
-        peers: peers.to_vec(),
-    };
-    let text = serde_json::to_string_pretty(&file)?;
-    let tmp = home.join(format!(
-        ".{PEERS_FILENAME}.{}.{}.tmp",
-        std::process::id(),
-        PeerId::new()
-    ));
-    std::fs::write(&tmp, text)?;
-    set_owner_only_permissions(&tmp)?;
-    replace_file(&tmp, &path)?;
-    set_owner_only_permissions(&path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(path)?;
-            std::fs::rename(tmp, path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, path)
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
@@ -460,44 +327,44 @@ mod tests {
         k
     }
 
-    #[test]
-    fn load_returns_empty_when_file_missing() {
+    #[tokio::test]
+    async fn load_returns_empty_when_store_has_no_peer_rows() {
         let home = TempDir::new().unwrap();
-        let peers = load(home.path()).unwrap();
+        let peers = load(home.path()).await.unwrap();
         assert!(peers.is_empty());
     }
 
-    #[test]
-    fn add_then_load_roundtrips() {
+    #[tokio::test]
+    async fn add_then_load_roundtrips() {
         let home = TempDir::new().unwrap();
         let id = PeerId::new();
         let pk = fake_pubkey(0xaa);
-        let stored = add(home.path(), id, pk).unwrap();
+        let stored = add(home.path(), id, pk).await.unwrap();
         assert_eq!(stored.peer_id, id);
         assert_eq!(stored.pubkey_bytes().unwrap(), pk);
 
-        let loaded = load(home.path()).unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].peer_id, id);
         assert_eq!(loaded[0].pubkey_bytes().unwrap(), pk);
     }
 
-    #[test]
-    fn add_is_idempotent_for_same_pubkey() {
+    #[tokio::test]
+    async fn add_is_idempotent_for_same_pubkey() {
         let home = TempDir::new().unwrap();
         let id = PeerId::new();
         let pk = fake_pubkey(0xbb);
-        let first = add(home.path(), id, pk).unwrap();
-        let second = add(home.path(), id, pk).unwrap();
+        let first = add(home.path(), id, pk).await.unwrap();
+        let second = add(home.path(), id, pk).await.unwrap();
         // Same added_at_ms because second call returns the already-
         // stored entry (didn't overwrite).
         assert_eq!(first.added_at_ms, second.added_at_ms);
-        let loaded = load(home.path()).unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded.len(), 1, "duplicate enrolment must be deduped");
     }
 
-    #[test]
-    fn add_refuses_silent_overwrite_on_pubkey_conflict() {
+    #[tokio::test]
+    async fn add_refuses_silent_overwrite_on_pubkey_conflict() {
         // Grievance §8 fix: silent overwrite on second `add` of the
         // same peer_id with a new pubkey is what the rotation path
         // replaces. `add` must now refuse and surface a typed error.
@@ -505,33 +372,33 @@ mod tests {
         let id = PeerId::new();
         let old = fake_pubkey(0xc0);
         let new = fake_pubkey(0xc1);
-        add(home.path(), id, old).unwrap();
-        let result = add(home.path(), id, new);
+        add(home.path(), id, old).await.unwrap();
+        let result = add(home.path(), id, new).await;
         assert!(
             matches!(result, Err(PeersStoreError::PubkeyConflict { peer_id, .. }) if peer_id == id),
             "second add() with a different pubkey must error PubkeyConflict; got {result:?}",
         );
         // Old pubkey must still be stored — no partial-overwrite.
-        let loaded = load(home.path()).unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].pubkey_bytes().unwrap(), old);
     }
 
-    #[test]
-    fn add_is_idempotent_for_same_peer_same_pubkey() {
+    #[tokio::test]
+    async fn add_is_idempotent_for_same_peer_same_pubkey() {
         let home = TempDir::new().unwrap();
         let id = PeerId::new();
         let key = fake_pubkey(0x42);
-        let first = add(home.path(), id, key).unwrap();
-        let second = add(home.path(), id, key).unwrap();
+        let first = add(home.path(), id, key).await.unwrap();
+        let second = add(home.path(), id, key).await.unwrap();
         assert_eq!(first.peer_id, second.peer_id);
         assert_eq!(first.pubkey_b64, second.pubkey_b64);
-        let loaded = load(home.path()).unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded.len(), 1);
     }
 
-    #[test]
-    fn signed_rotation_is_accepted_and_audited() {
+    #[tokio::test]
+    async fn signed_rotation_is_accepted_and_audited() {
         use airc_protocol::{sign_rotation, PeerKeypair};
 
         let home = TempDir::new().unwrap();
@@ -539,7 +406,9 @@ mod tests {
         let prev_kp = PeerKeypair::generate();
         let next_kp = PeerKeypair::generate();
 
-        add(home.path(), peer_id, prev_kp.public_bytes()).unwrap();
+        add(home.path(), peer_id, prev_kp.public_bytes())
+            .await
+            .unwrap();
 
         let rotation = sign_rotation(
             &prev_kp,
@@ -550,18 +419,18 @@ mod tests {
         )
         .unwrap();
 
-        let updated = rotate(home.path(), &rotation).unwrap();
+        let updated = rotate(home.path(), &rotation).await.unwrap();
         assert_eq!(updated.pubkey_bytes().unwrap(), next_kp.public_bytes());
 
         // Audit trail visible to consumers.
-        let audit = audit_log(home.path(), peer_id).unwrap();
+        let audit = audit_log(home.path(), peer_id).await.unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].sequence, 1);
         assert_eq!(audit[0].rotated_at_ms, 1_700_000_000_000);
     }
 
-    #[test]
-    fn rotation_signed_by_wrong_key_is_rejected_before_audit() {
+    #[tokio::test]
+    async fn rotation_signed_by_wrong_key_is_rejected_before_audit() {
         use airc_protocol::{sign_rotation, PeerKeypair, RotationVerificationError};
 
         let home = TempDir::new().unwrap();
@@ -570,7 +439,9 @@ mod tests {
         let next_kp = PeerKeypair::generate();
         let imposter_kp = PeerKeypair::generate();
 
-        add(home.path(), peer_id, prev_kp.public_bytes()).unwrap();
+        add(home.path(), peer_id, prev_kp.public_bytes())
+            .await
+            .unwrap();
 
         // Imposter forges a rotation pretending to be prev, signed by
         // their own key. Crypto verification fails before we touch the
@@ -591,7 +462,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = rotate(home.path(), &bad);
+        let result = rotate(home.path(), &bad).await;
         assert!(
             matches!(
                 result,
@@ -602,13 +473,13 @@ mod tests {
             "wrong-key rotation must fail crypto check before touching store; got {result:?}",
         );
         // Store untouched.
-        let loaded = load(home.path()).unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded[0].pubkey_bytes().unwrap(), prev_kp.public_bytes());
-        assert!(audit_log(home.path(), peer_id).unwrap().is_empty());
+        assert!(audit_log(home.path(), peer_id).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn stale_rotation_against_already_superseded_key_is_rejected() {
+    #[tokio::test]
+    async fn stale_rotation_against_already_superseded_key_is_rejected() {
         use airc_protocol::{sign_rotation, PeerKeypair};
 
         let home = TempDir::new().unwrap();
@@ -617,14 +488,14 @@ mod tests {
         let k1 = PeerKeypair::generate();
         let k2 = PeerKeypair::generate();
 
-        add(home.path(), peer_id, k0.public_bytes()).unwrap();
+        add(home.path(), peer_id, k0.public_bytes()).await.unwrap();
         let r1 = sign_rotation(&k0, peer_id, k1.public_bytes(), 1, 1).unwrap();
-        rotate(home.path(), &r1).unwrap();
+        rotate(home.path(), &r1).await.unwrap();
 
         // Now the stored key is k1. Replay r1 (or any rotation whose
         // prev_pubkey is k0) must be rejected — k0 was superseded.
         let replay = sign_rotation(&k0, peer_id, k2.public_bytes(), 2, 2).unwrap();
-        let result = rotate(home.path(), &replay);
+        let result = rotate(home.path(), &replay).await;
         assert!(
             matches!(
                 result,
@@ -634,8 +505,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rotation_with_non_monotonic_sequence_is_rejected() {
+    #[tokio::test]
+    async fn rotation_with_non_monotonic_sequence_is_rejected() {
         use airc_protocol::{sign_rotation, PeerKeypair};
 
         let home = TempDir::new().unwrap();
@@ -644,16 +515,16 @@ mod tests {
         let k1 = PeerKeypair::generate();
         let k2 = PeerKeypair::generate();
 
-        add(home.path(), peer_id, k0.public_bytes()).unwrap();
+        add(home.path(), peer_id, k0.public_bytes()).await.unwrap();
         let r1 = sign_rotation(&k0, peer_id, k1.public_bytes(), 5, 100).unwrap();
-        rotate(home.path(), &r1).unwrap();
+        rotate(home.path(), &r1).await.unwrap();
 
         // Try to apply a rotation with sequence == previous (replay) and
         // sequence < previous (out-of-order). Both must fail.
         let same_seq = sign_rotation(&k1, peer_id, k2.public_bytes(), 5, 200).unwrap();
         let lower_seq = sign_rotation(&k1, peer_id, k2.public_bytes(), 3, 200).unwrap();
         assert!(matches!(
-            rotate(home.path(), &same_seq),
+            rotate(home.path(), &same_seq).await,
             Err(PeersStoreError::SequenceNotMonotonic {
                 last_applied: 5,
                 attempted: 5,
@@ -661,7 +532,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            rotate(home.path(), &lower_seq),
+            rotate(home.path(), &lower_seq).await,
             Err(PeersStoreError::SequenceNotMonotonic {
                 last_applied: 5,
                 attempted: 3,
@@ -670,8 +541,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rotation_for_unknown_peer_is_rejected() {
+    #[tokio::test]
+    async fn rotation_for_unknown_peer_is_rejected() {
         use airc_protocol::{sign_rotation, PeerKeypair};
 
         let home = TempDir::new().unwrap();
@@ -681,53 +552,27 @@ mod tests {
 
         // Note: NO add() — peer isn't enrolled.
         let rotation = sign_rotation(&prev_kp, peer_id, next_kp.public_bytes(), 1, 0).unwrap();
-        let result = rotate(home.path(), &rotation);
+        let result = rotate(home.path(), &rotation).await;
         assert!(matches!(
             result,
             Err(PeersStoreError::UnknownPeer(p)) if p == peer_id
         ));
     }
 
-    #[test]
-    fn multiple_distinct_peers_accumulate() {
+    #[tokio::test]
+    async fn multiple_distinct_peers_accumulate() {
         let home = TempDir::new().unwrap();
         let a = (PeerId::new(), fake_pubkey(0x01));
         let b = (PeerId::new(), fake_pubkey(0x02));
         let c = (PeerId::new(), fake_pubkey(0x03));
-        add(home.path(), a.0, a.1).unwrap();
-        add(home.path(), b.0, b.1).unwrap();
-        add(home.path(), c.0, c.1).unwrap();
-        let loaded = load(home.path()).unwrap();
+        add(home.path(), a.0, a.1).await.unwrap();
+        add(home.path(), b.0, b.1).await.unwrap();
+        add(home.path(), c.0, c.1).await.unwrap();
+        let loaded = load(home.path()).await.unwrap();
         assert_eq!(loaded.len(), 3);
         let ids: Vec<PeerId> = loaded.iter().map(|p| p.peer_id).collect();
         assert!(ids.contains(&a.0));
         assert!(ids.contains(&b.0));
         assert!(ids.contains(&c.0));
-    }
-
-    #[test]
-    fn rejects_unknown_schema_version() {
-        let home = TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path()).unwrap();
-        std::fs::write(path_in(home.path()), r#"{"version":999,"peers":[]}"#).unwrap();
-        let result = load(home.path());
-        assert!(matches!(
-            result,
-            Err(PeersStoreError::SchemaVersionMismatch { found: 999, .. })
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn peers_file_is_owner_only_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        let home = TempDir::new().unwrap();
-        let id = PeerId::new();
-        add(home.path(), id, fake_pubkey(0x42)).unwrap();
-        let mode = std::fs::metadata(path_in(home.path()))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
     }
 }

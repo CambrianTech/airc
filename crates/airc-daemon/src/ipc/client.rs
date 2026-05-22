@@ -225,9 +225,8 @@ impl DaemonClient {
         }
     }
 
-    // Reserved for future CLI surfaces that want the daemon's
-    // authoritative in-memory view (rather than reading peers.json
-    // directly). The current `airc peer list` reads the file.
+    // Reserved for CLI surfaces that want the daemon's authoritative
+    // in-memory peer view instead of opening the store directly.
     #[allow(dead_code)]
     pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
         match self.call(Request::ListPeers).await? {

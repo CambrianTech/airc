@@ -33,6 +33,29 @@ pub enum StoreError {
     #[error("unknown transcript kind: {0}")]
     UnknownTranscriptKind(String),
 
+    /// Stored numeric value is outside the domain accepted by the
+    /// Rust contract. Refuse silent wraparound at the DB boundary.
+    #[error("invalid stored value for {field}: {value}")]
+    InvalidStoredValue { field: &'static str, value: i128 },
+
+    /// Peer trust conflict: a stored peer has a different public key.
+    #[error(
+        "peer {peer_id} is already enrolled with pubkey {stored_pubkey_b64}; cannot replace it with {attempted_pubkey_b64} without signed rotation"
+    )]
+    PeerPubkeyConflict {
+        peer_id: airc_core::PeerId,
+        stored_pubkey_b64: String,
+        attempted_pubkey_b64: String,
+    },
+
+    /// Peer public key data is malformed in the store.
+    #[error("peer pubkey is {0} bytes, expected 32")]
+    WrongPubkeyLength(usize),
+
+    /// Peer public key base64 is malformed in the store.
+    #[error("peer pubkey base64: {0}")]
+    Base64(#[from] base64::DecodeError),
+
     /// JSON encode/decode failure on the stored `metadata` /
     /// `headers` / `body` blob. Wrapped so callers can distinguish
     /// "corrupt persisted state" from a normal append failure.
