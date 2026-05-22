@@ -320,17 +320,13 @@ pub enum Command {
     /// and the inferred repo/org channel. With a room, subscribes to
     /// that channel and makes it the default.
     ///
-    /// `--attach` keeps the process alive and streams live events
-    /// from subscribed channels to stdout (same path Monitor wraps).
-    /// Without `--attach`, `join` exits cleanly after subscribing.
+    /// Always streams live events from ALL subscribed channels to
+    /// stdout until interrupted — there is no separate "attach"
+    /// mode. If you need just-set-up-and-exit (rare), spawn the
+    /// daemon directly with `airc daemon`.
     Join {
         /// Optional channel name to join.
         room: Option<String>,
-        /// After joining, attach to the live event stream and print
-        /// events to stdout until interrupted. Equivalent to
-        /// `airc join && airc monitor attach`.
-        #[arg(long)]
-        attach: bool,
     },
 
     /// Print the installed `airc` build metadata: short commit, branch,

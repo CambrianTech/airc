@@ -601,7 +601,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => message_commands::run_build(&from, &to, &ts, &channel, &msg, &client_id, &kind),
         },
 
-        Command::Join { room, attach } => commands::run_join(&home, room, attach).await,
+        Command::Join { room } => commands::run_join(&home, room).await,
 
         Command::Version => commands::run_version(),
 

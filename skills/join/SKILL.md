@@ -14,10 +14,10 @@ Audience: Claude Code, Codex, future agent runtimes. Optimized for parse-and-act
 
 If you are Claude Code and this skill was invoked by `/join` or `/airc:join`, your first tool call MUST be:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 
-Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `--attach` starts or verifies the scope's transport owner, then attaches the Monitor UI to the local stream. The user should see a Monitor task.
+Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join` starts or verifies the scope's transport owner and streams events from all subscribed channels until interrupted. The user should see a Monitor task.
 
 ## Substrate facts
 
@@ -65,7 +65,7 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 
 **Claude Code:** wrap in Monitor for streaming events:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
 

@@ -28,9 +28,9 @@ Captures `before` and `after` SHAs. Prints one of:
 
 2. **Run `airc teardown`** in Bash. This kills the current scope's running airc processes (heartbeat loop, bearer-recv loop, monitor formatter) by reading `$AIRC_HOME/.airc/airc.pid`. Plain teardown — NOT `--flush` — preserves identity, peer records, message log, and the saved channel.
 
-3. **Re-arm a new Monitor with `airc join --attach`**:
+3. **Re-arm a new Monitor with `airc join`**:
    ```
-   Monitor(persistent=true, description="airc", command="airc join --attach")
+   Monitor(persistent=true, description="airc", command="airc join")
    ```
    Same shape the `/join` skill uses. The new Monitor's airc binary loads from disk fresh — picks up the just-pulled code automatically.
 

@@ -82,11 +82,7 @@ pub async fn run_room(
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
-pub async fn run_join(
-    home: &Path,
-    room: Option<String>,
-    attach: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match room {
         Some(room) => {
@@ -114,17 +110,22 @@ pub async fn run_join(
     subscribe_daemon_to_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
-    // `--attach` keeps the foreground process alive and streams the
-    // live event broadcast. The skills doc has documented this flag
-    // for the longest time but only the bash wrapper implemented it;
-    // post-demolition the Rust binary needs to own it directly. Same
-    // path as `airc monitor attach`, just chained after the join.
-    if attach {
-        println!();
-        println!("attached — Ctrl-C to detach.");
-        let mut stream = airc.subscribe().await?;
-        print_event_stream_until_signal(&mut stream).await?;
-    }
+    // `airc join` always attaches and streams. Multi-room: the
+    // stream covers ALL subscribed channels (cambriantech +
+    // useideem + general, for example), not just the current room.
+    // Earlier code used the current-room-only `subscribe()`, which
+    // silently dropped frames from any subscribed room that wasn't
+    // currently selected — a Monitor running join would go dark on
+    // every channel except the default. The `subscribe_subscribed_filtered`
+    // path is documented as "the monitor/hook surface: no hidden
+    // narrowing to current room." Empty filter → no kind/header
+    // narrowing either, just multi-room scope.
+    println!();
+    println!("attached — Ctrl-C to detach.");
+    let mut stream = airc
+        .subscribe_subscribed_filtered(airc_lib::EventFilter::default())
+        .await?;
+    print_event_stream_until_signal(&mut stream).await?;
     Ok(())
 }
 
@@ -604,9 +605,13 @@ pub async fn run_inbox(
     Ok(())
 }
 
-async fn print_event_stream_until_signal(
-    stream: &mut airc_lib::EventStream,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn print_event_stream_until_signal<S>(
+    stream: &mut S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: futures::stream::Stream<Item = Result<airc_core::TranscriptEvent, airc_lib::LiveLag>>
+        + Unpin,
+{
     let sigint = tokio::signal::ctrl_c();
     let mut sigint = Box::pin(sigint);
     loop {
