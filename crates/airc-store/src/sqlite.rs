@@ -29,9 +29,10 @@ use airc_core::{
     Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptCursor, TranscriptEvent,
 };
 
+use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 use crate::entities::{
-    event, local_identity, mesh_identity, peer_rotation_audit, peer_trust, runtime_cursor,
-    subscription,
+    account_registry, event, local_identity, mesh_identity, peer_rotation_audit, peer_trust,
+    runtime_cursor, subscription,
 };
 use crate::error::StoreError;
 use crate::mesh_identity::StoredMeshIdentity;
@@ -275,6 +276,130 @@ impl SqliteEventStore {
             )?),
         };
         local_identity::Entity::insert(active)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Load the cached account-registry document for a given mesh
+    /// identity, if any. Returns `Ok(None)` when this scope has
+    /// never published-or-refreshed a document for that identity.
+    pub async fn load_account_registry(
+        &self,
+        mesh_identity: &str,
+    ) -> Result<Option<StoredAccountRegistry>, StoreError> {
+        let row = account_registry::document::Entity::find_by_id(mesh_identity.to_string())
+            .one(&self.db)
+            .await?;
+        row.map(|m| {
+            Ok(StoredAccountRegistry {
+                mesh_identity: m.mesh_identity,
+                schema_version: u16::try_from(m.schema_version).map_err(|_| {
+                    StoreError::InvalidStoredValue {
+                        field: "account_registry.schema_version",
+                        value: m.schema_version as i128,
+                    }
+                })?,
+                generated_at_ms: i64_to_u64("account_registry.generated_at_ms", m.generated_at_ms)?,
+                document_json: m.document_json,
+                updated_at_ms: i64_to_u64("account_registry.updated_at_ms", m.updated_at_ms)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Upsert the cached account-registry document for a given mesh
+    /// identity. Idempotent on the document body; the `updated_at_ms`
+    /// stamp always reflects the most recent save.
+    pub async fn save_account_registry(
+        &self,
+        document: StoredAccountRegistry,
+    ) -> Result<(), StoreError> {
+        let active = account_registry::document::ActiveModel {
+            mesh_identity: Set(document.mesh_identity.clone()),
+            schema_version: Set(i32::from(document.schema_version)),
+            generated_at_ms: Set(u64_to_i64(
+                "account_registry.generated_at_ms",
+                document.generated_at_ms,
+            )?),
+            document_json: Set(document.document_json),
+            updated_at_ms: Set(u64_to_i64(
+                "account_registry.updated_at_ms",
+                document.updated_at_ms,
+            )?),
+        };
+        account_registry::document::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(account_registry::document::Column::MeshIdentity)
+                    .update_columns([
+                        account_registry::document::Column::SchemaVersion,
+                        account_registry::document::Column::GeneratedAtMs,
+                        account_registry::document::Column::DocumentJson,
+                        account_registry::document::Column::UpdatedAtMs,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Load the gh-gist sentinel for a given mesh identity, if any.
+    pub async fn load_account_registry_gist_sentinel(
+        &self,
+        mesh_identity: &str,
+    ) -> Result<Option<StoredAccountRegistryGistSentinel>, StoreError> {
+        let row = account_registry::gist_sentinel::Entity::find_by_id(mesh_identity.to_string())
+            .one(&self.db)
+            .await?;
+        row.map(|m| {
+            Ok(StoredAccountRegistryGistSentinel {
+                mesh_identity: m.mesh_identity,
+                gist_id: m.gist_id,
+                updated_at_ms: i64_to_u64(
+                    "account_registry_gist_sentinel.updated_at_ms",
+                    m.updated_at_ms,
+                )?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Delete the gh-gist sentinel for a given mesh identity.
+    /// Used when the remote gist was edited-or-deleted out of band
+    /// and the local recording is stale.
+    pub async fn clear_account_registry_gist_sentinel(
+        &self,
+        mesh_identity: &str,
+    ) -> Result<(), StoreError> {
+        account_registry::gist_sentinel::Entity::delete_by_id(mesh_identity.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert the gh-gist sentinel for a given mesh identity.
+    pub async fn save_account_registry_gist_sentinel(
+        &self,
+        sentinel: StoredAccountRegistryGistSentinel,
+    ) -> Result<(), StoreError> {
+        let active = account_registry::gist_sentinel::ActiveModel {
+            mesh_identity: Set(sentinel.mesh_identity.clone()),
+            gist_id: Set(sentinel.gist_id),
+            updated_at_ms: Set(u64_to_i64(
+                "account_registry_gist_sentinel.updated_at_ms",
+                sentinel.updated_at_ms,
+            )?),
+        };
+        account_registry::gist_sentinel::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(account_registry::gist_sentinel::Column::MeshIdentity)
+                    .update_columns([
+                        account_registry::gist_sentinel::Column::GistId,
+                        account_registry::gist_sentinel::Column::UpdatedAtMs,
+                    ])
+                    .to_owned(),
+            )
             .exec(&self.db)
             .await?;
         Ok(())

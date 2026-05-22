@@ -46,7 +46,7 @@ pub mod work;
 
 pub use account_registry::{
     AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
-    FileAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
+    SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
 };
 pub use airc::Airc;
 pub use coordinator::{

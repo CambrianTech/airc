@@ -14,7 +14,12 @@
 //!     holds the `peer_id` / `client_id` / version / created_at
 //!     bookkeeping that lived in `identity.json` before Phase 3.5.
 //!   - `mesh_identity` — cached account identity for room derivation.
+//!   - `account_registry` + `account_registry_gist_sentinel` — local
+//!     cache of the published cross-machine registry document and the
+//!     per-mesh-identity gist-id sentinel that the gh adapter uses
+//!     to recognize its own gist across publishes.
 
+pub mod account_registry;
 pub mod event;
 pub mod local_identity;
 pub mod mesh_identity;

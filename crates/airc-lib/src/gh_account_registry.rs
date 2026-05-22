@@ -15,11 +15,11 @@
 //!   gist; gist private)
 //! - **Description marker:** `airc-account-mesh-registry` (used for
 //!   discovery filtering on `gh gist list`)
-//! - **One gist per machine.** The local `airc-registry-gist-id`
-//!   sentinel under `<wire_root>/` records this machine's gist id so
-//!   subsequent publishes update the same gist instead of creating
-//!   duplicates. If the sentinel is missing on first publish, a new
-//!   gist is created and the id is persisted.
+//! - **One gist per machine.** The per-mesh-identity gist-id
+//!   sentinel row in `account_registry_gist_sentinel` records this
+//!   machine's gist id so subsequent publishes update the same gist
+//!   instead of creating duplicates. If the sentinel is missing on
+//!   first publish, a new gist is created and the id is persisted.
 //! - **Refresh merges all matching gists.** A scope joining on a
 //!   third+ machine sees both other machines' beacons without any
 //!   server-side coordination.
@@ -40,6 +40,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -48,10 +49,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+use airc_store::{SqliteEventStore, StoredAccountRegistryGistSentinel};
+
 use crate::account_registry::{
     AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
 };
 use crate::subscriptions::MeshIdentity;
+use crate::time;
 
 /// Filename used for the registry blob inside each per-machine gist.
 const REGISTRY_FILENAME: &str = "airc-account-mesh-registry.json";
@@ -59,29 +63,29 @@ const REGISTRY_FILENAME: &str = "airc-account-mesh-registry.json";
 /// across versions — bumping this constant would orphan existing
 /// registries.
 const REGISTRY_DESCRIPTION: &str = "airc-account-mesh-registry";
-/// Local sentinel that records this machine's gist id so subsequent
-/// publishes update the same gist instead of creating duplicates.
-const GIST_ID_FILENAME: &str = "account-registry-gist-id";
 
 /// gh-gist-backed account-registry store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GhAccountRegistryStore {
     gh_bin: PathBuf,
-    sentinel_root: PathBuf,
+    store: Arc<SqliteEventStore>,
 }
 
 impl GhAccountRegistryStore {
-    /// Construct a new store. `sentinel_root` is the directory where
-    /// the local-gist-id sentinel will be persisted — typically the
-    /// machine-account home `~/.airc/`.
-    pub fn new(sentinel_root: impl Into<PathBuf>) -> Self {
+    /// Construct a new store. The `store` handle is where this
+    /// adapter persists the per-mesh-identity gist-id sentinel that
+    /// lets subsequent publishes update the same gist rather than
+    /// creating duplicates. Typically the same SqliteEventStore the
+    /// machine-account home (`~/.airc/events.sqlite`) uses, but any
+    /// store with the account_registry tables works.
+    pub fn new(store: Arc<SqliteEventStore>) -> Self {
         Self {
             gh_bin: PathBuf::from(
                 std::env::var_os("AIRC_GH_BIN")
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "gh".into()),
             ),
-            sentinel_root: sentinel_root.into(),
+            store,
         }
     }
 
@@ -91,25 +95,53 @@ impl GhAccountRegistryStore {
         self
     }
 
-    fn sentinel_path(&self) -> PathBuf {
-        self.sentinel_root.join(GIST_ID_FILENAME)
+    async fn load_gist_id(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<String>, AccountRegistryError> {
+        let row = self
+            .store
+            .load_account_registry_gist_sentinel(mesh_identity.as_str())
+            .await
+            .map_err(|error| {
+                AccountRegistryError::Adapter(format!("load gist sentinel: {error}"))
+            })?;
+        Ok(row.and_then(|s| {
+            let trimmed = s.gist_id.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }))
     }
 
-    fn load_gist_id(&self) -> Option<String> {
-        std::fs::read_to_string(self.sentinel_path())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    fn save_gist_id(&self, id: &str) -> Result<(), AccountRegistryError> {
-        std::fs::create_dir_all(&self.sentinel_root).map_err(|error| {
-            AccountRegistryError::Adapter(format!("create sentinel dir: {error}"))
+    async fn save_gist_id(
+        &self,
+        mesh_identity: &MeshIdentity,
+        id: &str,
+    ) -> Result<(), AccountRegistryError> {
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("clock for gist sentinel save: {error}"))
         })?;
-        let path = self.sentinel_path();
-        std::fs::write(&path, id).map_err(|error| {
-            AccountRegistryError::Adapter(format!("write sentinel {}: {error}", path.display()))
-        })
+        self.store
+            .save_account_registry_gist_sentinel(StoredAccountRegistryGistSentinel {
+                mesh_identity: mesh_identity.as_str().to_string(),
+                gist_id: id.to_string(),
+                updated_at_ms: now_ms,
+            })
+            .await
+            .map_err(|error| AccountRegistryError::Adapter(format!("save gist sentinel: {error}")))
+    }
+
+    async fn clear_gist_id(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<(), AccountRegistryError> {
+        self.store
+            .clear_account_registry_gist_sentinel(mesh_identity.as_str())
+            .await
+            .map_err(|error| AccountRegistryError::Adapter(format!("clear gist sentinel: {error}")))
     }
 
     async fn gh_run(
@@ -157,7 +189,7 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             AccountRegistryError::Adapter(format!("serialize registry: {error}"))
         })?;
 
-        match self.load_gist_id() {
+        match self.load_gist_id(&document.mesh_identity).await? {
             Some(id) => {
                 // Update existing gist. `gh gist edit <id> --filename
                 // <name> -` reads new content from stdin.
@@ -170,7 +202,7 @@ impl AccountRegistryStore for GhAccountRegistryStore {
                 if !ok {
                     // Probably the recorded gist was deleted out-of-
                     // band. Drop the sentinel and retry as create.
-                    let _ = std::fs::remove_file(self.sentinel_path());
+                    let _ = self.clear_gist_id(&document.mesh_identity).await;
                     return Err(AccountRegistryError::Adapter(format!(
                         "gh gist edit {id} failed; sentinel cleared so next publish will recreate. stderr: {stderr}"
                     )));
@@ -204,7 +236,7 @@ impl AccountRegistryStore for GhAccountRegistryStore {
                         "could not parse gist id from gh output: {stdout}"
                     ))
                 })?;
-                self.save_gist_id(&id)?;
+                self.save_gist_id(&document.mesh_identity, &id).await?;
                 Ok(())
             }
         }
@@ -365,12 +397,22 @@ mod tests {
         assert!(extract_gist_id("https://gist.github.com/joelteply/").is_none());
     }
 
-    #[test]
-    fn save_and_load_gist_id_round_trips() {
+    #[tokio::test]
+    async fn save_and_load_gist_id_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let store = GhAccountRegistryStore::new(dir.path());
-        assert!(store.load_gist_id().is_none());
-        store.save_gist_id("abc123").unwrap();
-        assert_eq!(store.load_gist_id().as_deref(), Some("abc123"));
+        let event_store =
+            airc_store::SqliteEventStore::open_path(&dir.path().join("events.sqlite"))
+                .await
+                .unwrap();
+        let store = GhAccountRegistryStore::new(Arc::new(event_store));
+        let mesh = MeshIdentity::new("joelteply");
+        assert!(store.load_gist_id(&mesh).await.unwrap().is_none());
+        store.save_gist_id(&mesh, "abc123").await.unwrap();
+        assert_eq!(
+            store.load_gist_id(&mesh).await.unwrap().as_deref(),
+            Some("abc123")
+        );
+        store.clear_gist_id(&mesh).await.unwrap();
+        assert!(store.load_gist_id(&mesh).await.unwrap().is_none());
     }
 }
