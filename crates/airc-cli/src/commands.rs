@@ -82,7 +82,11 @@ pub async fn run_room(
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
-pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_join(
+    home: &Path,
+    room: Option<String>,
+    attach: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match room {
         Some(room) => {
@@ -108,6 +112,35 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     let socket = crate::cli::default_socket_path_in(home);
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     subscribe_daemon_to_current_rooms(home, socket).await?;
+
+    // `--attach` keeps the foreground process alive and streams the
+    // live event broadcast. The skills doc has documented this flag
+    // for the longest time but only the bash wrapper implemented it;
+    // post-demolition the Rust binary needs to own it directly. Same
+    // path as `airc monitor attach`, just chained after the join.
+    if attach {
+        println!();
+        println!("attached — Ctrl-C to detach.");
+        let mut stream = airc.subscribe().await?;
+        print_event_stream_until_signal(&mut stream).await?;
+    }
+    Ok(())
+}
+
+/// `version` — print package version + install dir. Distinct from
+/// clap's `--version` flag (which only prints the package version)
+/// because operators use `airc version` to verify two scopes/tabs
+/// are on the same build path, not just the same version string.
+///
+/// Richer build metadata (commit sha, branch, commit subject) is a
+/// follow-up — would need a `build.rs` that captures git state at
+/// compile time. For now: package version + binary path is enough
+/// to distinguish "are we on the same install."
+pub fn run_version() -> Result<(), Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let exe_path = exe.canonicalize().unwrap_or(exe);
+    println!("  airc {}", env!("CARGO_PKG_VERSION"));
+    println!("  install: {}", exe_path.display());
     Ok(())
 }
 
