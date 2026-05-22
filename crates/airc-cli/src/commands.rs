@@ -112,6 +112,7 @@ pub async fn run_join(
     let socket = crate::cli::default_socket_path_in(home);
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     subscribe_daemon_to_current_rooms(home, socket).await?;
+    ensure_runtime_integrations();
 
     // `--attach` keeps the foreground process alive and streams the
     // live event broadcast. The skills doc has documented this flag
@@ -125,6 +126,20 @@ pub async fn run_join(
         print_event_stream_until_signal(&mut stream).await?;
     }
     Ok(())
+}
+
+fn ensure_runtime_integrations() {
+    match crate::codex_install::install_hooks_for_default_home_if_present() {
+        Ok(report) if report.is_empty() => {}
+        Ok(report) => {
+            for line in report.lines {
+                println!("runtime: {line}");
+            }
+        }
+        Err(error) => {
+            eprintln!("airc: Codex hook setup skipped: {error}");
+        }
+    }
 }
 
 /// `version` — print package version + install dir. Distinct from

@@ -204,6 +204,56 @@ fn join_without_args_uses_default_account_context() {
     );
 }
 
+#[test]
+fn join_sets_up_codex_hook_when_codex_home_exists() {
+    let machine = TempDir::new().expect("tempdir");
+    let repo = machine.path().join("continuum");
+    let home = repo.join(".airc");
+    let codex_home = machine.path().join(".codex");
+    create_repo_with_origin(&repo, "https://github.com/CambrianTech/continuum.git");
+    seed_mesh_identity(&home, "joelteply");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(codex_home.join("config.toml"), "[features]\n").expect("codex config");
+
+    let mut join = Command::new(airc_core());
+    join.env("HOME", machine.path())
+        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+        .args(["--home", home.to_str().unwrap(), "join"])
+        .current_dir(&repo);
+    let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
+    assert!(
+        output.status.success(),
+        "join failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("runtime: installed AIRC UserPromptSubmit hook"),
+        "{stdout}"
+    );
+
+    let hooks = std::fs::read_to_string(codex_home.join("hooks.json")).expect("hooks.json");
+    assert!(
+        hooks.contains("airc codex-hook user-prompt-submit"),
+        "{hooks}"
+    );
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("config.toml");
+    assert!(config.contains("hooks = true"), "{config}");
+
+    let mut stop_command = Command::new(airc_core());
+    stop_command
+        .env("HOME", machine.path())
+        .args(["--home", home.to_str().unwrap(), "stop"]);
+    let stop = output_with_timeout(stop_command, Duration::from_secs(10), "airc stop");
+    assert!(
+        stop.status.success(),
+        "stop failed after join proof: stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
 fn output_with_timeout(
     mut command: Command,
     timeout: Duration,
