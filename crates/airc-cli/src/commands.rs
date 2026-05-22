@@ -117,10 +117,13 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     //   - Interactive TTY: attach
     //   - cargo test / cargo run / pipe / script context: return cleanly
     //
-    // The cargo signal (`CARGO_BIN_EXE_*` / `CARGO_PKG_NAME` env vars
-    // set on the test binary AND inherited by spawned children)
-    // takes priority — even if Claude Code is the parent process,
-    // a `cargo test` run inside it should not hang the test harness.
+    // Agent runtime is detected through explicit env markers OR the
+    // same runtime client identity resolver used for event stamping
+    // (`airc client-id`). The cargo signal (`CARGO_BIN_EXE_*` /
+    // `CARGO_PKG_NAME` env vars set on the test binary AND inherited
+    // by spawned children) takes priority — even if Claude Code or
+    // Codex is the parent process, a `cargo test` run inside it
+    // should not hang the test harness.
     // `AIRC_NO_ATTACH=1` is an explicit internal opt-out for any
     // other script that needs setup-only without inheriting cargo
     // envs.
@@ -153,7 +156,11 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// 5. Otherwise — exit cleanly after setup.
 fn should_attach_after_join() -> bool {
     use std::io::IsTerminal;
-    should_attach_after_join_from(
+    let runtime_client_detected = crate::client_id::current_client_id()
+        .ok()
+        .flatten()
+        .is_some();
+    should_attach_after_join_with_client(
         std::env::vars_os().map(|(key, value)| {
             (
                 key.to_string_lossy().into_owned(),
@@ -161,10 +168,25 @@ fn should_attach_after_join() -> bool {
             )
         }),
         std::io::stdout().is_terminal(),
+        runtime_client_detected,
     )
 }
 
+#[cfg(test)]
 fn should_attach_after_join_from<I, K, V>(env: I, stdout_is_tty: bool) -> bool
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    should_attach_after_join_with_client(env, stdout_is_tty, false)
+}
+
+fn should_attach_after_join_with_client<I, K, V>(
+    env: I,
+    stdout_is_tty: bool,
+    runtime_client_detected: bool,
+) -> bool
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -200,6 +222,9 @@ where
         return false;
     }
     if has_agent_marker {
+        return true;
+    }
+    if runtime_client_detected {
         return true;
     }
     stdout_is_tty
@@ -824,7 +849,7 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_attach_after_join_from;
+    use super::{should_attach_after_join_from, should_attach_after_join_with_client};
 
     #[test]
     fn join_attach_decision_streams_for_codex_agent() {
@@ -851,20 +876,31 @@ mod tests {
     }
 
     #[test]
+    fn join_attach_decision_streams_for_detected_runtime_client() {
+        assert!(should_attach_after_join_with_client(
+            std::iter::empty::<(&str, &str)>(),
+            false,
+            true
+        ));
+    }
+
+    #[test]
     fn join_attach_decision_exits_for_cargo_context() {
-        assert!(!should_attach_after_join_from(
+        assert!(!should_attach_after_join_with_client(
             [
                 ("CLAUDE_CODE_SESSION_ID", "session-1"),
                 ("CARGO_BIN_EXE_airc", "/tmp/airc"),
             ],
+            true,
             true
         ));
     }
 
     #[test]
     fn join_attach_decision_internal_opt_out_wins() {
-        assert!(!should_attach_after_join_from(
+        assert!(!should_attach_after_join_with_client(
             [("CODEX_SESSION_ID", "thread-1"), ("AIRC_NO_ATTACH", "1")],
+            true,
             true
         ));
     }
