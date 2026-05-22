@@ -10,24 +10,17 @@
 //!
 //! ## State layout
 //!
-//! ```text
-//! ~/.airc/accounts/<mesh-identity>/
-//!   beacons/
-//!     <peer-id>.json           # per-scope presence beacon
-//!   refresh.lock                # singleflight sentinel for remote refresh
-//! ```
+//! Presence beacons live in the shared machine-account
+//! `events.sqlite` store (`beacons` + `beacon_channels` tables).
+//! The only coordinator files left are refresh lock sentinels under
+//! `~/.airc/accounts/<mesh-identity>/`, used to singleflight rare
+//! remote registry refreshes. Runtime presence is never kept in JSON
+//! sidecars.
 //!
 //! Each scope (Claude tab, Codex tab, persona instance, daemon, etc.)
-//! writes ONE beacon under `beacons/<peer-id>.json`. The peer-id is
+//! writes ONE row keyed by `(mesh_identity, peer_id)`. The peer-id is
 //! the scope's stable identifier (from `Airc::peer_id`), so two
 //! processes from the same scope coalesce; two scopes never collide.
-//!
-//! The coordinator never mutates other scopes' beacons. It only:
-//!
-//! - reads all beacons in the directory to compute a `CoordinatorSnapshot`;
-//! - writes / refreshes the caller's own beacon via `publish`;
-//! - drains expired beacons via `drain_stale` (separate verb so callers
-//!   opt in to destructive action — "drains are core" rule).
 //!
 //! ## TTL and singleflight
 //!
@@ -36,9 +29,9 @@
 //! 1. **Beacon TTL** — a beacon older than `heartbeat_ttl_ms` is
 //!    considered stale. Stale beacons appear in
 //!    [`CoordinatorSnapshot::stale`] separately from live ones. Stale
-//!    beacons stay on disk until `drain_stale` runs, so a transient
-//!    crash doesn't immediately purge the record (recovery still
-//!    sees the old subscriptions).
+//!    beacons stay in the store until `drain_stale_store` runs, so a
+//!    transient crash doesn't immediately purge the record (recovery
+//!    still sees the old subscriptions).
 //! 2. **Remote-refresh singleflight** — when a join needs the
 //!    rare-and-expensive remote registry refresh (GitHub gist pull),
 //!    [`try_acquire_refresh_lock`] takes the `refresh.lock` sentinel.
@@ -48,10 +41,9 @@
 //!
 //! ## Scope: what's in this PR
 //!
-//! The pure local presence/beacon machinery + singleflight primitive.
-//! Wiring into `Airc::join` / wrapper / monitor / hooks comes in
-//! follow-up PRs, per Joel's "no monitor/hook changes in first
-//! coordinator PR unless API is stable" boundary.
+//! The coordinator API is store-first. File-backed beacon helpers
+//! were removed after the SeaORM cut so production callers cannot
+//! accidentally reintroduce split-brain JSON presence state.
 
 use std::collections::HashMap;
 use std::fs;
@@ -63,12 +55,10 @@ use airc_core::PeerId;
 use airc_store::{EventStore, StoreError, StoredBeacon};
 
 use crate::coordinator_lock::RefreshLock;
-use crate::fs_permissions;
 use crate::subscriptions::{ChannelName, ChannelNameError, MeshIdentity};
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
-const BEACONS_DIR: &str = "beacons";
 const REFRESH_LOCK: &str = "refresh.lock";
 const REFRESH_TAKEOVER_LOCK: &str = "refresh.takeover";
 
@@ -156,14 +146,6 @@ pub enum CoordinatorError {
     Json(serde_json::Error),
     Store(StoreError),
     Channel(ChannelNameError),
-    /// A beacon file existed but its schema version didn't match. We
-    /// surface this rather than silently skip so the operator sees
-    /// the foreign-version surface.
-    SchemaVersionMismatch {
-        path: PathBuf,
-        found: u32,
-        expected: u32,
-    },
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -173,15 +155,6 @@ impl std::fmt::Display for CoordinatorError {
             Self::Json(error) => write!(f, "coordinator JSON: {error}"),
             Self::Store(error) => write!(f, "coordinator store: {error}"),
             Self::Channel(error) => write!(f, "coordinator channel: {error}"),
-            Self::SchemaVersionMismatch {
-                path,
-                found,
-                expected,
-            } => write!(
-                f,
-                "beacon {} version {found}, expected {expected}",
-                path.display()
-            ),
         }
     }
 }
@@ -193,7 +166,6 @@ impl std::error::Error for CoordinatorError {
             Self::Json(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Channel(error) => Some(error),
-            Self::SchemaVersionMismatch { .. } => None,
         }
     }
 }
@@ -248,14 +220,6 @@ fn sanitize_identity(value: &str) -> String {
         .collect()
 }
 
-fn beacons_dir(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
-    account_root(airc_home, identity).join(BEACONS_DIR)
-}
-
-fn beacon_path(airc_home: &Path, identity: &MeshIdentity, peer_id: PeerId) -> PathBuf {
-    beacons_dir(airc_home, identity).join(format!("{peer_id}.json"))
-}
-
 fn refresh_lock_path(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
     account_root(airc_home, identity).join(REFRESH_LOCK)
 }
@@ -264,24 +228,7 @@ fn refresh_takeover_lock_path(airc_home: &Path, identity: &MeshIdentity) -> Path
     account_root(airc_home, identity).join(REFRESH_TAKEOVER_LOCK)
 }
 
-/// Publish the caller's beacon. Atomic via write-tmp + rename so a
-/// concurrent reader never sees a partial file.
-pub fn publish(
-    airc_home: &Path,
-    identity: &MeshIdentity,
-    beacon: &PresenceBeacon,
-) -> Result<(), CoordinatorError> {
-    let dir = beacons_dir(airc_home, identity);
-    fs::create_dir_all(&dir)?;
-    let final_path = beacon_path(airc_home, identity, beacon.peer_id);
-    let tmp_path = dir.join(format!(".{}.tmp", beacon.peer_id));
-    let text = serde_json::to_string_pretty(beacon)?;
-    fs::write(&tmp_path, text)?;
-    fs_permissions::set_owner_only(&tmp_path)?;
-    fs::rename(&tmp_path, &final_path)?;
-    Ok(())
-}
-
+/// Publish the caller's beacon into the durable coordinator store.
 pub async fn publish_store(
     store: &dyn EventStore,
     identity: &MeshIdentity,
@@ -297,19 +244,6 @@ pub async fn publish_store(
 /// "no prior publish" from "publish exists with stale heartbeat" —
 /// the caller computes freshness from the returned beacon's
 /// `is_fresh`.
-pub fn load_own_beacon(
-    airc_home: &Path,
-    identity: &MeshIdentity,
-    peer_id: PeerId,
-) -> Result<Option<PresenceBeacon>, CoordinatorError> {
-    let path = beacon_path(airc_home, identity, peer_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let beacon = read_beacon(&path)?;
-    Ok(Some(beacon))
-}
-
 pub async fn load_own_beacon_store(
     store: &dyn EventStore,
     identity: &MeshIdentity,
@@ -325,53 +259,6 @@ pub async fn load_own_beacon_store(
 /// Build a snapshot of all beacons for a mesh identity. Beacons
 /// whose `heartbeat_at_ms` is within `config.heartbeat_ttl_ms` of
 /// `now_ms` land in `live`; the rest in `stale`.
-pub fn snapshot(
-    airc_home: &Path,
-    identity: &MeshIdentity,
-    config: &CoordinatorConfig,
-    now_ms: u64,
-) -> Result<CoordinatorSnapshot, CoordinatorError> {
-    let root = account_root(airc_home, identity);
-    let beacons_dir = root.join(BEACONS_DIR);
-    let mut live = Vec::new();
-    let mut stale = Vec::new();
-    if beacons_dir.exists() {
-        for entry in fs::read_dir(&beacons_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            // Skip tmp/dot files left mid-rename.
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') {
-                    continue;
-                }
-            }
-            let beacon = read_beacon(&path)?;
-            if beacon.is_fresh(now_ms, config.heartbeat_ttl_ms) {
-                live.push(beacon);
-            } else {
-                stale.push(beacon);
-            }
-        }
-    }
-    // Stable ordering for deterministic display + diffs.
-    // PeerId is a UUID wrapper without Ord; sort by string form for
-    // deterministic display + diffs across runs.
-    live.sort_by_key(|b| b.peer_id.to_string());
-    stale.sort_by_key(|b| b.peer_id.to_string());
-    let live_channels = unique_channels_in(&live);
-    Ok(CoordinatorSnapshot {
-        mesh_identity: identity.clone(),
-        root,
-        live,
-        stale,
-        live_channels,
-        fetched_at_ms: now_ms,
-    })
-}
-
 pub async fn snapshot_store(
     store: &dyn EventStore,
     identity: &MeshIdentity,
@@ -401,30 +288,13 @@ pub async fn snapshot_store(
     })
 }
 
-/// Delete beacon files for all entries currently in
-/// [`CoordinatorSnapshot::stale`]. Best-effort — missing files
+/// Delete store rows for all entries currently in
+/// [`CoordinatorSnapshot::stale`]. Best-effort — missing rows
 /// (raced with another draining process) aren't an error. Returns
 /// the count of beacons removed.
 ///
-/// Separate from `snapshot` so callers opt in to destructive action.
-pub fn drain_stale(
-    airc_home: &Path,
-    identity: &MeshIdentity,
-    snapshot: &CoordinatorSnapshot,
-) -> Result<usize, CoordinatorError> {
-    let mut removed = 0;
-    for beacon in &snapshot.stale {
-        let path = beacon_path(airc_home, identity, beacon.peer_id);
-        match fs::remove_file(&path) {
-            Ok(()) => removed += 1,
-            // Concurrent drain already won — fine.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(removed)
-}
-
+/// Separate from `snapshot_store` so callers opt in to destructive
+/// action.
 pub async fn drain_stale_store(
     store: &dyn EventStore,
     identity: &MeshIdentity,
@@ -508,19 +378,6 @@ pub fn release_refresh_lock(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn read_beacon(path: &Path) -> Result<PresenceBeacon, CoordinatorError> {
-    let text = fs::read_to_string(path)?;
-    let beacon: PresenceBeacon = serde_json::from_str(&text)?;
-    if beacon.version != BEACON_VERSION {
-        return Err(CoordinatorError::SchemaVersionMismatch {
-            path: path.to_path_buf(),
-            found: beacon.version,
-            expected: BEACON_VERSION,
-        });
-    }
-    Ok(beacon)
 }
 
 fn unique_channels_in(beacons: &[PresenceBeacon]) -> Vec<ChannelName> {
@@ -642,20 +499,6 @@ mod tests {
         assert_eq!(last, "joel-example.com");
     }
 
-    #[test]
-    fn publish_then_load_own_beacon_round_trips() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-        let mesh = id();
-        let beacon = make_beacon(1_000, vec!["general", "cambriantech"]);
-
-        publish(home, &mesh, &beacon).unwrap();
-        let loaded = load_own_beacon(home, &mesh, beacon.peer_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded, beacon);
-    }
-
     #[tokio::test]
     async fn store_publish_snapshot_and_drain_round_trip() {
         let store = airc_store::InMemoryEventStore::new();
@@ -697,17 +540,16 @@ mod tests {
         assert_eq!(after.live.len(), 1);
     }
 
-    #[test]
-    fn load_own_beacon_returns_none_when_absent() {
-        let dir = tempdir().unwrap();
-        let loaded = load_own_beacon(dir.path(), &id(), peer()).unwrap();
+    #[tokio::test]
+    async fn load_own_beacon_returns_none_when_absent() {
+        let store = airc_store::InMemoryEventStore::new();
+        let loaded = load_own_beacon_store(&store, &id(), peer()).await.unwrap();
         assert!(loaded.is_none());
     }
 
-    #[test]
-    fn snapshot_partitions_live_and_stale_by_ttl() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
+    #[tokio::test]
+    async fn snapshot_partitions_live_and_stale_by_ttl() {
+        let store = airc_store::InMemoryEventStore::new();
         let mesh = id();
         let cfg = CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
@@ -716,64 +558,65 @@ mod tests {
 
         let fresh = make_beacon(950, vec!["general"]);
         let stale = make_beacon(0, vec!["cambriantech"]);
-        publish(home, &mesh, &fresh).unwrap();
-        publish(home, &mesh, &stale).unwrap();
+        publish_store(&store, &mesh, &fresh).await.unwrap();
+        publish_store(&store, &mesh, &stale).await.unwrap();
 
-        let snap = snapshot(home, &mesh, &cfg, 1_000).unwrap();
+        let snap = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
         assert_eq!(snap.live.len(), 1, "fresh beacon should be live");
         assert_eq!(snap.stale.len(), 1, "old beacon should be stale");
         assert_eq!(snap.live[0].peer_id, fresh.peer_id);
         assert_eq!(snap.stale[0].peer_id, stale.peer_id);
     }
 
-    #[test]
-    fn snapshot_aggregates_live_channels_deduplicated() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
+    #[tokio::test]
+    async fn snapshot_aggregates_live_channels_deduplicated() {
+        let store = airc_store::InMemoryEventStore::new();
         let mesh = id();
         let cfg = CoordinatorConfig::default();
 
         let a = make_beacon(1_000, vec!["general", "cambriantech"]);
         let b = make_beacon(1_000, vec!["general", "ideem"]);
-        publish(home, &mesh, &a).unwrap();
-        publish(home, &mesh, &b).unwrap();
+        publish_store(&store, &mesh, &a).await.unwrap();
+        publish_store(&store, &mesh, &b).await.unwrap();
 
-        let snap = snapshot(home, &mesh, &cfg, 1_000).unwrap();
+        let snap = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
         let names: Vec<&str> = snap.live_channels.iter().map(ChannelName::as_str).collect();
         assert_eq!(names, vec!["cambriantech", "general", "ideem"]);
     }
 
-    #[test]
-    fn snapshot_empty_when_no_beacons() {
-        let dir = tempdir().unwrap();
-        let snap = snapshot(dir.path(), &id(), &CoordinatorConfig::default(), 0).unwrap();
+    #[tokio::test]
+    async fn snapshot_empty_when_no_beacons() {
+        let store = airc_store::InMemoryEventStore::new();
+        let snap = snapshot_store(&store, &id(), &CoordinatorConfig::default(), 0)
+            .await
+            .unwrap();
         assert!(snap.live.is_empty());
         assert!(snap.stale.is_empty());
         assert!(snap.live_channels.is_empty());
     }
 
-    #[test]
-    fn snapshot_isolates_identities() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
+    #[tokio::test]
+    async fn snapshot_isolates_identities() {
+        let store = airc_store::InMemoryEventStore::new();
         let cfg = CoordinatorConfig::default();
         let mine = make_beacon(1_000, vec!["general"]);
         let theirs = make_beacon(1_000, vec!["general"]);
-        publish(home, &id(), &mine).unwrap();
-        publish(home, &other_id(), &theirs).unwrap();
+        publish_store(&store, &id(), &mine).await.unwrap();
+        publish_store(&store, &other_id(), &theirs).await.unwrap();
 
-        let my_snap = snapshot(home, &id(), &cfg, 1_000).unwrap();
-        let their_snap = snapshot(home, &other_id(), &cfg, 1_000).unwrap();
+        let my_snap = snapshot_store(&store, &id(), &cfg, 1_000).await.unwrap();
+        let their_snap = snapshot_store(&store, &other_id(), &cfg, 1_000)
+            .await
+            .unwrap();
         assert_eq!(my_snap.live.len(), 1);
         assert_eq!(their_snap.live.len(), 1);
         assert_eq!(my_snap.live[0].peer_id, mine.peer_id);
         assert_eq!(their_snap.live[0].peer_id, theirs.peer_id);
     }
 
-    #[test]
-    fn drain_stale_removes_only_stale_files() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
+    #[tokio::test]
+    async fn drain_stale_removes_only_stale_rows() {
+        let store = airc_store::InMemoryEventStore::new();
         let mesh = id();
         let cfg = CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
@@ -781,23 +624,22 @@ mod tests {
         };
         let fresh = make_beacon(950, vec!["general"]);
         let stale = make_beacon(0, vec!["general"]);
-        publish(home, &mesh, &fresh).unwrap();
-        publish(home, &mesh, &stale).unwrap();
+        publish_store(&store, &mesh, &fresh).await.unwrap();
+        publish_store(&store, &mesh, &stale).await.unwrap();
 
-        let snap = snapshot(home, &mesh, &cfg, 1_000).unwrap();
-        let removed = drain_stale(home, &mesh, &snap).unwrap();
+        let snap = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
+        let removed = drain_stale_store(&store, &mesh, &snap).await.unwrap();
         assert_eq!(removed, 1);
 
         // Re-snapshot: only the fresh beacon should remain.
-        let after = snapshot(home, &mesh, &cfg, 1_000).unwrap();
+        let after = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
         assert_eq!(after.live.len(), 1);
         assert_eq!(after.stale.len(), 0);
     }
 
-    #[test]
-    fn publish_is_idempotent_via_atomic_rename() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
+    #[tokio::test]
+    async fn publish_is_idempotent_via_store_upsert() {
+        let store = airc_store::InMemoryEventStore::new();
         let mesh = id();
         let peer_id = peer();
         let first = PresenceBeacon {
@@ -814,9 +656,12 @@ mod tests {
             heartbeat_at_ms: 2_000,
             ..first.clone()
         };
-        publish(home, &mesh, &first).unwrap();
-        publish(home, &mesh, &second).unwrap();
-        let loaded = load_own_beacon(home, &mesh, peer_id).unwrap().unwrap();
+        publish_store(&store, &mesh, &first).await.unwrap();
+        publish_store(&store, &mesh, &second).await.unwrap();
+        let loaded = load_own_beacon_store(&store, &mesh, peer_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.heartbeat_at_ms, 2_000, "second publish wins");
     }
 
@@ -878,13 +723,13 @@ mod tests {
     fn unsafe_chars_in_identity_dont_escape_root() {
         let dir = tempdir().unwrap();
         let mesh = MeshIdentity::new("../../etc/passwd");
-        let beacon = make_beacon(1_000, vec!["general"]);
-        publish(dir.path(), &mesh, &beacon).unwrap();
         // Sanitized identity stays under the accounts/ subtree.
         let root = account_root(dir.path(), &mesh);
-        let canon_root = root.canonicalize().unwrap();
-        let canon_home = dir.path().canonicalize().unwrap();
-        assert!(canon_root.starts_with(canon_home));
+        assert!(root.starts_with(dir.path()));
+        assert_eq!(
+            root.file_name().unwrap().to_string_lossy(),
+            "..-..-etc-passwd"
+        );
     }
 
     #[test]
