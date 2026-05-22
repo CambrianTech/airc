@@ -44,6 +44,7 @@ mod hygiene_cli;
 mod hygiene_commands;
 mod identity_cli;
 mod identity_commands;
+mod join_feed;
 mod json_path;
 mod knock_cli;
 mod knock_commands;
