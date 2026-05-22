@@ -2,20 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use airc_core::{Body, TranscriptCursor, TranscriptEvent, TranscriptKind};
+use airc_core::{Body, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, EventFilter};
 use airc_protocol::HEADER_AIRC_CLIENT;
 use serde::Serialize;
 
 use crate::client_id::current_client_id;
 
-const DEFAULT_CURSOR_FILENAME: &str = "codex_hook_cursor.json";
+const CONSUMER_PREFIX: &str = "codex-hook";
 
 pub async fn run_user_prompt_submit(
     home: &Path,
-    cursor_file: Option<PathBuf>,
     count: usize,
     max_items: usize,
     raw: bool,
@@ -24,12 +23,13 @@ pub async fn run_user_prompt_submit(
     drain_stdin()?;
 
     let airc = Airc::open(home).await?;
-    let cursor_path = cursor_file.unwrap_or_else(|| home.join(DEFAULT_CURSOR_FILENAME));
     let filter = EventFilter {
         kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
         ..EventFilter::default()
     };
-    let previous = read_cursor_if_present(&cursor_path)?;
+    let runtime_client = current_client_id()?;
+    let consumer_id = consumer_id(runtime_client.as_deref());
+    let previous = airc.load_runtime_cursor(&consumer_id).await?;
     let events = match previous {
         Some(cursor) => {
             airc.resume_from_subscribed_filtered(&cursor, filter, count)
@@ -39,10 +39,9 @@ pub async fn run_user_prompt_submit(
     };
 
     if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-        write_cursor(&cursor_path, &newest)?;
+        airc.save_runtime_cursor(&consumer_id, &newest).await?;
     }
 
-    let runtime_client = current_client_id()?;
     let visible: Vec<_> = events
         .into_iter()
         .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
@@ -58,6 +57,13 @@ pub async fn run_user_prompt_submit(
     };
     print_hook_payload(&context)?;
     Ok(())
+}
+
+fn consumer_id(runtime_client: Option<&str>) -> String {
+    match runtime_client {
+        Some(client) => format!("{CONSUMER_PREFIX}:{client}"),
+        None => format!("{CONSUMER_PREFIX}:default"),
+    }
 }
 
 fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&str>) -> bool {
@@ -98,26 +104,6 @@ fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
     if !value.is_object() {
         return Err("Codex hook stdin must be a JSON object".into());
     }
-    Ok(())
-}
-
-fn read_cursor_if_present(
-    path: &Path,
-) -> Result<Option<TranscriptCursor>, Box<dyn std::error::Error>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn write_cursor(path: &Path, cursor: &TranscriptCursor) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(cursor)?)?;
-    std::fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -248,4 +234,18 @@ fn summarize_text(value: &str, max_len: usize) -> String {
         return one_line;
     }
     format!("{}...", one_line[..max_len.saturating_sub(3)].trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consumer_id;
+
+    #[test]
+    fn consumer_id_uses_runtime_client_when_present() {
+        assert_eq!(
+            consumer_id(Some("codex:thread-1")),
+            "codex-hook:codex:thread-1"
+        );
+        assert_eq!(consumer_id(None), "codex-hook:default");
+    }
 }

@@ -59,4 +59,18 @@ pub trait EventStore: Send + Sync {
         &self,
         channel: Option<RoomId>,
     ) -> Result<Option<TranscriptCursor>, StoreError>;
+
+    /// Return a named runtime consumer's checkpoint.
+    async fn load_runtime_cursor(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<TranscriptCursor>, StoreError>;
+
+    /// Persist a named runtime consumer's checkpoint.
+    async fn save_runtime_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &TranscriptCursor,
+        updated_at_ms: u64,
+    ) -> Result<(), StoreError>;
 }

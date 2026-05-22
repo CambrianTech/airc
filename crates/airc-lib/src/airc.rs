@@ -503,6 +503,31 @@ impl Airc {
         self.inner.store.as_ref()
     }
 
+    /// Load a named runtime consumer checkpoint from the durable
+    /// store. This is for hooks/feeds/monitors that need replay
+    /// state; it is intentionally store-backed so runtime delivery
+    /// state does not sprawl into JSON sidecars.
+    pub async fn load_runtime_cursor(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
+        Ok(self.inner.store.load_runtime_cursor(consumer_id).await?)
+    }
+
+    /// Persist a named runtime consumer checkpoint in the durable
+    /// store.
+    pub async fn save_runtime_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &airc_core::TranscriptCursor,
+    ) -> Result<(), AircError> {
+        self.inner
+            .store
+            .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn next_lamport(&self, wall_ms: u64) -> u64 {
         let mut current = self.inner.lamport_clock.load(Ordering::Relaxed);
         loop {

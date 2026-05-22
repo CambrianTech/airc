@@ -2,35 +2,33 @@
 //!
 //! `airc join` is the public recovery/live verb. Agent runtimes keep it
 //! open as their event feed; scripts/tests let it return. This module
-//! keeps the feed usable by storing a per-runtime cursor so each attach
-//! starts at "new since last seen" instead of replaying the full
-//! transcript.
+//! keeps the feed usable by storing a per-runtime cursor in
+//! `airc-store` so each attach starts at "new since last seen" instead
+//! of replaying the full transcript.
 
-use std::path::{Path, PathBuf};
-
-use airc_core::{Body, TranscriptCursor, TranscriptEvent};
+use airc_core::{Body, TranscriptEvent};
 use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::stream::StreamExt;
 
-const CURSOR_PREFIX: &str = "join_feed_cursor";
+const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
-pub async fn run(airc: &Airc, home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
     let filter = EventFilter::default();
-    let cursor_path = cursor_path(home)?;
-    print_catch_up(airc, filter.clone(), &cursor_path).await?;
+    let consumer_id = consumer_id()?;
+    print_catch_up(airc, filter.clone(), &consumer_id).await?;
     println!();
     println!("attached — Ctrl-C to detach.");
     let mut stream = airc.subscribe_subscribed_filtered(filter).await?;
-    print_stream_advancing_cursor(&mut stream, &cursor_path).await
+    print_stream_advancing_cursor(airc, &mut stream, &consumer_id).await
 }
 
 async fn print_catch_up(
     airc: &Airc,
     filter: EventFilter,
-    cursor_path: &Path,
+    consumer_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match read_cursor(cursor_path)? {
+    match airc.load_runtime_cursor(consumer_id).await? {
         Some(cursor) => {
             let events = airc
                 .resume_from_subscribed_filtered(&cursor, filter, CATCH_UP_LIMIT)
@@ -39,7 +37,7 @@ async fn print_catch_up(
                 print_event(event);
             }
             if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-                write_cursor(cursor_path, &newest)?;
+                airc.save_runtime_cursor(consumer_id, &newest).await?;
             }
             if events.len() == CATCH_UP_LIMIT {
                 eprintln!(
@@ -50,7 +48,7 @@ async fn print_catch_up(
         None => {
             let events = airc.page_recent_subscribed_filtered(filter, 1).await?;
             if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-                write_cursor(cursor_path, &newest)?;
+                airc.save_runtime_cursor(consumer_id, &newest).await?;
             }
         }
     }
@@ -58,8 +56,9 @@ async fn print_catch_up(
 }
 
 async fn print_stream_advancing_cursor<S>(
+    airc: &Airc,
     stream: &mut S,
-    cursor_path: &Path,
+    consumer_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: futures::stream::Stream<Item = Result<TranscriptEvent, LiveLag>> + Unpin,
@@ -78,7 +77,7 @@ where
                 match next {
                     Some(Ok(event)) => {
                         print_event(&event);
-                        write_cursor(cursor_path, &event.cursor())?;
+                        airc.save_runtime_cursor(consumer_id, &event.cursor()).await?;
                     }
                     Some(Err(lag)) => {
                         eprintln!("{lag}");
@@ -93,47 +92,12 @@ where
     }
 }
 
-fn cursor_path(home: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn consumer_id() -> Result<String, Box<dyn std::error::Error>> {
     let suffix = match crate::client_id::current_client_id()? {
-        Some(client_id) => safe_filename_component(&client_id),
+        Some(client_id) => client_id,
         None => "default".to_string(),
     };
-    Ok(home.join(format!("{CURSOR_PREFIX}.{suffix}.json")))
-}
-
-fn read_cursor(path: &Path) -> Result<Option<TranscriptCursor>, Box<dyn std::error::Error>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn write_cursor(path: &Path, cursor: &TranscriptCursor) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(cursor)?)?;
-    replace_file(&tmp, path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(path)?;
-            std::fs::rename(tmp, path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, path)
+    Ok(format!("{CONSUMER_PREFIX}:{suffix}"))
 }
 
 fn print_event(event: &TranscriptEvent) {
@@ -150,28 +114,12 @@ fn print_event(event: &TranscriptEvent) {
     );
 }
 
-fn safe_filename_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::safe_filename_component;
+    use super::CONSUMER_PREFIX;
 
     #[test]
-    fn cursor_filename_is_safe_for_runtime_client_ids() {
-        assert_eq!(
-            safe_filename_component("codex:019dea28/with spaces"),
-            "codex-019dea28-with-spaces"
-        );
+    fn consumer_prefix_names_join_feed_checkpoints() {
+        assert_eq!(CONSUMER_PREFIX, "join-feed");
     }
 }
