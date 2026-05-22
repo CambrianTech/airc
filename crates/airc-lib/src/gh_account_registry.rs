@@ -219,12 +219,19 @@ impl AccountRegistryStore for GhAccountRegistryStore {
         // matching the requested mesh_identity. Operator-supplied
         // identity mismatches (e.g., a stale gist from a previous
         // account) are ignored, not surfaced as errors.
+        // Discovery scans only the user's MOST RECENT 100 gists. The
+        // account-mesh-registry beacon is updated on every `airc
+        // join`, so it stays at the top of the user's gist list
+        // sorted by recency — there's no reason to iterate the
+        // entire account's gist history (which can take minutes for
+        // high-gist-count operators). Dropped `--paginate`
+        // deliberately. If an operator legitimately needs deeper
+        // discovery, that's a separate explicit verb later.
         let (ok, stdout, stderr) = self
             .gh_run(
                 &[
                     "api",
                     "/gists?per_page=100",
-                    "--paginate",
                     "--jq",
                     // Filter to gists whose description matches and which
                     // contain our registry filename. Returns one line of

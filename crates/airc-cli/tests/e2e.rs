@@ -155,6 +155,13 @@ fn join_without_args_uses_default_account_context() {
 
     let output = Command::new(airc_core())
         .env("HOME", machine.path())
+        // Tests run with the operator's real `gh` auth. The gh-gist
+        // account-registry sync (#862) would iterate the real user's
+        // gist list (`gh api /gists --paginate`), which hangs the
+        // test for high-gist-count accounts. Disable for hermetic
+        // testing; PR 1 of the architecture plan moves this sync to
+        // a background daemon tick.
+        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
         .args(["--home", home.to_str().unwrap(), "join"])
         .current_dir(&repo)
         .output()
