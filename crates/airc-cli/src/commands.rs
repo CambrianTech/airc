@@ -153,31 +153,56 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// 5. Otherwise — exit cleanly after setup.
 fn should_attach_after_join() -> bool {
     use std::io::IsTerminal;
-    if std::env::var_os("AIRC_NO_ATTACH").is_some() {
+    should_attach_after_join_from(
+        std::env::vars_os().map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        }),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+fn should_attach_after_join_from<I, K, V>(env: I, stdout_is_tty: bool) -> bool
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut has_opt_out = false;
+    let mut has_cargo_context = false;
+    let mut has_agent_marker = false;
+    for (key, _value) in env {
+        let key = key.as_ref();
+        if key == "AIRC_NO_ATTACH" {
+            has_opt_out = true;
+        }
+        if key.starts_with("CARGO_BIN_EXE_") || key == "CARGO_PKG_NAME" {
+            has_cargo_context = true;
+        }
+        if matches!(
+            key,
+            "CLAUDECODE"
+                | "CLAUDE_CODE_SESSION_ID"
+                | "AI_AGENT"
+                | "CODEX_AGENT_ID"
+                | "CODEX_SESSION_ID"
+                | "AIRC_CODEX_START_CHILD"
+        ) {
+            has_agent_marker = true;
+        }
+    }
+    if has_opt_out {
         return false;
     }
-    let cargo_context = std::env::vars_os().any(|(k, _)| {
-        let key = k.to_string_lossy();
-        key.starts_with("CARGO_BIN_EXE_") || key == "CARGO_PKG_NAME"
-    });
-    if cargo_context {
+    if has_cargo_context {
         return false;
     }
-    let agent_markers = [
-        "CLAUDECODE",
-        "CLAUDE_CODE_SESSION_ID",
-        "AI_AGENT",
-        "CODEX_AGENT_ID",
-        "CODEX_SESSION_ID",
-        "AIRC_CODEX_START_CHILD",
-    ];
-    if agent_markers
-        .iter()
-        .any(|key| std::env::var_os(key).is_some())
-    {
+    if has_agent_marker {
         return true;
     }
-    std::io::stdout().is_terminal()
+    stdout_is_tty
 }
 
 fn ensure_runtime_integrations() {
@@ -795,4 +820,60 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
         headers.insert(HEADER_AIRC_CLIENT.to_string(), client);
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_attach_after_join_from;
+
+    #[test]
+    fn join_attach_decision_streams_for_codex_agent() {
+        assert!(should_attach_after_join_from(
+            [("CODEX_SESSION_ID", "thread-1")],
+            false
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_streams_for_claude_agent() {
+        assert!(should_attach_after_join_from(
+            [("CLAUDE_CODE_SESSION_ID", "session-1")],
+            false
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_streams_for_interactive_tty() {
+        assert!(should_attach_after_join_from(
+            std::iter::empty::<(&str, &str)>(),
+            true
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_exits_for_cargo_context() {
+        assert!(!should_attach_after_join_from(
+            [
+                ("CLAUDE_CODE_SESSION_ID", "session-1"),
+                ("CARGO_BIN_EXE_airc", "/tmp/airc"),
+            ],
+            true
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_internal_opt_out_wins() {
+        assert!(!should_attach_after_join_from(
+            [("CODEX_SESSION_ID", "thread-1"), ("AIRC_NO_ATTACH", "1")],
+            true
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_exits_for_noninteractive_script() {
+        assert!(!should_attach_after_join_from(
+            std::iter::empty::<(&str, &str)>(),
+            false
+        ));
+    }
 }
