@@ -187,9 +187,8 @@ pub enum Command {
     /// Legacy envelope encryption helpers during Rust cutover.
     Envelope(EnvelopeArgs),
 
-    /// Send a single text Message frame to the current room and exit.
-    /// The current room lives in `<home>/room.json`; switch with
-    /// `airc room <name>`.
+    /// Send a single text Message frame to the default subscribed
+    /// room and exit. The default channel lives in the ORM store.
     Send {
         /// Message body.
         text: String,

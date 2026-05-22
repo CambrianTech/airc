@@ -194,9 +194,9 @@ Move to SeaORM entities (one row, one table, one transaction):
 
 | Today (JSON file + temp-rename) | Phase 3.5 (SeaORM table) |
 |---|---|
-| `peers.json` | `peers` (FK from events.peer_id) |
-| `subscriptions.json` | `subscriptions` (FK to rooms) |
-| `room.json` (current room marker) | `rooms` table + `default` flag |
+| `peers.json` | `peer_trust` + `peer_rotation_audit` (done in #883) |
+| `subscriptions.json` | `subscriptions` table (done in store-backed subscriptions cut) |
+| `room.json` (current room marker) | `subscriptions.is_default` (done in store-backed subscriptions cut) |
 | `identity.json` (singleton) | `identity` table (singleton row) |
 | `mesh_identity` cache file | `mesh_identity` table (or column on identity) |
 | `account_registry/*.json` | `account_registry` table |
@@ -240,10 +240,11 @@ five concrete hotpaths and seven kill-list patterns.
 ### Top 5 perf problems (worst first)
 
 1. **Synchronous file I/O on every CLI/subscribe call** —
-   `peers_store.rs:217`, `subscriptions.rs:437-458`. Every subscribe,
-   send, or join re-reads `peers.json` + `subscriptions.json` from
-   disk. ~5–15ms per JSON read × every invocation. Phase 3.5 (move
-   to SeaORM) kills this.
+   peer trust moved to SeaORM in #883 and subscriptions/default-room
+   moved to the `subscriptions` table in the store-backed
+   subscriptions cut. Remaining file-backed runtime state is
+   identity, mesh-identity cache, account registry, and coordinator
+   beacons.
 
 2. **Double clone of `TranscriptEvent` on every ingest** —
    `messaging.rs:110`, `transport.rs:124`. Each event is cloned
@@ -268,14 +269,16 @@ five concrete hotpaths and seven kill-list patterns.
 
 ### Substrate-wide patterns to kill (priority order)
 
-1. **Synchronous file I/O in async functions** — peers.json,
-   subscriptions.json reads on event path. (Phase 3.5 deletes
-   these files entirely.)
+1. **Synchronous file I/O in async functions** — identity,
+   mesh-identity cache, account registry, and coordinator beacon
+   reads still need SeaORM cuts. Peer trust and subscriptions are now
+   store-backed.
 2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
    route_health, route_endpoints, imported_invites. Switch to
    `DashMap` or sharded RwLock for N-reader scale.
-3. **Full JSON file rewrites on every mutate** — `peers_store`
-   save, `subscriptions` save. Phase 3.5 kills these.
+3. **Full JSON file rewrites on every mutate** — remaining registry
+   and coordinator saves. Peer trust and subscriptions/default-room
+   are no longer JSON-backed.
 4. **`event.clone()` on broadcast hot path** — `Arc<TranscriptEvent>`
    internally; broadcast is `Arc::clone`.
 5. **Linear scans for dedup** — `enrolled.contains`, subscriptions

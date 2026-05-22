@@ -11,10 +11,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use airc_daemon::{DaemonState, LocalIdentity};
 use airc_lib::{
-    coordinator_snapshot, resolve_mesh_identity_with, subscriptions, Airc, Body, ChannelName,
-    CoordinatorConfig, EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource,
-    PeerSpec, RouteEndpoint, SubscriptionSet, TranscriptKind, TransportHealthSample, TransportKind,
-    TransportRole,
+    coordinator_snapshot, resolve_mesh_identity_with, Airc, Body, ChannelName, CoordinatorConfig,
+    EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource, PeerSpec, RouteEndpoint,
+    TranscriptKind, TransportHealthSample, TransportKind, TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -709,19 +708,6 @@ async fn filtered_event_queries_match_kind_and_headers_without_body_parse() {
 #[tokio::test]
 async fn subscribed_filter_reads_all_configured_channels_not_current_room_only() {
     let home = TempDir::new().unwrap();
-    let identity = MeshIdentity::unset();
-    let mut subscription_set = SubscriptionSet::empty();
-    subscription_set
-        .subscribe(home.path(), &identity, ChannelName::new("general").unwrap())
-        .unwrap();
-    subscription_set
-        .subscribe(
-            home.path(),
-            &identity,
-            ChannelName::new("cambriantech").unwrap(),
-        )
-        .unwrap();
-    subscriptions::save(home.path(), &subscription_set).unwrap();
     let airc = Airc::open(home.path()).await.unwrap();
 
     airc.join("general").await.unwrap();

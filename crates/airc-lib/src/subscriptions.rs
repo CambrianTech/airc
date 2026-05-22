@@ -21,11 +21,13 @@
 //!
 //! ## Storage
 //!
-//! Persisted to `<home>/subscriptions.json`. Schema version 1.
+//! Persisted through `airc-store` ORM tables. There is no JSON
+//! sidecar for subscription/default-channel state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use airc_store::{EventStore, StoredSubscription};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,7 +38,6 @@ use crate::room::Room;
 use crate::stream::EventFilter;
 use crate::Airc;
 
-const SUBSCRIPTIONS_FILENAME: &str = "subscriptions.json";
 const SUBSCRIPTIONS_VERSION: u32 = 1;
 
 /// Namespace UUID for deriving channel UUIDs from
@@ -48,22 +49,16 @@ const SUBSCRIPTIONS_NAMESPACE: Uuid = Uuid::from_bytes([
 /// What can go wrong loading or saving the subscription set.
 #[derive(Debug)]
 pub enum SubscriptionError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
+    Store(airc_store::StoreError),
     Clock(std::time::SystemTimeError),
-    SchemaVersionMismatch { found: u32, expected: u32 },
     InvalidChannelName(ChannelNameError),
 }
 
 impl std::fmt::Display for SubscriptionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "subscriptions I/O: {error}"),
-            Self::Json(error) => write!(f, "subscriptions JSON: {error}"),
+            Self::Store(error) => write!(f, "subscriptions store: {error}"),
             Self::Clock(error) => write!(f, "subscriptions clock: {error}"),
-            Self::SchemaVersionMismatch { found, expected } => {
-                write!(f, "subscriptions.json version {found}, expected {expected}")
-            }
             Self::InvalidChannelName(error) => write!(f, "invalid channel name: {error}"),
         }
     }
@@ -72,24 +67,16 @@ impl std::fmt::Display for SubscriptionError {
 impl std::error::Error for SubscriptionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
-            Self::Json(error) => Some(error),
+            Self::Store(error) => Some(error),
             Self::Clock(error) => Some(error),
-            Self::SchemaVersionMismatch { .. } => None,
             Self::InvalidChannelName(error) => Some(error),
         }
     }
 }
 
-impl From<std::io::Error> for SubscriptionError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<serde_json::Error> for SubscriptionError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
+impl From<airc_store::StoreError> for SubscriptionError {
+    fn from(value: airc_store::StoreError) -> Self {
+        Self::Store(value)
     }
 }
 
@@ -178,7 +165,6 @@ impl Serialize for ChannelName {
     where
         S: serde::Serializer,
     {
-        // Serialize without `#` so on-disk JSON is the normalized form.
         serializer.serialize_str(&self.0)
     }
 }
@@ -243,7 +229,7 @@ pub fn derive_room_id(identity: &MeshIdentity, channel: &ChannelName) -> RoomId 
 }
 
 /// One channel this scope is subscribed to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
     pub name: ChannelName,
     pub room_id: RoomId,
@@ -306,7 +292,7 @@ impl Subscription {
 /// pointer for short-shape commands and the parted set so re-running
 /// [`Airc::join_default_context`](crate::Airc::join_default_context)
 /// doesn't auto-restore a channel the user left.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionSet {
     pub version: u32,
     pub subscribed: BTreeMap<ChannelName, Subscription>,
@@ -424,46 +410,71 @@ impl SubscriptionSet {
     }
 }
 
-/// On-disk path for the subscription set.
-pub fn path_in(home: &Path) -> PathBuf {
-    home.join(SUBSCRIPTIONS_FILENAME)
+/// Load the subscription set from the durable store. If no rows exist
+/// yet, return an empty set; callers decide how to seed it.
+pub async fn load_or_init(store: &dyn EventStore) -> Result<SubscriptionSet, SubscriptionError> {
+    let mut set = SubscriptionSet::empty();
+    for row in store.load_subscriptions().await? {
+        let name = ChannelName::new(&row.channel_name)?;
+        if row.parted {
+            set.parted.insert(name);
+            continue;
+        }
+        let subscription = Subscription {
+            name: name.clone(),
+            room_id: row.room_id,
+            wire: PathBuf::from(row.wire),
+            joined_at_ms: row.joined_at_ms,
+        };
+        if row.is_default {
+            set.default = Some(name.clone());
+        }
+        set.subscribed.insert(name, subscription);
+    }
+    if set
+        .default
+        .as_ref()
+        .is_some_and(|name| !set.subscribed.contains_key(name))
+    {
+        set.default = set.subscribed.keys().next().cloned();
+    }
+    Ok(set)
 }
 
-/// Load the subscription set. If it does not exist yet, return an
-/// empty set; callers decide how to seed it.
-pub fn load_or_init(home: &Path) -> Result<SubscriptionSet, SubscriptionError> {
-    let path = path_in(home);
-    if path.exists() {
-        let text = std::fs::read_to_string(&path)?;
-        let set: SubscriptionSet = serde_json::from_str(&text)?;
-        if set.version != SUBSCRIPTIONS_VERSION {
-            return Err(SubscriptionError::SchemaVersionMismatch {
-                found: set.version,
-                expected: SUBSCRIPTIONS_VERSION,
+/// Save the subscription set through the durable store. This is the
+/// only persistence path for subscriptions/default channel state.
+pub async fn save(store: &dyn EventStore, set: &SubscriptionSet) -> Result<(), SubscriptionError> {
+    let mut rows = Vec::new();
+    for subscription in set.all() {
+        rows.push(StoredSubscription {
+            channel_name: subscription.name.as_str().to_string(),
+            room_id: subscription.room_id,
+            wire: subscription.wire.to_string_lossy().into_owned(),
+            joined_at_ms: subscription.joined_at_ms,
+            is_default: set.default.as_ref() == Some(&subscription.name),
+            parted: false,
+        });
+    }
+    for channel in &set.parted {
+        if !set.subscribed.contains_key(channel) {
+            rows.push(StoredSubscription {
+                channel_name: channel.as_str().to_string(),
+                room_id: derive_room_id(&MeshIdentity::unset(), channel),
+                wire: String::new(),
+                joined_at_ms: 0,
+                is_default: false,
+                parted: true,
             });
         }
-        return Ok(set);
     }
-
-    Ok(SubscriptionSet::empty())
-}
-
-/// Save the subscription set to disk. Always writes the canonical
-/// shape; round-trip-safe (load_or_init → save → load_or_init yields
-/// the same set).
-pub fn save(home: &Path, set: &SubscriptionSet) -> Result<(), SubscriptionError> {
-    std::fs::create_dir_all(home)?;
-    let path = path_in(home);
-    let text = serde_json::to_string_pretty(set)?;
-    std::fs::write(&path, text)?;
-    set_owner_only_permissions(&path)?;
+    store.replace_subscriptions(rows).await?;
     Ok(())
 }
 
 impl Airc {
     /// Load this scope's subscription set for consumer surfaces.
     pub async fn subscription_set(&self) -> Result<SubscriptionSet, AircError> {
-        Ok(load_or_init(&self.inner.home)?)
+        Ok(load_or_init(self.event_store()).await?)
     }
 
     pub(crate) async fn subscribed_event_filter(
@@ -540,19 +551,6 @@ fn push_unique_path(items: &mut Vec<PathBuf>, item: PathBuf) {
     }
 }
 
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -562,6 +560,7 @@ fn now_ms() -> Result<u64, std::time::SystemTimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airc_store::InMemoryEventStore;
     use tempfile::tempdir;
 
     #[test]
@@ -601,16 +600,6 @@ mod tests {
         let c = ChannelName::new("general").unwrap();
         assert_eq!(c.to_string(), "#general");
         assert_eq!(c.display_with_hash(), "#general");
-    }
-
-    #[test]
-    fn channel_name_serde_round_trip() {
-        let original = ChannelName::new("#general").unwrap();
-        let json = serde_json::to_string(&original).unwrap();
-        // Stored without `#` to keep the normalized form on disk.
-        assert_eq!(json, "\"general\"");
-        let back: ChannelName = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, original);
     }
 
     #[test]
@@ -802,26 +791,27 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn save_load_round_trip_preserves_set() {
+    #[tokio::test]
+    async fn save_load_round_trip_preserves_set() {
         let dir = tempdir().unwrap();
         let home = dir.path();
+        let store = InMemoryEventStore::new();
         let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         set.subscribe(home, &id, ChannelName::new("general").unwrap())
             .unwrap();
         set.subscribe(home, &id, ChannelName::new("cambriantech").unwrap())
             .unwrap();
-        save(home, &set).unwrap();
+        save(&store, &set).await.unwrap();
 
-        let loaded = load_or_init(home).unwrap();
+        let loaded = load_or_init(&store).await.unwrap();
         assert_eq!(loaded, set);
     }
 
-    #[test]
-    fn empty_set_when_neither_file_exists() {
-        let dir = tempdir().unwrap();
-        let set = load_or_init(dir.path()).unwrap();
+    #[tokio::test]
+    async fn empty_set_when_store_has_no_rows() {
+        let store = InMemoryEventStore::new();
+        let set = load_or_init(&store).await.unwrap();
         assert!(set.subscribed.is_empty());
         assert!(set.default.is_none());
         assert!(set.parted.is_empty());

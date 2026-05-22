@@ -10,10 +10,12 @@ use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::error::StoreError;
 use crate::store::EventStore;
+use crate::subscriptions::StoredSubscription;
 
 pub struct InMemoryEventStore {
     events: Mutex<Vec<TranscriptEvent>>,
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
+    subscriptions: Mutex<Vec<StoredSubscription>>,
 }
 
 impl InMemoryEventStore {
@@ -21,6 +23,7 @@ impl InMemoryEventStore {
         Self {
             events: Mutex::new(Vec::new()),
             runtime_cursors: Mutex::new(BTreeMap::new()),
+            subscriptions: Mutex::new(Vec::new()),
         }
     }
 }
@@ -113,6 +116,23 @@ impl EventStore for InMemoryEventStore {
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
         cursors.insert(consumer_id.to_string(), cursor.clone());
+        Ok(())
+    }
+
+    async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError> {
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(subscriptions.clone())
+    }
+
+    async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError> {
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        *subscriptions = rows;
         Ok(())
     }
 }
