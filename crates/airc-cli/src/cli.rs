@@ -281,10 +281,10 @@ pub enum Command {
     /// and the inferred repo/org channel. With a room, subscribes to
     /// that channel and makes it the default.
     ///
-    /// Always streams live events from ALL subscribed channels to
-    /// stdout until interrupted — there is no separate "attach"
-    /// mode. If you need just-set-up-and-exit (rare), spawn the
-    /// daemon directly with `airc daemon`.
+    /// Sets up the account mesh and, in interactive/agent runtimes,
+    /// streams live events from ALL subscribed channels to stdout
+    /// until interrupted. Scripts/tests return after setup; there is
+    /// no separate public "attach" mode.
     Join {
         /// Optional channel name to join.
         room: Option<String>,
