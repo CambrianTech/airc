@@ -263,6 +263,58 @@ async fn save_runtime_cursor_emits_subscription_advanced() {
 }
 
 #[tokio::test]
+async fn part_channel_emits_room_parted_lifecycle_event() {
+    use airc_lib::lifecycle::RoomPartedBody;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+
+    let room = airc.join("part-me").await.expect("join");
+    let mut stream = airc.subscribe().await.expect("subscribe");
+    let parted = airc
+        .part_channel(Some("part-me"))
+        .await
+        .expect("part channel");
+    assert_eq!(parted.channel, room.channel);
+    assert!(
+        !airc
+            .is_subscribed(&airc_lib::ChannelName::new("part-me").unwrap())
+            .await
+            .expect("subscription query"),
+        "parted channel must no longer be subscribed"
+    );
+
+    let mut found = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(event))) => {
+                if event.kind == TranscriptKind::RoomParted {
+                    found = Some(event);
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) => continue,
+            Ok(None) => panic!("stream closed before RoomParted arrived"),
+            Err(_) => continue,
+        }
+    }
+    let event = found.expect("RoomParted lifecycle event exists");
+    assert_eq!(event.room_id, room.channel);
+    let body = event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("RoomParted body should be JSON"),
+    };
+    let parsed: RoomPartedBody =
+        serde_json::from_value(body_json).expect("body parses as RoomPartedBody");
+    assert_eq!(parsed.channel_name, "part-me");
+    assert_eq!(parsed.room_id, room.channel);
+}
+
+#[tokio::test]
 async fn saving_subscription_advanced_cursor_does_not_emit_recursive_event() {
     let dir = TempDir::new().expect("tempdir");
     let home = dir.path().join(".airc");

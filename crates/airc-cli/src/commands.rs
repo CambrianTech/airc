@@ -79,6 +79,16 @@ pub async fn run_room(
     Ok(())
 }
 
+/// `part` — leave a subscribed room without deleting identity, trust,
+/// or other room subscriptions.
+pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let parted = airc.part_channel(room.as_deref()).await?;
+    println!("parted:  #{}", parted.name);
+    println!("channel: {}", parted.channel);
+    Ok(())
+}
+
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.

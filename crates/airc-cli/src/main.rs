@@ -350,6 +350,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Room { name, wire } => commands::run_room(&home, name, wire).await,
 
+        Command::Part { room } => commands::run_part(&home, room).await,
+
         Command::Peer(args) => match args.action {
             PeerAction::Add { spec, socket } => {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await

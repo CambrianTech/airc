@@ -504,6 +504,41 @@ impl Airc {
         Ok(room)
     }
 
+    /// Leave a subscribed channel without deleting identity or trust.
+    ///
+    /// `None` parts the current default channel. The removed channel is
+    /// tombstoned in the subscription set so a later
+    /// [`join_default_context`](Self::join_default_context) does not
+    /// silently re-add a channel the caller explicitly left.
+    pub async fn part_channel(&self, name: Option<&str>) -> Result<Room, AircError> {
+        let identity = self.mesh_identity().await?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        let channel = match name {
+            Some(name) => ChannelName::new(name)?,
+            None => set.default.clone().ok_or(AircError::NoCurrentRoom)?,
+        };
+        let removed = set
+            .unsubscribe(&channel)
+            .ok_or_else(|| AircError::NotSubscribed(channel.display_with_hash()))?;
+        subscriptions::save(self.event_store(), &set).await?;
+        self.publish_presence(&identity, &set).await?;
+
+        let room = removed.as_room();
+        let body_json = serde_json::to_value(crate::lifecycle::RoomPartedBody {
+            channel_name: channel.as_str().to_string(),
+            room_id: room.channel,
+        })
+        .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?;
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::RoomParted,
+            room.channel,
+            airc_core::Body::Json(body_json),
+        )
+        .await?;
+
+        Ok(room)
+    }
+
     /// Read the default subscribed channel. Fresh scopes default to
     /// `#general` through the subscription set, using the resolved
     /// mesh identity so the `RoomId` is stable per Git/GitHub user.

@@ -72,6 +72,11 @@ pub enum AircError {
     #[error("no current room — call `join` to set one")]
     NoCurrentRoom,
 
+    /// Caller asked to leave a channel that this scope is not
+    /// currently subscribed to.
+    #[error("not subscribed to channel: {0}")]
+    NotSubscribed(String),
+
     /// Caller passed a peer registry operation referencing a peer
     /// not in the local registry.
     #[error("unknown peer: {0}")]
