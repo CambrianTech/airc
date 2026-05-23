@@ -862,6 +862,12 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
      state into the 5a PR events. GitHub remains an adapter, not the
      runtime source of truth.
 6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
+   - **Phase 2 lifecycle cursor slice.** Runtime consumers persist
+     cursors through `airc-store` and emit `SubscriptionAdvanced` as a
+     durable lifecycle event when they advance. Feeds/hooks that know
+     the source event use `Airc::save_runtime_cursor_for_event` so a
+     cursor advance caused by `SubscriptionAdvanced` is stored without
+     recursively emitting another cursor event.
 7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 
 ### What this replaces in the previous plan

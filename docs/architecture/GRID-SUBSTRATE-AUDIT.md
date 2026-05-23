@@ -170,6 +170,13 @@ Status:
 
 - `airc-lib` subscription query API landed in #911.
 - Typed lifecycle events landed in #914.
+- Lifecycle emit points are being wired as Phase 2 sub-slices:
+  `RoomJoined`, `PeerArrived`, `WireEstablished`, and
+  `SubscriptionAdvanced` now emit durable lifecycle events from
+  substrate code. Cursor advancement uses
+  `Airc::save_runtime_cursor_for_event` where the source event is known
+  so advancing past a `SubscriptionAdvanced` lifecycle event stores the
+  cursor without recursively emitting another cursor event.
 - Typed git/PR event contracts are being added in `airc-work`:
   `GitCommitObserved`, `GitBranchMoved`, `GitDirtyStateChanged`,
   `PullRequestCheckSuiteChanged`, `PullRequestReviewSubmitted`, and

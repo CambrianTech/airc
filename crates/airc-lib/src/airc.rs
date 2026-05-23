@@ -549,10 +549,37 @@ impl Airc {
         consumer_id: &str,
         cursor: &airc_core::TranscriptCursor,
     ) -> Result<(), AircError> {
+        let room = self.current_room().await?;
         self.inner
             .store
             .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
             .await?;
+        self.emit_subscription_advanced(consumer_id, cursor, room.channel)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist a runtime consumer checkpoint for a concrete event.
+    ///
+    /// This is the preferred path for hooks and live feeds because it
+    /// carries the source event's room and kind. Cursor advancement for
+    /// a `SubscriptionAdvanced` lifecycle event is stored but does not
+    /// emit another `SubscriptionAdvanced`, preventing self-amplifying
+    /// cursor loops.
+    pub async fn save_runtime_cursor_for_event(
+        &self,
+        consumer_id: &str,
+        event: &airc_core::TranscriptEvent,
+    ) -> Result<(), AircError> {
+        let cursor = event.cursor();
+        self.inner
+            .store
+            .save_runtime_cursor(consumer_id, &cursor, time::now_ms()?)
+            .await?;
+        if event.kind != airc_core::TranscriptKind::SubscriptionAdvanced {
+            self.emit_subscription_advanced(consumer_id, &cursor, event.room_id)
+                .await?;
+        }
         Ok(())
     }
 

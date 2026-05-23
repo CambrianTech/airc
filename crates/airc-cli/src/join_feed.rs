@@ -36,8 +36,9 @@ async fn print_catch_up(
             for event in &events {
                 print_event(event);
             }
-            if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-                airc.save_runtime_cursor(consumer_id, &newest).await?;
+            if let Some(newest) = events.last() {
+                airc.save_runtime_cursor_for_event(consumer_id, newest)
+                    .await?;
             }
             if events.len() == CATCH_UP_LIMIT {
                 eprintln!(
@@ -47,8 +48,9 @@ async fn print_catch_up(
         }
         None => {
             let events = airc.page_recent_subscribed_filtered(filter, 1).await?;
-            if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-                airc.save_runtime_cursor(consumer_id, &newest).await?;
+            if let Some(newest) = events.last() {
+                airc.save_runtime_cursor_for_event(consumer_id, newest)
+                    .await?;
             }
         }
     }
@@ -77,7 +79,7 @@ where
                 match next {
                     Some(Ok(event)) => {
                         print_event(&event);
-                        airc.save_runtime_cursor(consumer_id, &event.cursor()).await?;
+                        airc.save_runtime_cursor_for_event(consumer_id, &event).await?;
                     }
                     Some(Err(lag)) => {
                         eprintln!("{lag}");
