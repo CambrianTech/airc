@@ -37,6 +37,8 @@ fi
 
 # Clap exposes the version via `--version`, not a `version` subcommand.
 "$AIRC_BIN" --version >/dev/null || fail "airc --version failed"
+"$AIRC_BIN" codex-hook poll --help >/dev/null \
+  || fail "installed airc missing codex mid-turn poll command"
 
 # Demolition contract: no stale `airc-core` on PATH next to the
 # real binary. The installed `airc` is a copied Rust binary, not a
@@ -112,7 +114,7 @@ run_join_for_scope() {
   local err="$4"
   (
     cd "$repo" || exit 1
-    HOME="$MACHINE_HOME" AIRC_HOME="$scope" \
+    HOME="$MACHINE_HOME" AIRC_HOME="$scope" AIRC_NO_ATTACH=1 \
       "$AIRC_BIN" --home "$scope" join >"$out" 2>"$err"
   ) || {
     echo "--- join stdout ---" >&2
@@ -221,7 +223,7 @@ send_general_from_continuum() {
   local err="$3"
   (
     cd "$CONTINUUM_REPO" || exit 1
-    HOME="$MACHINE_HOME" AIRC_HOME="$CONTINUUM_SCOPE" \
+    HOME="$MACHINE_HOME" AIRC_HOME="$CONTINUUM_SCOPE" AIRC_NO_ATTACH=1 \
       "$AIRC_BIN" --home "$CONTINUUM_SCOPE" join general >/dev/null
     HOME="$MACHINE_HOME" AIRC_HOME="$CONTINUUM_SCOPE" AIRC_CLIENT_ID="continuum-proof-sender" \
       "$AIRC_BIN" --home "$CONTINUUM_SCOPE" msg "$message" >"$out" 2>"$err"
@@ -304,7 +306,7 @@ fi
 
 (
   cd "$OPENCLAW_REPO" || exit 1
-  HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" \
+  HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" AIRC_NO_ATTACH=1 \
     "$AIRC_BIN" --home "$OPENCLAW_SCOPE" join general >/dev/null
   printf '{"hook_event_name":"UserPromptSubmit"}' | \
     HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" AIRC_CLIENT_ID="openclaw-proof-hook" \
@@ -327,4 +329,44 @@ if ! grep -q "$HOOK_MESSAGE" "$ROOT/codex-hook.out"; then
   fail "public airc codex-hook did not include inbound Rust event context"
 fi
 
-log "public airc command, account-room derivation, same-machine #general wire, message delivery, monitor attach, and codex-hook are coherent"
+POLL_MESSAGE="codex poll public proof $(date +%s)"
+send_general_from_continuum "$POLL_MESSAGE" "$ROOT/poll-msg.out" "$ROOT/poll-msg.err"
+
+if ! wait_for_message \
+  "$OPENCLAW_REPO" \
+  "$OPENCLAW_SCOPE" \
+  "$POLL_MESSAGE" \
+  "$ROOT/poll-events.out" \
+  "$ROOT/poll-events.err"; then
+  echo "--- poll warmup events stdout ---" >&2
+  cat "$ROOT/poll-events.out" >&2 || true
+  echo "--- poll warmup events stderr ---" >&2
+  cat "$ROOT/poll-events.err" >&2 || true
+  fail "second fresh scope did not persist poll proof message before codex-hook poll"
+fi
+
+(
+  cd "$OPENCLAW_REPO" || exit 1
+  HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" AIRC_NO_ATTACH=1 \
+    "$AIRC_BIN" --home "$OPENCLAW_SCOPE" join general >/dev/null
+  HOME="$MACHINE_HOME" AIRC_HOME="$OPENCLAW_SCOPE" AIRC_CLIENT_ID="openclaw-proof-poll" \
+    "$AIRC_BIN" --home "$OPENCLAW_SCOPE" codex-hook poll \
+      --count 64 \
+      --raw
+) >"$ROOT/codex-poll.out" 2>"$ROOT/codex-poll.err" || {
+  echo "--- codex-hook poll stdout ---" >&2
+  cat "$ROOT/codex-poll.out" >&2 || true
+  echo "--- codex-hook poll stderr ---" >&2
+  cat "$ROOT/codex-poll.err" >&2 || true
+  fail "public airc codex-hook poll failed"
+}
+
+if ! grep -q "$POLL_MESSAGE" "$ROOT/codex-poll.out"; then
+  echo "--- codex-hook poll stdout ---" >&2
+  cat "$ROOT/codex-poll.out" >&2 || true
+  echo "--- codex-hook poll stderr ---" >&2
+  cat "$ROOT/codex-poll.err" >&2 || true
+  fail "public airc codex-hook poll did not include inbound Rust event context"
+fi
+
+log "public airc command, account-room derivation, same-machine #general wire, message delivery, monitor attach, codex-hook, and codex-hook poll are coherent"
