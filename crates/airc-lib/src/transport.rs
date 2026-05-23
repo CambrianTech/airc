@@ -62,27 +62,22 @@ impl Airc {
 
     async fn emit_wire_established(&self, wire: &Path) -> Result<(), AircError> {
         // Resolve channel_name + room_id by matching the wire path
-        // against the current subscription set. Best-effort: if no
-        // matching subscription is found (e.g. shared-wire test
-        // setups, lan subscriber spinning up before any join), emit
-        // with the wire path alone and let consumers correlate.
-        let (channel_name, room_id) = match self.subscriptions().await {
-            Ok(subs) => {
-                let canon = wire.canonicalize().ok();
-                let matched = subs.into_iter().find(|s| {
-                    if let Some(canon) = canon.as_ref() {
-                        s.wire.canonicalize().ok().as_ref() == Some(canon)
-                    } else {
-                        s.wire == wire
-                    }
-                });
-                match matched {
-                    Some(sub) => (sub.name.as_str().to_string(), sub.room_id),
-                    None => return Ok(()),
-                }
+        // against the current subscription set. Missing match is a
+        // legitimate no-op for shared-wire test setups; failure to
+        // read the subscription set propagates.
+        let subs = self.subscriptions().await?;
+        let canon = wire.canonicalize().ok();
+        let matched = subs.into_iter().find(|s| {
+            if let Some(canon) = canon.as_ref() {
+                s.wire.canonicalize().ok().as_ref() == Some(canon)
+            } else {
+                s.wire == wire
             }
-            Err(_) => return Ok(()),
+        });
+        let Some(sub) = matched else {
+            return Ok(());
         };
+        let (channel_name, room_id) = (sub.name.as_str().to_string(), sub.room_id);
         let body = airc_core::Body::Json(
             serde_json::to_value(crate::lifecycle::WireEstablishedBody {
                 wire: wire.display().to_string(),
