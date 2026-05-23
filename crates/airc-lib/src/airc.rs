@@ -409,11 +409,32 @@ impl Airc {
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
-        set.set_default(channel)?;
+        set.set_default(channel.clone())?;
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
         self.ensure_wire_subscriber(&room.wire).await?;
+
+        // Emit the lifecycle event after the subscription is durable
+        // and the wire is up. Failures here are non-fatal — the room
+        // is genuinely joined regardless of whether subscribers are
+        // notified — but we surface the error to logs so operators
+        // notice.
+        let body_json = serde_json::to_value(crate::lifecycle::RoomJoinedBody {
+            channel_name: channel.as_str().to_string(),
+            room_id: room.channel,
+            wire: room.wire.display().to_string(),
+            is_default: true,
+        })
+        .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?;
+        let body = airc_core::Body::Json(body_json);
+        if let Err(error) = self
+            .emit_lifecycle(airc_core::TranscriptKind::RoomJoined, room.channel, body)
+            .await
+        {
+            eprintln!("airc-lib: room_joined lifecycle emit failed: {error}");
+        }
+
         Ok(room)
     }
 

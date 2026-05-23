@@ -862,6 +862,13 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
         TranscriptKind::Presence => "presence",
         TranscriptKind::SessionControl => "session_control",
         TranscriptKind::System => "system",
+        TranscriptKind::PeerArrived => "peer_arrived",
+        TranscriptKind::PeerDeparted => "peer_departed",
+        TranscriptKind::WireEstablished => "wire_established",
+        TranscriptKind::WireLost => "wire_lost",
+        TranscriptKind::RoomJoined => "room_joined",
+        TranscriptKind::RoomParted => "room_parted",
+        TranscriptKind::SubscriptionAdvanced => "subscription_advanced",
     };
     Ok(event::ActiveModel {
         event_id: ActiveValue::Set(ev.event_id.as_uuid()),
@@ -897,6 +904,13 @@ fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
         "presence" => TranscriptKind::Presence,
         "session_control" => TranscriptKind::SessionControl,
         "system" => TranscriptKind::System,
+        "peer_arrived" => TranscriptKind::PeerArrived,
+        "peer_departed" => TranscriptKind::PeerDeparted,
+        "wire_established" => TranscriptKind::WireEstablished,
+        "wire_lost" => TranscriptKind::WireLost,
+        "room_joined" => TranscriptKind::RoomJoined,
+        "room_parted" => TranscriptKind::RoomParted,
+        "subscription_advanced" => TranscriptKind::SubscriptionAdvanced,
         other => return Err(StoreError::UnknownTranscriptKind(other.to_string())),
     };
     let target: MentionTarget = serde_json::from_value(m.target)?;
