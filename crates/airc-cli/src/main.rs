@@ -59,6 +59,7 @@ mod route_commands;
 mod runtime_context;
 mod transport_cli;
 mod transport_commands;
+mod update_commands;
 mod work_cli;
 mod work_commands;
 mod workspace_cli;
@@ -404,6 +405,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Join { room } => commands::run_join(&home, room).await,
 
         Command::Version => commands::run_version(),
+
+        Command::Update => update_commands::run_update(),
 
         Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
 
