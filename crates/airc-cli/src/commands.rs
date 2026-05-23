@@ -209,19 +209,36 @@ where
             has_agent_marker = true;
         }
     }
+    // Priority order — order matters; each branch is final:
+    //
+    // 1. `AIRC_NO_ATTACH=1` — explicit operator opt-out (smokes,
+    //    one-shot scripts in agent contexts). Always wins.
+    // 2. Cargo context (`CARGO_BIN_EXE_*` / `CARGO_PKG_NAME`) — we're
+    //    inside `cargo test` / `cargo run`; the harness expects
+    //    completion. Wins over agent markers because Claude Code's
+    //    shell often inherits CLAUDECODE into spawned `cargo test`
+    //    invocations.
+    // 3. Agent markers (`CLAUDECODE`, `CODEX_SESSION_ID`, …) OR a
+    //    detected runtime client — this is a Monitor/hook host that
+    //    explicitly expects the stream. Wins over the TTY check
+    //    because Monitor pipes stdout (so `IsTerminal` is false even
+    //    in a real interactive session).
+    // 4. TTY — fall-through for direct interactive users.
+    // 5. Otherwise (piped script, no agent, no TTY) — return cleanly
+    //    after setup.
+    //
+    // Regression history: before this fix, the noninteractive-stdout
+    // short-circuit ran BEFORE the agent-marker check, which made
+    // `airc join` exit immediately when wrapped by Claude Code's
+    // Monitor (Monitor captures stdout via a pipe). Cargo still has
+    // to win against agent markers so the install proofs don't hang.
     if has_opt_out {
-        return false;
-    }
-    if !stdout_is_tty {
         return false;
     }
     if has_cargo_context {
         return false;
     }
-    if has_agent_marker {
-        return true;
-    }
-    if runtime_client_detected {
+    if has_agent_marker || runtime_client_detected {
         return true;
     }
     stdout_is_tty
@@ -882,11 +899,37 @@ mod tests {
     }
 
     #[test]
-    fn join_attach_decision_exits_for_redirected_agent_script() {
-        assert!(!should_attach_after_join_with_client(
+    fn join_attach_decision_streams_for_monitor_piped_stdout() {
+        // Regression guard: Claude Code's Monitor (and Codex's
+        // persistent-attach tool session) pipes the child's stdout,
+        // so `IsTerminal` is false even though we ARE in an agent
+        // runtime that wants the stream. Agent markers + detected
+        // runtime client must beat the not-a-tty check. The previous
+        // logic short-circuited on `!stdout_is_tty` before checking
+        // markers, which made `airc join` exit immediately under
+        // Monitor — observed live, fixed here.
+        assert!(should_attach_after_join_with_client(
             [("CODEX_SESSION_ID", "thread-1")],
             false,
             true
+        ));
+        // Same with Claude markers.
+        assert!(should_attach_after_join_with_client(
+            [("CLAUDE_CODE_SESSION_ID", "session-1")],
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn join_attach_decision_exits_for_plain_pipe_with_no_agent_context() {
+        // Bare `airc join | tee log` from a non-agent shell still
+        // returns after setup — no markers, no detected client, no
+        // TTY → script context.
+        assert!(!should_attach_after_join_with_client(
+            std::iter::empty::<(&str, &str)>(),
+            false,
+            false
         ));
     }
 
