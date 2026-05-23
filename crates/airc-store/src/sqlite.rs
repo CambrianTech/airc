@@ -178,6 +178,29 @@ impl SqliteEventStore {
         })
     }
 
+    pub async fn remove_peer_trust(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Option<StoredPeer>, StoreError> {
+        let txn = self.db.begin().await?;
+        let stored = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&txn)
+            .await?;
+        let Some(stored) = stored else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+        peer_trust::Entity::delete_by_id(peer_id.as_uuid())
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(Some(StoredPeer {
+            peer_id,
+            pubkey_b64: stored.pubkey_b64,
+            added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+        }))
+    }
+
     pub async fn append_peer_rotation_audit(
         &self,
         entry: RotationAuditEntry,

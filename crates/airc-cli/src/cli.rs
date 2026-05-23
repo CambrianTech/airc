@@ -447,6 +447,14 @@ pub enum PeerAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Remove a peer from local trust.
+    Remove {
+        /// Peer UUID to remove from the trust store.
+        peer_id: String,
+        /// Override the default socket (`<home>/daemon.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// List enrolled peers from the peer trust store.
     List,
 }

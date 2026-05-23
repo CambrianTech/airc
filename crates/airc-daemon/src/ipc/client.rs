@@ -18,7 +18,8 @@ use tokio::time::{timeout, Duration};
 use crate::ipc::transport::IpcStream;
 
 use crate::ipc::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, Request, SendRequest, SubscribeRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, RemovePeerRequest, Request, SendRequest,
+    SubscribeRequest,
 };
 use crate::ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
 
@@ -215,6 +216,18 @@ impl DaemonClient {
 
     pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
         match self.call(Request::AddPeer(request)).await? {
+            Response::Ok => Ok(()),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Event { .. }
+            | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    pub async fn remove_peer(&self, request: RemovePeerRequest) -> Result<(), ClientError> {
+        match self.call(Request::RemovePeer(request)).await? {
             Response::Ok => Ok(()),
             other @ (Response::Pong
             | Response::Status(_)

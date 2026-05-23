@@ -14,7 +14,9 @@ use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
 use futures::stream::StreamExt;
 
-use crate::ipc::request::{AddPeerRequest, InboxRequest, Request, SendRequest, SubscribeRequest};
+use crate::ipc::request::{
+    AddPeerRequest, InboxRequest, RemovePeerRequest, Request, SendRequest, SubscribeRequest,
+};
 use crate::ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
 use crate::state::DaemonState;
 
@@ -39,6 +41,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             message: "attach is a streaming request handled by the server".to_string(),
         },
         Request::AddPeer(add) => handle_add_peer(state, add).await,
+        Request::RemovePeer(remove) => handle_remove_peer(state, remove).await,
         Request::ListPeers => handle_list_peers(state).await,
         Request::Stop => {
             // Don't actually stop here; just signal. The server's
@@ -188,6 +191,19 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
             message: format!("add_peer: enrol: {error}"),
         };
     }
+    Response::Ok
+}
+
+async fn handle_remove_peer(state: Arc<DaemonState>, remove: RemovePeerRequest) -> Response {
+    let mut registry = match state.registry.write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Response::Error {
+                message: "remove_peer: registry lock poisoned".to_string(),
+            };
+        }
+    };
+    registry.remove_peer(remove.peer_id);
     Response::Ok
 }
 
@@ -349,6 +365,39 @@ mod tests {
         let frames = dir.path().join("frames.jsonl");
         let contents = std::fs::read_to_string(frames).unwrap();
         assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_peer_updates_in_memory_registry() {
+        let state = test_state();
+        let peer_id = PeerId::from_u128(0xb0b);
+        let keypair = PeerKeypair::generate();
+        let pubkey_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            keypair.public_bytes(),
+        );
+        assert_eq!(
+            dispatch(
+                state.clone(),
+                Request::AddPeer(AddPeerRequest {
+                    peer_id,
+                    pubkey_b64,
+                }),
+            )
+            .await,
+            Response::Ok
+        );
+        assert!(state.registry.read().unwrap().lookup(peer_id, 0).is_some());
+
+        assert_eq!(
+            dispatch(
+                state.clone(),
+                Request::RemovePeer(RemovePeerRequest { peer_id }),
+            )
+            .await,
+            Response::Ok
+        );
+        assert!(state.registry.read().unwrap().lookup(peer_id, 0).is_none());
     }
 
     // Pull PathBuf into scope so the import isn't unused when only

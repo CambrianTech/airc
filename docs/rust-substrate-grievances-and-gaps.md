@@ -873,6 +873,11 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
      preserves identity/trust/other rooms, refreshes the account
      presence snapshot, and emits durable `RoomParted`. The public
      `airc part [room]` command is a thin wrapper over that API.
+   - **Phase 2 peer-departure slice.** `airc-lib::Airc::remove_peer`
+     removes durable peer trust through `airc-store`, removes the peer
+     from the live verifier registry, emits durable `PeerDeparted`, and
+     the public `airc peer remove <peer-id>` command syncs a running
+     daemon through a typed RPC instead of waiting for restart.
 7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 
 ### What this replaces in the previous plan

@@ -24,7 +24,7 @@ use futures::stream::StreamExt;
 
 use airc_daemon::{
     peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState,
-    LocalIdentity, SubscribeRequest,
+    LocalIdentity, RemovePeerRequest, Request, Response, SubscribeRequest,
 };
 use airc_lib::{Airc, Body, Headers, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
@@ -696,13 +696,49 @@ pub async fn run_peer_add(
     // fine — it'll pick up the trust store on next start.
     let client = DaemonClient::new(socket);
     match client
-        .add_peer(AddPeerRequest {
-            peer_id,
-            pubkey_b64,
-        })
+        .call_with_timeout(
+            Request::AddPeer(AddPeerRequest {
+                peer_id,
+                pubkey_b64,
+            }),
+            Duration::from_millis(250),
+        )
         .await
     {
-        Ok(()) => println!("daemon: in-memory registry updated."),
+        Ok(Response::Ok) => println!("daemon: in-memory registry updated."),
+        Ok(other) => println!("daemon: skipped in-memory registry sync ({other:?})."),
+        Err(_) => {
+            println!("daemon: not running (trust store updated; daemon will load on next start).")
+        }
+    }
+    Ok(())
+}
+
+/// `peer remove <peer-id>` — remove a peer from durable trust and
+/// update the running daemon's verifier when present.
+pub async fn run_peer_remove(
+    home: &Path,
+    peer_id: airc_core::PeerId,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let removed = airc.remove_peer(peer_id, "manual").await?;
+    if removed {
+        println!("removed peer_id={peer_id}");
+    } else {
+        println!("peer_id={peer_id} was not enroled");
+    }
+
+    let client = DaemonClient::new(socket);
+    match client
+        .call_with_timeout(
+            Request::RemovePeer(RemovePeerRequest { peer_id }),
+            Duration::from_millis(250),
+        )
+        .await
+    {
+        Ok(Response::Ok) => println!("daemon: in-memory registry updated."),
+        Ok(other) => println!("daemon: skipped in-memory registry sync ({other:?})."),
         Err(_) => {
             println!("daemon: not running (trust store updated; daemon will load on next start).")
         }

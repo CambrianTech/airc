@@ -159,6 +159,72 @@ async fn add_peer_is_idempotent_no_duplicate_lifecycle_event() {
 }
 
 #[tokio::test]
+async fn remove_peer_emits_peer_departed_lifecycle_event() {
+    use airc_core::PeerId;
+    use airc_lib::lifecycle::PeerDepartedBody;
+    use airc_lib::PeerSpec;
+    use airc_protocol::PeerKeypair;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+    let _room = airc.join("peer-departed-test").await.expect("join");
+
+    let peer_id = PeerId::new();
+    let peer_keypair = PeerKeypair::generate();
+    airc.add_peer(PeerSpec {
+        peer_id,
+        pubkey: peer_keypair.public_bytes(),
+    })
+    .await
+    .expect("add peer");
+
+    let mut stream = airc.subscribe().await.expect("subscribe");
+    let removed = airc
+        .remove_peer(peer_id, "manual")
+        .await
+        .expect("remove peer");
+    assert!(removed, "known peer should be removed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut found = None;
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(event))) => {
+                if event.kind == TranscriptKind::PeerDeparted {
+                    found = Some(event);
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) => continue,
+            Ok(None) => panic!("stream closed before PeerDeparted arrived"),
+            Err(_) => continue,
+        }
+    }
+
+    let event = found.expect("PeerDeparted lifecycle event exists");
+    let body = event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("PeerDeparted body should be JSON"),
+    };
+    let parsed: PeerDepartedBody =
+        serde_json::from_value(body_json).expect("body parses as PeerDepartedBody");
+    assert_eq!(parsed.peer_id, peer_id);
+    assert_eq!(parsed.reason, "manual");
+    assert!(
+        !airc
+            .peers()
+            .await
+            .expect("peers")
+            .iter()
+            .any(|peer| peer.peer_id == peer_id),
+        "removed peer must not remain in durable peer list"
+    );
+}
+
+#[tokio::test]
 async fn join_emits_wire_established_after_subscriber_attaches() {
     use airc_lib::lifecycle::WireEstablishedBody;
 
