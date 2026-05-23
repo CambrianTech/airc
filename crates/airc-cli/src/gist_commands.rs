@@ -271,16 +271,16 @@ mod tests {
     fn file_content_extracts_exact_filename_with_dot() {
         let gist = json!({
             "files": {
-                "messages.jsonl": {"content": "line one\nline two\n"},
+                "airc-room-extra.json": {"content": "line one\nline two\n"},
                 "airc-room-general.json": {"content": "{}"}
             }
         });
 
         assert_eq!(
-            file_content(&gist, "messages.jsonl").as_deref(),
+            file_content(&gist, "airc-room-extra.json").as_deref(),
             Some("line one\nline two\n")
         );
-        assert!(file_content(&gist, "missing.jsonl").is_none());
+        assert!(file_content(&gist, "missing.json").is_none());
     }
 
     #[test]
