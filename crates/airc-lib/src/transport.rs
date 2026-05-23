@@ -51,7 +51,47 @@ impl Airc {
 
         let task = self.spawn_frame_ingest(stream);
         subs.insert(wire.to_path_buf(), WireSubscriber { _task: task });
+        // Drop the subscribers lock before emitting — the emit
+        // path touches the store + broadcast and we don't want
+        // to hold the wire subscriber map across an await.
+        drop(subs);
+
+        self.emit_wire_established(wire).await?;
         Ok(())
+    }
+
+    async fn emit_wire_established(&self, wire: &Path) -> Result<(), AircError> {
+        // Resolve channel_name + room_id by matching the wire path
+        // against the current subscription set. Best-effort: if no
+        // matching subscription is found (e.g. shared-wire test
+        // setups, lan subscriber spinning up before any join), emit
+        // with the wire path alone and let consumers correlate.
+        let (channel_name, room_id) = match self.subscriptions().await {
+            Ok(subs) => {
+                let canon = wire.canonicalize().ok();
+                let matched = subs.into_iter().find(|s| {
+                    if let Some(canon) = canon.as_ref() {
+                        s.wire.canonicalize().ok().as_ref() == Some(canon)
+                    } else {
+                        s.wire == wire
+                    }
+                });
+                match matched {
+                    Some(sub) => (sub.name.as_str().to_string(), sub.room_id),
+                    None => return Ok(()),
+                }
+            }
+            Err(_) => return Ok(()),
+        };
+        let body = airc_core::Body::Json(
+            serde_json::to_value(crate::lifecycle::WireEstablishedBody {
+                wire: wire.display().to_string(),
+                channel_name,
+            })
+            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
+        );
+        self.emit_lifecycle(airc_core::TranscriptKind::WireEstablished, room_id, body)
+            .await
     }
 
     pub(crate) async fn ensure_lan_subscriber(&self) -> Result<(), AircError> {
