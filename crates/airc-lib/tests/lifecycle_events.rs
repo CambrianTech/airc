@@ -217,6 +217,97 @@ async fn wire_established_fires_once_per_wire_idempotent() {
 }
 
 #[tokio::test]
+async fn save_runtime_cursor_emits_subscription_advanced() {
+    use airc_lib::lifecycle::SubscriptionAdvancedBody;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+    let _room = airc.join("subscription-advanced-test").await.expect("join");
+
+    airc.say("cursor source").await.expect("say");
+    let source = airc
+        .page_recent(32)
+        .await
+        .expect("page")
+        .into_iter()
+        .find(|event| event.kind == TranscriptKind::Message)
+        .expect("message event exists");
+    let source_cursor = source.cursor();
+
+    airc.save_runtime_cursor_for_event("test-consumer", &source)
+        .await
+        .expect("save cursor");
+
+    assert_eq!(
+        airc.load_runtime_cursor("test-consumer").await.unwrap(),
+        Some(source_cursor.clone())
+    );
+
+    let page = airc.page_recent(64).await.expect("page");
+    let event = page
+        .iter()
+        .find(|event| event.kind == TranscriptKind::SubscriptionAdvanced)
+        .expect("SubscriptionAdvanced lifecycle event exists");
+    let body = event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("SubscriptionAdvanced body should be JSON"),
+    };
+    let parsed: SubscriptionAdvancedBody =
+        serde_json::from_value(body_json).expect("body parses as SubscriptionAdvancedBody");
+    assert_eq!(parsed.consumer_id, "test-consumer");
+    assert_eq!(parsed.lamport, source_cursor.lamport);
+    assert_eq!(parsed.event_id, source_cursor.event_id);
+}
+
+#[tokio::test]
+async fn saving_subscription_advanced_cursor_does_not_emit_recursive_event() {
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+    let _room = airc
+        .join("subscription-advanced-loop-test")
+        .await
+        .expect("join");
+
+    airc.say("cursor source").await.expect("say");
+    let source = airc
+        .page_recent(32)
+        .await
+        .expect("page")
+        .into_iter()
+        .find(|event| event.kind == TranscriptKind::Message)
+        .expect("message event exists");
+    airc.save_runtime_cursor_for_event("test-consumer", &source)
+        .await
+        .expect("save source cursor");
+
+    let lifecycle_event = airc
+        .page_recent(64)
+        .await
+        .expect("page")
+        .into_iter()
+        .find(|event| event.kind == TranscriptKind::SubscriptionAdvanced)
+        .expect("SubscriptionAdvanced lifecycle event exists");
+    airc.save_runtime_cursor_for_event("test-consumer", &lifecycle_event)
+        .await
+        .expect("save lifecycle cursor");
+
+    let page = airc.page_recent(128).await.expect("page");
+    let count = page
+        .iter()
+        .filter(|event| event.kind == TranscriptKind::SubscriptionAdvanced)
+        .count();
+    assert_eq!(
+        count, 1,
+        "saving a SubscriptionAdvanced cursor must not emit another SubscriptionAdvanced event"
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_event_is_persisted_for_cursor_replay() {
     // Lifecycle events must be durable so a consumer that reconnects
     // can replay the transitions it missed. Confirm by paging

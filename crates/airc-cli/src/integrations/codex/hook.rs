@@ -38,8 +38,9 @@ pub async fn run_user_prompt_submit(
         None => airc.page_recent_subscribed_filtered(filter, count).await?,
     };
 
-    if let Some(newest) = events.last().map(TranscriptEvent::cursor) {
-        airc.save_runtime_cursor(&consumer_id, &newest).await?;
+    if let Some(newest) = events.last() {
+        airc.save_runtime_cursor_for_event(&consumer_id, newest)
+            .await?;
     }
 
     let visible: Vec<_> = events
