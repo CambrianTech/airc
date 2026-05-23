@@ -270,10 +270,9 @@ ensure_prereqs() {
   # Identity gen + signing live in Rust, so system OpenSSL and Python
   # package state are irrelevant to airc install correctness.
 
-  # Post-3c: sshd setup + Tailscale install fully removed. Cross-network
-  # messaging routes through gh-as-bearer (envelope-encrypted gist),
-  # which works on every platform with `gh auth login` — no privileged
-  # daemon, no sign-in popup, no admin elevation. The earlier sshd-on-
+  # Post-3c: sshd setup + Tailscale install fully removed from install.
+  # Cross-network messaging is owned by Rust transports/discovery, while
+  # GitHub remains rendezvous/control-plane only. The earlier sshd-on-
   # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +
   # CI auto-detect) was deleted as part of issue #341 follow-up #345
   # (doctor's sshd probe also dropped); leaving this single tombstone

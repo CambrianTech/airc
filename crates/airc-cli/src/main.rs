@@ -11,7 +11,6 @@
 //! auto-generate missing identity material. `VerificationPolicy::Strict`
 //! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
-mod bearer;
 mod channel_gist_cli;
 mod channel_gist_commands;
 mod cli;
@@ -82,7 +81,6 @@ use uuid::Uuid;
 use airc_core::PeerId;
 
 use airc_daemon::LocalIdentity;
-use bearer::cli::BearerAction;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use codex_cli::CodexHookAction;
@@ -183,60 +181,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Init => commands::run_init(&home).await,
 
         Command::LanIp => network_commands::run_lan_ip(),
-
-        Command::Bearer(args) => match args.action {
-            BearerAction::Kinds => {
-                bearer::commands::run_kinds();
-                Ok(())
-            }
-            BearerAction::Send {
-                peer_id,
-                channel,
-                host_target,
-                identity_key,
-                remote_home,
-                room_gist_id,
-            } => bearer::commands::run_send(
-                &peer_id,
-                &channel,
-                host_target.as_deref(),
-                identity_key.as_deref(),
-                remote_home.as_deref(),
-                room_gist_id.as_deref(),
-            ),
-            BearerAction::SendBatch {
-                peer_id,
-                channel,
-                host_target,
-                identity_key,
-                remote_home,
-                room_gist_id,
-            } => bearer::commands::run_send_batch(
-                &peer_id,
-                &channel,
-                host_target.as_deref(),
-                identity_key.as_deref(),
-                remote_home.as_deref(),
-                room_gist_id.as_deref(),
-            ),
-            BearerAction::Recv {
-                peer_id,
-                host_target,
-                identity_key,
-                remote_home,
-                offset_file,
-                state_file,
-                room_gist_id,
-            } => bearer::recv::run_recv(
-                &peer_id,
-                host_target.as_deref(),
-                identity_key.as_deref(),
-                remote_home.as_deref(),
-                offset_file.as_deref(),
-                state_file.as_deref(),
-                room_gist_id.as_deref(),
-            ),
-        },
 
         Command::Collaboration(args) => match args.action {
             CollaborationAction::Status(args) => {

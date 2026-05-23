@@ -113,7 +113,7 @@ When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is
 
 `airc status` is local-only ground truth. If it shows:
 - `airc process: ... running` AND
-- `bearer: <Ns> ago via gh` (joiner) OR `bearer: n/a` (host)
+- route/process health is OK
 
 → scope IS in the mesh. Override gh-auth probe noise, empty-peers warnings, or "already joined" complaints. Trust `airc status`.
 

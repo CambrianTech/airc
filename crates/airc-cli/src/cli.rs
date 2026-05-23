@@ -16,7 +16,6 @@ use clap::{Args, Parser, Subcommand};
 
 use airc_lib::PeerSpec;
 
-use crate::bearer::cli::BearerArgs;
 use crate::channel_gist_cli::ChannelGistArgs;
 use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::collaboration_cli::CollaborationArgs;
@@ -144,9 +143,6 @@ pub enum Command {
 
     /// Print the primary non-loopback LAN IPv4 address, if detectable.
     LanIp,
-
-    /// Legacy bearer transport helpers during Rust cutover.
-    Bearer(BearerArgs),
 
     /// Inspect collaboration health during Rust cutover.
     Collaboration(CollaborationArgs),
