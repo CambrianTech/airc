@@ -20,7 +20,7 @@ pub enum MonitorAction {
         my_name: String,
     },
 
-    /// Attach to the local messages.jsonl stream without owning transport.
+    /// Attach to the Rust event stream without owning transport.
     Attach {
         /// Current local display name.
         #[arg(long)]

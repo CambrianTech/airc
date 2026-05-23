@@ -6,7 +6,6 @@ use serde_json::Value;
 
 pub(crate) struct Scope {
     pub(crate) peers_dir: PathBuf,
-    pub(crate) local_log: PathBuf,
     pub(crate) offset_path: PathBuf,
     scope_dir: PathBuf,
     config_path: PathBuf,
@@ -22,7 +21,6 @@ impl Scope {
         Self {
             peers_dir: peers_dir.to_path_buf(),
             config_path: scope_dir.join("config.json"),
-            local_log: scope_dir.join("messages.jsonl"),
             offset_path: scope_dir.join("monitor_offset"),
             scope_dir,
             my_name: my_name.to_string(),

@@ -692,13 +692,10 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 # ── Codex model-visible AIRC turn contract ─────────────────────────────
-# Codex currently has no Claude-style Monitor tool. A daemon can keep
-# the transport alive, but the model will not notice inbound peer
-# traffic unless it polls local state during a turn. Install a small
-# model-visible instruction so future Codex sessions surface AIRC
-# traffic reliably without hitting GitHub: `airc codex-poll` reads the
-# local messages.jsonl cursor, suppresses empty output, and excludes
-# this identity's own messages.
+# Codex currently has no Claude-style Monitor tool. Keep `airc join`
+# running as the live feed, and install a small model-visible
+# instruction so future Codex sessions distinguish the live stream from
+# the prompt-boundary hook catch-up.
 #
 # We only write this if the user has no existing developer_instructions
 # key. If they do, do not overwrite; they can copy the block manually or
@@ -740,10 +737,10 @@ _install_airc_codex_developer_instructions() {
 # AIRC-CODEX-INSTRUCTIONS-START — managed by install.sh; remove this section through AIRC-CODEX-INSTRUCTIONS-END to opt out
 developer_instructions = """
 AIRC Codex runtime contract:
-- At the beginning of every user turn, before substantive work, if `airc` is available on PATH, run `airc codex-poll`.
-- `airc codex-poll` is local-only: it reads this scope's local message cursor, prints only unread peer messages, advances the cursor, and is silent when empty.
-- If `airc codex-poll` prints messages, briefly surface them to the user and account for them before continuing. If it is silent or says the scope is not initialized, continue normally.
-- Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually polled and seen peer traffic.
+- Keep `airc join` running as this session's live AIRC feed when coordinating with peer agents.
+- The installed `airc codex-hook user-prompt-submit` hook is prompt-boundary catch-up only. Treat injected peer messages as active work context, but do not mistake hook delivery for a live monitor.
+- Reply to direct peer questions with `airc msg`, not user-chat stdout. The peer sees AIRC, not this transcript.
+- Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually seen peer traffic.
 """
 # AIRC-CODEX-INSTRUCTIONS-END
 
@@ -751,7 +748,7 @@ TOML
     cat "$config"
   } > "$_tmp"
   mv "$_tmp" "$config"
-  ok "Added Codex AIRC turn contract to ~/.codex/config.toml — restart Codex to activate automatic local inbox polling"
+  ok "Added Codex AIRC turn contract to ~/.codex/config.toml — restart Codex to activate AIRC coordination guidance"
 }
 
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then

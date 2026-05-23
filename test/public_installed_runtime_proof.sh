@@ -119,8 +119,6 @@ run_join_for_scope() {
     cat "$err" >&2 || true
     fail "airc join failed for $scope"
   }
-  [ -s "$scope/subscriptions.json" ] \
-    || fail "airc join did not create subscriptions.json for $scope"
   (
     cd "$repo" || exit 1
     HOME="$MACHINE_HOME" AIRC_HOME="$scope" \
@@ -134,17 +132,14 @@ run_join_for_scope() {
   }
 }
 
-json_channel_field() {
+join_stdout_channel_id() {
   local file="$1"
   local channel="$2"
-  local field="$3"
-  awk -v channel="\"$channel\"" -v field="\"$field\"" '
-    $0 ~ channel"[[:space:]]*:" { in_channel = 1; next }
-    in_channel && $0 ~ /^[[:space:]]*}/ { in_channel = 0 }
-    in_channel && index($0, field) {
+  awk -v channel="#$channel" '
+    index($0, channel " (") {
       line = $0
-      sub(/^[^:]*:[[:space:]]*"/, "", line)
-      sub(/".*$/, "", line)
+      sub(/^.*\(/, "", line)
+      sub(/\).*$/, "", line)
       print line
       exit
     }
@@ -158,21 +153,21 @@ run_join_for_scope "$OPENCLAW_REPO" "$OPENCLAW_SCOPE" "$ROOT/openclaw.out" "$ROO
 
 # Both scopes must have subscribed to #general (the account lobby)
 # AND the inferred org/project channel (cambriantech / openclaw).
-grep -q '"general"' "$CONTINUUM_SCOPE/subscriptions.json" \
+grep -q '#general (' "$ROOT/continuum.out" \
   || fail "continuum scope did not subscribe #general"
-grep -q '"general"' "$OPENCLAW_SCOPE/subscriptions.json" \
+grep -q '#general (' "$ROOT/openclaw.out" \
   || fail "openclaw scope did not subscribe #general"
-grep -q '"cambriantech"' "$CONTINUUM_SCOPE/subscriptions.json" \
+grep -q '#cambriantech (' "$ROOT/continuum.out" \
   || fail "continuum scope did not subscribe inferred #cambriantech"
-grep -q '"openclaw"' "$OPENCLAW_SCOPE/subscriptions.json" \
+grep -q '#openclaw (' "$ROOT/openclaw.out" \
   || fail "openclaw scope did not subscribe inferred #openclaw"
 
 # The cross-scope architectural truth: same mesh identity + same
 # channel name → same RoomId via #843's identity-namespaced
 # derivation. Two scopes on the same gh account converge on a
 # single #general room without coordination.
-continuum_general_id="$(json_channel_field "$CONTINUUM_SCOPE/subscriptions.json" general room_id)"
-openclaw_general_id="$(json_channel_field "$OPENCLAW_SCOPE/subscriptions.json" general room_id)"
+continuum_general_id="$(join_stdout_channel_id "$ROOT/continuum.out" general)"
+openclaw_general_id="$(join_stdout_channel_id "$ROOT/openclaw.out" general)"
 [ -n "$continuum_general_id" ] || fail "continuum #general RoomId missing"
 [ -n "$openclaw_general_id" ] || fail "openclaw #general RoomId missing"
 [ "$continuum_general_id" = "$openclaw_general_id" ] \
@@ -181,14 +176,12 @@ openclaw_general_id="$(json_channel_field "$OPENCLAW_SCOPE/subscriptions.json" g
 # The machine-account wire promotion: project scopes under $HOME
 # share the wire at $HOME/.airc/wires/<channel> rather than
 # project-local wires. Tested via #844 + #861.
-continuum_general_wire="$(json_channel_field "$CONTINUUM_SCOPE/subscriptions.json" general wire)"
-openclaw_general_wire="$(json_channel_field "$OPENCLAW_SCOPE/subscriptions.json" general wire)"
-[ -n "$continuum_general_wire" ] || fail "continuum #general wire missing"
-[ -n "$openclaw_general_wire" ] || fail "openclaw #general wire missing"
-[ "$continuum_general_wire" = "$openclaw_general_wire" ] \
-  || fail "#general wire diverged between project scopes: $continuum_general_wire != $openclaw_general_wire"
-[ "$continuum_general_wire" = "$MACHINE_HOME_REAL/.airc/wires/general" ] \
-  || fail "#general wire must be account-home scoped, got $continuum_general_wire"
+general_wire="$MACHINE_HOME_REAL/.airc/wires/general"
+[ -d "$general_wire" ] || fail "#general account-home wire missing: $general_wire"
+[ ! -e "$CONTINUUM_SCOPE/wires/general" ] \
+  || fail "#general wire must not be project-local for continuum"
+[ ! -e "$OPENCLAW_SCOPE/wires/general" ] \
+  || fail "#general wire must not be project-local for openclaw"
 
 wait_for_file_text() {
   local file="$1"

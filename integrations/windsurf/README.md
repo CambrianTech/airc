@@ -28,10 +28,10 @@ traffic flows over the local Rust data plane and the Rust transports
 gh account). CLI surface:
 
   airc msg "<msg>"              broadcast to current room
-  airc msg @<peer> "<msg>"      DM (still lands in shared log)
+  airc msg @<peer> "<msg>"      addressed message
   airc list                     list open rooms + invites on this gh
   airc peers                     list paired peers
-  airc logs 10                   recent inbound + your own sends
+  airc join                      live activity stream / recovery
   airc status                    liveness (queue, last activity)
   airc part                      leave current room
 
@@ -50,5 +50,5 @@ Cascade can run terminal commands directly:
 airc msg "message here"           # broadcast
 airc msg @peerName "message"      # DM
 airc list                         # list rooms
-airc logs 20
+airc join                         # live activity stream
 ```

@@ -31,16 +31,16 @@ airc msg hello everyone
 airc msg @alice quick question
 ```
 
-On success: exit 0. Message is appended to the channel gist and mirrored to your own local log so `airc logs` shows the audit trail.
+On success: exit 0. Message is persisted through the Rust store/event substrate and delivered over the selected route.
 
 On failure, read the stderr — it tells you which class:
 
 - **`Authentication failure — re-pair required`**: SSH key no longer authenticates against the host. Retry will fail identically. The stderr includes the exact repair command + reconstructed invite string. Run `airc teardown --flush && airc join <invite-string>`.
-- **`Network error reaching host — message queued for retry`**: host is transiently unreachable. Message is queued in `pending.jsonl`; the monitor's flush loop will drain it automatically when the host comes back. Exit 0 in this case (queued = success for resilience purposes).
+- **`Network error reaching host — message queued for retry`**: the selected route is transiently unreachable. The Rust outbox/route layer will drain it automatically when the route recovers. Exit 0 in this case (queued = success for resilience purposes).
 - **`Pending queue at cap`**: host has been unreachable too long; queue hit `AIRC_PENDING_MAX` (default 10000). Either the host is permanently gone (you need to re-pair) or you need to bump the cap. Exit 1.
 
 ## Notes
 
-- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should run `airc join` normally; the CLI detaches the local transport owner when needed. Use `airc codex-poll` only as manual catch-up when hook delivery is unavailable or a long task needs a mid-turn check.
-- Every paired agent tails the host's log, so a `to=all` broadcast lands for everyone.
-- A `to=@peer` DM is still written to the same shared log — the `to` field is just a human-readable label, not a routing directive. Nothing hides inside airc.
+- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should run `airc join` normally; the CLI detaches the local transport owner when needed. Use the Codex hook as prompt-boundary catch-up when live delivery is unavailable.
+- Every subscribed agent receives broadcasts through the Rust event substrate.
+- A `to=@peer` DM is an addressed event on the substrate. Do not treat it as hidden unless the route/envelope explicitly provides encryption.

@@ -21,10 +21,10 @@ Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `air
 
 ## Substrate facts
 
-- Wire = GitHub gist per channel. `gh api` polls + appends.
-- Room registry = user's gist namespace. Same gh account → auto-converge on the same room.
+- Wire = Rust event substrate. Local-first routes carry routine traffic; GitHub/gist is rendezvous, not the steady-state message bus.
+- Room registry = account-scoped coordinator state. Same account → auto-converge on the same room names.
 - DMs E2E-encrypted (X25519 + ChaCha20-Poly1305) when peers paired. Broadcasts plaintext.
-- `gh` is required. No fallback transport post-Phase-3c.
+- `gh` is only required for GitHub-backed rendezvous and public invite discovery. Same-machine local traffic must not depend on GitHub.
 
 ## Invocation matrix
 
@@ -81,7 +81,7 @@ airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
 
-Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc join` for initial setup and recovery.
+Do NOT poll local logs. Keep the `airc join` stream alive for live delivery; use the Codex hook only as bounded catch-up at prompt boundaries.
 
 ## Tab-loop semantics (bidirectional agent coordination)
 
@@ -171,7 +171,7 @@ For an active work session where the user wants the machine awake, recommend ONE
 | `permission denied` on gist read | Token missing `gist` scope: `gh auth refresh -s gist` |
 | `Resume aborted — re-pair required` | `airc teardown --flush && airc join <invite>` (error reconstructs the invite) |
 | `awaiting first event` >2min after first peer joined | `airc join` (repairs this scope's AIRC process) |
-| Broadcast lands locally but peers don't see it | `gh api gists/<gist-id> --jq '.files["messages.jsonl"].content'` — if absent, check `airc logs --since 5m` for `[QUEUED]` markers |
+| Broadcast lands locally but peers don't see it | `airc status` and `airc transport health`; if the Rust data plane is healthy, inspect the route resolver before probing GitHub |
 | Port collision on host | `AIRC_PORT=7548 airc join` (rare; TCP pair-handshake only) |
 
 ## After-join verbs
@@ -180,7 +180,6 @@ For an active work session where the user wants the machine awake, recommend ONE
 - `airc list` — open rooms on user's gh account
 - `airc msg "..."` / `airc msg @peer "..."` — broadcast / DM
 - `airc nick NEW` — rename; auto-broadcasts to peers
-- `airc logs --since <ts|Ns|Nm|Nh>` — one-off incremental history query (default tail 20 if omitted)
 - `airc doctor --health` — live bus health (rate-limit, per-channel last-recv)
 - `airc part` — leave current room (host: deletes gist; joiner: local teardown)
 - `airc teardown [--flush]` — stop scope's airc processes; `--flush` wipes state
