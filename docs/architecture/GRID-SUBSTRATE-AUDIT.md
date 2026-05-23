@@ -64,6 +64,14 @@ Priority order matters:
    for wire payload encoding, install/config bootstrap, and external
    invite documents; it is not acceptable for runtime cursors, trust
    state, subscriptions, presence registries, or replay checkpoints.
+10. CI proves the production path; it does not substitute around it.
+    A test that disables a behavior the production path enables is
+    blind to the bugs that behavior creates. Emulate the production
+    shape (Monitor-style streaming consumer, daemon-attached send,
+    cross-machine route resolution) under test; reach for
+    `AIRC_NO_ATTACH` or similar disable-flags only when the test is
+    explicitly proving the script/setup-only path. If we can't
+    emulate it cheaply, that's a substrate gap, not a test cheat.
 
 ## Current Drift
 
@@ -441,6 +449,29 @@ Acceptance gates:
 - No proof depends on GitHub for routine same-machine traffic.
 - Every proof has replay data suitable for debugging without the
   original UI or runtime process.
+- Per non-negotiable #10, proofs emulate the production shape they
+  are validating. A "setup-only" join test still has to prove
+  setup; a "monitor stream" test still has to prove the stream.
+  Disable-flags (`AIRC_NO_ATTACH`, `AIRC_DISABLE_ACCOUNT_REGISTRY`,
+  etc.) are admissible only when the proof is explicitly about
+  the disabled-path behavior.
+
+### Known emulation gaps (Phase 5 follow-ups)
+
+These are places CI currently disables a production behavior
+instead of emulating it. Each is a substrate bug to file once the
+companion phase work lands:
+
+- **e2e join harness sets `AIRC_NO_ATTACH=1` for setup-only
+  subprocesses** (patched alongside #911). Right next move:
+  replace the disable-flag path with a Monitor-shaped consumer
+  that reads stdout until a known marker line, SIGTERMs the
+  child, asserts on captured stream. Proves the actual attach
+  + stream path, not just the setup return.
+- **Cross-machine fixture is not yet emulated under CI.** Today
+  cross-machine routing relies on operator-side manual verify.
+  Phase 2 lifecycle events + Phase 4 command-bus need
+  multi-machine CI to genuinely prove they work end-to-end.
 
 ## Immediate PR Queue
 
