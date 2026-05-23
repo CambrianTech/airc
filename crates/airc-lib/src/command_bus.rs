@@ -171,15 +171,8 @@ impl Airc {
         );
         headers.insert(HEADER_AIRC_DEADLINE.into(), deadline_at_ms.to_string());
 
-        // For directed requests (Peer target) the substrate today
-        // routes by channel + headers; the target lives on the
-        // envelope but isn't enforced by the broadcaster. Receivers
-        // self-filter on `target == own peer_id`. Recording the
-        // intent here lets future routing optimisations honor it
-        // without changing the public API.
-        let _ = target;
-
-        self.send(body, headers).await?;
+        self.send_frame_to(airc_protocol::FrameKind::Message, target, body, headers)
+            .await?;
 
         Ok(PendingCommand {
             correlation_id,
@@ -197,13 +190,18 @@ impl Airc {
         mut headers: Headers,
         body: Body,
     ) -> Result<(), AircError> {
-        let _ = reply_to; // recorded in headers below
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
             correlation_id.to_string(),
         );
         headers.insert(HEADER_AIRC_REPLY_TO.into(), reply_to.to_string());
-        self.send(body, headers).await?;
+        self.send_frame_to(
+            airc_protocol::FrameKind::Message,
+            MentionTarget::Peer(reply_to),
+            body,
+            headers,
+        )
+        .await?;
         Ok(())
     }
 

@@ -109,6 +109,11 @@ async fn round_trip_inner(machine: &std::path::Path) {
     let correlation_id = pending.correlation_id;
     let reply = alice.await_reply(pending).await.expect("alice gets reply");
 
+    assert_eq!(
+        reply.target,
+        MentionTarget::Peer(alice.peer_id()),
+        "reply must be directed at the requester"
+    );
     // The reply must carry the same correlation id.
     assert_eq!(
         reply.headers.get(HEADER_AIRC_CORRELATION_ID),
