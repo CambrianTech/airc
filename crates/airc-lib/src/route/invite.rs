@@ -123,7 +123,7 @@ impl Airc {
 
     pub async fn import_invite_beacon(&self, beacon: InviteBeacon) -> Result<(), AircError> {
         let peer_spec = beacon.peer_spec.clone();
-        self.add_peer(peer_spec).await?;
+        self.add_peer_via(peer_spec, "invite").await?;
         let mut invites = self
             .inner
             .imported_invites

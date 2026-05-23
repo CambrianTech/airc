@@ -70,6 +70,95 @@ async fn join_emits_room_joined_lifecycle_event() {
 }
 
 #[tokio::test]
+async fn add_peer_emits_peer_arrived_with_manual_via() {
+    use airc_core::PeerId;
+    use airc_lib::lifecycle::PeerArrivedBody;
+    use airc_lib::PeerSpec;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+    let _room = airc.join("peer-arrived-test").await.expect("join");
+
+    let mut stream = airc.subscribe().await.expect("subscribe");
+
+    let new_peer = PeerSpec {
+        peer_id: PeerId::new(),
+        pubkey: [9u8; 32],
+    };
+    let expected_peer_id = new_peer.peer_id;
+
+    let add_task = {
+        let airc = airc.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            airc.add_peer(new_peer).await.expect("add_peer");
+        })
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut found = None;
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(event))) => {
+                if event.kind == TranscriptKind::PeerArrived {
+                    found = Some(event);
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) => continue,
+            Ok(None) => panic!("stream closed before PeerArrived arrived"),
+            Err(_) => continue,
+        }
+    }
+    add_task.await.expect("add completes");
+
+    let event = found.expect("PeerArrived should be emitted by add_peer");
+    let body = event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("PeerArrived body should be JSON"),
+    };
+    let parsed: PeerArrivedBody =
+        serde_json::from_value(body_json).expect("body parses as PeerArrivedBody");
+    assert_eq!(parsed.peer_id, expected_peer_id);
+    assert_eq!(
+        parsed.via, "manual",
+        "default add_peer path tags via=manual"
+    );
+}
+
+#[tokio::test]
+async fn add_peer_is_idempotent_no_duplicate_lifecycle_event() {
+    use airc_core::PeerId;
+    use airc_lib::PeerSpec;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+    airc.join("dedup-test").await.expect("join");
+
+    let spec = PeerSpec {
+        peer_id: PeerId::new(),
+        pubkey: [3u8; 32],
+    };
+    airc.add_peer(spec.clone()).await.expect("first add");
+    airc.add_peer(spec).await.expect("second add (idempotent)");
+
+    let page = airc.page_recent(64).await.expect("page");
+    let count = page
+        .iter()
+        .filter(|e| e.kind == TranscriptKind::PeerArrived)
+        .count();
+    assert_eq!(
+        count, 1,
+        "re-adding an already-known peer must not emit a duplicate PeerArrived"
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_event_is_persisted_for_cursor_replay() {
     // Lifecycle events must be durable so a consumer that reconnects
     // can replay the transitions it missed. Confirm by paging
