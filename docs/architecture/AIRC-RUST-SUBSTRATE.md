@@ -1,39 +1,63 @@
-# airc-rust — Generic Messaging Substrate
+# airc-rust — Backbone Bus for Cambrian AR, Continuum/OpenClaw/Hermes, and the p2p Grid
 
-**Status**: Draft. Outline + key decisions. Sections marked _stub_
-get fleshed out as peers + Joel iterate.
+**Status**: Living doctrine doc. Sections evolve as the substrate
+ships; non-negotiables in
+[`GRID-SUBSTRATE-AUDIT.md`](GRID-SUBSTRATE-AUDIT.md) lock the
+invariants.
 
 **Authored by**: claude (vHSM-tab, architecture role)
-**Date**: 2026-05-18
-**Supersedes**: today's Python+bash airc.
+**Date**: 2026-05-18, updated 2026-05-23 to widen the consumer
+framing past chat-only.
+**Supersedes**: original Python+bash airc.
 
 ## What airc-rust is
 
-airc-rust is a **network substrate that doubles as a messaging layer and
-an event bus**. The elevator-pitch analogy: it's to its consumers what
-Signal Protocol is to its apps — a generic encrypted-messaging primitive
-that applications layer their semantics on top of. Signal facilitates;
-the apps decide what they're saying.
+airc-rust is **Cambrian's backbone bus** — the substrate every
+internal system rides on for coordination, presence, event
+delivery, and command routing. Three consumer-classes drive the
+design pressure, in decreasing latency-sensitivity:
 
-Think IRC for the high-level shape: peers, rooms, messages, events,
-signaling, identity, durable scrollback. Same primitives, modern
-transport, structured storage, no language lock-in to Python or shell.
+1. **AR systems** — Continuum's headset/edge pose sync, shared
+   spatial anchors, AR event/command streams. 60–90Hz steady
+   state, sub-25ms p99 e2e on Tailnet/LAN, sub-8ms p99
+   same-machine. Highest-latency-sensitivity consumer; see
+   [AR-LATENCY-CONTRACT.md](AR-LATENCY-CONTRACT.md) for budgets.
+2. **All Cambrian internal coordination** — Continuum, OpenClaw,
+   Hermes, agent-relay, forge-alloy, sentinel-ai, plus
+   AI-agent runtimes (Claude Code, Codex, Cursor, opencode,
+   Windsurf). Different vocabularies, one substrate. See
+   [CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md](CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md).
+3. **The p2p grid** — Continuum's distributed compute + model
+   serving, multi-operator mesh, capability leasing. Same-machine,
+   then Tailnet/LAN, then grid-to-grid in priority order. See
+   [PEER-DISCOVERY-SCALABILITY.md](../PEER-DISCOVERY-SCALABILITY.md).
 
-It is **not** a continuum-specific layer, a coding-agent-specific layer,
-or any one consumer's protocol. Continuum, OpenClaw users, Hermes users,
-IRC-style human chat clients, future AI personas, CLI tools, grid
-routing layers — all join the same rooms as peer types of one primitive.
-None of them is mentioned by name in the core protocol.
+The elevator pitch: airc is to its consumers what Signal Protocol
+is to its apps — a generic encrypted-event primitive that
+applications layer their semantics on top of. Signal facilitates;
+the apps decide what they're saying. We add presence, multi-room
+subscriptions, durable transcript, and a route resolver across
+local-fs / LAN / Tailscale / relay / WebRTC / Reticulum.
+
+It is **not** chat-shaped at heart, even though chat is one of
+its consumer profiles. Pose streams at 60Hz, command/reply traffic
+with deadlines, ephemeral telemetry, and durable chat all ride the
+same envelope shape. None of them is mentioned by name in the
+core protocol.
 
 The three roles airc-rust plays for consumers:
-- **Network substrate** — the connection layer the multi-machine grid
-  rides on. Peer discovery, addressing, encryption, reachability
-  resolution. (Grid orchestration / routing decisions stay at the
-  consumer level; airc carries the connections those decisions land on.)
-- **Messaging layer** — durable chat-shaped store + scrollback + cursors.
-  The kind of substrate `irssi` would expect.
-- **Event bus** — interrupt-driven fan-out for things consumers need to
-  wake on, not poll for.
+- **Network substrate** — the connection layer the multi-machine
+  grid rides on. Peer discovery, addressing, encryption,
+  reachability resolution. Routine same-machine traffic never
+  depends on GitHub; gh is rendezvous metadata only
+  (non-negotiable #2).
+- **Event bus** — interrupt-driven fan-out for everything
+  consumers need to wake on, not poll for. Subscription by header
+  filter, multi-room by default, replay via cursor.
+- **Command plane** (Phase 4, in flight) — typed request/reply
+  primitive with correlation, deadline, cancellation. Consumers
+  own the command vocabulary; airc owns delivery + correlation
+  matching.
 
 See [`INVITE-ROUTING-ARCHITECTURE.md`](INVITE-ROUTING-ARCHITECTURE.md) for the
 transport boundary: gh-gist is an invite/rendezvous beacon, not the live

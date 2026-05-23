@@ -307,20 +307,31 @@ five concrete hotpaths and seven kill-list patterns.
 
 ### Layering rot (architectural)
 
+**Status after Phase 3.5**: peer-trust + identity ORM cuts
+(#883/#885/#902) softened the `airc-lib`/`airc-daemon` interface
+— the `peers_store` is now a thin shim over `airc-store`
+methods, not a parallel JSON store. The deeper issue (lib
+naming daemon types) is still present and worth a separate
+follow-up.
+
 - **`airc-lib` imports `airc-daemon::peers_store` + `DaemonClient`**
-  (`airc-lib/src/airc.rs:29-30`). The library reaches into the
-  daemon crate's internals. Clean shape: trait
-  `PersistentStore { async fn load_peers(...) }` and the daemon
-  provides an impl. Library never names daemon types.
+  (`airc-lib/src/airc.rs:29-30`) — STILL OPEN post-Phase 3.5. The
+  library reaches into the daemon crate's internals. Clean shape:
+  trait `PersistentStore { async fn load_peers(...) }` and the
+  daemon provides an impl. Library never names daemon types.
+  Tracked for the post-3.6 cleanup phase.
 - **`airc-transport::signed` holds an `Arc<RwLock<PeerKeyRegistry>>`**
-  (`transport/signed.rs:129-146`) but doesn't own its lifecycle.
-  Key rotation invalidates lib's registry but transport has a stale
-  reference. Fix: verification is a pure function or a delegate
-  passed per frame; transport does not own crypto state.
+  (`transport/signed.rs:129-146`) — STILL OPEN. Key rotation
+  invalidates lib's registry but transport has a stale reference.
+  Fix: verification is a pure function or a delegate passed per
+  frame; transport does not own crypto state. (Note: #905 made
+  unverifiable replay frames skip-and-warn instead of fail-closed,
+  which masks one symptom of this rot but doesn't fix the cause.)
 - **Daemon IPC is line-delimited JSON without length-framing**
-  (implied from `airc-daemon/src/ipc/request.rs`). A newline in a
-  message body breaks the parser. No backpressure framing. Fix:
-  length-prefixed CBOR/protobuf, or proper RPC codec (tonic).
+  (implied from `airc-daemon/src/ipc/request.rs`) — STILL OPEN. A
+  newline in a message body breaks the parser. No backpressure
+  framing. Fix: length-prefixed CBOR/protobuf, or proper RPC
+  codec (tonic).
 
 ### SeaORM perf notes (for Phase 3.5)
 

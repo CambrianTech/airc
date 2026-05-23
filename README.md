@@ -1,6 +1,8 @@
-# airc — Agentic Internet Relay Chat
+# airc — Cambrian's Backbone Bus
 
-A Rust grid substrate that lets local and remote AI agents share signed, typed events across machines. The user-facing surface is IRC-shaped because agents already understand IRC, but the wire underneath is the Rust substrate — signed envelopes, header-filterable subscriptions, durable store + cursor replay, and pluggable transports (same-host, LAN, relay, UDP, WebRTC). Consumers above the substrate (Continuum, Hermes, OpenClaw, opencode/Codex/Claude) speak typed `forge.*` contracts on the same wire without the substrate having to know what those headers mean.
+A Rust grid substrate that carries every Cambrian internal system on one signed, typed event wire — AR pose streams (60–90Hz, sub-25ms p99 on Tailnet/LAN), distributed-inference command/reply traffic, persona event buses, agent coordination, fleet presence, and IRC-shaped human/agent chat as one consumer profile among many. The substrate is layered so AR-rate workloads and chat-shaped consumers can ride the same envelopes without compromising either.
+
+Three primitives at the core: **signed envelopes** (Ed25519 + ChaCha20-Poly1305 for DMs), **header-filterable multi-room subscriptions**, and a **route resolver** that picks among local-fs / LAN-TCP / Tailscale / relay / WebRTC / Reticulum transports based on per-frame route-class hints + per-route health. Consumers above the substrate (Continuum, OpenClaw, Hermes, agent-relay, forge-alloy, sentinel-ai, AI agents) speak typed `forge.*` / `continuum.*` / `openclaw.*` contracts on the same wire without the substrate having to know what those headers mean. See [`docs/architecture/CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md`](docs/architecture/CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md) for the full consumer roster.
 
 The default flow is intentionally small:
 
@@ -88,7 +90,7 @@ Three layers, sharp boundaries:
 | **SDK** (`airc-lib`) | typed ergonomic API: `Airc::open`, `join_with_wire`, `send`, `subscribe_filtered`, `page_recent`, `resume_from`, `add_peer`, `rotate_peer` | reimplement substrate primitives; reach around the substrate to a different store |
 | **Consumers** (Continuum, Hermes, OpenClaw, opencode/Codex/Claude, your app) | typed `forge.*` event vocabularies, capability projections that map "I want model X" to a peer who advertised it, agent policy | reach into substrate internals; embed substrate state in their own; bypass `airc-lib` for performance |
 
-The substrate's only routing primitive is **"deliver events whose headers match this filter to subscribers of that filter."** It does not know that `forge.hermes.tool="continuum.lora.invoke"` should land on a peer with a loaded LoRA capability. That mapping — tool-name → capability-bearing-peer — is policy that lives in the consumer layer, not in airc. If airc started ranking peers by VRAM × latency × model-match, the next request would be for airc to UNDERSTAND models, which dissolves the layer.
+The substrate's core routing primitives are (1) **header-filtered subscription delivery** — events whose headers match a subscriber's filter fan out to that subscriber, multi-room by default; and (2) the **route resolver** — for each send, pick among local-fs / LAN / Tailscale / relay / WebRTC / Reticulum based on per-route health + an optional `airc.route_class` hint from the sender (AR consumers pin `local-only` or `lan-allowed`). The substrate does not know that `forge.hermes.tool="continuum.lora.invoke"` should land on a peer with a loaded LoRA capability. That mapping — tool-name → capability-bearing-peer — is policy that lives in the consumer layer, not in airc. If airc started ranking peers by VRAM × latency × model-match, the next request would be for airc to UNDERSTAND models, which dissolves the layer.
 
 ### Transports (pick automatically, fail loudly)
 
@@ -111,7 +113,9 @@ The Rust route resolver picks among these based on local health + invite metadat
 
 ## The Model
 
-airc is IRC-shaped because agents already understand IRC.
+The substrate is **envelope-shaped, not chat-shaped**: every send is a signed typed event with headers and an opaque body. Chat-shaped consumers get an IRC-friendly surface on top of those envelopes because agents and humans already understand IRC; AR pose streams, command/reply traffic, capability advertisements, and other non-chat consumers ride the same envelopes with different headers and don't see (or need) the IRC layer at all.
+
+When you're consuming chat through the CLI or a Claude/Codex skill, the IRC mapping below is what you interact with. When you're embedding airc as Continuum's pose-sync bus, you see typed events through `airc-lib`, not `/join`.
 
 | IRC | airc |
 |-----|------|
