@@ -52,6 +52,11 @@ Priority order matters:
 7. Cursor replay and live push are first-class. Anything visible in
    production should be inspectable, replayable, and debuggable
    without a full UI stack.
+   Claude currently receives live push through Monitor. Codex does
+   not expose an equivalent runtime interrupt primitive, so the
+   installed Codex contract is a long-running `airc join` feed tool
+   session plus prompt-boundary hook catch-up. Treat that as a
+   runtime integration gap, not as a substrate transport failure.
 8. Code organization must preserve the substrate boundary. If a file
    starts naming consumers, move that surface into an integration
    crate/module.
@@ -90,6 +95,9 @@ Work:
   - `codex_*.rs`
   - Codex hook JSON/config mutation
   - Codex-specific feed/cursor policy
+- Define the Codex feed contract explicitly: `airc join` is the live
+  feed, the UserPromptSubmit hook is bounded catch-up, and true
+  wake-on-AIRC requires Codex runtime support outside the substrate.
 - Move generic runtime context detection out of `commands.rs`.
   `airc join` should call a small substrate-facing classifier, not own
   env/process heuristics inline.

@@ -52,6 +52,8 @@ airc join
 
 Open another agent tab and run `airc join` again. It detects the existing background transport for the scope, attaches the tab to the live message stream, and surfaces unread context. There is no per-tab reconnect dance.
 
+Claude Code runs that stream through Monitor. Codex does not expose a Monitor-equivalent interrupt primitive, so Codex keeps `airc join` running as a long-lived tool session and polls that session between work steps; the Codex hook is prompt-boundary catch-up, not the live path.
+
 Send messages:
 
 ```bash
@@ -259,13 +261,13 @@ Cross-account joins use the gist id or four-word mnemonic from `airc list`.
 | Agent | Integration |
 |-------|-------------|
 | Claude Code | Skills + Monitor (live event stream via `airc join`, transitioning to a typed `events subscribe` CLI over `airc-lib`) |
-| OpenAI Codex CLI | Skills + prompt hook (Rust event API — no log scraping) |
+| OpenAI Codex CLI | Skills + long-running `airc join` feed tool session + prompt-boundary hook catch-up (Rust event API — no log scraping) |
 | opencode | `AGENTS.md` + shell |
 | Cursor | Rules + terminal |
 | Windsurf | Cascade + terminal |
 | Generic | JSONL protocol and shell examples |
 
-All integrations consume from the Rust event substrate. Prompt-time log scraping has been removed; live integrations use `airc join`, and bounded catch-up uses the Rust Codex/event APIs.
+All integrations consume from the Rust event substrate. Prompt-time log scraping has been removed; live integrations use `airc join`, and bounded catch-up uses the Rust Codex/event APIs. Codex still cannot be woken by AIRC without its own runtime support; until then, the feed must be kept as an active tool session and polled by Codex between work steps.
 
 Static queue and room widgets for project portals live in [`widgets/`](widgets/) with usage notes in [`docs/queue-widgets.md`](docs/queue-widgets.md).
 

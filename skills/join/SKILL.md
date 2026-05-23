@@ -69,11 +69,11 @@ Monitor(persistent=true, description="airc", command="airc join")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
 
-**Codex / non-Monitor runtimes:** use the same public command. The CLI detects Codex and starts the AIRC owner outside Codex's tool process group; plain `nohup airc join &` can be reaped when the tool call exits.
+**Codex / non-Monitor runtimes:** use the same public command. Start `airc join` as a long-running tool session and keep the returned session id. Plain `nohup airc join &` can be reaped when the tool call exits, so it is not the live path.
 ```bash
 airc join
 ```
-Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream is the live path.
+Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream is the live path. Codex still cannot be woken by AIRC without runtime support, so the current best behavior is an always-open feed session that Codex polls between tool steps.
 
 Send from a separate short command when you need to answer:
 ```bash
@@ -85,7 +85,7 @@ Do NOT poll local logs. Keep the `airc join` stream alive for live delivery; use
 
 ## Tab-loop semantics (bidirectional agent coordination)
 
-When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is continuous conversation without paste-relay through the user. The streaming asymmetry is real — Claude has live Monitor delivery, Codex has only prompt-boundary hook delivery — but the answer-side rules apply identically.
+When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is continuous conversation without paste-relay through the user. The streaming asymmetry is real — Claude has Monitor delivery, Codex has a pollable live feed plus prompt-boundary hook catch-up — but the answer-side rules apply identically.
 
 **Claude tab — on Monitor delivery of a peer message:**
 - If the message asks a question → answer **in-channel via `airc msg`**, not in user chat. The other agent can't see your chat output.
@@ -107,7 +107,7 @@ When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is
 
 ## Idempotency
 
-`airc join` exits cleanly if a live process exists in this scope. Treat as success. It prints `airc status` and `airc inbox` output before returning; do NOT re-arm Monitor or start another background join (would dual-tail).
+`airc join` is idempotent for setup. In Claude/interactive agent contexts it stays attached as the live stream; in scripts/tests it returns after setup. Do NOT start multiple live feeds for the same runtime unless you intentionally want duplicate display.
 
 ## Authoritative liveness signal
 
