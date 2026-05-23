@@ -426,6 +426,87 @@ async fn saving_subscription_advanced_cursor_does_not_emit_recursive_event() {
 }
 
 #[tokio::test]
+async fn teardown_wire_emits_wire_lost_with_teardown_reason() {
+    use airc_lib::lifecycle::WireLostBody;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+
+    // Join puts a wire subscriber in the map.
+    let room = airc.join("wire-lost-test").await.expect("join");
+
+    // Resolve the wire path the same way the subscriber map keys
+    // are formed — via the room subscription.
+    let subs = airc.subscriptions().await.expect("subscriptions");
+    let sub = subs
+        .iter()
+        .find(|s| s.room_id == room.channel)
+        .expect("subscription row for joined channel");
+    let wire_path = sub.wire.clone();
+
+    airc.teardown_wire_for_test(&wire_path)
+        .await
+        .expect("teardown_wire");
+
+    // Allow the task a moment to flush its emit even though
+    // teardown_wire awaits the JoinHandle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut wire_lost_event = None;
+    while std::time::Instant::now() < deadline {
+        let page = airc.page_recent(64).await.expect("page");
+        if let Some(event) = page
+            .into_iter()
+            .find(|e| e.kind == TranscriptKind::WireLost)
+        {
+            wire_lost_event = Some(event);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let event = wire_lost_event.expect("WireLost should be emitted by teardown_wire");
+    let body = event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("WireLost body should be JSON"),
+    };
+    let parsed: WireLostBody =
+        serde_json::from_value(body_json).expect("body parses as WireLostBody");
+    assert_eq!(
+        parsed.reason, "teardown",
+        "explicit teardown path tags reason=teardown"
+    );
+    assert!(!parsed.wire.is_empty(), "wire path should be set");
+}
+
+#[tokio::test]
+async fn teardown_wire_is_idempotent_no_subscriber_noop() {
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+
+    // Tearing down a wire that was never subscribed must not panic
+    // and must not emit a WireLost event (no room to attach it to).
+    let bogus = home.join("does-not-exist");
+    airc.teardown_wire_for_test(&bogus)
+        .await
+        .expect("teardown_wire on unknown wire is a no-op");
+
+    let page = airc.page_recent(64).await.expect("page");
+    let count = page
+        .iter()
+        .filter(|e| e.kind == TranscriptKind::WireLost)
+        .count();
+    assert_eq!(
+        count, 0,
+        "tearing down an unknown wire must not emit WireLost"
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_event_is_persisted_for_cursor_replay() {
     // Lifecycle events must be durable so a consumer that reconnects
     // can replay the transitions it missed. Confirm by paging
