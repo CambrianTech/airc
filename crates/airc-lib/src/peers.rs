@@ -24,10 +24,49 @@ impl Airc {
     }
 
     /// Enrol a peer into the local trust registry and persist it to
-    /// the peer trust store.
+    /// the peer trust store. Public API; defaults the `via` tag on
+    /// the lifecycle event to `"manual"`.
     pub async fn add_peer(&self, spec: PeerSpec) -> Result<(), AircError> {
+        self.add_peer_via(spec, "manual").await
+    }
+
+    /// Internal: enrol a peer and emit `PeerArrived` with the
+    /// caller-supplied `via` tag (`"invite"`, `"account_registry"`,
+    /// `"manual"`, etc.). Callers that know how the peer was
+    /// discovered call this directly so subscribers see the typed
+    /// provenance.
+    pub(crate) async fn add_peer_via(&self, spec: PeerSpec, via: &str) -> Result<(), AircError> {
+        let already_known = self
+            .peers()
+            .await?
+            .iter()
+            .any(|p| p.peer_id == spec.peer_id);
         peers_store::add(&self.inner.home, spec.peer_id, spec.pubkey).await?;
-        self.enrol_volatile_peer(&spec)
+        self.enrol_volatile_peer(&spec)?;
+
+        // Only emit on first arrival — re-adding an already-known
+        // peer (idempotent enrol) shouldn't fire a duplicate
+        // lifecycle event. Also requires a current default room to
+        // route through; if the local scope hasn't joined any room
+        // yet, the event has nowhere to live and the consumer can
+        // introspect `Airc::peers()` directly on first join.
+        if already_known {
+            return Ok(());
+        }
+        let room_id = match self.current_room().await {
+            Ok(room) => room.channel,
+            Err(_) => return Ok(()),
+        };
+        let body = airc_core::Body::Json(
+            serde_json::to_value(crate::lifecycle::PeerArrivedBody {
+                peer_id: spec.peer_id,
+                via: via.to_string(),
+            })
+            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
+        );
+        self.emit_lifecycle(airc_core::TranscriptKind::PeerArrived, room_id, body)
+            .await?;
+        Ok(())
     }
 
     /// Enrol a peer in the in-memory trust registry without writing
