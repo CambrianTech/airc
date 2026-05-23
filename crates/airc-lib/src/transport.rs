@@ -191,9 +191,7 @@ impl Airc {
                         item = stream.next() => match item {
                             Some(Ok(frame)) => airc.append_received_frame(frame).await,
                             Some(Err(verify_err)) => {
-                                eprintln!(
-                                    "airc-lib subscriber: frame verification failed: {verify_err}"
-                                );
+                                warn_frame_verify_failed(&verify_err);
                             }
                             None => break "stream_ended",
                         }
@@ -203,9 +201,7 @@ impl Airc {
                     match stream.next().await {
                         Some(Ok(frame)) => airc.append_received_frame(frame).await,
                         Some(Err(verify_err)) => {
-                            eprintln!(
-                                "airc-lib subscriber: frame verification failed: {verify_err}"
-                            );
+                            warn_frame_verify_failed(&verify_err);
                         }
                         None => break "stream_ended",
                     }
@@ -285,5 +281,11 @@ impl Airc {
                 eprintln!("airc-lib subscriber: store append failed: {err}");
             }
         }
+    }
+}
+
+fn warn_frame_verify_failed(error: &impl std::fmt::Display) {
+    if std::env::var_os("AIRC_REPLAY_WARN").is_some() {
+        eprintln!("airc-lib subscriber: frame verification failed: {error}");
     }
 }

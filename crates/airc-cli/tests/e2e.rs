@@ -433,8 +433,10 @@ fn seed_mesh_identity(home: &Path, identity: &str) {
 #[test]
 fn listen_rejects_unenrolled_signer() {
     // Mallory's signed frame must be rejected by Alice's listen — she
-    // isn't in Alice's peer registry. Stderr surfaces a verification
-    // failure; stdout never prints it as a happy message.
+    // isn't in Alice's peer registry. Routine agent feeds keep stale
+    // verification errors quiet, so this diagnostic test opts into
+    // explicit warnings and asserts stdout never prints it as a happy
+    // message.
     let workspace = TempDir::new().expect("tempdir");
     let alice_home = workspace.path().join("alice");
     let mallory_home = workspace.path().join("mallory");
@@ -449,6 +451,7 @@ fn listen_rejects_unenrolled_signer() {
     run_room(&mallory_home, "e2e", &wire);
 
     let mut alice = command_for_home(&alice_home)
+        .env("AIRC_REPLAY_WARN", "1")
         .args(["--home", alice_home.to_str().unwrap(), "listen", "--replay"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
