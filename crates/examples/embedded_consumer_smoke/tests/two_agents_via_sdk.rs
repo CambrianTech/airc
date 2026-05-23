@@ -76,7 +76,7 @@ async fn two_agents_in_separate_homes_exchange_and_replay_via_sdk() {
     // "no prompt-time polling" path is exercised. The Codex hook
     // case the audit calls out: a consumer subscribes to typed
     // events and receives them as they happen, instead of shelling
-    // out to `airc logs N` between turns.
+    // out to a log-scraping command between turns.
     let mut bob_stream = bob.subscribe().await.unwrap();
 
     let first = "hello bob, from alice via sdk";

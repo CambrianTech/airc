@@ -337,9 +337,6 @@ pub enum Command {
     /// Queue-card parsing and mutation primitives during Rust cutover.
     QueueCard(crate::queue_card_cli::QueueCardArgs),
 
-    /// Append and rotate legacy messages.jsonl files through Rust.
-    Log(crate::log_cli::LogArgs),
-
     /// Format legacy monitor JSONL streams for AI/runtime consumers.
     Monitor(crate::monitor::MonitorArgs),
 

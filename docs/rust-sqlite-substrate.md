@@ -13,7 +13,7 @@ The command surface should stay simple:
 
 ```bash
 airc msg "status: tests are green"
-airc logs 20
+airc join
 airc queue
 airc hygiene report
 ```
@@ -343,11 +343,12 @@ behind the same trait boundary and keep the public API unchanged.
 The shell/Python layer should become dispatch glue:
 
 - `airc msg` calls Rust append, then enqueues adapter fanout.
-- `airc logs` pages the SQLite chat projection.
+- `airc join` streams the SQLite-backed event projection.
 - `airc queue` reads the queue projection and asks the GitHub adapter to refresh
   only when its cursor is stale.
 - `airc hygiene report` writes health samples and can trigger policy hooks.
-- monitor/codex-poll subscribe from the store instead of tailing raw JSONL.
+- monitor, hooks, and non-Monitor live feeds subscribe from the store instead
+  of tailing raw JSONL.
 
 Continuum integration should consume Rust/TypeScript types, IPC responses, and
 projection APIs. It should not open the SQLite database, run SQL queries, or
@@ -404,14 +405,16 @@ performance claim must have a reproducible measurement.
 
 1. Add `airc-store` Rust crate with ORM entities, migrations, event ID
    generation, append/page/resume APIs, and unit tests.
-2. Add JSONL import/export so existing `messages.jsonl` rooms are not stranded.
-3. Route `airc logs` through the Rust store behind a feature flag while keeping
-   JSONL as compatibility output.
+2. Add typed import/export around the Rust store for diagnostic capture and
+   replay.
+3. Route live event consumption through the Rust store and remove JSONL
+   compatibility output.
 4. Move `airc msg` append/dedupe/outbox into Rust; keep GitHub bearer as an
    adapter.
 5. Move queue card parsing/projection into Rust; keep GitHub issues as the
    canonical remote work record.
-6. Add subscription API for monitor/codex-poll and generic realtime events.
+6. Add subscription API for monitor, hooks, non-Monitor live feeds, and generic
+   realtime events.
 7. Add benchmark gate and bottleneck ledger issue creation for any missed target.
 8. Make SQLite the default runtime store. Keep JSONL export for debugging and
    old peers.

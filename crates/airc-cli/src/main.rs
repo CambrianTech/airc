@@ -49,8 +49,6 @@ mod lane_cli;
 mod lane_commands;
 mod legacy_envelope;
 mod legacy_identity;
-mod log_cli;
-mod log_commands;
 mod message_cli;
 mod message_commands;
 mod monitor;
@@ -97,7 +95,6 @@ use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
 use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
-use log_cli::LogAction;
 use message_cli::MessageAction;
 use monitor::MonitorAction;
 use pending_cli::PendingAction;
@@ -677,42 +674,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 target,
                 field,
             } => worktree_lane_commands::run_find(&registry, &target, &field),
-        },
-
-        Command::Log(args) => match args.action {
-            LogAction::Append { path } => log_commands::run_append(&path),
-            LogAction::Rotate {
-                path,
-                max_lines,
-                keep_lines,
-            } => log_commands::run_rotate(&path, max_lines, keep_lines),
-            LogAction::Render { since, count, json } => {
-                log_commands::run_render(&since, count, json)
-            }
-            LogAction::InboxRead {
-                home,
-                cursor_file,
-                since,
-                count,
-                peek,
-                quiet_empty,
-                exclude_self,
-                my_name,
-                client_id,
-            } => log_commands::run_inbox_read(log_commands::InboxReadArgs {
-                home,
-                cursor_file,
-                since,
-                count,
-                peek,
-                quiet_empty,
-                exclude_self,
-                my_name,
-                client_id,
-            }),
-            LogAction::InboxReset { home, cursor_file } => {
-                log_commands::run_inbox_reset(&home, &cursor_file)
-            }
         },
 
         Command::Monitor(args) => match args.action {

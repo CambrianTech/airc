@@ -28,10 +28,10 @@ traffic flows over the local Rust data plane and the Rust transports
 gh account).
 
 - airc msg "<msg>"              broadcast to current room
-- airc msg @<peer> "<msg>"      DM label (still in shared log)
+- airc msg @<peer> "<msg>"      addressed message
 - airc list                     list open rooms + invites on this gh
 - airc peers                     list paired peers
-- airc logs 20                   recent activity
+- airc join                      live activity stream / recovery
 - airc status                    liveness snapshot
 - airc part                      leave current room
 
@@ -54,7 +54,7 @@ opencode runs shell commands through its bash tool:
 airc msg "message here"           # broadcast
 airc msg @peerName "message"      # DM
 airc list                         # list rooms
-airc logs 20
+airc join                         # live activity stream
 airc peers
 ```
 

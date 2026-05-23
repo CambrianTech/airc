@@ -17,12 +17,8 @@ use super::scope::Scope;
 use crate::client_id::current_client_id;
 use crate::legacy_envelope;
 use crate::legacy_identity;
-use crate::log_commands::{self, AppendOutcome};
 
 const WATCHDOG_SEC: u64 = 150;
-const ROTATE_EVERY_LINES: u64 = 100;
-const DEFAULT_LOG_MAX_LINES: usize = 5_000;
-const DEFAULT_LOG_KEEP_LINES: usize = 2_500;
 
 pub(crate) struct Formatter {
     scope: Scope,
@@ -38,7 +34,6 @@ impl Formatter {
     pub(crate) fn new(scope: Scope) -> Self {
         let room_name = scope.room_name();
         let client_id = current_client_id().ok().flatten();
-        let seen_sigs = load_seen_sigs(&scope.local_log, DEFAULT_LOG_MAX_LINES);
         let offset_counter = fs::read_to_string(&scope.offset_path)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
@@ -47,7 +42,7 @@ impl Formatter {
             scope,
             room_name,
             client_id,
-            seen_sigs,
+            seen_sigs: BTreeSet::new(),
             offset_counter,
             sandbox: Sandbox::new(),
             drops: DropTracker::new(),
@@ -111,31 +106,13 @@ impl Formatter {
             }
         }
 
-        let mirrored_line = match serde_json::to_string(&message) {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("[airc:formatter] skipped one line: {error}");
-                return;
-            }
-        };
         if self.is_seen(&message) {
             return;
         }
-        match log_commands::append_unique_sig(&self.scope.local_log, &mirrored_line) {
-            Ok(AppendOutcome::Appended) => self.record_seen(&message),
-            Ok(AppendOutcome::Skipped) => return,
-            Err(_) => {}
-        }
+        self.record_seen(&message);
 
         if self.is_own_client_send(&message) {
             return;
-        }
-        if self.offset_counter.is_multiple_of(ROTATE_EVERY_LINES) {
-            let _ = log_commands::run_rotate(
-                &self.scope.local_log,
-                env_usize("AIRC_LOG_MAX_LINES", DEFAULT_LOG_MAX_LINES),
-                env_usize("AIRC_LOG_KEEP_LINES", DEFAULT_LOG_KEEP_LINES),
-            );
         }
 
         let msg = message_text(&message);
@@ -249,23 +226,6 @@ impl Formatter {
     }
 }
 
-fn load_seen_sigs(path: &std::path::Path, limit: usize) -> BTreeSet<String> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return BTreeSet::new();
-    };
-    raw.lines()
-        .rev()
-        .take(limit)
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| {
-            value
-                .get("sig")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect()
-}
-
 fn sig(message: &Value) -> Option<&str> {
     message
         .get("sig")
@@ -295,13 +255,6 @@ fn marker_uuid<'a>(msg: &'a str, marker: &str) -> Option<&'a str> {
     let id = &rest[..end];
     Uuid::parse_str(id).ok()?;
     Some(id)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
 }
 
 #[cfg(test)]

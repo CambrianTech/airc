@@ -65,7 +65,6 @@ List rooms and peers:
 ```bash
 airc list
 airc peers
-airc logs 20
 ```
 
 Check health:
@@ -266,7 +265,7 @@ Cross-account joins use the gist id or four-word mnemonic from `airc list`.
 | Windsurf | Cascade + terminal |
 | Generic | JSONL protocol and shell examples |
 
-All integrations consume from the Rust event substrate. The prompt-time-polling pattern (shelling out to `airc logs N` between turns) is the deprecated path; the typed subscription path replaces it.
+All integrations consume from the Rust event substrate. Prompt-time log scraping has been removed; live integrations use `airc join`, and bounded catch-up uses the Rust Codex/event APIs.
 
 Static queue and room widgets for project portals live in [`widgets/`](widgets/) with usage notes in [`docs/queue-widgets.md`](docs/queue-widgets.md).
 
@@ -319,7 +318,6 @@ airc part                         # leave the current room
 airc msg "<message>"              # broadcast
 airc msg @<peer> "<message>"      # addressed message
 airc msg --room general "<text>"  # send to a sidecar room
-airc logs [N]                     # show recent messages
 airc peers                        # list peers
 
 # Identity
