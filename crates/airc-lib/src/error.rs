@@ -78,4 +78,12 @@ pub enum AircError {
     /// that the identity layer didn't already classify.
     #[error("crypto: {0}")]
     Crypto(String),
+
+    /// A `PendingCommand`'s deadline elapsed before any matching
+    /// reply event arrived on the broadcast stream. The receiver
+    /// may still be processing the request; consumers that need
+    /// idempotent retry should send a new request with a fresh
+    /// correlation id rather than reusing the timed-out one.
+    #[error("command deadline elapsed (correlation_id={correlation_id})")]
+    CommandDeadline { correlation_id: uuid::Uuid },
 }

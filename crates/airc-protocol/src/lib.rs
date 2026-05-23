@@ -36,8 +36,8 @@ pub mod trust_rotation;
 pub use canonical::{canonical_signed_bytes, CanonicalError};
 pub use envelope::{ChannelId, Envelope, Frame, FrameKind};
 pub use headers_keys::{
-    HEADER_AIRC_CLIENT, HEADER_AIRC_DEADLINE, HEADER_AIRC_PRIORITY, HEADER_AIRC_REPLY_TO,
-    HEADER_AIRC_TRACE_ID, HEADER_FORGE_BODY_HINT,
+    HEADER_AIRC_CLIENT, HEADER_AIRC_COMMAND_KIND, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
+    HEADER_AIRC_PRIORITY, HEADER_AIRC_REPLY_TO, HEADER_AIRC_TRACE_ID, HEADER_FORGE_BODY_HINT,
 };
 pub use keypair::PeerKeypair;
 pub use media::MediaRef;
