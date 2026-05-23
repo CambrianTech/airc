@@ -904,7 +904,12 @@ mod tests {
         let default = airc.default_room().await.unwrap();
         assert_eq!(default.name, "cambriantech");
 
-        let cambriantech_event = make_event(42, default.channel, "cursor proof");
+        let next_lamport = airc
+            .subscription_cursor(&cambriantech)
+            .await
+            .unwrap()
+            .map_or(42, |cursor| cursor.lamport + 1);
+        let cambriantech_event = make_event(next_lamport, default.channel, "cursor proof");
         let expected_cursor = cambriantech_event.cursor();
         airc.append_event(cambriantech_event).await.unwrap();
         assert_eq!(
