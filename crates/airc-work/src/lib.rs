@@ -9,6 +9,7 @@ pub mod codec;
 pub mod drain_policy;
 pub mod event;
 pub mod ids;
+pub mod local_git;
 pub mod model;
 pub mod projection;
 pub mod replay;
@@ -33,6 +34,10 @@ pub use event::{
     WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
+pub use local_git::{
+    local_git_events_since, CommandGitRunner, GitCommandRunner, LocalGitError, LocalGitObserver,
+    LocalGitSnapshot, LocalGitWorkspace,
+};
 pub use model::{
     BranchName, CardState, DirtyState, DrainCandidate, DrainCandidateCategory, DrainOutcome,
     GitObjectId, HygieneReport, LaneState, PrCheckState, PrMergeState, PrReviewState,

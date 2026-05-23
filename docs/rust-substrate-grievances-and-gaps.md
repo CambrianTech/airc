@@ -852,7 +852,12 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
      this slice.
    - **Sub-PR 5b — local git watcher adapter.** Observe branch head,
      commit, and dirty-state changes for AIRC-managed workspaces and
-     emit the 5a events.
+     emit the 5a events. Implemented as `airc-work::local_git` plus
+     `airc-lib::Airc::observe_local_git_workspace`: the adapter reads a
+     local git worktree, compares it to the caller's prior snapshot, and
+     publishes only typed work events for actual changes. CLI/monitor
+     surfaces remain consumers of this library API rather than owning
+     git parsing.
    - **Sub-PR 5c — GitHub PR adapter.** Reconcile PR/check/review/merge
      state into the 5a PR events. GitHub remains an adapter, not the
      runtime source of truth.

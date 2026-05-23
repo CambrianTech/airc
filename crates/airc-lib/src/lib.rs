@@ -99,8 +99,8 @@ pub use subscriptions::{
 };
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
-    CreateWorkLane, HeartbeatWorkspace, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
-    RequestWorkspace,
+    CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservedLocalGitWorkspace,
+    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, RequestWorkspace,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core
@@ -112,7 +112,7 @@ pub use airc_core::{
     ClientId, EventId, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
 };
 pub use airc_work::{
-    BoardSnapshot, BranchName, CardState, ClaimId, LaneId, LaneState, ManagerHat, Priority,
-    ProjectionError, RepoId, WorkBoardProjection, WorkCardId, WorkEvent, WorkspaceId,
-    WorkspaceStatus,
+    BoardSnapshot, BranchName, CardState, ClaimId, DirtyState, GitObjectId, LaneId, LaneState,
+    LocalGitSnapshot, ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection,
+    WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus,
 };
