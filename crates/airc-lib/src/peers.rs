@@ -64,12 +64,8 @@ impl Airc {
             })
             .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
         );
-        if let Err(error) = self
-            .emit_lifecycle(airc_core::TranscriptKind::PeerArrived, room_id, body)
-            .await
-        {
-            eprintln!("airc-lib: peer_arrived lifecycle emit failed: {error}");
-        }
+        self.emit_lifecycle(airc_core::TranscriptKind::PeerArrived, room_id, body)
+            .await?;
         Ok(())
     }
 
