@@ -12,7 +12,7 @@
 //!   4. both keep a live subscription open
 //!   5. each sends and the other receives through persisted state
 //!   6. Monitor attach receives from the same Rust event stream, without
-//!      legacy messages.jsonl mirroring
+//!      filesystem-log mirroring
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -156,10 +156,10 @@ fn monitor_attach_streams_rust_events_without_legacy_log() {
         "monitor attach did not receive the Rust event"
     );
 
-    let legacy_log = claude_user_home.join(".airc").join("messages.jsonl");
+    let old_log_mirror = claude_user_home.join(".airc").join("airc-events.jsonl");
     assert!(
-        !legacy_log.exists(),
-        "monitor proof must not depend on legacy messages.jsonl"
+        !old_log_mirror.exists(),
+        "monitor proof must not depend on filesystem-log mirroring"
     );
 
     let _ = claude_monitor.kill();

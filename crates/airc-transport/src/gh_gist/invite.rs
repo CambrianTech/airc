@@ -128,15 +128,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let messages = store
+        let old_data_plane_file = store
             .client
-            .get_file("gist-a", "messages.jsonl")
+            .get_file("gist-a", "airc-events.jsonl")
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&invite).unwrap();
 
         assert_eq!(parsed["peer"], "peer-a");
-        assert_eq!(messages, None);
+        assert_eq!(old_data_plane_file, None);
     }
 
     #[tokio::test]

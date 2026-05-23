@@ -34,6 +34,10 @@ if git grep -nE 'airc-src|[.]airc-src' -- . ':!test/rust_cutover_guard.sh'; then
   fail "old split install clone path remains"
 fi
 
+if git grep -nE 'messages[.]jsonl|airc bearer|gh-bearer|GH bearer|GitHub bearer|ChatLogEnvelope|MessageAction|message_cli|message_commands' -- . ':!test/rust_cutover_guard.sh'; then
+  fail "old JSONL/bearer message-bus surface remains"
+fi
+
 # Post-demolition contract (PR D): the public `airc` is the Rust
 # binary at $BIN_DIR/airc, installed by install.sh from
 # target/release/airc. No bash wrapper, no .shim/.cmd/.ps1
