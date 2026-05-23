@@ -15,12 +15,6 @@ mod channel_gist_cli;
 mod channel_gist_commands;
 mod cli;
 mod client_id;
-mod codex_cli;
-mod codex_commands;
-mod codex_config;
-mod codex_hooks_json;
-mod codex_install;
-mod codex_start;
 mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
@@ -40,6 +34,7 @@ mod hygiene_cli;
 mod hygiene_commands;
 mod identity_cli;
 mod identity_commands;
+mod integrations;
 mod join_feed;
 mod json_path;
 mod knock_cli;
@@ -82,7 +77,6 @@ use airc_core::PeerId;
 use airc_daemon::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
-use codex_cli::CodexHookAction;
 use collaboration_cli::CollaborationAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
@@ -90,6 +84,7 @@ use gh_cli::GhAction;
 use gist_cli::GistAction;
 use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
+use integrations::codex::CodexHookAction;
 use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use monitor::MonitorAction;
@@ -505,10 +500,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::CodexHook(args) => match args.action {
             CodexHookAction::InstallHooks { codex_home } => {
-                codex_install::run_install_hooks(codex_home).await
+                integrations::codex::install::run_install_hooks(codex_home).await
             }
             CodexHookAction::UninstallHooks { codex_home } => {
-                codex_install::run_uninstall_hooks(codex_home).await
+                integrations::codex::install::run_uninstall_hooks(codex_home).await
             }
             CodexHookAction::UserPromptSubmit {
                 count,
@@ -516,13 +511,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 raw,
                 include_self,
             } => {
-                codex_commands::run_user_prompt_submit(&home, count, max_items, raw, include_self)
-                    .await
+                integrations::codex::hook::run_user_prompt_submit(
+                    &home,
+                    count,
+                    max_items,
+                    raw,
+                    include_self,
+                )
+                .await
             }
         },
 
         Command::CodexStart(args) => {
-            codex_start::run(&args.airc, &args.home, &args.log, args.join_args).await
+            integrations::codex::start::run(&args.airc, &args.home, &args.log, args.join_args).await
         }
 
         Command::Work(args) => match args.action {

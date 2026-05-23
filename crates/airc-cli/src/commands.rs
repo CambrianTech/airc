@@ -117,7 +117,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 }
 
 fn ensure_runtime_integrations() {
-    match crate::codex_install::install_hooks_for_default_home_if_present() {
+    match crate::integrations::codex::install::install_hooks_for_default_home_if_present() {
         Ok(report) if report.is_empty() => {}
         Ok(report) => {
             for line in report.lines {

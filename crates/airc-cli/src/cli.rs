@@ -17,7 +17,6 @@ use clap::{Args, Parser, Subcommand};
 use airc_lib::PeerSpec;
 
 use crate::channel_gist_cli::ChannelGistArgs;
-use crate::codex_cli::{CodexHookArgs, CodexStartArgs};
 use crate::collaboration_cli::CollaborationArgs;
 use crate::envelope_cli::EnvelopeArgs;
 use crate::gh_cli::GhArgs;
@@ -25,6 +24,7 @@ use crate::gist_cli::GistArgs;
 use crate::handshake_cli::HandshakeArgs;
 use crate::hygiene_cli::HygieneArgs;
 use crate::identity_cli::IdentityArgs;
+use crate::integrations::codex::{CodexHookArgs, CodexStartArgs};
 use crate::knock_cli::KnockArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;

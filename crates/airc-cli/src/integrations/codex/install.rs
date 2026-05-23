@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::{codex_config, codex_hooks_json};
+use super::{config, hooks_json};
 
 #[derive(Debug, Default)]
 pub struct HookInstallReport {
@@ -37,22 +37,22 @@ pub fn install_hooks_at(
     let hooks_json = codex_home.join("hooks.json");
     let mut report = HookInstallReport::default();
 
-    if codex_config::enable_hooks_feature(&config)? {
+    if config::enable_hooks_feature(&config)? {
         report.push(format!("enabled hooks in {}", config.display()));
     }
-    if codex_config::remove_stale_airc_filesystem_permissions(&config)? {
+    if config::remove_stale_airc_filesystem_permissions(&config)? {
         report.push(format!(
             "removed stale AIRC filesystem permission profile from {}",
             config.display()
         ));
     }
-    if codex_hooks_json::install(&hooks_json)? {
+    if hooks_json::install(&hooks_json)? {
         report.push(format!(
             "installed AIRC UserPromptSubmit hook in {}",
             hooks_json.display()
         ));
     }
-    if codex_config::remove_managed_developer_instructions(&config)? {
+    if config::remove_managed_developer_instructions(&config)? {
         report.push(format!(
             "removed legacy AIRC Codex polling instructions from {}",
             config.display()
@@ -77,13 +77,13 @@ pub async fn run_uninstall_hooks(
     let config = codex_home.join("config.toml");
     let hooks_json = codex_home.join("hooks.json");
 
-    if codex_config::disable_managed_hooks_feature(&config)? {
+    if config::disable_managed_hooks_feature(&config)? {
         println!(
             "removed airc-managed hooks feature from {}",
             config.display()
         );
     }
-    if codex_hooks_json::uninstall(&hooks_json)? {
+    if hooks_json::uninstall(&hooks_json)? {
         println!(
             "removed AIRC UserPromptSubmit hook from {}",
             hooks_json.display()
