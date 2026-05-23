@@ -602,8 +602,27 @@ fn now_ms() -> Result<u64, std::time::SystemTimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airc_core::{Body, ClientId, EventId, Headers, MentionTarget, PeerId, TranscriptEvent};
     use airc_store::InMemoryEventStore;
     use tempfile::tempdir;
+
+    fn make_event(lamport: u64, room_id: RoomId, body: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            event_id: EventId::new(),
+            room_id,
+            peer_id: PeerId::from_u128(0xa1),
+            client_id: ClientId::from_u128(0xc1),
+            kind: airc_core::TranscriptKind::Message,
+            occurred_at_ms: 1_700_000_000_000 + lamport,
+            lamport,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text(body)),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
 
     #[test]
     fn channel_name_normalizes() {
@@ -885,18 +904,13 @@ mod tests {
         let default = airc.default_room().await.unwrap();
         assert_eq!(default.name, "cambriantech");
 
-        assert!(airc
-            .subscription_cursor(&cambriantech)
-            .await
-            .unwrap()
-            .is_none());
-        airc.say("cursor proof").await.unwrap();
-        assert!(airc
-            .subscription_cursor(&cambriantech)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(airc.subscription_cursor(&general).await.unwrap().is_none());
+        let cambriantech_event = make_event(42, default.channel, "cursor proof");
+        let expected_cursor = cambriantech_event.cursor();
+        airc.append_event(cambriantech_event).await.unwrap();
+        assert_eq!(
+            airc.subscription_cursor(&cambriantech).await.unwrap(),
+            Some(expected_cursor)
+        );
         assert!(airc.subscription_cursor(&missing).await.unwrap().is_none());
     }
 }

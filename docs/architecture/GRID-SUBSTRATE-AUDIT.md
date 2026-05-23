@@ -143,9 +143,20 @@ Work:
   - `Airc::subscriptions()`
   - `Airc::is_subscribed(ChannelName)`
   - `Airc::default_room()`
-  - `Airc::subscription_cursor(SubscriptionId)`
+  - `Airc::subscription_cursor(ChannelName)`
 - Make `Airc::open` accept or derive `RuntimeContext`, so consumers
   do not reimplement runtime identity/client-id logic.
+- Add typed repository/work tracking adapters:
+  - Git events: branch moved, commit observed, worktree leased/drained,
+    dirty state changed.
+  - PR events: check suite queued/running/passed/failed, review
+    requested/submitted, merge state changed.
+  - Kanban/work events: card claimed, card blocked, lane changed,
+    status advanced.
+  These are event producers over the substrate, not ad hoc polling in
+  agent scripts. Agents subscribe by repo/lane/PR headers and receive
+  state changes the same way they receive chat, monitor, and lifecycle
+  events.
 
 Acceptance gates:
 
@@ -153,6 +164,8 @@ Acceptance gates:
   without shelling out.
 - OpenClaw can list joined rooms and presence from typed API calls.
 - Agent monitor/feed code consumes the same lifecycle events.
+- Agents can track CI/PR/kanban state through subscriptions instead of
+  each runtime polling GitHub independently.
 - `airc status` is a renderer over typed state, not an owner of state.
 
 ## Phase 3 — Reliability And Error Shape
