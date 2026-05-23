@@ -93,6 +93,84 @@ pub struct PullRequestRef {
     pub base: BranchName,
 }
 
+/// Git object id such as a commit SHA. Kept as a string because Git
+/// installations may expose full SHA-1 today and SHA-256 in newer
+/// repositories; validation only enforces a non-empty hexadecimal id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitObjectId(String);
+
+impl GitObjectId {
+    pub fn new(value: impl Into<String>) -> Result<Self, GitObjectIdError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(GitObjectIdError::Empty);
+        }
+        if !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(GitObjectIdError::NonHex);
+        }
+        Ok(Self(trimmed.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GitObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GitObjectIdError {
+    #[error("git object id cannot be empty")]
+    Empty,
+    #[error("git object id must be hexadecimal")]
+    NonHex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyState {
+    Clean,
+    Dirty,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCheckState {
+    Queued,
+    Running,
+    Passed,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewState {
+    Requested,
+    Commented,
+    Approved,
+    ChangesRequested,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMergeState {
+    Open,
+    Draft,
+    Ready,
+    Merged,
+    Closed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkCard {
     pub card_id: WorkCardId,
@@ -241,5 +319,15 @@ mod tests {
             BranchName::new(" feat/good ").unwrap().as_str(),
             "feat/good"
         );
+    }
+
+    #[test]
+    fn git_object_id_normalizes_hex_and_rejects_unknown_shapes() {
+        assert_eq!(GitObjectId::new(" ABCD1234 ").unwrap().as_str(), "abcd1234");
+        assert!(matches!(GitObjectId::new(""), Err(GitObjectIdError::Empty)));
+        assert!(matches!(
+            GitObjectId::new("not-a-sha"),
+            Err(GitObjectIdError::NonHex)
+        ));
     }
 }

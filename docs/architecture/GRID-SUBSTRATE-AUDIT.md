@@ -166,6 +166,17 @@ Work:
   state changes the same way they receive chat, monitor, and lifecycle
   events.
 
+Status:
+
+- `airc-lib` subscription query API landed in #911.
+- Typed lifecycle events landed in #914.
+- Typed git/PR event contracts are being added in `airc-work`:
+  `GitCommitObserved`, `GitBranchMoved`, `GitDirtyStateChanged`,
+  `PullRequestCheckSuiteChanged`, `PullRequestReviewSubmitted`, and
+  `PullRequestMergeStateChanged`. This is the contract/projection
+  layer only; the GitHub adapter and local git watcher are separate
+  producers that must emit these events instead of polling inline.
+
 Acceptance gates:
 
 - Continuum can subscribe to room/lifecycle events through `airc-lib`

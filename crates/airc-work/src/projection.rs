@@ -6,9 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 
-use crate::event::{WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspacePressureReported};
+use crate::event::{
+    GitCommitObserved, GitDirtyStateChanged, PullRequestCheckSuiteChanged,
+    PullRequestMergeStateChanged, PullRequestReviewSubmitted, WorkspaceDrainCompleted,
+    WorkspaceDrainRequested, WorkspacePressureReported,
+};
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
-use crate::model::{HygieneReport, LaneState, WorkCard, WorkspaceLease};
+use crate::model::{
+    BranchName, GitObjectId, HygieneReport, LaneState, PrCheckState, PrMergeState, PrReviewState,
+    PullRequestRef, WorkCard, WorkspaceLease,
+};
 
 mod apply;
 
@@ -31,6 +38,8 @@ pub struct WorkBoardProjection {
     /// Append-only history of completed drains across all workspaces.
     /// Consumers paginate / filter by `workspace_id` via accessors.
     pub(super) drain_history: Vec<WorkspaceDrainCompleted>,
+    pub(super) repo_tracking: BTreeMap<RepoId, RepoTrackingRecord>,
+    pub(super) pull_requests: BTreeMap<String, PullRequestRecord>,
     pub(super) manager_hats: BTreeMap<RepoId, ManagerHat>,
     pub(super) hygiene_reports: Vec<HygieneReport>,
 }
@@ -61,6 +70,14 @@ impl WorkBoardProjection {
             .filter(|d| &d.workspace_id == workspace_id)
             .collect()
     }
+
+    pub fn repo_tracking(&self, repo: &RepoId) -> Option<&RepoTrackingRecord> {
+        self.repo_tracking.get(repo)
+    }
+
+    pub fn pull_request(&self, repo: &RepoId, number: u64) -> Option<&PullRequestRecord> {
+        self.pull_requests.get(&pull_request_key(repo, number))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +85,8 @@ pub struct BoardSnapshot {
     pub cards: Vec<WorkCard>,
     pub lanes: Vec<LaneRecord>,
     pub workspaces: Vec<WorkspaceRecord>,
+    pub repo_tracking: Vec<RepoTrackingRecord>,
+    pub pull_requests: Vec<PullRequestRecord>,
     pub manager_hats: Vec<ManagerHat>,
     pub hygiene_reports: Vec<HygieneReport>,
 }
@@ -87,6 +106,95 @@ pub struct LaneRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
     pub lease: WorkspaceLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTrackingRecord {
+    pub repo: RepoId,
+    pub branches: BTreeMap<BranchName, BranchTrackingRecord>,
+    pub observed_commits: Vec<GitCommitObserved>,
+    pub dirty_states: Vec<GitDirtyStateChanged>,
+}
+
+impl RepoTrackingRecord {
+    fn new(repo: RepoId) -> Self {
+        Self {
+            repo,
+            branches: BTreeMap::new(),
+            observed_commits: Vec::new(),
+            dirty_states: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchTrackingRecord {
+    pub branch: BranchName,
+    pub head: GitObjectId,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestRecord {
+    pub pull_request: PullRequestRef,
+    pub check_state: Option<PrCheckState>,
+    pub review_state: Option<PrReviewState>,
+    pub merge_state: Option<PrMergeState>,
+    pub updated_at_ms: u64,
+}
+
+impl PullRequestRecord {
+    fn from_check(event: &PullRequestCheckSuiteChanged) -> Self {
+        Self {
+            pull_request: event.pull_request.clone(),
+            check_state: Some(event.state),
+            review_state: None,
+            merge_state: None,
+            updated_at_ms: event.changed_at_ms,
+        }
+    }
+
+    fn from_review(event: &PullRequestReviewSubmitted) -> Self {
+        Self {
+            pull_request: event.pull_request.clone(),
+            check_state: None,
+            review_state: Some(event.state),
+            merge_state: None,
+            updated_at_ms: event.submitted_at_ms,
+        }
+    }
+
+    fn from_merge(event: &PullRequestMergeStateChanged) -> Self {
+        Self {
+            pull_request: event.pull_request.clone(),
+            check_state: None,
+            review_state: None,
+            merge_state: Some(event.state),
+            updated_at_ms: event.changed_at_ms,
+        }
+    }
+
+    fn apply_check(&mut self, event: &PullRequestCheckSuiteChanged) {
+        self.pull_request = event.pull_request.clone();
+        self.check_state = Some(event.state);
+        self.updated_at_ms = event.changed_at_ms;
+    }
+
+    fn apply_review(&mut self, event: &PullRequestReviewSubmitted) {
+        self.pull_request = event.pull_request.clone();
+        self.review_state = Some(event.state);
+        self.updated_at_ms = event.submitted_at_ms;
+    }
+
+    fn apply_merge(&mut self, event: &PullRequestMergeStateChanged) {
+        self.pull_request = event.pull_request.clone();
+        self.merge_state = Some(event.state);
+        self.updated_at_ms = event.changed_at_ms;
+    }
+}
+
+pub(super) fn pull_request_key(repo: &RepoId, number: u64) -> String {
+    format!("{repo}#{number}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

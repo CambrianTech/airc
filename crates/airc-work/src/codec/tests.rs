@@ -3,9 +3,11 @@ use airc_protocol::{FrameKind, HEADER_FORGE_BODY_HINT};
 
 use super::*;
 use crate::{
-    BranchName, CardCreated, ClaimId, DrainCandidate, DrainCandidateCategory, DrainOutcome, LaneId,
-    PressureLevel, Priority, RepoId, WorkCardId, WorkEvent, WorkspaceDrainCompleted,
-    WorkspaceDrainRequested, WorkspaceId, WorkspacePressureReported, WorkspaceRequested,
+    BranchName, CardCreated, ClaimId, DrainCandidate, DrainCandidateCategory, DrainOutcome,
+    GitBranchMoved, GitObjectId, LaneId, PrCheckState, PressureLevel, Priority,
+    PullRequestCheckSuiteChanged, PullRequestRef, RepoId, WorkCardId, WorkEvent,
+    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceId, WorkspacePressureReported,
+    WorkspaceRequested,
 };
 
 fn card_created() -> WorkEvent {
@@ -208,5 +210,71 @@ fn workspace_headers_include_workspace_claim_card_and_repo() {
     assert_eq!(
         headers.get(HEADER_FORGE_WORK_REPO).map(String::as_str),
         Some("CambrianTech/continuum")
+    );
+}
+
+#[test]
+fn git_and_pr_events_roundtrip_with_routeable_headers() {
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+    let branch = BranchName::new("rust-rewrite").unwrap();
+    let commit = GitObjectId::new("abc123").unwrap();
+
+    let git_event = WorkEvent::GitBranchMoved(GitBranchMoved {
+        repo: repo.clone(),
+        branch: branch.clone(),
+        old_head: None,
+        new_head: commit.clone(),
+        moved_by: PeerId::from_u128(1),
+        moved_at_ms: 2,
+    });
+    let (headers, body) = encode_work_event(&git_event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), git_event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("git_branch_moved")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_GIT_BRANCH)
+            .map(String::as_str),
+        Some("rust-rewrite")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_GIT_COMMIT)
+            .map(String::as_str),
+        Some("abc123")
+    );
+
+    let pr_event = WorkEvent::PullRequestCheckSuiteChanged(PullRequestCheckSuiteChanged {
+        pull_request: PullRequestRef {
+            repo,
+            number: 914,
+            head: BranchName::new("feat/lifecycle-events").unwrap(),
+            base: branch,
+        },
+        state: PrCheckState::Passed,
+        changed_by: PeerId::from_u128(3),
+        changed_at_ms: 4,
+    });
+    let (headers, body) = encode_work_event(&pr_event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), pr_event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("pull_request_check_suite_changed")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_PR_NUMBER).map(String::as_str),
+        Some("914")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_GIT_BRANCH)
+            .map(String::as_str),
+        Some("feat/lifecycle-events")
     );
 }
