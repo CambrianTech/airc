@@ -471,28 +471,29 @@ Acceptance gates:
 
 ### Known emulation gaps (Phase 5 follow-ups)
 
-These are places CI currently disables a production behavior
-instead of emulating it. Each is a substrate bug to file once the
-companion phase work lands:
+These track places where CI disabled a production behavior instead
+of emulating it. Open items are substrate bugs to file once the
+companion phase work lands; closed items stay here as regression
+context.
 
-- **e2e join harness sets `AIRC_NO_ATTACH=1` for setup-only
-  subprocesses** (patched alongside #911). Right next move:
-  replace the disable-flag path with a Monitor-shaped consumer
-  that reads stdout until a known marker line, SIGTERMs the
-  child, asserts on captured stream. Proves the actual attach
-  + stream path, not just the setup return.
-- **Cross-machine fixture is not yet emulated under CI.** Today
+- **Closed: e2e join harness no longer sets `AIRC_NO_ATTACH=1` for
+  setup-only subprocesses.** It now emulates an agent runtime by
+  removing Cargo harness markers, setting a stable runtime client,
+  reading stdout until the attach marker, terminating the child, and
+  asserting on the captured stream. This proves the actual attach +
+  stream path instead of only the setup return.
+- **Open: cross-machine fixture is not yet emulated under CI.** Today
   cross-machine routing relies on operator-side manual verify.
   Phase 2 lifecycle events + Phase 4 command-bus need
   multi-machine CI to genuinely prove they work end-to-end.
 
 ## Immediate PR Queue
 
-1. In flight: add subscription query API on `airc-lib` so consumers can
-   inspect joined channels/default room/cursors without CLI parsing.
-2. Add lifecycle event types.
-3. Add first command-bus request/reply helper after reviewing
-   Continuum's bus contract.
+1. Add lifecycle event types.
+2. Add the git/PR/kanban event adapter skeleton so agents can
+   subscribe to work-state changes instead of polling.
+3. Add cross-machine CI fixture shape that proves local/LAN/tailnet
+   routing without relying on GitHub for routine traffic.
 
 Done or superseded:
 
@@ -507,6 +508,12 @@ Done or superseded:
 - Codex hook/feed/config/start files live under
   `airc-cli::integrations::codex`; the top-level CLI no longer owns
   Codex-specific implementation modules.
+- Subscription query APIs are in `airc-lib`: consumers can inspect
+  joined channels, default room, and cursors without parsing CLI prose.
+- Command-bus request/reply helpers are in `airc-lib`, with directed
+  envelope targets and correlation/deadline headers.
+- The e2e join harness now emulates a Monitor-shaped streaming
+  consumer instead of disabling attach with `AIRC_NO_ATTACH`.
 
 ## Open Questions
 
