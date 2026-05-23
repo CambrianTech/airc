@@ -159,6 +159,64 @@ async fn add_peer_is_idempotent_no_duplicate_lifecycle_event() {
 }
 
 #[tokio::test]
+async fn join_emits_wire_established_after_subscriber_attaches() {
+    use airc_lib::lifecycle::WireEstablishedBody;
+
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+
+    // join() drives ensure_wire_subscriber which emits the event.
+    let _room = airc.join("wire-established-test").await.expect("join");
+
+    // Page recent events; both RoomJoined and WireEstablished
+    // should land. The order between them is implementation
+    // detail (current order: RoomJoined fires inside join() after
+    // ensure_wire_subscriber returns, so WireEstablished is first
+    // in the lamport sequence — but the test asserts presence,
+    // not order).
+    let page = airc.page_recent(64).await.expect("page");
+    let wire_event = page
+        .iter()
+        .find(|e| e.kind == TranscriptKind::WireEstablished)
+        .expect("WireEstablished should be emitted when the wire subscriber attaches");
+    let body = wire_event.body.as_ref().expect("event has body");
+    let body_json = match body {
+        Body::Json(value) => value.clone(),
+        _ => panic!("WireEstablished body should be JSON"),
+    };
+    let parsed: WireEstablishedBody =
+        serde_json::from_value(body_json).expect("body parses as WireEstablishedBody");
+    assert_eq!(parsed.channel_name, "wire-established-test");
+    assert!(!parsed.wire.is_empty(), "wire path should be set");
+}
+
+#[tokio::test]
+async fn wire_established_fires_once_per_wire_idempotent() {
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join(".airc");
+    std::fs::create_dir_all(&home).unwrap();
+    let airc = Airc::open(&home).await.expect("open");
+
+    let _room = airc.join("idempotent-wire").await.expect("first join");
+    // Second join() to the same channel — should hit the
+    // contains_key short-circuit in ensure_wire_subscriber. No
+    // duplicate WireEstablished.
+    let _room2 = airc.join("idempotent-wire").await.expect("second join");
+
+    let page = airc.page_recent(64).await.expect("page");
+    let count = page
+        .iter()
+        .filter(|e| e.kind == TranscriptKind::WireEstablished)
+        .count();
+    assert_eq!(
+        count, 1,
+        "ensure_wire_subscriber must short-circuit on the second call; only one WireEstablished expected"
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_event_is_persisted_for_cursor_replay() {
     // Lifecycle events must be durable so a consumer that reconnects
     // can replay the transitions it missed. Confirm by paging

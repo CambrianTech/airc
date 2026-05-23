@@ -51,7 +51,42 @@ impl Airc {
 
         let task = self.spawn_frame_ingest(stream);
         subs.insert(wire.to_path_buf(), WireSubscriber { _task: task });
+        // Drop the subscribers lock before emitting — the emit
+        // path touches the store + broadcast and we don't want
+        // to hold the wire subscriber map across an await.
+        drop(subs);
+
+        self.emit_wire_established(wire).await?;
         Ok(())
+    }
+
+    async fn emit_wire_established(&self, wire: &Path) -> Result<(), AircError> {
+        // Resolve channel_name + room_id by matching the wire path
+        // against the current subscription set. Missing match is a
+        // legitimate no-op for shared-wire test setups; failure to
+        // read the subscription set propagates.
+        let subs = self.subscriptions().await?;
+        let canon = wire.canonicalize().ok();
+        let matched = subs.into_iter().find(|s| {
+            if let Some(canon) = canon.as_ref() {
+                s.wire.canonicalize().ok().as_ref() == Some(canon)
+            } else {
+                s.wire == wire
+            }
+        });
+        let Some(sub) = matched else {
+            return Ok(());
+        };
+        let (channel_name, room_id) = (sub.name.as_str().to_string(), sub.room_id);
+        let body = airc_core::Body::Json(
+            serde_json::to_value(crate::lifecycle::WireEstablishedBody {
+                wire: wire.display().to_string(),
+                channel_name,
+            })
+            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
+        );
+        self.emit_lifecycle(airc_core::TranscriptKind::WireEstablished, room_id, body)
+            .await
     }
 
     pub(crate) async fn ensure_lan_subscriber(&self) -> Result<(), AircError> {
