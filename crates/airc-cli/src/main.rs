@@ -529,6 +529,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             }
+            CodexHookAction::Poll {
+                count,
+                max_items,
+                raw,
+                include_self,
+                wait_ms,
+            } => {
+                integrations::codex::hook::run_poll(
+                    &home,
+                    count,
+                    max_items,
+                    raw,
+                    include_self,
+                    wait_ms,
+                )
+                .await
+            }
         },
 
         Command::CodexStart(args) => {

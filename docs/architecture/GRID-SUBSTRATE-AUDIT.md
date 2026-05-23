@@ -104,8 +104,10 @@ Work:
   - Codex hook JSON/config mutation
   - Codex-specific feed/cursor policy
 - Define the Codex feed contract explicitly: `airc join` is the live
-  feed, the UserPromptSubmit hook is bounded catch-up, and true
-  wake-on-AIRC requires Codex runtime support outside the substrate.
+  feed, `airc codex-hook poll --wait-ms N` is the bounded mid-turn
+  tool-callable feed, the UserPromptSubmit hook is prompt-boundary
+  catch-up, and true wake-on-AIRC requires Codex runtime support
+  outside the substrate.
 - Move generic runtime context detection out of `commands.rs`.
   `airc join` should call a small substrate-facing classifier, not own
   env/process heuristics inline.
@@ -531,7 +533,8 @@ Done or superseded:
 - Store-backed runtime cursors are now in place; `airc join` and Codex hook
   consumers never replay the whole backlog and never write cursor JSON
   sidecars.
-- Codex live-feed contract is documented: `airc join` is the feed,
+- Codex feed contract is documented: `airc join` is the live feed,
+  `airc codex-hook poll --wait-ms N` is the bounded mid-turn feed,
   UserPromptSubmit is catch-up, and true wake-on-AIRC requires Codex
   runtime support.
 - Runtime context detection is isolated in `airc-cli::runtime_context`;
