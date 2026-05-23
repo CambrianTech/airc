@@ -3,8 +3,9 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, BranchName, CardCreated, ClaimId, ClaimReleased, LaneCreated, LaneId,
-    LaneState, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, Priority, RepoId,
+    encode_work_event, local_git_events_since, BranchName, CardCreated, ClaimId, ClaimReleased,
+    CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged, LocalGitObserver,
+    LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased, Priority, RepoId,
     WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
     WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
@@ -83,6 +84,20 @@ pub struct ClaimManagerHat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseManagerHat {
     pub repo: RepoId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserveLocalGitWorkspace {
+    pub repo: RepoId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub path: std::path::PathBuf,
+    pub previous: Option<LocalGitSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedLocalGitWorkspace {
+    pub snapshot: LocalGitSnapshot,
+    pub emitted_event_ids: Vec<EventId>,
 }
 
 impl Airc {
@@ -242,6 +257,39 @@ impl Airc {
         });
         self.publish_work_event(&event).await?;
         Ok(())
+    }
+
+    /// Observe a local git worktree and publish typed work-domain
+    /// events for changes since the caller's previous snapshot.
+    ///
+    /// This is the local adapter boundary: it shells out to `git`, but
+    /// only typed `airc-work` events cross the substrate.
+    pub async fn observe_local_git_workspace(
+        &self,
+        request: ObserveLocalGitWorkspace,
+    ) -> Result<ObservedLocalGitWorkspace, AircError> {
+        let workspace = LocalGitWorkspace {
+            repo: request.repo,
+            workspace_id: request.workspace_id,
+            path: request.path,
+        };
+        let snapshot = LocalGitObserver::new(CommandGitRunner).observe(&workspace)?;
+        let events = local_git_events_since(
+            &workspace,
+            request.previous.as_ref(),
+            &snapshot,
+            self.peer_id(),
+            now_ms()?,
+        );
+        let mut emitted_event_ids = Vec::with_capacity(events.len());
+        for event in events {
+            emitted_event_ids.push(self.publish_work_event(&event).await?);
+        }
+
+        Ok(ObservedLocalGitWorkspace {
+            snapshot,
+            emitted_event_ids,
+        })
     }
 
     /// Rebuild the current room's work board from persisted work

@@ -176,6 +176,13 @@ Status:
   `PullRequestMergeStateChanged`. This is the contract/projection
   layer only; the GitHub adapter and local git watcher are separate
   producers that must emit these events instead of polling inline.
+- The local producer is `airc-work::local_git`, surfaced through
+  `airc-lib::Airc::observe_local_git_workspace`. It records branch,
+  head commit, commit summary, and dirty/untracked counts as typed
+  events, with duplicate suppression based on an explicit prior
+  snapshot. Monitor, hooks, Continuum, OpenClaw, and Hermes should call
+  this API or subscribe to its events; they should not each poll git and
+  invent their own state model.
 
 Acceptance gates:
 

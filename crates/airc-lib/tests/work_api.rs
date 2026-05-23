@@ -2,10 +2,39 @@ use std::time::{Duration, Instant};
 
 use airc_lib::{
     Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
-    CreateWorkCard, CreateWorkLane, HeartbeatWorkspace, LaneState, Priority, ReleaseManagerHat,
-    ReleaseWorkClaim, ReleaseWorkspace, RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
+    CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatWorkspace, LaneState,
+    ObserveLocalGitWorkspace, Priority, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
+    RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
 };
 use tempfile::TempDir;
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-b", "main"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "airc@example.invalid"],
+    );
+    git(repo.path(), &["config", "user.name", "AIRC Test"]);
+    std::fs::write(repo.path().join("README.md"), "initial\n").unwrap();
+    git(repo.path(), &["add", "README.md"]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    repo
+}
 
 async fn wait_for_card(airc: &Airc, card_id: WorkCardId) -> airc_lib::WorkBoardProjection {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -275,4 +304,73 @@ async fn manager_hat_claim_and_release_project_from_store() {
         board.snapshot().manager_hats.is_empty(),
         "released manager hat must leave projection"
     );
+}
+
+#[tokio::test]
+async fn local_git_observation_publishes_repo_tracking_events() {
+    let home = TempDir::new().unwrap();
+    let git_repo = init_git_repo();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("local-git-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    let observed = airc
+        .observe_local_git_workspace(ObserveLocalGitWorkspace {
+            repo: repo.clone(),
+            workspace_id: None,
+            path: git_repo.path().to_path_buf(),
+            previous: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observed.emitted_event_ids.len(),
+        3,
+        "first observation emits commit, branch, and dirty-state records"
+    );
+    assert_eq!(observed.snapshot.branch.as_str(), "main");
+    assert_eq!(observed.snapshot.dirty_state, DirtyState::Clean);
+
+    let board = airc.work_board(128).await.unwrap();
+    let tracking = board.repo_tracking(&repo).unwrap();
+    assert_eq!(
+        tracking
+            .branches
+            .get(&observed.snapshot.branch)
+            .unwrap()
+            .head,
+        observed.snapshot.head
+    );
+    assert_eq!(tracking.observed_commits.len(), 1);
+    assert_eq!(tracking.dirty_states.len(), 1);
+
+    let unchanged = airc
+        .observe_local_git_workspace(ObserveLocalGitWorkspace {
+            repo: repo.clone(),
+            workspace_id: None,
+            path: git_repo.path().to_path_buf(),
+            previous: Some(observed.snapshot.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        unchanged.emitted_event_ids.is_empty(),
+        "unchanged git state must not spam the work event stream"
+    );
+
+    std::fs::write(git_repo.path().join("README.md"), "changed\n").unwrap();
+    let dirty = airc
+        .observe_local_git_workspace(ObserveLocalGitWorkspace {
+            repo: repo.clone(),
+            workspace_id: None,
+            path: git_repo.path().to_path_buf(),
+            previous: Some(observed.snapshot),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(dirty.emitted_event_ids.len(), 1);
+    assert_eq!(dirty.snapshot.dirty_state, DirtyState::Dirty);
+    assert_eq!(dirty.snapshot.dirty_paths, 1);
 }
