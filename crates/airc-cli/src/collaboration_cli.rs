@@ -16,17 +16,10 @@ pub enum CollaborationAction {
     Doctor(CollaborationScopeArgs),
     /// Warn when sends are likely isolated.
     SendWarning(CollaborationScopeArgs),
-    /// Print paired peers plus recent broadcast-only peers.
+    /// Print paired peers from the substrate peer registry.
     Peers(CollaborationScopeArgs),
     /// Remove stale duplicate peer records for the same host.
     PrunePeers(CollaborationScopeArgs),
-    /// Print identity evidence observed from signed room traffic.
-    ObservedWhois {
-        #[command(flatten)]
-        scope: CollaborationScopeArgs,
-        #[arg(long)]
-        peer_name: String,
-    },
 }
 
 #[derive(Debug, Args)]
