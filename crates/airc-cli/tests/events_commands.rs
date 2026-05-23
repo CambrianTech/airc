@@ -73,10 +73,13 @@ fn send_receipt_distinguishes_zero_paired_peers_without_lying_about_delivery() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
+    let account_home = home.parent().unwrap_or(home);
     let output = Command::new(airc_core())
         .arg("--home")
         .arg(home)
         .args(args)
+        .env("HOME", account_home)
+        .env("USERPROFILE", account_home)
         .output()
         .expect("airc-core command must spawn");
     assert!(

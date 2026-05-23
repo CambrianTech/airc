@@ -46,14 +46,18 @@ impl Airc {
 
     /// Return a list of enrolled peers.
     pub async fn peers(&self) -> Result<Vec<EnrolledPeer>, AircError> {
-        let stored = peers_store::load(&self.inner.home).await?;
-        Ok(stored
+        let stored =
+            crate::airc::load_peer_registries(&self.inner.home, &self.inner.wire_root).await?;
+        let mut peers = stored
             .into_iter()
             .filter(|p| p.peer_id != self.inner.identity.peer_id)
             .map(|p| EnrolledPeer {
                 peer_id: p.peer_id,
                 pubkey_b64: p.pubkey_b64,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|p| p.peer_id.to_string());
+        peers.dedup_by_key(|p| p.peer_id);
+        Ok(peers)
     }
 }
