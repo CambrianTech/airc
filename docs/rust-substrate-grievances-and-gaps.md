@@ -844,6 +844,18 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
    - **Sub-PR 3c — pressure detector + drain executor.** Runtime that probes disk, emits `WorkspacePressureReported`, evaluates policy (default = `RebuildableCache` + `DownloadedDependency`), and executes `WorkspaceDrainRequested` → `WorkspaceDrainCompleted`. Dry-run path lands first.
 4. **PR 4 — CLI thin wrapper.** `airc work list`, `airc work claim`, `airc lane status`, `airc workspace list`, `airc workspace report`, `airc hygiene report`, `airc hygiene clean --dry-run` — all backed by `airc-work`, no Python touched.
 5. **PR 5 — GitHub adapter.** Mirror card state to issues/PRs; reconcile PR status into events; GitHub is adapter-only.
+   - **Sub-PR 5a — git/PR event contracts.** Typed events for
+     `GitCommitObserved`, `GitBranchMoved`, `GitDirtyStateChanged`,
+     `PullRequestCheckSuiteChanged`, `PullRequestReviewSubmitted`, and
+     `PullRequestMergeStateChanged`, plus routeable headers and
+     projection records. No `gh` calls and no local git watcher in
+     this slice.
+   - **Sub-PR 5b — local git watcher adapter.** Observe branch head,
+     commit, and dirty-state changes for AIRC-managed workspaces and
+     emit the 5a events.
+   - **Sub-PR 5c — GitHub PR adapter.** Reconcile PR/check/review/merge
+     state into the 5a PR events. GitHub remains an adapter, not the
+     runtime source of truth.
 6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
 7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 

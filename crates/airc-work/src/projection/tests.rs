@@ -1,8 +1,9 @@
 use super::*;
 use crate::event::*;
 use crate::model::{
-    BranchName, CardState, DrainCandidate, DrainCandidateCategory, DrainOutcome, PressureLevel,
-    Priority, PullRequestRef, WorkspaceStatus,
+    BranchName, CardState, DirtyState, DrainCandidate, DrainCandidateCategory, DrainOutcome,
+    GitObjectId, PrCheckState, PrMergeState, PrReviewState, PressureLevel, Priority,
+    PullRequestRef, WorkspaceStatus,
 };
 
 fn repo() -> RepoId {
@@ -297,6 +298,86 @@ fn two_concurrent_drain_requests_for_same_workspace_and_rule_overwrites() {
     let pending = projection.pending_drains_for(&workspace_id);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].requested_at_ms, 20);
+}
+
+#[test]
+fn git_and_pr_adapter_events_project_without_polling() {
+    let repo = repo();
+    let branch = BranchName::new("rust-rewrite").unwrap();
+    let head = GitObjectId::new("abc123").unwrap();
+    let next = GitObjectId::new("def456").unwrap();
+    let peer = peer(77);
+    let pr = PullRequestRef {
+        repo: repo.clone(),
+        number: 914,
+        head: BranchName::new("feat/lifecycle-events").unwrap(),
+        base: branch.clone(),
+    };
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::GitCommitObserved(GitCommitObserved {
+            repo: repo.clone(),
+            commit: head.clone(),
+            branch: Some(branch.clone()),
+            summary: Some("initial rust substrate".to_string()),
+            observed_by: peer,
+            observed_at_ms: 10,
+        }),
+        WorkEvent::GitBranchMoved(GitBranchMoved {
+            repo: repo.clone(),
+            branch: branch.clone(),
+            old_head: Some(head.clone()),
+            new_head: next.clone(),
+            moved_by: peer,
+            moved_at_ms: 20,
+        }),
+        WorkEvent::GitDirtyStateChanged(GitDirtyStateChanged {
+            repo: repo.clone(),
+            workspace_id: Some(WorkspaceId::from_u128(5)),
+            path: "/Users/joelteply/.airc/worktrees/airc/feat".to_string(),
+            state: DirtyState::Dirty,
+            dirty_paths: 2,
+            untracked_paths: 1,
+            changed_by: peer,
+            changed_at_ms: 30,
+        }),
+        WorkEvent::PullRequestCheckSuiteChanged(PullRequestCheckSuiteChanged {
+            pull_request: pr.clone(),
+            state: PrCheckState::Running,
+            changed_by: peer,
+            changed_at_ms: 40,
+        }),
+        WorkEvent::PullRequestReviewSubmitted(PullRequestReviewSubmitted {
+            pull_request: pr.clone(),
+            reviewer: peer,
+            state: PrReviewState::Approved,
+            submitted_at_ms: 50,
+        }),
+        WorkEvent::PullRequestMergeStateChanged(PullRequestMergeStateChanged {
+            pull_request: pr.clone(),
+            state: PrMergeState::Merged,
+            changed_by: peer,
+            changed_at_ms: 60,
+        }),
+    ])
+    .unwrap();
+
+    let repo_tracking = projection.repo_tracking(&repo).unwrap();
+    assert_eq!(repo_tracking.observed_commits.len(), 1);
+    assert_eq!(repo_tracking.dirty_states[0].state, DirtyState::Dirty);
+    assert_eq!(repo_tracking.branches[&branch].head, next);
+    assert_eq!(repo_tracking.branches[&branch].updated_at_ms, 20);
+
+    let pr_record = projection.pull_request(&repo, 914).unwrap();
+    assert_eq!(pr_record.pull_request, pr);
+    assert_eq!(pr_record.check_state, Some(PrCheckState::Running));
+    assert_eq!(pr_record.review_state, Some(PrReviewState::Approved));
+    assert_eq!(pr_record.merge_state, Some(PrMergeState::Merged));
+    assert_eq!(pr_record.updated_at_ms, 60);
+
+    let snapshot = projection.snapshot();
+    assert_eq!(snapshot.repo_tracking.len(), 1);
+    assert_eq!(snapshot.pull_requests.len(), 1);
 }
 
 #[test]

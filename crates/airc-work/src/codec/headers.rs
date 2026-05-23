@@ -13,6 +13,9 @@ pub const HEADER_FORGE_WORK_LANE_ID: &str = "forge.work.lane_id";
 pub const HEADER_FORGE_WORK_CLAIM_ID: &str = "forge.work.claim_id";
 pub const HEADER_FORGE_WORK_WORKSPACE_ID: &str = "forge.work.workspace_id";
 pub const HEADER_FORGE_WORK_POLICY_RULE_ID: &str = "forge.work.policy_rule_id";
+pub const HEADER_FORGE_WORK_GIT_BRANCH: &str = "forge.work.git_branch";
+pub const HEADER_FORGE_WORK_GIT_COMMIT: &str = "forge.work.git_commit";
+pub const HEADER_FORGE_WORK_PR_NUMBER: &str = "forge.work.pr_number";
 
 pub fn work_event_headers(event: &WorkEvent) -> Headers {
     let mut headers = Headers::new();
@@ -84,11 +87,40 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
                 e.policy_rule_id.clone(),
             );
         }
+        WorkEvent::GitCommitObserved(e) => {
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            insert_display_header(headers, HEADER_FORGE_WORK_GIT_COMMIT, &e.commit);
+            if let Some(branch) = &e.branch {
+                insert_display_header(headers, HEADER_FORGE_WORK_GIT_BRANCH, branch);
+            }
+        }
+        WorkEvent::GitBranchMoved(e) => {
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            insert_display_header(headers, HEADER_FORGE_WORK_GIT_BRANCH, &e.branch);
+            insert_display_header(headers, HEADER_FORGE_WORK_GIT_COMMIT, &e.new_head);
+        }
+        WorkEvent::GitDirtyStateChanged(e) => {
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            if let Some(workspace_id) = e.workspace_id {
+                insert_display_header(headers, HEADER_FORGE_WORK_WORKSPACE_ID, workspace_id);
+            }
+        }
+        WorkEvent::PullRequestCheckSuiteChanged(e) => {
+            project_pull_request(headers, &e.pull_request);
+        }
+        WorkEvent::PullRequestReviewSubmitted(e) => {
+            project_pull_request(headers, &e.pull_request);
+        }
+        WorkEvent::PullRequestMergeStateChanged(e) => {
+            project_pull_request(headers, &e.pull_request);
+        }
         WorkEvent::PullRequestLinked(e) => {
-            project_pull_request(headers, e.card_id, &e.pull_request.repo)
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            project_pull_request(headers, &e.pull_request);
         }
         WorkEvent::PullRequestMerged(e) => {
-            project_pull_request(headers, e.card_id, &e.pull_request.repo)
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            project_pull_request(headers, &e.pull_request);
         }
         WorkEvent::HygieneReportRecorded(e) => {
             headers.insert(
@@ -110,9 +142,13 @@ fn project_claim(headers: &mut Headers, card_id: crate::WorkCardId, claim_id: cr
     insert_display_header(headers, HEADER_FORGE_WORK_CLAIM_ID, claim_id);
 }
 
-fn project_pull_request(headers: &mut Headers, card_id: crate::WorkCardId, repo: &crate::RepoId) {
-    insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, card_id);
-    headers.insert(HEADER_FORGE_WORK_REPO.to_string(), repo.to_string());
+fn project_pull_request(headers: &mut Headers, pull_request: &crate::PullRequestRef) {
+    headers.insert(
+        HEADER_FORGE_WORK_REPO.to_string(),
+        pull_request.repo.to_string(),
+    );
+    insert_display_header(headers, HEADER_FORGE_WORK_PR_NUMBER, pull_request.number);
+    insert_display_header(headers, HEADER_FORGE_WORK_GIT_BRANCH, &pull_request.head);
 }
 
 fn insert_display_header(headers: &mut Headers, key: &str, value: impl std::fmt::Display) {

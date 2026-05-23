@@ -1,16 +1,17 @@
 use crate::event::{
-    CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, HygieneReportRecorded,
-    LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestLinked,
-    PullRequestMerged, WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
-    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
-    WorkspaceRequested,
+    CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, GitBranchMoved,
+    GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged,
+    ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
+    PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed,
+    WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested,
+    WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
 
 use super::{
-    BoardSnapshot, LaneRecord, ManagerHat, ProjectionError, StaleClaim, WorkBoardProjection,
-    WorkspaceRecord,
+    pull_request_key, BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat, ProjectionError,
+    PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection, WorkspaceRecord,
 };
 
 impl WorkBoardProjection {
@@ -34,6 +35,21 @@ impl WorkBoardProjection {
             WorkEvent::WorkspacePressureReported(e) => self.apply_workspace_pressure_reported(e),
             WorkEvent::WorkspaceDrainRequested(e) => self.apply_workspace_drain_requested(e),
             WorkEvent::WorkspaceDrainCompleted(e) => self.apply_workspace_drain_completed(e),
+            WorkEvent::GitCommitObserved(e) => self.apply_git_commit_observed(e),
+            WorkEvent::GitBranchMoved(e) => self.apply_git_branch_moved(e),
+            WorkEvent::GitDirtyStateChanged(e) => self.apply_git_dirty_state_changed(e),
+            WorkEvent::PullRequestCheckSuiteChanged(e) => {
+                self.apply_pull_request_check_suite_changed(e);
+                Ok(())
+            }
+            WorkEvent::PullRequestReviewSubmitted(e) => {
+                self.apply_pull_request_review_submitted(e);
+                Ok(())
+            }
+            WorkEvent::PullRequestMergeStateChanged(e) => {
+                self.apply_pull_request_merge_state_changed(e);
+                Ok(())
+            }
             WorkEvent::PullRequestLinked(e) => self.apply_pull_request_linked(e),
             WorkEvent::PullRequestMerged(e) => self.apply_pull_request_merged(e),
             WorkEvent::HygieneReportRecorded(e) => self.apply_hygiene_report_recorded(e),
@@ -55,6 +71,8 @@ impl WorkBoardProjection {
             cards: self.cards.values().cloned().collect(),
             lanes: self.lanes.values().cloned().collect(),
             workspaces: self.workspaces.values().cloned().collect(),
+            repo_tracking: self.repo_tracking.values().cloned().collect(),
+            pull_requests: self.pull_requests.values().cloned().collect(),
             manager_hats: self.manager_hats.values().cloned().collect(),
             hygiene_reports: self.hygiene_reports.clone(),
         }
@@ -267,6 +285,74 @@ impl WorkBoardProjection {
         Ok(())
     }
 
+    fn apply_git_commit_observed(&mut self, e: &GitCommitObserved) -> Result<(), ProjectionError> {
+        let repo = self.repo_tracking_record(e.repo.clone());
+        repo.observed_commits.push(e.clone());
+        if let Some(branch) = &e.branch {
+            repo.branches.insert(
+                branch.clone(),
+                BranchTrackingRecord {
+                    branch: branch.clone(),
+                    head: e.commit.clone(),
+                    updated_at_ms: e.observed_at_ms,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_git_branch_moved(&mut self, e: &GitBranchMoved) -> Result<(), ProjectionError> {
+        let repo = self.repo_tracking_record(e.repo.clone());
+        repo.branches.insert(
+            e.branch.clone(),
+            BranchTrackingRecord {
+                branch: e.branch.clone(),
+                head: e.new_head.clone(),
+                updated_at_ms: e.moved_at_ms,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_git_dirty_state_changed(
+        &mut self,
+        e: &GitDirtyStateChanged,
+    ) -> Result<(), ProjectionError> {
+        let repo = self.repo_tracking_record(e.repo.clone());
+        repo.dirty_states.push(e.clone());
+        Ok(())
+    }
+
+    fn apply_pull_request_check_suite_changed(&mut self, e: &PullRequestCheckSuiteChanged) {
+        self.pull_requests
+            .entry(pull_request_key(
+                &e.pull_request.repo,
+                e.pull_request.number,
+            ))
+            .and_modify(|record| record.apply_check(e))
+            .or_insert_with(|| PullRequestRecord::from_check(e));
+    }
+
+    fn apply_pull_request_review_submitted(&mut self, e: &PullRequestReviewSubmitted) {
+        self.pull_requests
+            .entry(pull_request_key(
+                &e.pull_request.repo,
+                e.pull_request.number,
+            ))
+            .and_modify(|record| record.apply_review(e))
+            .or_insert_with(|| PullRequestRecord::from_review(e));
+    }
+
+    fn apply_pull_request_merge_state_changed(&mut self, e: &PullRequestMergeStateChanged) {
+        self.pull_requests
+            .entry(pull_request_key(
+                &e.pull_request.repo,
+                e.pull_request.number,
+            ))
+            .and_modify(|record| record.apply_merge(e))
+            .or_insert_with(|| PullRequestRecord::from_merge(e));
+    }
+
     fn apply_pull_request_linked(&mut self, e: &PullRequestLinked) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
         card.pull_request = Some(e.pull_request.clone());
@@ -329,6 +415,12 @@ impl WorkBoardProjection {
         self.workspaces
             .get_mut(&workspace_id)
             .ok_or(ProjectionError::UnknownWorkspace(workspace_id))
+    }
+
+    fn repo_tracking_record(&mut self, repo: crate::RepoId) -> &mut RepoTrackingRecord {
+        self.repo_tracking
+            .entry(repo.clone())
+            .or_insert_with(|| RepoTrackingRecord::new(repo))
     }
 }
 

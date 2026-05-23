@@ -17,7 +17,8 @@ mod tests;
 
 pub use headers::{
     work_event_headers, HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID,
-    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID,
+    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_GIT_BRANCH, HEADER_FORGE_WORK_GIT_COMMIT,
+    HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_PR_NUMBER,
     HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
 };
 
@@ -96,6 +97,12 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::WorkspacePressureReported(_) => "workspace_pressure_reported",
         WorkEvent::WorkspaceDrainRequested(_) => "workspace_drain_requested",
         WorkEvent::WorkspaceDrainCompleted(_) => "workspace_drain_completed",
+        WorkEvent::GitCommitObserved(_) => "git_commit_observed",
+        WorkEvent::GitBranchMoved(_) => "git_branch_moved",
+        WorkEvent::GitDirtyStateChanged(_) => "git_dirty_state_changed",
+        WorkEvent::PullRequestCheckSuiteChanged(_) => "pull_request_check_suite_changed",
+        WorkEvent::PullRequestReviewSubmitted(_) => "pull_request_review_submitted",
+        WorkEvent::PullRequestMergeStateChanged(_) => "pull_request_merge_state_changed",
         WorkEvent::PullRequestLinked(_) => "pull_request_linked",
         WorkEvent::PullRequestMerged(_) => "pull_request_merged",
         WorkEvent::HygieneReportRecorded(_) => "hygiene_report_recorded",

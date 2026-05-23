@@ -6,8 +6,8 @@ use airc_core::PeerId;
 
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 use crate::model::{
-    BranchName, CardState, DrainCandidate, DrainOutcome, HygieneReport, LaneState, PressureLevel,
-    Priority, PullRequestRef,
+    BranchName, CardState, DirtyState, DrainCandidate, DrainOutcome, GitObjectId, HygieneReport,
+    LaneState, PrCheckState, PrMergeState, PrReviewState, PressureLevel, Priority, PullRequestRef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +27,12 @@ pub enum WorkEvent {
     WorkspacePressureReported(WorkspacePressureReported),
     WorkspaceDrainRequested(WorkspaceDrainRequested),
     WorkspaceDrainCompleted(WorkspaceDrainCompleted),
+    GitCommitObserved(GitCommitObserved),
+    GitBranchMoved(GitBranchMoved),
+    GitDirtyStateChanged(GitDirtyStateChanged),
+    PullRequestCheckSuiteChanged(PullRequestCheckSuiteChanged),
+    PullRequestReviewSubmitted(PullRequestReviewSubmitted),
+    PullRequestMergeStateChanged(PullRequestMergeStateChanged),
     PullRequestLinked(PullRequestLinked),
     PullRequestMerged(PullRequestMerged),
     HygieneReportRecorded(HygieneReportRecorded),
@@ -51,6 +57,12 @@ impl WorkEvent {
             WorkEvent::WorkspacePressureReported(e) => e.reported_at_ms,
             WorkEvent::WorkspaceDrainRequested(e) => e.requested_at_ms,
             WorkEvent::WorkspaceDrainCompleted(e) => e.completed_at_ms,
+            WorkEvent::GitCommitObserved(e) => e.observed_at_ms,
+            WorkEvent::GitBranchMoved(e) => e.moved_at_ms,
+            WorkEvent::GitDirtyStateChanged(e) => e.changed_at_ms,
+            WorkEvent::PullRequestCheckSuiteChanged(e) => e.changed_at_ms,
+            WorkEvent::PullRequestReviewSubmitted(e) => e.submitted_at_ms,
+            WorkEvent::PullRequestMergeStateChanged(e) => e.changed_at_ms,
             WorkEvent::PullRequestLinked(e) => e.linked_at_ms,
             WorkEvent::PullRequestMerged(e) => e.merged_at_ms,
             WorkEvent::HygieneReportRecorded(e) => e.report.recorded_at_ms,
@@ -204,6 +216,70 @@ pub struct WorkspaceDrainCompleted {
     pub dry_run: bool,
     pub outcome: DrainOutcome,
     pub completed_at_ms: u64,
+}
+
+/// A commit was observed by a local git adapter, CI adapter, or
+/// external forge adapter. This is an observation event, not a command
+/// to mutate git.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitObserved {
+    pub repo: RepoId,
+    pub commit: GitObjectId,
+    pub branch: Option<BranchName>,
+    pub summary: Option<String>,
+    pub observed_by: PeerId,
+    pub observed_at_ms: u64,
+}
+
+/// A branch head moved. Consumers can subscribe to this instead of
+/// polling `git fetch && git rev-parse` in every runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranchMoved {
+    pub repo: RepoId,
+    pub branch: BranchName,
+    pub old_head: Option<GitObjectId>,
+    pub new_head: GitObjectId,
+    pub moved_by: PeerId,
+    pub moved_at_ms: u64,
+}
+
+/// Worktree dirty state changed. This is intentionally small and
+/// closed: detailed path inventories belong in a follow-up inventory
+/// event, while this event is what monitors need to wake up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDirtyStateChanged {
+    pub repo: RepoId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub path: String,
+    pub state: DirtyState,
+    pub dirty_paths: u64,
+    pub untracked_paths: u64,
+    pub changed_by: PeerId,
+    pub changed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCheckSuiteChanged {
+    pub pull_request: PullRequestRef,
+    pub state: PrCheckState,
+    pub changed_by: PeerId,
+    pub changed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestReviewSubmitted {
+    pub pull_request: PullRequestRef,
+    pub reviewer: PeerId,
+    pub state: PrReviewState,
+    pub submitted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestMergeStateChanged {
+    pub pull_request: PullRequestRef,
+    pub state: PrMergeState,
+    pub changed_by: PeerId,
+    pub changed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
