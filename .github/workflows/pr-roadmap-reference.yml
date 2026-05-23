@@ -1,0 +1,58 @@
+name: pr-roadmap-reference
+
+# Every implementation PR must name the design phase it advances.
+# The PR template creates the shape; this workflow makes the shape
+# enforceable so roadmap linkage is not a memory exercise.
+
+on:
+  pull_request:
+    branches: [rust-rewrite, canary, main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+jobs:
+  require-roadmap-reference:
+    name: require roadmap reference
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR body roadmap reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          require_present() {
+            local label="$1"
+            local pattern="$2"
+            if ! printf '%s\n' "$PR_BODY" | grep -qE "$pattern"; then
+              echo "::error::PR body must include: $label"
+              exit 1
+            fi
+          }
+
+          require_nonempty_field() {
+            local field="$1"
+            local line
+            line="$(printf '%s\n' "$PR_BODY" | grep -E "^- ${field}:" | head -1 || true)"
+            if [ -z "$line" ]; then
+              echo "::error::PR body is missing '- ${field}: ...'"
+              exit 1
+            fi
+            local value="${line#*:}"
+            value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [ -z "$value" ]; then
+              echo "::error::PR body field '- ${field}:' must not be empty"
+              exit 1
+            fi
+          }
+
+          require_present "## Roadmap Reference heading" '^## Roadmap Reference[[:space:]]*$'
+          require_nonempty_field "Phase / slice"
+          require_present \
+            "Primary doc: docs/architecture/GRID-SUBSTRATE-AUDIT.md" \
+            '^- Primary doc:.*docs/architecture/GRID-SUBSTRATE-AUDIT\.md'
+          require_nonempty_field "Acceptance gate advanced"
+          require_present "## Summary heading" '^## Summary[[:space:]]*$'
+          require_present "## Verification heading" '^## Verification[[:space:]]*$'
+          require_present "## Coordination heading" '^## Coordination[[:space:]]*$'
+
+          echo "PR roadmap reference is present."
