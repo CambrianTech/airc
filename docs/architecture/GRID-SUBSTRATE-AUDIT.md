@@ -143,9 +143,20 @@ Work:
   - `Airc::subscriptions()`
   - `Airc::is_subscribed(ChannelName)`
   - `Airc::default_room()`
-  - `Airc::subscription_cursor(SubscriptionId)`
+  - `Airc::subscription_cursor(ChannelName)`
 - Make `Airc::open` accept or derive `RuntimeContext`, so consumers
   do not reimplement runtime identity/client-id logic.
+- Add typed repository/work tracking adapters:
+  - Git events: branch moved, commit observed, worktree leased/drained,
+    dirty state changed.
+  - PR events: check suite queued/running/passed/failed, review
+    requested/submitted, merge state changed.
+  - Kanban/work events: card claimed, card blocked, lane changed,
+    status advanced.
+  These are event producers over the substrate, not ad hoc polling in
+  agent scripts. Agents subscribe by repo/lane/PR headers and receive
+  state changes the same way they receive chat, monitor, and lifecycle
+  events.
 
 Acceptance gates:
 
@@ -153,6 +164,8 @@ Acceptance gates:
   without shelling out.
 - OpenClaw can list joined rooms and presence from typed API calls.
 - Agent monitor/feed code consumes the same lifecycle events.
+- Agents can track CI/PR/kanban state through subscriptions instead of
+  each runtime polling GitHub independently.
 - `airc status` is a renderer over typed state, not an owner of state.
 
 ## Phase 3 — Reliability And Error Shape
@@ -444,9 +457,9 @@ Acceptance gates:
 
 ## Immediate PR Queue
 
-1. In flight: move Codex hook/feed files behind an integration boundary
-   so `airc-cli` stops owning Codex-specific policy.
-2. Add lifecycle event types and subscription query API.
+1. In flight: add subscription query API on `airc-lib` so consumers can
+   inspect joined channels/default room/cursors without CLI parsing.
+2. Add lifecycle event types.
 3. Add first command-bus request/reply helper after reviewing
    Continuum's bus contract.
 
@@ -460,6 +473,9 @@ Done or superseded:
   runtime support.
 - Runtime context detection is isolated in `airc-cli::runtime_context`;
   `commands.rs` no longer owns join stream/exit heuristics.
+- Codex hook/feed/config/start files live under
+  `airc-cli::integrations::codex`; the top-level CLI no longer owns
+  Codex-specific implementation modules.
 
 ## Open Questions
 
