@@ -252,9 +252,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             CollaborationAction::PrunePeers(args) => {
                 collaboration_peers::run_prune_peers(&home, args)
             }
-            CollaborationAction::ObservedWhois { scope, peer_name } => {
-                collaboration_commands::run_observed_whois(&home, scope, &peer_name)
-            }
         },
 
         Command::ChannelGist(args) => match args.action {
