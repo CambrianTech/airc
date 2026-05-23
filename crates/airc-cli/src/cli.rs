@@ -296,6 +296,27 @@ pub enum Command {
     /// package version.)
     Version,
 
+    /// Self-diagnose the airc install + scope state.
+    ///
+    /// Walks the install/identity/daemon/route checklist that
+    /// `skills/doctor/SKILL.md` documents agents calling. Default
+    /// mode is the env probe (fast, local). `--health` adds live
+    /// route/process state. `--fix` applies only safe auto-recovery
+    /// for detected issues (currently stale daemon sockets).
+    Doctor {
+        /// After diagnosing, apply safe auto-recovery. Identity
+        /// partial states are reported with manual fix commands;
+        /// doctor does not wipe identity/trust state automatically.
+        /// Without `--fix`, doctor only reports.
+        #[arg(long)]
+        fix: bool,
+
+        /// Include live route/process health (calls into the
+        /// route resolver + daemon status).
+        #[arg(long)]
+        health: bool,
+    },
+
     /// Shared GitHub request governor.
     Gh(GhArgs),
 

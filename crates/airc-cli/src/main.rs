@@ -20,6 +20,7 @@ mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
 mod daemon_scope;
+mod doctor;
 mod envelope_cli;
 mod events_cli;
 mod events_commands;
@@ -397,6 +398,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Join { room } => commands::run_join(&home, room).await,
 
         Command::Version => commands::run_version(),
+
+        Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
 
         Command::Gh(args) => match args.action {
             GhAction::Run { gh_args } => gh_commands::run_gh(gh_args),
