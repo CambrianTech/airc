@@ -1,6 +1,6 @@
 ---
 name: airc:doctor
-description: Self-diagnose AIRC. AI checks environment health (gh, ssh, ports), runs the integration suite, and proactively fixes recoverable issues (install gh, etc.) instead of just reporting them.
+description: Self-diagnose AIRC. AI checks environment health, route/process state, and the integration suite, then proactively fixes recoverable issues instead of just reporting them.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: "[scenario|all]"
@@ -14,9 +14,9 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 
 | Command | Purpose |
 |---|---|
-| `airc doctor` | env probe (gh, ssh, python, tailscale) — fast, local |
+| `airc doctor` | env probe — fast, local |
 | `airc doctor --join` | pre-flight before `airc join` (also probes cached host) |
-| `airc doctor --health` | LIVE bus health (rate-limit headroom, process, per-channel bearer last-recv) |
+| `airc doctor --health` | live route/process health |
 | `airc doctor --fix` | repair recoverable issues (currently: gh auth re-login) |
 | `airc doctor --tests [scenario]` | full integration suite (~245 assertions, 32 scenarios) |
 
@@ -26,8 +26,8 @@ CLI aliases for `--tests`: `airc tests`, `airc test`. Do not expose a separate t
 
 When something feels wrong, in this order:
 
-1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, join process stopped, bearer wedged). Green → bus is fine, issue is upstream.
-2. **`airc doctor`** — env regression check. Gh missing, sshd down, python broken.
+1. **`airc doctor --health`** — live route/process state. Fast. Catches stopped local transport or bad route health. Green → bus is fine, issue is upstream.
+2. **`airc doctor`** — env regression check.
 3. **`airc inbox --peek`** — most-recent unread context without advancing the cursor.
 4. **`airc doctor --tests`** — only if 1-3 are green and the bug is reproducible.
 
@@ -36,7 +36,7 @@ When something feels wrong, in this order:
 | Marker | Meaning | Action |
 |---|---|---|
 | `[ok] gh core rate-limit: <N>/5000` | Healthy headroom | None |
-| `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced headroom | None; bearer auto-throttles per #416 |
+| `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced rendezvous headroom | Avoid unnecessary GitHub discovery |
 | `[WARN] gh core rate-limit: <N>/5000` (<100) | Bus may stall soon | Wait for window reset; peers resume automatically |
 | `[BLOCKED] gh API not reachable` | Network or token | Run `airc doctor` for env probe |
 | `[ok] gh governor: no active backoff` | Cross-process gh guard is healthy | None |
@@ -44,10 +44,9 @@ When something feels wrong, in this order:
 | `[BLOCKED] gh governor shared backoff active` | GitHub told this user/device to wait | Do not retry; wait for displayed seconds |
 | `[ok] airc process running` | Join process up | None |
 | `[WARN] airc process not running` | Disconnected scope | `airc join` |
-| `[ok] #<channel> — last bearer recv <Ns>` (<60s) | Healthy | None |
-| `[info] #<channel> — last bearer recv <Ns>` (<5min) | Idle | None |
-| `[WARN] #<channel> — last bearer recv <Ns>` (5-30min stale) | Check join process + rate-limit | Surface to user |
-| `[BLOCKED] #<channel> — last bearer recv <Ns>` (>30min wedged) | Bearer wedged | `airc join` |
+| `[ok] route health` | Healthy selected route | None |
+| `[WARN] route health` | Degraded selected route | Run `airc transport health` |
+| `[BLOCKED] route health` | No usable route | `airc join`, then inspect discovery/transport health |
 
 ## env probe (`airc doctor`)
 

@@ -282,7 +282,7 @@ airc is designed to **fail loudly and recover through `join`**. No silent degrad
 Run health checks:
 
 ```bash
-airc status                # Rust local + GH bearer separation
+airc status                # Rust local route and daemon health
 airc doctor --health
 ```
 

@@ -45,7 +45,7 @@ Adapters own:
 
 - GitHub gist/issue API calls
 - local-only transport, LAN/Tailscale/WebRTC/LiveKit signaling bridges, and any
-  future Reticulum-like bearer
+  future Reticulum-like transport
 - import/export compatibility with existing JSONL rooms
 
 No adapter should own the state machine. No Continuum module should need to know
@@ -409,8 +409,8 @@ performance claim must have a reproducible measurement.
    replay.
 3. Route live event consumption through the Rust store and remove JSONL
    compatibility output.
-4. Move `airc msg` append/dedupe/outbox into Rust; keep GitHub bearer as an
-   adapter.
+4. Move `airc msg` append/dedupe/outbox into Rust; keep GitHub as rendezvous
+   and durable artifact adapter only.
 5. Move queue card parsing/projection into Rust; keep GitHub issues as the
    canonical remote work record.
 6. Add subscription API for monitor, hooks, non-Monitor live feeds, and generic

@@ -26,7 +26,7 @@ Captures `before` and `after` SHAs. Prints one of:
 
 1. **TaskStop the Monitor task you armed for `/join`** in this session. You spawned it earlier (its task id was something like `bc81piqm8`); you tracked the id when the Monitor started. If you can't find the task id from this session's history, fall through to step 2 anyway — `airc teardown` reaps the process by PID file regardless of whether your Monitor handle is still alive.
 
-2. **Run `airc teardown`** in Bash. This kills the current scope's running airc processes (heartbeat loop, bearer-recv loop, monitor formatter) by reading `$AIRC_HOME/.airc/airc.pid`. Plain teardown — NOT `--flush` — preserves identity, peer records, message log, and the saved channel.
+2. **Run `airc teardown`** in Bash. This kills the current scope's running airc processes by reading scope-owned runtime state. Plain teardown — NOT `--flush` — preserves identity, peer records, and subscriptions.
 
 3. **Re-arm a new Monitor with `airc join`**:
    ```

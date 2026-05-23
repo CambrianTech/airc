@@ -130,7 +130,7 @@ Everything below is a gap against that end state.
 
 ### 1. Python And Shell Still Own Too Much Runtime
 
-The repo still depends on shell/Python for install, monitor, queue, lanes, hygiene, GitHub bearer, Codex hook plumbing, channel discovery, and status health. Some of that is tested, but tested legacy is still legacy.
+The repo still depends on shell/Python for install, monitor, queue, lanes, hygiene, Codex hook plumbing, channel discovery, and status health. Some of that is tested, but tested legacy is still legacy.
 
 This violates the Rust direction. It also creates repeated failure modes:
 
@@ -194,7 +194,7 @@ Needed shape:
 - local-fs for same-host;
 - TLS LAN TCP for same LAN;
 - Tailscale transport/discovery;
-- cross-grid relay/bearer adapter;
+- cross-grid relay/transport adapter;
 - GitHub only as fallback/control-plane/migration path;
 - no silent downgrade to insecure or slow paths.
 
@@ -211,7 +211,7 @@ Long-term unmet need:
 - per-channel subscriptions;
 - per-header subscriptions;
 - per-frame priority and deadline handling;
-- no GitHub bearer for same-machine, same-LAN, or Tailscale routine traffic.
+- no GitHub routine traffic for same-machine, same-LAN, or Tailscale paths.
 
 ### 4. Windows Was Treated As Install-Only, Not Runtime-Proven
 
@@ -507,7 +507,7 @@ Required operating rule:
 - Transport resolver with health scoring.
 - Tailscale adapter/discovery.
 - mDNS/LAN discovery.
-- Cross-grid relay/bearer adapter.
+- Cross-grid relay/transport adapter.
 - Persistent subscription hub.
 - Presence and responder-ready projection.
 - Record/replay API over production events.
@@ -624,7 +624,7 @@ Verified strengths:
 
 Critical remaining gaps:
 
-- The public `airc` product path now routes through Rust for identity, config, bearer, logs, monitor formatting, Codex hooks, queue/work helpers, and install-time setup. Remaining shell should keep shrinking toward install/bootstrap only.
+- The public `airc` product path now routes through Rust for identity, config, logs, monitor formatting, Codex hooks, queue/work helpers, and install-time setup. The legacy GitHub-as-wire command has been deleted; remaining shell should keep shrinking toward install/bootstrap only.
 - `airc-lib` now owns in-process send/subscribe/replay, route selection, local-fs execution, LAN/Tailscale-class TCP execution, route health, invite endpoint metadata, and a daemon-attached SDK path for send/page/resume through typed daemon IPC. Persistent live subscription streams over daemon IPC are still not complete.
 - `airc-cli` is thinner for local, LAN, and daemon-backed msg/inbox paths. Remaining user-facing commands must continue moving onto SDK surfaces instead of constructing substrate state directly.
 - Peer trust rotation is still too permissive: `peers_store::add` silently replaces a pubkey for the same `PeerId`. That must become an explicit signed rotation/audit operation.
@@ -859,7 +859,7 @@ Slice 7 (PR 1–7) closes most of what Python currently owns at runtime:
 
 - queue/lane/workspace/kanban — `airc-work` (PR 1–3)
 - hygiene/sweep/manager-hat — projections + lease TTLs (PR 1–3)
-- GitHub bearer / token state — moves into the GitHub adapter (PR 5), or is deleted if gh is no longer the wire
+- GitHub token state belongs only in rendezvous/artifact adapters; it must not re-enter the runtime wire path
 - Codex hooks — Rust subscription (PR 6)
 - Claude monitor / monitor channel — Rust subscription (PR 6)
 
