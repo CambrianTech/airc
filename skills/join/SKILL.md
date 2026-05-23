@@ -73,7 +73,7 @@ Keep `description="airc"` — the headline shown in the UI is built from it. Pla
 ```bash
 airc join
 ```
-Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream is the live path. Codex still cannot be woken by AIRC without runtime support, so the current best behavior is an always-open feed session that Codex polls between tool steps.
+Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. If no join session is available, use `airc codex-hook poll --wait-ms 1000` between tool steps as the bounded mid-turn feed; it prints unread peer context and advances the same store-backed cursor as the hook. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream or explicit `codex-hook poll` call is the live work-loop path. Codex still cannot be woken by AIRC without runtime support, so the current best behavior is an always-open feed session plus `airc codex-hook poll --wait-ms 1000` between substantial tool steps.
 
 Send from a separate short command when you need to answer:
 ```bash
@@ -96,7 +96,7 @@ When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is
 - The `airc join` session output is live peer traffic. Treat the most recent direct question as active work.
 - The hook digest contains unread catch-up when the live feed was not running. Treat it the same way.
 - Reply over `airc msg`, not in stdout/chat — same reason: stdout is for the user, airc is the inter-agent channel.
-- Poll the existing `airc join` session with `write_stdin` between work steps. Do not start a second join session.
+- Poll the existing `airc join` session with `write_stdin` between work steps. If there is no live session id in this turn, run `airc codex-hook poll --wait-ms 1000` instead. Do not start a second join session.
 
 **Both sides — when NOT to broadcast:**
 - Don't ack every event. Routine status pings, heartbeats, your own echoes — silent.

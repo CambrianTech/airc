@@ -3,10 +3,12 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use airc_core::{Body, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, EventFilter};
+use airc_lib::{Airc, EventFilter, LiveLag};
 use airc_protocol::HEADER_AIRC_CLIENT;
+use futures::StreamExt;
 use serde::Serialize;
 
 use crate::client_id::current_client_id;
@@ -23,20 +25,10 @@ pub async fn run_user_prompt_submit(
     drain_stdin()?;
 
     let airc = Airc::open(home).await?;
-    let filter = EventFilter {
-        kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
-        ..EventFilter::default()
-    };
+    let filter = hook_filter();
     let runtime_client = current_client_id()?;
     let consumer_id = consumer_id(runtime_client.as_deref());
-    let previous = airc.load_runtime_cursor(&consumer_id).await?;
-    let events = match previous {
-        Some(cursor) => {
-            airc.resume_from_subscribed_filtered(&cursor, filter, count)
-                .await?
-        }
-        None => airc.page_recent_subscribed_filtered(filter, count).await?,
-    };
+    let events = unread_events(&airc, &consumer_id, filter, count).await?;
 
     if let Some(newest) = events.last() {
         airc.save_runtime_cursor_for_event(&consumer_id, newest)
@@ -60,10 +52,86 @@ pub async fn run_user_prompt_submit(
     Ok(())
 }
 
+pub async fn run_poll(
+    home: &Path,
+    count: usize,
+    max_items: usize,
+    raw: bool,
+    include_self: bool,
+    wait_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let runtime_client = current_client_id()?;
+    let consumer_id = consumer_id(runtime_client.as_deref());
+    let filter = hook_filter();
+
+    let mut events = unread_events(&airc, &consumer_id, filter.clone(), count).await?;
+    if events.is_empty() && wait_ms > 0 {
+        events = wait_for_one_event(&airc, filter, wait_ms).await?;
+    }
+
+    if let Some(newest) = events.last() {
+        airc.save_runtime_cursor_for_event(&consumer_id, newest)
+            .await?;
+    }
+
+    let visible: Vec<_> = events
+        .into_iter()
+        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
+        .collect();
+    if visible.is_empty() {
+        return Ok(());
+    }
+
+    let context = if raw {
+        render_raw(&visible)
+    } else {
+        render_digest(&visible, max_items)
+    };
+    println!("{context}");
+    Ok(())
+}
+
 fn consumer_id(runtime_client: Option<&str>) -> String {
     match runtime_client {
         Some(client) => format!("{CONSUMER_PREFIX}:{client}"),
         None => format!("{CONSUMER_PREFIX}:default"),
+    }
+}
+
+fn hook_filter() -> EventFilter {
+    EventFilter {
+        kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
+        ..EventFilter::default()
+    }
+}
+
+async fn unread_events(
+    airc: &Airc,
+    consumer_id: &str,
+    filter: EventFilter,
+    count: usize,
+) -> Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>> {
+    let previous = airc.load_runtime_cursor(consumer_id).await?;
+    let events = match previous {
+        Some(cursor) => {
+            airc.resume_from_subscribed_filtered(&cursor, filter, count)
+                .await?
+        }
+        None => airc.page_recent_subscribed_filtered(filter, count).await?,
+    };
+    Ok(events)
+}
+
+async fn wait_for_one_event(
+    airc: &Airc,
+    filter: EventFilter,
+    wait_ms: u64,
+) -> Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>> {
+    let mut stream = airc.subscribe_subscribed_filtered(filter).await?;
+    match tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await {
+        Ok(Some(Ok(event))) => Ok(vec![event]),
+        Ok(Some(Err(LiveLag { .. }))) | Ok(None) | Err(_) => Ok(Vec::new()),
     }
 }
 

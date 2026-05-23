@@ -862,6 +862,12 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
      state into the 5a PR events. GitHub remains an adapter, not the
      runtime source of truth.
 6. **PR 6 — monitor/hook subscriptions.** Codex hook becomes `airc codex-hook` consuming an `airc-work`-aware subscription; monitor reads typed subscriptions; no Python hook path remains.
+   - **Codex mid-turn feed slice.** `airc codex-hook poll
+     --wait-ms N` gives Codex a normal CLI feed it can call between
+     tool steps when no long-running `airc join` session id is
+     available. It shares the hook's ORM-backed runtime cursor,
+     filters same-runtime echoes by default, and prints plain context
+     instead of hook JSON.
    - **Phase 2 lifecycle cursor slice.** Runtime consumers persist
      cursors through `airc-store` and emit `SubscriptionAdvanced` as a
      durable lifecycle event when they advance. Feeds/hooks that know
