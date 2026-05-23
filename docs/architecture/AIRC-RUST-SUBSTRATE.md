@@ -350,7 +350,7 @@ through local filesystem, LAN-TCP, Tailscale, UDP, Reticulum, a relay, or
 WebRTC datachannel is invisible above the substrate boundary.
 
 This is the telecom shape: separate the service contract from the
-bearers underneath it. A room can contain a same-host Codex process,
+transports underneath it. A room can contain a same-host Codex process,
 a LAN Claude, a Tailscale grid node, and an offline OpenClaw client.
 The send path does not switch to "local mode" or "remote mode". The
 control plane decomposes the envelope into delivery work per endpoint,
@@ -365,7 +365,7 @@ needed, and reassembles a single delivery state for observability.
 | Identity/presence | Peer identity, client identity, device/session endpoints, capabilities, current leases | Transport implementation details |
 | Route graph | Endpoint-to-endpoint candidate edges, health, cost, priority, redundancy groups | Consumer semantics or body parsing |
 | Delivery scheduler | Durable outbound/inbound queues, batching, deadlines, acks, retry/backoff, resource leases | Adapter-specific protocol code |
-| Transport adapters | One implementation of the common transport contract per bearer | Route policy, admission decisions, consumer-visible behavior |
+| Transport adapters | One implementation of the common transport contract per route edge | Route policy, admission decisions, consumer-visible behavior |
 | Store/replay | Transcript, delivery journal, cursors, replay fixtures, audit | Live route selection |
 | Consumer API | `Airc::send`, `Airc::subscribe`, `Airc::page_recent`, typed headers | Choosing GH/local/LAN/Tailscale directly |
 
@@ -602,29 +602,29 @@ pub struct TransportCapabilities {
 }
 ```
 
-### Resilient to bearer changes
+### Resilient to transport changes
 
-The point: when any bearer stops being viable (rate limits get worse,
+The point: when any transport stops being viable (rate limits get worse,
 an upstream deprecates an API, our trust assumptions shift, whatever) —
 we **don't get stuck**. Adapter design means:
 
-- Roll a new bearer (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
-  our own continuum-hosted store-and-forward) — implement the `Bearer`
+- Roll a new transport (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
+  our own continuum-hosted store-and-forward) — implement the `Transport`
   trait, register it. Existing peer pairings auto-discover the new
-  bearer via the registry handshake.
-- Offer multiple bearers simultaneously — peers pick by health +
-  policy. Bearer-A goes down, traffic shifts to Bearer-B without
+  transport via the registry handshake.
+- Offer multiple transports simultaneously — peers pick by health +
+  policy. Transport-A goes down, traffic shifts to Transport-B without
   consumer involvement.
-- Deprecate a bearer gradually — mark it `deprecated_after_ts`; new
+- Deprecate a transport gradually — mark it `deprecated_after_ts`; new
   pairings prefer alternatives; existing pairings get a structured
   "your transport is sunsetting" event so consumers can re-pair.
 - Hot-swap mid-life — the resolver re-evaluates on every send; a
-  bearer added at runtime is usable immediately, no restart.
+  transport added at runtime is usable immediately, no restart.
 
 Same pride as the rest of the stack. No transport is a hard
 dependency. Whatever ships first is replaceable later.
 
-### Planned bearers / transports
+### Planned transports
 
 In the doc as anchors; not all in the v1 ship:
 

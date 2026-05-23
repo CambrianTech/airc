@@ -2,8 +2,7 @@
 
 **Status:** design contract for the rust-rewrite integration branch
 **Date:** 2026-05-20
-**Supersedes:** the parts of `docs/fusion-transport.md` that treated GitHub
-gists as a data-plane fallback
+**Supersedes:** prior GitHub-gist-as-data-plane designs
 
 ## Decision
 

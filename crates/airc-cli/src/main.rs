@@ -48,8 +48,6 @@ mod lane_cli;
 mod lane_commands;
 mod legacy_envelope;
 mod legacy_identity;
-mod message_cli;
-mod message_commands;
 mod monitor;
 mod network_commands;
 mod pending_cli;
@@ -93,7 +91,6 @@ use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
 use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
-use message_cli::MessageAction;
 use monitor::MonitorAction;
 use pending_cli::PendingAction;
 use queue_card_cli::QueueCardAction;
@@ -399,18 +396,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             GistAction::ListLanEntries => gist_commands::run_list_lan_entries(),
             GistAction::GistContent { channel } => gist_commands::run_gist_content(&channel),
             GistAction::FileContent { filename } => gist_commands::run_file_content(&filename),
-        },
-
-        Command::Message(args) => match args.action {
-            MessageAction::Build {
-                from,
-                to,
-                ts,
-                channel,
-                msg,
-                client_id,
-                kind,
-            } => message_commands::run_build(&from, &to, &ts, &channel, &msg, &client_id, &kind),
         },
 
         Command::Join { room } => commands::run_join(&home, room).await,

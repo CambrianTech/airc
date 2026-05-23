@@ -26,7 +26,6 @@ use crate::handshake_cli::HandshakeArgs;
 use crate::hygiene_cli::HygieneArgs;
 use crate::identity_cli::IdentityArgs;
 use crate::knock_cli::KnockArgs;
-use crate::message_cli::MessageArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
 use crate::transport_cli::TransportArgs;
@@ -278,9 +277,6 @@ pub enum Command {
     /// Parse legacy GitHub gist envelope JSON.
     Gist(GistArgs),
 
-    /// Build and inspect message envelopes during Rust cutover.
-    Message(MessageArgs),
-
     /// Join the account mesh. With no room, subscribes to #general
     /// and the inferred repo/org channel. With a room, subscribes to
     /// that channel and makes it the default.
@@ -318,7 +314,7 @@ pub enum Command {
     /// Codex lifecycle hook adapters backed by Rust AIRC events.
     CodexHook(CodexHookArgs),
 
-    /// Launch legacy `airc join` detached from Codex's tool process.
+    /// Launch the runtime feed owner for Codex integration.
     CodexStart(CodexStartArgs),
 
     /// Coordinate work cards over the current room's AIRC substrate.
@@ -327,13 +323,13 @@ pub enum Command {
     /// Coordinate work lanes over the current room's AIRC substrate.
     Lane(crate::lane_cli::LaneArgs),
 
-    /// Manage legacy local git worktree lane registry during Rust cutover.
+    /// Manage local git worktree lane registry.
     WorktreeLane(crate::worktree_lane_cli::WorktreeLaneArgs),
 
     /// Queue-card parsing and mutation primitives during Rust cutover.
     QueueCard(crate::queue_card_cli::QueueCardArgs),
 
-    /// Format legacy monitor JSONL streams for AI/runtime consumers.
+    /// Format monitor events for AI/runtime consumers.
     Monitor(crate::monitor::MonitorArgs),
 
     /// Coordinate workspace leases over the current room's AIRC substrate.
