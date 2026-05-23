@@ -29,12 +29,24 @@ impl Airc {
 
     /// Send a frame with typed body and arbitrary headers.
     pub async fn send(&self, body: Body, headers: Headers) -> Result<EventId, AircError> {
-        self.send_frame(FrameKind::Message, body, headers).await
+        self.send_frame_to(FrameKind::Message, MentionTarget::All, body, headers)
+            .await
     }
 
     pub(crate) async fn send_frame(
         &self,
         kind: FrameKind,
+        body: Body,
+        headers: Headers,
+    ) -> Result<EventId, AircError> {
+        self.send_frame_to(kind, MentionTarget::All, body, headers)
+            .await
+    }
+
+    pub(crate) async fn send_frame_to(
+        &self,
+        kind: FrameKind,
+        target: MentionTarget,
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
@@ -51,7 +63,7 @@ impl Airc {
                 sender: self.inner.identity.peer_id,
                 sender_client: self.inner.identity.client_id,
                 channel: room.channel,
-                target: MentionTarget::All,
+                target,
                 lamport,
                 occurred_at_ms,
                 reply_to: None,

@@ -41,3 +41,17 @@ pub const HEADER_AIRC_CLIENT: &str = "airc.client";
 /// recognise the contract decode the body accordingly. Substrate never
 /// interprets this — it only routes on it.
 pub const HEADER_FORGE_BODY_HINT: &str = "forge.body_hint";
+
+/// Request/reply correlation id. Distinct from `airc.trace_id`:
+/// trace_id is end-to-end observability that spans many events;
+/// correlation_id pairs ONE request with ONE reply. The command-bus
+/// helpers (`Airc::request` / `Airc::reply` / `Airc::await_reply`)
+/// generate + match on this header. Format: UUIDv4 string.
+pub const HEADER_AIRC_CORRELATION_ID: &str = "airc.correlation_id";
+
+/// Command-kind label for the command-bus primitive. Consumers
+/// own the vocabulary (e.g. `continuum.lora.invoke`,
+/// `forge.hermes.agent_command`); the substrate carries it as
+/// opaque routing metadata. Useful for receivers to dispatch
+/// matching handlers without parsing the body.
+pub const HEADER_AIRC_COMMAND_KIND: &str = "airc.command_kind";

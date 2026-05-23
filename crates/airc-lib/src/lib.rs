@@ -36,6 +36,7 @@
 
 pub mod account_registry;
 pub mod airc;
+pub mod command_bus;
 pub mod coordinator;
 mod coordinator_lock;
 mod daemon;
@@ -62,6 +63,7 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
 };
 pub use airc::Airc;
+pub use command_bus::PendingCommand;
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
     drain_stale_store as coordinator_drain_stale_store,
