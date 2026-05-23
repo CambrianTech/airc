@@ -156,20 +156,17 @@ fn join_without_args_uses_default_account_context() {
     let mut join = Command::new(airc_core());
     join.env("HOME", machine.path())
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
-        .env("AIRC_NO_ATTACH", "1")
+        .env("AIRC_CLIENT_ID", "agent:e2e-join")
         .args(["--home", home.to_str().unwrap(), "join"])
-        .current_dir(&repo);
-    let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
-    assert!(
-        output.status.success(),
-        "join failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    strip_cargo_harness_env(&mut join);
+    let stdout = run_join_until_attached(join, Duration::from_secs(10)).join("\n");
     assert!(stdout.contains("#general"), "{stdout}");
     assert!(stdout.contains("#cambriantech"), "{stdout}");
     assert!(stdout.contains("default: #cambriantech"), "{stdout}");
+    assert!(stdout.contains("attached"), "{stdout}");
 
     assert!(
         !home.join("subscriptions.json").exists(),
@@ -203,21 +200,18 @@ fn join_sets_up_codex_hook_when_codex_home_exists() {
     let mut join = Command::new(airc_core());
     join.env("HOME", machine.path())
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
-        .env("AIRC_NO_ATTACH", "1")
+        .env("AIRC_CLIENT_ID", "agent:e2e-join-codex")
         .args(["--home", home.to_str().unwrap(), "join"])
-        .current_dir(&repo);
-    let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
-    assert!(
-        output.status.success(),
-        "join failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    strip_cargo_harness_env(&mut join);
+    let stdout = run_join_until_attached(join, Duration::from_secs(10)).join("\n");
     assert!(
         stdout.contains("runtime: installed AIRC UserPromptSubmit hook"),
         "{stdout}"
     );
+    assert!(stdout.contains("attached"), "{stdout}");
 
     let hooks = std::fs::read_to_string(codex_home.join("hooks.json")).expect("hooks.json");
     assert!(
@@ -238,6 +232,60 @@ fn join_sets_up_codex_hook_when_codex_home_exists() {
         String::from_utf8_lossy(&stop.stdout),
         String::from_utf8_lossy(&stop.stderr),
     );
+}
+
+fn strip_cargo_harness_env(command: &mut Command) {
+    command.env_remove("CARGO_PKG_NAME");
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
+    {
+        command.env_remove(key);
+    }
+}
+
+fn run_join_until_attached(mut command: Command, timeout: Duration) -> Vec<String> {
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!("airc join must spawn: {error}");
+    });
+    let stdout = child.stdout.take().expect("join stdout");
+    let stderr = child.stderr.take().expect("join stderr");
+    let stdout_lines = spawn_line_reader(stdout);
+    let stderr_lines = spawn_line_reader(stderr);
+    let mut lines = Vec::new();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match stdout_lines.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let attached = line.contains("attached");
+                lines.push(line);
+                if attached {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return lines;
+                }
+            }
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let stderr = stderr_lines.try_iter().collect::<Vec<_>>().join("\n");
+                    panic!(
+                        "airc join exited before attaching: status={status} stdout={} stderr={stderr}",
+                        lines.join("\n"),
+                    );
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = stderr_lines.try_iter().collect::<Vec<_>>().join("\n");
+                    panic!(
+                        "airc join did not attach within {timeout:?}: stdout={} stderr={stderr}",
+                        lines.join("\n"),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn output_with_timeout(
