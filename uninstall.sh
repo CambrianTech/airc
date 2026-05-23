@@ -10,7 +10,7 @@
 #   - running airc processes (via airc teardown --all, if airc is on PATH)
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
 #   - stale POSIX forwarders and Windows shim files under $BIN_DIR
-#   - skill symlinks under ~/.claude/skills/ pointing into the clone
+#   - airc-owned skill directories under ~/.claude/skills/ and ~/.codex/skills/
 #   - the clone itself (~/.airc/src or $AIRC_DIR)
 #
 # What it leaves:
@@ -59,7 +59,7 @@ cd "$HOME" 2>/dev/null || cd /
 cat <<EOF
 This will remove airc from this machine:
   PATH files        $BIN_DIR/{airc,airc.exe} plus legacy $BIN_DIR/{airc-core,airc-core.exe,airc.cmd,airc.ps1}
-  skill symlinks    $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
+  skill dirs        $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
   running processes airc teardown --all (if airc is on PATH)
@@ -97,29 +97,32 @@ if command -v airc >/dev/null 2>&1; then
   fi
 fi
 
-# 3. Skill symlinks. Walk every entry in the skills dir and drop any
-# symlink that resolves into the clone. install.sh writes
-# into both ~/.claude/skills (Claude Code) and ~/.codex/skills (Codex)
-# when both agents are present, so we walk both on uninstall.
-_remove_clone_owned_skill_symlinks() {
+# 3. Skill dirs. Walk every entry in the skills dir and drop any airc-owned
+# copied skill directory. Also remove older symlinks that resolve into the
+# clone so upgrades converge cleanly.
+_remove_airc_owned_skills() {
   local skills_dir="$1"
   local removed=0 entry target
   [ -d "$skills_dir" ] || { echo 0; return; }
   for entry in "$skills_dir"/*; do
-    [ -L "$entry" ] || continue
-    target="$(readlink "$entry" 2>/dev/null || true)"
-    case "$target" in
-      "$CLONE_DIR"/*|"$CLONE_DIR")
-        rm -f "$entry"
-        removed=$((removed + 1)) ;;
-    esac
+    if [ -L "$entry" ]; then
+      target="$(readlink "$entry" 2>/dev/null || true)"
+      case "$target" in
+        "$CLONE_DIR"/*|"$CLONE_DIR")
+          rm -f "$entry"
+          removed=$((removed + 1)) ;;
+      esac
+    elif [ -d "$entry" ] && [ -f "$entry/.airc-skill" ]; then
+      rm -rf "$entry"
+      removed=$((removed + 1))
+    fi
   done
   echo "$removed"
 }
-removed_skills_claude=$(_remove_clone_owned_skill_symlinks "$SKILLS_TARGET")
-removed_skills_codex=$(_remove_clone_owned_skill_symlinks "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}")
-[ "$removed_skills_claude" -gt 0 ] && ok "Removed $removed_skills_claude skill symlink(s) from $SKILLS_TARGET"
-[ "$removed_skills_codex"  -gt 0 ] && ok "Removed $removed_skills_codex skill symlink(s) from ${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}"
+removed_skills_claude=$(_remove_airc_owned_skills "$SKILLS_TARGET")
+removed_skills_codex=$(_remove_airc_owned_skills "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}")
+[ "$removed_skills_claude" -gt 0 ] && ok "Removed $removed_skills_claude airc skill dir(s) from $SKILLS_TARGET"
+[ "$removed_skills_codex"  -gt 0 ] && ok "Removed $removed_skills_codex airc skill dir(s) from ${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}"
 
 # 3b. Codex config.toml cleanup. Strip the airc-managed GH_TOKEN block
 # (and the network-permission profile) if present. Keeps the rest of

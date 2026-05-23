@@ -38,11 +38,10 @@ if git grep -nE 'messages[.]jsonl|airc bearer|gh-bearer|GH bearer|GitHub bearer|
   fail "old JSONL/bearer message-bus surface remains"
 fi
 
-# Post-demolition contract (PR D): the public `airc` is the Rust
-# binary at $BIN_DIR/airc, installed by install.sh from
-# target/release/airc. No bash wrapper, no .shim/.cmd/.ps1
-# trampolines, no airc-core suffix on the binary. Guards below
-# enforce that the install.sh shape stays consistent with that.
+# Post-demolition contract: the public `airc` is the Rust binary at
+# $BIN_DIR/airc, copied by install.sh from target/release/airc. No
+# bash wrapper, no source-tree symlink, no .shim/.cmd/.ps1
+# trampolines, no airc-core suffix on the binary.
 
 if [ -e airc ] || [ -e airc.shim ] || [ -e airc.cmd ] || [ -e airc.ps1 ]; then
   fail "legacy bash wrapper/trampoline files must not exist in the repo root"
@@ -62,6 +61,10 @@ fi
 
 if git grep -nE 'Installed command shim:|cat > "[$]BIN_DIR/airc" <<' -- install.sh; then
   fail "install.sh must not install a bash wrapper shim — the Rust binary is the user surface"
+fi
+
+if git grep -nE 'ln -sf "[$]built"|Installed airc: [$]BIN_DIR/airc ->|Symlink to source-tree target/release/airc' -- install.sh test ':!test/rust_cutover_guard.sh'; then
+  fail "install.sh must copy the Rust binary into BIN_DIR, not symlink target/release"
 fi
 
 if git grep -nE 'BIN_DIR.*/relay|for f in airc relay|[,{]airc,relay|relay-[*]' -- install.sh uninstall.sh skills; then

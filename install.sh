@@ -493,12 +493,10 @@ _add_path_entry() {
   fi
 }
 
-# Put a tiny shim on PATH on every platform. Do not copy the full command
-# implementation and do not install a language-suffixed binary here.
 # Build the Rust binary and place it on PATH as `airc`. No shell
 # wrapper, no .shim/.cmd/.ps1 trampolines — the Rust binary is the
-# user surface. Post-demolition (PR D): one binary, one truth, no
-# legacy bash dispatch layer.
+# user surface. Copy the built binary into BIN_DIR so PATH never points
+# at mutable target artifacts inside the source checkout.
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   if ! command -v cargo >/dev/null 2>&1; then
@@ -518,13 +516,11 @@ _install_airc_binary() {
     *)
       local built="$CLONE_DIR/target/release/airc"
       [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
-      # Symlink so subsequent `airc update` rebuilds are picked up
-      # without a re-install step. Atomic via rename to avoid a
-      # mid-install window where $BIN_DIR/airc is missing.
       local tmp="$BIN_DIR/.airc.tmp.$$"
-      ln -sf "$built" "$tmp"
+      cp -f "$built" "$tmp"
+      chmod +x "$tmp"
       mv -f "$tmp" "$BIN_DIR/airc"
-      ok "Installed airc: $BIN_DIR/airc -> $built"
+      ok "Installed airc: $BIN_DIR/airc"
       ;;
   esac
 
@@ -552,12 +548,11 @@ _install_airc_binary
 #   Claude Code → ~/.claude/skills/<name>/
 #   Codex       → ~/.codex/skills/<name>/
 #
-# We symlink airc's skills into both whenever the corresponding agent
-# is installed on the machine. Each agent picks up the same skill
-# content; airc's skill text is intentionally written to be agent-
-# generic where the operation is shell-callable (which most airc verbs
-# are). Claude-Code-specific nuances like Monitor invocations are
-# additive — Codex agents fall back to direct shell calls.
+# We copy airc's skills into both whenever the corresponding agent is
+# installed on the machine. Copies avoid symlink resolution differences
+# between shells, agents, Windows Git Bash, and future source checkouts.
+# Each copied skill carries a marker so uninstall can remove only
+# airc-owned skill directories.
 
 _install_airc_skills_into() {
   local skills_target="$1" agent_label="$2"
@@ -570,14 +565,12 @@ _install_airc_skills_into() {
     [ -f "$skill_dir/SKILL.md" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$skills_target/$skill_name"
-    # If the target is a real directory, it shadows the current skill
-    # link. Remove it and install the current skill.
-    if [ -d "$target" ] && [ ! -L "$target" ]; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
       rm -rf "$target"
-    elif [ -L "$target" ]; then
-      rm "$target"
     fi
-    ln -sf "$skill_dir" "$target"
+    mkdir -p "$target"
+    cp -R "$skill_dir"/. "$target"/
+    printf 'installed-by=airc\nsource=%s\n' "$skill_dir" > "$target/.airc-skill"
     ok "Skill ($agent_label): /$skill_name"
   done
 }
@@ -613,7 +606,7 @@ fi
 # Codex sessions via `codex --profile airc`.
 #
 # Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
-# skill symlinks but NOT the config write.
+# skill install but NOT the config write.
 
 _install_airc_codex_permission_profile() {
   local config="$HOME/.codex/config.toml"
