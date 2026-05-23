@@ -39,14 +39,16 @@ fi
 "$AIRC_BIN" --version >/dev/null || fail "airc --version failed"
 
 # Demolition contract: no stale `airc-core` on PATH next to the
-# real binary. Symlink to source-tree target/release/airc IS the
-# expected shape (legacy "must be a shim file" check was wrapper-era).
+# real binary. The installed `airc` is a copied Rust binary, not a
+# shell wrapper or source-tree symlink.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*) ;;
   *)
     if [ -z "${AIRC_EXPECT_BIN:-}" ]; then
       [ ! -e "$(dirname "$AIRC_BIN")/airc-core" ] \
         || fail "POSIX install must not expose stale airc-core on PATH"
+      [ ! -L "$AIRC_BIN" ] \
+        || fail "POSIX install must copy the airc binary, not symlink it"
     fi
     ;;
 esac

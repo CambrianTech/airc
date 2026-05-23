@@ -16,7 +16,7 @@ Switches this airc install to the `canary` channel. Under the covers:
 - `git fetch origin canary`
 - `git checkout canary`
 - `git pull --ff-only`
-- Refreshes skills + binary symlinks via `install.sh`
+- Refreshes skills + installed binary via `install.sh`
 - Persists the choice to `$AIRC_DIR/.channel` so subsequent `airc update` (no args) stays on canary
 
 ## Execute
