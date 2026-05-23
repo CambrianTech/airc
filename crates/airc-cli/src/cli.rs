@@ -262,6 +262,13 @@ pub enum Command {
         wire: Option<PathBuf>,
     },
 
+    /// Leave a subscribed room without deleting identity or trust.
+    /// With no room, leaves the current default channel.
+    Part {
+        /// Optional channel name to leave.
+        room: Option<String>,
+    },
+
     /// Manage the persisted peer trust registry.
     Peer(PeerArgs),
 

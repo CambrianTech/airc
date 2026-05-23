@@ -234,6 +234,27 @@ fn join_sets_up_codex_hook_when_codex_home_exists() {
     );
 }
 
+#[test]
+fn part_without_args_leaves_default_channel() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join(".airc");
+    let wire = workspace.path().join("wire");
+
+    run_room(&home, "part-cli", &wire);
+
+    let mut part = command_for_home(&home);
+    part.args(["--home", home.to_str().unwrap(), "part"]);
+    let output = output_with_timeout(part, Duration::from_secs(10), "airc part");
+    assert!(
+        output.status.success(),
+        "part failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("parted:  #part-cli"), "{stdout}");
+}
+
 fn strip_cargo_harness_env(command: &mut Command) {
     command.env_remove("CARGO_PKG_NAME");
     for key in std::env::vars_os()

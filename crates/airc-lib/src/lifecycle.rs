@@ -98,10 +98,12 @@ impl Airc {
     /// - `SubscriptionAdvanced` — fired when a runtime consumer cursor
     ///   advances, except for cursor advances caused by
     ///   `SubscriptionAdvanced` itself.
+    /// - `RoomParted` — fired from [`Airc::part_channel`] after the
+    ///   subscription row is tombstoned and presence is refreshed.
     ///
-    /// Other variants (PeerDeparted, WireLost, RoomParted) have stable
-    /// body schemas defined in this module; their emit points are
-    /// queued for follow-up PRs.
+    /// Other variants (PeerDeparted, WireLost) have stable body schemas
+    /// defined in this module; their emit points are queued for
+    /// follow-up PRs.
     pub(crate) async fn emit_lifecycle(
         &self,
         kind: TranscriptKind,
@@ -217,6 +219,17 @@ mod tests {
         };
         let json = serde_json::to_string(&body).unwrap();
         let parsed: SubscriptionAdvancedBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn room_parted_body_round_trips_through_json() {
+        let body = RoomPartedBody {
+            channel_name: "general".to_string(),
+            room_id: RoomId::from_u128(0xabc),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let parsed: RoomPartedBody = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, body);
     }
 }

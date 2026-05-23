@@ -868,6 +868,11 @@ Replaces the single-slice "Queue/lane Rust model" line in the First Remediation 
      the source event use `Airc::save_runtime_cursor_for_event` so a
      cursor advance caused by `SubscriptionAdvanced` is stored without
      recursively emitting another cursor event.
+   - **Phase 2 room-part slice.** `airc-lib::Airc::part_channel`
+     removes the subscription through the ORM-backed `SubscriptionSet`,
+     preserves identity/trust/other rooms, refreshes the account
+     presence snapshot, and emits durable `RoomParted`. The public
+     `airc part [room]` command is a thin wrapper over that API.
 7. **PR 7 — Continuum bridge.** Continuum event subsystem consumes AIRC subscriptions directly. Persona inboxes are AIRC channel/header subscriptions plus Continuum-specific projection/RAG assembly.
 
 ### What this replaces in the previous plan
