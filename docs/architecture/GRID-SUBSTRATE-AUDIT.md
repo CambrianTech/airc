@@ -433,15 +433,23 @@ Acceptance gates:
 
 ## Immediate PR Queue
 
-1. Extract runtime context detection from `airc-cli::commands` into a
-   small typed module. Keep behavior identical.
-2. Add store-backed runtime cursors so `airc join` and Codex hook
+1. In flight: extract runtime context detection from
+   `airc-cli::commands` into a small typed module. Keep behavior
+   identical; no new user command and no new runtime flag.
+2. Next: move Codex hook/feed files behind an integration boundary so
+   `airc-cli` stops owning Codex-specific policy.
+3. Add lifecycle event types and subscription query API.
+4. Add first command-bus request/reply helper after reviewing
+   Continuum's bus contract.
+
+Done or superseded:
+
+- Store-backed runtime cursors are now in place; `airc join` and Codex hook
    consumers never replay the whole backlog and never write cursor JSON
    sidecars.
-3. Move Codex hook/feed files behind an integration boundary.
-4. Add lifecycle event types and subscription query API.
-5. Add first command-bus request/reply helper after reviewing
-   Continuum's bus contract.
+- Codex live-feed contract is documented: `airc join` is the feed,
+  UserPromptSubmit is catch-up, and true wake-on-AIRC requires Codex
+  runtime support.
 
 ## Open Questions
 
