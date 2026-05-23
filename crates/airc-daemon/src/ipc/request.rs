@@ -21,6 +21,9 @@ pub enum Request {
     /// trust lives in the store; this op keeps the running daemon's
     /// registry in sync without a restart.
     AddPeer(AddPeerRequest),
+    /// Remove a peer from the daemon's in-memory registry after the
+    /// durable trust store has been updated.
+    RemovePeer(RemovePeerRequest),
     /// Snapshot of currently-enrolled peers (peer_id + pubkey).
     /// Returned via `Response::Peers`.
     ListPeers,
@@ -93,6 +96,12 @@ pub struct AddPeerRequest {
     pub pubkey_b64: String,
 }
 
+/// Parameters for `RemovePeer`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemovePeerRequest {
+    pub peer_id: PeerId,
+}
+
 /// Parameters for `Send`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendRequest {
@@ -120,6 +129,15 @@ mod tests {
         assert_eq!(encoded, r#"{"op":"ping"}"#);
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, Request::Ping);
+    }
+
+    #[test]
+    fn remove_peer_roundtrips_with_peer_id() {
+        let peer_id = PeerId::from_u128(0xabc);
+        let encoded =
+            serde_json::to_string(&Request::RemovePeer(RemovePeerRequest { peer_id })).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, Request::RemovePeer(RemovePeerRequest { peer_id }));
     }
 
     #[test]

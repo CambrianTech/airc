@@ -356,6 +356,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             PeerAction::Add { spec, socket } => {
                 commands::run_peer_add(&home, spec, default_or(socket, &home)).await
             }
+            PeerAction::Remove { peer_id, socket } => {
+                let peer_id = parse_peer_id(&peer_id)?;
+                commands::run_peer_remove(&home, peer_id, default_or(socket, &home)).await
+            }
             PeerAction::List => commands::run_peer_list(&home).await,
         },
 

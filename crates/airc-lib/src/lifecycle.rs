@@ -93,6 +93,8 @@ impl Airc {
     ///   is persisted.
     /// - `PeerArrived` — fired from `Airc::add_peer` when a new peer
     ///   enters the local trust store.
+    /// - `PeerDeparted` — fired from `Airc::remove_peer` when a peer
+    ///   leaves local trust.
     /// - `WireEstablished` — fired when a new local wire subscriber
     ///   attaches.
     /// - `SubscriptionAdvanced` — fired when a runtime consumer cursor
@@ -101,9 +103,8 @@ impl Airc {
     /// - `RoomParted` — fired from [`Airc::part_channel`] after the
     ///   subscription row is tombstoned and presence is refreshed.
     ///
-    /// Other variants (PeerDeparted, WireLost) have stable body schemas
-    /// defined in this module; their emit points are queued for
-    /// follow-up PRs.
+    /// `WireLost` has a stable body schema defined in this module; its
+    /// emit point is queued for a follow-up PR.
     pub(crate) async fn emit_lifecycle(
         &self,
         kind: TranscriptKind,

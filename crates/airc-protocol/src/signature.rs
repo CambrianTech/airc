@@ -129,6 +129,18 @@ impl PeerKeyRegistry {
         self.keys.get(&(peer, key_id))
     }
 
+    /// Remove every enrolled key for `peer`.
+    ///
+    /// Used when local trust is explicitly revoked. Returns the
+    /// number of key ids removed so callers can distinguish an
+    /// idempotent remove from a real departure.
+    pub fn remove_peer(&mut self, peer: PeerId) -> usize {
+        let before = self.keys.len();
+        self.keys
+            .retain(|(enrolled_peer, _key_id), _key| *enrolled_peer != peer);
+        before - self.keys.len()
+    }
+
     /// Reverse lookup: find which `(peer, key_id)` enrolled a given
     /// pubkey. Used by the lan-tcp TLS verifier — at handshake time
     /// the server receives a client cert but doesn't know which peer
@@ -506,5 +518,26 @@ mod tests {
             &PeerKeyRegistry::new(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn remove_peer_removes_all_key_ids_for_peer() {
+        use crate::keypair::PeerKeypair;
+
+        let peer = PeerId::from_u128(0xabc);
+        let other = PeerId::from_u128(0xdef);
+        let key_a = PeerKeypair::generate();
+        let key_b = PeerKeypair::generate();
+        let key_other = PeerKeypair::generate();
+        let mut registry = PeerKeyRegistry::new();
+        registry.enrol(peer, 0, key_a.public_bytes()).unwrap();
+        registry.enrol(peer, 1, key_b.public_bytes()).unwrap();
+        registry.enrol(other, 0, key_other.public_bytes()).unwrap();
+
+        assert_eq!(registry.remove_peer(peer), 2);
+        assert!(registry.lookup(peer, 0).is_none());
+        assert!(registry.lookup(peer, 1).is_none());
+        assert!(registry.lookup(other, 0).is_some());
+        assert_eq!(registry.remove_peer(peer), 0);
     }
 }

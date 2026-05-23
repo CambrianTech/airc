@@ -255,6 +255,51 @@ fn part_without_args_leaves_default_channel() {
     assert!(stdout.contains("parted:  #part-cli"), "{stdout}");
 }
 
+#[test]
+fn peer_remove_deletes_enrolled_peer() {
+    let workspace = TempDir::new().expect("tempdir");
+    let alice_home = workspace.path().join("alice");
+    let bob_home = workspace.path().join("bob");
+    let (bob_id, bob_spec) = run_init(&bob_home);
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let airc = airc_lib::Airc::open(&alice_home).await.unwrap();
+        airc.add_peer(bob_spec.parse().unwrap()).await.unwrap();
+    });
+
+    let mut remove = command_for_home(&alice_home);
+    remove.args([
+        "--home",
+        alice_home.to_str().unwrap(),
+        "peer",
+        "remove",
+        &bob_id,
+    ]);
+    let remove_output = output_with_timeout(remove, Duration::from_secs(10), "airc peer remove");
+    assert!(
+        remove_output.status.success(),
+        "peer remove failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&remove_output.stdout),
+        String::from_utf8_lossy(&remove_output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&remove_output.stdout);
+    assert!(
+        stdout.contains(&format!("removed peer_id={bob_id}")),
+        "{stdout}"
+    );
+
+    let mut list = command_for_home(&alice_home);
+    list.args(["--home", alice_home.to_str().unwrap(), "peer", "list"]);
+    let list_output = output_with_timeout(list, Duration::from_secs(10), "airc peer list");
+    assert!(list_output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&list_output.stdout).contains(&bob_id),
+        "removed peer should not appear in list: {}",
+        String::from_utf8_lossy(&list_output.stdout),
+    );
+}
+
 fn strip_cargo_harness_env(command: &mut Command) {
     command.env_remove("CARGO_PKG_NAME");
     for key in std::env::vars_os()

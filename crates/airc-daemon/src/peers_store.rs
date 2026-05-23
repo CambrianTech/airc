@@ -215,6 +215,16 @@ pub async fn add(
         .map_err(Into::into)
 }
 
+/// Remove an enrolled peer from the local trust store. Idempotent:
+/// returns `Ok(None)` when the peer is already absent.
+pub async fn remove(home: &Path, peer_id: PeerId) -> Result<Option<StoredPeer>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .remove_peer_trust(peer_id)
+        .await
+        .map_err(Into::into)
+}
+
 /// Apply a signed trust rotation:
 ///
 /// 1. Verify cryptographic shape (signature against `prev_pubkey`,
@@ -348,6 +358,23 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].peer_id, id);
         assert_eq!(loaded[0].pubkey_bytes().unwrap(), pk);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_peer_trust_idempotently() {
+        let home = TempDir::new().unwrap();
+        let id = PeerId::new();
+        let pk = fake_pubkey(0xab);
+        add(home.path(), id, pk).await.unwrap();
+
+        let removed = remove(home.path(), id)
+            .await
+            .unwrap()
+            .expect("peer was stored");
+        assert_eq!(removed.peer_id, id);
+        assert_eq!(removed.pubkey_bytes().unwrap(), pk);
+        assert!(load(home.path()).await.unwrap().is_empty());
+        assert!(remove(home.path(), id).await.unwrap().is_none());
     }
 
     #[tokio::test]

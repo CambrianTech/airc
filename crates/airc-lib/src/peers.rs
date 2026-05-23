@@ -30,6 +30,44 @@ impl Airc {
         self.add_peer_via(spec, "manual").await
     }
 
+    /// Remove a peer from local durable trust and in-memory
+    /// verification state. Emits `PeerDeparted` only when a stored peer
+    /// was actually removed.
+    pub async fn remove_peer(&self, peer_id: PeerId, reason: &str) -> Result<bool, AircError> {
+        let removed_home = peers_store::remove(&self.inner.home, peer_id).await?;
+        let removed_wire_root = if self.inner.wire_root != self.inner.home {
+            peers_store::remove(&self.inner.wire_root, peer_id).await?
+        } else {
+            None
+        };
+        let removed = removed_home.or(removed_wire_root).is_some();
+
+        {
+            let mut registry = self
+                .inner
+                .registry
+                .write()
+                .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
+            registry.remove_peer(peer_id);
+        }
+
+        if !removed {
+            return Ok(false);
+        }
+
+        let room_id = self.current_room().await?.channel;
+        let body = airc_core::Body::Json(
+            serde_json::to_value(crate::lifecycle::PeerDepartedBody {
+                peer_id,
+                reason: reason.to_string(),
+            })
+            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
+        );
+        self.emit_lifecycle(airc_core::TranscriptKind::PeerDeparted, room_id, body)
+            .await?;
+        Ok(true)
+    }
+
     /// Internal: enrol a peer and emit `PeerArrived` with the
     /// caller-supplied `via` tag (`"invite"`, `"account_registry"`,
     /// `"manual"`, etc.). Callers that know how the peer was
