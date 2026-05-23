@@ -444,9 +444,9 @@ Acceptance gates:
 
 ## Immediate PR Queue
 
-1. In flight: move Codex hook/feed files behind an integration boundary
-   so `airc-cli` stops owning Codex-specific policy.
-2. Add lifecycle event types and subscription query API.
+1. In flight: add subscription query API on `airc-lib` so consumers can
+   inspect joined channels/default room/cursors without CLI parsing.
+2. Add lifecycle event types.
 3. Add first command-bus request/reply helper after reviewing
    Continuum's bus contract.
 
@@ -460,6 +460,9 @@ Done or superseded:
   runtime support.
 - Runtime context detection is isolated in `airc-cli::runtime_context`;
   `commands.rs` no longer owns join stream/exit heuristics.
+- Codex hook/feed/config/start files live under
+  `airc-cli::integrations::codex`; the top-level CLI no longer owns
+  Codex-specific implementation modules.
 
 ## Open Questions
 

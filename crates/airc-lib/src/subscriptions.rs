@@ -477,6 +477,48 @@ impl Airc {
         Ok(load_or_init(self.event_store()).await?)
     }
 
+    /// Return all active channel subscriptions for this scope.
+    ///
+    /// Consumer integrations use this instead of parsing `airc status`
+    /// or reading the store directly. Ordering is deterministic by
+    /// channel name.
+    pub async fn subscriptions(&self) -> Result<Vec<Subscription>, AircError> {
+        let set = self.subscription_set().await?;
+        Ok(set.all().cloned().collect())
+    }
+
+    /// True when this scope is subscribed to `channel`.
+    pub async fn is_subscribed(&self, channel: &ChannelName) -> Result<bool, AircError> {
+        let set = self.subscription_set().await?;
+        Ok(set.subscribed.contains_key(channel))
+    }
+
+    /// Return the default room used by short-shape commands such as
+    /// `airc msg "..."`.
+    pub async fn default_room(&self) -> Result<Room, AircError> {
+        self.current_room().await
+    }
+
+    /// Cursor of the newest event in a subscribed channel.
+    ///
+    /// `None` means either the channel has no events yet or this
+    /// scope is not subscribed to it. Use [`Self::is_subscribed`] when
+    /// callers need to distinguish those cases.
+    pub async fn subscription_cursor(
+        &self,
+        channel: &ChannelName,
+    ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
+        let set = self.subscription_set().await?;
+        let Some(subscription) = set.subscribed.get(channel) else {
+            return Ok(None);
+        };
+        Ok(self
+            .inner
+            .store
+            .latest_cursor(Some(subscription.room_id))
+            .await?)
+    }
+
     pub(crate) async fn subscribed_event_filter(
         &self,
         mut filter: EventFilter,
@@ -815,5 +857,46 @@ mod tests {
         assert!(set.subscribed.is_empty());
         assert!(set.default.is_none());
         assert!(set.parted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn airc_exposes_subscription_query_api() {
+        let dir = tempdir().unwrap();
+        let airc = Airc::open(dir.path()).await.unwrap();
+
+        airc.join("general").await.unwrap();
+        airc.join("cambriantech").await.unwrap();
+
+        let subscriptions = airc.subscriptions().await.unwrap();
+        let names = subscriptions
+            .iter()
+            .map(|subscription| subscription.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["cambriantech", "general"]);
+
+        let cambriantech = ChannelName::new("cambriantech").unwrap();
+        let general = ChannelName::new("general").unwrap();
+        let missing = ChannelName::new("not-joined").unwrap();
+
+        assert!(airc.is_subscribed(&cambriantech).await.unwrap());
+        assert!(airc.is_subscribed(&general).await.unwrap());
+        assert!(!airc.is_subscribed(&missing).await.unwrap());
+
+        let default = airc.default_room().await.unwrap();
+        assert_eq!(default.name, "cambriantech");
+
+        assert!(airc
+            .subscription_cursor(&cambriantech)
+            .await
+            .unwrap()
+            .is_none());
+        airc.say("cursor proof").await.unwrap();
+        assert!(airc
+            .subscription_cursor(&cambriantech)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(airc.subscription_cursor(&general).await.unwrap().is_none());
+        assert!(airc.subscription_cursor(&missing).await.unwrap().is_none());
     }
 }
