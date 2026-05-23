@@ -24,10 +24,9 @@ _default_clone_dir() {
 }
 
 CLONE_DIR="${AIRC_DIR:-$(_default_clone_dir)}"
-# BIN_DIR holds a tiny command shim. The shim execs $HOME/.airc/src/airc
-# so the canonical source command remains the single implementation,
-# while agent/non-interactive shells that already have ~/.local/bin on
-# PATH can still run plain `airc` without sourcing shell rc files.
+# BIN_DIR holds the installed Rust binary copied from CLONE_DIR.
+# PATH points at this stable binary, not at mutable source-tree build
+# artifacts and not at a shell wrapper.
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 

@@ -37,6 +37,8 @@ fi
 
 # Clap exposes the version via `--version`, not a `version` subcommand.
 "$AIRC_BIN" --version >/dev/null || fail "airc --version failed"
+"$AIRC_BIN" update --help >/dev/null \
+  || fail "installed airc missing update command"
 "$AIRC_BIN" codex-hook poll --help >/dev/null \
   || fail "installed airc missing codex mid-turn poll command"
 

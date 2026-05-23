@@ -303,6 +303,11 @@ pub enum Command {
     /// package version.)
     Version,
 
+    /// Fast-forward the installed source checkout and refresh the
+    /// installed `airc` binary + skills from that source.
+    #[command(visible_aliases = ["upgrade", "pull"])]
+    Update,
+
     /// Self-diagnose the airc install + scope state.
     ///
     /// Walks the install/identity/daemon/route checklist that
