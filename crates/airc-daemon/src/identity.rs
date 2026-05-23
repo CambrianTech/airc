@@ -33,12 +33,14 @@ use std::path::{Path, PathBuf};
 use airc_core::{identity::Identity, ClientId, PeerId};
 use airc_protocol::PeerKeypair;
 use airc_store::{SqliteEventStore, StoreError, StoredLocalIdentity};
+use serde::Deserialize;
 
 /// On-disk schema version for the singleton row. Bump when the
 /// stored shape changes incompatibly.
 const IDENTITY_STATE_VERSION: u32 = 1;
 
 const IDENTITY_KEY_FILENAME: &str = "identity.key";
+const LEGACY_IDENTITY_JSON_FILENAME: &str = "identity.json";
 const STORE_DB_FILENAME: &str = "events.sqlite";
 
 /// Persisted-state bundle: stable identity for this airc install.
@@ -69,6 +71,9 @@ pub enum IdentityError {
     },
     /// `identity.key` exists but isn't the expected 32 bytes.
     BadKeyLength(usize),
+    /// A prior install has `identity.json`, but it is not valid
+    /// enough to deterministically migrate into the ORM row.
+    LegacyIdentityJson(serde_json::Error),
     /// System clock is before UNIX_EPOCH; refuse to write a corrupt
     /// timestamp into the identity audit record.
     Clock(std::time::SystemTimeError),
@@ -99,6 +104,12 @@ impl std::fmt::Display for IdentityError {
                 f,
                 "identity.key is {got} bytes, expected 32 (raw Ed25519 secret)"
             ),
+            IdentityError::LegacyIdentityJson(error) => {
+                write!(
+                    f,
+                    "identity.json could not be migrated into local_identity: {error}"
+                )
+            }
             IdentityError::Clock(error) => write!(f, "identity timestamp clock error: {error}"),
         }
     }
@@ -109,6 +120,7 @@ impl std::error::Error for IdentityError {
         match self {
             IdentityError::Io(error) => Some(error),
             IdentityError::Store(error) => Some(error),
+            IdentityError::LegacyIdentityJson(error) => Some(error),
             IdentityError::Clock(error) => Some(error),
             IdentityError::SchemaVersionMismatch { .. }
             | IdentityError::PartialState { .. }
@@ -153,6 +165,13 @@ impl LocalIdentity {
         let stored = store.load_local_identity().await?;
         match (key_exists, stored) {
             (true, Some(stored)) => Self::load_with_metadata(home, stored),
+            (true, None) => match migrate_legacy_identity_json(home, &store).await? {
+                Some(stored) => Self::load_with_metadata(home, stored),
+                None => Err(IdentityError::PartialState {
+                    key_exists: true,
+                    state_exists: false,
+                }),
+            },
             (false, None) => Self::generate_and_save(home, &store).await,
             (key, state) => Err(IdentityError::PartialState {
                 key_exists: key,
@@ -229,6 +248,42 @@ impl LocalIdentity {
             client_id,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyIdentityJson {
+    version: u32,
+    peer_id: PeerId,
+    client_id: ClientId,
+    created_at_ms: u64,
+}
+
+async fn migrate_legacy_identity_json(
+    home: &Path,
+    store: &SqliteEventStore,
+) -> Result<Option<StoredLocalIdentity>, IdentityError> {
+    let path = home.join(LEGACY_IDENTITY_JSON_FILENAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let parsed: LegacyIdentityJson = serde_json::from_slice(&std::fs::read(&path)?)
+        .map_err(IdentityError::LegacyIdentityJson)?;
+    if parsed.version != IDENTITY_STATE_VERSION {
+        return Err(IdentityError::SchemaVersionMismatch {
+            found: parsed.version,
+            expected: IDENTITY_STATE_VERSION,
+        });
+    }
+    let stored = StoredLocalIdentity {
+        peer_id: parsed.peer_id,
+        client_id: parsed.client_id,
+        version: parsed.version,
+        created_at_ms: parsed.created_at_ms,
+        identity: Identity::default(),
+    };
+    store.insert_local_identity(stored.clone()).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(Some(stored))
 }
 
 async fn open_store(home: &Path) -> Result<SqliteEventStore, IdentityError> {
@@ -319,6 +374,51 @@ mod tests {
                 state_exists: false,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn migrates_identity_json_when_key_exists_and_row_missing() {
+        let home = TempDir::new().unwrap();
+        write_owner_only(&LocalIdentity::key_path(home.path()), &[7u8; 32]).unwrap();
+        let peer_id = PeerId::new();
+        let client_id = ClientId::new();
+        std::fs::write(
+            home.path().join(LEGACY_IDENTITY_JSON_FILENAME),
+            serde_json::json!({
+                "version": IDENTITY_STATE_VERSION,
+                "peer_id": peer_id,
+                "client_id": client_id,
+                "created_at_ms": 1234_u64
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let identity = LocalIdentity::load_or_generate(home.path()).await.unwrap();
+
+        assert_eq!(identity.peer_id, peer_id);
+        assert_eq!(identity.client_id, client_id);
+        assert_eq!(identity.keypair.secret_bytes(), [7u8; 32]);
+        assert!(
+            !home.path().join(LEGACY_IDENTITY_JSON_FILENAME).exists(),
+            "identity.json is consumed after deterministic ORM migration"
+        );
+        let store = open_store(home.path()).await.unwrap();
+        let stored = store.load_local_identity().await.unwrap().unwrap();
+        assert_eq!(stored.peer_id, peer_id);
+        assert_eq!(stored.client_id, client_id);
+        assert_eq!(stored.created_at_ms, 1234);
+    }
+
+    #[tokio::test]
+    async fn invalid_identity_json_keeps_partial_state_loud() {
+        let home = TempDir::new().unwrap();
+        write_owner_only(&LocalIdentity::key_path(home.path()), &[7u8; 32]).unwrap();
+        std::fs::write(home.path().join(LEGACY_IDENTITY_JSON_FILENAME), "{").unwrap();
+
+        let result = LocalIdentity::load_or_generate(home.path()).await;
+
+        assert!(matches!(result, Err(IdentityError::LegacyIdentityJson(_))));
     }
 
     #[tokio::test]
