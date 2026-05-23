@@ -48,7 +48,7 @@ pub enum GistAction {
 
     /// Extract a named file's content from a GitHub gist API response.
     FileContent {
-        /// Exact gist filename, for example messages.jsonl.
+        /// Exact gist filename, for example airc-room-general.json.
         #[arg(long)]
         filename: String,
     },

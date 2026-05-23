@@ -318,6 +318,6 @@ mod tests {
             parsed["files"]["airc-room-general.json"]["content"],
             "{\"host\":{\"name\":\"beta\"}}\n"
         );
-        assert!(parsed["files"]["messages.jsonl"].is_null());
+        assert!(parsed["files"]["other-room.json"].is_null());
     }
 }
