@@ -17,6 +17,9 @@ impl Airc {
             Err(error) => return Err(AircError::Transport(error.to_string())),
         };
 
+        let mut malformed_count = 0usize;
+        let mut unverifiable_count = 0usize;
+
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -31,10 +34,13 @@ impl Airc {
                     // files can carry frames from older builds or
                     // ad-hoc test fixtures; refusing to read past
                     // one means losing every later real event too.
-                    eprintln!(
-                        "airc-lib replay: skipping malformed frame in {}: {error}",
-                        path.display()
-                    );
+                    malformed_count += 1;
+                    if replay_warnings_enabled() {
+                        eprintln!(
+                            "airc-lib replay: skipping malformed frame in {}: {error}",
+                            path.display()
+                        );
+                    }
                     continue;
                 }
             };
@@ -55,7 +61,10 @@ impl Airc {
                 // subsequent legitimate frame in the same file
                 // and breaks `airc inbox` / `airc join` for any
                 // scope that touched the wire pre-identity-reset.
-                eprintln!("airc-lib replay: skipping unverifiable frame: {error}");
+                unverifiable_count += 1;
+                if replay_warnings_enabled() {
+                    eprintln!("airc-lib replay: skipping unverifiable frame: {error}");
+                }
                 continue;
             }
             let event = frame.into_transcript_event();
@@ -63,6 +72,12 @@ impl Airc {
                 Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+        if replay_warnings_enabled() && (malformed_count > 0 || unverifiable_count > 0) {
+            eprintln!(
+                "airc-lib replay: skipped {malformed_count} malformed and {unverifiable_count} unverifiable frame(s) in {}",
+                path.display()
+            );
         }
         Ok(())
     }
@@ -72,5 +87,28 @@ impl Airc {
             self.replay_wire_once(&wire).await?;
         }
         Ok(())
+    }
+}
+
+fn replay_warnings_enabled() -> bool {
+    replay_warnings_enabled_from(std::env::var_os("AIRC_REPLAY_WARN"))
+}
+
+fn replay_warnings_enabled_from(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_warnings_enabled_from;
+
+    #[test]
+    fn replay_warnings_default_to_quiet() {
+        assert!(!replay_warnings_enabled_from(None));
+    }
+
+    #[test]
+    fn replay_warnings_can_be_enabled_for_diagnostics() {
+        assert!(replay_warnings_enabled_from(Some("1".into())));
     }
 }
