@@ -156,6 +156,7 @@ fn join_without_args_uses_default_account_context() {
     let mut join = Command::new(airc_core());
     join.env("HOME", machine.path())
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+        .env("AIRC_NO_ATTACH", "1")
         .args(["--home", home.to_str().unwrap(), "join"])
         .current_dir(&repo);
     let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
@@ -202,6 +203,7 @@ fn join_sets_up_codex_hook_when_codex_home_exists() {
     let mut join = Command::new(airc_core());
     join.env("HOME", machine.path())
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+        .env("AIRC_NO_ATTACH", "1")
         .args(["--home", home.to_str().unwrap(), "join"])
         .current_dir(&repo);
     let output = output_with_timeout(join, Duration::from_secs(10), "airc join");
