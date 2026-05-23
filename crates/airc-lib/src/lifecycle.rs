@@ -97,14 +97,17 @@ impl Airc {
     ///   leaves local trust.
     /// - `WireEstablished` — fired when a new local wire subscriber
     ///   attaches.
+    /// - `WireLost` — fired when the wire subscriber task exits,
+    ///   either because the stream ended (`reason="stream_ended"`)
+    ///   or because `Airc::teardown_wire` signalled it
+    ///   (`reason="teardown"`).
     /// - `SubscriptionAdvanced` — fired when a runtime consumer cursor
     ///   advances, except for cursor advances caused by
     ///   `SubscriptionAdvanced` itself.
     /// - `RoomParted` — fired from [`Airc::part_channel`] after the
     ///   subscription row is tombstoned and presence is refreshed.
     ///
-    /// `WireLost` has a stable body schema defined in this module; its
-    /// emit point is queued for a follow-up PR.
+    /// All seven Phase 2 lifecycle variants are now wired.
     pub(crate) async fn emit_lifecycle(
         &self,
         kind: TranscriptKind,
