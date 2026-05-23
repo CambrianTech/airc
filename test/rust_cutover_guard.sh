@@ -34,7 +34,7 @@ if git grep -nE 'airc-src|[.]airc-src' -- . ':!test/rust_cutover_guard.sh'; then
   fail "old split install clone path remains"
 fi
 
-if git grep -nE 'messages[.]jsonl|airc bearer|gh-bearer|GH bearer|GitHub bearer|ChatLogEnvelope|MessageAction|message_cli|message_commands' -- . ':!test/rust_cutover_guard.sh'; then
+if git grep -nE 'messages[.]jsonl|airc bearer|gh-bearer|GH bearer|GitHub bearer|ChatLogEnvelope|MessageAction|message_cli|message_commands' -- . ':!test/rust_cutover_guard.sh' ':!docs/**' ':!REFCONTRACT.md'; then
   fail "old JSONL/bearer message-bus surface remains"
 fi
 

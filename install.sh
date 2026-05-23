@@ -730,6 +730,7 @@ _install_airc_codex_developer_instructions() {
 developer_instructions = """
 AIRC Codex runtime contract:
 - Keep `airc join` running as this session's live AIRC feed when coordinating with peer agents.
+- If no live join session id is available during a turn, run `airc codex-hook poll --wait-ms 1000` between tool steps. It is the bounded mid-turn feed and shares the same runtime cursor as the hook.
 - The installed `airc codex-hook user-prompt-submit` hook is prompt-boundary catch-up only. Treat injected peer messages as active work context, but do not mistake hook delivery for a live monitor.
 - Reply to direct peer questions with `airc msg`, not user-chat stdout. The peer sees AIRC, not this transcript.
 - Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually seen peer traffic.
