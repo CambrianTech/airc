@@ -22,16 +22,41 @@ impl Airc {
             if trimmed.is_empty() {
                 continue;
             }
-            let frame: Frame = serde_json::from_str(trimmed)
-                .map_err(|error| AircError::Transport(error.to_string()))?;
-            {
+            let frame: Frame = match serde_json::from_str(trimmed) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    // A single malformed line shouldn't abort the
+                    // whole replay — surface it and continue, same
+                    // policy as the live frame-ingest task. Wire
+                    // files can carry frames from older builds or
+                    // ad-hoc test fixtures; refusing to read past
+                    // one means losing every later real event too.
+                    eprintln!(
+                        "airc-lib replay: skipping malformed frame in {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let verify_result = {
                 let registry = self
                     .inner
                     .registry
                     .read()
                     .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
                 verify(&frame, self.inner.policy, &registry)
-                    .map_err(|error| AircError::Crypto(error.to_string()))?;
+            };
+            if let Err(error) = verify_result {
+                // Same fail-open policy as `spawn_frame_ingest` in
+                // transport.rs:91. The most common case is a frame
+                // signed by a peer who's no longer enrolled (e.g.
+                // an orphan identity from a previous install on the
+                // same wire). Failing closed here aborts every
+                // subsequent legitimate frame in the same file
+                // and breaks `airc inbox` / `airc join` for any
+                // scope that touched the wire pre-identity-reset.
+                eprintln!("airc-lib replay: skipping unverifiable frame: {error}");
+                continue;
             }
             let event = frame.into_transcript_event();
             match self.inner.store.append(event).await {
