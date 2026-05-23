@@ -121,8 +121,7 @@ async fn open_join_say_and_replay_round_trips_in_process() {
 
     let _event_id = airc.say("hello, consumer").await.unwrap();
 
-    let page = wait_for_events(&airc, 1, Duration::from_secs(2)).await;
-    assert_eq!(page.len(), 1);
+    let page = wait_for_events(&airc, 2, Duration::from_secs(2)).await;
     let bodies: Vec<&str> = page
         .iter()
         .filter_map(|e| e.body.as_ref().and_then(Body::as_text))
@@ -562,14 +561,22 @@ async fn send_typed_body_with_headers_round_trips() {
         .await
         .unwrap();
 
-    let page = wait_for_events(&airc, 1, Duration::from_secs(2)).await;
-    assert_eq!(page.len(), 1);
+    let page = wait_for_events(&airc, 2, Duration::from_secs(2)).await;
+    let event = page
+        .iter()
+        .find(|event| {
+            event
+                .headers
+                .get("x-test-marker")
+                .is_some_and(|value| value == "round-trip")
+        })
+        .expect("typed event should round-trip with marker header");
     assert_eq!(
-        page[0].headers.get("x-test-marker").map(String::as_str),
+        event.headers.get("x-test-marker").map(String::as_str),
         Some("round-trip")
     );
     assert_eq!(
-        page[0].headers.get("forge.body_hint").map(String::as_str),
+        event.headers.get("forge.body_hint").map(String::as_str),
         Some("application/json")
     );
 }
@@ -618,12 +625,11 @@ async fn two_embedded_handles_chat_over_lan_without_cli() {
 
     bob.say("hello over sdk lan").await.unwrap();
 
-    let page = wait_for_events(&alice, 1, Duration::from_secs(3)).await;
-    let bodies: Vec<&str> = page
-        .iter()
-        .filter_map(|event| event.body.as_ref().and_then(Body::as_text))
-        .collect();
-    assert_eq!(bodies, vec!["hello over sdk lan"]);
+    let event = wait_for_text(&alice, "hello over sdk lan", Duration::from_secs(3)).await;
+    assert_eq!(
+        event.body.as_ref().and_then(Body::as_text),
+        Some("hello over sdk lan")
+    );
 }
 
 #[tokio::test]

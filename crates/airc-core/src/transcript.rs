@@ -18,6 +18,15 @@ use crate::ids::{ClientId, EventId, PeerId, RoomId};
 
 /// The category of a transcript event. Different kinds may carry
 /// different optional fields on `TranscriptEvent`.
+///
+/// The first six kinds are chat-shaped and consumer-authored:
+/// every send is one of these. The remaining "lifecycle" kinds are
+/// **substrate-authored** — emitted by airc itself when state
+/// transitions happen (room joined, peer arrived, wire established,
+/// etc.). They share the same envelope shape so consumers
+/// subscribe with the same `EventFilter` surface, but the substrate
+/// signs them from its own identity, and the `body` carries a
+/// structured JSON payload documented per-variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptKind {
@@ -27,12 +36,64 @@ pub enum TranscriptKind {
     Attachment,
     /// Delivery / read / applied receipt — `receipt` field populated.
     Receipt,
-    /// Presence transition (join, leave, away).
+    /// Presence transition (join, leave, away) — IRC analog.
+    /// Distinct from the lifecycle kinds below: `Presence` is a
+    /// consumer-authored chat-shaped event ("I am away"), while
+    /// `PeerArrived`/`PeerDeparted` are substrate-authored
+    /// transitions of the local peer registry.
     Presence,
     /// Session-level control envelope (NICK, IDENTIFY, etc.).
     SessionControl,
     /// Substrate-emitted system message (host eviction, error, etc.).
     System,
+
+    // --- Lifecycle kinds (Phase 2 of GRID-SUBSTRATE-AUDIT) ---
+    // Substrate-authored events consumers subscribe to instead of
+    // polling. Each carries a JSON body documented in
+    // `airc-lib::lifecycle`.
+    /// A new peer was enrolled in the local peer-trust registry.
+    /// Body: `{ "peer_id": <uuid>, "via": "<source>" }` where
+    /// `via` is `"invite"` / `"account_registry"` / `"manual"`.
+    PeerArrived,
+    /// A peer was removed from the local trust registry (kick,
+    /// teardown). Body: `{ "peer_id": <uuid>, "reason": "<text>" }`.
+    PeerDeparted,
+    /// A wire (channel transport) became available to the local
+    /// scope — the wire subscriber attached successfully.
+    /// Body: `{ "wire": "<path>", "channel_name": "<name>" }`.
+    WireEstablished,
+    /// A wire subscriber failed or was torn down. Body:
+    /// `{ "wire": "<path>", "reason": "<text>" }`.
+    WireLost,
+    /// This scope joined a room. Body: `{ "channel_name": "<name>",
+    /// "room_id": <uuid>, "wire": "<path>", "is_default": bool }`.
+    RoomJoined,
+    /// This scope parted a room. Body: `{ "channel_name": "<name>",
+    /// "room_id": <uuid> }`.
+    RoomParted,
+    /// A runtime consumer's cursor advanced. Body:
+    /// `{ "consumer_id": "<id>", "lamport": <u64>,
+    ///    "event_id": <uuid> }`. Useful for "I've caught up to
+    /// here" signals between cooperating consumers.
+    SubscriptionAdvanced,
+}
+
+impl TranscriptKind {
+    /// True for substrate-authored lifecycle kinds (the Phase 2
+    /// additions). Consumers that want only chat-shaped events
+    /// filter these out via `EventFilter::kinds`.
+    pub fn is_lifecycle(self) -> bool {
+        matches!(
+            self,
+            TranscriptKind::PeerArrived
+                | TranscriptKind::PeerDeparted
+                | TranscriptKind::WireEstablished
+                | TranscriptKind::WireLost
+                | TranscriptKind::RoomJoined
+                | TranscriptKind::RoomParted
+                | TranscriptKind::SubscriptionAdvanced
+        )
+    }
 }
 
 /// Who a transcript event is addressed to.

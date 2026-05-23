@@ -45,6 +45,7 @@ mod fs_permissions;
 pub mod gh_account_registry;
 pub mod join_context;
 mod lan;
+pub mod lifecycle;
 pub mod mesh_identity;
 mod messaging;
 mod peers;
