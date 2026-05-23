@@ -77,7 +77,7 @@ fn machine_account_home(scope_home: &Path) -> PathBuf {
     scope_home.to_path_buf()
 }
 
-async fn load_peer_registries(
+pub(crate) async fn load_peer_registries(
     home: &Path,
     wire_root: &Path,
 ) -> Result<Vec<peers_store::StoredPeer>, AircError> {

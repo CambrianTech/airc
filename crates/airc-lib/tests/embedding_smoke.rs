@@ -265,6 +265,23 @@ fn same_machine_scopes_share_account_wire_and_registry() {
                 2,
                 "opening two local scopes must publish both identities into the machine registry"
             );
+            assert!(
+                alice
+                    .peers()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|peer| peer.peer_id == bob.peer_id()),
+                "alice's project scope must report peers from the machine-account registry"
+            );
+            assert!(
+                bob.peers()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|peer| peer.peer_id == alice.peer_id()),
+                "bob's project scope must report peers from the machine-account registry"
+            );
 
             alice.say("same-machine account wire").await.unwrap();
             let event =
