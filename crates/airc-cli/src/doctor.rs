@@ -10,9 +10,9 @@
 //! Diagnostic surface (in priority order):
 //!
 //! 1. **Identity** — `identity.key` + `local_identity` row pairing.
-//!    Detects PartialState (most common new-machine friction).
-//!    Auto-fix on `--fix`: wipe + regenerate when both halves are
-//!    safe to discard (no remote pairings on the orphan id).
+//!    Detects partial state (most common new-machine friction).
+//!    Identity repair is intentionally manual because wiping a
+//!    peer_id discards remote trust enrolled against that id.
 //!
 //! 2. **Daemon liveness** — is a daemon process answering the IPC
 //!    socket for this scope? Stale socket vs missing entirely.
