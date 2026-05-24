@@ -258,7 +258,7 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        // Deterministic: PR 901 (check, merge), PR 902 (check, merge).
+        // Deterministic: PR 1 (check, merge), PR 2 (check, merge).
         assert_eq!(kinds, vec!["check", "merge", "check", "merge"]);
     }
 

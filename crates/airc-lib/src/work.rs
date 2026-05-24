@@ -323,9 +323,7 @@ impl Airc {
         observer: &PullRequestObserver<S>,
         request: ObservePullRequests,
     ) -> Result<ObservedPullRequests, AircError> {
-        let snapshot = observer
-            .observe(&request.repo)
-            .map_err(|error| AircError::Crypto(format!("pull request source: {error}")))?;
+        let snapshot = observer.observe(&request.repo)?;
         let events = pull_request_events_since(
             request.previous.as_ref(),
             &snapshot,
