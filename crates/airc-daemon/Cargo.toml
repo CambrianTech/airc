@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 airc-core = { path = "../airc-core" }
+airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
 airc-protocol = { path = "../airc-protocol" }

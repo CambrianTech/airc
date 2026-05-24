@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/airc-core",
+    "crates/airc-diagnostics",
     "crates/airc-blobs",
     "crates/airc-protocol",
     "crates/airc-transport",

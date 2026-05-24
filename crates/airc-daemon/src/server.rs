@@ -20,6 +20,9 @@ use fs2::FileExt;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_ipc::codec::{read_frame, write_frame};
 use airc_ipc::request::{AttachRequest, Request};
 use airc_ipc::response::Response;
@@ -88,7 +91,14 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, state).await {
-                        eprintln!("daemon connection error: {error}");
+                        StderrJsonDiagnosticSink.emit(
+                            DiagnosticEvent::error(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::ConnectionError,
+                                "daemon connection error",
+                            )
+                            .with_field("error", error),
+                        );
                     }
                 });
             }

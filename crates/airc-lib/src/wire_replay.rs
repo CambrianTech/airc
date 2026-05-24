@@ -1,5 +1,8 @@
 use std::path::Path;
 
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::{verify, Frame};
 
 use crate::error::AircError;
@@ -36,9 +39,14 @@ impl Airc {
                     // one means losing every later real event too.
                     malformed_count += 1;
                     if replay_warnings_enabled() {
-                        eprintln!(
-                            "airc-lib replay: skipping malformed frame in {}: {error}",
-                            path.display()
+                        StderrJsonDiagnosticSink.emit(
+                            DiagnosticEvent::warn(
+                                DiagnosticComponent::Replay,
+                                DiagnosticCode::MalformedReplayFrameSkipped,
+                                "skipping malformed replay frame",
+                            )
+                            .with_field("wire_file", path.display())
+                            .with_field("error", error),
                         );
                     }
                     continue;
@@ -56,7 +64,15 @@ impl Airc {
                 // scope that touched the wire pre-identity-reset.
                 unverifiable_count += 1;
                 if replay_warnings_enabled() {
-                    eprintln!("airc-lib replay: skipping unverifiable frame: {error}");
+                    StderrJsonDiagnosticSink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Replay,
+                            DiagnosticCode::UnverifiableReplayFrameSkipped,
+                            "skipping unverifiable replay frame",
+                        )
+                        .with_field("wire_file", path.display())
+                        .with_field("error", error),
+                    );
                 }
                 continue;
             }
@@ -67,9 +83,15 @@ impl Airc {
             }
         }
         if replay_warnings_enabled() && (malformed_count > 0 || unverifiable_count > 0) {
-            eprintln!(
-                "airc-lib replay: skipped {malformed_count} malformed and {unverifiable_count} unverifiable frame(s) in {}",
-                path.display()
+            StderrJsonDiagnosticSink.emit(
+                DiagnosticEvent::warn(
+                    DiagnosticComponent::Replay,
+                    DiagnosticCode::ReplayFramesSkipped,
+                    "replay skipped invalid frame(s)",
+                )
+                .with_field("wire_file", path.display())
+                .with_field("malformed_count", malformed_count)
+                .with_field("unverifiable_count", unverifiable_count),
             );
         }
         Ok(())

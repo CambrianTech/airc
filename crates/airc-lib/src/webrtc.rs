@@ -33,6 +33,9 @@ use std::time::Duration;
 
 use airc_core::headers::Headers;
 use airc_core::{Body, PeerId, TranscriptEvent};
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::FrameKind;
 use airc_transport::webrtc_datachannel::WebRtcDataChannelAdapter;
 use futures::StreamExt;
@@ -224,7 +227,16 @@ impl Airc {
                 }
                 let initiator = event.peer_id;
                 if let Err(error) = airc.answer_offer(initiator, session_id, sdp).await {
-                    eprintln!("webrtc accept_offer failed for {initiator}: {error}");
+                    StderrJsonDiagnosticSink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::WebRtc,
+                            DiagnosticCode::WebRtcOfferAnswerFailed,
+                            "WebRTC offer answer failed",
+                        )
+                        .with_field("initiator", initiator)
+                        .with_field("session_id", session_id)
+                        .with_field("error", error),
+                    );
                 }
             }
         });
