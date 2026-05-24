@@ -406,7 +406,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
-        Command::Update => update_commands::run_update(),
+        Command::Update => update_commands::run_update(&home, cli::default_socket_path_in(&home)),
 
         Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
 
