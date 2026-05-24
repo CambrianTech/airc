@@ -573,6 +573,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkAction::Claim { card_id, ttl_ms } => {
                 work_commands::run_claim(&home, card_id, ttl_ms).await
             }
+            WorkAction::Heartbeat {
+                card_id,
+                claim_id,
+                ttl_ms,
+            } => work_commands::run_heartbeat(&home, card_id, claim_id, ttl_ms).await,
             WorkAction::Release {
                 card_id,
                 claim_id,

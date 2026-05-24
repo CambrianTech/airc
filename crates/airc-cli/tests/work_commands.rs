@@ -53,6 +53,12 @@ fn work_create_claim_release_projects_on_board() {
     assert!(claimed_board.contains(claim_id));
     assert!(claimed_board.contains("Claimed"));
 
+    let heartbeat = run_ok(
+        &home,
+        &["work", "heartbeat", card_id, claim_id, "--ttl-ms", "60000"],
+    );
+    assert!(heartbeat.contains("claim_heartbeat"));
+
     run_ok(
         &home,
         &[
@@ -69,6 +75,35 @@ fn work_create_claim_release_projects_on_board() {
     assert!(released_board.contains(card_id));
     assert!(released_board.contains("Open"));
     assert!(released_board.contains("claim=-"));
+}
+
+#[test]
+fn work_board_surfaces_stale_claims() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "do not let abandoned claims idle-lock a lane",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+
+    let claim = run_ok(&home, &["work", "claim", card_id, "--ttl-ms", "1"]);
+    let claim_id = extract_field(&claim, "claim_id:").expect("claim prints claim_id");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let stale_board = run_ok(&home, &["work", "board"]);
+    assert!(stale_board.contains("stale claims: 1"), "{stale_board}");
+    assert!(stale_board.contains(card_id), "{stale_board}");
+    assert!(stale_board.contains(claim_id), "{stale_board}");
 }
 
 #[test]

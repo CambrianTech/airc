@@ -4,11 +4,11 @@ use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
     encode_work_event, local_git_events_since, pull_request_events_since, BranchName, CardCreated,
-    ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged,
-    LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased,
-    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot,
-    WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
-    WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
+    ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState,
+    LaneStateChanged, LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed,
+    ManagerHatReleased, Priority, PullRequestObserver, PullRequestSource, RepoId,
+    RepoPullRequestSnapshot, WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent,
+    WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -35,6 +35,13 @@ pub struct ReleaseWorkClaim {
     pub card_id: WorkCardId,
     pub claim_id: ClaimId,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatWorkClaim {
+    pub card_id: WorkCardId,
+    pub claim_id: ClaimId,
+    pub ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +166,21 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Extend this peer's claim lease for a work card. Agents should
+    /// heartbeat long-running work so stale claims become visible when
+    /// a tab goes idle or dies instead of locking a lane indefinitely.
+    pub async fn heartbeat_work_claim(&self, request: HeartbeatWorkClaim) -> Result<(), AircError> {
+        let event = WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
+            card_id: request.card_id,
+            claim_id: request.claim_id,
+            owner: self.peer_id(),
+            ttl_ms: request.ttl_ms,
+            heartbeat_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

@@ -36,6 +36,16 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 600_000)]
         ttl_ms: u64,
     },
+    /// Extend this peer's claim lease on a work card.
+    Heartbeat {
+        /// Work card UUID.
+        card_id: String,
+        /// Claim UUID returned by `work claim`.
+        claim_id: String,
+        /// New lease duration from this heartbeat.
+        #[arg(long, default_value_t = 600_000)]
+        ttl_ms: u64,
+    },
     /// Release this peer's claim on a work card.
     Release {
         /// Work card UUID.
