@@ -64,6 +64,7 @@ pub mod webrtc_media;
 pub mod webrtc_signaling;
 mod wire_replay;
 pub mod work;
+pub mod work_subscription;
 
 pub use account_registry::{
     AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
@@ -120,6 +121,9 @@ pub use work::{
     CreateWorkLane, HeartbeatWorkClaim, HeartbeatWorkspace, ObserveLocalGitWorkspace,
     ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
     ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace,
+};
+pub use work_subscription::{
+    WorkEventFilter, HEADER_WORK_CARD_ID, HEADER_WORK_LANE_ID, HEADER_WORK_REPO,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core
