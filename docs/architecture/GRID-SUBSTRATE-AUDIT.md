@@ -362,10 +362,13 @@ five concrete hotpaths and seven kill-list patterns.
    `PeerKeyRegistry`. `signed.rs` verifies against the registry's
    internal concurrent map directly; there is no external lock to hold
    while draining the stream.
-7. **Untracked `tokio::spawn` tasks** — `transport.rs:52`
-   (`spawn_frame_ingest` at line 91). No cancellation, no shutdown
-   signal. Use `JoinSet` + a broadcast shutdown channel; cancel on
-   drop.
+7. **Untracked `tokio::spawn` tasks** — closed for local ingest.
+   `spawn_frame_ingest` now returns an owned `IngestTask`; dropping
+   the SDK subscriber aborts the task instead of detaching it from the
+   handle lifecycle, and explicit wire teardown still sends a shutdown
+   signal before waiting briefly for `WireLost` emission. Future
+   transport/server loops should use the same owned-task pattern (or a
+   scoped `JoinSet`) rather than discarding `JoinHandle`s.
 
 ### Layering rot (architectural)
 
