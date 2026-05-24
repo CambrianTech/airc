@@ -266,6 +266,7 @@ backend files:
 | `mesh_identity` cache file | `mesh_identity` table (done in store-backed mesh identity cut) |
 | `account_registry/*.json` | `account_registry` table (done in store-backed account registry cut) |
 | `coordinator/*.beacon` | `beacons` + `beacon_channels` tables (done in store-backed coordinator beacon cut) |
+| `accounts/*/refresh.lock` | `refresh_locks` table (done in store-backed coordinator lock cut) |
 | `codex_hook_cursor.json` + `join_feed_cursor.{client}.json` | `runtime_cursors` table (done in cursor cut) |
 | `airc config ...` JSON editor | removed from the public CLI; typed commands and store APIs own runtime state |
 

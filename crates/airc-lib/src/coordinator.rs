@@ -12,10 +12,8 @@
 //!
 //! Presence beacons live in the shared machine-account
 //! `events.sqlite` store (`beacons` + `beacon_channels` tables).
-//! The only coordinator files left are refresh lock sentinels under
-//! `~/.airc/accounts/<mesh-identity>/`, used to singleflight rare
-//! remote registry refreshes. Runtime presence is never kept in JSON
-//! sidecars.
+//! Remote-refresh locks live in the same store (`refresh_locks`).
+//! Runtime presence is never kept in JSON sidecars.
 //!
 //! Each scope (Claude tab, Codex tab, persona instance, daemon, etc.)
 //! writes ONE row keyed by `(mesh_identity, peer_id)`. The peer-id is
@@ -34,7 +32,7 @@
 //!    still sees the old subscriptions).
 //! 2. **Remote-refresh singleflight** — when a join needs the
 //!    rare-and-expensive remote registry refresh (GitHub gist pull),
-//!    [`try_acquire_refresh_lock`] takes the `refresh.lock` sentinel.
+//!    [`try_acquire_refresh_lock`] takes the store-backed refresh row.
 //!    Concurrent joins return `HeldFresh` and re-use the snapshot the
 //!    lock-holder produces. Without this, ten local agents starting
 //!    `airc join` simultaneously would each hammer GitHub.
@@ -46,21 +44,16 @@
 //! accidentally reintroduce split-brain JSON presence state.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use airc_core::PeerId;
-use airc_store::{EventStore, StoreError, StoredBeacon};
-
-use crate::coordinator_lock::RefreshLock;
 use crate::subscriptions::{ChannelName, ChannelNameError, MeshIdentity};
+use airc_core::PeerId;
+use airc_store::{EventStore, StoreError, StoredBeacon, StoredRefreshLockOutcome};
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
-const REFRESH_LOCK: &str = "refresh.lock";
-const REFRESH_TAKEOVER_LOCK: &str = "refresh.takeover";
 
 /// Default beacon staleness threshold: 60s. A scope that hasn't
 /// heartbeated within this window is considered stale (process dead
@@ -220,14 +213,6 @@ fn sanitize_identity(value: &str) -> String {
         .collect()
 }
 
-fn refresh_lock_path(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
-    account_root(airc_home, identity).join(REFRESH_LOCK)
-}
-
-fn refresh_takeover_lock_path(airc_home: &Path, identity: &MeshIdentity) -> PathBuf {
-    account_root(airc_home, identity).join(REFRESH_TAKEOVER_LOCK)
-}
-
 /// Publish the caller's beacon into the durable coordinator store.
 pub async fn publish_store(
     store: &dyn EventStore,
@@ -321,63 +306,47 @@ pub enum RefreshLockOutcome {
     HeldFresh { held_at_ms: u64 },
 }
 
-/// Try to acquire the remote-refresh lock. Singleflight pattern:
-/// only one caller at a time should hammer the remote registry
-/// (GitHub gist), so subsequent callers within
+/// Try to acquire the remote-refresh lock through the durable store.
+/// Singleflight pattern: only one caller at a time should hammer the
+/// remote registry (GitHub gist), so subsequent callers within
 /// `refresh_interval_ms` see `HeldFresh` and re-use the lock-holder's
 /// snapshot.
 ///
-/// Atomicity is provided by `OpenOptions::create_new(true)` —
-/// `O_CREAT|O_EXCL` semantics on POSIX, the equivalent on Windows.
-/// Exactly one caller wins the creation; others get
-/// `ErrorKind::AlreadyExists` and inspect the existing lock to
-/// decide fresh vs stale.
-///
-/// Stale-takeover path: when the existing lock's `held_at_ms` is
-/// past `refresh_interval_ms`, the loser first acquires a second
-/// exclusive `refresh.takeover` sentinel. Only that takeover holder
-/// may remove and replace the stale `refresh.lock`. Without this,
-/// several stale readers can delete each other's newly-created fresh
-/// lock on Windows/POSIX under contention. The lock adapter uses a
-/// bounded retry loop so an adversary can't pin a caller.
-///
-/// (Earlier revision of this function did a read-then-write without
-/// any atomicity primitive — two concurrent callers could both see
-/// "no lock" and both succeed, violating singleflight. Fixed in
-/// response to PR #850 review.)
-pub fn try_acquire_refresh_lock(
-    airc_home: &Path,
+/// Atomicity is owned by the store. SQLite uses a primary-key insert
+/// followed by compare-and-set stale takeover on the `refresh_locks`
+/// row; there are no coordinator lock files and no JSON sidecars.
+pub async fn try_acquire_refresh_lock(
+    store: &dyn EventStore,
     identity: &MeshIdentity,
     config: &CoordinatorConfig,
     now_ms: u64,
     holder_pid: u32,
 ) -> Result<RefreshLockOutcome, CoordinatorError> {
-    let root = account_root(airc_home, identity);
-    fs::create_dir_all(&root)?;
-    RefreshLock::new(
-        refresh_lock_path(airc_home, identity),
-        refresh_takeover_lock_path(airc_home, identity),
-        config.refresh_interval_ms,
-        now_ms,
-        holder_pid,
-    )?
-    .acquire()
+    let outcome = store
+        .try_acquire_refresh_lock(
+            identity.as_str(),
+            now_ms,
+            config.refresh_interval_ms,
+            holder_pid,
+        )
+        .await?;
+    Ok(match outcome {
+        StoredRefreshLockOutcome::Acquired => RefreshLockOutcome::Acquired,
+        StoredRefreshLockOutcome::HeldFresh { held_at_ms } => {
+            RefreshLockOutcome::HeldFresh { held_at_ms }
+        }
+    })
 }
 
-/// Release the refresh lock — best-effort delete. Idempotent: a
-/// missing lock file is not an error (e.g., concurrent drain, or
-/// another process already took over after our holder window
-/// expired).
-pub fn release_refresh_lock(
-    airc_home: &Path,
+/// Release the refresh lock. Idempotent: a missing row is not an
+/// error (e.g., concurrent drain, or another process already took
+/// over after our holder window expired).
+pub async fn release_refresh_lock(
+    store: &dyn EventStore,
     identity: &MeshIdentity,
 ) -> Result<(), CoordinatorError> {
-    let path = refresh_lock_path(airc_home, identity);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    store.release_refresh_lock(identity.as_str()).await?;
+    Ok(())
 }
 
 fn unique_channels_in(beacons: &[PresenceBeacon]) -> Vec<ChannelName> {
@@ -665,26 +634,31 @@ mod tests {
         assert_eq!(loaded.heartbeat_at_ms, 2_000, "second publish wins");
     }
 
-    #[test]
-    fn refresh_lock_first_caller_acquires() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn refresh_lock_first_caller_acquires() {
+        let store = airc_store::InMemoryEventStore::new();
         let outcome =
-            try_acquire_refresh_lock(dir.path(), &id(), &CoordinatorConfig::default(), 1_000, 42)
+            try_acquire_refresh_lock(&store, &id(), &CoordinatorConfig::default(), 1_000, 42)
+                .await
                 .unwrap();
         assert_eq!(outcome, RefreshLockOutcome::Acquired);
     }
 
-    #[test]
-    fn refresh_lock_singleflights_within_window() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn refresh_lock_singleflights_within_window() {
+        let store = airc_store::InMemoryEventStore::new();
         let cfg = CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 500,
         };
         // Caller A acquires at t=1000.
-        try_acquire_refresh_lock(dir.path(), &id(), &cfg, 1_000, 1).unwrap();
+        try_acquire_refresh_lock(&store, &id(), &cfg, 1_000, 1)
+            .await
+            .unwrap();
         // Caller B arrives at t=1100 — well within 500ms window.
-        let outcome = try_acquire_refresh_lock(dir.path(), &id(), &cfg, 1_100, 2).unwrap();
+        let outcome = try_acquire_refresh_lock(&store, &id(), &cfg, 1_100, 2)
+            .await
+            .unwrap();
         match outcome {
             RefreshLockOutcome::HeldFresh { held_at_ms } => {
                 assert_eq!(held_at_ms, 1_000);
@@ -693,30 +667,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refresh_lock_can_be_taken_over_after_window_expires() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn refresh_lock_can_be_taken_over_after_window_expires() {
+        let store = airc_store::InMemoryEventStore::new();
         let cfg = CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 500,
         };
-        try_acquire_refresh_lock(dir.path(), &id(), &cfg, 1_000, 1).unwrap();
+        try_acquire_refresh_lock(&store, &id(), &cfg, 1_000, 1)
+            .await
+            .unwrap();
         // Caller B arrives at t=1500 (exactly at the window — counts as expired).
-        let outcome = try_acquire_refresh_lock(dir.path(), &id(), &cfg, 1_500, 2).unwrap();
+        let outcome = try_acquire_refresh_lock(&store, &id(), &cfg, 1_500, 2)
+            .await
+            .unwrap();
         assert_eq!(outcome, RefreshLockOutcome::Acquired);
     }
 
-    #[test]
-    fn release_refresh_lock_is_idempotent() {
-        let dir = tempdir().unwrap();
+    #[tokio::test]
+    async fn release_refresh_lock_is_idempotent() {
+        let store = airc_store::InMemoryEventStore::new();
         let mesh = id();
-        // Releasing when no lock exists is fine.
-        release_refresh_lock(dir.path(), &mesh).unwrap();
-        // Acquire, release, release again.
-        try_acquire_refresh_lock(dir.path(), &mesh, &CoordinatorConfig::default(), 1_000, 1)
+        release_refresh_lock(&store, &mesh).await.unwrap();
+        try_acquire_refresh_lock(&store, &mesh, &CoordinatorConfig::default(), 1_000, 1)
+            .await
             .unwrap();
-        release_refresh_lock(dir.path(), &mesh).unwrap();
-        release_refresh_lock(dir.path(), &mesh).unwrap();
+        release_refresh_lock(&store, &mesh).await.unwrap();
+        release_refresh_lock(&store, &mesh).await.unwrap();
     }
 
     #[test]
@@ -732,39 +709,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_lock_singleflights_under_concurrent_acquire() {
-        // Race N threads at the same time against an empty lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_lock_singleflights_under_concurrent_acquire() {
+        // Race N tasks at the same time against an empty store row.
         // Exactly ONE must return Acquired; the rest see HeldFresh.
-        // Validates the create_new atomicity vs. the older
-        // read-then-write race that PR review caught.
-        use std::sync::Arc;
-        use std::thread;
-
         const N: usize = 16;
-        let dir = Arc::new(tempdir().unwrap());
-        let mesh = Arc::new(id());
-        let cfg = Arc::new(CoordinatorConfig {
+        let store = std::sync::Arc::new(airc_store::SqliteEventStore::in_memory().await.unwrap());
+        let mesh = std::sync::Arc::new(id());
+        let cfg = std::sync::Arc::new(CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 10_000, // big window so no takeover races
         });
-        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
 
         let handles: Vec<_> = (0..N)
             .map(|i| {
-                let dir = Arc::clone(&dir);
-                let mesh = Arc::clone(&mesh);
-                let cfg = Arc::clone(&cfg);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    // Sync all threads so they hit the lock simultaneously.
-                    barrier.wait();
-                    try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 1_000, i as u32).unwrap()
+                let store = std::sync::Arc::clone(&store);
+                let mesh = std::sync::Arc::clone(&mesh);
+                let cfg = std::sync::Arc::clone(&cfg);
+                let barrier = std::sync::Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    try_acquire_refresh_lock(&*store, &mesh, &cfg, 1_000, i as u32)
+                        .await
+                        .unwrap()
                 })
             })
             .collect();
 
-        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut outcomes = Vec::with_capacity(N);
+        for handle in handles {
+            outcomes.push(handle.await.unwrap());
+        }
         let acquired = outcomes
             .iter()
             .filter(|o| matches!(o, RefreshLockOutcome::Acquired))
@@ -780,40 +756,42 @@ mod tests {
         assert_eq!(held_fresh, N - 1, "remaining racers must see HeldFresh");
     }
 
-    #[test]
-    fn refresh_lock_takeover_under_concurrent_stale() {
-        // After a stale lock, race N threads. Exactly one should
-        // succeed the takeover; the rest see HeldFresh on the new
-        // holder's just-written timestamp. Validates the
-        // remove-then-retry path under contention.
-        use std::sync::Arc;
-        use std::thread;
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_lock_takeover_under_concurrent_stale() {
+        // After a stale lock, race N tasks. Exactly one should
+        // succeed the compare-and-set takeover.
         const N: usize = 8;
-        let dir = Arc::new(tempdir().unwrap());
-        let mesh = Arc::new(id());
-        let cfg = Arc::new(CoordinatorConfig {
+        let store = std::sync::Arc::new(airc_store::SqliteEventStore::in_memory().await.unwrap());
+        let mesh = std::sync::Arc::new(id());
+        let cfg = std::sync::Arc::new(CoordinatorConfig {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 100,
         });
         // Plant a stale lock (held_at_ms=0, now=10_000, window=100 → stale).
-        try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 0, 999).unwrap();
+        try_acquire_refresh_lock(&*store, &mesh, &cfg, 0, 999)
+            .await
+            .unwrap();
 
-        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
         let handles: Vec<_> = (0..N)
             .map(|i| {
-                let dir = Arc::clone(&dir);
-                let mesh = Arc::clone(&mesh);
-                let cfg = Arc::clone(&cfg);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    try_acquire_refresh_lock(dir.path(), &mesh, &cfg, 10_000, i as u32).unwrap()
+                let store = std::sync::Arc::clone(&store);
+                let mesh = std::sync::Arc::clone(&mesh);
+                let cfg = std::sync::Arc::clone(&cfg);
+                let barrier = std::sync::Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    try_acquire_refresh_lock(&*store, &mesh, &cfg, 10_000, i as u32)
+                        .await
+                        .unwrap()
                 })
             })
             .collect();
 
-        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut outcomes = Vec::with_capacity(N);
+        for handle in handles {
+            outcomes.push(handle.await.unwrap());
+        }
         let acquired = outcomes
             .iter()
             .filter(|o| matches!(o, RefreshLockOutcome::Acquired))
