@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod account_registry;
+pub mod agent_heartbeat;
 pub mod airc;
 mod broadcast_deduper;
 pub mod command_bus;
@@ -67,6 +68,10 @@ pub mod work;
 pub use account_registry::{
     AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
+};
+pub use agent_heartbeat::{
+    AgentHeartbeat, AgentLiveness, HeartbeatKind, HeartbeatTask, DEFAULT_HEARTBEAT_INTERVAL,
+    HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::Airc;
 pub use command_bus::PendingCommand;
