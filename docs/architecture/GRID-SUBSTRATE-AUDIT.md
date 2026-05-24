@@ -535,18 +535,21 @@ context.
   reading stdout until the attach marker, terminating the child, and
   asserting on the captured stream. This proves the actual attach +
   stream path instead of only the setup return.
-- **Open: cross-machine fixture is not yet emulated under CI.** Today
-  cross-machine routing relies on operator-side manual verify.
-  Phase 2 lifecycle events + Phase 4 command-bus need
-  multi-machine CI to genuinely prove they work end-to-end.
+- **Closed for LAN-shaped command traffic: cross-machine fixture is
+  emulated under CI with separate homes and no shared local-fs data
+  plane.** `airc-lib` now proves command-bus request/reply over the
+  LAN-TCP route (`request_and_reply_round_trip_over_lan_without_github`).
+  Remaining broader proof: tailnet/relay across real machines before
+  promoting the rewrite beyond local/LAN confidence.
 
 ## Immediate PR Queue
 
-1. Add lifecycle event types.
-2. Add the git/PR/kanban event adapter skeleton so agents can
+1. Add the git/PR/kanban event adapter skeleton so agents can
    subscribe to work-state changes instead of polling.
-3. Add cross-machine CI fixture shape that proves local/LAN/tailnet
-   routing without relying on GitHub for routine traffic.
+2. Add tailnet/relay CI fixture shape that proves non-LAN routing
+   without relying on GitHub for routine traffic.
+3. Promote the LAN command-bus proof into the Continuum/OpenClaw/Hermes
+   integration fixture once those consumers bind to command-bus APIs.
 
 Done or superseded:
 
@@ -566,6 +569,8 @@ Done or superseded:
   joined channels, default room, and cursors without parsing CLI prose.
 - Command-bus request/reply helpers are in `airc-lib`, with directed
   envelope targets and correlation/deadline headers.
+- Command-bus request/reply is proven over LAN-TCP with separate homes
+  and no GitHub/shared-fs data plane.
 - The e2e join harness now emulates a Monitor-shaped streaming
   consumer instead of disabling attach with `AIRC_NO_ATTACH`.
 
