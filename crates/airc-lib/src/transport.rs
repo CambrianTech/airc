@@ -60,10 +60,13 @@ impl Airc {
     }
 
     pub(crate) async fn ensure_wire_subscriber(&self, wire: &Path) -> Result<(), AircError> {
-        let mut subs = self.inner.subscribers.lock().await;
-        if subs.contains_key(wire) {
-            return Ok(());
+        {
+            let subs = self.inner.subscribers.lock().await;
+            if subs.contains_key(wire) {
+                return Ok(());
+            }
         }
+
         self.sync_account_peer_registry().await?;
         let transport = SignedTransport::new(
             LocalFsAdapter::new(wire),
@@ -83,6 +86,11 @@ impl Airc {
             .subscribe(subscription)
             .await
             .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subs = self.inner.subscribers.lock().await;
+        if subs.contains_key(wire) {
+            return Ok(());
+        }
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = self.spawn_frame_ingest(stream, Some(wire.to_path_buf()), Some(shutdown_rx));
@@ -169,10 +177,13 @@ impl Airc {
     }
 
     pub(crate) async fn ensure_lan_subscriber(&self) -> Result<(), AircError> {
-        let mut subscriber = self.inner.lan_subscriber.lock().await;
-        if subscriber.is_some() {
-            return Ok(());
+        {
+            let subscriber = self.inner.lan_subscriber.lock().await;
+            if subscriber.is_some() {
+                return Ok(());
+            }
         }
+
         let adapter = self.lan_adapter().await?;
         let transport = SignedTransport::new(
             adapter,
@@ -189,6 +200,12 @@ impl Airc {
             .subscribe(subscription)
             .await
             .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscriber = self.inner.lan_subscriber.lock().await;
+        if subscriber.is_some() {
+            return Ok(());
+        }
+
         let task = self.spawn_frame_ingest(stream, None, None);
         *subscriber = Some(FrameSubscriber { _task: task });
         Ok(())
