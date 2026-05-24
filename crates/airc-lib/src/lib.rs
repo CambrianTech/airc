@@ -58,6 +58,7 @@ mod time;
 mod transport;
 mod udp;
 mod webrtc;
+pub mod webrtc_media;
 pub mod webrtc_signaling;
 mod wire_replay;
 pub mod work;
@@ -100,6 +101,7 @@ pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,
 };
+pub use webrtc_media::{IncomingTrack, IncomingTrackHandler};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
     CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests,

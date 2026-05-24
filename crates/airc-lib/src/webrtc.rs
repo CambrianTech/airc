@@ -39,6 +39,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use webrtc::data_channel::DataChannel;
+use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState, RTCSdpType, RTCSessionDescription,
@@ -81,6 +82,8 @@ impl Airc {
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
                 .with_handler(Arc::new(OffererHandler {
+                    airc: self.clone(),
+                    remote_peer: peer_id,
                     gather_tx,
                     connected_tx,
                 }))
@@ -210,6 +213,8 @@ impl Airc {
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
                 .with_handler(Arc::new(AnswererHandler {
+                    airc: self.clone(),
+                    remote_peer: initiator,
                     gather_tx,
                     connected_tx,
                     channel_tx,
@@ -387,6 +392,8 @@ async fn wait_for_adapter_open(adapter: &WebRtcDataChannelAdapter) -> Result<(),
 }
 
 struct OffererHandler {
+    airc: Airc,
+    remote_peer: PeerId,
     gather_tx: RtcSender<()>,
     connected_tx: RtcSender<()>,
 }
@@ -404,9 +411,17 @@ impl PeerConnectionEventHandler for OffererHandler {
             let _ = self.connected_tx.try_send(());
         }
     }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        self.airc
+            .handle_incoming_webrtc_track(self.remote_peer, track)
+            .await;
+    }
 }
 
 struct AnswererHandler {
+    airc: Airc,
+    remote_peer: PeerId,
     gather_tx: RtcSender<()>,
     connected_tx: RtcSender<()>,
     channel_tx: mpsc::Sender<Arc<dyn DataChannel>>,
@@ -428,5 +443,11 @@ impl PeerConnectionEventHandler for AnswererHandler {
 
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
         let _ = self.channel_tx.send(channel).await;
+    }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        self.airc
+            .handle_incoming_webrtc_track(self.remote_peer, track)
+            .await;
     }
 }
