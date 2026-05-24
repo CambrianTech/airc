@@ -281,6 +281,44 @@ impl Airc {
         Ok(())
     }
 
+    pub(crate) async fn ensure_webrtc_subscriber(
+        &self,
+        peer_id: airc_core::PeerId,
+    ) -> Result<(), AircError> {
+        {
+            let subscribers = self.inner.webrtc_subscribers.lock().await;
+            if subscribers.contains_key(&peer_id) {
+                return Ok(());
+            }
+        }
+
+        let adapter = self.webrtc_adapter_for(peer_id).await?;
+        let transport = SignedTransport::new(
+            adapter,
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: None,
+            ..Default::default()
+        };
+        let stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscribers = self.inner.webrtc_subscribers.lock().await;
+        if subscribers.contains_key(&peer_id) {
+            return Ok(());
+        }
+
+        let task = self.spawn_frame_ingest(stream, None, None);
+        subscribers.insert(peer_id, FrameSubscriber { _task: task });
+        Ok(())
+    }
+
     /// Spawn the ingest task for a subscription stream.
     ///
     /// - `wire_for_lifecycle = Some(path)` opts the task into

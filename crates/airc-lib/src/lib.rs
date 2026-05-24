@@ -57,6 +57,7 @@ pub mod subscriptions;
 mod time;
 mod transport;
 mod udp;
+mod webrtc;
 pub mod webrtc_signaling;
 mod wire_replay;
 pub mod work;

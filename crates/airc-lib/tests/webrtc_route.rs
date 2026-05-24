@@ -1,0 +1,163 @@
+//! Integration: full WebRTC orchestration round-trip without GitHub.
+//!
+//! Two `Airc` instances on separate homes share a local-fs wire so the
+//! signaling messages can travel. Bob runs the responder via
+//! [`Airc::accept_webrtc_offers`]; Alice calls
+//! [`Airc::open_webrtc_to(bob)`] which drives the offer/answer
+//! handshake over the AIRC mesh. Once the DataChannel is open on both
+//! sides, both `replace_transport_health` with WebRTC-only so the
+//! route resolver has no other choice, then Alice sends a control
+//! event whose only viable route is `TransportKind::WebRtcDataChannel`.
+//!
+//! Uses the same gather-complete pattern as the existing
+//! `webrtc_datachannel/tests.rs` adapter tests, and the
+//! `send_frame_to_for_test` doc-hidden alias from #955 because UDP /
+//! WebRTC are only admissible for non-`DataInteractive` route
+//! classes.
+
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+use airc_lib::{
+    Airc, Body, Headers, MentionTarget, PeerSpec, TransportHealthSample, TransportHealthState,
+    TransportKind, TransportRole,
+};
+use airc_protocol::FrameKind;
+use futures::stream::StreamExt;
+use tempfile::TempDir;
+
+static CRYPTO_INIT: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+
+fn ensure_crypto_provider() {
+    let mut guard = CRYPTO_INIT.lock().unwrap();
+    if !*guard {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        *guard = true;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_orchestration_round_trip_over_mesh_signaling() {
+    ensure_crypto_provider();
+
+    let alice_home = TempDir::new().expect("alice home");
+    let bob_home = TempDir::new().expect("bob home");
+    let wire_dir = TempDir::new().expect("shared wire dir");
+    let wire_path = wire_dir.path().join("wire.jsonl");
+
+    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
+    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
+    alice
+        .add_peer(bob_spec.clone())
+        .await
+        .expect("alice trusts bob");
+    bob.add_peer(alice_spec.clone())
+        .await
+        .expect("bob trusts alice");
+
+    // Shared wire path so both scopes see each other's signaling
+    // events — matches the throughput-proof pattern from #954.
+    alice
+        .join_with_wire("webrtc-orchestration-test", wire_path.clone())
+        .await
+        .unwrap();
+    bob.join_with_wire("webrtc-orchestration-test", wire_path)
+        .await
+        .unwrap();
+
+    // Bob runs the responder before Alice initiates so the offer
+    // handshake doesn't race the accept loop.
+    bob.accept_webrtc_offers()
+        .await
+        .expect("bob spawns webrtc responder");
+
+    // Brief settle so Bob's subscriber attaches.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Alice initiates. Drives offer → gather → send → receive answer →
+    // connected → DataChannel open → adapter registered.
+    alice
+        .open_webrtc_to(bob_spec.peer_id)
+        .await
+        .expect("alice opens webrtc to bob");
+
+    // Wait until Bob has the adapter registered too — the accept loop
+    // runs in a spawned task and completes asynchronously.
+    let bob_handle = bob.clone();
+    let bob_ready = tokio::time::timeout(Duration::from_secs(20), async move {
+        loop {
+            if bob_handle.has_webrtc_channel(alice_spec.peer_id).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    bob_ready.expect("bob registered webrtc adapter for alice within 20s");
+
+    // Force route resolver to pick WebRTC — no other healthy route.
+    let webrtc_only = [TransportHealthSample {
+        kind: TransportKind::WebRtcDataChannel,
+        role: TransportRole::Direct,
+        state: TransportHealthState::Healthy,
+        rtt_ms: None,
+        success_ppm: None,
+    }];
+    alice.replace_transport_health(webrtc_only).unwrap();
+    bob.replace_transport_health(webrtc_only).unwrap();
+
+    let bob_handle = bob.clone();
+    let bob_peer_id = bob.peer_id();
+    let alice_peer_id = alice.peer_id();
+    let receiver = tokio::spawn(async move {
+        let mut stream = bob_handle.subscribe().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+                Ok(Some(Ok(event))) => {
+                    if event.peer_id == bob_peer_id {
+                        continue;
+                    }
+                    if event.peer_id != alice_peer_id {
+                        continue;
+                    }
+                    if let Some(text) = event.body.as_ref().and_then(Body::as_text) {
+                        if text == "webrtc-control-ping" {
+                            return Some(event);
+                        }
+                    }
+                }
+                Ok(Some(Err(_))) => continue,
+                Ok(None) => return None,
+                Err(_) => continue,
+            }
+        }
+        None
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut headers = Headers::new();
+    headers.insert("airc.command_kind".into(), "test.webrtc.control".into());
+    alice
+        .send_frame_to_for_test(
+            FrameKind::Event,
+            MentionTarget::Peer(bob_spec.peer_id),
+            Body::text("webrtc-control-ping"),
+            headers,
+        )
+        .await
+        .expect("alice sends event over webrtc route");
+
+    let event = receiver
+        .await
+        .expect("receiver task joined")
+        .expect("bob received webrtc-routed event within deadline");
+    assert_eq!(
+        event.body.as_ref().and_then(Body::as_text),
+        Some("webrtc-control-ping")
+    );
+}

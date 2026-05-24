@@ -43,7 +43,25 @@ impl Airc {
                     .await
                     .map_err(|error| AircError::Transport(error.to_string()))
             }
-            TransportKind::WebRtcDataChannel => Err(unwired_transport_error(route)),
+            TransportKind::WebRtcDataChannel => {
+                let target_peer = match frame.envelope.target {
+                    airc_core::transcript::MentionTarget::Peer(peer) => peer,
+                    airc_core::transcript::MentionTarget::All
+                    | airc_core::transcript::MentionTarget::Room(_) => {
+                        return Err(AircError::Route(
+                            "WebRtcDataChannel requires a Peer-directed target; \
+                             rooms/broadcasts must go over LAN-TCP or Relay"
+                                .into(),
+                        ));
+                    }
+                };
+                self.ensure_webrtc_subscriber(target_peer).await?;
+                self.webrtc_adapter_for(target_peer)
+                    .await?
+                    .send(frame)
+                    .await
+                    .map_err(|error| AircError::Transport(error.to_string()))
+            }
             TransportKind::Reticulum => Err(unwired_transport_error(route)),
             TransportKind::Relay => {
                 self.ensure_relay_subscriber().await?;
