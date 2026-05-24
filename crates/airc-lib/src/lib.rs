@@ -49,6 +49,7 @@ pub mod mesh_identity;
 mod messaging;
 mod peers;
 pub mod registry;
+mod relay;
 pub mod room;
 pub mod route;
 mod stream;

@@ -46,6 +46,9 @@ uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
 airc-daemon = { path = "../airc-daemon" }
+airc-relay = { path = "../airc-relay" }
+airc-protocol = { path = "../airc-protocol" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
