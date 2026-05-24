@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+const JOIN_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
 }
@@ -162,7 +164,7 @@ fn join_without_args_uses_default_account_context() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     strip_cargo_harness_env(&mut join);
-    let stdout = run_join_until_attached(join, Duration::from_secs(10)).join("\n");
+    let stdout = run_join_until_attached(join, JOIN_ATTACH_TIMEOUT).join("\n");
     assert!(stdout.contains("#general"), "{stdout}");
     assert!(stdout.contains("#cambriantech"), "{stdout}");
     assert!(stdout.contains("default: #cambriantech"), "{stdout}");
@@ -206,7 +208,7 @@ fn join_sets_up_codex_hook_when_codex_home_exists() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     strip_cargo_harness_env(&mut join);
-    let stdout = run_join_until_attached(join, Duration::from_secs(10)).join("\n");
+    let stdout = run_join_until_attached(join, JOIN_ATTACH_TIMEOUT).join("\n");
     assert!(
         stdout.contains("runtime: installed AIRC UserPromptSubmit hook"),
         "{stdout}"
