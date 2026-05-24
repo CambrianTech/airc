@@ -3,12 +3,13 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, local_git_events_since, pull_request_events_since, BranchName, CardCreated,
-    ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState,
-    LaneStateChanged, LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed,
-    ManagerHatReleased, Priority, PullRequestObserver, PullRequestSource, RepoId,
-    RepoPullRequestSnapshot, WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent,
-    WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
+    encode_work_event, local_git_events_since, pull_request_events_since,
+    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, ClaimHeartbeat,
+    ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged,
+    LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased,
+    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot,
+    WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
+    WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -92,6 +93,14 @@ pub struct ClaimManagerHat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseManagerHat {
     pub repo: RepoId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportAgentAvailability {
+    pub repo: RepoId,
+    pub state: AgentAvailabilityState,
+    pub note: Option<String>,
+    pub ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +301,26 @@ impl Airc {
             repo: request.repo,
             manager: self.peer_id(),
             released_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Publish this peer's current availability for a repo. This is a
+    /// coordination signal, not a permission boundary: managers and
+    /// peers use it to avoid idle lock by finding ready responders and
+    /// detecting stale/busy agents without parsing recent chat.
+    pub async fn report_agent_availability(
+        &self,
+        request: ReportAgentAvailability,
+    ) -> Result<(), AircError> {
+        let event = WorkEvent::AgentAvailabilityReported(AgentAvailabilityReported {
+            repo: request.repo,
+            peer: self.peer_id(),
+            state: request.state,
+            note: request.note,
+            ttl_ms: request.ttl_ms,
+            reported_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

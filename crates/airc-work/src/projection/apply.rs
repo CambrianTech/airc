@@ -1,17 +1,19 @@
 use crate::event::{
-    CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, GitBranchMoved,
-    GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged,
-    ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
-    PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed,
-    WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested,
-    WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased,
+    GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
+    LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
+    PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
+    WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
+    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
+    WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
 
 use super::{
-    pull_request_key, BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat, ProjectionError,
-    PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection, WorkspaceRecord,
+    pull_request_key, AgentAvailabilityRecord, BoardSnapshot, BranchTrackingRecord, LaneRecord,
+    ManagerHat, ProjectionError, PullRequestRecord, RepoTrackingRecord, StaleClaim,
+    WorkBoardProjection, WorkspaceRecord,
 };
 
 impl WorkBoardProjection {
@@ -55,6 +57,10 @@ impl WorkBoardProjection {
             WorkEvent::HygieneReportRecorded(e) => self.apply_hygiene_report_recorded(e),
             WorkEvent::ManagerHatClaimed(e) => self.apply_manager_hat_claimed(e),
             WorkEvent::ManagerHatReleased(e) => self.apply_manager_hat_released(e),
+            WorkEvent::AgentAvailabilityReported(e) => {
+                self.apply_agent_availability_reported(e);
+                Ok(())
+            }
         }
     }
 
@@ -74,6 +80,7 @@ impl WorkBoardProjection {
             repo_tracking: self.repo_tracking.values().cloned().collect(),
             pull_requests: self.pull_requests.values().cloned().collect(),
             manager_hats: self.manager_hats.values().cloned().collect(),
+            agent_availability: self.agent_availability.values().cloned().collect(),
             hygiene_reports: self.hygiene_reports.clone(),
         }
     }
@@ -400,6 +407,16 @@ impl WorkBoardProjection {
             }
         }
         Ok(())
+    }
+
+    fn apply_agent_availability_reported(&mut self, e: &AgentAvailabilityReported) {
+        self.agent_availability.insert(
+            format!("{}:{}", e.repo, e.peer),
+            AgentAvailabilityRecord {
+                report: e.clone(),
+                expires_at_ms: e.reported_at_ms + e.ttl_ms,
+            },
+        );
     }
 
     fn card_mut(&mut self, card_id: WorkCardId) -> Result<&mut WorkCard, ProjectionError> {

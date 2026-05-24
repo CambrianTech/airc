@@ -584,6 +584,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reason,
             } => work_commands::run_release(&home, card_id, claim_id, reason).await,
             WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
+            WorkAction::Availability {
+                repo,
+                state,
+                note,
+                ttl_ms,
+            } => work_commands::run_availability(&home, repo, state, note, ttl_ms).await,
         },
 
         Command::Lane(args) => match args.action {

@@ -62,6 +62,21 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 128)]
         limit: usize,
     },
+    /// Publish this agent's availability for a repo.
+    Availability {
+        /// Repository key, e.g. `CambrianTech/airc`.
+        #[arg(long)]
+        repo: String,
+        /// Availability state.
+        #[arg(long, value_enum)]
+        state: CliAvailabilityState,
+        /// Optional short note for managers/peers.
+        #[arg(long)]
+        note: Option<String>,
+        /// Availability lease duration.
+        #[arg(long, default_value_t = 600_000)]
+        ttl_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -71,4 +86,12 @@ pub enum CliPriority {
     P1,
     P2,
     P3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliAvailabilityState {
+    Ready,
+    Busy,
+    Away,
 }

@@ -1,9 +1,9 @@
 use super::*;
 use crate::event::*;
 use crate::model::{
-    BranchName, CardState, DirtyState, DrainCandidate, DrainCandidateCategory, DrainOutcome,
-    GitObjectId, PrCheckState, PrMergeState, PrReviewState, PressureLevel, Priority,
-    PullRequestRef, WorkspaceStatus,
+    AgentAvailabilityState, BranchName, CardState, DirtyState, DrainCandidate,
+    DrainCandidateCategory, DrainOutcome, GitObjectId, PrCheckState, PrMergeState, PrReviewState,
+    PressureLevel, Priority, PullRequestRef, WorkspaceStatus,
 };
 
 fn repo() -> RepoId {
@@ -60,6 +60,52 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
         .unwrap();
     assert!(projection.stale_claims(299).is_empty());
     assert_eq!(projection.stale_claims(300)[0].claim_id, claim_id);
+}
+
+#[test]
+fn availability_projection_keeps_latest_peer_state_per_repo() {
+    let repo = repo();
+    let other_repo = RepoId::new("CambrianTech/continuum").unwrap();
+    let alice = peer(41);
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::AgentAvailabilityReported(AgentAvailabilityReported {
+            repo: repo.clone(),
+            peer: alice,
+            state: AgentAvailabilityState::Ready,
+            note: Some("can review".to_string()),
+            ttl_ms: 100,
+            reported_at_ms: 10,
+        }),
+        WorkEvent::AgentAvailabilityReported(AgentAvailabilityReported {
+            repo: repo.clone(),
+            peer: alice,
+            state: AgentAvailabilityState::Busy,
+            note: Some("taking PR".to_string()),
+            ttl_ms: 50,
+            reported_at_ms: 20,
+        }),
+        WorkEvent::AgentAvailabilityReported(AgentAvailabilityReported {
+            repo: other_repo.clone(),
+            peer: alice,
+            state: AgentAvailabilityState::Ready,
+            note: None,
+            ttl_ms: 100,
+            reported_at_ms: 30,
+        }),
+    ])
+    .unwrap();
+
+    let mut availability = projection.snapshot().agent_availability;
+    availability.sort_by_key(|record| record.report.repo.to_string());
+
+    assert_eq!(availability.len(), 2);
+    assert_eq!(availability[0].report.repo, repo);
+    assert_eq!(availability[0].report.state, AgentAvailabilityState::Busy);
+    assert_eq!(availability[0].expires_at_ms, 70);
+    assert_eq!(availability[1].report.repo, other_repo);
+    assert_eq!(availability[1].report.state, AgentAvailabilityState::Ready);
+    assert_eq!(availability[1].expires_at_ms, 130);
 }
 
 #[test]

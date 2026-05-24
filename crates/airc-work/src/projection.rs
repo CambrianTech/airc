@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use airc_core::PeerId;
 
 use crate::event::{
-    GitCommitObserved, GitDirtyStateChanged, PullRequestCheckSuiteChanged,
-    PullRequestMergeStateChanged, PullRequestReviewSubmitted, WorkspaceDrainCompleted,
-    WorkspaceDrainRequested, WorkspacePressureReported,
+    AgentAvailabilityReported, GitCommitObserved, GitDirtyStateChanged,
+    PullRequestCheckSuiteChanged, PullRequestMergeStateChanged, PullRequestReviewSubmitted,
+    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspacePressureReported,
 };
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 use crate::model::{
@@ -41,6 +41,7 @@ pub struct WorkBoardProjection {
     pub(super) repo_tracking: BTreeMap<RepoId, RepoTrackingRecord>,
     pub(super) pull_requests: BTreeMap<String, PullRequestRecord>,
     pub(super) manager_hats: BTreeMap<RepoId, ManagerHat>,
+    pub(super) agent_availability: BTreeMap<String, AgentAvailabilityRecord>,
     pub(super) hygiene_reports: Vec<HygieneReport>,
 }
 
@@ -88,6 +89,7 @@ pub struct BoardSnapshot {
     pub repo_tracking: Vec<RepoTrackingRecord>,
     pub pull_requests: Vec<PullRequestRecord>,
     pub manager_hats: Vec<ManagerHat>,
+    pub agent_availability: Vec<AgentAvailabilityRecord>,
     pub hygiene_reports: Vec<HygieneReport>,
 }
 
@@ -203,6 +205,12 @@ pub struct ManagerHat {
     pub manager: PeerId,
     pub expires_at_ms: u64,
     pub claimed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAvailabilityRecord {
+    pub report: AgentAvailabilityReported,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

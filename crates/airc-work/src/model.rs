@@ -49,6 +49,14 @@ pub enum WorkspaceStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAvailabilityState {
+    Ready,
+    Busy,
+    Away,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BranchName(String);
