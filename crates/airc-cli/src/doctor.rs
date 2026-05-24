@@ -33,7 +33,8 @@
 
 use std::path::Path;
 
-use airc_daemon::{DaemonClient, LocalIdentity};
+use airc_daemon::LocalIdentity;
+use airc_ipc::DaemonClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {

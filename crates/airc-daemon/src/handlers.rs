@@ -10,14 +10,14 @@ use std::sync::Arc;
 use airc_core::{
     headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, RoomId, TranscriptCursor,
 };
+use airc_ipc::request::{
+    AddPeerRequest, InboxRequest, RemovePeerRequest, Request, SendRequest, SubscribeRequest,
+};
+use airc_ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
 use futures::stream::StreamExt;
 
-use crate::ipc::request::{
-    AddPeerRequest, InboxRequest, RemovePeerRequest, Request, SendRequest, SubscribeRequest,
-};
-use crate::ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
 use crate::state::DaemonState;
 
 /// Default `Inbox.limit` when the client doesn't pass one. Caps the

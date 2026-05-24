@@ -5,14 +5,14 @@
 //! daemon requests directly.
 
 use airc_core::{EventId, Headers, TranscriptCursor, TranscriptEvent};
-use airc_daemon::{InboxRequest, SendRequest, SubscribeRequest};
+use airc_ipc::{InboxRequest, SendRequest, SubscribeRequest};
 
 use crate::error::AircError;
 use crate::room::Room;
 use crate::Airc;
 
 impl Airc {
-    pub(crate) fn daemon_client(&self) -> Option<&airc_daemon::DaemonClient> {
+    pub(crate) fn daemon_client(&self) -> Option<&airc_ipc::DaemonClient> {
         self.inner.daemon_client.as_deref()
     }
 

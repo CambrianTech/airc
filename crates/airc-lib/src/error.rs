@@ -53,7 +53,7 @@ pub enum AircError {
     PeersStore(#[from] airc_daemon::peers_store::PeersStoreError),
 
     #[error("daemon client: {0}")]
-    DaemonClient(#[from] airc_daemon::ClientError),
+    DaemonClient(#[from] airc_ipc::ClientError),
 
     /// Transport-side I/O. Stringified because LocalFsAdapter and
     /// LanTcpAdapter return different concrete error types and a

@@ -12,37 +12,29 @@
 //!   - `server` — IPC listener + accept loop, [`run`].
 //!   - `state` — shared daemon state ([`DaemonState`]).
 //!   - `handlers` — match arms for each `Request` variant.
-//!   - `ipc` — wire-protocol types ([`Request`], [`Response`],
-//!     [`DaemonClient`]) shared by daemon and clients.
+//!   - `airc-ipc` — wire-protocol types shared by daemon and clients.
 //!
 //! Adding a new operation:
 //!
-//!   1. Add a `Request` variant in `ipc::request`.
+//!   1. Add a `Request` variant in `airc-ipc`.
 //!   2. Add a `Response` variant if it returns data.
 //!   3. Add a match arm in `handlers::dispatch`.
 //!
 //! The compiler enforces exhaustiveness — no silent gaps.
 //!
-//! Consumers (currently `airc-cli`): depend on this crate and use
-//! `DaemonClient` for RPC or `run`/`DaemonState` for hosting the
-//! daemon themselves.
+//! Consumers host the daemon through `run` / `DaemonState`. IPC client
+//! code lives in `airc-ipc` so consumer SDKs do not depend on daemon
+//! runtime internals.
 
 #![deny(unsafe_code)]
 
 pub mod handlers;
 pub mod identity;
-pub mod ipc;
 pub mod peers_store;
 pub mod server;
 pub mod state;
 
 pub use identity::{IdentityError, LocalIdentity};
 
-pub use ipc::client::{ClientError, DaemonClient};
-pub use ipc::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, RemovePeerRequest, Request, SendRequest,
-    SubscribeRequest,
-};
-pub use ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
 pub use server::{run, DaemonError};
 pub use state::DaemonState;

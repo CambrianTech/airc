@@ -76,12 +76,12 @@ fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::request::Request;
+    use crate::request::Request;
 
     #[tokio::test]
     async fn frame_round_trips_newline_bearing_payload() {
         let mut bytes = Vec::new();
-        let request = Request::Send(crate::ipc::request::SendRequest {
+        let request = Request::Send(crate::request::SendRequest {
             wire: "/tmp/airc-wire".into(),
             channel: uuid::Uuid::nil(),
             text: "first line\nsecond line".to_string(),
