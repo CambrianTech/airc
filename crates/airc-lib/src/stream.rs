@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -56,7 +56,7 @@ impl std::error::Error for LiveLag {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
     pub channel: Option<RoomId>,
-    pub channels: Vec<RoomId>,
+    pub channels: HashSet<RoomId>,
     pub kinds: BTreeSet<TranscriptKind>,
     pub headers_filter: HeaderFilter,
 }
@@ -65,7 +65,7 @@ impl Default for EventFilter {
     fn default() -> Self {
         Self {
             channel: None,
-            channels: Vec::new(),
+            channels: HashSet::new(),
             kinds: BTreeSet::new(),
             headers_filter: HeaderFilter::Any,
         }
@@ -115,5 +115,47 @@ impl Stream for FilteredEventStream {
                 Poll::Ready(None) => return Poll::Ready(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashSet};
+
+    use airc_core::{Body, ClientId, EventId, Headers, MentionTarget, PeerId};
+
+    use super::*;
+
+    fn event(room_id: RoomId, kind: TranscriptKind) -> TranscriptEvent {
+        TranscriptEvent {
+            event_id: EventId::new(),
+            room_id,
+            peer_id: PeerId::from_u128(0xa1),
+            client_id: ClientId::from_u128(0xc1),
+            kind,
+            occurred_at_ms: 1,
+            lamport: 1,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text("test")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn event_filter_uses_channel_membership_set() {
+        let admitted = RoomId::from_u128(0x01);
+        let other = RoomId::from_u128(0x02);
+        let filter = EventFilter {
+            channel: None,
+            channels: HashSet::from([admitted]),
+            kinds: BTreeSet::new(),
+            headers_filter: HeaderFilter::Any,
+        };
+
+        assert!(filter.matches(&event(admitted, TranscriptKind::Message)));
+        assert!(!filter.matches(&event(other, TranscriptKind::Message)));
     }
 }

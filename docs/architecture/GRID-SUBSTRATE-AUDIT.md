@@ -362,7 +362,9 @@ five concrete hotpaths and seven kill-list patterns.
    subscription room/wire collection. `Airc::open` uses `HashSet` for
    peer enrollment, and subscription helpers now keep deterministic
    output order while using set-backed membership instead of
-   `Vec::contains` scans.
+   `Vec::contains` scans. Live/persisted `EventFilter` channel
+   membership is also set-backed, so multi-room monitor/hook/consumer
+   streams do not pay a linear channel scan on every event.
 6. **Verification lock held across async I/O** — closed for
    `PeerKeyRegistry`. `signed.rs` verifies against the registry's
    internal concurrent map directly; there is no external lock to hold

@@ -526,7 +526,7 @@ impl Airc {
         if filter.channel.is_some() || !filter.channels.is_empty() {
             return Ok(filter);
         }
-        filter.channels = self.subscribed_room_ids().await?;
+        filter.channels = self.subscribed_room_ids().await?.into_iter().collect();
         Ok(filter)
     }
 
