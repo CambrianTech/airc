@@ -579,8 +579,14 @@ Status:
   `PullRequestMergeStateChanged` / `PullRequestReviewSubmitted`
   events. `airc-lib::Airc::observe_pull_requests` mirrors the
   `observe_local_git_workspace` shape: caller owns the source impl,
-  SDK owns the publish path. The real `gh`-CLI source is a
-  follow-up; the in-memory stub is the test source today.
+  SDK owns the publish path.
+- (#1) Real `gh`-CLI source landed: `airc-work::pull_requests::gh`
+  ships `GhPullRequestSource` over a `GhCommandRunner` trait, with a
+  shell-out `CommandGhRunner` for production and stub runners for
+  tests. Translates `gh pr list --json` rows to `PullRequestSnapshot`
+  for check + merge state; review-state translation is deferred until
+  the GitHub-login → `PeerId` mapping question has a real answer (the
+  shape is in place, it just emits empty `reviews` from this source).
 
 Done or superseded:
 
