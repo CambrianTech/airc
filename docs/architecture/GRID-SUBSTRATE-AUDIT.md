@@ -348,8 +348,10 @@ five concrete hotpaths and seven kill-list patterns.
    PeerKeyRegistry and the route resolver tables. Route health,
    advertised endpoints, and imported invites now own internal
    `DashMap` storage and are held by `Arc<Table>` at the SDK boundary.
-   Remaining global maps should follow the same internally concurrent
-   table pattern rather than exposing outer locks to callers.
+   Remaining lifecycle maps should avoid holding locks across async
+   I/O; wire/LAN subscriber setup now checks under lock, performs
+   transport setup outside the critical section, then re-checks before
+   insertion.
 3. **Full JSON file rewrites on every mutate** — removed from peer
    trust, subscriptions/default-room, account registry, and
    coordinator beacons. Keep pushing remaining config/install helpers
