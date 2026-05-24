@@ -69,6 +69,7 @@ dependencies = [
  "airc-protocol",
  "airc-store",
  "airc-transport",
+ "airc-trust",
  "base64",
  "chacha20poly1305",
  "chrono",
@@ -111,6 +112,7 @@ dependencies = [
  "airc-protocol",
  "airc-store",
  "airc-transport",
+ "airc-trust",
  "async-trait",
  "base64",
  "fs2",
@@ -157,6 +159,7 @@ dependencies = [
  "airc-protocol",
  "airc-store",
  "airc-transport",
+ "airc-trust",
  "airc-work",
  "airc-work-store",
  "async-trait",
@@ -240,6 +243,18 @@ dependencies = [
  "tokio-rustls",
  "webrtc",
  "x509-parser 0.18.1",
+]
+
+[[package]]
+name = "airc-trust"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "airc-protocol",
+ "airc-store",
+ "base64",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

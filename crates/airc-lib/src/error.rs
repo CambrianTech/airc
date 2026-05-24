@@ -50,7 +50,7 @@ pub enum AircError {
     PeerSpec(#[from] crate::registry::PeerSpecError),
 
     #[error("peers store: {0}")]
-    PeersStore(#[from] airc_daemon::peers_store::PeersStoreError),
+    PeersStore(#[from] airc_trust::PeersStoreError),
 
     #[error("daemon client: {0}")]
     DaemonClient(#[from] airc_ipc::ClientError),

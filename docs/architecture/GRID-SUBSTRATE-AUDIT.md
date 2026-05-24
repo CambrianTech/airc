@@ -386,15 +386,16 @@ methods, not a parallel JSON store. The deeper issue (lib
 naming daemon types) is still present and worth a separate
 follow-up.
 
-- **`airc-lib` imports daemon runtime internals** — PARTIALLY CLOSED
+- **`airc-lib` imports daemon runtime internals** — CLOSED
   in the IPC crate cut. `DaemonClient`, request/response enums, the
   length-framed codec, and cross-platform IPC transport now live in
   `airc-ipc`, so daemon-attached SDK mode no longer depends on the
   daemon runtime crate for IPC. The identity crate cut moved
   `LocalIdentity` / `IdentityError` into `airc-identity`, so consumers
   can open local identities without importing daemon runtime state.
-  Remaining cleanup: move peer-trust helpers behind lower-level
-  contracts so `airc-lib` stops naming `airc-daemon::peers_store`.
+  The peer-trust crate cut moved peer enrollment, removal, and signed
+  rotation into `airc-trust`, so `airc-lib` no longer names daemon
+  runtime internals for trust storage either.
 - **`airc-transport::signed` holds peer trust through
   `Arc<PeerKeyRegistry>`** — CLOSED for global-lock contention. Key
   rotation mutates the shared registry directly, so transport verifiers

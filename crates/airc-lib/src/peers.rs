@@ -1,5 +1,5 @@
 use airc_core::PeerId;
-use airc_daemon::peers_store;
+use airc_trust as peers_store;
 
 use crate::error::AircError;
 use crate::registry::PeerSpec;

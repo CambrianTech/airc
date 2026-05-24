@@ -25,12 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use airc_core::{ClientId, PeerId, TranscriptEvent};
-use airc_daemon::peers_store;
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::LanTcpAdapter;
+use airc_trust as peers_store;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::broadcast_deduper::BroadcastDeduper;

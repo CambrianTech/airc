@@ -21,13 +21,14 @@ use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
-use airc_daemon::{peers_store, run as run_daemon_server, DaemonState};
+use airc_daemon::{run as run_daemon_server, DaemonState};
 use airc_identity::LocalIdentity;
 use airc_ipc::{
     AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
 };
 use airc_lib::{Airc, Body, Headers, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
+use airc_trust as peers_store;
 
 /// `init` — open the substrate at `<home>`. `Airc::open` loads or
 /// generates the identity, opens the event store, applies any

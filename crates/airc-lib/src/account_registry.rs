@@ -258,7 +258,7 @@ impl Airc {
             peer_id: self.inner.identity.peer_id,
             pubkey: self.inner.identity.keypair.public_bytes(),
         }];
-        for stored in airc_daemon::peers_store::load(&self.inner.wire_root).await? {
+        for stored in airc_trust::load(&self.inner.wire_root).await? {
             peer_specs.push(PeerSpec {
                 peer_id: stored.peer_id,
                 pubkey: stored.pubkey_bytes()?,
@@ -304,7 +304,7 @@ impl Airc {
             if peer.peer_id() == self.inner.identity.peer_id {
                 continue;
             }
-            airc_daemon::peers_store::add(
+            airc_trust::add(
                 &self.inner.wire_root,
                 peer.peer_spec.peer_id,
                 peer.peer_spec.pubkey,
@@ -535,9 +535,7 @@ mod tests {
             .await
             .unwrap();
 
-        let peers = airc_daemon::peers_store::load(&airc.inner.wire_root)
-            .await
-            .unwrap();
+        let peers = airc_trust::load(&airc.inner.wire_root).await.unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == spec.peer_id));
         let snapshot = crate::coordinator::snapshot_store(
             airc.coordinator_store(),
@@ -576,9 +574,7 @@ mod tests {
         let refreshed = airc_b.refresh_account_registry(&store).await.unwrap();
 
         assert!(refreshed.is_some());
-        let peers = airc_daemon::peers_store::load(&airc_b.inner.wire_root)
-            .await
-            .unwrap();
+        let peers = airc_trust::load(&airc_b.inner.wire_root).await.unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
         let snapshot = crate::coordinator::snapshot_store(
             airc_b.coordinator_store(),

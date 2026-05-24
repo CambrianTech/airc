@@ -29,7 +29,6 @@
 #![deny(unsafe_code)]
 
 pub mod handlers;
-pub mod peers_store;
 pub mod server;
 pub mod state;
 
