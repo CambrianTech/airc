@@ -137,7 +137,12 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
 }
 
 fn trust_root_for_wire(wire: &Path) -> Option<PathBuf> {
-    wire.parent().and_then(Path::parent).map(Path::to_path_buf)
+    match wire.parent() {
+        Some(parent) if parent.file_name().is_some_and(|name| name == "wires") => {
+            parent.parent().map(Path::to_path_buf)
+        }
+        _ => Some(wire.to_path_buf()),
+    }
 }
 
 async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
@@ -375,6 +380,18 @@ mod tests {
         let frames = dir.path().join("frames.jsonl");
         let contents = std::fs::read_to_string(frames).unwrap();
         assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[test]
+    fn trust_root_prefers_airc_wire_root_but_accepts_raw_wire_dirs() {
+        let airc_wire = PathBuf::from("/tmp/home/.airc/wires/general");
+        assert_eq!(
+            trust_root_for_wire(&airc_wire),
+            Some(PathBuf::from("/tmp/home/.airc"))
+        );
+
+        let raw_wire = PathBuf::from("/tmp/raw-wire-dir");
+        assert_eq!(trust_root_for_wire(&raw_wire), Some(raw_wire));
     }
 
     #[tokio::test]
