@@ -539,15 +539,20 @@ context.
   emulated under CI with separate homes and no shared local-fs data
   plane.** `airc-lib` now proves command-bus request/reply over the
   LAN-TCP route (`request_and_reply_round_trip_over_lan_without_github`).
+- **Closed for relay-shaped command traffic: non-LAN fixture is
+  emulated under CI with separate homes, a real `airc-relay` server,
+  and no GitHub/shared-fs data plane.** `airc-lib` now executes the
+  Relay route directly and proves command-bus request/reply over it
+  (`request_and_reply_round_trip_over_relay_without_github_or_lan`).
   Remaining broader proof: tailnet/relay across real machines before
-  promoting the rewrite beyond local/LAN confidence.
+  promoting the rewrite beyond local/LAN/relay confidence.
 
 ## Immediate PR Queue
 
 1. Add the git/PR/kanban event adapter skeleton so agents can
    subscribe to work-state changes instead of polling.
-2. Add tailnet/relay CI fixture shape that proves non-LAN routing
-   without relying on GitHub for routine traffic.
+2. Add real-machine tailnet/relay proof that exercises the same route
+   execution across host boundaries without GitHub routine traffic.
 3. Promote the LAN command-bus proof into the Continuum/OpenClaw/Hermes
    integration fixture once those consumers bind to command-bus APIs.
 

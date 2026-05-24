@@ -38,7 +38,14 @@ impl Airc {
             TransportKind::Udp => Err(unwired_transport_error(route)),
             TransportKind::WebRtcDataChannel => Err(unwired_transport_error(route)),
             TransportKind::Reticulum => Err(unwired_transport_error(route)),
-            TransportKind::Relay => Err(unwired_transport_error(route)),
+            TransportKind::Relay => {
+                self.ensure_relay_subscriber().await?;
+                self.relay_adapter()
+                    .await?
+                    .send(frame)
+                    .await
+                    .map_err(|error| AircError::Transport(error.to_string()))
+            }
             TransportKind::Ssh => Err(unwired_transport_error(route)),
             TransportKind::GhGist => Err(unwired_transport_error(route)),
         }

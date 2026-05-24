@@ -54,6 +54,7 @@ struct Inner {
     next_sub_id: AtomicU64,
 }
 
+#[derive(Clone)]
 pub struct RelayAdapter {
     inner: Arc<Inner>,
 }

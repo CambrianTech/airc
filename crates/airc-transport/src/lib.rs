@@ -39,6 +39,7 @@ pub use lan_tcp::{
     PinnedServerVerifier, TlsConfigError,
 };
 pub use local_fs::LocalFsAdapter;
+pub use relay::{RelayAdapter, RelayClientConfig, RelayClientError};
 pub use signed::{SignedError, SignedTransport};
 pub use transport::{FrameStream, Transport};
 pub use udp::{UdpAdapter, UdpConfig, UdpError};
