@@ -120,6 +120,18 @@ theoretical architecture concerns; they showed up in normal use.
    wired into normal agent coordination so "claim lane C2" becomes an
    event/projection, not just a sentence.
 
+   **Substrate primitive landed** via `airc-lib::lane_coordination`:
+   `LaneCoordinationEvent` (action ∈ Claim/Release/Complete/BlockOn,
+   lane_id, owner peer, optional pr_number/blocked_on_lane_id),
+   stable headers (`airc.coord.kind` / `lane_id` / `pr`), publish
+   helpers (`Airc::claim_lane` / `release_lane` / `complete_lane` /
+   `block_on_lane`), query (`Airc::lane_status(lane_id, window)`),
+   and a filtered stream (`Airc::subscribe_lane_coordination`).
+   Closed the typed-primitive half. Open follow-ups: roster UI that
+   renders active claims (overlaps with flaw #2), scheduler that
+   auto-assigns unclaimed lanes, and enforcement (refuse second claim
+   while first is open).
+
 4. **System lifecycle noise pollutes normal inbox reads.**
    `WireEstablished` and `SubscriptionAdvanced` events are valuable, but
    raw `airc inbox` interleaves them with human/agent chat. During

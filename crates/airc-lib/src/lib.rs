@@ -44,6 +44,7 @@ pub mod error;
 pub mod gh_account_registry;
 pub mod join_context;
 mod lan;
+pub mod lane_coordination;
 pub mod lifecycle;
 pub mod mesh_identity;
 mod messaging;
@@ -83,6 +84,10 @@ pub use coordinator::{
 pub use error::AircError;
 pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
+pub use lane_coordination::{
+    LaneAction, LaneCoordinationEvent, LaneStatus, HEADER_COORD_KIND, HEADER_COORD_LANE_ID,
+    HEADER_COORD_PR,
+};
 pub use mesh_identity::{
     load_cached as load_cached_mesh_identity, resolve as resolve_mesh_identity,
     resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
