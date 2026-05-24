@@ -43,6 +43,7 @@ use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
 use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
 use crate::transport::{FrameSubscriber, WireSubscriber};
+use crate::webrtc_media::{IncomingTrack, IncomingTrackHandler, IncomingTrackRegistry};
 use crate::{coordinator, time};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
@@ -143,6 +144,10 @@ pub(crate) struct AircInner {
     /// registered. Dropping the PC drops the DataChannel.
     pub(crate) webrtc_peer_connections:
         Mutex<HashMap<PeerId, std::sync::Arc<dyn webrtc::peer_connection::PeerConnection>>>,
+    /// Global consumer callback for inbound WebRTC media tracks.
+    pub(crate) webrtc_incoming_track_handler: Mutex<Option<IncomingTrackHandler>>,
+    /// Runtime registry of inbound WebRTC media tracks by peer.
+    pub(crate) webrtc_incoming_tracks: IncomingTrackRegistry,
     /// Per-wire background subscriber tasks. Spawned lazily on first
     /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
     /// Held in a Mutex so concurrent calls can't double-spawn.
@@ -265,6 +270,8 @@ impl Airc {
                 webrtc_channels: Mutex::new(HashMap::new()),
                 webrtc_subscribers: Mutex::new(HashMap::new()),
                 webrtc_peer_connections: Mutex::new(HashMap::new()),
+                webrtc_incoming_track_handler: Mutex::new(None),
+                webrtc_incoming_tracks: IncomingTrackRegistry::default(),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
@@ -304,6 +311,46 @@ impl Airc {
         self.inner.daemon_client.is_some()
     }
 
+    /// Register the callback invoked when any WebRTC peer connection
+    /// negotiates an inbound media track.
+    ///
+    /// The callback is process-local runtime state. It is not
+    /// persisted because `TrackRemote` handles are live transport
+    /// objects, not replayable transcript data.
+    pub async fn set_incoming_track_handler<F>(&self, handler: F) -> Result<(), AircError>
+    where
+        F: Fn(PeerId, IncomingTrack) + Send + Sync + 'static,
+    {
+        let mut guard = self.inner.webrtc_incoming_track_handler.lock().await;
+        *guard = Some(std::sync::Arc::new(handler));
+        Ok(())
+    }
+
+    /// Return the inbound WebRTC tracks currently registered for a
+    /// peer. This is an inspection surface for consumers and tests;
+    /// media samples themselves are read through the returned
+    /// `TrackRemote` handles.
+    pub async fn incoming_tracks_for_peer(&self, peer_id: PeerId) -> Vec<IncomingTrack> {
+        self.inner
+            .webrtc_incoming_tracks
+            .tracks_for_peer(peer_id)
+            .await
+    }
+
+    pub(crate) async fn handle_incoming_webrtc_track(&self, peer_id: PeerId, track: IncomingTrack) {
+        self.inner
+            .webrtc_incoming_tracks
+            .record(peer_id, track.clone())
+            .await;
+        let handler = {
+            let guard = self.inner.webrtc_incoming_track_handler.lock().await;
+            guard.clone()
+        };
+        if let Some(handler) = handler {
+            handler(peer_id, track);
+        }
+    }
+
     fn with_daemon_client(&self, client: DaemonClient) -> Self {
         let inner = AircInner {
             home: self.inner.home.clone(),
@@ -327,6 +374,8 @@ impl Airc {
             webrtc_channels: Mutex::new(HashMap::new()),
             webrtc_subscribers: Mutex::new(HashMap::new()),
             webrtc_peer_connections: Mutex::new(HashMap::new()),
+            webrtc_incoming_track_handler: Mutex::new(None),
+            webrtc_incoming_tracks: IncomingTrackRegistry::default(),
             subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
