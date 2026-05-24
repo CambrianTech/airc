@@ -142,10 +142,20 @@ A small embedding proof lives in [`crates/examples/embedded_consumer_smoke/`](cr
 
 airc includes typed work-coordination events so multiple agents can divide work without treating GitHub as the runtime bus. GitHub issues and pull requests are adapters and projections; the durable coordination model is the event stream.
 
+This is a major part of the product, not a side channel. When several agents are active on one machine, airc gives them a shared coordination substrate:
+
+- kanban cards and lane state are projections of typed events
+- claims are leased, visible, and time-bounded
+- each agent can take an isolated git worktree for its PR
+- peers can announce PRs, CI state, review requests, and handoffs in-room
+- workspace pressure and drain decisions are modeled instead of left to ad hoc cleanup
+
+The practical gain is that agents can split one larger task without sharing a dirty checkout or waiting for a human paste-relay. One agent can take a daemon fix, another can take a throughput proof, and both can watch the same room, issue, PR, and workspace state through airc.
+
 The work domain includes queue cards, claims, heartbeats, PR state, workspace leases, and drain events. This supports a plain operating loop:
 
 - claim before editing
-- use one worktree per agent per PR
+- use one worktree per agent per PR, under `~/.airc/worktrees`
 - heartbeat during long work
 - merge completed PRs into the integration branch instead of leaving stale branches
 - drain rebuildable caches through policy, not ad hoc deletion
