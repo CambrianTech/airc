@@ -1,12 +1,12 @@
 //! IPC contract between clients and the running AIRC daemon.
 //!
 //! Wire protocol = length-prefixed CBOR frames over a local IPC
-//! primitive. On Unix that's a Unix-domain socket at
-//! `<home>/daemon.sock`. On Windows it's a named pipe
-//! (`\\.\pipe\airc-core-<home>`). The `transport` module abstracts
-//! both behind one `IpcListener` / `IpcStream` API; everything above
-//! (request/response types, dispatch, handlers) stays
-//! platform-agnostic.
+//! primitive. The CLI derives the default endpoint from the scoped
+//! home plus [`IPC_PROTOCOL_VERSION`], so protocol-incompatible
+//! daemons never share a socket. The `transport` module abstracts
+//! Unix sockets and Windows named pipes behind one `IpcListener` /
+//! `IpcStream` API; everything above (request/response types,
+//! dispatch, handlers) stays platform-agnostic.
 //!
 //! This crate intentionally contains no daemon runtime state. It is the
 //! local ABI: typed request/response enums, frame codec, cross-platform
@@ -18,6 +18,14 @@ pub mod codec;
 pub mod request;
 pub mod response;
 pub mod transport;
+
+/// Local daemon IPC ABI version.
+///
+/// Bump this when the request/response wire encoding changes in a way
+/// that an already-running daemon cannot parse. The default CLI socket
+/// includes this value so `airc join` starts a current daemon instead of
+/// connecting to a stale daemon that speaks the previous protocol.
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{

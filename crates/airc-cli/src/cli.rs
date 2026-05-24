@@ -3,7 +3,7 @@
 //! All commands default to the persisted state at `<home>` (default
 //! the current git project's `.airc`), which contains:
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600 on Unix)
-//!   - `daemon.sock`    — IPC socket for the daemon
+//!   - daemon IPC endpoint, derived from scope + IPC protocol version
 //!   - `events.sqlite`  — ORM-backed identity metadata, events, cursors, peer
 //!     trust, subscriptions, and coordinator state
 //!
@@ -85,13 +85,20 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Default Unix socket path inside `home`.
+/// Default daemon IPC endpoint for `home`.
+///
+/// The endpoint includes `airc_ipc::IPC_PROTOCOL_VERSION`. If the
+/// local daemon wire protocol changes, a new client must not talk to an
+/// old daemon that still owns the prior socket; `airc join` should start
+/// a current daemon immediately and leave stale process cleanup to the
+/// drain path.
 pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
     #[cfg(unix)]
     {
         use sha2::{Digest, Sha256};
         let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
         let mut hasher = Sha256::new();
+        hasher.update(airc_ipc::IPC_PROTOCOL_VERSION.to_be_bytes());
         hasher.update(canonical.to_string_lossy().as_bytes());
         let digest = hasher.finalize();
         let hex = digest
@@ -99,10 +106,13 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
             .take(12)
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        std::env::temp_dir().join(format!("airc-{hex}.sock"))
+        std::env::temp_dir().join(format!(
+            "airc-ipc-v{}-{hex}.sock",
+            airc_ipc::IPC_PROTOCOL_VERSION
+        ))
     }
     #[cfg(not(unix))]
-    home.join("daemon.sock")
+    home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION))
 }
 
 /// AIRC substrate CLI.
@@ -198,7 +208,7 @@ pub enum Command {
     /// subsequent short-lived CLI calls (`ping`, `msg`, `status`)
     /// don't re-load identity or re-handshake.
     Daemon {
-        /// Override the default socket path (`<home>/daemon.sock`).
+        /// Override the default daemon IPC endpoint.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -398,7 +408,7 @@ pub enum Command {
 
 #[cfg(test)]
 mod tests {
-    use super::default_home_dir_for;
+    use super::{default_home_dir_for, default_socket_path_in};
 
     #[test]
     fn default_home_uses_enclosing_airc_scope() {
@@ -431,6 +441,21 @@ mod tests {
             expected.canonicalize().unwrap()
         );
     }
+
+    #[test]
+    fn default_socket_path_is_versioned_by_ipc_protocol() {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join(".airc");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let socket = default_socket_path_in(&home);
+        let rendered = socket.to_string_lossy();
+
+        assert!(
+            rendered.contains(&format!("v{}", airc_ipc::IPC_PROTOCOL_VERSION)),
+            "socket endpoint must include IPC protocol version to avoid stale daemon protocol reuse: {rendered}"
+        );
+    }
 }
 
 #[derive(Debug, Args)]
@@ -442,13 +467,13 @@ pub struct PeerArgs {
 #[derive(Debug, Subcommand)]
 pub enum PeerAction {
     /// Enrol a peer by spec. If a daemon is running on
-    /// `<home>/daemon.sock`, also tells it via RPC so the in-memory
-    /// registry stays in sync — no daemon restart required.
+    /// the scope's default IPC endpoint, also tells it via RPC so the
+    /// in-memory registry stays in sync — no daemon restart required.
     Add {
         /// Peer spec: `<uuid>:<base64-pubkey-no-padding>` (the
         /// `peer_spec:` line from the other side's `airc init`).
         spec: PeerSpec,
-        /// Override the default socket (`<home>/daemon.sock`).
+        /// Override the default daemon IPC endpoint.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -456,7 +481,7 @@ pub enum PeerAction {
     Remove {
         /// Peer UUID to remove from the trust store.
         peer_id: String,
-        /// Override the default socket (`<home>/daemon.sock`).
+        /// Override the default daemon IPC endpoint.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
