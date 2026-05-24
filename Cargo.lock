@@ -63,6 +63,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "airc-daemon",
+ "airc-ipc",
  "airc-lib",
  "airc-protocol",
  "airc-store",
@@ -104,14 +105,27 @@ name = "airc-daemon"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-ipc",
  "airc-protocol",
  "airc-store",
  "airc-transport",
  "async-trait",
  "base64",
- "ciborium",
  "fs2",
  "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "airc-ipc"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "ciborium",
  "serde",
  "serde_json",
  "tempfile",
@@ -125,6 +139,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "airc-daemon",
+ "airc-ipc",
  "airc-protocol",
  "airc-store",
  "airc-transport",

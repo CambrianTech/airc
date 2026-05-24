@@ -67,7 +67,10 @@ pub async fn run_poll(
 
     let mut events = unread_events(&airc, &consumer_id, filter.clone(), count).await?;
     if events.is_empty() && wait_ms > 0 {
-        events = wait_for_one_event(&airc, filter, wait_ms).await?;
+        events = wait_for_one_event(&airc, filter.clone(), wait_ms).await?;
+        if events.is_empty() {
+            events = unread_events(&airc, &consumer_id, filter, count).await?;
+        }
     }
 
     if let Some(newest) = events.last() {

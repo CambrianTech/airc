@@ -20,11 +20,12 @@ use fs2::FileExt;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use airc_ipc::codec::{read_frame, write_frame};
+use airc_ipc::request::{AttachRequest, Request};
+use airc_ipc::response::Response;
+use airc_ipc::transport::{IpcListener, IpcStream};
+
 use crate::handlers::dispatch;
-use crate::ipc::codec::{read_frame, write_frame};
-use crate::ipc::request::{AttachRequest, Request};
-use crate::ipc::response::Response;
-use crate::ipc::transport::{IpcListener, IpcStream};
 use crate::state::DaemonState;
 
 /// What can go wrong running the daemon.
@@ -252,8 +253,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::client::DaemonClient;
     use airc_core::PeerId;
+    use airc_ipc::client::DaemonClient;
     use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
     use std::time::Duration;
 
@@ -343,7 +344,7 @@ mod tests {
         // (daemon's own send writes to the wire), inbox returns it.
         // Proves the daemon's send + buffered-subscribe paths
         // compose correctly.
-        use crate::ipc::request::{InboxRequest, SendRequest, SubscribeRequest};
+        use airc_ipc::request::{InboxRequest, SendRequest, SubscribeRequest};
         use tempfile::TempDir;
 
         let state = fresh_state();

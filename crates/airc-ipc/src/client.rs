@@ -13,14 +13,14 @@ use std::path::PathBuf;
 
 use tokio::time::{timeout, Duration};
 
-use crate::ipc::codec::{read_frame, write_frame};
-use crate::ipc::transport::IpcStream;
+use crate::codec::{read_frame, write_frame};
+use crate::transport::IpcStream;
 
-use crate::ipc::request::{
+use crate::request::{
     AddPeerRequest, AttachRequest, InboxRequest, RemovePeerRequest, Request, SendRequest,
     SubscribeRequest,
 };
-use crate::ipc::response::{InboxResponse, PeersResponse, Response, StatusResponse};
+use crate::response::{InboxResponse, PeersResponse, Response, StatusResponse};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 

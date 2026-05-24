@@ -8,6 +8,7 @@ members = [
     "crates/airc-work",
     "crates/airc-work-store",
     "crates/airc-relay",
+    "crates/airc-ipc",
     "crates/airc-daemon",
     "crates/airc-lib",
     "crates/airc-cli",

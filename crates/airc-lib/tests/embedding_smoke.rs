@@ -149,7 +149,7 @@ async fn attached_sdk_sends_and_pages_through_daemon() {
     let after = airc.resume_from(&event.cursor(), 10).await.unwrap();
     assert!(after.is_empty());
 
-    airc_daemon::DaemonClient::new(socket).stop().await.unwrap();
+    airc_ipc::DaemonClient::new(socket).stop().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), daemon)
         .await
         .unwrap()

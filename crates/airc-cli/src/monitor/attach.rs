@@ -2,9 +2,7 @@ use std::error::Error;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
-use airc_daemon::{
-    ipc::codec::read_frame, AttachRequest, DaemonClient, Response, SubscribeRequest,
-};
+use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, Response, SubscribeRequest};
 use airc_lib::Airc;
 use airc_protocol::HEADER_AIRC_CLIENT;
 

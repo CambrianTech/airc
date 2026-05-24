@@ -386,12 +386,13 @@ methods, not a parallel JSON store. The deeper issue (lib
 naming daemon types) is still present and worth a separate
 follow-up.
 
-- **`airc-lib` imports `airc-daemon::peers_store` + `DaemonClient`**
-  (`airc-lib/src/airc.rs:29-30`) — STILL OPEN post-Phase 3.5. The
-  library reaches into the daemon crate's internals. Clean shape:
-  trait `PersistentStore { async fn load_peers(...) }` and the
-  daemon provides an impl. Library never names daemon types.
-  Tracked for the post-3.6 cleanup phase.
+- **`airc-lib` imports daemon runtime internals** — PARTIALLY CLOSED
+  in the IPC crate cut. `DaemonClient`, request/response enums, the
+  length-framed codec, and cross-platform IPC transport now live in
+  `airc-ipc`, so daemon-attached SDK mode no longer depends on the
+  daemon runtime crate for IPC. Remaining cleanup: move identity and
+  peer-trust helpers behind lower-level contracts so `airc-lib` stops
+  naming `airc-daemon::LocalIdentity` / `airc-daemon::peers_store`.
 - **`airc-transport::signed` holds peer trust through
   `Arc<PeerKeyRegistry>`** — CLOSED for global-lock contention. Key
   rotation mutates the shared registry directly, so transport verifiers
@@ -399,9 +400,9 @@ follow-up.
   delegate can still narrow ownership further, but the hot-path
   serialization point is gone.
 - **Daemon IPC is line-delimited JSON without length-framing** —
-  CLOSED in the IPC framing cut. `airc-daemon::ipc::codec` now owns a
-  single length-prefixed CBOR frame format for request/response RPC
-  and long-lived attach streams, with a bounded max frame size.
+  CLOSED in the IPC framing cut. `airc-ipc::codec` now owns a single
+  length-prefixed CBOR frame format for request/response RPC and
+  long-lived attach streams, with a bounded max frame size.
 
 ### SeaORM perf notes (for Phase 3.5)
 

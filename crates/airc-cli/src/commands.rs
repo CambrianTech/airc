@@ -21,9 +21,9 @@ use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
-use airc_daemon::{
-    peers_store, run as run_daemon_server, AddPeerRequest, DaemonClient, DaemonState,
-    LocalIdentity, RemovePeerRequest, Request, Response, SubscribeRequest,
+use airc_daemon::{peers_store, run as run_daemon_server, DaemonState, LocalIdentity};
+use airc_ipc::{
+    AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
 };
 use airc_lib::{Airc, Body, Headers, PeerSpec};
 use airc_store::{EventStore, SqliteEventStore};
