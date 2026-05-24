@@ -257,14 +257,72 @@ fn check_binary_freshness() -> Vec<Finding> {
     };
     let canonical = exe.canonicalize().unwrap_or_else(|_| exe.clone());
 
-    // If the binary lives under a known source-tree layout, mention
-    // that — helps operators notice when the installed binary is
-    // pointing at a stale `~/.airc/src/target/...` from a different
-    // checkout. We don't have a reliable way to compare to a
-    // canonical "current" build here without baking commit metadata
-    // into the binary (TODO), so just surface the location.
-    let detail = format!("install: {}", canonical.display());
-    vec![Finding::info("binary", detail)]
+    let mut findings = vec![Finding::info(
+        "binary",
+        format!("install: {}", canonical.display()),
+    )];
+
+    // Compare the baked-in build sha (from build.rs) against the
+    // current HEAD of the install source tree. If they diverge, the
+    // installed binary is stale relative to its source checkout —
+    // running `airc update` reconciles it.
+    if !crate::build_info::is_unknown() {
+        findings.push(Finding::info(
+            "binary",
+            format!(
+                "build: {} on {}",
+                crate::build_info::COMMIT_SHORT,
+                crate::build_info::BRANCH
+            ),
+        ));
+        if let Some(source_head) = source_tree_head() {
+            if source_head == crate::build_info::COMMIT {
+                findings.push(Finding::ok(
+                    "binary",
+                    "installed binary matches source checkout HEAD",
+                ));
+            } else {
+                let short_source = &source_head[..source_head.len().min(12)];
+                findings.push(Finding::warn(
+                    "binary",
+                    format!(
+                        "installed binary drifted from source tree (binary={} source={short_source})",
+                        crate::build_info::COMMIT_SHORT
+                    ),
+                    "run `airc update` to reconcile",
+                ));
+            }
+        }
+    } else {
+        findings.push(Finding::info(
+            "binary",
+            "build sha unknown (git unavailable at compile time); skipping drift check",
+        ));
+    }
+
+    findings
+}
+
+fn source_tree_head() -> Option<String> {
+    // The install source path is conventionally `~/.airc/src` per
+    // install.sh, but we resolve it the same way `update_commands`
+    // does so the two stay aligned.
+    let source = crate::update_commands::install_source_dir().ok()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 async fn check_health(home: &Path) -> Vec<Finding> {

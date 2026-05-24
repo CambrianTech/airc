@@ -11,6 +11,7 @@
 //! auto-generate missing identity material. `VerificationPolicy::Strict`
 //! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
+mod build_info;
 mod channel_gist_cli;
 mod channel_gist_commands;
 mod cli;

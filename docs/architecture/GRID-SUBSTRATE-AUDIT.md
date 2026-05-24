@@ -105,6 +105,16 @@ theoretical architecture concerns; they showed up in normal use.
    installed CLI contract during `airc update`, and IRC-shaped verbs
    should remain the public surface when they match the product model.
 
+   **IRC-shaped commands restored** in #966 (`airc peers` / `whois`).
+   The follow-up "installed binary can reject public commands if update
+   lags" surfaced as work card 38c295b8 — closed via the
+   installed-runtime-convergence work: a `build.rs` bakes the git
+   commit + branch into the airc binary at compile time;
+   `airc version` shows the build sha; `airc doctor` compares the
+   baked-in commit against the install-source HEAD and surfaces drift
+   with a `Fix:` directive pointing at `airc update`. Skill/docs
+   generation from the live CLI contract is still open as a follow-up.
+
 2. **Peer roster is too low-level for human/agent coordination.**
    `airc peers` prints peer IDs and public keys only. It does not
    show nick, runtime kind, project scope, room subscriptions,

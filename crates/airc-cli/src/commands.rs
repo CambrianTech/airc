@@ -153,8 +153,17 @@ fn ensure_runtime_integrations() {
 pub fn run_version() -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let exe_path = exe.canonicalize().unwrap_or(exe);
-    println!("  airc {}", env!("CARGO_PKG_VERSION"));
+    println!("  airc {}", crate::build_info::PACKAGE_VERSION);
     println!("  install: {}", exe_path.display());
+    if !crate::build_info::is_unknown() {
+        println!(
+            "  build:   {} on {}",
+            crate::build_info::COMMIT_SHORT,
+            crate::build_info::BRANCH
+        );
+    } else {
+        println!("  build:   unknown (git unavailable at compile time)");
+    }
     Ok(())
 }
 

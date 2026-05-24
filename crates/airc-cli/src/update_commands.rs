@@ -150,7 +150,7 @@ fn detach_daemon(command: &mut Command) {
 #[cfg(not(unix))]
 fn detach_daemon(_command: &mut Command) {}
 
-fn install_source_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn install_source_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = env::var_os("AIRC_DIR").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
