@@ -556,16 +556,23 @@ context.
 
 ## Immediate PR Queue
 
-1. Add the git/PR/kanban event adapter skeleton so agents can
-   subscribe to work-state changes instead of polling.
-2. Add real-machine tailnet/relay proof that exercises the same route
+1. Add a real PR source adapter that feeds the landed
+   `PullRequestSource` trait from GitHub/PR state. This is work-state
+   observation, not chat transport; failures must be explicit and must
+   not degrade into GitHub-as-message-bus behavior.
+2. Add a first consumer-facing work subscription surface so agents can
+   watch work/PR/kanban events through AIRC instead of polling CLI
+   prose. This should consume typed `airc-work` events from the
+   transcript stream.
+3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
-3. Bind the same command-bus request/reply proof in real Continuum,
+4. Bind the same command-bus request/reply proof in real Continuum,
    OpenClaw, and Hermes repos once their adapters depend on `airc-lib`.
 
 Status:
 
-- (#2) Pull-request observation skeleton landed: `airc-work::pull_requests`
+- Closed: Pull-request observation skeleton landed in #947:
+  `airc-work::pull_requests`
   exposes a `PullRequestSource` trait, `PullRequestObserver`,
   per-repo snapshot type, and a snapshot-diff function that emits
   the existing `PullRequestCheckSuiteChanged` /
