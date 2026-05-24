@@ -107,9 +107,9 @@ pub use webrtc_media::{
 };
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
-    CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests,
-    ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim,
-    ReleaseWorkspace, RequestWorkspace,
+    CreateWorkLane, HeartbeatWorkClaim, HeartbeatWorkspace, ObserveLocalGitWorkspace,
+    ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
+    ReleaseWorkClaim, ReleaseWorkspace, RequestWorkspace,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core

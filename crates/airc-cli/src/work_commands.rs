@@ -1,9 +1,11 @@
 //! `airc work ...` handlers.
 //!
 //! The CLI stays intentionally thin: it parses human input, calls the
-//! consumer-facing `airc_lib::Airc` work API, and prints stable lines
-//! that other tools can scrape. Work-domain validation and event
-//! construction live in `airc-lib` / `airc-work`.
+//! consumer-facing `airc_lib::Airc` work API, and renders terminal
+//! output for humans. Integrations should call `airc-lib` / daemon IPC
+//! / ORM projections directly rather than parsing CLI output.
+//! Work-domain validation and event construction live in `airc-lib` /
+//! `airc-work`.
 
 use std::path::Path;
 
@@ -69,6 +71,23 @@ pub async fn run_release(
     Ok(())
 }
 
+pub async fn run_heartbeat(
+    home: &Path,
+    card_id: String,
+    claim_id: String,
+    ttl_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
+        card_id: parse_work_card_id(&card_id)?,
+        claim_id: parse_claim_id(&claim_id)?,
+        ttl_ms,
+    })
+    .await?;
+    println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
+    Ok(())
+}
+
 pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     let board = airc.work_board(limit).await?;
@@ -82,6 +101,7 @@ fn print_board(board: &WorkBoardProjection) {
         println!("(no work cards)");
         return;
     }
+    let stale_claims = board.stale_claims(now_ms());
 
     println!("work cards: {}", snapshot.cards.len());
     for card in &snapshot.cards {
@@ -102,6 +122,26 @@ fn print_board(board: &WorkBoardProjection) {
             title = card.title,
         );
     }
+    if !stale_claims.is_empty() {
+        println!();
+        println!("stale claims: {}", stale_claims.len());
+        for claim in stale_claims {
+            println!(
+                "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
+                card_id = claim.card_id,
+                owner = claim.owner,
+                claim_id = claim.claim_id,
+                expired_at_ms = claim.expired_at_ms,
+            );
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
