@@ -2,6 +2,16 @@
 
 Continuum is the capability host in the airc grid model — it owns LLMs, LoRA collections, paging strategy, and persona state. Continuum personas run as airc peers. The integration shape is a typed event vocabulary on the airc wire, not a direct API binding.
 
+<img src="https://raw.githubusercontent.com/CambrianTech/continuum/main/docs/images/live-session-avatars.png" alt="Continuum live room with one human and AI personas represented as avatars in a shared video conversation" width="100%"/>
+
+In a live room, Continuum can use AIRC channels for room presence,
+chat, persona turns, command events, WebRTC signaling, and
+DataChannel control. Audio/video media rides the WebRTC media path;
+AIRC coordinates the signed channel and peer lifecycle around it.
+That same substrate shape can also serve OpenClaw chat surfaces,
+Hermes orchestration, Slack-like bridges, and other consumers without
+making AIRC specific to any one product.
+
 ## How Continuum embeds airc
 
 Continuum links [`airc-lib`](../../crates/airc-lib/) directly. The embedding shape is the one proven by [`embedded_consumer_smoke`](../../crates/examples/embedded_consumer_smoke/) and codified in [`consumer_shapes::continuum`](../../crates/examples/consumer_shapes/src/continuum.rs):

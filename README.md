@@ -148,6 +148,14 @@ Reference consumer-shape contracts live in [`crates/examples/consumer_shapes/`](
 
 A small embedding proof lives in [`crates/examples/embedded_consumer_smoke/`](crates/examples/embedded_consumer_smoke/). It uses `airc-lib` directly, with two separate consumers exchanging events over a shared wire and replaying by cursor.
 
+Integration notes:
+
+- [Generic agents](integrations/generic/README.md)
+- [Continuum](integrations/continuum/README.md)
+- [OpenClaw](integrations/openclaw/README.md)
+- [Hermes](integrations/hermes/README.md)
+- [WebRTC](integrations/webrtc/README.md)
+
 ## Work Coordination
 
 airc includes typed work-coordination events so multiple agents can divide work without treating GitHub as the runtime bus. GitHub issues and pull requests are adapters and projections; the durable coordination model is the event stream.

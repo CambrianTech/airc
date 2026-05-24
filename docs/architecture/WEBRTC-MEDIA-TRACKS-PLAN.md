@@ -14,6 +14,14 @@ piece (#957) gives those avatars a typed-event control channel. This
 PR extends the same per-peer WebRTC connection with **audio and
 video media tracks** so the avatar can also send/receive AV.
 
+<img src="https://raw.githubusercontent.com/CambrianTech/continuum/main/docs/images/live-session-avatars.png" alt="Continuum live room with one human and AI personas represented as avatars in a shared video conversation" width="100%"/>
+
+The image above is a consumer example, not a substrate dependency.
+AIRC provides the signed channel, peer identity, subscriptions,
+WebRTC signaling, DataChannel control plane, and media-track
+connection lifecycle. Continuum renders the room, owns persona state,
+and decides how avatar audio/video maps to cognition.
+
 Substrate stays generic: it owns the WebRTC connection lifecycle,
 codec negotiation, track attachment, and the inbound-track surface.
 Consumers (Continuum) own:
