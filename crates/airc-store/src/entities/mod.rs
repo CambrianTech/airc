@@ -19,6 +19,8 @@
 //!     per-mesh-identity gist-id sentinel that the gh adapter uses
 //!     to recognize its own gist across publishes.
 //!   - `beacons` / `beacon_channels` — account-mesh presence.
+//!   - `refresh_locks` — store-backed singleflight for rare remote
+//!     registry refreshes.
 pub mod account_registry;
 pub mod beacon;
 pub mod beacon_channel;
@@ -27,5 +29,6 @@ pub mod local_identity;
 pub mod mesh_identity;
 pub mod peer_rotation_audit;
 pub mod peer_trust;
+pub mod refresh_lock;
 pub mod runtime_cursor;
 pub mod subscription;

@@ -34,13 +34,14 @@ use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSe
 use crate::beacon::StoredBeacon;
 use crate::entities::{
     account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
-    peer_rotation_audit, peer_trust, runtime_cursor, subscription,
+    peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, subscription,
 };
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
+use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
@@ -87,6 +88,71 @@ impl SqliteEventStore {
     /// Open an ephemeral in-memory store. Convenience for tests.
     pub async fn in_memory() -> Result<Self, StoreError> {
         Self::open("sqlite::memory:").await
+    }
+
+    pub async fn try_acquire_refresh_lock(
+        &self,
+        mesh_identity: &str,
+        now_ms: u64,
+        refresh_interval_ms: u64,
+        holder_pid: u32,
+    ) -> Result<StoredRefreshLockOutcome, StoreError> {
+        const MAX_ATTEMPTS: usize = 8;
+        let held_at_ms = u64_to_i64("refresh_locks.held_at_ms", now_ms)?;
+        let holder_pid = u64_to_i64("refresh_locks.holder_pid", holder_pid as u64)?;
+        let active = refresh_lock::ActiveModel {
+            mesh_identity: Set(mesh_identity.to_string()),
+            held_at_ms: Set(held_at_ms),
+            holder_pid: Set(holder_pid),
+        };
+        let inserted = refresh_lock::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(refresh_lock::Column::MeshIdentity)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await;
+        match inserted {
+            Ok(_) => return Ok(StoredRefreshLockOutcome::Acquired),
+            Err(sea_orm::DbErr::RecordNotInserted) => {}
+            Err(error) => return Err(StoreError::Database(error)),
+        }
+
+        for _ in 0..MAX_ATTEMPTS {
+            let Some(existing) = refresh_lock::Entity::find_by_id(mesh_identity.to_string())
+                .one(&self.db)
+                .await?
+            else {
+                continue;
+            };
+            let existing_held_at = i64_to_u64("refresh_locks.held_at_ms", existing.held_at_ms)?;
+            if now_ms.saturating_sub(existing_held_at) < refresh_interval_ms {
+                return Ok(StoredRefreshLockOutcome::HeldFresh {
+                    held_at_ms: existing_held_at,
+                });
+            }
+
+            let result = refresh_lock::Entity::update_many()
+                .col_expr(refresh_lock::Column::HeldAtMs, Expr::value(held_at_ms))
+                .col_expr(refresh_lock::Column::HolderPid, Expr::value(holder_pid))
+                .filter(refresh_lock::Column::MeshIdentity.eq(mesh_identity))
+                .filter(refresh_lock::Column::HeldAtMs.eq(existing.held_at_ms))
+                .exec(&self.db)
+                .await?;
+            if result.rows_affected == 1 {
+                return Ok(StoredRefreshLockOutcome::Acquired);
+            }
+        }
+
+        Ok(StoredRefreshLockOutcome::HeldFresh { held_at_ms: now_ms })
+    }
+
+    pub async fn release_refresh_lock(&self, mesh_identity: &str) -> Result<(), StoreError> {
+        refresh_lock::Entity::delete_by_id(mesh_identity.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     pub async fn load_peers(&self) -> Result<Vec<StoredPeer>, StoreError> {
@@ -848,6 +914,27 @@ impl EventStore for SqliteEventStore {
         }
         txn.commit().await?;
         Ok(removed)
+    }
+
+    async fn try_acquire_refresh_lock(
+        &self,
+        mesh_identity: &str,
+        now_ms: u64,
+        refresh_interval_ms: u64,
+        holder_pid: u32,
+    ) -> Result<StoredRefreshLockOutcome, StoreError> {
+        SqliteEventStore::try_acquire_refresh_lock(
+            self,
+            mesh_identity,
+            now_ms,
+            refresh_interval_ms,
+            holder_pid,
+        )
+        .await
+    }
+
+    async fn release_refresh_lock(&self, mesh_identity: &str) -> Result<(), StoreError> {
+        SqliteEventStore::release_refresh_lock(self, mesh_identity).await
     }
 }
 

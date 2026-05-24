@@ -13,6 +13,7 @@ use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
+use crate::refresh_lock::{StoredRefreshLock, StoredRefreshLockOutcome};
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
@@ -23,6 +24,7 @@ pub struct InMemoryEventStore {
     subscriptions: Mutex<Vec<StoredSubscription>>,
     mesh_identities: Mutex<BTreeMap<String, StoredMeshIdentity>>,
     beacons: Mutex<BTreeMap<(String, Uuid), StoredBeacon>>,
+    refresh_locks: Mutex<BTreeMap<String, StoredRefreshLock>>,
 }
 
 impl InMemoryEventStore {
@@ -34,6 +36,7 @@ impl InMemoryEventStore {
             subscriptions: Mutex::new(Vec::new()),
             mesh_identities: Mutex::new(BTreeMap::new()),
             beacons: Mutex::new(BTreeMap::new()),
+            refresh_locks: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -248,6 +251,44 @@ impl EventStore for InMemoryEventStore {
             }
         }
         Ok(removed)
+    }
+
+    async fn try_acquire_refresh_lock(
+        &self,
+        mesh_identity: &str,
+        now_ms: u64,
+        refresh_interval_ms: u64,
+        holder_pid: u32,
+    ) -> Result<StoredRefreshLockOutcome, StoreError> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        if let Some(existing) = locks.get(mesh_identity) {
+            if now_ms.saturating_sub(existing.held_at_ms) < refresh_interval_ms {
+                return Ok(StoredRefreshLockOutcome::HeldFresh {
+                    held_at_ms: existing.held_at_ms,
+                });
+            }
+        }
+        locks.insert(
+            mesh_identity.to_string(),
+            StoredRefreshLock {
+                mesh_identity: mesh_identity.to_string(),
+                held_at_ms: now_ms,
+                holder_pid,
+            },
+        );
+        Ok(StoredRefreshLockOutcome::Acquired)
+    }
+
+    async fn release_refresh_lock(&self, mesh_identity: &str) -> Result<(), StoreError> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        locks.remove(mesh_identity);
+        Ok(())
     }
 }
 

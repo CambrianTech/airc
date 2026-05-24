@@ -12,6 +12,7 @@ use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
+use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::subscriptions::StoredSubscription;
 
 /// Durable transcript event store.
@@ -134,4 +135,21 @@ pub trait EventStore: Send + Sync {
         mesh_identity: &str,
         peer_ids: &[airc_core::PeerId],
     ) -> Result<usize, StoreError>;
+
+    /// Try to acquire the account-registry refresh singleflight lock.
+    ///
+    /// Implementations must make the acquire/takeover decision
+    /// atomically. If the existing lock is fresher than
+    /// `refresh_interval_ms`, return `HeldFresh`; otherwise replace it
+    /// with the caller's `(now_ms, holder_pid)` and return `Acquired`.
+    async fn try_acquire_refresh_lock(
+        &self,
+        mesh_identity: &str,
+        now_ms: u64,
+        refresh_interval_ms: u64,
+        holder_pid: u32,
+    ) -> Result<StoredRefreshLockOutcome, StoreError>;
+
+    /// Release the account-registry refresh lock. Idempotent.
+    async fn release_refresh_lock(&self, mesh_identity: &str) -> Result<(), StoreError>;
 }
