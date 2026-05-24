@@ -24,7 +24,7 @@
 //! Persisted through `airc-store` ORM tables. There is no JSON
 //! sidecar for subscription/default-channel state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use airc_store::{EventStore, StoredSubscription};
@@ -539,57 +539,51 @@ impl Airc {
 
     async fn subscribed_room_ids(&self) -> Result<Vec<RoomId>, AircError> {
         let mut room_ids = Vec::new();
+        let mut seen = HashSet::new();
         let set = self.subscription_set().await?;
         for subscription in set.all() {
-            push_unique(&mut room_ids, subscription.room_id);
+            if seen.insert(subscription.room_id) {
+                room_ids.push(subscription.room_id);
+            }
         }
 
         if room_ids.is_empty() {
             let identity = self.mesh_identity().await?;
-            push_unique(
-                &mut room_ids,
-                Subscription::new_with_wire_root(
-                    &self.inner.wire_root,
-                    &identity,
-                    ChannelName::new("general").map_err(SubscriptionError::from)?,
-                )?
-                .room_id,
-            );
+            let room_id = Subscription::new_with_wire_root(
+                &self.inner.wire_root,
+                &identity,
+                ChannelName::new("general").map_err(SubscriptionError::from)?,
+            )?
+            .room_id;
+            if seen.insert(room_id) {
+                room_ids.push(room_id);
+            }
         }
         Ok(room_ids)
     }
 
     pub(crate) async fn subscribed_wires(&self) -> Result<Vec<PathBuf>, AircError> {
         let mut wires = Vec::new();
+        let mut seen = BTreeSet::new();
         let set = self.subscription_set().await?;
         for subscription in set.all() {
-            push_unique_path(&mut wires, subscription.wire.clone());
+            if seen.insert(subscription.wire.clone()) {
+                wires.push(subscription.wire.clone());
+            }
         }
         if wires.is_empty() {
             let identity = self.mesh_identity().await?;
-            push_unique_path(
-                &mut wires,
-                Subscription::new_with_wire_root(
-                    &self.inner.wire_root,
-                    &identity,
-                    ChannelName::new("general").map_err(SubscriptionError::from)?,
-                )?
-                .wire,
-            );
+            let wire = Subscription::new_with_wire_root(
+                &self.inner.wire_root,
+                &identity,
+                ChannelName::new("general").map_err(SubscriptionError::from)?,
+            )?
+            .wire;
+            if seen.insert(wire.clone()) {
+                wires.push(wire);
+            }
         }
         Ok(wires)
-    }
-}
-
-fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
-    if !items.contains(&item) {
-        items.push(item);
-    }
-}
-
-fn push_unique_path(items: &mut Vec<PathBuf>, item: PathBuf) {
-    if !items.contains(&item) {
-        items.push(item);
     }
 }
 

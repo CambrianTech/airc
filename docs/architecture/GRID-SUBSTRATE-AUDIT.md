@@ -356,8 +356,11 @@ five concrete hotpaths and seven kill-list patterns.
    toward typed store-backed or wire-payload-only boundaries.
 4. **`event.clone()` on broadcast hot path** — `Arc<TranscriptEvent>`
    internally; broadcast is `Arc::clone`.
-5. **Linear scans for dedup** — `enrolled.contains`, subscriptions
-   iteration. HashSet / indexed lookup.
+5. **Linear scans for dedup** — closed for peer startup dedup and
+   subscription room/wire collection. `Airc::open` uses `HashSet` for
+   peer enrollment, and subscription helpers now keep deterministic
+   output order while using set-backed membership instead of
+   `Vec::contains` scans.
 6. **Verification lock held across async I/O** — closed for
    `PeerKeyRegistry`. `signed.rs` verifies against the registry's
    internal concurrent map directly; there is no external lock to hold
