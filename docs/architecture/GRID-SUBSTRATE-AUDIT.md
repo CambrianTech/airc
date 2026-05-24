@@ -414,6 +414,13 @@ follow-up.
   socket; `airc join` starts the current daemon on the current endpoint
   and old scoped daemons become drain candidates instead of blocking
   normal use.
+- **Shared account wires can outpace daemon trust** — CLOSED in the
+  daemon trust-refresh cut. A daemon now registers each subscribed
+  wire's root trust store, refreshes the ORM-backed peer rows before
+  subscription, and keeps that verifier cache synchronized while the
+  daemon runs. Sibling project scopes can publish their durable
+  identity into the shared account wire without requiring a restart or
+  a coincidental CLI command to resync the live verifier.
 
 ### SeaORM perf notes (for Phase 3.5)
 
@@ -574,7 +581,13 @@ context.
    transcript stream.
 3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
-4. Bind the same command-bus request/reply proof in real Continuum,
+4. Add a consumer-throughput proof for Continuum-shaped live traffic:
+   synthetic room producers at configurable Hz, subscribers in separate
+   scopes first and separate Tailnet/LAN hosts next, with p50/p99
+   latency and drop-rate assertions. This is the proof for pose/avatar
+   streams, fast persona room events, and other high-rate consumers;
+   command-bus request/reply tests are not enough.
+5. Bind the same command-bus request/reply proof in real Continuum,
    OpenClaw, and Hermes repos once their adapters depend on `airc-lib`.
 
 Status:

@@ -30,7 +30,7 @@ base64 = "0.22"
 futures = "0.3"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4", "v5"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

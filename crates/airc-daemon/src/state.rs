@@ -13,9 +13,9 @@
 //! semantics + no cross-room leakage).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Mutex, Notify};
 
@@ -23,6 +23,10 @@ use airc_core::PeerId;
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::EventStore;
 use airc_transport::{LocalFsAdapter, SignedTransport};
+
+use crate::trust_refresh;
+
+const TRUST_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 /// Everything a daemon needs at runtime. Cheap to clone via Arc; the
 /// underlying handles (registry, transports, store) do their own
@@ -49,6 +53,11 @@ pub struct DaemonState {
     /// is idempotent — repeated calls find the wire here and skip
     /// the spawn.
     pub subscribed_wires: Mutex<HashMap<PathBuf, ()>>,
+    /// Trust roots already watched by this daemon. Each root is an
+    /// AIRC home/store whose peer trust rows should feed the live
+    /// verifier. This is separate from `subscribed_wires`: many wires
+    /// can share one root.
+    pub trusted_roots: Mutex<HashMap<PathBuf, ()>>,
     /// Authoritative live fan-out for daemon consumers.
     pub live_tx: broadcast::Sender<airc_core::TranscriptEvent>,
     /// Notified when the daemon should stop accepting + exit cleanly.
@@ -79,6 +88,7 @@ impl DaemonState {
             local_fs_transports: Mutex::new(HashMap::new()),
             event_store,
             subscribed_wires: Mutex::new(HashMap::new()),
+            trusted_roots: Mutex::new(HashMap::new()),
             live_tx,
             shutdown: Notify::new(),
         }
@@ -125,6 +135,45 @@ impl DaemonState {
         let handle = Arc::new(signed);
         transports.insert(key, handle.clone());
         handle
+    }
+
+    /// Start live verifier synchronization for `root` if this daemon
+    /// is not already watching it. Returns true when a new watcher was
+    /// registered. The caller should refresh once before subscribing;
+    /// the watcher keeps later sibling-scope trust additions visible.
+    pub async fn register_trust_root(&self, root: &Path) -> bool {
+        let mut roots = self.trusted_roots.lock().await;
+        if roots.contains_key(root) {
+            return false;
+        }
+        roots.insert(root.to_path_buf(), ());
+        true
+    }
+
+    pub async fn refresh_trust_root(
+        &self,
+        root: &Path,
+    ) -> Result<usize, trust_refresh::TrustRefreshError> {
+        trust_refresh::refresh_root(self.registry.clone(), root).await
+    }
+
+    pub fn spawn_trust_refresher(self: &Arc<Self>, root: PathBuf) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = state.shutdown.notified() => break,
+                    _ = tokio::time::sleep(TRUST_REFRESH_INTERVAL) => {
+                        if let Err(error) = state.refresh_trust_root(&root).await {
+                            eprintln!(
+                                "daemon trust refresh failed for {}: {error}",
+                                root.display()
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn uptime_seconds(&self) -> u64 {
