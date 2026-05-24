@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
@@ -26,6 +27,7 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
     let mut sandbox = Sandbox::new();
 
     println!("airc: attached to Rust event stream for subscribed channels");
+    std::io::stdout().flush()?;
     loop {
         let Some(response) = read_frame::<_, Response>(&mut stream).await? else {
             return Ok(());
