@@ -779,8 +779,12 @@ name = "consumer-shapes"
 version = "0.1.0"
 dependencies = [
  "airc-lib",
+ "futures",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
