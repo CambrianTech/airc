@@ -19,7 +19,7 @@
 //! # Ok(()) }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,6 +32,7 @@ use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::LanTcpAdapter;
 use tokio::sync::{broadcast, Mutex};
 
+use crate::broadcast_deduper::BroadcastDeduper;
 use crate::error::AircError;
 use crate::join_context::JoinContext;
 use crate::mesh_identity;
@@ -143,7 +144,7 @@ pub(crate) struct AircInner {
     /// local identity row, so two processes on the same AIRC_HOME
     /// share it and the equality check would (incorrectly) suppress
     /// the cross-process peer's frames as "our own."
-    pub(crate) recently_broadcast: std::sync::Mutex<std::collections::VecDeque<airc_core::EventId>>,
+    pub(crate) recently_broadcast: std::sync::Mutex<BroadcastDeduper>,
 }
 
 /// Capacity of the recently-broadcast ring. Sized to a multiple of
@@ -206,12 +207,11 @@ impl Airc {
         registry
             .enrol(identity.peer_id, 0, identity.keypair.public_bytes())
             .map_err(|e| AircError::Crypto(e.to_string()))?;
-        let mut enrolled = vec![identity.peer_id];
+        let mut enrolled = HashSet::from([identity.peer_id]);
         for stored in load_peer_registries(&home, &wire_root).await? {
-            if enrolled.contains(&stored.peer_id) {
+            if !enrolled.insert(stored.peer_id) {
                 continue;
             }
-            enrolled.push(stored.peer_id);
             registry
                 .enrol(
                     stored.peer_id,
@@ -243,9 +243,9 @@ impl Airc {
                 lan_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
-                recently_broadcast: std::sync::Mutex::new(
-                    std::collections::VecDeque::with_capacity(RECENTLY_BROADCAST_CAPACITY),
-                ),
+                recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
+                    RECENTLY_BROADCAST_CAPACITY,
+                )),
             }),
         })
     }
@@ -258,14 +258,7 @@ impl Airc {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if ring.contains(&event_id) {
-            return false;
-        }
-        if ring.len() >= RECENTLY_BROADCAST_CAPACITY {
-            ring.pop_front();
-        }
-        ring.push_back(event_id);
-        true
+        ring.mark(event_id)
     }
 
     /// Return the home directory backing this handle.
@@ -305,7 +298,7 @@ impl Airc {
             lan_subscriber: Mutex::new(None),
             subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
-            recently_broadcast: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
             )),
         };
