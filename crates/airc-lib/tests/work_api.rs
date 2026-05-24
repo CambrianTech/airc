@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use airc_lib::{
     Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
-    CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatWorkspace, LaneState,
+    ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatWorkspace, LaneState,
     ObserveLocalGitWorkspace, Priority, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
     RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
 };
@@ -141,6 +141,121 @@ async fn claim_and_release_work_card_round_trip_through_projection() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn claimable_work_suggests_open_priority_cards_without_stdout_parsing() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("claimable-work-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    let p0 = airc
+        .create_work_card(CreateWorkCard {
+            repo: repo.clone(),
+            title: "take this first".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let p1 = airc
+        .create_work_card(CreateWorkCard {
+            repo: repo.clone(),
+            title: "take this second".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let p2 = airc
+        .create_work_card(CreateWorkCard {
+            repo,
+            title: "lower priority".to_string(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let claimed = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "already claimed".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    airc.claim_work_card(ClaimWorkCard {
+        card_id: claimed,
+        ttl_ms: 60_000,
+    })
+    .await
+    .unwrap();
+
+    let claimable = airc
+        .claimable_work(ClaimableWorkQuery {
+            event_limit: 128,
+            ..ClaimableWorkQuery::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<WorkCardId> = claimable.iter().map(|item| item.card.card_id).collect();
+    assert_eq!(ids, vec![p0, p1]);
+    assert!(!ids.contains(&p2));
+    assert!(!ids.contains(&claimed));
+}
+
+#[tokio::test]
+async fn claimable_work_can_surface_stale_claims_for_recovery() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("claimable-stale-api").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "recover stale claim".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let claim_id = airc
+        .claim_work_card(ClaimWorkCard { card_id, ttl_ms: 1 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let hidden = airc
+        .claimable_work(ClaimableWorkQuery {
+            include_stale_claims: false,
+            event_limit: 128,
+            ..ClaimableWorkQuery::default()
+        })
+        .await
+        .unwrap();
+    assert!(hidden.is_empty());
+
+    let visible = airc
+        .claimable_work(ClaimableWorkQuery {
+            include_stale_claims: true,
+            event_limit: 128,
+            ..ClaimableWorkQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].card.card_id, card_id);
+    assert_eq!(
+        visible[0].stale_claim.as_ref().map(|claim| claim.claim_id),
+        Some(claim_id)
+    );
 }
 
 #[tokio::test]

@@ -62,6 +62,24 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 128)]
         limit: usize,
     },
+    /// Suggest claimable work for this agent.
+    Next {
+        /// Optional repository filter, e.g. `CambrianTech/airc`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Highest priority to include.
+        #[arg(long, value_enum, default_value = "p1")]
+        max_priority: CliPriority,
+        /// Include expired claims as recoverable work.
+        #[arg(long)]
+        include_stale: bool,
+        /// Maximum suggestions to print.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Recent transcript events to replay into the projection.
+        #[arg(long, default_value_t = 512)]
+        event_limit: usize,
+    },
     /// Publish this agent's availability for a repo.
     Availability {
         /// Repository key, e.g. `CambrianTech/airc`.

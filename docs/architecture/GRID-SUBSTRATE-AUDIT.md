@@ -706,6 +706,11 @@ context.
    watch work/PR/kanban events through AIRC instead of polling CLI
    prose. This should consume typed `airc-work` events from the
    transcript stream.
+   - First slice landed: `Airc::claimable_work(ClaimableWorkQuery)`
+     returns typed claimable-card suggestions for agents/monitors,
+     and `airc work next` is only a terminal wrapper around that SDK
+     call. Default policy surfaces open P0/P1 work; callers can opt
+     into stale-claim recovery.
 3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
 4. Add a consumer-throughput proof for Continuum-shaped live traffic:

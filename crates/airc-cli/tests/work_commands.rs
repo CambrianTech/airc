@@ -141,6 +141,48 @@ fn work_availability_projects_to_board() {
 }
 
 #[test]
+fn work_next_suggests_claimable_priority_cards() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let p0 = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "claimable p0",
+            "--priority",
+            "p0",
+        ],
+    );
+    let p0_id = extract_field(&p0, "card_id:").expect("p0 card id");
+    let p2 = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "lower p2",
+            "--priority",
+            "p2",
+        ],
+    );
+    let p2_id = extract_field(&p2, "card_id:").expect("p2 card id");
+
+    let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(next.contains("claimable work: 1"), "{next}");
+    assert!(next.contains(p0_id), "{next}");
+    assert!(next.contains("claimable p0"), "{next}");
+    assert!(!next.contains(p2_id), "{next}");
+}
+
+#[test]
 fn lane_create_status_and_state_drive_work_projection() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");

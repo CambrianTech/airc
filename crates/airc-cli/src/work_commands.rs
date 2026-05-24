@@ -95,6 +95,46 @@ pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+pub async fn run_next(
+    home: &Path,
+    repo: Option<String>,
+    max_priority: CliPriority,
+    include_stale: bool,
+    limit: usize,
+    event_limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let query = airc_lib::ClaimableWorkQuery {
+        repo: repo.map(RepoId::new).transpose()?,
+        max_priority: max_priority.into(),
+        include_stale_claims: include_stale,
+        event_limit,
+        limit,
+    };
+    let items = airc.claimable_work(query).await?;
+    if items.is_empty() {
+        println!("(no claimable work)");
+        return Ok(());
+    }
+
+    println!("claimable work: {}", items.len());
+    for item in items {
+        let stale = item
+            .stale_claim
+            .as_ref()
+            .map(|claim| format!("stale_claim={} owner={}", claim.claim_id, claim.owner))
+            .unwrap_or_else(|| "open".to_string());
+        println!(
+            "{card_id}  {priority:?}  repo={repo}  {stale}  title={title}",
+            card_id = item.card.card_id,
+            priority = item.card.priority,
+            repo = item.card.repo,
+            title = item.card.title,
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_availability(
     home: &Path,
     repo: String,

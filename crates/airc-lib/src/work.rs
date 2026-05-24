@@ -7,8 +7,8 @@ use airc_work::{
     AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, ClaimHeartbeat,
     ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged,
     LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased,
-    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot,
-    WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
+    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot, StaleClaim,
+    WorkBoardProjection, WorkCard, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
     WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
@@ -101,6 +101,39 @@ pub struct ReportAgentAvailability {
     pub state: AgentAvailabilityState,
     pub note: Option<String>,
     pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimableWorkQuery {
+    pub repo: Option<RepoId>,
+    pub max_priority: Priority,
+    pub include_stale_claims: bool,
+    pub event_limit: usize,
+    pub limit: usize,
+}
+
+impl Default for ClaimableWorkQuery {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            max_priority: Priority::P1,
+            include_stale_claims: false,
+            event_limit: 512,
+            limit: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimableWorkItem {
+    pub card: WorkCard,
+    pub stale_claim: Option<StaleClaim>,
+}
+
+impl ClaimableWorkItem {
+    pub fn is_stale_claim(&self) -> bool {
+        self.stale_claim.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +433,51 @@ impl Airc {
         self.ensure_room_subscriber(&room).await?;
         let store = WorkEventStore::new(self.event_store());
         Ok(store.project_recent(Some(room.channel), limit).await?)
+    }
+
+    /// Return work cards this peer could reasonably take next. This
+    /// is the typed scheduling surface agents/monitors should use
+    /// instead of scraping `airc work board` output.
+    pub async fn claimable_work(
+        &self,
+        query: ClaimableWorkQuery,
+    ) -> Result<Vec<ClaimableWorkItem>, AircError> {
+        let board = self.work_board(query.event_limit).await?;
+        let stale_claims = board.stale_claims(now_ms()?);
+        let snapshot = board.snapshot();
+
+        let mut items = Vec::new();
+        for card in snapshot.cards {
+            if card.priority > query.max_priority {
+                continue;
+            }
+            if query.repo.as_ref().is_some_and(|repo| &card.repo != repo) {
+                continue;
+            }
+
+            let stale_claim = stale_claims
+                .iter()
+                .find(|claim| claim.card_id == card.card_id)
+                .cloned();
+            let open = card.state == airc_work::CardState::Open && card.claim_id.is_none();
+            let stale_claimable = query.include_stale_claims && stale_claim.is_some();
+            if !open && !stale_claimable {
+                continue;
+            }
+
+            items.push(ClaimableWorkItem { card, stale_claim });
+        }
+
+        items.sort_by(|left, right| {
+            left.card
+                .priority
+                .cmp(&right.card.priority)
+                .then_with(|| right.is_stale_claim().cmp(&left.is_stale_claim()))
+                .then_with(|| left.card.updated_at_ms.cmp(&right.card.updated_at_ms))
+                .then_with(|| left.card.card_id.cmp(&right.card.card_id))
+        });
+        items.truncate(query.limit);
+        Ok(items)
     }
 
     async fn publish_work_event(&self, event: &WorkEvent) -> Result<EventId, AircError> {
