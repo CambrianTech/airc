@@ -10,6 +10,7 @@
 //! can build typed request/reply on top of `Airc::request` +
 //! `Airc::reply` + `Airc::await_reply`.
 
+use std::net::SocketAddr;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,108 @@ fn request_and_reply_round_trip_via_shared_wire() {
         runtime.block_on(async {
             round_trip_inner(machine.path()).await;
         });
+    });
+}
+
+#[test]
+fn request_and_reply_round_trip_over_lan_without_github() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let alice_home = TempDir::new().expect("alice home");
+        let bob_home = TempDir::new().expect("bob home");
+
+        let alice = Airc::open(alice_home.path()).await.expect("alice opens");
+        let bob = Airc::open(bob_home.path()).await.expect("bob opens");
+
+        let alice_spec = alice.peer_spec().parse().expect("alice peer spec");
+        let bob_spec = bob.peer_spec().parse().expect("bob peer spec");
+        alice.add_peer(bob_spec).await.expect("alice trusts bob");
+        bob.add_peer(alice_spec).await.expect("bob trusts alice");
+
+        alice.join("command-bus-lan-test").await.unwrap();
+        bob.join("command-bus-lan-test").await.unwrap();
+
+        let bob_addr = bob
+            .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bob listens on LAN");
+        alice
+            .connect_lan(bob_addr, bob.peer_id())
+            .await
+            .expect("alice connects to bob over LAN");
+
+        let bob_handle = bob.clone();
+        let handler = tokio::spawn(async move {
+            let mut stream = bob_handle.subscribe().await.unwrap();
+            loop {
+                match stream.next().await {
+                    Some(Ok(event)) => {
+                        let Some(correlation) = event.headers.get(HEADER_AIRC_CORRELATION_ID)
+                        else {
+                            continue;
+                        };
+                        let Some(reply_to) = event.headers.get(HEADER_AIRC_REPLY_TO) else {
+                            continue;
+                        };
+                        if event.peer_id == bob_handle.peer_id() {
+                            continue;
+                        }
+                        let correlation_id =
+                            Uuid::parse_str(correlation).expect("valid correlation uuid");
+                        let reply_to_peer = PeerId::from_uuid(
+                            Uuid::parse_str(reply_to).expect("valid reply_to uuid"),
+                        );
+                        let mut headers = Headers::new();
+                        headers.insert("forge.body_hint".into(), "test.lan.result".into());
+                        bob_handle
+                            .reply(
+                                reply_to_peer,
+                                correlation_id,
+                                headers,
+                                Body::text("lan-pong"),
+                            )
+                            .await
+                            .expect("bob replies over LAN");
+                        return;
+                    }
+                    Some(Err(_)) => continue,
+                    None => return,
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut headers = Headers::new();
+        headers.insert("airc.command_kind".into(), "test.lan.ping".into());
+        let pending = alice
+            .request(
+                MentionTarget::All,
+                headers,
+                Body::text("lan-ping"),
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("alice issues LAN request");
+        let correlation_id = pending.correlation_id;
+
+        let reply = alice.await_reply(pending).await.expect("alice gets reply");
+        assert_eq!(
+            reply.target,
+            MentionTarget::Peer(alice.peer_id()),
+            "LAN reply must be directed at the requester"
+        );
+        assert_eq!(
+            reply.headers.get(HEADER_AIRC_CORRELATION_ID),
+            Some(&correlation_id.to_string()),
+            "LAN reply must preserve the correlation id"
+        );
+        assert_eq!(
+            reply.body.as_ref().and_then(Body::as_text),
+            Some("lan-pong")
+        );
+
+        handler.await.expect("handler completes");
     });
 }
 
