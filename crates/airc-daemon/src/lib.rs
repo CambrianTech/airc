@@ -12,6 +12,7 @@
 //!   - `server` — IPC listener + accept loop, [`run`].
 //!   - `state` — shared daemon state ([`DaemonState`]).
 //!   - `handlers` — match arms for each `Request` variant.
+//!   - `trust_refresh` — durable peer-trust store -> live verifier sync.
 //!   - `airc-ipc` — wire-protocol types shared by daemon and clients.
 //!
 //! Adding a new operation:
@@ -31,6 +32,7 @@
 pub mod handlers;
 pub mod server;
 pub mod state;
+pub mod trust_refresh;
 
 pub use server::{run, DaemonError};
 pub use state::DaemonState;

@@ -5,6 +5,7 @@
 //! Adding a new op = add Request variant + add arm here. The
 //! compiler enforces exhaustiveness.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use airc_core::{
@@ -54,6 +55,26 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
 }
 
 async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Response {
+    let trust_root = match trust_root_for_wire(&sub.wire) {
+        Some(root) => root,
+        None => {
+            return Response::Error {
+                message: format!("subscribe: invalid wire path {}", sub.wire.display()),
+            };
+        }
+    };
+    match state.refresh_trust_root(&trust_root).await {
+        Ok(_) => {}
+        Err(error) => {
+            return Response::Error {
+                message: format!("subscribe: trust refresh: {error}"),
+            };
+        }
+    }
+    if state.register_trust_root(&trust_root).await {
+        state.spawn_trust_refresher(trust_root);
+    }
+
     // Idempotent: if a subscriber task is already running for this
     // wire, return Ok without spawning a duplicate.
     if !state.register_subscriber(&sub.wire).await {
@@ -113,6 +134,10 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
     });
 
     Response::Ok
+}
+
+fn trust_root_for_wire(wire: &Path) -> Option<PathBuf> {
+    wire.parent().and_then(Path::parent).map(Path::to_path_buf)
 }
 
 async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
@@ -254,7 +279,9 @@ mod tests {
     use super::*;
     use airc_core::PeerId;
     use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
+    use airc_transport::{LocalFsAdapter, SignedTransport};
     use std::path::PathBuf;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn test_state() -> Arc<DaemonState> {
@@ -348,6 +375,80 @@ mod tests {
         let frames = dir.path().join("frames.jsonl");
         let contents = std::fs::read_to_string(frames).unwrap();
         assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscribed_daemon_learns_wire_root_trust_before_ingest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let wire_root = root.path().join(".airc");
+        let wire = wire_root.join("wires").join("general");
+
+        let daemon = test_state();
+        assert_eq!(
+            dispatch(
+                daemon.clone(),
+                Request::Subscribe(SubscribeRequest { wire: wire.clone() }),
+            )
+            .await,
+            Response::Ok
+        );
+
+        let sibling_peer = PeerId::from_u128(0xc1a0de);
+        let sibling_keypair = PeerKeypair::generate();
+        airc_trust::add(&wire_root, sibling_peer, sibling_keypair.public_bytes())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if daemon.registry.lookup(sibling_peer, 0).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("daemon verifier must learn sibling trust from the wire root");
+
+        let sender_registry = Arc::new(PeerKeyRegistry::new());
+        sender_registry
+            .enrol(sibling_peer, 0, sibling_keypair.public_bytes())
+            .unwrap();
+        let sender_state = DaemonState::new(
+            sibling_peer,
+            sibling_keypair.clone(),
+            sender_registry.clone(),
+            VerificationPolicy::Strict,
+            wire_root.clone(),
+            Arc::new(airc_store::InMemoryEventStore::new()),
+        );
+        let sender = SignedTransport::new(
+            LocalFsAdapter::new(&wire),
+            sibling_keypair,
+            sibling_peer,
+            sender_registry,
+            VerificationPolicy::Strict,
+        );
+        let mut live = daemon.live_tx.subscribe();
+
+        sender
+            .send(
+                build_message_frame(
+                    &sender_state,
+                    Uuid::nil(),
+                    "sibling scope frame after trust refresh",
+                    Headers::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), live.recv())
+            .await
+            .expect("daemon live stream must receive refreshed-trust frame")
+            .expect("live sender must remain open");
+        assert_eq!(event.peer_id, sibling_peer);
     }
 
     #[tokio::test]
