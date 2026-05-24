@@ -76,7 +76,7 @@ use uuid::Uuid;
 
 use airc_core::PeerId;
 
-use airc_daemon::LocalIdentity;
+use airc_identity::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction};
 use collaboration_cli::CollaborationAction;

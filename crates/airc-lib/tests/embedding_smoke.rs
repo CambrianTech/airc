@@ -9,7 +9,8 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use airc_daemon::{DaemonState, LocalIdentity};
+use airc_daemon::DaemonState;
+use airc_identity::LocalIdentity;
 use airc_lib::{
     coordinator_snapshot_store, resolve_mesh_identity_with, Airc, Body, ChannelName,
     CoordinatorConfig, EventFilter, HeaderFilter, Headers, MeshIdentity, MeshIdentitySource,

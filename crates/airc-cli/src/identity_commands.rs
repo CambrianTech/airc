@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use airc_core::identity::Identity;
-use airc_daemon::LocalIdentity;
+use airc_identity::LocalIdentity;
 use airc_store::{EventStore, SqliteEventStore};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};

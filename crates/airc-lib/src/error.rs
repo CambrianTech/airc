@@ -8,7 +8,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum AircError {
     #[error("identity: {0}")]
-    Identity(#[from] airc_daemon::IdentityError),
+    Identity(#[from] airc_identity::IdentityError),
 
     #[error("event store: {0}")]
     Store(#[from] airc_store::StoreError),

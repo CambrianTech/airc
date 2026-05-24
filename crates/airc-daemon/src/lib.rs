@@ -29,12 +29,9 @@
 #![deny(unsafe_code)]
 
 pub mod handlers;
-pub mod identity;
 pub mod peers_store;
 pub mod server;
 pub mod state;
-
-pub use identity::{IdentityError, LocalIdentity};
 
 pub use server::{run, DaemonError};
 pub use state::DaemonState;
