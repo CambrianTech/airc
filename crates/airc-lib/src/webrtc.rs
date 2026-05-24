@@ -224,7 +224,10 @@ impl Airc {
                 }
                 let initiator = event.peer_id;
                 if let Err(error) = airc.answer_offer(initiator, session_id, sdp).await {
-                    eprintln!("webrtc accept_offer failed for {initiator}: {error}");
+                    tracing::warn!(
+                        target: "airc_lib::webrtc",
+                        "webrtc accept_offer failed for {initiator}: {error}"
+                    );
                 }
             }
         });

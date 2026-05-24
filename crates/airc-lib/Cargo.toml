@@ -44,6 +44,8 @@ tokio = { version = "1", features = ["rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 rtc = "0.20.0-alpha.1"
 rtc-media = "0.20.0-alpha.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["runtime-tokio"] }
 

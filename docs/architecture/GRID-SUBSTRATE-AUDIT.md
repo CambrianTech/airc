@@ -167,6 +167,20 @@ theoretical architecture concerns; they showed up in normal use.
    channels — `airc-lib`, daemon IPC, ORM-backed projections, and AIRC
    events — not stdout/stderr parsing.
 
+   **Substrate primitive landed** via `airc-lib::diagnostic` (work card
+   49ba8abf, P1). Standardizes on `tracing` as the emission contract;
+   `AircDiagnosticLayer` is a `tracing_subscriber::Layer` that converts
+   `tracing::Event`s into typed `DiagnosticEvent` bodies and publishes
+   them as AIRC Event frames with `airc.diag.level` / `airc.diag.target`
+   headers. `Airc::install_diagnostic_subscriber` wires the layer plus a
+   background drain task that handles the async publish. Integrations
+   consume via `Airc::subscribe_diagnostics()`, not stdout/stderr. v1
+   migrates a representative subset of `eprintln!`s in `airc-lib`
+   (transport/webrtc error paths). Open follow-ups: structured-field
+   harvesting in the layer's Visit impl; wholesale migration across the
+   workspace (~429 sites); ephemeral frame kind so diagnostics don't
+   accumulate in the transcript store (composes with flaw #4).
+
 These flaws do not invalidate the substrate path. They identify the
 next product gap: the transport now works well enough that the weak
 point is coordination ergonomics, typed roster/claim state, and stale

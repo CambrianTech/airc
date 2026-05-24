@@ -367,8 +367,9 @@ impl Airc {
             };
             if let Some(wire) = wire_for_lifecycle {
                 if let Err(err) = airc.emit_wire_lost(&wire, reason).await {
-                    eprintln!(
-                        "airc-lib subscriber: wire_lost emit failed for {} ({reason}): {err}",
+                    tracing::warn!(
+                        target: "airc_lib::transport",
+                        "wire_lost emit failed for {} ({reason}): {err}",
                         wire.display()
                     );
                 }
@@ -436,7 +437,10 @@ impl Airc {
                 }
             }
             Err(err) => {
-                eprintln!("airc-lib subscriber: store append failed: {err}");
+                tracing::error!(
+                    target: "airc_lib::transport",
+                    "store append failed: {err}"
+                );
             }
         }
     }
@@ -444,7 +448,10 @@ impl Airc {
 
 fn warn_frame_verify_failed(error: &impl std::fmt::Display) {
     if std::env::var_os("AIRC_REPLAY_WARN").is_some() {
-        eprintln!("airc-lib subscriber: frame verification failed: {error}");
+        tracing::warn!(
+            target: "airc_lib::transport",
+            "frame verification failed: {error}"
+        );
     }
 }
 
