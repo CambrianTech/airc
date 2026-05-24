@@ -36,9 +36,11 @@ use airc_core::{Body, PeerId, TranscriptEvent};
 use airc_protocol::FrameKind;
 use airc_transport::webrtc_datachannel::WebRtcDataChannelAdapter;
 use futures::StreamExt;
+use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use webrtc::data_channel::DataChannel;
+use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -47,6 +49,10 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{channel as rtc_channel, default_runtime, Sender as RtcSender};
 
 use crate::error::AircError;
+use crate::webrtc_media::{
+    OpenedWebRtcConnection, OutgoingAudioTrack, OutgoingVideoTrack, PreparedOutgoingTracks,
+    WebRtcConnectionBuilder,
+};
 use crate::webrtc_signaling::{
     SignalingMessage, HEADER_WEBRTC_SIGNALING_KIND, HEADER_WEBRTC_SIGNALING_SESSION_ID,
 };
@@ -65,14 +71,40 @@ impl Airc {
     /// out. Concurrent calls for the same `peer_id` short-circuit if
     /// an adapter is already registered.
     pub async fn open_webrtc_to(&self, peer_id: PeerId) -> Result<(), AircError> {
+        self.webrtc_connection(peer_id).open().await?;
+        Ok(())
+    }
+
+    /// Build a WebRTC connection to `peer_id` with optional
+    /// pre-negotiated media tracks.
+    pub fn webrtc_connection(&self, peer_id: PeerId) -> WebRtcConnectionBuilder {
+        WebRtcConnectionBuilder::new(self.clone(), peer_id)
+    }
+
+    pub(crate) async fn open_webrtc_with_media(
+        &self,
+        peer_id: PeerId,
+        audio_tracks: Vec<OutgoingAudioTrack>,
+        video_tracks: Vec<OutgoingVideoTrack>,
+    ) -> Result<OpenedWebRtcConnection, AircError> {
+        let requested_media = !audio_tracks.is_empty() || !video_tracks.is_empty();
         {
             let guard = self.inner.webrtc_channels.lock().await;
             if guard.contains_key(&peer_id) {
+                if requested_media {
+                    return Err(AircError::Transport(
+                        "webrtc media renegotiation is not supported; \
+                         declare tracks before opening the connection"
+                            .into(),
+                    ));
+                }
                 drop(guard);
                 self.ensure_webrtc_subscriber(peer_id).await?;
-                return Ok(());
+                return Ok(OpenedWebRtcConnection::default());
             }
         }
+        let prepared_tracks = PreparedOutgoingTracks::from_configs(audio_tracks, video_tracks)?;
+        let opened = prepared_tracks.opened();
 
         let session_id = Uuid::new_v4();
         let runtime = default_runtime()
@@ -81,6 +113,7 @@ impl Airc {
         let (connected_tx, mut connected_rx) = rtc_channel::<()>(1);
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
+                .with_media_engine(default_media_engine()?)
                 .with_handler(Arc::new(OffererHandler {
                     airc: self.clone(),
                     remote_peer: peer_id,
@@ -93,6 +126,13 @@ impl Airc {
                 .await
                 .map_err(|error| AircError::Transport(format!("webrtc build: {error}")))?,
         );
+
+        for track in prepared_tracks.all_tracks() {
+            let local_track: Arc<dyn TrackLocal> = track;
+            pc.add_track(local_track)
+                .await
+                .map_err(|error| AircError::Transport(format!("webrtc add_track: {error}")))?;
+        }
 
         let channel = pc
             .create_data_channel("airc", None)
@@ -156,7 +196,7 @@ impl Airc {
         wait_for_adapter_open(&adapter).await?;
         self.register_webrtc_adapter(peer_id, adapter, pc).await?;
         self.ensure_webrtc_subscriber(peer_id).await?;
-        Ok(())
+        Ok(opened)
     }
 
     /// Spawn a long-running responder task that listens for incoming
@@ -212,6 +252,7 @@ impl Airc {
         let (channel_tx, mut channel_rx) = mpsc::channel::<Arc<dyn DataChannel>>(1);
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
+                .with_media_engine(default_media_engine()?)
                 .with_handler(Arc::new(AnswererHandler {
                     airc: self.clone(),
                     remote_peer: initiator,
@@ -389,6 +430,14 @@ async fn wait_for_adapter_open(adapter: &WebRtcDataChannelAdapter) -> Result<(),
     Err(AircError::Transport(
         "webrtc adapter did not open within deadline".to_string(),
     ))
+}
+
+fn default_media_engine() -> Result<MediaEngine, AircError> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .map_err(|error| AircError::Transport(format!("webrtc media codecs: {error}")))?;
+    Ok(media_engine)
 }
 
 struct OffererHandler {

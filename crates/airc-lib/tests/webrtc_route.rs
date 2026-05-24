@@ -19,12 +19,16 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use airc_lib::{
-    Airc, Body, Headers, MentionTarget, PeerSpec, TransportHealthSample, TransportHealthState,
-    TransportKind, TransportRole,
+    Airc, Body, Headers, MentionTarget, OutgoingAudioTrack, PeerSpec, TransportHealthSample,
+    TransportHealthState, TransportKind, TransportRole,
 };
 use airc_protocol::FrameKind;
+use bytes::Bytes;
 use futures::stream::StreamExt;
+use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use rtc_media::Sample;
 use tempfile::TempDir;
+use webrtc::media_stream::Track;
 
 static CRYPTO_INIT: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 
@@ -34,6 +38,96 @@ fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         *guard = true;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_builder_negotiates_outgoing_audio_track() {
+    ensure_crypto_provider();
+
+    let alice_home = TempDir::new().expect("alice home");
+    let bob_home = TempDir::new().expect("bob home");
+    let wire_dir = TempDir::new().expect("shared wire dir");
+    let wire_path = wire_dir.path().join("wire.jsonl");
+
+    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
+    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
+    alice
+        .add_peer(bob_spec.clone())
+        .await
+        .expect("alice trusts bob");
+    bob.add_peer(alice_spec.clone())
+        .await
+        .expect("bob trusts alice");
+
+    alice
+        .join_with_wire("webrtc-media-test", wire_path.clone())
+        .await
+        .expect("alice joins media test room");
+    bob.join_with_wire("webrtc-media-test", wire_path)
+        .await
+        .expect("bob joins media test room");
+
+    let (track_tx, track_rx) = std::sync::mpsc::channel();
+    bob.set_incoming_track_handler(move |peer_id, track| {
+        let _ = track_tx.send((peer_id, track));
+    })
+    .await
+    .expect("handler registered");
+
+    bob.accept_webrtc_offers()
+        .await
+        .expect("bob spawns webrtc responder");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let opened = alice
+        .webrtc_connection(bob_spec.peer_id)
+        .with_audio_track(OutgoingAudioTrack::new("avatar-voice", "avatar-stream"))
+        .open()
+        .await
+        .expect("alice opens media webrtc to bob");
+    assert_eq!(opened.outgoing_audio.len(), 1);
+    assert!(opened.outgoing_video.is_empty());
+    let ssrcs = opened.outgoing_audio[0].ssrcs().await;
+    let ssrc = ssrcs
+        .first()
+        .copied()
+        .expect("outgoing audio track has an ssrc");
+    opened.outgoing_audio[0]
+        .write_sample(
+            ssrc,
+            &Sample {
+                data: Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                duration: Duration::from_millis(20),
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .expect("alice writes audio sample");
+
+    let (remote_peer, track) = tokio::time::timeout(Duration::from_secs(10), async move {
+        loop {
+            if let Ok(track) = track_rx.try_recv() {
+                return track;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("bob receives inbound audio track");
+
+    assert_eq!(remote_peer, alice_spec.peer_id);
+    assert_eq!(track.kind().await, RtpCodecKind::Audio);
+    assert!(
+        !track.label().await.is_empty(),
+        "remote track should expose a label"
+    );
+
+    let registered = bob.incoming_tracks_for_peer(alice_spec.peer_id).await;
+    assert_eq!(registered.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

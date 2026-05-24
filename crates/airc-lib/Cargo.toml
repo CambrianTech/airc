@@ -42,6 +42,8 @@ serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+rtc = "0.20.0-alpha.1"
+rtc-media = "0.20.0-alpha.1"
 uuid = { version = "1", features = ["v4", "v5"] }
 webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["runtime-tokio"] }
 
@@ -49,6 +51,7 @@ webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["ru
 airc-daemon = { path = "../airc-daemon" }
 airc-relay = { path = "../airc-relay" }
 airc-protocol = { path = "../airc-protocol" }
+bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tempfile = "3"
 temp-env = "0.3"
