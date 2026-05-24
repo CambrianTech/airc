@@ -44,6 +44,23 @@ impl Airc {
             .await
     }
 
+    /// Test-only public alias for [`Airc::send_frame_to`]. Hidden
+    /// from docs because the public send surface is owned by
+    /// `say`/`request`/`reply`; this exists so transport-wiring
+    /// integration tests can target a specific `FrameKind` (and
+    /// therefore a specific `RouteClass`) without going through the
+    /// command-bus.
+    #[doc(hidden)]
+    pub async fn send_frame_to_for_test(
+        &self,
+        kind: FrameKind,
+        target: MentionTarget,
+        body: Body,
+        headers: Headers,
+    ) -> Result<EventId, AircError> {
+        self.send_frame_to(kind, target, body, headers).await
+    }
+
     pub(crate) async fn send_frame_to(
         &self,
         kind: FrameKind,

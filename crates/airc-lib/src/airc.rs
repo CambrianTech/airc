@@ -29,7 +29,7 @@ use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
-use airc_transport::{LanTcpAdapter, RelayAdapter};
+use airc_transport::{udp::UdpAdapter, LanTcpAdapter, RelayAdapter};
 use airc_trust as peers_store;
 use tokio::sync::{broadcast, Mutex};
 
@@ -128,6 +128,8 @@ pub(crate) struct AircInner {
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     pub(crate) relay: Mutex<Option<RelayAdapter>>,
     pub(crate) relay_subscriber: Mutex<Option<FrameSubscriber>>,
+    pub(crate) udp: Mutex<Option<UdpAdapter>>,
+    pub(crate) udp_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
     /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
     /// Held in a Mutex so concurrent calls can't double-spawn.
@@ -245,6 +247,8 @@ impl Airc {
                 lan_subscriber: Mutex::new(None),
                 relay: Mutex::new(None),
                 relay_subscriber: Mutex::new(None),
+                udp: Mutex::new(None),
+                udp_subscriber: Mutex::new(None),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
@@ -302,6 +306,8 @@ impl Airc {
             lan_subscriber: Mutex::new(None),
             relay: Mutex::new(None),
             relay_subscriber: Mutex::new(None),
+            udp: Mutex::new(None),
+            udp_subscriber: Mutex::new(None),
             subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(

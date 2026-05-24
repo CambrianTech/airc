@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 const EVENT_COUNT: usize = 90;
 const EVENT_HZ: u64 = 60;
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(8);
+const RECEIVE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 const CI_P99_MAX: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
@@ -58,15 +58,9 @@ async fn continuum_shaped_pose_stream_delivers_at_60hz_without_drop() {
 
     let mut stream = bob.subscribe().await.unwrap();
     let receiver = tokio::spawn(async move {
-        let deadline = Instant::now() + RECEIVE_TIMEOUT;
         let mut received = Vec::with_capacity(EVENT_COUNT);
-        while received.len() < EVENT_COUNT && Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let Some(next) = tokio::time::timeout(remaining, stream.next())
-                .await
-                .ok()
-                .flatten()
-            else {
+        while received.len() < EVENT_COUNT {
+            let Some(next) = stream.next().await else {
                 break;
             };
             let event = next.expect("live stream event must decode");
@@ -103,7 +97,10 @@ async fn continuum_shaped_pose_stream_delivers_at_60hz_without_drop() {
         tokio::time::sleep(interval).await;
     }
 
-    let received = receiver.await.expect("receiver task must join");
+    let received = tokio::time::timeout(RECEIVE_DRAIN_TIMEOUT, receiver)
+        .await
+        .expect("receiver must drain stream after sender finishes")
+        .expect("receiver task must join");
     assert_eq!(
         received.len(),
         EVENT_COUNT,
