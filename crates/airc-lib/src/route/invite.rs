@@ -47,25 +47,25 @@ impl InviteBeacon {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteEndpointTable {
-    endpoints: Vec<RouteEndpoint>,
+    endpoints: dashmap::DashMap<RouteEndpointKind, RouteEndpoint>,
 }
 
 impl RouteEndpointTable {
-    pub fn upsert(&mut self, endpoint: RouteEndpoint) {
-        match self
-            .endpoints
-            .iter_mut()
-            .find(|existing| same_endpoint_kind(existing, &endpoint))
-        {
-            Some(existing) => *existing = endpoint,
-            None => self.endpoints.push(endpoint),
-        }
+    pub fn upsert(&self, endpoint: RouteEndpoint) {
+        self.endpoints
+            .insert(RouteEndpointKind::from(&endpoint), endpoint);
     }
 
     pub fn endpoints(&self) -> Vec<RouteEndpoint> {
-        self.endpoints.clone()
+        let mut endpoints = self
+            .endpoints
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        endpoints.sort_by_key(|endpoint| RouteEndpointKind::from(endpoint));
+        endpoints
     }
 }
 
@@ -75,39 +75,34 @@ pub struct ImportedInvite {
     pub endpoints: Vec<RouteEndpoint>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ImportedInviteTable {
-    invites: Vec<ImportedInvite>,
+    invites: dashmap::DashMap<PeerId, ImportedInvite>,
 }
 
 impl ImportedInviteTable {
-    pub fn import(&mut self, beacon: InviteBeacon) {
+    pub fn import(&self, beacon: InviteBeacon) {
         let imported = ImportedInvite {
             peer_id: beacon.peer_id,
             endpoints: beacon.endpoints,
         };
-        match self
-            .invites
-            .iter_mut()
-            .find(|existing| existing.peer_id == imported.peer_id)
-        {
-            Some(existing) => *existing = imported,
-            None => self.invites.push(imported),
-        }
+        self.invites.insert(imported.peer_id, imported);
     }
 
     pub fn invites(&self) -> Vec<ImportedInvite> {
-        self.invites.clone()
+        let mut invites = self
+            .invites
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        invites.sort_by_key(|invite| invite.peer_id.to_string());
+        invites
     }
 }
 
 impl Airc {
     pub fn route_endpoints(&self) -> Result<Vec<RouteEndpoint>, AircError> {
-        self.inner
-            .route_endpoints
-            .read()
-            .map_err(|_| AircError::Route("route endpoints lock poisoned".to_string()))
-            .map(|table| table.endpoints())
+        Ok(self.inner.route_endpoints.endpoints())
     }
 
     pub fn invite_beacon(&self) -> Result<InviteBeacon, AircError> {
@@ -124,21 +119,12 @@ impl Airc {
     pub async fn import_invite_beacon(&self, beacon: InviteBeacon) -> Result<(), AircError> {
         let peer_spec = beacon.peer_spec.clone();
         self.add_peer_via(peer_spec, "invite").await?;
-        let mut invites = self
-            .inner
-            .imported_invites
-            .write()
-            .map_err(|_| AircError::Route("imported invites lock poisoned".to_string()))?;
-        invites.import(beacon);
+        self.inner.imported_invites.import(beacon);
         Ok(())
     }
 
     pub fn imported_invites(&self) -> Result<Vec<ImportedInvite>, AircError> {
-        self.inner
-            .imported_invites
-            .read()
-            .map_err(|_| AircError::Route("imported invites lock poisoned".to_string()))
-            .map(|table| table.invites())
+        Ok(self.inner.imported_invites.invites())
     }
 
     pub async fn publish_gist_invite(&self, gist_id: &str) -> Result<InviteBeacon, AircError> {
@@ -166,35 +152,32 @@ impl Airc {
     }
 
     pub(crate) fn upsert_route_endpoint(&self, endpoint: RouteEndpoint) -> Result<(), AircError> {
-        let mut endpoints = self
-            .inner
-            .route_endpoints
-            .write()
-            .map_err(|_| AircError::Route("route endpoints lock poisoned".to_string()))?;
-        endpoints.upsert(endpoint);
+        self.inner.route_endpoints.upsert(endpoint);
         Ok(())
     }
 }
 
-fn same_endpoint_kind(left: &RouteEndpoint, right: &RouteEndpoint) -> bool {
-    matches!(
-        (left, right),
-        (RouteEndpoint::LanTcp { .. }, RouteEndpoint::LanTcp { .. })
-            | (
-                RouteEndpoint::TailscaleTcp { .. },
-                RouteEndpoint::TailscaleTcp { .. }
-            )
-            | (RouteEndpoint::Udp { .. }, RouteEndpoint::Udp { .. })
-            | (RouteEndpoint::Relay { .. }, RouteEndpoint::Relay { .. })
-            | (
-                RouteEndpoint::Reticulum { .. },
-                RouteEndpoint::Reticulum { .. }
-            )
-            | (
-                RouteEndpoint::WebRtcSignaling { .. },
-                RouteEndpoint::WebRtcSignaling { .. }
-            )
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RouteEndpointKind {
+    LanTcp,
+    TailscaleTcp,
+    Udp,
+    Relay,
+    Reticulum,
+    WebRtcSignaling,
+}
+
+impl From<&RouteEndpoint> for RouteEndpointKind {
+    fn from(endpoint: &RouteEndpoint) -> Self {
+        match endpoint {
+            RouteEndpoint::LanTcp { .. } => Self::LanTcp,
+            RouteEndpoint::TailscaleTcp { .. } => Self::TailscaleTcp,
+            RouteEndpoint::Udp { .. } => Self::Udp,
+            RouteEndpoint::Relay { .. } => Self::Relay,
+            RouteEndpoint::Reticulum { .. } => Self::Reticulum,
+            RouteEndpoint::WebRtcSignaling { .. } => Self::WebRtcSignaling,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -226,7 +209,7 @@ mod tests {
 
     #[test]
     fn endpoint_table_replaces_same_transport_kind() {
-        let mut table = RouteEndpointTable::default();
+        let table = RouteEndpointTable::default();
         table.upsert(RouteEndpoint::LanTcp {
             addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
         });
@@ -244,7 +227,7 @@ mod tests {
 
     #[test]
     fn endpoint_table_tracks_udp_separately_from_lan_tcp() {
-        let mut table = RouteEndpointTable::default();
+        let table = RouteEndpointTable::default();
         table.upsert(RouteEndpoint::LanTcp {
             addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
         });
@@ -269,7 +252,7 @@ mod tests {
     fn imported_invites_are_remote_not_local_advertised_endpoints() {
         let keypair = PeerKeypair::generate();
         let peer_id = PeerId::new();
-        let mut table = ImportedInviteTable::default();
+        let table = ImportedInviteTable::default();
         table.import(InviteBeacon::new(
             peer_id,
             PeerSpec {

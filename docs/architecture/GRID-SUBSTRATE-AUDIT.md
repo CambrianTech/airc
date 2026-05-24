@@ -344,10 +344,12 @@ five concrete hotpaths and seven kill-list patterns.
    must stay store-backed. Peer trust, subscriptions, local identity
    metadata, mesh identity, account registry, runtime cursors, and
    coordinator beacons are now store-backed.
-2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry is
-   closed; route_health, route_endpoints, and imported_invites remain.
-   Switch remaining hot-path registries to `DashMap` or sharded
-   RwLock for N-reader scale.
+2. **`RwLock<HashMap>` at global granularity** — closed for
+   PeerKeyRegistry and the route resolver tables. Route health,
+   advertised endpoints, and imported invites now own internal
+   `DashMap` storage and are held by `Arc<Table>` at the SDK boundary.
+   Remaining global maps should follow the same internally concurrent
+   table pattern rather than exposing outer locks to callers.
 3. **Full JSON file rewrites on every mutate** — removed from peer
    trust, subscriptions/default-room, account registry, and
    coordinator beacons. Keep pushing remaining config/install helpers

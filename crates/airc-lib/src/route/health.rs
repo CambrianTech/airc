@@ -55,37 +55,76 @@ impl TransportHealthSample {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TransportHealthTable {
-    samples: Vec<TransportHealthSample>,
+    samples: dashmap::DashMap<(TransportKind, TransportRole), TransportHealthSample>,
 }
 
 impl TransportHealthTable {
     pub fn local_default() -> Self {
-        Self {
-            samples: vec![TransportHealthSample::healthy_direct(
-                TransportKind::LocalFs,
-            )],
+        let table = Self::default();
+        table.upsert(TransportHealthSample::healthy_direct(
+            TransportKind::LocalFs,
+        ));
+        table
+    }
+
+    pub fn replace(&self, samples: impl IntoIterator<Item = TransportHealthSample>) {
+        self.samples.clear();
+        for sample in samples {
+            self.upsert(sample);
         }
     }
 
-    pub fn replace(&mut self, samples: impl IntoIterator<Item = TransportHealthSample>) {
-        self.samples = samples.into_iter().collect();
-    }
-
-    pub fn upsert(&mut self, sample: TransportHealthSample) {
-        match self
-            .samples
-            .iter_mut()
-            .find(|existing| existing.kind == sample.kind && existing.role == sample.role)
-        {
-            Some(existing) => *existing = sample,
-            None => self.samples.push(sample),
-        }
+    pub fn upsert(&self, sample: TransportHealthSample) {
+        self.samples.insert((sample.kind, sample.role), sample);
     }
 
     pub fn samples(&self) -> Vec<TransportHealthSample> {
-        self.samples.clone()
+        let mut samples = self
+            .samples
+            .iter()
+            .map(|entry| *entry.value())
+            .collect::<Vec<_>>();
+        samples.sort_by_key(|sample| {
+            (
+                transport_kind_order(sample.kind),
+                transport_role_order(sample.role),
+            )
+        });
+        samples
+    }
+}
+
+impl Default for TransportHealthTable {
+    fn default() -> Self {
+        Self {
+            samples: dashmap::DashMap::new(),
+        }
+    }
+}
+
+fn transport_kind_order(kind: TransportKind) -> u8 {
+    match kind {
+        TransportKind::LocalFs => 0,
+        TransportKind::LanTcp => 1,
+        TransportKind::Tailscale => 2,
+        TransportKind::Udp => 3,
+        TransportKind::WebRtcDataChannel => 4,
+        TransportKind::Reticulum => 5,
+        TransportKind::Relay => 6,
+        TransportKind::Ssh => 7,
+        TransportKind::GhGist => 8,
+    }
+}
+
+fn transport_role_order(role: TransportRole) -> u8 {
+    match role {
+        TransportRole::Direct => 0,
+        TransportRole::Relay => 1,
+        TransportRole::InviteBeacon => 2,
+        TransportRole::Rendezvous => 3,
+        TransportRole::Admin => 4,
     }
 }
 
@@ -125,7 +164,7 @@ mod tests {
 
     #[test]
     fn health_table_upsert_replaces_same_kind_and_role() {
-        let mut table = TransportHealthTable::local_default();
+        let table = TransportHealthTable::local_default();
         table.upsert(TransportHealthSample::healthy_direct(TransportKind::LanTcp));
         table.upsert(TransportHealthSample::down(
             TransportKind::LanTcp,

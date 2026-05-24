@@ -131,6 +131,7 @@ dependencies = [
  "airc-work-store",
  "async-trait",
  "base64",
+ "dashmap",
  "futures",
  "serde",
  "serde_json",
