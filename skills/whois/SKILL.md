@@ -1,26 +1,26 @@
 ---
 name: airc:whois
-description: Look up identity (name, pronouns, role, bio, status, integrations) for self / host / paired peer / fellow joiner across all subscribed rooms. IRC /whois analog.
+description: Look up this scope's identity, or inspect an enrolled peer trust entry. IRC /whois analog.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "[<peer-name>]"
+argument-hint: "[<peer-id-or-prefix>]"
 ---
 
-# /whois — Look up identity for a peer
+# /whois — Look up identity / peer trust
 
 Run this yourself — don't ask the user.
 
 ## Execute
 
 ```bash
-airc whois <peer-name>
+airc whois <peer-id-or-prefix>
 ```
 
 ```bash
-airc whois         # prints YOUR own identity (self)
+airc whois         # prints this scope's own identity card
 ```
 
-Output is a structured block:
+Self output is a structured identity block:
 
 ```
   name:      build-d1f4
@@ -29,19 +29,20 @@ Output is a structured block:
   bio:       CI and release coordination for the current project
   status:    in a meeting til 3pm
   integrations: (none)
-  host:      joelteply@100.91.51.87
 ```
 
-## Resolution order (per scope)
+Peer output is the enrolled trust entry:
 
-For each subscribed scope (primary first, then sidecars):
+```
+  peer_id:   543c0bf7-15a3-48be-bc9b-876a7b586926
+  pubkey:    <base64-url-public-key>
+  identity:  not published yet
+  source:    peer trust store
+```
 
-1. **Self** — short-circuits, prints your own identity.
-2. **Host** — when target name matches the scope's `host_name`, reads `host_identity` cached at handshake.
-3. **Local peer file** — `<scope>/peers/<target>.json` if you've paired with the target directly.
-4. **Cross-peer-via-host** — single SSH read of host's `peers/<target>.json` for fellow joiners in the same room.
-
-If primary scope misses, sibling sidecar scopes are walked (issue #134) — so a peer who's only in your `#general` sidecar resolves cleanly from a project-scope cwd.
+Rich peer names, roles, room subscriptions, live/stale status, and
+published identity cards belong to the roster projection follow-up.
+Do not pretend that data exists before the roster layer publishes it.
 
 ## When to use
 
@@ -51,14 +52,12 @@ If primary scope misses, sibling sidecar scopes are walked (issue #134) — so a
 
 ## When the lookup will 404
 
-- Target hasn't published identity yet (peer file exists but identity blob is empty → fields show `(unset)`).
-- Target is in a room you're not subscribed to (no scope to walk).
-- Target name is misspelled — names are lowercase alphanumeric + `-`.
+- Target peer id/prefix is not enrolled in this scope's trust store.
+- Target prefix matches more than one enrolled peer.
 
 The error message lists `airc peers` as a hint so the user can list valid names.
 
 ## Notes
 
 - Whois is a one-shot command. Doesn't require a running monitor. Safe to call any time.
-- Cross-scope walk runs at most one SSH per scope. Cheap.
-- Identity is cached at pair-handshake time — no live propagation if the peer changes their `identity` mid-session. They re-pair (or you do) to refresh.
+- This is the public IRC-shaped command. `airc identity show` is the lower-level self-only equivalent.

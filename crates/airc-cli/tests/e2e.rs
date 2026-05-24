@@ -292,14 +292,71 @@ fn peer_remove_deletes_enrolled_peer() {
     );
 
     let mut list = command_for_home(&alice_home);
-    list.args(["--home", alice_home.to_str().unwrap(), "peer", "list"]);
-    let list_output = output_with_timeout(list, Duration::from_secs(10), "airc peer list");
+    list.args(["--home", alice_home.to_str().unwrap(), "peers"]);
+    let list_output = output_with_timeout(list, Duration::from_secs(10), "airc peers");
     assert!(list_output.status.success());
     assert!(
         !String::from_utf8_lossy(&list_output.stdout).contains(&bob_id),
         "removed peer should not appear in list: {}",
         String::from_utf8_lossy(&list_output.stdout),
     );
+}
+
+#[test]
+fn irc_shaped_peers_and_whois_commands_are_available() {
+    let workspace = TempDir::new().expect("tempdir");
+    let alice_home = workspace.path().join("alice");
+    let bob_home = workspace.path().join("bob");
+    let (bob_id, bob_spec) = run_init(&bob_home);
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let airc = airc_lib::Airc::open(&alice_home).await.unwrap();
+        airc.add_peer(bob_spec.parse().unwrap()).await.unwrap();
+    });
+
+    let mut peers = command_for_home(&alice_home);
+    peers.args(["--home", alice_home.to_str().unwrap(), "peers"]);
+    let peers_output = output_with_timeout(peers, Duration::from_secs(10), "airc peers");
+    assert!(
+        peers_output.status.success(),
+        "peers failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&peers_output.stdout),
+        String::from_utf8_lossy(&peers_output.stderr),
+    );
+    let peers_stdout = String::from_utf8_lossy(&peers_output.stdout);
+    assert!(peers_stdout.contains(&bob_id), "{peers_stdout}");
+
+    let prefix = &bob_id[..8];
+    let mut whois_peer = command_for_home(&alice_home);
+    whois_peer.args(["--home", alice_home.to_str().unwrap(), "whois", prefix]);
+    let whois_peer_output =
+        output_with_timeout(whois_peer, Duration::from_secs(10), "airc whois <peer>");
+    assert!(
+        whois_peer_output.status.success(),
+        "whois peer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&whois_peer_output.stdout),
+        String::from_utf8_lossy(&whois_peer_output.stderr),
+    );
+    let whois_peer_stdout = String::from_utf8_lossy(&whois_peer_output.stdout);
+    assert!(whois_peer_stdout.contains(&bob_id), "{whois_peer_stdout}");
+    assert!(
+        whois_peer_stdout.contains("source:    peer trust store"),
+        "{whois_peer_stdout}"
+    );
+
+    let mut whois_self = command_for_home(&alice_home);
+    whois_self.args(["--home", alice_home.to_str().unwrap(), "whois"]);
+    let whois_self_output = output_with_timeout(whois_self, Duration::from_secs(10), "airc whois");
+    assert!(
+        whois_self_output.status.success(),
+        "whois self failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&whois_self_output.stdout),
+        String::from_utf8_lossy(&whois_self_output.stderr),
+    );
+    let whois_self_stdout = String::from_utf8_lossy(&whois_self_output.stdout);
+    assert!(whois_self_stdout.contains("name:"), "{whois_self_stdout}");
+    assert!(whois_self_stdout.contains("role:"), "{whois_self_stdout}");
 }
 
 fn strip_cargo_harness_env(command: &mut Command) {

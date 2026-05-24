@@ -149,7 +149,7 @@ clears `is_default` if applicable; the row stays for replay
 fidelity.
 
 **Owner**: `airc join` / `airc room`. **Readers**: every send/recv
-path, `airc peer list`, `airc status`.
+path, `airc peers`, `airc status`.
 
 ---
 

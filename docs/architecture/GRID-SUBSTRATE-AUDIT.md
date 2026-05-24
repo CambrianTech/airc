@@ -97,14 +97,16 @@ agents coordinated Continuum integration over AIRC. They are not
 theoretical architecture concerns; they showed up in normal use.
 
 1. **Runtime skill/docs drift from the installed CLI.** The installed
-   Codex skills still referenced `airc peers` and `airc whois`, while
-   the current command surface exposes `airc peer list` and has no
-   `whois` command. This makes agents trust stale instructions and
-   burns time on nonexistent commands. Skills must be generated or
-   verified from the installed CLI contract during `airc update`.
+   Codex skills referenced the correct IRC-shaped public verbs
+   (`airc peers`, `airc whois`), while the Rust CLI exposed only a
+   lower-level `airc peer list` path and no top-level `whois` command.
+   This makes agents trust stale instructions and burns time on
+   nonexistent commands. Skills must be generated or verified from the
+   installed CLI contract during `airc update`, and IRC-shaped verbs
+   should remain the public surface when they match the product model.
 
 2. **Peer roster is too low-level for human/agent coordination.**
-   `airc peer list` prints peer IDs and public keys only. It does not
+   `airc peers` prints peer IDs and public keys only. It does not
    show nick, runtime kind, project scope, room subscriptions,
    last-seen timestamp, or live/stale status. With several Claude
    agents plus Codex online, this forced manual inference from inbox
@@ -151,6 +153,19 @@ theoretical architecture concerns; they showed up in normal use.
    worktrees or prevent accidental edits in a dirty main checkout.
    Worktree leases should become the default for claimed work, with
    status/drain commands showing ownership and cleanup eligibility.
+
+8. **Operational logging is mixed into stdout/stderr command output.**
+   Several user-facing commands print lifecycle, debug, install, and
+   coordination status directly to stdout/stderr. That makes the CLI
+   brittle when it is mistaken for an integration surface: hooks,
+   monitors, scripts, and consumer SDKs cannot reliably distinguish
+   protocol state from incidental diagnostics. AIRC needs a
+   logging/event abstraction with explicit sinks and levels. Even when
+   debug output ultimately lands on stdout/stderr for a terminal, it
+   must be emitted through that diagnostic abstraction, not scattered
+   `println!`/`eprintln!` calls. Integration contracts must use real
+   channels — `airc-lib`, daemon IPC, ORM-backed projections, and AIRC
+   events — not stdout/stderr parsing.
 
 These flaws do not invalidate the substrate path. They identify the
 next product gap: the transport now works well enough that the weak
