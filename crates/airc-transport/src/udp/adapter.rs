@@ -65,11 +65,10 @@ impl UdpAdapter {
     /// signalling/discovery after the adapter is bound, rather than
     /// known at construction.
     pub fn add_peer(&self, peer_id: PeerId, addr: SocketAddr) -> Option<SocketAddr> {
-        let mut guard = self
-            .inner
-            .peer_endpoints
-            .write()
-            .expect("udp peer_endpoints lock poisoned");
+        let mut guard = match self.inner.peer_endpoints.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         guard.insert(peer_id, addr)
     }
 
@@ -115,11 +114,10 @@ impl UdpAdapter {
     }
 
     fn destinations(&self, frame: &Frame) -> Result<Vec<SocketAddr>, UdpError> {
-        let guard = self
-            .inner
-            .peer_endpoints
-            .read()
-            .expect("udp peer_endpoints lock poisoned");
+        let guard = match self.inner.peer_endpoints.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         match frame.envelope.target {
             MentionTarget::Peer(peer_id) => guard
                 .get(&peer_id)
