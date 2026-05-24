@@ -130,6 +130,19 @@ pub(crate) struct AircInner {
     pub(crate) relay_subscriber: Mutex<Option<FrameSubscriber>>,
     pub(crate) udp: Mutex<Option<UdpAdapter>>,
     pub(crate) udp_subscriber: Mutex<Option<FrameSubscriber>>,
+    /// Per-peer WebRTC DataChannel adapters, keyed by the remote
+    /// peer id. Populated by `Airc::open_webrtc_to` /
+    /// `Airc::accept_webrtc_offers` after a handshake completes.
+    pub(crate) webrtc_channels:
+        Mutex<HashMap<PeerId, airc_transport::webrtc_datachannel::WebRtcDataChannelAdapter>>,
+    /// Per-peer WebRTC ingest subscriber tasks. Mirrors the
+    /// per-wire `subscribers` map but keyed by peer because each
+    /// WebRTC DataChannel is its own transport instance.
+    pub(crate) webrtc_subscribers: Mutex<HashMap<PeerId, FrameSubscriber>>,
+    /// Keep RTCPeerConnections alive for as long as the adapter is
+    /// registered. Dropping the PC drops the DataChannel.
+    pub(crate) webrtc_peer_connections:
+        Mutex<HashMap<PeerId, std::sync::Arc<dyn webrtc::peer_connection::PeerConnection>>>,
     /// Per-wire background subscriber tasks. Spawned lazily on first
     /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
     /// Held in a Mutex so concurrent calls can't double-spawn.
@@ -249,6 +262,9 @@ impl Airc {
                 relay_subscriber: Mutex::new(None),
                 udp: Mutex::new(None),
                 udp_subscriber: Mutex::new(None),
+                webrtc_channels: Mutex::new(HashMap::new()),
+                webrtc_subscribers: Mutex::new(HashMap::new()),
+                webrtc_peer_connections: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(HashMap::new()),
                 live_tx,
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
@@ -308,6 +324,9 @@ impl Airc {
             relay_subscriber: Mutex::new(None),
             udp: Mutex::new(None),
             udp_subscriber: Mutex::new(None),
+            webrtc_channels: Mutex::new(HashMap::new()),
+            webrtc_subscribers: Mutex::new(HashMap::new()),
+            webrtc_peer_connections: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
