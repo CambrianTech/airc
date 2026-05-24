@@ -88,12 +88,7 @@ impl Airc {
 
     fn resolve_send_route(&self, kind: FrameKind) -> Result<TransportRoute, AircError> {
         let class = route_class_for_frame(kind);
-        let samples = self
-            .inner
-            .route_health
-            .read()
-            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?
-            .samples();
+        let samples = self.inner.route_health.samples();
         TransportResolver::from_health(samples)
             .resolve(class)
             .map_err(format_route_refusal)

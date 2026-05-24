@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use airc_core::{ClientId, PeerId, TranscriptEvent};
 use airc_daemon::{peers_store, DaemonClient, LocalIdentity};
@@ -119,9 +118,9 @@ pub(crate) struct AircInner {
     pub(crate) daemon_client: Option<Arc<DaemonClient>>,
     pub(crate) registry: Arc<PeerKeyRegistry>,
     pub(crate) policy: VerificationPolicy,
-    pub(crate) route_health: RwLock<TransportHealthTable>,
-    pub(crate) route_endpoints: RwLock<RouteEndpointTable>,
-    pub(crate) imported_invites: RwLock<ImportedInviteTable>,
+    pub(crate) route_health: Arc<TransportHealthTable>,
+    pub(crate) route_endpoints: Arc<RouteEndpointTable>,
+    pub(crate) imported_invites: Arc<ImportedInviteTable>,
     pub(crate) lamport_clock: AtomicU64,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
@@ -234,9 +233,9 @@ impl Airc {
                 daemon_client: None,
                 registry,
                 policy,
-                route_health: RwLock::new(TransportHealthTable::local_default()),
-                route_endpoints: RwLock::new(RouteEndpointTable::default()),
-                imported_invites: RwLock::new(ImportedInviteTable::default()),
+                route_health: Arc::new(TransportHealthTable::local_default()),
+                route_endpoints: Arc::new(RouteEndpointTable::default()),
+                imported_invites: Arc::new(ImportedInviteTable::default()),
                 lamport_clock: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
@@ -289,9 +288,9 @@ impl Airc {
             daemon_client: Some(Arc::new(client)),
             registry: self.inner.registry.clone(),
             policy: self.inner.policy,
-            route_health: RwLock::new(TransportHealthTable::local_default()),
-            route_endpoints: RwLock::new(RouteEndpointTable::default()),
-            imported_invites: RwLock::new(ImportedInviteTable::default()),
+            route_health: Arc::new(TransportHealthTable::local_default()),
+            route_endpoints: Arc::new(RouteEndpointTable::default()),
+            imported_invites: Arc::new(ImportedInviteTable::default()),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             lan_tcp: Mutex::new(None),
             lan_subscriber: Mutex::new(None),
@@ -314,35 +313,21 @@ impl Airc {
         &self,
         samples: impl IntoIterator<Item = TransportHealthSample>,
     ) -> Result<(), AircError> {
-        let mut route_health = self
-            .inner
-            .route_health
-            .write()
-            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?;
-        route_health.replace(samples);
+        self.inner.route_health.replace(samples);
         Ok(())
     }
 
     /// Snapshot the current route-health samples. Consumers can use
     /// this for diagnostics without reaching into resolver internals.
     pub fn transport_health(&self) -> Result<Vec<TransportHealthSample>, AircError> {
-        self.inner
-            .route_health
-            .read()
-            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))
-            .map(|table| table.samples())
+        Ok(self.inner.route_health.samples())
     }
 
     pub(crate) fn upsert_transport_health(
         &self,
         sample: TransportHealthSample,
     ) -> Result<(), AircError> {
-        let mut route_health = self
-            .inner
-            .route_health
-            .write()
-            .map_err(|_| AircError::Route("route health lock poisoned".to_string()))?;
-        route_health.upsert(sample);
+        self.inner.route_health.upsert(sample);
         Ok(())
     }
 
