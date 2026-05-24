@@ -198,7 +198,7 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
     // PeerKeyRegistry (only by-peer lookup + find_peer). Read the
     // persisted peer trust store instead — the source of truth that
     // both the daemon and CLI write to.
-    let peers = match crate::peers_store::load(&state.home).await {
+    let peers = match airc_trust::load(&state.home).await {
         Ok(peers) => peers,
         Err(error) => {
             return Response::Error {

@@ -97,7 +97,7 @@ async fn rust_peer_record_count(home: &Path) -> usize {
 
     let mut seen: HashSet<airc_core::PeerId> = HashSet::new();
     for path in rust_peer_registry_paths(home) {
-        if let Ok(peers) = airc_daemon::peers_store::load(&path).await {
+        if let Ok(peers) = airc_trust::load(&path).await {
             for peer in peers {
                 seen.insert(peer.peer_id);
             }

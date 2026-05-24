@@ -18,6 +18,7 @@ airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
 airc-protocol = { path = "../airc-protocol" }
 airc-transport = { path = "../airc-transport" }
+airc-trust = { path = "../airc-trust" }
 airc-daemon = { path = "../airc-daemon" }
 airc-store = { path = "../airc-store" }
 airc-lib = { path = "../airc-lib" }
