@@ -46,7 +46,8 @@ impl Airc {
             TransportKind::WebRtcDataChannel => {
                 let target_peer = match frame.envelope.target {
                     airc_core::transcript::MentionTarget::Peer(peer) => peer,
-                    _ => {
+                    airc_core::transcript::MentionTarget::All
+                    | airc_core::transcript::MentionTarget::Room(_) => {
                         return Err(AircError::Route(
                             "WebRtcDataChannel requires a Peer-directed target; \
                              rooms/broadcasts must go over LAN-TCP or Relay"
