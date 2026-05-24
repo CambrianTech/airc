@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use airc_core::{EventId, TranscriptCursor};
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::{Frame, Subscription};
 use airc_transport::{LocalFsAdapter, SignedTransport, Transport};
 use futures::stream::StreamExt;
@@ -367,9 +370,15 @@ impl Airc {
             };
             if let Some(wire) = wire_for_lifecycle {
                 if let Err(err) = airc.emit_wire_lost(&wire, reason).await {
-                    eprintln!(
-                        "airc-lib subscriber: wire_lost emit failed for {} ({reason}): {err}",
-                        wire.display()
+                    StderrJsonDiagnosticSink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::WireLostEmitFailed,
+                            "wire_lost lifecycle emit failed",
+                        )
+                        .with_field("wire", wire.display())
+                        .with_field("reason", reason)
+                        .with_field("error", err),
                     );
                 }
             }
@@ -436,7 +445,15 @@ impl Airc {
                 }
             }
             Err(err) => {
-                eprintln!("airc-lib subscriber: store append failed: {err}");
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Subscriber,
+                        DiagnosticCode::StoreAppendFailed,
+                        "subscriber store append failed",
+                    )
+                    .with_field("event_id", event_id)
+                    .with_field("error", err),
+                );
             }
         }
     }
@@ -444,7 +461,14 @@ impl Airc {
 
 fn warn_frame_verify_failed(error: &impl std::fmt::Display) {
     if std::env::var_os("AIRC_REPLAY_WARN").is_some() {
-        eprintln!("airc-lib subscriber: frame verification failed: {error}");
+        StderrJsonDiagnosticSink.emit(
+            DiagnosticEvent::warn(
+                DiagnosticComponent::Subscriber,
+                DiagnosticCode::FrameVerificationFailed,
+                "subscriber frame verification failed",
+            )
+            .with_field("error", error),
+        );
     }
 }
 

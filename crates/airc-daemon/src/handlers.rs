@@ -11,6 +11,9 @@ use std::sync::Arc;
 use airc_core::{
     headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, RoomId, TranscriptCursor,
 };
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_ipc::request::{
     AddPeerRequest, InboxRequest, RemovePeerRequest, Request, SendRequest, SubscribeRequest,
 };
@@ -113,21 +116,27 @@ async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Res
                             let _ = state.live_tx.send(event);
                         }
                         Err(err) => {
-                            // Persistence failures are loud. Most likely
-                            // a duplicate replay (DuplicateEventId), which
-                            // is benign for replay-style subscriptions.
-                            // Anything else (Database, Migration, Codec)
-                            // surfaces here so the operator sees it.
-                            eprintln!(
-                                "daemon subscriber: store append failed for {event_id}: {err}"
+                            StderrJsonDiagnosticSink.emit(
+                                DiagnosticEvent::error(
+                                    DiagnosticComponent::Daemon,
+                                    DiagnosticCode::StoreAppendFailed,
+                                    "daemon subscriber store append failed",
+                                )
+                                .with_field("event_id", event_id)
+                                .with_field("error", err),
                             );
                         }
                     }
                 }
                 Err(verify_error) => {
-                    // Verification failure — don't persist.
-                    // Future: surface a counter in Status response.
-                    eprintln!("daemon subscriber: frame verification failed: {verify_error}");
+                    StderrJsonDiagnosticSink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Daemon,
+                            DiagnosticCode::FrameVerificationFailed,
+                            "daemon subscriber frame verification failed",
+                        )
+                        .with_field("error", verify_error),
+                    );
                 }
             }
         }

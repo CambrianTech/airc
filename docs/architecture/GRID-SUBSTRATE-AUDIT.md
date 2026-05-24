@@ -167,6 +167,14 @@ theoretical architecture concerns; they showed up in normal use.
    channels — `airc-lib`, daemon IPC, ORM-backed projections, and AIRC
    events — not stdout/stderr parsing.
 
+   Status: foundation landed in `airc-diagnostics`: typed severity,
+   component, and code enums plus sink implementations. The first
+   substrate warnings in `airc-lib` replay/subscriber paths and
+   `airc-daemon` subscriber/trust/connection paths now emit structured
+   diagnostics before terminal rendering. Remaining work is to move
+   CLI/monitor/doctor surfaces onto the same sink model and add an ORM
+   sink for consumer-visible diagnostics.
+
 These flaws do not invalidate the substrate path. They identify the
 next product gap: the transport now works well enough that the weak
 point is coordination ergonomics, typed roster/claim state, and stale
@@ -308,8 +316,8 @@ Work:
   - dropped event count where loss is allowed
   - oldest retained cursor
   - per-subscriber cursor age
-- Replace silent ingest warnings with typed diagnostics that can be
-  emitted as events and surfaced in `airc doctor`.
+- Continue replacing silent ingest warnings with typed diagnostics that
+  can be emitted as ORM rows/events and surfaced in `airc doctor`.
 - Audit `Mutex`/lock scopes across `.await`; split or narrow where a
   lock crosses IO.
 - Reduce avoidable `event.clone()` in hot broadcast paths.

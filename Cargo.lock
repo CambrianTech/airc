@@ -107,6 +107,7 @@ name = "airc-daemon"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-diagnostics",
  "airc-identity",
  "airc-ipc",
  "airc-protocol",
@@ -120,6 +121,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "airc-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -154,6 +163,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "airc-daemon",
+ "airc-diagnostics",
  "airc-identity",
  "airc-ipc",
  "airc-protocol",

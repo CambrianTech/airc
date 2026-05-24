@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use airc_core::PeerId;
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::EventStore;
 use airc_transport::{LocalFsAdapter, SignedTransport};
@@ -165,9 +168,14 @@ impl DaemonState {
                     _ = state.shutdown.notified() => break,
                     _ = tokio::time::sleep(TRUST_REFRESH_INTERVAL) => {
                         if let Err(error) = state.refresh_trust_root(&root).await {
-                            eprintln!(
-                                "daemon trust refresh failed for {}: {error}",
-                                root.display()
+                            StderrJsonDiagnosticSink.emit(
+                                DiagnosticEvent::warn(
+                                    DiagnosticComponent::Daemon,
+                                    DiagnosticCode::TrustRefreshFailed,
+                                    "daemon trust refresh failed",
+                                )
+                                .with_field("root", root.display())
+                                .with_field("error", error),
                             );
                         }
                     }
