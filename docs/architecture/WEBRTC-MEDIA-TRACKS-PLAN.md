@@ -1,9 +1,10 @@
 # WebRTC Media Tracks — API Sketch and Scope
 
-Status: **planning doc, no code yet.** Awaiting Joel's review before
-implementation begins. This is the proposed shape for the
-`airc-lib` media-track SDK that #957's WebRTC orchestration enables
-but doesn't yet expose.
+Status: **baseline implemented.** #960 added inbound media-track
+delivery and the per-peer registry. #961 added the outbound
+connection builder, closed-set Opus/VP8 codec surface, and writable
+sample-track handles. The remaining work is hardening the media path
+for consumer integration, not proving the basic API exists.
 
 ## Goal
 
@@ -24,16 +25,16 @@ Consumers (Continuum) own:
 
 ## Scope cuts (this PR)
 
-**IN:**
+**Baseline now in-tree:**
 - Pre-connect track attachment (tracks added before the offer/answer
   exchange — frozen for the lifetime of the connection)
 - Opinion-ated defaults for the common case: Opus audio, VP8 video
 - Outbound: a sample-writer handle returned to the caller
 - Inbound: a callback or per-peer stream of incoming `TrackRemote`
-- Integration test exercising audio sample round-trip between two
+- Integration test exercising audio/video negotiation between two
   Airc instances on a shared signaling wire
 
-**OUT (deferred to follow-ups):**
+**Still deferred to follow-ups:**
 - **Renegotiation** — adding/removing tracks after the connection is
   established. This needs the signaling state machine to handle
   re-offer events on an existing PC, which is a substantial expansion
@@ -159,20 +160,20 @@ Rationale:
 - Continuum-side avatar rendering can always re-encode if a specific
   hardware encoder is preferred.
 
-## Open questions for Joel
+## Remaining Design Decisions
 
-1. **Codec escape hatch.** Should `OutgoingAudioTrack` /
-   `OutgoingVideoTrack` accept a `with_codec(mime_type)` override
-   for callers that need H264 / AV1 / G.711? Or is opinion-ated-only
-   acceptable for v1?
+1. **Codec expansion.** `WebRtcMediaCodec` is intentionally a
+   closed enum, not a string MIME escape hatch. Add H264 / AV1 /
+   G.711 as explicit variants only when a consumer proof needs them.
 
 2. **Track count limits.** A single PC can carry multiple audio/video
    tracks (e.g. avatar voice + ambient audio). The proposed builder
    accepts a `Vec`. Is unbounded fine, or should there be a sanity
    cap?
 
-3. **Inbound surface shape.** Global callback (proposed) vs per-peer
-   receiver vs both. Recommendation above is global callback first.
+3. **Inbound surface shape.** Global callback and per-peer inspection
+   are in-tree. Per-peer receiver streams remain optional ergonomic
+   sugar if Continuum wants dedicated tasks per peer.
 
 4. **Failure mode when peer doesn't accept the track kinds.** SDP
    negotiation can refuse a codec/track. Surface as an `AircError`
@@ -184,22 +185,35 @@ Rationale:
    declared at session start — they can't go from "voice-only" to
    "voice + video" mid-call without dropping and reconnecting.
 
-## Implementation sketch (rough)
+## Implementation Record
 
-Once the API is approved, the implementation:
+1. #960 added `airc-lib/src/webrtc_media.rs` inbound track types,
+   handler registration, per-peer runtime registry, and `on_track`
+   forwarding from offerer/answerer handlers.
+2. #961 added `WebRtcConnectionBuilder`, `OutgoingAudioTrack`,
+   `OutgoingVideoTrack`, `OpenedWebRtcConnection`, and
+   `OutgoingSampleTrack`.
+3. `Airc::open_webrtc_to(peer_id)` now delegates through the builder
+   so the no-media path and media path share the same connection
+   lifecycle.
+4. The integration proof negotiates tracks over the existing AIRC
+   signaling wire, returns writable local sample handles, and verifies
+   the responder sees inbound `TrackRemote` handles.
 
-1. New module `airc-lib/src/webrtc_media.rs` with `WebRtcConnectionBuilder`,
-   `OutgoingAudioTrack`, `OutgoingVideoTrack`, `OpenedWebRtcConnection`.
-2. Refactor `Airc::open_webrtc_to(peer_id)` internals to delegate to
-   `webrtc_connection(peer_id).open()` so the no-tracks path stays
-   identical.
-3. Update `OffererHandler` and `AnswererHandler` (currently in
-   `webrtc.rs`) to forward `on_track` events to the global inbound
-   handler.
-4. Add `inner.webrtc_incoming_track_handler: Mutex<Option<...>>` to
-   `AircInner`.
-5. Integration test: two Airc instances, audio track only, Alice
-   writes a sample, Bob's handler fires with a matching `TrackRemote`.
+## Next Consumer Proof
+
+The next useful proof is not another substrate type. It is a
+consumer-shaped fixture:
+
+1. A Continuum-like avatar peer opens a WebRTC connection with Opus
+   audio and VP8 video tracks.
+2. A second peer accepts the connection, receives both tracks, and
+   records per-track metadata without parsing AIRC internals.
+3. A control event travels over the DataChannel during the same
+   session, proving media and command/control share the same peer
+   lifecycle without conflating media frames with transcript bodies.
+4. The test asserts no GitHub, no shell, and no consumer-specific
+   code in `airc-lib`.
 
 ## Why this scope is honest
 

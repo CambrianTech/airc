@@ -19,8 +19,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use airc_lib::{
-    Airc, Body, Headers, MentionTarget, OutgoingAudioTrack, PeerSpec, TransportHealthSample,
-    TransportHealthState, TransportKind, TransportRole,
+    Airc, Body, Headers, MentionTarget, OutgoingAudioTrack, OutgoingVideoTrack, PeerSpec,
+    TransportHealthSample, TransportHealthState, TransportKind, TransportRole,
 };
 use airc_protocol::FrameKind;
 use bytes::Bytes;
@@ -41,7 +41,7 @@ fn ensure_crypto_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn webrtc_builder_negotiates_outgoing_audio_track() {
+async fn webrtc_builder_negotiates_outgoing_media_tracks() {
     ensure_crypto_provider();
 
     let alice_home = TempDir::new().expect("alice home");
@@ -85,19 +85,20 @@ async fn webrtc_builder_negotiates_outgoing_audio_track() {
     let opened = alice
         .webrtc_connection(bob_spec.peer_id)
         .with_audio_track(OutgoingAudioTrack::new("avatar-voice", "avatar-stream"))
+        .with_video_track(OutgoingVideoTrack::new("avatar-video", "avatar-stream"))
         .open()
         .await
         .expect("alice opens media webrtc to bob");
     assert_eq!(opened.outgoing_audio.len(), 1);
-    assert!(opened.outgoing_video.is_empty());
-    let ssrcs = opened.outgoing_audio[0].ssrcs().await;
-    let ssrc = ssrcs
+    assert_eq!(opened.outgoing_video.len(), 1);
+    let audio_ssrcs = opened.outgoing_audio[0].ssrcs().await;
+    let audio_ssrc = audio_ssrcs
         .first()
         .copied()
         .expect("outgoing audio track has an ssrc");
     opened.outgoing_audio[0]
         .write_sample(
-            ssrc,
+            audio_ssrc,
             &Sample {
                 data: Bytes::from_static(&[0xf8, 0xff, 0xfe]),
                 duration: Duration::from_millis(20),
@@ -107,27 +108,59 @@ async fn webrtc_builder_negotiates_outgoing_audio_track() {
         )
         .await
         .expect("alice writes audio sample");
+    let video_ssrcs = opened.outgoing_video[0].ssrcs().await;
+    let video_ssrc = video_ssrcs
+        .first()
+        .copied()
+        .expect("outgoing video track has an ssrc");
+    opened.outgoing_video[0]
+        .write_sample(
+            video_ssrc,
+            &Sample {
+                data: Bytes::from_static(&[
+                    0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00,
+                ]),
+                duration: Duration::from_millis(33),
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .expect("alice writes video sample");
 
-    let (remote_peer, track) = tokio::time::timeout(Duration::from_secs(10), async move {
+    let tracks = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut tracks = Vec::new();
         loop {
             if let Ok(track) = track_rx.try_recv() {
-                return track;
+                tracks.push(track);
+                if tracks.len() == 2 {
+                    return tracks;
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("bob receives inbound audio track");
+    .expect("bob receives inbound media tracks");
 
-    assert_eq!(remote_peer, alice_spec.peer_id);
-    assert_eq!(track.kind().await, RtpCodecKind::Audio);
-    assert!(
-        !track.label().await.is_empty(),
-        "remote track should expose a label"
-    );
+    let mut kinds = Vec::new();
+    for (remote_peer, track) in tracks {
+        assert_eq!(remote_peer, alice_spec.peer_id);
+        assert!(
+            !track.label().await.is_empty(),
+            "remote track should expose a label"
+        );
+        kinds.push(track.kind().await);
+    }
+    kinds.sort_by_key(|kind| match kind {
+        RtpCodecKind::Unspecified => 0,
+        RtpCodecKind::Audio => 1,
+        RtpCodecKind::Video => 2,
+    });
+    assert_eq!(kinds, vec![RtpCodecKind::Audio, RtpCodecKind::Video]);
 
     let registered = bob.incoming_tracks_for_peer(alice_spec.peer_id).await;
-    assert_eq!(registered.len(), 1);
+    assert_eq!(registered.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
