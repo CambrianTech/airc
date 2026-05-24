@@ -27,12 +27,13 @@ pub use drain_policy::{
     PolicyInputs, PrStatus, PrTerminalState, ReportOnlyReason, DEFAULT_HEARTBEAT_STALE_MS,
 };
 pub use event::{
-    CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased, GitBranchMoved,
-    GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged,
-    ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
-    PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed,
-    WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested,
-    WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased,
+    GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
+    LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
+    PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
+    WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
+    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
+    WorkspaceRequested,
 };
 pub use ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 pub use local_git::{
@@ -40,13 +41,15 @@ pub use local_git::{
     LocalGitSnapshot, LocalGitWorkspace,
 };
 pub use model::{
-    BranchName, CardState, DirtyState, DrainCandidate, DrainCandidateCategory, DrainOutcome,
-    GitObjectId, HygieneReport, LaneState, PrCheckState, PrMergeState, PrReviewState,
-    PressureLevel, Priority, PullRequestRef, WorkCard, WorkspaceLease, WorkspaceStatus,
+    AgentAvailabilityState, BranchName, CardState, DirtyState, DrainCandidate,
+    DrainCandidateCategory, DrainOutcome, GitObjectId, HygieneReport, LaneState, PrCheckState,
+    PrMergeState, PrReviewState, PressureLevel, Priority, PullRequestRef, WorkCard, WorkspaceLease,
+    WorkspaceStatus,
 };
 pub use projection::{
-    BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat, ProjectionError,
-    PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection, WorkspaceRecord,
+    AgentAvailabilityRecord, BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat,
+    ProjectionError, PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection,
+    WorkspaceRecord,
 };
 pub use pull_requests::gh::{
     CommandGhRunner, GhCommandRunner, GhPullRequestSource, GhRunnerError, GH_JSON_FIELDS,

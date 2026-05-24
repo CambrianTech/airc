@@ -3,11 +3,11 @@ use airc_protocol::{FrameKind, HEADER_FORGE_BODY_HINT};
 
 use super::*;
 use crate::{
-    BranchName, CardCreated, ClaimId, DrainCandidate, DrainCandidateCategory, DrainOutcome,
-    GitBranchMoved, GitObjectId, LaneId, PrCheckState, PressureLevel, Priority,
-    PullRequestCheckSuiteChanged, PullRequestRef, RepoId, WorkCardId, WorkEvent,
-    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceId, WorkspacePressureReported,
-    WorkspaceRequested,
+    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, ClaimId,
+    DrainCandidate, DrainCandidateCategory, DrainOutcome, GitBranchMoved, GitObjectId, LaneId,
+    PrCheckState, PressureLevel, Priority, PullRequestCheckSuiteChanged, PullRequestRef, RepoId,
+    WorkCardId, WorkEvent, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceId,
+    WorkspacePressureReported, WorkspaceRequested,
 };
 
 fn card_created() -> WorkEvent {
@@ -276,5 +276,34 @@ fn git_and_pr_events_roundtrip_with_routeable_headers() {
             .get(HEADER_FORGE_WORK_GIT_BRANCH)
             .map(String::as_str),
         Some("feat/lifecycle-events")
+    );
+}
+
+#[test]
+fn availability_event_roundtrips_with_repo_and_state_headers() {
+    let event = WorkEvent::AgentAvailabilityReported(AgentAvailabilityReported {
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        peer: PeerId::from_u128(42),
+        state: AgentAvailabilityState::Ready,
+        note: Some("can take review".to_string()),
+        ttl_ms: 60_000,
+        reported_at_ms: 7,
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("agent_availability_reported")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_REPO).map(String::as_str),
+        Some("CambrianTech/airc")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_STATE).map(String::as_str),
+        Some("ready")
     );
 }

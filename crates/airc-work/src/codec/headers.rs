@@ -16,6 +16,7 @@ pub const HEADER_FORGE_WORK_POLICY_RULE_ID: &str = "forge.work.policy_rule_id";
 pub const HEADER_FORGE_WORK_GIT_BRANCH: &str = "forge.work.git_branch";
 pub const HEADER_FORGE_WORK_GIT_COMMIT: &str = "forge.work.git_commit";
 pub const HEADER_FORGE_WORK_PR_NUMBER: &str = "forge.work.pr_number";
+pub const HEADER_FORGE_WORK_STATE: &str = "forge.work.state";
 
 pub fn work_event_headers(event: &WorkEvent) -> Headers {
     let mut headers = Headers::new();
@@ -133,6 +134,13 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
         }
         WorkEvent::ManagerHatReleased(e) => {
             headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+        }
+        WorkEvent::AgentAvailabilityReported(e) => {
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());
+            headers.insert(
+                HEADER_FORGE_WORK_STATE.to_string(),
+                format!("{:?}", e.state).to_ascii_lowercase(),
+            );
         }
     }
 }

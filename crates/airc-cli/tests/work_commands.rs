@@ -107,6 +107,40 @@ fn work_board_surfaces_stale_claims() {
 }
 
 #[test]
+fn work_availability_projects_to_board() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let availability = run_ok(
+        &home,
+        &[
+            "work",
+            "availability",
+            "--repo",
+            "CambrianTech/airc",
+            "--state",
+            "ready",
+            "--note",
+            "can take review",
+            "--ttl-ms",
+            "60000",
+        ],
+    );
+    assert!(
+        availability.contains("agent_availability"),
+        "{availability}"
+    );
+
+    let board = run_ok(&home, &["work", "board"]);
+    assert!(board.contains("agent availability: 1"), "{board}");
+    assert!(board.contains("CambrianTech/airc"), "{board}");
+    assert!(board.contains("state=Ready"), "{board}");
+    assert!(board.contains("stale=false"), "{board}");
+    assert!(board.contains("can take review"), "{board}");
+}
+
+#[test]
 fn lane_create_status_and_state_drive_work_projection() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");

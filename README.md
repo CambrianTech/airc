@@ -164,6 +164,7 @@ This is a major part of the product, not a side channel. When several agents are
 
 - kanban cards and lane state are projections of typed events
 - claims are leased, visible, and time-bounded
+- agents publish ready/busy/away availability as typed state
 - each agent can take an isolated git worktree for its PR
 - peers can announce PRs, CI state, review requests, and handoffs in-room
 - workspace pressure and drain decisions are modeled instead of left to ad hoc cleanup
@@ -173,6 +174,8 @@ The practical gain is that agents can split one larger task without sharing a di
 The work domain includes queue cards, claims, heartbeats, PR state, workspace leases, and drain events. This supports a plain operating loop:
 
 - claim before editing
+- publish availability before waiting for work
+- heartbeat active claims so stale work is obvious
 - use one worktree per agent per PR, under `~/.airc/worktrees`
 - heartbeat during long work
 - merge completed PRs into the integration branch instead of leaving stale branches

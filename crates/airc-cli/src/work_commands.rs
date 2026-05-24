@@ -12,11 +12,11 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    Airc, ClaimId, ClaimWorkCard, CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId,
-    WorkBoardProjection, WorkCardId,
+    AgentAvailabilityState, Airc, ClaimId, ClaimWorkCard, CreateWorkCard, LaneId, Priority,
+    ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
 };
 
-use crate::work_cli::CliPriority;
+use crate::work_cli::{CliAvailabilityState, CliPriority};
 
 pub async fn run_create(
     home: &Path,
@@ -95,15 +95,37 @@ pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+pub async fn run_availability(
+    home: &Path,
+    repo: String,
+    state: CliAvailabilityState,
+    note: Option<String>,
+    ttl_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let repo = RepoId::new(repo)?;
+    airc.report_agent_availability(airc_lib::ReportAgentAvailability {
+        repo: repo.clone(),
+        state: state.into(),
+        note,
+        ttl_ms,
+    })
+    .await?;
+    println!("agent_availability: repo={repo} state={state:?} ttl_ms={ttl_ms}");
+    Ok(())
+}
+
 fn print_board(board: &WorkBoardProjection) {
     let snapshot = board.snapshot();
-    if snapshot.cards.is_empty() {
+    if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");
         return;
     }
     let stale_claims = board.stale_claims(now_ms());
 
-    println!("work cards: {}", snapshot.cards.len());
+    if !snapshot.cards.is_empty() {
+        println!("work cards: {}", snapshot.cards.len());
+    }
     for card in &snapshot.cards {
         let owner = card
             .owner
@@ -132,6 +154,21 @@ fn print_board(board: &WorkBoardProjection) {
                 owner = claim.owner,
                 claim_id = claim.claim_id,
                 expired_at_ms = claim.expired_at_ms,
+            );
+        }
+    }
+    if !snapshot.agent_availability.is_empty() {
+        println!();
+        println!("agent availability: {}", snapshot.agent_availability.len());
+        for availability in snapshot.agent_availability {
+            let stale = availability.expires_at_ms <= now_ms();
+            let note = availability.report.note.as_deref().unwrap_or("-");
+            println!(
+                "{repo}  peer={peer}  state={state:?}  stale={stale}  expires_at_ms={expires_at_ms}  note={note}",
+                repo = availability.report.repo,
+                peer = availability.report.peer,
+                state = availability.report.state,
+                expires_at_ms = availability.expires_at_ms,
             );
         }
     }
@@ -175,6 +212,16 @@ impl From<CliPriority> for Priority {
             CliPriority::P1 => Self::P1,
             CliPriority::P2 => Self::P2,
             CliPriority::P3 => Self::P3,
+        }
+    }
+}
+
+impl From<CliAvailabilityState> for AgentAvailabilityState {
+    fn from(value: CliAvailabilityState) -> Self {
+        match value {
+            CliAvailabilityState::Ready => Self::Ready,
+            CliAvailabilityState::Busy => Self::Busy,
+            CliAvailabilityState::Away => Self::Away,
         }
     }
 }

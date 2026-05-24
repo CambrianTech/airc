@@ -6,8 +6,9 @@ use airc_core::PeerId;
 
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 use crate::model::{
-    BranchName, CardState, DirtyState, DrainCandidate, DrainOutcome, GitObjectId, HygieneReport,
-    LaneState, PrCheckState, PrMergeState, PrReviewState, PressureLevel, Priority, PullRequestRef,
+    AgentAvailabilityState, BranchName, CardState, DirtyState, DrainCandidate, DrainOutcome,
+    GitObjectId, HygieneReport, LaneState, PrCheckState, PrMergeState, PrReviewState,
+    PressureLevel, Priority, PullRequestRef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub enum WorkEvent {
     HygieneReportRecorded(HygieneReportRecorded),
     ManagerHatClaimed(ManagerHatClaimed),
     ManagerHatReleased(ManagerHatReleased),
+    AgentAvailabilityReported(AgentAvailabilityReported),
 }
 
 impl WorkEvent {
@@ -68,6 +70,7 @@ impl WorkEvent {
             WorkEvent::HygieneReportRecorded(e) => e.report.recorded_at_ms,
             WorkEvent::ManagerHatClaimed(e) => e.claimed_at_ms,
             WorkEvent::ManagerHatReleased(e) => e.released_at_ms,
+            WorkEvent::AgentAvailabilityReported(e) => e.reported_at_ms,
         }
     }
 }
@@ -316,6 +319,16 @@ pub struct ManagerHatReleased {
     pub repo: RepoId,
     pub manager: PeerId,
     pub released_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAvailabilityReported {
+    pub repo: RepoId,
+    pub peer: PeerId,
+    pub state: AgentAvailabilityState,
+    pub note: Option<String>,
+    pub ttl_ms: u64,
+    pub reported_at_ms: u64,
 }
 
 #[cfg(test)]
