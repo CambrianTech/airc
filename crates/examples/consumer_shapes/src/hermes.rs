@@ -16,7 +16,7 @@
 
 use airc_lib::{Body, EventFilter, HeaderFilter, Headers};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub const BODY_HINT_FORGE_HERMES_EVENT: &str = "forge.hermes.event.v1";
 
@@ -171,7 +171,7 @@ pub fn decode_hermes_event(
 pub fn any_hermes_event_filter() -> EventFilter {
     EventFilter {
         channel: None,
-        channels: Vec::new(),
+        channels: HashSet::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::Exact {
             key: HEADER_FORGE_BODY_HINT.to_string(),
@@ -186,7 +186,7 @@ pub fn any_hermes_event_filter() -> EventFilter {
 pub fn agent_event_filter(agent_id: &str) -> EventFilter {
     EventFilter {
         channel: None,
-        channels: Vec::new(),
+        channels: HashSet::new(),
         kinds: BTreeSet::new(),
         headers_filter: HeaderFilter::All(vec![
             HeaderFilter::Exact {
