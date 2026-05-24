@@ -589,8 +589,30 @@ context.
    command-bus request/reply tests are not enough.
 5. Bind the same command-bus request/reply proof in real Continuum,
    OpenClaw, and Hermes repos once their adapters depend on `airc-lib`.
+6. Wire UDP and WebRTC datachannel route execution end-to-end so
+   AR/Continuum pose streams and video/bulk traffic have a real
+   transport story, not just enum slots. Includes route-resolver
+   admission, runtime peer endpoint mutation, and the signaling-via-
+   AIRC-mesh state machine WebRTC needs to bootstrap its DataChannel.
 
 Status:
+
+- (#6) UDP route execution + signaling message types landed: the
+  `TransportKind::Udp` arm in `route::execution` now dispatches via
+  `UdpAdapter`; `Airc::bind_udp` and `Airc::add_udp_peer` give
+  consumers a path to register peer endpoints either at bind or at
+  runtime. `UdpAdapter::add_peer` adds the runtime-peer-change
+  surface that was missing in the original adapter. End-to-end proof:
+  a control event sent from Alice to Bob between separate Airc homes
+  with `replace_transport_health(udp-only)` forcing UDP as the only
+  admissible route. The `webrtc_signaling::SignalingMessage` types
+  (Offer/Answer/IceCandidate) ship as the data contract for the
+  follow-up orchestration PR; this PR does **not** include the
+  mesh-as-signaling-channel state machine, the WebRTC route
+  execution arm, or the per-peer DataChannel registry. Those are
+  the next slice.
+
+
 
 - Closed: Pull-request observation skeleton landed in #947:
   `airc-work::pull_requests`

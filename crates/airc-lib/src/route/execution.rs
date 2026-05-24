@@ -35,7 +35,14 @@ impl Airc {
                     .await
                     .map_err(|error| AircError::Transport(error.to_string()))
             }
-            TransportKind::Udp => Err(unwired_transport_error(route)),
+            TransportKind::Udp => {
+                self.ensure_udp_subscriber().await?;
+                self.udp_adapter()
+                    .await?
+                    .send(frame)
+                    .await
+                    .map_err(|error| AircError::Transport(error.to_string()))
+            }
             TransportKind::WebRtcDataChannel => Err(unwired_transport_error(route)),
             TransportKind::Reticulum => Err(unwired_transport_error(route)),
             TransportKind::Relay => {

@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -9,6 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use airc_core::transcript::MentionTarget;
+use airc_core::PeerId;
 use airc_protocol::{Frame, FrameKind, Subscription};
 
 use crate::transport::{FrameStream, Transport};
@@ -27,6 +29,11 @@ struct SubscriberHandle {
 
 struct Inner {
     config: UdpConfig,
+    /// Live peer endpoint table. Initialized from
+    /// `config.peer_endpoints` at construction and mutated through
+    /// [`UdpAdapter::add_peer`]. Wrapped in a `std::sync::RwLock` so
+    /// `destinations()` can stay sync.
+    peer_endpoints: StdRwLock<HashMap<PeerId, SocketAddr>>,
     socket: RwLock<Option<Arc<UdpSocket>>>,
     subscribers: Mutex<Vec<SubscriberHandle>>,
     next_sub_id: AtomicU64,
@@ -40,14 +47,30 @@ pub struct UdpAdapter {
 
 impl UdpAdapter {
     pub fn new(config: UdpConfig) -> Self {
+        let peer_endpoints = StdRwLock::new(config.peer_endpoints.clone());
         Self {
             inner: Arc::new(Inner {
                 config,
+                peer_endpoints,
                 socket: RwLock::new(None),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Add or replace a known peer endpoint at runtime. Returns the
+    /// previous address for `peer_id` if one was registered.
+    /// Intended for SDK paths where peer addresses are learned via
+    /// signalling/discovery after the adapter is bound, rather than
+    /// known at construction.
+    pub fn add_peer(&self, peer_id: PeerId, addr: SocketAddr) -> Option<SocketAddr> {
+        let mut guard = self
+            .inner
+            .peer_endpoints
+            .write()
+            .expect("udp peer_endpoints lock poisoned");
+        guard.insert(peer_id, addr)
     }
 
     /// Bind the UDP socket and spawn the receive loop. Returns the
@@ -92,18 +115,19 @@ impl UdpAdapter {
     }
 
     fn destinations(&self, frame: &Frame) -> Result<Vec<SocketAddr>, UdpError> {
+        let guard = self
+            .inner
+            .peer_endpoints
+            .read()
+            .expect("udp peer_endpoints lock poisoned");
         match frame.envelope.target {
-            MentionTarget::Peer(peer_id) => self
-                .inner
-                .config
-                .peer_endpoints
+            MentionTarget::Peer(peer_id) => guard
                 .get(&peer_id)
                 .copied()
                 .map(|addr| vec![addr])
                 .ok_or(UdpError::UnknownPeerEndpoint(peer_id)),
             MentionTarget::All | MentionTarget::Room(_) => {
-                let endpoints: Vec<SocketAddr> =
-                    self.inner.config.peer_endpoints.values().copied().collect();
+                let endpoints: Vec<SocketAddr> = guard.values().copied().collect();
                 if endpoints.is_empty() {
                     Err(UdpError::NoPeerEndpoints)
                 } else {
