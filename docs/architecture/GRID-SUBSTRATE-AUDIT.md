@@ -606,11 +606,24 @@ Status:
   a control event sent from Alice to Bob between separate Airc homes
   with `replace_transport_health(udp-only)` forcing UDP as the only
   admissible route. The `webrtc_signaling::SignalingMessage` types
-  (Offer/Answer/IceCandidate) ship as the data contract for the
-  follow-up orchestration PR; this PR does **not** include the
-  mesh-as-signaling-channel state machine, the WebRTC route
-  execution arm, or the per-peer DataChannel registry. Those are
-  the next slice.
+  (Offer/Answer/IceCandidate) shipped alongside as the data contract
+  for the orchestration follow-up.
+- (#6 cont.) WebRTC DataChannel orchestration landed: `Airc::
+  open_webrtc_to(peer_id)` drives the full SDP offer/answer handshake
+  over the AIRC mesh using `SignalingMessage` events;
+  `Airc::accept_webrtc_offers` spawns the responder task. Gather-
+  complete (non-trickle) ICE matches the existing webrtc_datachannel
+  adapter tests. Per-peer DataChannel registry in `AircInner.
+  webrtc_channels`; `TransportKind::WebRtcDataChannel` route arm
+  dispatches sends to it. End-to-end proof: two Airc instances over
+  a shared local-fs signaling wire, Alice initiates, Bob accepts,
+  both `replace_transport_health(webrtc-only)`, then Alice sends a
+  control event whose only viable route is the freshly-established
+  DataChannel — round-trip in ~1.5s under `cargo test`. Explicit
+  non-goals for follow-up: trickle ICE, STUN/TURN configuration for
+  real-network NAT traversal (currently loopback-only via
+  `with_udp_addrs(["127.0.0.1:0"])`), reconnect-on-drop, and
+  renegotiation.
 
 
 

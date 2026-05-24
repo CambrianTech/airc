@@ -43,6 +43,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = { version = "1", features = ["v4", "v5"] }
+webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
 airc-daemon = { path = "../airc-daemon" }
