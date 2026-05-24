@@ -1,0 +1,26 @@
+[package]
+name = "airc-identity"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Local identity contract for AIRC peers. Owns the Ed25519 keypair,
+# stable peer/client ids, and ORM-backed identity metadata. Kept out
+# of `airc-daemon` so consumers can open identities without depending
+# on daemon runtime state.
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
+airc-store = { path = "../airc-store" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

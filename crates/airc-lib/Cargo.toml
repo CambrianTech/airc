@@ -6,7 +6,7 @@ license = "MIT"
 publish = false
 
 # Consumer-facing AIRC API. Composes:
-#   - airc-daemon::LocalIdentity (Ed25519 identity persisted at <home>)
+#   - airc-identity::LocalIdentity (Ed25519 identity persisted at <home>)
 #   - airc-ipc (typed daemon client for daemon-attached mode)
 #   - airc-store::SqliteEventStore (durable transcript backing)
 #   - airc-transport (signed local-fs + LAN-TCP send/subscribe)
@@ -23,6 +23,7 @@ workspace = true
 
 [dependencies]
 airc-core = { path = "../airc-core" }
+airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
 airc-protocol = { path = "../airc-protocol" }
 airc-store = { path = "../airc-store" }

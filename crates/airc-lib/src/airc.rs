@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use airc_core::{ClientId, PeerId, TranscriptEvent};
-use airc_daemon::{peers_store, LocalIdentity};
+use airc_daemon::peers_store;
+use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
@@ -186,10 +187,10 @@ impl Airc {
         policy: VerificationPolicy,
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
-        std::fs::create_dir_all(&home).map_err(airc_daemon::IdentityError::Io)?;
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let identity = LocalIdentity::load_or_generate(&home).await?;
         let wire_root = machine_account_home(&home);
-        std::fs::create_dir_all(&wire_root).map_err(airc_daemon::IdentityError::Io)?;
+        std::fs::create_dir_all(&wire_root).map_err(IdentityError::Io)?;
         peers_store::add(
             &wire_root,
             identity.peer_id,

@@ -390,9 +390,11 @@ follow-up.
   in the IPC crate cut. `DaemonClient`, request/response enums, the
   length-framed codec, and cross-platform IPC transport now live in
   `airc-ipc`, so daemon-attached SDK mode no longer depends on the
-  daemon runtime crate for IPC. Remaining cleanup: move identity and
-  peer-trust helpers behind lower-level contracts so `airc-lib` stops
-  naming `airc-daemon::LocalIdentity` / `airc-daemon::peers_store`.
+  daemon runtime crate for IPC. The identity crate cut moved
+  `LocalIdentity` / `IdentityError` into `airc-identity`, so consumers
+  can open local identities without importing daemon runtime state.
+  Remaining cleanup: move peer-trust helpers behind lower-level
+  contracts so `airc-lib` stops naming `airc-daemon::peers_store`.
 - **`airc-transport::signed` holds peer trust through
   `Arc<PeerKeyRegistry>`** — CLOSED for global-lock contention. Key
   rotation mutates the shared registry directly, so transport verifiers
