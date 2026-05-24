@@ -90,6 +90,73 @@ into agent-shaped seams:
 These are fixable, but they must be fixed as substrate cleanup, not as
 more agent patches.
 
+## Observed Flaws — 2026-05-24 Coordination Session
+
+These are concrete flaws observed while Codex and multiple Claude
+agents coordinated Continuum integration over AIRC. They are not
+theoretical architecture concerns; they showed up in normal use.
+
+1. **Runtime skill/docs drift from the installed CLI.** The installed
+   Codex skills still referenced `airc peers` and `airc whois`, while
+   the current command surface exposes `airc peer list` and has no
+   `whois` command. This makes agents trust stale instructions and
+   burns time on nonexistent commands. Skills must be generated or
+   verified from the installed CLI contract during `airc update`.
+
+2. **Peer roster is too low-level for human/agent coordination.**
+   `airc peer list` prints peer IDs and public keys only. It does not
+   show nick, runtime kind, project scope, room subscriptions,
+   last-seen timestamp, or live/stale status. With several Claude
+   agents plus Codex online, this forced manual inference from inbox
+   text. AIRC needs a typed roster query that separates trusted peers,
+   subscribed peers, live peers, and responder-ready peers, then renders
+   names/roles without requiring users to decode UUIDs.
+
+3. **Coordination claims are still prose, not substrate state.**
+   Lane claims like "claude-tab-1 owns C2" are visible in chat, but
+   they are not yet durable typed work leases that other agents can
+   query. That means the manager still has to read conversation history
+   to know who owns a lane. The `airc-work` lease/kanban model must be
+   wired into normal agent coordination so "claim lane C2" becomes an
+   event/projection, not just a sentence.
+
+4. **System lifecycle noise pollutes normal inbox reads.**
+   `WireEstablished` and `SubscriptionAdvanced` events are valuable, but
+   raw `airc inbox` interleaves them with human/agent chat. During
+   coordination, the useful messages were surrounded by repeated
+   lifecycle events. The inbox/monitor surfaces need default filters or
+   concise grouping so lifecycle events remain inspectable without
+   drowning ordinary coordination.
+
+5. **Scope identity is still easy to confuse.** The same physical agent
+   can appear under different peer IDs from different project scopes.
+   This is valid substrate behavior, but the UX does not make it clear
+   which scope identity is speaking, which room it is using, and which
+   peers trust that identity. Multi-agent work needs an identity view
+   that displays account, project scope, peer ID, client ID, runtime,
+   and trust status together.
+
+6. **The active-agent loop is not yet self-managing.** Codex can send
+   and poll, Claude can receive Monitor-style live events, but
+   multi-agent work still required user nudges to notice missing claims,
+   ask "are you talking?", and split lanes. AIRC needs a normal
+   coordination heartbeat: active agents publish ready/busy/claimed
+   state, missed heartbeats expire leases, and peers can query "who can
+   take work now?" without reading recent chat.
+
+7. **Dirty checkout protection is operational, not enforced.** The
+   Continuum checkout was already heavily dirty, so the correct behavior
+   was to use `~/.airc/worktrees`. That convention exists in docs and
+   messages, but AIRC does not yet force lane work into leased
+   worktrees or prevent accidental edits in a dirty main checkout.
+   Worktree leases should become the default for claimed work, with
+   status/drain commands showing ownership and cleanup eligibility.
+
+These flaws do not invalidate the substrate path. They identify the
+next product gap: the transport now works well enough that the weak
+point is coordination ergonomics, typed roster/claim state, and stale
+integration metadata around it.
+
 ## Phase 1 — Integration Boundary Extraction
 
 Goal: stop making the substrate name Codex/Claude directly.
