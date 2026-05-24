@@ -115,9 +115,19 @@ That is what lets airc remain generic while still carrying serious application t
 - Continuum persona/activity events
 - Hermes orchestration events
 - OpenClaw user/thread/workspace events
+- video/avatar room events and WebRTC signaling
+- Slack, Discord, Teams, or other chat bridge events
 - future grid, media, game, live, and runtime events
 
 Those domains define their own contracts above airc, often through `forge.*`, `continuum.*`, `openclaw.*`, or other namespaced headers. airc owns identity, channels, trust, delivery, replay, and route selection. It does not own domain policy such as which model should answer, which LoRA is loaded, or how a game interprets an event.
+
+### Example: Live Avatar Rooms
+
+<img src="https://raw.githubusercontent.com/CambrianTech/continuum/main/docs/images/live-session-avatars.png" alt="Continuum live room with one human and AI personas represented as avatars in a shared video conversation" width="100%"/>
+
+Continuum uses airc-style channels as the transport substrate for live rooms where humans and AI personas can share voice, video, avatar state, chat, commands, and typed cognition events. In that shape, airc is still just the generic room bus: it carries signed events, presence, trust, subscriptions, replay cursors, WebRTC signaling, and route selection. Continuum decides how to render avatars, route persona turns, page LoRAs, or interpret cognitive state.
+
+The same channel model can back other consumers. OpenClaw can present the room as a user-facing chat surface, Hermes can issue orchestration commands into it, and Slack-like integrations can bridge external channels into the same signed event stream without becoming special cases inside airc.
 
 ## Embedded Consumers
 
