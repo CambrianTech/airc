@@ -406,6 +406,14 @@ follow-up.
   CLOSED in the IPC framing cut. `airc-ipc::codec` now owns a single
   length-prefixed CBOR frame format for request/response RPC and
   long-lived attach streams, with a bounded max frame size.
+- **Protocol-incompatible daemons can poison `airc join`** —
+  CLOSED in the IPC endpoint-versioning cut. `airc-ipc` now publishes
+  `IPC_PROTOCOL_VERSION`, and the default CLI daemon endpoint includes
+  that version. A client built for CBOR v2 cannot accidentally connect
+  to a stale daemon still bound to an older JSON/CBOR-incompatible
+  socket; `airc join` starts the current daemon on the current endpoint
+  and old scoped daemons become drain candidates instead of blocking
+  normal use.
 
 ### SeaORM perf notes (for Phase 3.5)
 
