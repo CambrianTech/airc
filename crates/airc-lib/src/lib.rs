@@ -99,8 +99,9 @@ pub use subscriptions::{
 };
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
-    CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservedLocalGitWorkspace,
-    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, RequestWorkspace,
+    CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests,
+    ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim,
+    ReleaseWorkspace, RequestWorkspace,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core

@@ -25,6 +25,9 @@ pub enum AircError {
     #[error("local git observer: {0}")]
     LocalGit(#[from] airc_work::LocalGitError),
 
+    #[error("pull request source: {0}")]
+    PullRequestSource(#[from] airc_work::PullRequestSourceError),
+
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 
