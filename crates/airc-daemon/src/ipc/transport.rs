@@ -392,9 +392,9 @@ mod tests {
         // each other's messages.
         // Use `read_exact` framing on both sides so the test doesn't
         // depend on `shutdown()` half-close semantics — Windows named
-        // pipes have no half-close, so the daemon protocol switched
-        // to newline framing for the same reason. Here we know each
-        // side writes exactly 6 bytes.
+        // pipes have no half-close, so the daemon protocol uses
+        // explicit length framing for the same reason. Here we know
+        // each side writes exactly 6 bytes.
         let server_a = tokio::spawn(async move {
             let mut stream = listener_a.accept().await.unwrap();
             let mut buf = [0u8; 6];

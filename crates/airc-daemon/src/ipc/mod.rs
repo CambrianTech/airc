@@ -1,18 +1,20 @@
 //! IPC between the `airc-core` CLI and the running daemon.
 //!
-//! Wire protocol = newline-delimited JSON over a local IPC primitive.
-//! On Unix that's a Unix-domain socket at `<home>/daemon.sock`. On
-//! Windows it's a named pipe (`\\.\pipe\airc-core-<home>`). The
-//! `transport` module abstracts both behind one `IpcListener` /
-//! `IpcStream` API; everything above (request/response types,
-//! dispatch, handlers) stays platform-agnostic.
+//! Wire protocol = length-prefixed CBOR frames over a local IPC
+//! primitive. On Unix that's a Unix-domain socket at
+//! `<home>/daemon.sock`. On Windows it's a named pipe
+//! (`\\.\pipe\airc-core-<home>`). The `transport` module abstracts
+//! both behind one `IpcListener` / `IpcStream` API; everything above
+//! (request/response types, dispatch, handlers) stays
+//! platform-agnostic.
 //!
 //! Why not gRPC / cap'n proto: this is local-only IPC for a
-//! single-machine daemon. JSON over Unix sockets / named pipes is
-//! the right amount of ceremony — typed in Rust (Request/Response
-//! enums), human-debuggable, zero extra schema toolchain.
+//! single-machine daemon. Typed Rust enums plus one internal codec are
+//! enough; consumer-facing observability remains at the CLI/event
+//! layer rather than the raw daemon byte stream.
 
 pub mod client;
+pub mod codec;
 pub mod request;
 pub mod response;
 pub mod transport;

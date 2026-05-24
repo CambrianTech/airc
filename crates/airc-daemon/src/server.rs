@@ -1,8 +1,9 @@
 //! Cross-platform IPC listener + accept loop.
 //!
 //! Each accepted connection is handled in its own task: read one
-//! request, dispatch, write one response, close. Independent
-//! connections so a slow handler doesn't block the listener.
+//! length-framed request, dispatch, write one length-framed response,
+//! close. Attach streams keep writing response frames on the same
+//! connection.
 //!
 //! Transport varies by platform via `IpcListener`:
 //!   - Unix: Unix-domain socket at `<home>/daemon.sock`
@@ -16,10 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::handlers::dispatch;
+use crate::ipc::codec::{read_frame, write_frame};
 use crate::ipc::request::{AttachRequest, Request};
 use crate::ipc::response::Response;
 use crate::ipc::transport::{IpcListener, IpcStream};
@@ -177,26 +179,17 @@ fn cleanup_stale_socket(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Handle one connection: read a single newline-terminated JSON
-/// request line, dispatch, write the JSON response line, drop. No
-/// half-close on the read side — Unix sockets can `shutdown` to
-/// signal EOF, but Windows named pipes have no half-close, so a
-/// protocol that relies on `shutdown` + `read_to_end` hangs on
-/// Windows. Newline-delimited single-line framing works identically
-/// on both transports.
+/// Handle one connection: read one length-framed request, dispatch,
+/// write one length-framed response, drop. No half-close on the read
+/// side — Unix sockets can `shutdown` to signal EOF, but Windows named
+/// pipes have no half-close.
 async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result<(), DaemonError> {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut request_line = String::new();
-    let bytes_read = reader.read_line(&mut request_line).await?;
-    if bytes_read == 0 {
-        // Client closed without sending a request line. Nothing to
-        // respond to; just drop the connection.
-        return Ok(());
-    }
+    let mut reader = reader;
 
-    let request: Request = match serde_json::from_str(request_line.trim_end_matches('\n')) {
-        Ok(request) => request,
+    let request: Request = match read_frame(&mut reader).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
         Err(error) => {
             let response = Response::Error {
                 message: format!("could not parse request: {error}"),
@@ -253,16 +246,7 @@ async fn write_response<W>(writer: &mut W, response: &Response) -> Result<(), Da
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut payload = serde_json::to_vec(response).map_err(|error| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error.to_string(),
-        ))
-    })?;
-    payload.push(b'\n');
-    writer.write_all(&payload).await?;
-    writer.flush().await?;
-    Ok(())
+    write_frame(writer, response).await.map_err(DaemonError::Io)
 }
 
 #[cfg(test)]
