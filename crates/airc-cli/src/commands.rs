@@ -766,6 +766,50 @@ pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// `whois <peer>` — print the trust entry for an enrolled peer.
+///
+/// Rich peer identity cards are a roster-layer follow-up. This command
+/// is intentionally honest today: it resolves the peer trust entry that
+/// controls message verification instead of pretending to have profile
+/// metadata that is not yet published on the substrate.
+pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let peers = airc.peers().await?;
+    let matches = peers
+        .iter()
+        .filter(|peer| peer.peer_id.to_string().starts_with(target))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => {
+            println!("peer not found: {target}");
+            if peers.is_empty() {
+                println!("(no enroled peers — use `airc peer add <spec>` to enrol)");
+            } else {
+                println!("known peers:");
+                for peer in peers {
+                    println!("  {}  {}", peer.peer_id, peer.pubkey_b64);
+                }
+            }
+            Err("peer not found".into())
+        }
+        [peer] => {
+            println!("  peer_id:   {}", peer.peer_id);
+            println!("  pubkey:    {}", peer.pubkey_b64);
+            println!("  identity:  not published yet");
+            println!("  source:    peer trust store");
+            Ok(())
+        }
+        _ => {
+            println!("ambiguous peer prefix: {target}");
+            for peer in matches {
+                println!("  {}  {}", peer.peer_id, peer.pubkey_b64);
+            }
+            Err("ambiguous peer prefix".into())
+        }
+    }
+}
+
 // Silence the unused-import warning for `ClientId`: it's used
 // transitively through `LocalIdentity::client_id` (the
 // `airc_core::ClientId` newtype) but not referenced by name in this

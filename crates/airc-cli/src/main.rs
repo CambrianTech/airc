@@ -364,6 +364,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             PeerAction::List => commands::run_peer_list(&home).await,
         },
 
+        Command::Peers => commands::run_peer_list(&home).await,
+
+        Command::Whois { peer } => match peer {
+            Some(peer) => commands::run_whois_peer(&home, &peer).await,
+            None => identity_commands::run_show(&home).await,
+        },
+
         Command::Route(args) => match args.action {
             RouteAction::Status(args) => route_commands::run_status(args),
         },

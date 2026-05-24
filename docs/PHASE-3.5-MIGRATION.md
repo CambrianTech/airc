@@ -50,7 +50,7 @@ The first `airc join` after upgrade:
 5. Reads the wire to backfill any unseen events into the
    `events` table.
 
-What you'll see if it worked: `airc peer list` shows enrolled
+What you'll see if it worked: `airc peers` shows enrolled
 peers (post-#903 it reads from the account-mesh union, so HOME
 peers + scope peers both show up); `airc msg "..."` reports
 "N paired peer(s)" with N > 0.
@@ -118,7 +118,7 @@ What it means: pre-#903 bug where `Airc::peers()` loaded scope-local
 trust instead of the account-mesh union. Fixed in #903.
 
 Recovery: upgrade to a post-#903 binary. If you're already there,
-verify with `airc peer list` (should show HOME + per-scope peers).
+verify with `airc peers` (should show HOME + per-scope peers).
 
 ## What you should clean up by hand
 

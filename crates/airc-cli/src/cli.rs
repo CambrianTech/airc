@@ -282,6 +282,21 @@ pub enum Command {
     /// Manage the persisted peer trust registry.
     Peer(PeerArgs),
 
+    /// List enrolled peers in the current scope.
+    ///
+    /// IRC-shaped public command. Equivalent to `airc peer list`,
+    /// kept as the low-friction human / agent coordination surface.
+    Peers,
+
+    /// Show identity information for self or an enrolled peer.
+    ///
+    /// With no target, prints this scope's identity card. With a peer
+    /// id or prefix, prints the enrolled trust entry for that peer.
+    Whois {
+        /// Optional peer UUID or unambiguous UUID prefix.
+        peer: Option<String>,
+    },
+
     /// Inspect transport route policy and candidate selection.
     Route(RouteArgs),
 
