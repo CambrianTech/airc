@@ -1,10 +1,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
-pub fn run_update() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
+    let airc_exe = env::current_exe()?;
+    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
     let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" || branch.is_empty() {
@@ -16,6 +19,9 @@ pub fn run_update() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+    if daemon_was_running {
+        stop_daemon(&airc_exe, home, &socket)?;
+    }
     run_checked(
         Command::new("git")
             .arg("-C")
@@ -44,8 +50,105 @@ pub fn run_update() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("Updated: {before} -> {after}");
     }
+    if daemon_was_running {
+        restart_daemon(&airc_exe, home, &socket)?;
+        wait_daemon_ready(&airc_exe, home, &socket)?;
+        println!("daemon: restarted.");
+    }
     Ok(())
 }
+
+fn daemon_is_running(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(daemon_command(airc_exe, home, "ping", socket)
+        .output()?
+        .status
+        .success())
+}
+
+fn stop_daemon(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = daemon_command(airc_exe, home, "stop", socket);
+    run_checked(&mut command, "airc stop before update")
+}
+
+fn restart_daemon(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(home)?;
+    let log = home.join("airc-daemon.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
+    let stderr = stdout.try_clone()?;
+    let mut command = daemon_command(airc_exe, home, "daemon", socket);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    detach_daemon(&mut command);
+    command.spawn()?;
+    Ok(())
+}
+
+fn wait_daemon_ready(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if daemon_is_running(airc_exe, home, socket)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon did not become ready after update: {}",
+                home.display()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn daemon_command(airc_exe: &Path, home: &Path, subcommand: &str, socket: &Path) -> Command {
+    let mut command = Command::new(airc_exe);
+    command
+        .arg("--home")
+        .arg(home)
+        .arg(subcommand)
+        .arg("--socket")
+        .arg(socket);
+    command
+}
+
+#[cfg(unix)]
+fn detach_daemon(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: this closure runs in the child just before exec and
+    // only calls setsid, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_daemon(_command: &mut Command) {}
 
 fn install_source_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = env::var_os("AIRC_DIR").filter(|value| !value.is_empty()) {
@@ -168,5 +271,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("No git checkout"));
+    }
+
+    #[test]
+    fn daemon_command_passes_home_subcommand_and_socket() {
+        let command = daemon_command(
+            Path::new("/bin/airc"),
+            Path::new("/tmp/home/.airc"),
+            "daemon",
+            Path::new("/tmp/airc.sock"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--home",
+                "/tmp/home/.airc",
+                "daemon",
+                "--socket",
+                "/tmp/airc.sock"
+            ]
+        );
     }
 }
