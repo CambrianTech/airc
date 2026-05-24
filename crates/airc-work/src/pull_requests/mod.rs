@@ -15,6 +15,8 @@
 //! (Continuum, OpenClaw, Hermes, agents) can subscribe against
 //! immediately.
 
+pub mod gh;
+
 use std::collections::HashMap;
 
 use airc_core::PeerId;

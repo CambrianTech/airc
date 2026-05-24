@@ -48,6 +48,9 @@ pub use projection::{
     BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat, ProjectionError,
     PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection, WorkspaceRecord,
 };
+pub use pull_requests::gh::{
+    CommandGhRunner, GhCommandRunner, GhPullRequestSource, GhRunnerError, GH_JSON_FIELDS,
+};
 pub use pull_requests::{
     pull_request_events_since, InMemoryPullRequestSource, PullRequestObserver, PullRequestSnapshot,
     PullRequestSource, PullRequestSourceError, RepoPullRequestSnapshot,
