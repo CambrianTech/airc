@@ -544,6 +544,13 @@ context.
   and no GitHub/shared-fs data plane.** `airc-lib` now executes the
   Relay route directly and proves command-bus request/reply over it
   (`request_and_reply_round_trip_over_relay_without_github_or_lan`).
+- **Closed for consumer-shaped command traffic: Continuum, OpenClaw,
+  and Hermes contract payloads now ride the command-bus request/reply
+  primitive over LAN-TCP with separate homes.** The
+  `consumer-shapes` fixture proves typed downstream payloads can use
+  `Airc::request`, `Airc::reply`, and `Airc::await_reply` without
+  parsing CLI prose or depending on GitHub/shared-fs runtime traffic
+  (`consumer_contracts_round_trip_over_lan_command_bus`).
   Remaining broader proof: tailnet/relay across real machines before
   promoting the rewrite beyond local/LAN/relay confidence.
 
@@ -553,8 +560,8 @@ context.
    subscribe to work-state changes instead of polling.
 2. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
-3. Promote the LAN command-bus proof into the Continuum/OpenClaw/Hermes
-   integration fixture once those consumers bind to command-bus APIs.
+3. Bind the same command-bus request/reply proof in real Continuum,
+   OpenClaw, and Hermes repos once their adapters depend on `airc-lib`.
 
 Done or superseded:
 

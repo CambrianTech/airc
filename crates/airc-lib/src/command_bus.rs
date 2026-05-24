@@ -112,11 +112,11 @@ use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use crate::error::AircError;
+use crate::stream::EventStream;
 use crate::time::now_ms;
 use crate::Airc;
 
 /// One in-flight request awaiting a matching reply.
-#[derive(Debug)]
 pub struct PendingCommand {
     /// The correlation id stamped on the outgoing request event.
     /// The reply event must carry the same value in
@@ -125,6 +125,23 @@ pub struct PendingCommand {
     /// Wall-clock deadline. `await_reply` returns
     /// `AircError::CommandDeadline` past this point.
     pub deadline_at_ms: u64,
+    /// Live reply stream armed before the request is emitted.
+    ///
+    /// Without this, a fast same-process/LAN responder can reply
+    /// before `await_reply` subscribes, and the requester misses its
+    /// own command response. The stream is private so consumers use
+    /// the request/await contract rather than constructing half-armed
+    /// pending commands.
+    reply_stream: Option<EventStream>,
+}
+
+impl std::fmt::Debug for PendingCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingCommand")
+            .field("correlation_id", &self.correlation_id)
+            .field("deadline_at_ms", &self.deadline_at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PendingCommand {
@@ -160,6 +177,7 @@ impl Airc {
     ) -> Result<PendingCommand, AircError> {
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
+        let reply_stream = self.subscribe().await?;
 
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
@@ -177,6 +195,7 @@ impl Airc {
         Ok(PendingCommand {
             correlation_id,
             deadline_at_ms,
+            reply_stream: Some(reply_stream),
         })
     }
 
@@ -210,24 +229,26 @@ impl Airc {
     /// headers intact) or [`AircError::CommandDeadline`] if the
     /// deadline elapses first.
     ///
-    /// The substrate subscribes to the live broadcast stream and
-    /// filters by `airc.correlation_id`. If the reply arrived
-    /// before this call (uncommon but possible — the broadcast
-    /// channel has a buffer), the subscribed stream replays it.
+    /// The substrate filters the reply stream armed by
+    /// [`request`](Self::request) before the request frame is sent.
+    /// That ordering is part of the contract: fast local/LAN
+    /// responders cannot win a race against the awaiter.
     pub async fn await_reply(&self, pending: PendingCommand) -> Result<TranscriptEvent, AircError> {
         let correlation = pending.correlation_id.to_string();
-        let mut stream = self.subscribe().await?;
+        let correlation_id = pending.correlation_id;
         let deadline = Instant::now()
             + pending
                 .remaining()
                 .unwrap_or_else(|| Duration::from_secs(0));
+        let mut stream = match pending.reply_stream {
+            Some(stream) => stream,
+            None => self.subscribe().await?,
+        };
 
         loop {
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
-                return Err(AircError::CommandDeadline {
-                    correlation_id: pending.correlation_id,
-                });
+                return Err(AircError::CommandDeadline { correlation_id });
             }
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(event))) => {
@@ -244,14 +265,10 @@ impl Airc {
                 }
                 Ok(None) => {
                     // Stream closed before any reply arrived.
-                    return Err(AircError::CommandDeadline {
-                        correlation_id: pending.correlation_id,
-                    });
+                    return Err(AircError::CommandDeadline { correlation_id });
                 }
                 Err(_) => {
-                    return Err(AircError::CommandDeadline {
-                        correlation_id: pending.correlation_id,
-                    });
+                    return Err(AircError::CommandDeadline { correlation_id });
                 }
             }
         }
@@ -268,6 +285,7 @@ mod tests {
         let pending = PendingCommand {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: 1,
+            reply_stream: None,
         };
         assert!(pending.remaining().is_none());
     }
@@ -278,6 +296,7 @@ mod tests {
         let pending = PendingCommand {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: u64::MAX / 2,
+            reply_stream: None,
         };
         let remaining = pending.remaining().unwrap();
         assert!(remaining.as_millis() > 0);
