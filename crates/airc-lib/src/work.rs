@@ -3,9 +3,10 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, local_git_events_since, BranchName, CardCreated, ClaimId, ClaimReleased,
-    CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged, LocalGitObserver,
-    LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased, Priority, RepoId,
+    encode_work_event, local_git_events_since, pull_request_events_since, BranchName, CardCreated,
+    ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged,
+    LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased,
+    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot,
     WorkBoardProjection, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
     WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
 };
@@ -97,6 +98,21 @@ pub struct ObserveLocalGitWorkspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedLocalGitWorkspace {
     pub snapshot: LocalGitSnapshot,
+    pub emitted_event_ids: Vec<EventId>,
+}
+
+/// Observe pull-request state for `repo` against an optional prior
+/// snapshot. The caller owns the source impl (gh-CLI, REST, or a stub)
+/// so the SDK is free of any hard GitHub dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservePullRequests {
+    pub repo: RepoId,
+    pub previous: Option<RepoPullRequestSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPullRequests {
+    pub snapshot: RepoPullRequestSnapshot,
     pub emitted_event_ids: Vec<EventId>,
 }
 
@@ -287,6 +303,38 @@ impl Airc {
         }
 
         Ok(ObservedLocalGitWorkspace {
+            snapshot,
+            emitted_event_ids,
+        })
+    }
+
+    /// Observe pull-request state via a caller-supplied
+    /// [`PullRequestSource`] and publish any state changes as signed
+    /// work events. Mirrors [`Airc::observe_local_git_workspace`]: the
+    /// SDK owns the publish path, the caller owns the I/O surface.
+    ///
+    /// This is the substrate adapter boundary for PR/CI/review events
+    /// — once a real gh-CLI source ships in a follow-up, agents,
+    /// monitor renderers, Continuum/OpenClaw/Hermes all consume PR
+    /// state changes through the same subscription stream they
+    /// already use for chat and lifecycle.
+    pub async fn observe_pull_requests<S: PullRequestSource>(
+        &self,
+        observer: &PullRequestObserver<S>,
+        request: ObservePullRequests,
+    ) -> Result<ObservedPullRequests, AircError> {
+        let snapshot = observer.observe(&request.repo)?;
+        let events = pull_request_events_since(
+            request.previous.as_ref(),
+            &snapshot,
+            self.peer_id(),
+            now_ms()?,
+        );
+        let mut emitted_event_ids = Vec::with_capacity(events.len());
+        for event in events {
+            emitted_event_ids.push(self.publish_work_event(&event).await?);
+        }
+        Ok(ObservedPullRequests {
             snapshot,
             emitted_event_ids,
         })

@@ -563,6 +563,18 @@ context.
 3. Bind the same command-bus request/reply proof in real Continuum,
    OpenClaw, and Hermes repos once their adapters depend on `airc-lib`.
 
+Status:
+
+- (#2) Pull-request observation skeleton landed: `airc-work::pull_requests`
+  exposes a `PullRequestSource` trait, `PullRequestObserver`,
+  per-repo snapshot type, and a snapshot-diff function that emits
+  the existing `PullRequestCheckSuiteChanged` /
+  `PullRequestMergeStateChanged` / `PullRequestReviewSubmitted`
+  events. `airc-lib::Airc::observe_pull_requests` mirrors the
+  `observe_local_git_workspace` shape: caller owns the source impl,
+  SDK owns the publish path. The real `gh`-CLI source is a
+  follow-up; the in-memory stub is the test source today.
+
 Done or superseded:
 
 - Store-backed runtime cursors are now in place; `airc join` and Codex hook

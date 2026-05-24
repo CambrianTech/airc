@@ -12,6 +12,7 @@ pub mod ids;
 pub mod local_git;
 pub mod model;
 pub mod projection;
+pub mod pull_requests;
 pub mod replay;
 
 pub use codec::{
@@ -46,6 +47,10 @@ pub use model::{
 pub use projection::{
     BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat, ProjectionError,
     PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection, WorkspaceRecord,
+};
+pub use pull_requests::{
+    pull_request_events_since, InMemoryPullRequestSource, PullRequestObserver, PullRequestSnapshot,
+    PullRequestSource, PullRequestSourceError, RepoPullRequestSnapshot,
 };
 pub use replay::{
     decode_transcript_work_event, project_transcript_work_events, transcript_is_work_event,
