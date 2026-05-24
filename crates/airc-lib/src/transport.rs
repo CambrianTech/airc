@@ -11,9 +11,37 @@ use crate::error::AircError;
 use crate::room::Room;
 use crate::Airc;
 
+pub(crate) struct IngestTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IngestTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn wait_bounded(mut self, timeout: std::time::Duration) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(timeout, handle).await;
+    }
+}
+
+impl Drop for IngestTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub(crate) struct WireSubscriber {
-    /// Kept alive by ownership of its `JoinHandle`.
-    pub(crate) _task: tokio::task::JoinHandle<()>,
+    /// Owns the ingest task; dropping aborts it instead of
+    /// detaching background work from the SDK handle lifecycle.
+    pub(crate) task: IngestTask,
     /// Drop or `take().send(())` to stop the task and trigger the
     /// `WireLost` emit path with `reason="teardown"`. `None` after
     /// the sender has been consumed by a teardown call.
@@ -21,8 +49,9 @@ pub(crate) struct WireSubscriber {
 }
 
 pub(crate) struct FrameSubscriber {
-    /// Kept alive by ownership of its `JoinHandle`.
-    pub(crate) _task: tokio::task::JoinHandle<()>,
+    /// Owns the ingest task; dropping aborts it instead of
+    /// detaching background work from the SDK handle lifecycle.
+    pub(crate) _task: IngestTask,
 }
 
 impl Airc {
@@ -60,7 +89,7 @@ impl Airc {
         subs.insert(
             wire.to_path_buf(),
             WireSubscriber {
-                _task: task,
+                task,
                 shutdown: Some(shutdown_tx),
             },
         );
@@ -103,7 +132,10 @@ impl Airc {
         }
         // Wait briefly for the task to finalize its emit. Bounded so
         // a wedged subscriber can't hang teardown forever.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), subscriber._task).await;
+        subscriber
+            .task
+            .wait_bounded(std::time::Duration::from_secs(2))
+            .await;
         Ok(())
     }
 
@@ -178,12 +210,12 @@ impl Airc {
         mut stream: airc_transport::FrameStream<E>,
         wire_for_lifecycle: Option<PathBuf>,
         shutdown: Option<oneshot::Receiver<()>>,
-    ) -> tokio::task::JoinHandle<()>
+    ) -> IngestTask
     where
         E: std::fmt::Display + Send + 'static,
     {
         let airc = self.clone();
-        tokio::spawn(async move {
+        IngestTask::new(tokio::spawn(async move {
             let reason: &'static str = match shutdown {
                 Some(mut shutdown_rx) => loop {
                     tokio::select! {
@@ -216,7 +248,7 @@ impl Airc {
                     );
                 }
             }
-        })
+        }))
     }
 
     async fn emit_wire_lost(&self, wire: &Path, reason: &str) -> Result<(), AircError> {
@@ -288,5 +320,49 @@ impl Airc {
 fn warn_frame_verify_failed(error: &impl std::fmt::Display) {
     if std::env::var_os("AIRC_REPLAY_WARN").is_some() {
         eprintln!("airc-lib subscriber: frame verification failed: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::IngestTask;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_task_aborts_underlying_task_on_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_task = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = IngestTask::new(tokio::spawn(async move {
+            let _guard = DropFlag(dropped_by_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx
+            .await
+            .expect("spawned ingest task should start before drop assertion");
+
+        drop(task);
+
+        for _ in 0..20 {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping IngestTask must abort and drop the spawned future"
+        );
     }
 }
