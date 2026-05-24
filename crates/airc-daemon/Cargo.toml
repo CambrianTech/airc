@@ -25,6 +25,7 @@ airc-store = { path = "../airc-store" }
 airc-transport = { path = "../airc-transport" }
 
 async-trait = "0.1"
+ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

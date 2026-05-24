@@ -398,11 +398,10 @@ follow-up.
   observe updates without swapping an outer lock guard. A future
   delegate can still narrow ownership further, but the hot-path
   serialization point is gone.
-- **Daemon IPC is line-delimited JSON without length-framing**
-  (implied from `airc-daemon/src/ipc/request.rs`) — STILL OPEN. A
-  newline in a message body breaks the parser. No backpressure
-  framing. Fix: length-prefixed CBOR/protobuf, or proper RPC
-  codec (tonic).
+- **Daemon IPC is line-delimited JSON without length-framing** —
+  CLOSED in the IPC framing cut. `airc-daemon::ipc::codec` now owns a
+  single length-prefixed CBOR frame format for request/response RPC
+  and long-lived attach streams, with a bounded max frame size.
 
 ### SeaORM perf notes (for Phase 3.5)
 

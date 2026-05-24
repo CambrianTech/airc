@@ -42,7 +42,7 @@ pub enum Request {
     Inbox(InboxRequest),
     /// Attach to the daemon's live event stream. This is a long-lived
     /// request: after an initial `Response::Ok`, the daemon writes
-    /// `Response::Event` lines until the client disconnects.
+    /// `Response::Event` frames until the client disconnects.
     Attach(AttachRequest),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.

@@ -1,10 +1,9 @@
 //! Typed client used by CLI commands to talk to a running daemon.
 //!
-//! `DaemonClient::call(request)` opens a Unix socket, writes the
-//! request as one newline-delimited JSON line, reads the response,
-//! and parses it. One round-trip per connection — simple to debug
-//! with `socat`, and the daemon's accept loop can spawn each
-//! connection independently.
+//! `DaemonClient::call(request)` opens the local daemon socket, writes
+//! one length-prefixed typed request frame, reads one typed response
+//! frame, and closes. One round-trip per connection keeps the daemon's
+//! accept loop simple while avoiding newline-sensitive parsing.
 //!
 //! Convenience helpers (`ping`, `status`, `send`, `stop`) wrap the
 //! generic `call` and dispatch on response variants so callers don't
@@ -12,9 +11,9 @@
 
 use std::path::PathBuf;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{timeout, Duration};
 
+use crate::ipc::codec::{read_frame, write_frame};
 use crate::ipc::transport::IpcStream;
 
 use crate::ipc::request::{
@@ -89,11 +88,9 @@ impl DaemonClient {
         Self { socket_path }
     }
 
-    /// Generic RPC: writes a single newline-terminated request line,
-    /// reads a single newline-terminated response line. No half-close
-    /// — newline framing avoids the Windows-vs-Unix asymmetry where
-    /// Unix sockets support `shutdown` half-close but named pipes
-    /// don't. Both sides read until `\n`, parse, drop.
+    /// Generic RPC: writes one length-prefixed request frame and reads
+    /// one length-prefixed response frame. No half-close — Unix
+    /// sockets support `shutdown`, but Windows named pipes don't.
     pub async fn call(&self, request: Request) -> Result<Response, ClientError> {
         self.call_with_timeout(request, DEFAULT_RPC_TIMEOUT).await
     }
@@ -113,19 +110,20 @@ impl DaemonClient {
             .await
             .map_err(ClientError::NotConnected)?;
         let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = BufReader::new(reader);
+        let mut reader = reader;
 
-        let mut buffer = serde_json::to_vec(&request)?;
-        buffer.push(b'\n');
-        writer.write_all(&buffer).await.map_err(ClientError::Io)?;
-        writer.flush().await.map_err(ClientError::Io)?;
-
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
+        write_frame(&mut writer, &request)
             .await
             .map_err(ClientError::Io)?;
-        let response: Response = serde_json::from_str(response_line.trim_end_matches('\n'))?;
+        let response: Response = read_frame(&mut reader)
+            .await
+            .map_err(ClientError::Io)?
+            .ok_or_else(|| {
+                ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon closed before response frame",
+                ))
+            })?;
 
         match response {
             Response::Error { message } => Err(ClientError::Daemon(message)),
@@ -263,10 +261,9 @@ impl DaemonClient {
         let mut stream = IpcStream::connect(&self.socket_path)
             .await
             .map_err(ClientError::NotConnected)?;
-        let mut buffer = serde_json::to_vec(&Request::Attach(request))?;
-        buffer.push(b'\n');
-        stream.write_all(&buffer).await.map_err(ClientError::Io)?;
-        stream.flush().await.map_err(ClientError::Io)?;
+        write_frame(&mut stream, &Request::Attach(request))
+            .await
+            .map_err(ClientError::Io)?;
         Ok(stream)
     }
 }

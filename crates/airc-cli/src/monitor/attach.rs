@@ -2,10 +2,11 @@ use std::error::Error;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
-use airc_daemon::{AttachRequest, DaemonClient, Response, SubscribeRequest};
+use airc_daemon::{
+    ipc::codec::read_frame, AttachRequest, DaemonClient, Response, SubscribeRequest,
+};
 use airc_lib::Airc;
 use airc_protocol::HEADER_AIRC_CLIENT;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
 use crate::client_id::current_client_id;
@@ -23,18 +24,14 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
             })
             .await?;
     }
-    let stream = client.attach(AttachRequest::default()).await?;
-    let mut reader = BufReader::new(stream);
+    let mut stream = client.attach(AttachRequest::default()).await?;
     let mut sandbox = Sandbox::new();
 
     println!("airc: attached to Rust event stream for subscribed channels");
-    let mut line = String::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let Some(response) = read_frame::<_, Response>(&mut stream).await? else {
             return Ok(());
-        }
-        let response: Response = serde_json::from_str(line.trim_end_matches('\n'))?;
+        };
         match response {
             Response::Ok => {}
             Response::Event { event } => {
