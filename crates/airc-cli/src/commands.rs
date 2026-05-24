@@ -15,7 +15,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
@@ -663,8 +662,8 @@ async fn build_combined_registry(
     home: &Path,
     identity: &LocalIdentity,
     adhoc: &[PeerSpec],
-) -> Result<Arc<RwLock<PeerKeyRegistry>>, Box<dyn std::error::Error>> {
-    let mut registry = PeerKeyRegistry::new();
+) -> Result<Arc<PeerKeyRegistry>, Box<dyn std::error::Error>> {
+    let registry = PeerKeyRegistry::new();
     registry.enrol(identity.peer_id, 0, identity.keypair.public_bytes())?;
     for stored in peers_store::load(home).await? {
         registry.enrol(stored.peer_id, 0, stored.pubkey_bytes()?)?;
@@ -672,7 +671,7 @@ async fn build_combined_registry(
     for spec in adhoc {
         registry.enrol(spec.peer_id, 0, spec.pubkey)?;
     }
-    Ok(Arc::new(RwLock::new(registry)))
+    Ok(Arc::new(registry))
 }
 
 /// `peer add <spec>` — persist a peer to the trust store via

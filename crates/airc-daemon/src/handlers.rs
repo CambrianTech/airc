@@ -178,15 +178,7 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&bytes);
-    let mut registry = match state.registry.write() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Response::Error {
-                message: "add_peer: registry lock poisoned".to_string(),
-            };
-        }
-    };
-    if let Err(error) = registry.enrol(add.peer_id, 0, pubkey) {
+    if let Err(error) = state.registry.enrol(add.peer_id, 0, pubkey) {
         return Response::Error {
             message: format!("add_peer: enrol: {error}"),
         };
@@ -195,15 +187,7 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
 }
 
 async fn handle_remove_peer(state: Arc<DaemonState>, remove: RemovePeerRequest) -> Response {
-    let mut registry = match state.registry.write() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Response::Error {
-                message: "remove_peer: registry lock poisoned".to_string(),
-            };
-        }
-    };
-    registry.remove_peer(remove.peer_id);
+    state.registry.remove_peer(remove.peer_id);
     Response::Ok
 }
 
@@ -271,15 +255,14 @@ mod tests {
     use airc_core::PeerId;
     use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
     use std::path::PathBuf;
-    use std::sync::RwLock;
     use uuid::Uuid;
 
     fn test_state() -> Arc<DaemonState> {
         let peer_id = PeerId::from_u128(0xa1);
         let keypair = PeerKeypair::generate();
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
         // Test home is fresh per-call — empty peer trust store is
         // fine for dispatcher tests; no preexisting state required.
         let home = tempfile::TempDir::new().unwrap();
@@ -387,7 +370,7 @@ mod tests {
             .await,
             Response::Ok
         );
-        assert!(state.registry.read().unwrap().lookup(peer_id, 0).is_some());
+        assert!(state.registry.lookup(peer_id, 0).is_some());
 
         assert_eq!(
             dispatch(
@@ -397,7 +380,7 @@ mod tests {
             .await,
             Response::Ok
         );
-        assert!(state.registry.read().unwrap().lookup(peer_id, 0).is_none());
+        assert!(state.registry.lookup(peer_id, 0).is_none());
     }
 
     // Pull PathBuf into scope so the import isn't unused when only

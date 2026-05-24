@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use tokio::sync::{mpsc, Mutex};
 
@@ -54,7 +53,7 @@ pub(super) struct SubscriberHandle {
 pub(super) struct Inner {
     pub(super) self_peer_id: PeerId,
     pub(super) keypair: PeerKeypair,
-    pub(super) registry: Arc<RwLock<PeerKeyRegistry>>,
+    pub(super) registry: Arc<PeerKeyRegistry>,
     pub(super) server_config: Arc<rustls::ServerConfig>,
     /// Active connections keyed by remote `PeerId`. Filled by both
     /// the accept loop (server-side handshakes) and `connect()`

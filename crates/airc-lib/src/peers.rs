@@ -42,14 +42,7 @@ impl Airc {
         };
         let removed = removed_home.or(removed_wire_root).is_some();
 
-        {
-            let mut registry = self
-                .inner
-                .registry
-                .write()
-                .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
-            registry.remove_peer(peer_id);
-        }
+        self.inner.registry.remove_peer(peer_id);
 
         if !removed {
             return Ok(false);
@@ -110,12 +103,8 @@ impl Airc {
     /// Enrol a peer in the in-memory trust registry without writing
     /// durable peer trust state.
     pub fn enrol_volatile_peer(&self, spec: &PeerSpec) -> Result<(), AircError> {
-        let mut registry = self
-            .inner
+        self.inner
             .registry
-            .write()
-            .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
-        registry
             .enrol(spec.peer_id, 0, spec.pubkey)
             .map_err(|e| AircError::Crypto(e.to_string()))?;
         Ok(())

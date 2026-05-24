@@ -170,7 +170,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         let frame = Frame {
@@ -189,7 +189,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         // Tamper with the body — substantive content change.
@@ -216,7 +216,7 @@ mod tests {
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
         envelope.lamport = 999;
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         let frame = Frame {
@@ -238,7 +238,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         envelope
@@ -265,7 +265,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         envelope.reply_to = Some(EventId::from_u128(0x99));
@@ -291,7 +291,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = real_keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(peer, 0, imposter_keypair.public_bytes())
             .unwrap();
@@ -338,7 +338,7 @@ mod tests {
         let old_keypair = PeerKeypair::generate();
         let new_keypair = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, old_keypair.public_bytes()).unwrap();
         registry.enrol(peer, 1, new_keypair.public_bytes()).unwrap();
 

@@ -12,7 +12,6 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
@@ -67,7 +66,7 @@ pub struct SignedTransport<T: Transport> {
     /// Which enrolled key the signer uses. Multiple keys per peer
     /// support rotation; substrate sticks with a single id by default.
     key_id: u32,
-    registry: Arc<RwLock<PeerKeyRegistry>>,
+    registry: Arc<PeerKeyRegistry>,
     policy: VerificationPolicy,
 }
 
@@ -76,7 +75,7 @@ impl<T: Transport> SignedTransport<T> {
         inner: T,
         keypair: PeerKeypair,
         self_peer_id: PeerId,
-        registry: Arc<RwLock<PeerKeyRegistry>>,
+        registry: Arc<PeerKeyRegistry>,
         policy: VerificationPolicy,
     ) -> Self {
         Self {
@@ -131,23 +130,10 @@ where
             async move {
                 match item {
                     Err(error) => Err(SignedError::Inner(error)),
-                    Ok(frame) => {
-                        let registry_guard = match registry.read() {
-                            Ok(g) => g,
-                            Err(_) => {
-                                // Poisoned lock — refuse the frame
-                                // rather than silently passing without
-                                // verification.
-                                return Err(SignedError::Verify(
-                                    VerificationError::CanonicalEncodingFailed,
-                                ));
-                            }
-                        };
-                        match verify(&frame, policy, &registry_guard) {
-                            Ok(()) => Ok(frame),
-                            Err(error) => Err(SignedError::Verify(error)),
-                        }
-                    }
+                    Ok(frame) => match verify(&frame, policy, registry.as_ref()) {
+                        Ok(()) => Ok(frame),
+                        Err(error) => Err(SignedError::Verify(error)),
+                    },
                 }
             }
         });
@@ -199,24 +185,18 @@ mod tests {
         PeerKeypair,
         PeerId,
         PeerKeypair,
-        Arc<RwLock<PeerKeyRegistry>>,
+        Arc<PeerKeyRegistry>,
     ) {
         let alice_id = PeerId::from_u128(0xa1);
         let bob_id = PeerId::from_u128(0xb2);
         let alice_kp = PeerKeypair::generate();
         let bob_kp = PeerKeypair::generate();
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
         registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
-        (
-            alice_id,
-            alice_kp,
-            bob_id,
-            bob_kp,
-            Arc::new(RwLock::new(registry)),
-        )
+        (alice_id, alice_kp, bob_id, bob_kp, Arc::new(registry))
     }
 
     fn replay_sub() -> Subscription {
@@ -293,7 +273,7 @@ mod tests {
         // can sign — the wire is shared but registries are not.
         let mallory_id = PeerId::from_u128(0xc4);
         let mallory_kp = PeerKeypair::generate();
-        let mut mallory_registry = PeerKeyRegistry::new();
+        let mallory_registry = PeerKeyRegistry::new();
         mallory_registry
             .enrol(mallory_id, 0, mallory_kp.public_bytes())
             .unwrap();
@@ -302,7 +282,7 @@ mod tests {
         mallory_registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
-        let mallory_registry = Arc::new(RwLock::new(mallory_registry));
+        let mallory_registry = Arc::new(mallory_registry);
         let mallory = SignedTransport::new(
             LocalFsAdapter::new(dir.path()),
             mallory_kp,

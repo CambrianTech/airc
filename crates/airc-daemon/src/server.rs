@@ -271,15 +271,14 @@ mod tests {
     use crate::ipc::client::DaemonClient;
     use airc_core::PeerId;
     use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
-    use std::sync::RwLock;
     use std::time::Duration;
 
     fn fresh_state() -> Arc<DaemonState> {
         let peer_id = PeerId::from_u128(0xa1);
         let keypair = PeerKeypair::generate();
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
         // Test home — leaked so it lives until process exit.
         let home = tempfile::TempDir::new().unwrap();
         let home_path = home.path().to_path_buf();

@@ -29,7 +29,6 @@
 //! "this pubkey is in the registry."
 
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -52,11 +51,11 @@ fn supported_schemes() -> Vec<SignatureScheme> {
 #[derive(Debug)]
 pub struct PinnedServerVerifier {
     expected_peer: PeerId,
-    registry: Arc<RwLock<PeerKeyRegistry>>,
+    registry: Arc<PeerKeyRegistry>,
 }
 
 impl PinnedServerVerifier {
-    pub fn new(expected_peer: PeerId, registry: Arc<RwLock<PeerKeyRegistry>>) -> Self {
+    pub fn new(expected_peer: PeerId, registry: Arc<PeerKeyRegistry>) -> Self {
         Self {
             expected_peer,
             registry,
@@ -76,14 +75,9 @@ impl ServerCertVerifier for PinnedServerVerifier {
         let pubkey = extract_ed25519_pubkey(end_entity)
             .map_err(|error| RustlsError::General(error.to_string()))?;
 
-        let registry = self
-            .registry
-            .read()
-            .map_err(|error| RustlsError::General(format!("registry lock: {error}")))?;
-
         // Resolve the cert's pubkey to a (peer, key_id) entry. We
         // accept only if the resolved peer matches the expected one.
-        match registry.find_peer(&pubkey) {
+        match self.registry.find_peer(&pubkey) {
             Some((peer, _key_id)) if peer == self.expected_peer => {
                 Ok(ServerCertVerified::assertion())
             }
@@ -129,14 +123,14 @@ impl ServerCertVerifier for PinnedServerVerifier {
 /// registry. The caller resolves the peer post-handshake.
 #[derive(Debug)]
 pub struct PinnedClientVerifier {
-    registry: Arc<RwLock<PeerKeyRegistry>>,
+    registry: Arc<PeerKeyRegistry>,
     /// Held as an owned empty slice so `root_hint_subjects` can
     /// return a borrow per the rustls 0.23 trait signature.
     empty_hints: Vec<DistinguishedName>,
 }
 
 impl PinnedClientVerifier {
-    pub fn new(registry: Arc<RwLock<PeerKeyRegistry>>) -> Self {
+    pub fn new(registry: Arc<PeerKeyRegistry>) -> Self {
         Self {
             registry,
             empty_hints: Vec::new(),
@@ -162,15 +156,10 @@ impl ClientCertVerifier for PinnedClientVerifier {
         let pubkey = extract_ed25519_pubkey(end_entity)
             .map_err(|error| RustlsError::General(error.to_string()))?;
 
-        let registry = self
-            .registry
-            .read()
-            .map_err(|error| RustlsError::General(format!("registry lock: {error}")))?;
-
         // Any enrolled peer is acceptable; the adapter will read the
         // cert pubkey post-handshake and bind the connection to the
         // resolved PeerId. Pubkey not in registry → reject.
-        if registry.find_peer(&pubkey).is_some() {
+        if self.registry.find_peer(&pubkey).is_some() {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(RustlsError::General(
@@ -248,10 +237,10 @@ mod tests {
 
     use crate::lan_tcp::cert::generate_self_signed_cert;
 
-    fn make_registry_with(peer: PeerId, keypair: &PeerKeypair) -> Arc<RwLock<PeerKeyRegistry>> {
-        let mut registry = PeerKeyRegistry::new();
+    fn make_registry_with(peer: PeerId, keypair: &PeerKeypair) -> Arc<PeerKeyRegistry> {
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
-        Arc::new(RwLock::new(registry))
+        Arc::new(registry)
     }
 
     fn unix_now() -> UnixTime {
@@ -288,10 +277,10 @@ mod tests {
         let kp_b = PeerKeypair::generate();
         let (cert_b, _) = generate_self_signed_cert(&kp_b, peer_b).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer_a, 0, kp_a.public_bytes()).unwrap();
         registry.enrol(peer_b, 0, kp_b.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let verifier = PinnedServerVerifier::new(peer_a, registry);
         let server_name = ServerName::try_from("localhost").unwrap();
@@ -348,10 +337,10 @@ mod tests {
         let (cert_a, _) = generate_self_signed_cert(&kp_a, peer_a).unwrap();
         let (cert_b, _) = generate_self_signed_cert(&kp_b, peer_b).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer_a, 0, kp_a.public_bytes()).unwrap();
         registry.enrol(peer_b, 0, kp_b.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let verifier = PinnedClientVerifier::new(registry);
         assert!(verifier

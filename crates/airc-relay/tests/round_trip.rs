@@ -6,7 +6,7 @@
 //! stands in for "we can't reach each other directly").
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -39,13 +39,12 @@ impl TestIdentity {
     }
 }
 
-fn enrolled_registry(identities: &[&TestIdentity]) -> Arc<RwLock<PeerKeyRegistry>> {
-    let registry = Arc::new(RwLock::new(PeerKeyRegistry::new()));
-    {
-        let mut w = registry.write().unwrap();
-        for id in identities {
-            w.enrol(id.peer_id, 1, id.keypair.public_bytes()).unwrap();
-        }
+fn enrolled_registry(identities: &[&TestIdentity]) -> Arc<PeerKeyRegistry> {
+    let registry = Arc::new(PeerKeyRegistry::new());
+    for id in identities {
+        registry
+            .enrol(id.peer_id, 1, id.keypair.public_bytes())
+            .unwrap();
     }
     registry
 }

@@ -41,7 +41,6 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -71,7 +70,7 @@ impl LanTcpAdapter {
     pub fn new(
         self_peer_id: PeerId,
         keypair: PeerKeypair,
-        registry: Arc<RwLock<PeerKeyRegistry>>,
+        registry: Arc<PeerKeyRegistry>,
     ) -> Result<Self, LanTcpError> {
         let server_config = build_server_config(self_peer_id, &keypair, registry.clone())?;
         Ok(Self {
@@ -310,12 +309,12 @@ mod tests {
         let alice_kp = PeerKeypair::generate();
         let bob_kp = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
         registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
         let bob = LanTcpAdapter::new(bob_id, bob_kp, registry).unwrap();
@@ -370,11 +369,11 @@ mod tests {
         ensure_crypto_provider();
         let alice_id = PeerId::from_u128(0xa1);
         let alice_kp = PeerKeypair::generate();
-        let mut alice_registry = PeerKeyRegistry::new();
+        let alice_registry = PeerKeyRegistry::new();
         alice_registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
-        let alice_registry = Arc::new(RwLock::new(alice_registry));
+        let alice_registry = Arc::new(alice_registry);
         let alice = LanTcpAdapter::new(alice_id, alice_kp, alice_registry).unwrap();
 
         let stranger_id = PeerId::from_u128(0xdeadbeef);
@@ -390,14 +389,14 @@ mod tests {
             .unwrap();
             extract_ed25519_pubkey(&cert).unwrap()
         };
-        let mut stranger_registry = PeerKeyRegistry::new();
+        let stranger_registry = PeerKeyRegistry::new();
         stranger_registry
             .enrol(alice_id, 0, alice_pub_for_stranger)
             .unwrap();
         stranger_registry
             .enrol(stranger_id, 0, stranger_kp.public_bytes())
             .unwrap();
-        let stranger_registry = Arc::new(RwLock::new(stranger_registry));
+        let stranger_registry = Arc::new(stranger_registry);
         let stranger = LanTcpAdapter::new(stranger_id, stranger_kp, stranger_registry).unwrap();
 
         let bound = alice
@@ -433,7 +432,7 @@ mod tests {
         let bob_kp = PeerKeypair::generate();
         let charlie_kp = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
@@ -441,7 +440,7 @@ mod tests {
         registry
             .enrol(charlie_id, 0, charlie_kp.public_bytes())
             .unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
         let bob = LanTcpAdapter::new(bob_id, bob_kp, registry.clone()).unwrap();

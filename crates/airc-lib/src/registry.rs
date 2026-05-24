@@ -8,7 +8,6 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -93,13 +92,13 @@ pub fn build_registry(
     self_peer_id: PeerId,
     self_pubkey: [u8; 32],
     peer_specs: &[PeerSpec],
-) -> Result<Arc<RwLock<PeerKeyRegistry>>, airc_protocol::KeyError> {
-    let mut registry = PeerKeyRegistry::new();
+) -> Result<Arc<PeerKeyRegistry>, airc_protocol::KeyError> {
+    let registry = PeerKeyRegistry::new();
     registry.enrol(self_peer_id, 0, self_pubkey)?;
     for spec in peer_specs {
         registry.enrol(spec.peer_id, 0, spec.pubkey)?;
     }
-    Ok(Arc::new(RwLock::new(registry)))
+    Ok(Arc::new(registry))
 }
 
 /// Encode a pubkey as a `--peer` argument tail (`<id>:<b64>`), for
@@ -156,7 +155,6 @@ mod tests {
             pubkey: other_kp.public_bytes(),
         };
         let registry = build_registry(self_id, self_kp.public_bytes(), &[spec]).unwrap();
-        let registry = registry.read().unwrap();
         assert!(registry.lookup(self_id, 0).is_some());
         assert!(registry.lookup(other_id, 0).is_some());
     }

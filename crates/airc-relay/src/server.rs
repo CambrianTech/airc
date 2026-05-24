@@ -40,7 +40,7 @@ pub struct RelayServerConfig {
     /// Allowlist of clients permitted to connect. mTLS client cert is
     /// resolved to a `PeerId` via `extract_ed25519_pubkey`; only entries
     /// in this registry may connect. Unknown certs fail-closed.
-    pub registry: Arc<std::sync::RwLock<PeerKeyRegistry>>,
+    pub registry: Arc<PeerKeyRegistry>,
     /// Bind address. `0.0.0.0:0` is allowed in tests to let the OS
     /// pick a free port (the actual address is reported by
     /// [`RelayServer::local_addr`]).
@@ -55,7 +55,7 @@ pub(crate) type OutboundTx = mpsc::Sender<Vec<u8>>;
 /// Shared per-server state. Held inside `Arc` and reachable from the
 /// accept loop and every connection task.
 pub(crate) struct Inner {
-    pub(crate) registry: Arc<std::sync::RwLock<PeerKeyRegistry>>,
+    pub(crate) registry: Arc<PeerKeyRegistry>,
     pub(crate) connections: Mutex<HashMap<PeerId, OutboundTx>>,
 }
 

@@ -6,7 +6,7 @@
 //! that owns persistent identity and a populated `PeerKeyRegistry`.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use airc_core::PeerId;
 use airc_protocol::{PeerKeyRegistry, PeerKeypair};
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peer_id = PeerId::new();
     let keypair = PeerKeypair::generate();
-    let registry = Arc::new(RwLock::new(PeerKeyRegistry::new()));
+    let registry = Arc::new(PeerKeyRegistry::new());
 
     let server = RelayServer::start(RelayServerConfig {
         peer_id,

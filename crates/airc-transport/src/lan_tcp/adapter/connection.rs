@@ -57,8 +57,10 @@ fn resolve_peer_from_server_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
-    let registry = inner.registry.read().ok()?;
-    registry.find_peer(&pubkey).map(|(peer, _key_id)| peer)
+    inner
+        .registry
+        .find_peer(&pubkey)
+        .map(|(peer, _key_id)| peer)
 }
 
 fn resolve_peer_from_client_stream(
@@ -68,8 +70,10 @@ fn resolve_peer_from_client_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
-    let registry = inner.registry.read().ok()?;
-    registry.find_peer(&pubkey).map(|(peer, _key_id)| peer)
+    inner
+        .registry
+        .find_peer(&pubkey)
+        .map(|(peer, _key_id)| peer)
 }
 
 /// Install the outbound channel into `inner` **before** spawning the

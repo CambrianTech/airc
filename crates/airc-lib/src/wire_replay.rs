@@ -44,14 +44,7 @@ impl Airc {
                     continue;
                 }
             };
-            let verify_result = {
-                let registry = self
-                    .inner
-                    .registry
-                    .read()
-                    .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
-                verify(&frame, self.inner.policy, &registry)
-            };
+            let verify_result = verify(&frame, self.inner.policy, self.inner.registry.as_ref());
             if let Err(error) = verify_result {
                 // Same fail-open policy as `spawn_frame_ingest` in
                 // transport.rs:91. The most common case is a frame
