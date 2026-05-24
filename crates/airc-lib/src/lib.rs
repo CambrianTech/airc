@@ -36,6 +36,7 @@
 
 pub mod account_registry;
 pub mod airc;
+mod broadcast_deduper;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;

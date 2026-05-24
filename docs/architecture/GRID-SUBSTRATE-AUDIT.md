@@ -330,10 +330,11 @@ five concrete hotpaths and seven kill-list patterns.
    With N=50 subscribers, ~10 µs/event in clones alone. Subsumed
    by Top #2 once events go through Arc.
 
-5. **Linear peer dedup at startup** — `airc.rs:204-209`.
-   `enrolled.contains()` on a `Vec` is O(N²) during init. At N=500
-   peers (large org grid), ~250 µs per Airc::open. Fix: HashSet,
-   not Vec.
+5. **Linear peer dedup at startup** — closed by the set-backed dedup
+   cut. `Airc::open` uses a `HashSet` while loading peer trust rows,
+   and the live broadcast duplicate guard uses `BroadcastDeduper`
+   (`VecDeque` eviction + `HashSet` membership) instead of scanning
+   the whole recent-event ring on every ingest.
 
 ### Substrate-wide patterns to kill (priority order)
 
