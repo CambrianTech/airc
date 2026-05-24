@@ -158,7 +158,7 @@ impl AgentInbox {
             let event = tokio::time::timeout(remaining, self.stream.next()).await;
             match event {
                 Ok(Some(Ok(event))) if self.owner.is_own_event(&event) => continue,
-                Ok(Some(Ok(event))) => return Ok(Some(event)),
+                Ok(Some(Ok(event))) => return Ok(Some(event.as_ref().clone())),
                 Ok(Some(Err(lag))) => return Err(AircError::Route(lag.to_string())),
                 Ok(None) => return Ok(None),
                 Err(_) => return Ok(None),

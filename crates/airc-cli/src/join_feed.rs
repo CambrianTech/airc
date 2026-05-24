@@ -9,6 +9,7 @@
 use airc_core::{Body, TranscriptEvent};
 use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::stream::StreamExt;
+use std::sync::Arc;
 
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
@@ -63,7 +64,7 @@ async fn print_stream_advancing_cursor<S>(
     consumer_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    S: futures::stream::Stream<Item = Result<TranscriptEvent, LiveLag>> + Unpin,
+    S: futures::stream::Stream<Item = Result<Arc<TranscriptEvent>, LiveLag>> + Unpin,
 {
     let sigint = tokio::signal::ctrl_c();
     let mut sigint = Box::pin(sigint);

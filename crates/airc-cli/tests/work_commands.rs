@@ -171,7 +171,10 @@ fn work_board_empty_state_is_explicit() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
+    let machine_home = home.parent().unwrap_or(home);
     let output = Command::new(airc_core())
+        .env("HOME", machine_home)
+        .env("USERPROFILE", machine_home)
         .arg("--home")
         .arg(home)
         .args(args)

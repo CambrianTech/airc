@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use airc_core::transcript::TranscriptKind;
@@ -9,11 +10,11 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 /// Live transcript-event stream returned by `Airc::subscribe`.
 pub struct EventStream {
-    pub(crate) inner: BroadcastStream<TranscriptEvent>,
+    pub(crate) inner: BroadcastStream<Arc<TranscriptEvent>>,
 }
 
 impl Stream for EventStream {
-    type Item = Result<TranscriptEvent, LiveLag>;
+    type Item = Result<Arc<TranscriptEvent>, LiveLag>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -98,7 +99,7 @@ pub struct FilteredEventStream {
 }
 
 impl Stream for FilteredEventStream {
-    type Item = Result<TranscriptEvent, LiveLag>;
+    type Item = Result<Arc<TranscriptEvent>, LiveLag>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -106,7 +107,7 @@ impl Stream for FilteredEventStream {
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(event))) => {
-                    if this.filter.matches(&event) {
+                    if this.filter.matches(event.as_ref()) {
                         return Poll::Ready(Some(Ok(event)));
                     }
                 }

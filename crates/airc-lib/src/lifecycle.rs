@@ -140,7 +140,7 @@ impl Airc {
         match persist_result {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
                 if self.mark_broadcast(event_id) {
-                    let _ = self.inner.live_tx.send(event);
+                    let _ = self.inner.live_tx.send(std::sync::Arc::new(event));
                 }
                 Ok(())
             }

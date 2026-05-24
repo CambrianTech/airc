@@ -234,7 +234,7 @@ impl Airc {
                     if event.headers.get(HEADER_AIRC_CORRELATION_ID) == Some(&correlation)
                         && event.peer_id != self.inner.identity.peer_id
                     {
-                        return Ok(event);
+                        return Ok(event.as_ref().clone());
                     }
                     // Some other event flowed through; keep waiting.
                 }
