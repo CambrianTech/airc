@@ -321,10 +321,10 @@ five concrete hotpaths and seven kill-list patterns.
    rather than full event clone.
 
 3. **`RwLock<PeerKeyRegistry>` at process-global granularity** —
-   `airc.rs:118`, `transport/signed.rs:135-145`. Every frame
-   verification acquires a read lock. At 5000 frames/sec on a
-   many-peer grid, that's 5–25 ms/s of contention. Fix: `DashMap`
-   (sharded concurrent map, no global lock).
+   closed by the concurrent peer-registry cut. `PeerKeyRegistry` now
+   owns a sharded `DashMap`; signed transport, TLS verifiers, relay,
+   daemon, and SDK handles hold `Arc<PeerKeyRegistry>` directly. Frame
+   verification no longer serializes on a process-global read lock.
 
 4. **`event.clone()` on broadcast fan-out** — closed with Top #2.
    `EventStream` and `FilteredEventStream` now yield
@@ -344,9 +344,10 @@ five concrete hotpaths and seven kill-list patterns.
    must stay store-backed. Peer trust, subscriptions, local identity
    metadata, mesh identity, account registry, runtime cursors, and
    coordinator beacons are now store-backed.
-2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry,
-   route_health, route_endpoints, imported_invites. Switch to
-   `DashMap` or sharded RwLock for N-reader scale.
+2. **`RwLock<HashMap>` at global granularity** — PeerKeyRegistry is
+   closed; route_health, route_endpoints, and imported_invites remain.
+   Switch remaining hot-path registries to `DashMap` or sharded
+   RwLock for N-reader scale.
 3. **Full JSON file rewrites on every mutate** — removed from peer
    trust, subscriptions/default-room, account registry, and
    coordinator beacons. Keep pushing remaining config/install helpers
@@ -355,9 +356,10 @@ five concrete hotpaths and seven kill-list patterns.
    internally; broadcast is `Arc::clone`.
 5. **Linear scans for dedup** — `enrolled.contains`, subscriptions
    iteration. HashSet / indexed lookup.
-6. **Verification lock held across async I/O** — `signed.rs`
-   `registry.read()` during stream processing. Snapshot the
-   registry once or use `try_read()` with fallback.
+6. **Verification lock held across async I/O** — closed for
+   `PeerKeyRegistry`. `signed.rs` verifies against the registry's
+   internal concurrent map directly; there is no external lock to hold
+   while draining the stream.
 7. **Untracked `tokio::spawn` tasks** — `transport.rs:52`
    (`spawn_frame_ingest` at line 91). No cancellation, no shutdown
    signal. Use `JoinSet` + a broadcast shutdown channel; cancel on
@@ -378,13 +380,12 @@ follow-up.
   trait `PersistentStore { async fn load_peers(...) }` and the
   daemon provides an impl. Library never names daemon types.
   Tracked for the post-3.6 cleanup phase.
-- **`airc-transport::signed` holds an `Arc<RwLock<PeerKeyRegistry>>`**
-  (`transport/signed.rs:129-146`) — STILL OPEN. Key rotation
-  invalidates lib's registry but transport has a stale reference.
-  Fix: verification is a pure function or a delegate passed per
-  frame; transport does not own crypto state. (Note: #905 made
-  unverifiable replay frames skip-and-warn instead of fail-closed,
-  which masks one symptom of this rot but doesn't fix the cause.)
+- **`airc-transport::signed` holds peer trust through
+  `Arc<PeerKeyRegistry>`** — CLOSED for global-lock contention. Key
+  rotation mutates the shared registry directly, so transport verifiers
+  observe updates without swapping an outer lock guard. A future
+  delegate can still narrow ownership further, but the hot-path
+  serialization point is gone.
 - **Daemon IPC is line-delimited JSON without length-framing**
   (implied from `airc-daemon/src/ipc/request.rs`) — STILL OPEN. A
   newline in a message body breaks the parser. No backpressure

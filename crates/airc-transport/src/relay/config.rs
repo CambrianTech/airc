@@ -1,7 +1,7 @@
 //! Typed setup for the relay client adapter.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use airc_core::PeerId;
 use airc_protocol::{PeerKeyRegistry, PeerKeypair};
@@ -27,5 +27,5 @@ pub struct RelayClientConfig {
     /// Shared peer-key registry. MUST contain an enrolled entry for
     /// `relay_peer_id` before [`super::RelayAdapter::connect`] is
     /// called.
-    pub registry: Arc<RwLock<PeerKeyRegistry>>,
+    pub registry: Arc<PeerKeyRegistry>,
 }

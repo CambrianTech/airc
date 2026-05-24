@@ -4,7 +4,7 @@
 //! `DaemonState` is constructed once at startup and passed (via Arc)
 //! to every per-connection handler. Handlers read fields directly;
 //! the substrate enforces its own internal locking (e.g.
-//! `PeerKeyRegistry` is wrapped in `Arc<RwLock>`).
+//! `PeerKeyRegistry` owns its own concurrent map).
 //!
 //! Slice 5b: the per-wire `InboxBuffer` ring is gone. Subscribers now
 //! convert each received `Frame` into a `TranscriptEvent` and append
@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Instant;
 
 use tokio::sync::{broadcast, Mutex, Notify};
@@ -31,7 +30,7 @@ use airc_transport::{LocalFsAdapter, SignedTransport};
 pub struct DaemonState {
     pub peer_id: PeerId,
     pub keypair: PeerKeypair,
-    pub registry: Arc<RwLock<PeerKeyRegistry>>,
+    pub registry: Arc<PeerKeyRegistry>,
     pub policy: VerificationPolicy,
     /// Home directory the daemon was started against. Lets handlers
     /// reach the store and IPC state without re-deriving the path.
@@ -64,7 +63,7 @@ impl DaemonState {
     pub fn new(
         peer_id: PeerId,
         keypair: PeerKeypair,
-        registry: Arc<RwLock<PeerKeyRegistry>>,
+        registry: Arc<PeerKeyRegistry>,
         policy: VerificationPolicy,
         home: PathBuf,
         event_store: Arc<dyn EventStore>,

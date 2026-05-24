@@ -117,7 +117,7 @@ pub(crate) struct AircInner {
     pub(crate) store: Arc<dyn EventStore>,
     pub(crate) coordinator_store: Arc<dyn EventStore>,
     pub(crate) daemon_client: Option<Arc<DaemonClient>>,
-    pub(crate) registry: Arc<RwLock<PeerKeyRegistry>>,
+    pub(crate) registry: Arc<PeerKeyRegistry>,
     pub(crate) policy: VerificationPolicy,
     pub(crate) route_health: RwLock<TransportHealthTable>,
     pub(crate) route_endpoints: RwLock<RouteEndpointTable>,
@@ -203,7 +203,7 @@ impl Airc {
         let coordinator_store: Arc<dyn EventStore> =
             Arc::new(SqliteEventStore::open_path(&coordinator_store_path).await?);
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = Arc::new(PeerKeyRegistry::new());
         registry
             .enrol(identity.peer_id, 0, identity.keypair.public_bytes())
             .map_err(|e| AircError::Crypto(e.to_string()))?;
@@ -222,7 +222,6 @@ impl Airc {
                 )
                 .map_err(|e| AircError::Crypto(e.to_string()))?;
         }
-        let registry = Arc::new(RwLock::new(registry));
         let (live_tx, _) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
 
         Ok(Self {
@@ -359,13 +358,9 @@ impl Airc {
 
     pub(crate) async fn sync_account_peer_registry(&self) -> Result<(), AircError> {
         let peers = load_peer_registries(&self.inner.home, &self.inner.wire_root).await?;
-        let mut registry = self
-            .inner
-            .registry
-            .write()
-            .map_err(|_| AircError::Crypto("registry lock poisoned".to_string()))?;
         for peer in peers {
-            registry
+            self.inner
+                .registry
                 .enrol(
                     peer.peer_id,
                     0,

@@ -3,7 +3,7 @@
 //! sides and `airc-relay` already depends on this crate — wiring a
 //! dev-dependency back here would be circular.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use airc_core::{
     headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, PeerId, RoomId,
@@ -41,7 +41,7 @@ fn adapter_without_connect() -> RelayAdapter {
         self_keypair: PeerKeypair::generate(),
         relay_peer_id: PeerId::from_u128(0xff),
         relay_addr: "127.0.0.1:0".parse().unwrap(),
-        registry: Arc::new(RwLock::new(PeerKeyRegistry::new())),
+        registry: Arc::new(PeerKeyRegistry::new()),
     })
 }
 

@@ -98,17 +98,16 @@ impl std::error::Error for KeyError {
 /// bytes once at enrolment time.
 #[derive(Debug, Default, Clone)]
 pub struct PeerKeyRegistry {
-    // HashMap rather than BTreeMap — PeerId is a UUIDv4 newtype which
-    // derives Hash+Eq but not Ord. The registry isn't serialized or
-    // iterated for canonical output, so non-deterministic key order is
-    // harmless here.
-    keys: std::collections::HashMap<(PeerId, u32), VerifyingKey>,
+    // Sharded storage keeps verification from taking a process-global
+    // read lock. The registry is not serialized or iterated for
+    // canonical output, so non-deterministic key order is harmless.
+    keys: dashmap::DashMap<(PeerId, u32), VerifyingKey>,
 }
 
 impl PeerKeyRegistry {
     pub fn new() -> Self {
         Self {
-            keys: std::collections::HashMap::new(),
+            keys: dashmap::DashMap::new(),
         }
     }
 
@@ -117,7 +116,7 @@ impl PeerKeyRegistry {
     /// Returns `KeyError::InvalidPublicKey` if the bytes don't
     /// decode as a valid Ed25519 point — substrate refuses garbage
     /// at enrolment rather than at verify time.
-    pub fn enrol(&mut self, peer: PeerId, key_id: u32, pubkey: [u8; 32]) -> Result<(), KeyError> {
+    pub fn enrol(&self, peer: PeerId, key_id: u32, pubkey: [u8; 32]) -> Result<(), KeyError> {
         let verifying_key =
             VerifyingKey::from_bytes(&pubkey).map_err(KeyError::InvalidPublicKey)?;
         self.keys.insert((peer, key_id), verifying_key);
@@ -125,8 +124,8 @@ impl PeerKeyRegistry {
     }
 
     /// Look up a parsed `VerifyingKey` for verification.
-    pub fn lookup(&self, peer: PeerId, key_id: u32) -> Option<&VerifyingKey> {
-        self.keys.get(&(peer, key_id))
+    pub fn lookup(&self, peer: PeerId, key_id: u32) -> Option<VerifyingKey> {
+        self.keys.get(&(peer, key_id)).map(|entry| *entry)
     }
 
     /// Remove every enrolled key for `peer`.
@@ -134,7 +133,7 @@ impl PeerKeyRegistry {
     /// Used when local trust is explicitly revoked. Returns the
     /// number of key ids removed so callers can distinguish an
     /// idempotent remove from a real departure.
-    pub fn remove_peer(&mut self, peer: PeerId) -> usize {
+    pub fn remove_peer(&self, peer: PeerId) -> usize {
         let before = self.keys.len();
         self.keys
             .retain(|(enrolled_peer, _key_id), _key| *enrolled_peer != peer);
@@ -154,7 +153,8 @@ impl PeerKeyRegistry {
     /// reverse-lookup correctness because we only need to know
     /// whether ANY match exists.
     pub fn find_peer(&self, pubkey: &[u8; 32]) -> Option<(PeerId, u32)> {
-        self.keys.iter().find_map(|((peer, key_id), key)| {
+        self.keys.iter().find_map(|entry| {
+            let ((peer, key_id), key) = entry.pair();
             if key.as_bytes() == pubkey {
                 Some((*peer, *key_id))
             } else {
@@ -423,7 +423,7 @@ mod tests {
         use crate::keypair::PeerKeypair;
         let signer = PeerId::from_u128(0xa1);
         let real_keypair = PeerKeypair::generate();
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(signer, 0, real_keypair.public_bytes())
             .unwrap();
@@ -529,7 +529,7 @@ mod tests {
         let key_a = PeerKeypair::generate();
         let key_b = PeerKeypair::generate();
         let key_other = PeerKeypair::generate();
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, key_a.public_bytes()).unwrap();
         registry.enrol(peer, 1, key_b.public_bytes()).unwrap();
         registry.enrol(other, 0, key_other.public_bytes()).unwrap();

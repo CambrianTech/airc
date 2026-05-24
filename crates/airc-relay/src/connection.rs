@@ -50,8 +50,8 @@ fn resolve_peer_from_stream(
     let (_, conn) = tls_stream.get_ref();
     let cert = conn.peer_certificates()?.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
-    let registry = inner.registry.read().ok()?;
-    registry
+    inner
+        .registry
         .find_peer(&pubkey)
         .map(|(peer_id, _key_version)| peer_id)
 }

@@ -8,7 +8,6 @@
 //! reference.
 
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use rustls::{ClientConfig, ServerConfig};
 
@@ -63,7 +62,7 @@ impl From<rustls::Error> for TlsConfigError {
 pub fn build_server_config(
     peer_id: PeerId,
     keypair: &PeerKeypair,
-    registry: Arc<RwLock<PeerKeyRegistry>>,
+    registry: Arc<PeerKeyRegistry>,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let (cert, key) = generate_self_signed_cert(keypair, peer_id)?;
 
@@ -86,7 +85,7 @@ pub fn build_client_config(
     self_peer_id: PeerId,
     keypair: &PeerKeypair,
     expected_peer: PeerId,
-    registry: Arc<RwLock<PeerKeyRegistry>>,
+    registry: Arc<PeerKeyRegistry>,
 ) -> Result<Arc<ClientConfig>, TlsConfigError> {
     let (cert, key) = generate_self_signed_cert(keypair, self_peer_id)?;
 
@@ -118,9 +117,9 @@ mod tests {
         let peer = PeerId::from_u128(0xa1);
         let keypair = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let config = build_server_config(peer, &keypair, registry);
         assert!(config.is_ok(), "expected Ok, got {config:?}");
@@ -134,14 +133,14 @@ mod tests {
         let self_kp = PeerKeypair::generate();
         let other_kp = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(self_peer, 0, self_kp.public_bytes())
             .unwrap();
         registry
             .enrol(other_peer, 0, other_kp.public_bytes())
             .unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let config = build_client_config(self_peer, &self_kp, other_peer, registry);
         assert!(config.is_ok(), "expected Ok, got {config:?}");
