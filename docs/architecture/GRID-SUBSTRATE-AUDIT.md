@@ -146,6 +146,21 @@ theoretical architecture concerns; they showed up in normal use.
    state, missed heartbeats expire leases, and peers can query "who can
    take work now?" without reading recent chat.
 
+   **Substrate primitive landed** via `airc-lib::agent_heartbeat`:
+   typed `AgentHeartbeat` event (kind ∈ Alive/Leaving, peer, runtime,
+   optional scope, emitted_at_ms), `airc.heartbeat.kind` / `runtime`
+   headers, `Airc::start_agent_heartbeat(runtime, scope, interval)`
+   that spawns a periodic emit task returning a stop-handle, and
+   `Airc::active_agents(within, window)` that reduces recent
+   transcript to the current liveness view (filters stale, excludes
+   `Leaving`-terminated peers). 60s default cadence trades durability
+   noise for query simplicity. Open follow-ups: ephemeral
+   (non-durable) frame kind so heartbeats don't accumulate in the
+   transcript store (composes with flaw #4 lifecycle noise);
+   ready/busy/claimed state machine on top of this (composes with
+   flaw #3 lane coordination); CLI surface (`airc agents` /
+   `airc whois --live`).
+
 7. **Dirty checkout protection is operational, not enforced.** The
    Continuum checkout was already heavily dirty, so the correct behavior
    was to use `~/.airc/worktrees`. That convention exists in docs and
