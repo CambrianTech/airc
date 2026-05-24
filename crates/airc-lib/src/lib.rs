@@ -101,7 +101,10 @@ pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,
 };
-pub use webrtc_media::{IncomingTrack, IncomingTrackHandler};
+pub use webrtc_media::{
+    IncomingTrack, IncomingTrackHandler, OpenedWebRtcConnection, OutgoingAudioTrack,
+    OutgoingSampleTrack, OutgoingVideoTrack, WebRtcConnectionBuilder, WebRtcMediaCodec,
+};
 pub use work::{
     AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, CreateWorkCard,
     CreateWorkLane, HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests,
