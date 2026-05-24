@@ -1,5 +1,6 @@
 use airc_core::{Body, EventId, Headers, MentionTarget, TranscriptCursor, TranscriptEvent};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature};
+use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
@@ -123,7 +124,7 @@ impl Airc {
         match persist_result {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
                 if self.mark_broadcast(event_id) {
-                    let _ = self.inner.live_tx.send(event);
+                    let _ = self.inner.live_tx.send(Arc::new(event));
                 }
                 Ok(())
             }

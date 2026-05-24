@@ -104,7 +104,7 @@ pub(crate) async fn load_peer_registries(
 ///   - `Airc::join(name)` / `Airc::say(text)` lazily start a
 ///     subscriber on the room's wire if one isn't already running.
 ///   - Consumers wanting live push call `Airc::subscribe()` and
-///     get a `Stream<Item = TranscriptEvent>`.
+///     get a `Stream<Item = Arc<TranscriptEvent>>`.
 #[derive(Clone)]
 pub struct Airc {
     pub(crate) inner: Arc<AircInner>,
@@ -132,7 +132,7 @@ pub(crate) struct AircInner {
     /// Live event fan-out. Every event the subscribers append to the
     /// store is also forwarded here so consumers tailing via
     /// [`Airc::subscribe`] see it immediately.
-    pub(crate) live_tx: broadcast::Sender<TranscriptEvent>,
+    pub(crate) live_tx: broadcast::Sender<Arc<TranscriptEvent>>,
     /// Event IDs this Airc instance has already broadcast via
     /// [`live_tx`]. Consulted by the wire subscriber to avoid
     /// double-delivering a send that was already broadcast in-process

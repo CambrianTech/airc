@@ -130,7 +130,7 @@ async fn wait_for_one_event(
 ) -> Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>> {
     let mut stream = airc.subscribe_subscribed_filtered(filter).await?;
     match tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await {
-        Ok(Some(Ok(event))) => Ok(vec![event]),
+        Ok(Some(Ok(event))) => Ok(vec![event.as_ref().clone()]),
         Ok(Some(Err(LiveLag { .. }))) | Ok(None) | Err(_) => Ok(Vec::new()),
     }
 }

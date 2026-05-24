@@ -606,8 +606,9 @@ async fn print_event_stream_until_signal<S>(
     stream: &mut S,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    S: futures::stream::Stream<Item = Result<airc_core::TranscriptEvent, airc_lib::LiveLag>>
-        + Unpin,
+    S: futures::stream::Stream<
+            Item = Result<std::sync::Arc<airc_core::TranscriptEvent>, airc_lib::LiveLag>,
+        > + Unpin,
 {
     let sigint = tokio::signal::ctrl_c();
     let mut sigint = Box::pin(sigint);

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use airc_core::{EventId, TranscriptCursor};
 use airc_protocol::{Frame, Subscription};
@@ -274,7 +275,7 @@ impl Airc {
         match self.inner.store.append(event.clone()).await {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
                 if self.mark_broadcast(event_id) {
-                    let _ = self.inner.live_tx.send(event);
+                    let _ = self.inner.live_tx.send(Arc::new(event));
                 }
             }
             Err(err) => {

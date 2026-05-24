@@ -314,11 +314,11 @@ five concrete hotpaths and seven kill-list patterns.
    Remaining file-backed surfaces are install/config compatibility
    helpers and remote wire payloads, not the local runtime truth.
 
-2. **Double clone of `TranscriptEvent` on every ingest** —
-   `messaging.rs:110`, `transport.rs:124`. Each event is cloned
-   for store and again for broadcast. ~100–200 ns × N events/sec,
-   plus allocator churn. Fix: `Arc<TranscriptEvent>` internally;
-   broadcast becomes `Arc::clone` (cheap).
+2. **Double clone of `TranscriptEvent` on every ingest** — closed by
+   the Arc live-event cut. Store append still receives the owned
+   event it persists, but live fan-out now broadcasts
+   `Arc<TranscriptEvent>` so subscriber delivery is pointer clone
+   rather than full event clone.
 
 3. **`RwLock<PeerKeyRegistry>` at process-global granularity** —
    `airc.rs:118`, `transport/signed.rs:135-145`. Every frame
@@ -326,9 +326,11 @@ five concrete hotpaths and seven kill-list patterns.
    many-peer grid, that's 5–25 ms/s of contention. Fix: `DashMap`
    (sharded concurrent map, no global lock).
 
-4. **`event.clone()` on broadcast fan-out** — `messaging.rs:114`.
-   With N=50 subscribers, ~10 µs/event in clones alone. Subsumed
-   by Top #2 once events go through Arc.
+4. **`event.clone()` on broadcast fan-out** — closed with Top #2.
+   `EventStream` and `FilteredEventStream` now yield
+   `Arc<TranscriptEvent>`; owned clones happen only at explicit
+   compatibility boundaries such as command-bus reply return values
+   and hook batch vectors.
 
 5. **Linear peer dedup at startup** — closed by the set-backed dedup
    cut. `Airc::open` uses a `HashSet` while loading peer trust rows,
