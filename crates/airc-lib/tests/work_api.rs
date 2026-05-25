@@ -1,11 +1,12 @@
 use std::time::{Duration, Instant};
 
 use airc_lib::{
-    AgentAvailabilityState, Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState,
-    ClaimManagerHat, ClaimWorkCard, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, DirtyState,
-    HeartbeatKind, HeartbeatWorkspace, LaneState, ObserveLocalGitWorkspace, Priority,
-    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, RepoId, ReportAgentAvailability,
-    RequestWorkspace, WorkCardId, WorkRosterQuery, WorkspaceStatus,
+    AgentAvailabilityState, Airc, AircError, AllocateWorkspace, BranchName, CardState,
+    ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, ClaimableWorkQuery,
+    CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatKind, HeartbeatWorkspace, LaneState,
+    ObserveLocalGitWorkspace, Priority, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
+    RepoId, ReportAgentAvailability, RequestWorkspace, WorkCardId, WorkRosterQuery,
+    WorkspaceStatus,
 };
 use tempfile::TempDir;
 
@@ -142,6 +143,124 @@ async fn claim_and_release_work_card_round_trip_through_projection() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn work_card_transitions_refuse_cards_from_another_room() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("room-a").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "room-scoped work".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(airc.work_board(128).await.unwrap().card(card_id).is_some());
+
+    airc.join("room-b").await.unwrap();
+    let error = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect_err("claiming a card from another room must fail closed");
+
+    match error {
+        AircError::WorkCardNotInCurrentRoom {
+            card_id: rejected,
+            room_name,
+            ..
+        } => {
+            assert_eq!(rejected, card_id);
+            assert_eq!(room_name, "room-b");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    airc.change_work_card_state(ChangeWorkCardState {
+        card_id,
+        state: CardState::Closed,
+    })
+    .await
+    .expect_err("state transitions from another room must fail closed");
+
+    let room_b_board = airc.work_board(128).await.unwrap();
+    assert!(
+        room_b_board.card(card_id).is_none(),
+        "room-b must not project a false state for a room-a card"
+    );
+
+    airc.join("room-a").await.unwrap();
+    airc.change_work_card_state(ChangeWorkCardState {
+        card_id,
+        state: CardState::Closed,
+    })
+    .await
+    .unwrap();
+    let room_a_board = airc.work_board(128).await.unwrap();
+    assert_eq!(room_a_board.card(card_id).unwrap().state, CardState::Closed);
+}
+
+#[tokio::test]
+async fn duplicate_work_card_claims_fail_before_poisoning_projection() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("duplicate-claim").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "one active owner".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let claim_id = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+
+    let error = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect_err("second active claim must fail before emitting a work event");
+    match error {
+        AircError::WorkCardAlreadyClaimed {
+            card_id: rejected,
+            claim_id: active_claim,
+            owner,
+        } => {
+            assert_eq!(rejected, card_id);
+            assert_eq!(active_claim, Some(claim_id));
+            assert_eq!(owner, Some(airc.peer_id()));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    airc.release_work_claim(ReleaseWorkClaim {
+        card_id,
+        claim_id,
+        reason: Some("done".to_string()),
+    })
+    .await
+    .unwrap();
+    let board = airc.work_board(128).await.unwrap();
+    assert_eq!(board.card(card_id).unwrap().claim_id, None);
 }
 
 #[tokio::test]

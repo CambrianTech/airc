@@ -194,6 +194,12 @@ theoretical architecture concerns; they showed up in normal use.
    recovery, merge hygiene, collision avoidance, handoff quality, and
    responsiveness. AIRC carries the data contract; Continuum and other
    consumers decide how to train, evaluate, or render behavior from it.
+   The manager/scrum-master loop is part of that evidence: gap
+   observed, card created, card suggested, claim accepted, heartbeat
+   maintained, review requested, CI interpreted, merge accepted, card
+   closed, follow-up card created. If the queue is empty or agents are
+   idle, the manager persona should create or suggest the next card from
+   typed state, not wait for a human prompt.
 
 7. **Dirty checkout protection is operational, not enforced.** The
    Continuum checkout was already heavily dirty, so the correct behavior

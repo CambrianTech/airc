@@ -80,6 +80,29 @@ pub enum AircError {
     #[error("not subscribed to channel: {0}")]
     NotSubscribed(String),
 
+    /// Caller attempted to mutate a work card from a room whose work
+    /// projection does not contain that card. Work cards are
+    /// room-scoped coordination state; transitions from another room
+    /// would create false projections.
+    #[error(
+        "work card {card_id} is not in current room {room_name} ({room_id}); switch to the card's room before mutating it"
+    )]
+    WorkCardNotInCurrentRoom {
+        card_id: airc_work::WorkCardId,
+        room_name: String,
+        room_id: airc_core::RoomId,
+    },
+
+    /// Caller attempted to create a second active claim for a card
+    /// that already has one. Claims are leases; duplicate active
+    /// claims make manager/persona training data ambiguous.
+    #[error("work card {card_id} already has active claim {claim_id:?} owned by {owner:?}")]
+    WorkCardAlreadyClaimed {
+        card_id: airc_work::WorkCardId,
+        claim_id: Option<airc_work::ClaimId>,
+        owner: Option<airc_core::PeerId>,
+    },
+
     /// Caller passed a peer registry operation referencing a peer
     /// not in the local registry.
     #[error("unknown peer: {0}")]
