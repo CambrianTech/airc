@@ -4,12 +4,13 @@ use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
     encode_work_event, local_git_events_since, pull_request_events_since,
-    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, ClaimHeartbeat,
-    ClaimId, ClaimReleased, CommandGitRunner, LaneCreated, LaneId, LaneState, LaneStateChanged,
-    LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased,
-    Priority, PullRequestObserver, PullRequestSource, RepoId, RepoPullRequestSnapshot, StaleClaim,
-    WorkBoardProjection, WorkCard, WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated,
-    WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased, WorkspaceRequested,
+    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, CardState,
+    CardStateChanged, ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner, LaneCreated,
+    LaneId, LaneState, LaneStateChanged, LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace,
+    ManagerHatClaimed, ManagerHatReleased, Priority, PullRequestObserver, PullRequestSource,
+    RepoId, RepoPullRequestSnapshot, StaleClaim, WorkBoardProjection, WorkCard, WorkCardClaimed,
+    WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased,
+    WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -36,6 +37,12 @@ pub struct ReleaseWorkClaim {
     pub card_id: WorkCardId,
     pub claim_id: ClaimId,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeWorkCardState {
+    pub card_id: WorkCardId,
+    pub state: CardState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +215,23 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Change a work card's lifecycle state through the work event
+    /// stream. This is the queue hygiene path agents use to stop
+    /// completed work from remaining claimable.
+    pub async fn change_work_card_state(
+        &self,
+        request: ChangeWorkCardState,
+    ) -> Result<(), AircError> {
+        let event = WorkEvent::CardStateChanged(CardStateChanged {
+            card_id: request.card_id,
+            state: request.state,
+            changed_by: self.peer_id(),
+            changed_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

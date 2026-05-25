@@ -585,6 +585,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 claim_id,
                 reason,
             } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            WorkAction::State { card_id, state } => {
+                work_commands::run_state(&home, card_id, state).await
+            }
+            WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
             WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
             WorkAction::Next {
                 repo,

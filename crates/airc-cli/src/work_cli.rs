@@ -56,6 +56,19 @@ pub enum WorkAction {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Change a work card's lifecycle state.
+    State {
+        /// Work card UUID.
+        card_id: String,
+        /// New lifecycle state.
+        #[arg(value_enum)]
+        state: CliCardState,
+    },
+    /// Mark a work card closed so it no longer appears as claimable.
+    Close {
+        /// Work card UUID.
+        card_id: String,
+    },
     /// Print the current room's projected work board.
     Board {
         /// Recent transcript events to replay into the projection.
@@ -112,4 +125,16 @@ pub enum CliAvailabilityState {
     Ready,
     Busy,
     Away,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliCardState {
+    Open,
+    Claimed,
+    InProgress,
+    Blocked,
+    Review,
+    Merged,
+    Closed,
 }

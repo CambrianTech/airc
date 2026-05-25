@@ -117,11 +117,11 @@ pub use webrtc_media::{
     OutgoingSampleTrack, OutgoingVideoTrack, WebRtcConnectionBuilder, WebRtcMediaCodec,
 };
 pub use work::{
-    AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, ClaimableWorkItem,
-    ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim, HeartbeatWorkspace,
-    ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests,
-    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability,
-    RequestWorkspace,
+    AllocateWorkspace, ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
+    ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
+    HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace,
+    ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
+    ReportAgentAvailability, RequestWorkspace,
 };
 pub use work_subscription::{
     WorkEventFilter, HEADER_WORK_CARD_ID, HEADER_WORK_LANE_ID, HEADER_WORK_REPO,

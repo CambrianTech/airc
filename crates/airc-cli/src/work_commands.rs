@@ -12,11 +12,11 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    AgentAvailabilityState, Airc, ClaimId, ClaimWorkCard, CreateWorkCard, LaneId, Priority,
-    ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
+    AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
+    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
 };
 
-use crate::work_cli::{CliAvailabilityState, CliPriority};
+use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
 
 pub async fn run_create(
     home: &Path,
@@ -86,6 +86,24 @@ pub async fn run_heartbeat(
     .await?;
     println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
     Ok(())
+}
+
+pub async fn run_state(
+    home: &Path,
+    card_id: String,
+    state: CliCardState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let card_id = parse_work_card_id(&card_id)?;
+    let state = CardState::from(state);
+    airc.change_work_card_state(ChangeWorkCardState { card_id, state })
+        .await?;
+    println!("card_state_changed: card_id={card_id} state={state:?}");
+    Ok(())
+}
+
+pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
+    run_state(home, card_id, CliCardState::Closed).await
 }
 
 pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -262,6 +280,20 @@ impl From<CliAvailabilityState> for AgentAvailabilityState {
             CliAvailabilityState::Ready => Self::Ready,
             CliAvailabilityState::Busy => Self::Busy,
             CliAvailabilityState::Away => Self::Away,
+        }
+    }
+}
+
+impl From<CliCardState> for CardState {
+    fn from(value: CliCardState) -> Self {
+        match value {
+            CliCardState::Open => Self::Open,
+            CliCardState::Claimed => Self::Claimed,
+            CliCardState::InProgress => Self::InProgress,
+            CliCardState::Blocked => Self::Blocked,
+            CliCardState::Review => Self::Review,
+            CliCardState::Merged => Self::Merged,
+            CliCardState::Closed => Self::Closed,
         }
     }
 }
