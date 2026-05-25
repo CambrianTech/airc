@@ -5,11 +5,11 @@
 //! scheduling view that agents, monitors, and future manager personas
 //! can consume directly.
 
-use airc_work::{Priority, RepoId, StaleClaim, WorkCard};
+use airc_work::{CardState, LaneId, Priority, RepoId, StaleClaim, WorkCard, WorkCardId};
 
 use crate::time::now_ms;
 use crate::{
-    AgentAvailabilityState, Airc, AircError, WorkQueueStatus, WorkQueueStatusQuery,
+    AgentAvailabilityState, Airc, AircError, CreateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
     WorkRosterQuery, WorkRosterRow, WorkRosterStatus,
 };
 
@@ -87,6 +87,62 @@ pub struct WorkManagerAgent {
     pub scope: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBacklogSeedCandidate {
+    pub repo: RepoId,
+    pub title: String,
+    pub body: Option<String>,
+    pub priority: Priority,
+    pub lane_id: Option<LaneId>,
+    /// Stable source identifier supplied by a roadmap/RAG/issue
+    /// adapter. AIRC stores it in the typed result for auditability;
+    /// duplicate suppression remains repo+title+lane so adapters can
+    /// change evidence wording without creating duplicate work.
+    pub evidence_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBacklogSeedResult {
+    pub items: Vec<SeededWorkCard>,
+}
+
+impl WorkBacklogSeedResult {
+    pub fn created_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.outcome == WorkBacklogSeedOutcome::Created)
+            .count()
+    }
+
+    pub fn represented_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.outcome == WorkBacklogSeedOutcome::AlreadyRepresented)
+            .count()
+    }
+
+    pub fn completed_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.outcome == WorkBacklogSeedOutcome::AlreadyCompleted)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeededWorkCard {
+    pub candidate: WorkBacklogSeedCandidate,
+    pub card_id: WorkCardId,
+    pub outcome: WorkBacklogSeedOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBacklogSeedOutcome {
+    Created,
+    AlreadyRepresented,
+    AlreadyCompleted,
+}
+
 impl Airc {
     /// Return a typed manager-loop evaluation. This is the substrate
     /// surface for "why is the room idle?" and "what should happen
@@ -118,6 +174,54 @@ impl Airc {
             roster,
             recommendations,
         })
+    }
+
+    /// Idempotently materialize typed backlog candidates into the
+    /// current room. This is the manager flywheel's write boundary:
+    /// roadmap/RAG/issue adapters propose candidates; AIRC creates
+    /// only the missing cards and treats represented/completed cards
+    /// as the recursion base case.
+    pub async fn seed_work_backlog(
+        &self,
+        candidates: Vec<WorkBacklogSeedCandidate>,
+    ) -> Result<WorkBacklogSeedResult, AircError> {
+        let mut board = self.work_board_complete(512).await?;
+        let mut items = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            let snapshot = board.snapshot();
+            if let Some(card) = find_seed_match(&snapshot.cards, &candidate) {
+                let outcome = if work_card_is_complete(card.state) {
+                    WorkBacklogSeedOutcome::AlreadyCompleted
+                } else {
+                    WorkBacklogSeedOutcome::AlreadyRepresented
+                };
+                items.push(SeededWorkCard {
+                    candidate,
+                    card_id: card.card_id,
+                    outcome,
+                });
+                continue;
+            }
+
+            let card_id = self
+                .create_work_card(CreateWorkCard {
+                    repo: candidate.repo.clone(),
+                    title: candidate.title.clone(),
+                    body: candidate.body.clone(),
+                    priority: candidate.priority,
+                    lane_id: candidate.lane_id,
+                })
+                .await?;
+            items.push(SeededWorkCard {
+                candidate,
+                card_id,
+                outcome: WorkBacklogSeedOutcome::Created,
+            });
+            board = self.work_board_complete(512).await?;
+        }
+
+        Ok(WorkBacklogSeedResult { items })
     }
 }
 
@@ -236,6 +340,26 @@ fn agent_from_row(row: &WorkRosterRow) -> WorkManagerAgent {
             .as_ref()
             .and_then(|liveness| liveness.scope.clone()),
     }
+}
+
+fn find_seed_match<'a>(
+    cards: &'a [WorkCard],
+    candidate: &WorkBacklogSeedCandidate,
+) -> Option<&'a WorkCard> {
+    let title = normalize_seed_title(&candidate.title);
+    cards.iter().find(|card| {
+        card.repo == candidate.repo
+            && card.lane_id == candidate.lane_id
+            && normalize_seed_title(&card.title) == title
+    })
+}
+
+fn normalize_seed_title(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn work_card_is_complete(state: CardState) -> bool {
+    matches!(state, CardState::Merged | CardState::Closed)
 }
 
 #[cfg(test)]

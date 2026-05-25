@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use airc_lib::{
     AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
-    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
-    WorkManagerRecommendation, WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus,
-    WorkRosterStatus,
+    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBacklogSeedCandidate,
+    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
+    WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
 use crate::lease;
@@ -41,6 +41,42 @@ pub async fn run_create(
         })
         .await?;
     println!("card_id: {card_id}");
+    Ok(())
+}
+
+pub async fn run_seed(
+    home: &Path,
+    repo: String,
+    title: String,
+    body: Option<String>,
+    lane_id: Option<String>,
+    priority: CliPriority,
+    evidence_key: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let result = airc
+        .seed_work_backlog(vec![WorkBacklogSeedCandidate {
+            repo: RepoId::new(repo)?,
+            title,
+            body,
+            priority: priority.into(),
+            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
+            evidence_key,
+        }])
+        .await?;
+    for item in result.items {
+        let outcome = match item.outcome {
+            WorkBacklogSeedOutcome::Created => "created",
+            WorkBacklogSeedOutcome::AlreadyRepresented => "already_represented",
+            WorkBacklogSeedOutcome::AlreadyCompleted => "already_completed",
+        };
+        println!(
+            "seeded: outcome={outcome} card_id={card_id} repo={repo} title={title}",
+            card_id = item.card_id,
+            repo = item.candidate.repo,
+            title = item.candidate.title,
+        );
+    }
     Ok(())
 }
 

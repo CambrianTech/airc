@@ -584,6 +584,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 lane_id,
                 priority,
             } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
+            WorkAction::Seed {
+                repo,
+                title,
+                body,
+                lane_id,
+                priority,
+                evidence_key,
+            } => {
+                work_commands::run_seed(&home, repo, title, body, lane_id, priority, evidence_key)
+                    .await
+            }
             WorkAction::Claim {
                 card_id,
                 ttl_ms,
