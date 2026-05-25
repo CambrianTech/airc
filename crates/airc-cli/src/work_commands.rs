@@ -14,6 +14,7 @@ use uuid::Uuid;
 use airc_lib::{
     AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
     CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
+    WorkQueueStatus,
 };
 
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
@@ -122,33 +123,50 @@ pub async fn run_next(
     event_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
-    let query = airc_lib::ClaimableWorkQuery {
+    let query = airc_lib::WorkQueueStatusQuery {
         repo: repo.map(RepoId::new).transpose()?,
         max_priority: max_priority.into(),
         include_stale_claims: include_stale,
         event_limit,
         limit,
     };
-    let items = airc.claimable_work(query).await?;
-    if items.is_empty() {
+    let status = airc.work_queue_status(query).await?;
+    if status.claimable.is_empty() {
         println!("(no claimable work)");
-        return Ok(());
+    } else {
+        println!("claimable work: {}", status.claimable.len());
+        for item in &status.claimable {
+            let stale = item
+                .stale_claim
+                .as_ref()
+                .map(|claim| format!("stale_claim={} owner={}", claim.claim_id, claim.owner))
+                .unwrap_or_else(|| "open".to_string());
+            println!(
+                "{card_id}  {priority:?}  repo={repo}  {stale}  title={title}",
+                card_id = item.card.card_id,
+                priority = item.card.priority,
+                repo = item.card.repo,
+                title = item.card.title,
+            );
+        }
     }
 
-    println!("claimable work: {}", items.len());
-    for item in items {
-        let stale = item
-            .stale_claim
-            .as_ref()
-            .map(|claim| format!("stale_claim={} owner={}", claim.claim_id, claim.owner))
-            .unwrap_or_else(|| "open".to_string());
+    print_work_queue_availability(&status);
+    if !status.active_claims_for_peer.is_empty() {
+        println!();
         println!(
-            "{card_id}  {priority:?}  repo={repo}  {stale}  title={title}",
-            card_id = item.card.card_id,
-            priority = item.card.priority,
-            repo = item.card.repo,
-            title = item.card.title,
+            "your active claims: {}",
+            status.active_claims_for_peer.len()
         );
+        for card in &status.active_claims_for_peer {
+            println!(
+                "{card_id}  {priority:?}  repo={repo}  title={title}",
+                card_id = card.card_id,
+                priority = card.priority,
+                repo = card.repo,
+                title = card.title,
+            );
+        }
     }
     Ok(())
 }
@@ -229,6 +247,32 @@ fn print_board(board: &WorkBoardProjection) {
                 expires_at_ms = availability.expires_at_ms,
             );
         }
+    }
+}
+
+fn print_work_queue_availability(status: &WorkQueueStatus) {
+    if status.agent_availability.is_empty() {
+        return;
+    }
+
+    let now_ms = now_ms();
+    println!();
+    println!(
+        "agent availability: ready={} busy={} away={} stale={}",
+        status.ready_count(now_ms),
+        status.busy_count(now_ms),
+        status.away_count(now_ms),
+        status.stale_availability_count(now_ms)
+    );
+    for availability in &status.agent_availability {
+        let stale = availability.expires_at_ms <= now_ms;
+        let note = availability.report.note.as_deref().unwrap_or("-");
+        println!(
+            "{repo}  peer={peer}  state={state:?}  stale={stale}  note={note}",
+            repo = availability.report.repo,
+            peer = availability.report.peer,
+            state = availability.report.state,
+        );
     }
 }
 

@@ -3,7 +3,7 @@
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
-    encode_work_event, local_git_events_since, pull_request_events_since,
+    encode_work_event, local_git_events_since, pull_request_events_since, AgentAvailabilityRecord,
     AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, CardState,
     CardStateChanged, ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner, LaneCreated,
     LaneId, LaneState, LaneStateChanged, LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace,
@@ -140,6 +140,83 @@ pub struct ClaimableWorkItem {
 impl ClaimableWorkItem {
     pub fn is_stale_claim(&self) -> bool {
         self.stale_claim.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkQueueStatusQuery {
+    pub repo: Option<RepoId>,
+    pub max_priority: Priority,
+    pub include_stale_claims: bool,
+    pub event_limit: usize,
+    pub limit: usize,
+}
+
+impl Default for WorkQueueStatusQuery {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            max_priority: Priority::P1,
+            include_stale_claims: false,
+            event_limit: 512,
+            limit: 8,
+        }
+    }
+}
+
+impl From<ClaimableWorkQuery> for WorkQueueStatusQuery {
+    fn from(value: ClaimableWorkQuery) -> Self {
+        Self {
+            repo: value.repo,
+            max_priority: value.max_priority,
+            include_stale_claims: value.include_stale_claims,
+            event_limit: value.event_limit,
+            limit: value.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkQueueStatus {
+    pub claimable: Vec<ClaimableWorkItem>,
+    pub agent_availability: Vec<AgentAvailabilityRecord>,
+    pub active_claims_for_peer: Vec<WorkCard>,
+}
+
+impl WorkQueueStatus {
+    pub fn ready_count(&self, now_ms: u64) -> usize {
+        self.agent_availability
+            .iter()
+            .filter(|record| {
+                record.expires_at_ms > now_ms
+                    && record.report.state == AgentAvailabilityState::Ready
+            })
+            .count()
+    }
+
+    pub fn busy_count(&self, now_ms: u64) -> usize {
+        self.agent_availability
+            .iter()
+            .filter(|record| {
+                record.expires_at_ms > now_ms && record.report.state == AgentAvailabilityState::Busy
+            })
+            .count()
+    }
+
+    pub fn away_count(&self, now_ms: u64) -> usize {
+        self.agent_availability
+            .iter()
+            .filter(|record| {
+                record.expires_at_ms > now_ms && record.report.state == AgentAvailabilityState::Away
+            })
+            .count()
+    }
+
+    pub fn stale_availability_count(&self, now_ms: u64) -> usize {
+        self.agent_availability
+            .iter()
+            .filter(|record| record.expires_at_ms <= now_ms)
+            .count()
     }
 }
 
@@ -466,17 +543,39 @@ impl Airc {
         &self,
         query: ClaimableWorkQuery,
     ) -> Result<Vec<ClaimableWorkItem>, AircError> {
+        Ok(self.work_queue_status(query.into()).await?.claimable)
+    }
+
+    /// Return the scheduling view agents need to avoid idle lock:
+    /// claimable cards, current peer claims, and typed ready/busy/away
+    /// availability records. Consumers should use this instead of
+    /// parsing CLI output.
+    pub async fn work_queue_status(
+        &self,
+        query: WorkQueueStatusQuery,
+    ) -> Result<WorkQueueStatus, AircError> {
         let board = self.work_board(query.event_limit).await?;
-        let stale_claims = board.stale_claims(now_ms()?);
+        let now_ms = now_ms()?;
+        let stale_claims = board.stale_claims(now_ms);
         let snapshot = board.snapshot();
+        let peer_id = self.peer_id();
 
         let mut items = Vec::new();
+        let mut active_claims_for_peer = Vec::new();
         for card in snapshot.cards {
             if card.priority > query.max_priority {
                 continue;
             }
             if query.repo.as_ref().is_some_and(|repo| &card.repo != repo) {
                 continue;
+            }
+
+            if card.owner == Some(peer_id)
+                && card
+                    .claim_expires_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms)
+            {
+                active_claims_for_peer.push(card.clone());
             }
 
             let stale_claim = stale_claims
@@ -501,11 +600,58 @@ impl Airc {
                 .then_with(|| left.card.card_id.cmp(&right.card.card_id))
         });
         items.truncate(query.limit);
-        Ok(items)
+
+        let mut agent_availability: Vec<_> = snapshot
+            .agent_availability
+            .into_iter()
+            .filter(|record| {
+                query
+                    .repo
+                    .as_ref()
+                    .is_none_or(|repo| &record.report.repo == repo)
+            })
+            .collect();
+        agent_availability.sort_by(|left, right| {
+            left.report
+                .repo
+                .cmp(&right.report.repo)
+                .then_with(|| {
+                    availability_state_rank(left.report.state)
+                        .cmp(&availability_state_rank(right.report.state))
+                })
+                .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
+                .then_with(|| {
+                    left.report
+                        .peer
+                        .to_string()
+                        .cmp(&right.report.peer.to_string())
+                })
+        });
+
+        active_claims_for_peer.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.updated_at_ms.cmp(&right.updated_at_ms))
+                .then_with(|| left.card_id.cmp(&right.card_id))
+        });
+
+        Ok(WorkQueueStatus {
+            claimable: items,
+            agent_availability,
+            active_claims_for_peer,
+        })
     }
 
     async fn publish_work_event(&self, event: &WorkEvent) -> Result<EventId, AircError> {
         let (headers, body) = encode_work_event(event)?;
         self.send_frame(FrameKind::Event, body, headers).await
+    }
+}
+
+fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
+    match state {
+        AgentAvailabilityState::Ready => 0,
+        AgentAvailabilityState::Busy => 1,
+        AgentAvailabilityState::Away => 2,
     }
 }

@@ -131,6 +131,36 @@ fn codex_hook_suggests_claimable_work_on_work_events() {
 }
 
 #[test]
+fn codex_hook_suggests_availability_on_availability_events() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(
+        &home,
+        &[
+            "work",
+            "availability",
+            "--repo",
+            "CambrianTech/airc",
+            "--state",
+            "ready",
+            "--note",
+            "available for queue work",
+            "--ttl-ms",
+            "60000",
+        ],
+    );
+
+    let output = run_hook(&home, &["codex-hook", "user-prompt-submit"], "{}");
+    let context = additional_context(&output);
+
+    assert!(context.contains("AIRC work: 0 claimable P0/P1"));
+    assert!(context.contains("availability ready=1 busy=0 away=0 stale=0"));
+    assert!(context.contains("publish ready/busy/away"));
+}
+
+#[test]
 fn codex_hook_raw_mode_preserves_full_event_lines() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");

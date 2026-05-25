@@ -141,6 +141,37 @@ fn work_availability_projects_to_board() {
 }
 
 #[test]
+fn work_next_surfaces_availability_and_idle_guidance() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(
+        &home,
+        &[
+            "work",
+            "availability",
+            "--repo",
+            "CambrianTech/airc",
+            "--state",
+            "ready",
+            "--note",
+            "available for P0",
+            "--ttl-ms",
+            "60000",
+        ],
+    );
+
+    let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(next.contains("(no claimable work)"), "{next}");
+    assert!(
+        next.contains("agent availability: ready=1 busy=0 away=0 stale=0"),
+        "{next}"
+    );
+    assert!(next.contains("available for P0"), "{next}");
+}
+
+#[test]
 fn work_next_suggests_claimable_priority_cards() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
