@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use airc_lib::PeerSpec;
 
@@ -238,6 +238,34 @@ pub enum Command {
         socket: Option<PathBuf>,
         /// Message body.
         text: String,
+    },
+
+    /// Publish a structured frame and emit a JSON receipt on
+    /// stdout. Designed for consumers (Continuum chat, OpenClaw,
+    /// bridge processes) that need typed event id + lamport +
+    /// channel without human-prose parsing, and to route to a
+    /// non-default room without mutating this scope's default
+    /// pointer.
+    Publish {
+        /// Channel name to route to. Must already be subscribed
+        /// (publish does not auto-join). Defaults to the current
+        /// room when omitted.
+        #[arg(long)]
+        room: Option<String>,
+        /// Inline UTF-8 body. Mutually exclusive with
+        /// `--body-json`.
+        #[arg(long, conflicts_with = "body_json", group = "body")]
+        body_text: Option<String>,
+        /// Path to a UTF-8 JSON file whose contents become the
+        /// frame body. Pass `-` to read from stdin.
+        #[arg(long, group = "body")]
+        body_json: Option<String>,
+        /// Header in `key=value` form. Repeatable.
+        #[arg(long = "header", value_name = "KEY=VALUE")]
+        headers: Vec<String>,
+        /// Frame kind. Defaults to `event` for structured payloads.
+        #[arg(long, value_enum, default_value = "event")]
+        kind: PublishFrameKind,
     },
 
     /// Pull buffered frames from the daemon's inbox for the current
@@ -502,4 +530,18 @@ pub enum PeerAction {
     },
     /// List enrolled peers from the peer trust store.
     List,
+}
+
+/// Frame kind selector for `airc publish`. Maps 1:1 onto
+/// `airc_protocol::FrameKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum PublishFrameKind {
+    /// Plain message frame (human-readable chat).
+    Message,
+    /// Structured event frame (recommended for typed envelopes
+    /// like Continuum's `AircRealtimeEnvelope`).
+    Event,
+    /// Control-plane signalling.
+    Control,
 }

@@ -9,6 +9,15 @@ use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
+/// Event metadata returned by [`Airc::send_frame_to_room`]. Carries
+/// enough to build a typed receipt for the public publish API.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SendFrameResult {
+    pub event_id: EventId,
+    pub lamport: u64,
+    pub occurred_at_ms: u64,
+}
+
 impl Airc {
     /// Send a plain-text message to the current room.
     pub async fn say(&self, text: &str) -> Result<EventId, AircError> {
@@ -68,8 +77,30 @@ impl Airc {
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
-        self.sync_account_peer_registry().await?;
         let room = self.current_room().await?;
+        self.send_frame_to_room(kind, target, body, headers, &room)
+            .await
+            .map(|receipt| receipt.event_id)
+    }
+
+    /// Send a frame to a specific room without changing this scope's
+    /// notion of "current room". Returns the full event metadata so
+    /// callers can produce a typed receipt.
+    ///
+    /// This is the substrate-level publish primitive that
+    /// [`Airc::publish`](crate::Airc::publish) composes onto a typed
+    /// [`PublishTarget`](crate::PublishTarget). Existing
+    /// `say`/`send`/`send_frame_to` paths keep their
+    /// current-room-only behaviour by funnelling through here.
+    pub(crate) async fn send_frame_to_room(
+        &self,
+        kind: FrameKind,
+        target: MentionTarget,
+        body: Body,
+        headers: Headers,
+        room: &crate::Room,
+    ) -> Result<SendFrameResult, AircError> {
+        self.sync_account_peer_registry().await?;
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
@@ -97,10 +128,14 @@ impl Airc {
             .keypair
             .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
             .map_err(|error| AircError::Crypto(error.to_string()))?;
-        self.execute_send_route(route.kind, &room, frame.clone())
+        self.execute_send_route(route.kind, room, frame.clone())
             .await?;
         self.append_sent_frame(frame).await?;
-        Ok(event_id)
+        Ok(SendFrameResult {
+            event_id,
+            lamport,
+            occurred_at_ms,
+        })
     }
 
     fn resolve_send_route(&self, kind: FrameKind) -> Result<TransportRoute, AircError> {

@@ -50,6 +50,7 @@ mod monitor;
 mod network_commands;
 mod pending_cli;
 mod pending_commands;
+mod publish_commands;
 mod queue_card_cli;
 mod queue_card_commands;
 mod queue_card_plan;
@@ -345,6 +346,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Msg { socket, text } => {
             commands::run_msg(&home, default_or(socket, &home), &text).await
         }
+        Command::Publish {
+            room,
+            body_text,
+            body_json,
+            headers,
+            kind,
+        } => publish_commands::run_publish(&home, room, body_text, body_json, headers, kind).await,
 
         Command::Inbox {
             socket,
