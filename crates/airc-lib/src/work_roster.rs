@@ -88,6 +88,7 @@ impl WorkRosterStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkRosterRow {
     pub peer: PeerId,
+    pub client_id: Option<String>,
     pub liveness: Option<AgentLiveness>,
     pub availability: Option<AgentAvailabilityRecord>,
     pub active_claims: Vec<WorkCard>,
@@ -157,7 +158,9 @@ impl RosterRows {
 
     fn upsert_liveness(&mut self, liveness: AgentLiveness) {
         let peer = liveness.peer;
-        self.row_mut(peer).liveness = Some(liveness);
+        let key = row_key(peer, liveness.client_id.as_deref());
+        let client_id = liveness.client_id.clone();
+        self.row_mut_with_key(key, peer, client_id).liveness = Some(liveness);
     }
 
     fn upsert_availability(&mut self, availability: AgentAvailabilityRecord) {
@@ -173,14 +176,22 @@ impl RosterRows {
     }
 
     fn row_mut(&mut self, peer: PeerId) -> &mut WorkRosterRow {
-        self.rows
-            .entry(peer.to_string())
-            .or_insert_with(|| WorkRosterRow {
-                peer,
-                liveness: None,
-                availability: None,
-                active_claims: Vec::new(),
-            })
+        self.row_mut_with_key(row_key(peer, None), peer, None)
+    }
+
+    fn row_mut_with_key(
+        &mut self,
+        key: String,
+        peer: PeerId,
+        client_id: Option<String>,
+    ) -> &mut WorkRosterRow {
+        self.rows.entry(key).or_insert_with(|| WorkRosterRow {
+            peer,
+            client_id,
+            liveness: None,
+            availability: None,
+            active_claims: Vec::new(),
+        })
     }
 
     fn into_sorted_rows(self, now_ms: u64) -> Vec<WorkRosterRow> {
@@ -207,9 +218,22 @@ impl RosterRows {
                                 .map(|record| record.report.repo.to_string()),
                         )
                 })
+                .then_with(|| {
+                    left.client_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(right.client_id.as_deref().unwrap_or(""))
+                })
                 .then_with(|| left.peer.to_string().cmp(&right.peer.to_string()))
         });
         rows
+    }
+}
+
+fn row_key(peer: PeerId, client_id: Option<&str>) -> String {
+    match client_id {
+        Some(client_id) => format!("{peer}\0{client_id}"),
+        None => peer.to_string(),
     }
 }
 

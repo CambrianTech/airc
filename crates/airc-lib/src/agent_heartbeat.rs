@@ -12,6 +12,8 @@
 //!   kinds: `"leaving"`, `"degraded"`).
 //! - `airc.heartbeat.runtime` = caller-supplied runtime label
 //!   (e.g. `"claude"`, `"codex"`, `"interactive"`).
+//! - `airc.heartbeat.client` = optional runtime client id
+//!   (`"codex:..."`, `"claude:..."`) when known.
 //!
 //! Frame kind is `Event` (durable — same trade-off the audit's flaw
 //! #4 flags). 60s default emit interval keeps noise bounded. The
@@ -44,6 +46,7 @@ use crate::Airc;
 
 pub const HEADER_HEARTBEAT_KIND: &str = "airc.heartbeat.kind";
 pub const HEADER_HEARTBEAT_RUNTIME: &str = "airc.heartbeat.runtime";
+pub const HEADER_HEARTBEAT_CLIENT: &str = "airc.heartbeat.client";
 
 /// Default 60s emit cadence. Tuned so a peer that hasn't beat in
 /// 3× the default is unambiguously stale, while keeping heartbeat
@@ -82,11 +85,19 @@ pub struct AgentHeartbeat {
     /// Caller-supplied runtime label. Convention: lowercase identifier
     /// (`"claude"`, `"codex"`, `"interactive"`, `"automation"`).
     pub runtime: String,
+    /// Optional runtime-client id. This distinguishes multiple tabs
+    /// sharing the same durable peer identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// Optional caller-supplied scope label. Useful when one agent
     /// runs from multiple project worktrees and observers want to
     /// distinguish them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Optional build identifier for operators checking whether idle
+    /// or broken agents are on stale code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     pub emitted_at_ms: u64,
 }
 
@@ -96,7 +107,9 @@ pub struct AgentHeartbeat {
 pub struct AgentLiveness {
     pub peer: PeerId,
     pub runtime: String,
+    pub client_id: Option<String>,
     pub scope: Option<String>,
+    pub build: Option<String>,
     pub last_seen_ms: u64,
 }
 
@@ -152,12 +165,29 @@ impl Airc {
         runtime: impl Into<String>,
         scope: Option<String>,
     ) -> Result<(), AircError> {
+        self.emit_agent_heartbeat_with_metadata(kind, runtime, None, scope, None)
+            .await
+    }
+
+    /// Emit a heartbeat with runtime metadata. CLI `join` uses this
+    /// form so managers can distinguish multiple tabs sharing one
+    /// peer identity and spot stale builds.
+    pub async fn emit_agent_heartbeat_with_metadata(
+        &self,
+        kind: HeartbeatKind,
+        runtime: impl Into<String>,
+        client_id: Option<String>,
+        scope: Option<String>,
+        build: Option<String>,
+    ) -> Result<(), AircError> {
         let runtime = runtime.into();
         let heartbeat = AgentHeartbeat {
             kind,
             peer: self.peer_id(),
             runtime: runtime.clone(),
+            client_id: client_id.clone(),
             scope,
+            build,
             emitted_at_ms: now_ms()?,
         };
         let body = serde_json::to_value(&heartbeat)
@@ -168,6 +198,9 @@ impl Airc {
             kind.header_value().to_string(),
         );
         headers.insert(HEADER_HEARTBEAT_RUNTIME.into(), runtime);
+        if let Some(client_id) = client_id {
+            headers.insert(HEADER_HEARTBEAT_CLIENT.into(), client_id);
+        }
         self.send_frame_to(
             FrameKind::Event,
             MentionTarget::All,
@@ -192,11 +225,30 @@ impl Airc {
         scope: Option<String>,
         interval: Duration,
     ) -> Result<HeartbeatTask, AircError> {
+        self.start_agent_heartbeat_with_metadata(runtime, None, scope, None, interval)
+            .await
+    }
+
+    /// Spawn a heartbeat task with runtime metadata.
+    pub async fn start_agent_heartbeat_with_metadata(
+        &self,
+        runtime: impl Into<String>,
+        client_id: Option<String>,
+        scope: Option<String>,
+        build: Option<String>,
+        interval: Duration,
+    ) -> Result<HeartbeatTask, AircError> {
         let runtime = runtime.into();
         // Emit one beat synchronously so observers see the agent
         // alive immediately, before the first interval tick.
-        self.emit_agent_heartbeat(HeartbeatKind::Alive, runtime.clone(), scope.clone())
-            .await?;
+        self.emit_agent_heartbeat_with_metadata(
+            HeartbeatKind::Alive,
+            runtime.clone(),
+            client_id.clone(),
+            scope.clone(),
+            build.clone(),
+        )
+        .await?;
 
         let airc = self.clone();
         let handle = tokio::spawn(async move {
@@ -206,7 +258,13 @@ impl Airc {
             loop {
                 ticker.tick().await;
                 if let Err(error) = airc
-                    .emit_agent_heartbeat(HeartbeatKind::Alive, runtime.clone(), scope.clone())
+                    .emit_agent_heartbeat_with_metadata(
+                        HeartbeatKind::Alive,
+                        runtime.clone(),
+                        client_id.clone(),
+                        scope.clone(),
+                        build.clone(),
+                    )
                     .await
                 {
                     eprintln!("agent heartbeat emit failed: {error}");
@@ -231,7 +289,7 @@ impl Airc {
         let now = now_ms()?;
         let cutoff = now.saturating_sub(within.as_millis() as u64);
         let recent = self.page_recent(window).await?;
-        let mut latest: std::collections::HashMap<PeerId, AgentHeartbeat> =
+        let mut latest: std::collections::HashMap<AgentHeartbeatKey, AgentHeartbeat> =
             std::collections::HashMap::new();
         for event in &recent {
             let Some(beat) = parse_heartbeat(event) else {
@@ -242,7 +300,7 @@ impl Airc {
             }
             // Keep the highest emitted_at_ms per peer.
             latest
-                .entry(beat.peer)
+                .entry(AgentHeartbeatKey::from(&beat))
                 .and_modify(|existing| {
                     if beat.emitted_at_ms > existing.emitted_at_ms {
                         *existing = beat.clone();
@@ -256,12 +314,35 @@ impl Airc {
             .map(|beat| AgentLiveness {
                 peer: beat.peer,
                 runtime: beat.runtime,
+                client_id: beat.client_id,
                 scope: beat.scope,
+                build: beat.build,
                 last_seen_ms: beat.emitted_at_ms,
             })
             .collect();
-        alive.sort_by_key(|liveness| liveness.peer.to_string());
+        alive.sort_by_key(|liveness| {
+            format!(
+                "{}:{}",
+                liveness.peer,
+                liveness.client_id.as_deref().unwrap_or("")
+            )
+        });
         Ok(alive)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentHeartbeatKey {
+    peer: PeerId,
+    client_id: Option<String>,
+}
+
+impl AgentHeartbeatKey {
+    fn from(beat: &AgentHeartbeat) -> Self {
+        Self {
+            peer: beat.peer,
+            client_id: beat.client_id.clone(),
+        }
     }
 }
 
@@ -284,7 +365,9 @@ mod tests {
             kind: HeartbeatKind::Alive,
             peer: PeerId::new(),
             runtime: "claude".to_string(),
+            client_id: Some("claude:tab-1".to_string()),
             scope: Some("/work/airc".to_string()),
+            build: Some("abc123".to_string()),
             emitted_at_ms: 1_700_000_000_000,
         }
     }
@@ -294,7 +377,9 @@ mod tests {
             kind: HeartbeatKind::Leaving,
             peer: PeerId::new(),
             runtime: "codex".to_string(),
+            client_id: None,
             scope: None,
+            build: None,
             emitted_at_ms: 1_700_000_001_000,
         }
     }
@@ -327,7 +412,9 @@ mod tests {
             kind: HeartbeatKind::Alive,
             peer: PeerId::new(),
             runtime: "interactive".to_string(),
+            client_id: None,
             scope: None,
+            build: None,
             emitted_at_ms: 0,
         };
         let json = serde_json::to_string(&beat).expect("encode");

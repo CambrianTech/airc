@@ -359,10 +359,14 @@ fn print_work_roster(status: &WorkRosterStatus) {
             .liveness
             .as_ref()
             .map(|liveness| {
+                let client = liveness.client_id.as_deref().unwrap_or("-");
+                let build = liveness.build.as_deref().unwrap_or("-");
                 format!(
-                    "live runtime={} scope={} last_seen_ms={}",
+                    "live runtime={} client={} scope={} build={} last_seen_ms={}",
                     liveness.runtime,
+                    client,
                     liveness.scope.as_deref().unwrap_or("-"),
+                    build,
                     liveness.last_seen_ms
                 )
             })
