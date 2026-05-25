@@ -43,6 +43,7 @@ pub mod coordinator;
 mod daemon;
 pub mod diagnostic_event_sink;
 pub mod error;
+pub mod external_identity;
 pub mod gh_account_registry;
 pub mod join_context;
 mod lan;
@@ -92,6 +93,10 @@ pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
 pub use error::AircError;
+pub use external_identity::{
+    BridgedMessage, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource,
+    HEADER_BRIDGE_HANDLE, HEADER_BRIDGE_SOURCE,
+};
 pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use lane_coordination::{
