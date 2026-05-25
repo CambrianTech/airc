@@ -14,7 +14,7 @@ use uuid::Uuid;
 use airc_lib::{
     AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
     CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
-    WorkQueueStatus,
+    WorkQueueStatus, WorkRosterStatus,
 };
 
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
@@ -171,6 +171,24 @@ pub async fn run_next(
     Ok(())
 }
 
+pub async fn run_roster(
+    home: &Path,
+    repo: Option<String>,
+    event_limit: usize,
+    active_within_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let status = airc
+        .work_roster_status(airc_lib::WorkRosterQuery {
+            repo: repo.map(RepoId::new).transpose()?,
+            event_limit,
+            active_within_ms,
+        })
+        .await?;
+    print_work_roster(&status);
+    Ok(())
+}
+
 pub async fn run_availability(
     home: &Path,
     repo: String,
@@ -273,6 +291,68 @@ fn print_work_queue_availability(status: &WorkQueueStatus) {
             peer = availability.report.peer,
             state = availability.report.state,
         );
+    }
+}
+
+fn print_work_roster(status: &WorkRosterStatus) {
+    let now_ms = now_ms();
+    if status.rows.is_empty() {
+        println!("work roster: 0 agent(s)");
+        println!("claimable work: {}", status.claimable_count);
+        return;
+    }
+
+    println!(
+        "work roster: {} agent(s) live={} ready={} busy={} away={} stale_availability={} claimable={}",
+        status.rows.len(),
+        status.alive_count(),
+        status.ready_count(now_ms),
+        status.busy_count(now_ms),
+        status.away_count(now_ms),
+        status.stale_availability_count(now_ms),
+        status.claimable_count
+    );
+    for row in &status.rows {
+        let live = row
+            .liveness
+            .as_ref()
+            .map(|liveness| {
+                format!(
+                    "live runtime={} scope={} last_seen_ms={}",
+                    liveness.runtime,
+                    liveness.scope.as_deref().unwrap_or("-"),
+                    liveness.last_seen_ms
+                )
+            })
+            .unwrap_or_else(|| "live=false".to_string());
+        let availability = row
+            .availability
+            .as_ref()
+            .map(|availability| {
+                format!(
+                    "availability={:?} repo={} stale={} note={}",
+                    availability.report.state,
+                    availability.report.repo,
+                    availability.expires_at_ms <= now_ms,
+                    availability.report.note.as_deref().unwrap_or("-")
+                )
+            })
+            .unwrap_or_else(|| "availability=unknown".to_string());
+        println!(
+            "peer={peer}  {live}  {availability}  claims={claims}",
+            peer = row.peer,
+            claims = row.active_claims.len(),
+        );
+        for card in &row.active_claims {
+            println!(
+                "  claim {card_id}  {priority:?}  {state:?}  repo={repo}  title={title}",
+                card_id = card.card_id,
+                priority = card.priority,
+                state = card.state,
+                repo = card.repo,
+                title = card.title,
+            );
+        }
     }
 }
 

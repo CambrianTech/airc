@@ -65,6 +65,7 @@ pub mod webrtc_media;
 pub mod webrtc_signaling;
 mod wire_replay;
 pub mod work;
+pub mod work_roster;
 pub mod work_subscription;
 
 pub use account_registry::{
@@ -127,6 +128,7 @@ pub use work::{
     ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
     ReportAgentAvailability, RequestWorkspace, WorkQueueStatus, WorkQueueStatusQuery,
 };
+pub use work_roster::{WorkRosterQuery, WorkRosterRow, WorkRosterStatus};
 pub use work_subscription::{
     WorkEventFilter, HEADER_WORK_CARD_ID, HEADER_WORK_LANE_ID, HEADER_WORK_REPO,
 };

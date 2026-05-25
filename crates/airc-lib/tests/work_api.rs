@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
 
 use airc_lib::{
-    Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
-    ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatWorkspace, LaneState,
-    ObserveLocalGitWorkspace, Priority, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
-    RepoId, RequestWorkspace, WorkCardId, WorkspaceStatus,
+    AgentAvailabilityState, Airc, AllocateWorkspace, BranchName, ChangeWorkLaneState,
+    ClaimManagerHat, ClaimWorkCard, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, DirtyState,
+    HeartbeatKind, HeartbeatWorkspace, LaneState, ObserveLocalGitWorkspace, Priority,
+    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, RepoId, ReportAgentAvailability,
+    RequestWorkspace, WorkCardId, WorkRosterQuery, WorkspaceStatus,
 };
 use tempfile::TempDir;
 
@@ -256,6 +257,72 @@ async fn claimable_work_can_surface_stale_claims_for_recovery() {
         visible[0].stale_claim.as_ref().map(|claim| claim.claim_id),
         Some(claim_id)
     );
+}
+
+#[tokio::test]
+async fn work_roster_status_combines_liveness_availability_and_claims() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-roster-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    airc.emit_agent_heartbeat(
+        HeartbeatKind::Alive,
+        "codex",
+        Some("airc-worktree".to_string()),
+    )
+    .await
+    .unwrap();
+    airc.report_agent_availability(ReportAgentAvailability {
+        repo: repo.clone(),
+        state: AgentAvailabilityState::Ready,
+        note: Some("can take next card".to_string()),
+        ttl_ms: 60_000,
+    })
+    .await
+    .unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo,
+            title: "render typed work roster".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let claim_id = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+
+    let roster = airc
+        .work_roster_status(WorkRosterQuery {
+            event_limit: 128,
+            ..WorkRosterQuery::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(roster.rows.len(), 1);
+    assert_eq!(roster.alive_count(), 1);
+    assert_eq!(roster.ready_count(u64::MAX.saturating_sub(1)), 0);
+    assert_eq!(roster.ready_count(0), 1);
+    let row = &roster.rows[0];
+    assert_eq!(row.peer, airc.peer_id());
+    assert_eq!(row.liveness.as_ref().unwrap().runtime, "codex");
+    assert_eq!(
+        row.availability.as_ref().unwrap().report.note.as_deref(),
+        Some("can take next card")
+    );
+    assert_eq!(row.active_claims.len(), 1);
+    assert_eq!(row.active_claims[0].card_id, card_id);
+    assert_eq!(row.active_claims[0].claim_id, Some(claim_id));
+    assert_eq!(roster.claimable_count, 0);
 }
 
 #[tokio::test]

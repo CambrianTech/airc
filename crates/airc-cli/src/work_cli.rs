@@ -93,6 +93,18 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 512)]
         event_limit: usize,
     },
+    /// Show agent liveness, availability, and active work claims.
+    Roster {
+        /// Optional repository filter, e.g. `CambrianTech/airc`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Recent transcript events to replay into the projection.
+        #[arg(long, default_value_t = 512)]
+        event_limit: usize,
+        /// Heartbeat age to consider live.
+        #[arg(long, default_value_t = 180_000)]
+        active_within_ms: u64,
+    },
     /// Publish this agent's availability for a repo.
     Availability {
         /// Repository key, e.g. `CambrianTech/airc`.
