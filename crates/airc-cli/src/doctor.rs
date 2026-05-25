@@ -367,7 +367,7 @@ async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
         match diag.severity {
             DiagnosticSeverity::Error => errors += 1,
             DiagnosticSeverity::Warn => warns += 1,
-            _ => {}
+            DiagnosticSeverity::Info | DiagnosticSeverity::Debug => {}
         }
     }
 
