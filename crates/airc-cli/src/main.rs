@@ -626,6 +626,25 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 event_limit,
                 active_within_ms,
             } => work_commands::run_roster(&home, repo, event_limit, active_within_ms).await,
+            WorkAction::Manage {
+                repo,
+                max_priority,
+                include_stale,
+                limit,
+                event_limit,
+                active_within_ms,
+            } => {
+                work_commands::run_manage(
+                    &home,
+                    repo,
+                    max_priority,
+                    include_stale,
+                    limit,
+                    event_limit,
+                    active_within_ms,
+                )
+                .await
+            }
             WorkAction::Availability {
                 repo,
                 state,
