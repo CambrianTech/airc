@@ -172,7 +172,19 @@ impl WorkBoardProjection {
 
     fn apply_claim_heartbeat(&mut self, e: &ClaimHeartbeat) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
-        ensure_claim(card, e.claim_id)?;
+        // Idempotent-replay tolerance (closes work card c29506b8,
+        // "Work board replay window must not fail on partial
+        // history"): if this heartbeat names a claim that isn't
+        // currently active on the card, drop it silently. The
+        // claim was either never granted (the projection treats
+        // `apply_card_claimed` as first-write-wins, so a racing
+        // second claim is dropped without state change) or was
+        // already superseded by another release. Heartbeating a
+        // ghost claim is a no-op — refusing to project would just
+        // poison the board for every downstream consumer.
+        if card.claim_id != Some(e.claim_id) {
+            return Ok(());
+        }
         card.claim_expires_at_ms = Some(e.heartbeat_at_ms + e.ttl_ms);
         card.last_heartbeat_at_ms = Some(e.heartbeat_at_ms);
         card.updated_at_ms = e.heartbeat_at_ms;
@@ -181,10 +193,25 @@ impl WorkBoardProjection {
 
     fn apply_claim_released(&mut self, e: &ClaimReleased) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
-        if card.claim_id.is_none() {
+        // Two tolerant-replay branches that converge to the same
+        // no-op (closes work card c29506b8). Both happen in real
+        // distributed runs:
+        //
+        // 1. `claim_id.is_none()` — card already had its active
+        //    claim released; subsequent release events for any
+        //    older claim are idempotent (Codex's #987 fix).
+        //
+        // 2. `claim_id != Some(e.claim_id)` — release names a
+        //    claim that the projection considers superseded
+        //    (e.g. `apply_card_claimed` drops a racing second
+        //    claim, but the second claimant still later emits a
+        //    release for "their" claim id). Treat as no-op
+        //    instead of panicking — refusing here freezes every
+        //    consumer's board until the operator surgically
+        //    rewrites the wire.
+        if card.claim_id != Some(e.claim_id) {
             return Ok(());
         }
-        ensure_claim(card, e.claim_id)?;
         card.state = match card.state {
             CardState::Claimed | CardState::InProgress | CardState::Blocked => CardState::Open,
             CardState::Open | CardState::Review | CardState::Merged | CardState::Closed => {
@@ -467,15 +494,4 @@ impl WorkBoardProjection {
             .entry(repo.clone())
             .or_insert_with(|| RepoTrackingRecord::new(repo))
     }
-}
-
-fn ensure_claim(card: &WorkCard, got: crate::ids::ClaimId) -> Result<(), ProjectionError> {
-    if card.claim_id == Some(got) {
-        return Ok(());
-    }
-    Err(ProjectionError::ClaimMismatch {
-        card_id: card.card_id,
-        expected: card.claim_id,
-        got,
-    })
 }
