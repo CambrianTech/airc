@@ -355,7 +355,6 @@ mod tests {
         // Proves the daemon's send + buffered-subscribe paths
         // compose correctly.
         use airc_ipc::request::{InboxRequest, SendRequest, SubscribeRequest};
-        use tempfile::TempDir;
 
         let state = fresh_state();
         let socket = unique_socket();
@@ -364,11 +363,11 @@ mod tests {
         let server_handle = tokio::spawn(async move { run(server_state, server_socket).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let dir = TempDir::new().unwrap();
-        let wire = dir.path().to_path_buf();
+        let wire = state.home.join("wires").join("daemon-round-trip");
         let channel = uuid::Uuid::nil();
 
         let client = DaemonClient::new(socket);
+        client.ping().await.unwrap();
         // Subscribe first so the daemon starts the drain task.
         client
             .subscribe(SubscribeRequest { wire: wire.clone() })
