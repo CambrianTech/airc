@@ -761,11 +761,18 @@ through the command-bus over LAN-TCP without GitHub.
    WebRTC media tracks for direct calls; LiveKit hybrid for SFU).
    Lane owner: claude-tab-1 per the cambriantech room.
 
-2. **OpenClaw repo not in workspace** — can't audit adoption directly.
-   Substrate contract exists; adoption gap is on the OpenClaw side
-   when/if that repo lands locally.
+2. **OpenClaw adoption audit now unblocked.** The repo is present at
+   `/Users/joelteply/Development/opensource/openclaw`. The substrate
+   contract exists; the open work is the OpenClaw-side adapter audit:
+   channel/thread mapping, presence source, event ingestion point, and
+   the smallest fixture proof that maps an OpenClaw chat/thread event
+   onto an AIRC room without embedding OpenClaw semantics in AIRC core.
 
-3. **Hermes repo not in workspace** — same shape as OpenClaw.
+3. **Hermes adoption audit now unblocked.** The repo is present at
+   `/Users/joelteply/Development/opensource/hermes-agent`. The open
+   work is the Hermes-side adapter audit: command model, request/reply
+   correlation, capability advertisement, and the smallest fixture
+   proof that sends a Hermes command over the AIRC command primitive.
 
 **Cross-cutting substrate gaps still open**:
 
@@ -793,6 +800,15 @@ through the command-bus over LAN-TCP without GitHub.
   in the post-WebRTC audit work as needed for chat-protocol
   bridges; no substrate contract exists yet. Worth a follow-up
   design card.
+- **Runtime planning adapters.** Codex and Claude can both consume
+  AIRC events, but neither runtime's proprietary "planning mode" is an
+  AIRC substrate primitive. The correct substrate shape is typed,
+  room-scoped planning/work events (`PlanRequested`, `PlanProposed`,
+  `PlanAccepted`, `WorkCardsGenerated`, etc.) that runtime adapters
+  render through their own surfaces. Claude gets live delivery through
+  Monitor. Codex currently has `UserPromptSubmit` catch-up plus
+  `airc codex-hook poll --wait-ms N` / long-running `airc join` feed.
+  AIRC must not depend on a runtime-specific Plan Mode existing.
 
 **Concrete follow-up cards created from this audit**:
 - `d61d7853` (P1) — Continuum TS-layer AIRC migration: chat services first.
@@ -820,8 +836,9 @@ against the current work board projection. Findings:
 | 2. Work subscription API | `e1f8e2e0` | shipped via #974 / #975 / #976 — closed |
 | 3. Real-machine tailnet/relay proof | `c877e142` | claimable |
 | 4. Consumer-throughput proof | `399cef36` | local 60Hz + 90Hz fan-out proof; tailnet still open |
-| 5. Bind to Continuum/OpenClaw/Hermes | `d61d7853` | Continuum lane formalized (e9ca8a09 audit); OpenClaw/Hermes blocked on repos in workspace |
+| 5. Bind to Continuum/OpenClaw/Hermes | `d61d7853`, `54e1dbd0`, `9ccb3146` | Continuum lane formalized; OpenClaw and Hermes repo audits now claimable |
 | 6. UDP + WebRTC route execution | (no single card — shipped) | covered by #955/#957/#960/#961/#962/#963 |
+| 7. Runtime planning hooks | `1702d553` | define runtime-neutral planning events and Codex/Claude adapters |
 
 **Observed Flaws #1-#8 → cards**:
 
