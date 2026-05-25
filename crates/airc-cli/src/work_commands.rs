@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
 use uuid::Uuid;
 
 use airc_lib::{
@@ -17,6 +18,7 @@ use airc_lib::{
     WorkQueueStatus, WorkRosterStatus,
 };
 
+use crate::lease;
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
 
 pub async fn run_create(
@@ -45,7 +47,21 @@ pub async fn run_claim(
     home: &Path,
     card_id: String,
     ttl_ms: u64,
+    no_lease_required: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !no_lease_required {
+        let check = lease::check_current_dir()?;
+        if !check.under_lease {
+            return Err(format!(
+                "refusing to claim work card from {cwd}: not under lease zone {root}.\n\
+                 Allocate a worktree under ~/.airc/worktrees/ first, or pass \
+                 --no-lease-required to override.",
+                cwd = check.path.display(),
+                root = check.lease_root.display(),
+            )
+            .into());
+        }
+    }
     let airc = Airc::open(home).await?;
     let card_id = parse_work_card_id(&card_id)?;
     let claim_id = airc
@@ -79,13 +95,39 @@ pub async fn run_heartbeat(
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
+    let card_uuid = parse_work_card_id(&card_id)?;
+    let claim_uuid = parse_claim_id(&claim_id)?;
     airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
-        card_id: parse_work_card_id(&card_id)?,
-        claim_id: parse_claim_id(&claim_id)?,
+        card_id: card_uuid,
+        claim_id: claim_uuid,
         ttl_ms,
     })
     .await?;
     println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
+
+    // Heartbeat doesn't refuse on lease drift — the claim was
+    // already granted, and refusing here would just orphan it. But
+    // we DO record the drift as a typed diagnostic so a substrate
+    // observer can see when an agent has wandered out of its lease.
+    if let Ok(check) = lease::check_current_dir() {
+        if !check.under_lease {
+            let diag = DiagnosticEvent::warn(
+                DiagnosticComponent::Work,
+                DiagnosticCode::WorkspaceLeaseViolation,
+                "work heartbeat fired from a path outside the lease zone",
+            )
+            .with_field("card_id", &card_id)
+            .with_field("claim_id", &claim_id)
+            .with_field("cwd", check.path.display())
+            .with_field("lease_root", check.lease_root.display());
+            // Best-effort: a publish failure shouldn't break the
+            // heartbeat from the user's perspective. Surface to
+            // stderr so it isn't silently swallowed.
+            if let Err(error) = airc.publish_diagnostic_event(&diag).await {
+                eprintln!("airc: failed to publish lease-violation diagnostic: {error}");
+            }
+        }
+    }
     Ok(())
 }
 

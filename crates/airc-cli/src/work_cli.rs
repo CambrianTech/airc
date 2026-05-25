@@ -29,12 +29,21 @@ pub enum WorkAction {
         priority: CliPriority,
     },
     /// Claim an existing work card for this peer.
+    ///
+    /// Refuses when the current directory is not under
+    /// `~/.airc/worktrees/` (the lease zone). Pass
+    /// `--no-lease-required` to override — useful for one-shot
+    /// admin claims from the main checkout.
     Claim {
         /// Work card UUID.
         card_id: String,
         /// Claim lease duration.
         #[arg(long, default_value_t = 600_000)]
         ttl_ms: u64,
+        /// Allow claim from outside `~/.airc/worktrees/`. Default
+        /// behaviour refuses, to keep lane work inside leases.
+        #[arg(long)]
+        no_lease_required: bool,
     },
     /// Extend this peer's claim lease on a work card.
     Heartbeat {
