@@ -10,6 +10,8 @@ pub struct RouteArgs {
 pub enum RouteAction {
     /// Show route candidates and policy decisions.
     Status(RouteStatusArgs),
+    /// Execute a route proof and print a machine-readable JSON report.
+    Proof(RouteProofArgs),
 }
 
 #[derive(Debug, Args)]
@@ -34,6 +36,25 @@ pub struct RouteStatusArgs {
     /// `lan-tcp:direct` or `gh-gist:rendezvous`.
     #[arg(long = "down")]
     pub down: Vec<RouteHealthOverride>,
+}
+
+#[derive(Debug, Args)]
+pub struct RouteProofArgs {
+    /// Which proof to run.
+    #[arg(long, value_enum, default_value_t = RouteProofKind::RelayLoopback)]
+    pub kind: RouteProofKind,
+
+    /// Deadline for the command-bus round trip.
+    #[arg(long, default_value_t = 3000)]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RouteProofKind {
+    /// Two independent homes exchange a request/reply over TLS LAN-TCP on loopback.
+    LanLoopback,
+    /// Two independent homes exchange a request/reply through a local `airc-relay`.
+    RelayLoopback,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
