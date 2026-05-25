@@ -63,6 +63,7 @@ mod transport_commands;
 mod update_commands;
 mod work_cli;
 mod work_commands;
+mod work_suggestions;
 mod workspace_cli;
 mod workspace_commands;
 mod worktree_lane_cli;

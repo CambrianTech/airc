@@ -12,6 +12,7 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use crate::client_id::current_client_id;
+use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 const CONSUMER_PREFIX: &str = "codex-hook";
 
@@ -35,18 +36,13 @@ pub async fn run_user_prompt_submit(
             .await?;
     }
 
+    let work_context = work_context(&airc, &events).await?;
     let visible: Vec<_> = events
         .into_iter()
         .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
         .collect();
-    if visible.is_empty() {
+    let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
         return Ok(());
-    }
-
-    let context = if raw {
-        render_raw(&visible)
-    } else {
-        render_digest(&visible, max_items)
     };
     print_hook_payload(&context)?;
     Ok(())
@@ -78,21 +74,51 @@ pub async fn run_poll(
             .await?;
     }
 
+    let work_context = work_context(&airc, &events).await?;
     let visible: Vec<_> = events
         .into_iter()
         .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
         .collect();
-    if visible.is_empty() {
+    let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
         return Ok(());
-    }
-
-    let context = if raw {
-        render_raw(&visible)
-    } else {
-        render_digest(&visible, max_items)
     };
     println!("{context}");
     Ok(())
+}
+
+async fn work_context(
+    airc: &Airc,
+    events: &[TranscriptEvent],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if events.iter().any(is_work_queue_event) {
+        render_claimable_work(airc).await
+    } else {
+        Ok(None)
+    }
+}
+
+async fn render_context(
+    _airc: &Airc,
+    events: &[TranscriptEvent],
+    max_items: usize,
+    raw: bool,
+    work_context: Option<String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let chat_context = if raw {
+        let text = render_raw(events);
+        (!text.is_empty()).then_some(text)
+    } else {
+        let text = render_digest(events, max_items);
+        (!text.is_empty()).then_some(text)
+    };
+    let mut sections = Vec::new();
+    if let Some(context) = chat_context {
+        sections.push(context);
+    }
+    if let Some(context) = work_context {
+        sections.push(context);
+    }
+    Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
 }
 
 fn consumer_id(runtime_client: Option<&str>) -> String {
@@ -273,6 +299,9 @@ fn dedupe(events: &[TranscriptEvent]) -> Vec<DigestMessage> {
     let mut seen = BTreeSet::new();
     let mut messages = Vec::new();
     for event in events {
+        if is_work_queue_event(event) {
+            continue;
+        }
         let peer = event.peer_id.to_string();
         let body = summarize_body(event);
         if seen.insert((peer.clone(), body.clone())) {

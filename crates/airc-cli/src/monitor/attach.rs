@@ -9,6 +9,7 @@ use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
 use crate::client_id::current_client_id;
+use crate::work_suggestions::render_claimable_work_for_event;
 
 pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
@@ -35,7 +36,10 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
         match response {
             Response::Ok => {}
             Response::Event { event } => {
-                if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
+                if let Some(text) = render_claimable_work_for_event(&airc, event.as_ref()).await? {
+                    sandbox.emit_contract_once();
+                    render_text_event(event.as_ref(), client_id.as_deref(), &text, &mut sandbox);
+                } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
                     render_event(event.as_ref(), client_id.as_deref(), &mut sandbox);
                 }
             }
@@ -55,6 +59,15 @@ fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut 
     };
 
     sandbox.emit_contract_once();
+    render_text_event(event, client_id, body, sandbox);
+}
+
+fn render_text_event(
+    event: &TranscriptEvent,
+    _client_id: Option<&str>,
+    body: &str,
+    sandbox: &mut Sandbox,
+) {
     let channel = normalize_channel(&event.room_id.to_string());
     let mut attrs = vec![
         format!("from=\"{}\"", xml_escape(&event.peer_id.to_string())),
