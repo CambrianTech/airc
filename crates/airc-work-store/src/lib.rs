@@ -107,7 +107,7 @@ where
             }
         }
 
-        Ok(WorkBoardProjection::replay(events)?)
+        Ok(WorkBoardProjection::replay_window(events)?)
     }
 }
 

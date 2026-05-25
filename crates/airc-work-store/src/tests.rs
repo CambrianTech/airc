@@ -189,6 +189,35 @@ async fn project_complete_pages_from_start_without_recent_window_loss() {
 }
 
 #[tokio::test]
+async fn project_complete_tolerates_orphaned_work_events() {
+    let store = InMemoryEventStore::new();
+    let room = RoomId::from_u128(10);
+    let orphan_card = WorkCardId::from_u128(19);
+    let valid_card = WorkCardId::from_u128(20);
+
+    store
+        .append(work_transcript(
+            1,
+            room,
+            1,
+            &card_state_changed(orphan_card),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(work_transcript(2, room, 2, &card_created(valid_card)))
+        .await
+        .unwrap();
+
+    let complete = WorkEventStore::new(&store)
+        .project_complete(Some(room), 1)
+        .await
+        .unwrap();
+    assert!(complete.card(orphan_card).is_none());
+    assert!(complete.card(valid_card).is_some());
+}
+
+#[tokio::test]
 async fn resume_from_uses_store_cursor_contract() {
     let store = InMemoryEventStore::new();
     let room = RoomId::from_u128(10);
