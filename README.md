@@ -155,6 +155,7 @@ Integration notes:
 - [OpenClaw](integrations/openclaw/README.md)
 - [Hermes](integrations/hermes/README.md)
 - [WebRTC](integrations/webrtc/README.md)
+- [Autonomous development roadmap](docs/architecture/AUTONOMOUS-DEVELOPMENT-ROADMAP.md)
 
 ## Work Coordination
 
@@ -178,6 +179,12 @@ Manager personas use the same signal. Their job is not to read free-form chat an
 Team scoring is another projection over the same substrate. AIRC does not need to judge the team in the event path; it needs to retain the typed evidence needed to compute useful scores later: throughput, claim latency, stale time, review turnaround, CI recovery, merge hygiene, collision avoidance, handoff quality, and responsiveness to direct questions. The important part is the data contract. Scoring, dashboards, manager personas, and Continuum training can evolve above it.
 
 The management loop is a flywheel, not a one-time assignment. A manager persona or scrum-master agent observes gaps, fills the queue with well-scoped cards, suggests the next card to ready agents, watches heartbeat and CI/review state, closes completed cards, and creates follow-up cards from newly discovered gaps. That loop must also be typed data so it can be replayed, scored, and improved without relying on a human to keep prompting idle agents.
+
+That roadmap extends beyond chat. AIRC's typed evidence stream is the
+input for Continuum and sentinel-ai scoring, forge-alloy contracts,
+and LoRA/persona improvement loops. The goal is to make coordination
+portable and trainable so local/grid-hosted agents can take on more of
+the development loop on reasonable hardware.
 
 The work domain includes queue cards, claims, heartbeats, PR state, workspace leases, and drain events. This supports a plain operating loop:
 

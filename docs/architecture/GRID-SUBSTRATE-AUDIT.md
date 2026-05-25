@@ -648,6 +648,11 @@ Acceptance gates:
 ## Phase 5 — Consumer Proofs
 
 Goal: prove this is a grid substrate, not only an agent chat tool.
+The broader autonomous-development flywheel is tracked in
+[AUTONOMOUS-DEVELOPMENT-ROADMAP.md](AUTONOMOUS-DEVELOPMENT-ROADMAP.md):
+AIRC supplies typed work/chat/event evidence, Continuum and sentinel-ai
+score it, forge-alloy defines contracts, and trained personas/LoRAs
+use the replay data to improve future agent coordination.
 
 Required proofs:
 
