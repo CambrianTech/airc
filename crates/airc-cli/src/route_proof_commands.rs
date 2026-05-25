@@ -44,6 +44,8 @@ struct RouteProofReport {
 async fn proof_lan_loopback(
     timeout: Duration,
 ) -> Result<RouteProofReport, Box<dyn std::error::Error>> {
+    ensure_crypto_provider();
+
     let proof = ProofHomes::new("lan-loopback")?;
     let alice = Airc::open(&proof.alice_home).await?;
     let bob = Airc::open(&proof.bob_home).await?;
