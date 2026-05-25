@@ -21,7 +21,7 @@ single read for "who uses what."
 |---|---|---|---|---|---|---|
 | **Continuum** | AR pose + spatial sync, persona event bus, distributed inference orchestration | A (pose) + B (anchors) + C (commands) | `forge.persona.*`, `continuum.lora.invoke`, `airc.route_class` (TBD) | `events`, `subscriptions`, `peer_trust`, `beacons` | `events` (broadcasts), `subscriptions` (joins) | `integrations/continuum/README.md` |
 | **OpenClaw** | Workspace UI surface (threads, users, presence, render targets) | C (event-driven UI) | `openclaw.thread.*`, `openclaw.user.*` | `events`, `subscriptions`, `peer_trust`, `local_identity` | `events`, `subscriptions` | `integrations/openclaw/README.md` |
-| **Hermes** | Command/orchestration plane for agent workflows | C (request/reply) | `forge.hermes.agent_command`, `airc.correlation_id` (TBD Phase 4) | `events`, `peer_trust` | `events` | TODO — placeholder needed |
+| **Hermes** | Command/orchestration plane for agent workflows | C (request/reply) | `forge.hermes.agent_command`, `airc.correlation_id` (TBD Phase 4) | `events`, `peer_trust` | `events` | `integrations/hermes/README.md` |
 | **Claude Code** | AI agent runtime (Monitor stream + skill bindings) | C (chat + commands) | `airc.client=claude:*`, `airc.correlation_id` (TBD) | `events`, `subscriptions`, `runtime_cursors`, `peer_trust`, `local_identity` | `events`, `subscriptions`, `runtime_cursors` | `integrations/claude-code/README.md` |
 | **OpenAI Codex** | AI agent runtime (UserPromptSubmit hook + persistent join session) | C (chat + commands) | `airc.client=codex:*`, `airc.correlation_id` (TBD) | `events`, `subscriptions`, `runtime_cursors`, `peer_trust`, `local_identity` | `events`, `subscriptions`, `runtime_cursors` | `integrations/openai-codex/README.md` |
 | **Cursor / opencode / Windsurf** | IDE-resident agent surfaces | C | `airc.client=<runtime>:*` | same as Claude/Codex | same as Claude/Codex | placeholders in `integrations/`; READMEs missing until those integrations ship |
@@ -93,8 +93,6 @@ Each consumer's integration README should answer:
 These consumers don't have integration READMEs yet. Each blocks a
 production deployment of that consumer:
 
-- **Hermes** — referenced in `README.md` as `forge.hermes.*` but
-  no `integrations/hermes/README.md`. Needed before Hermes embeds.
 - **agent-relay** — Cambrian-internal scope unknown to substrate
   docs. Owner: Cambrian team. Needs the matrix row above filled in.
 - **forge-alloy** — same.
