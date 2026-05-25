@@ -40,6 +40,22 @@ pub struct StatusResponse {
     pub peer_id: String,
     /// Seconds since daemon start.
     pub uptime_seconds: u64,
+    /// IPC protocol version spoken by this daemon. Missing means the
+    /// daemon predates status metadata and should be treated as stale
+    /// by lifecycle code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_protocol_version: Option<u32>,
+    /// Build commit baked into the daemon binary. Missing means
+    /// unknown/old daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_commit: Option<String>,
+    /// Build branch baked into the daemon binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_branch: Option<String>,
+    /// Executable path of the daemon process. This is diagnostics
+    /// only; lifecycle decisions use protocol + build metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
 }
 
 /// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
@@ -98,10 +114,33 @@ mod tests {
         let original = Response::Status(StatusResponse {
             peer_id: "07e7ad58-ba56-4535-b4e5-a161a110e487".to_string(),
             uptime_seconds: 42,
+            ipc_protocol_version: Some(3),
+            build_commit: Some("abc123".to_string()),
+            build_branch: Some("rust-rewrite".to_string()),
+            executable: Some("/tmp/airc".to_string()),
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn status_accepts_pre_metadata_daemon_response() {
+        let decoded: Response = serde_json::from_str(
+            r#"{"kind":"status","peer_id":"07e7ad58-ba56-4535-b4e5-a161a110e487","uptime_seconds":42}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            Response::Status(StatusResponse {
+                peer_id: "07e7ad58-ba56-4535-b4e5-a161a110e487".to_string(),
+                uptime_seconds: 42,
+                ipc_protocol_version: None,
+                build_commit: None,
+                build_branch: None,
+                executable: None,
+            })
+        );
     }
 
     #[test]

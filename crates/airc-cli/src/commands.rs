@@ -21,7 +21,7 @@ use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
-use airc_daemon::{run as run_daemon_server, DaemonState};
+use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
 use airc_identity::LocalIdentity;
 use airc_ipc::{
     AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
@@ -173,12 +173,12 @@ pub async fn ensure_daemon_running(
     _peers: Vec<PeerSpec>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = DaemonClient::new(socket.clone());
-    if client
-        .ping_with_timeout(Duration::from_millis(250))
-        .await
-        .is_ok()
-    {
-        return Ok(());
+    if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
+        if daemon_status_is_current(&status) {
+            return Ok(());
+        }
+        let _ = client.stop().await;
+        wait_for_daemon_exit(&client, Duration::from_secs(3)).await;
     }
 
     std::fs::create_dir_all(home)?;
@@ -218,6 +218,25 @@ pub async fn ensure_daemon_running(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!("daemon did not become ready; see {}", log.display()).into())
+}
+
+fn daemon_status_is_current(status: &airc_ipc::StatusResponse) -> bool {
+    status.ipc_protocol_version == Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION))
+        && crate::build_info::is_unknown_or_matches(status.build_commit.as_deref())
+}
+
+async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        if client
+            .ping_with_timeout(Duration::from_millis(150))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(unix)]
@@ -495,13 +514,14 @@ pub async fn run_daemon(
     // same `(lamport, event_id)` cursor on next boot.
     let store_path = home.join("events.sqlite");
     let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
-    let state = Arc::new(DaemonState::new(
+    let state = Arc::new(DaemonState::new_with_runtime(
         identity.peer_id,
         identity.keypair,
         registry,
         VerificationPolicy::Strict,
         home.to_path_buf(),
         store,
+        current_daemon_runtime_info(),
     ));
     println!(
         "airc daemon: peer_id={} listening on {}",
@@ -511,6 +531,17 @@ pub async fn run_daemon(
     run_daemon_server(state, socket).await?;
     println!("airc daemon: stopped.");
     Ok(())
+}
+
+fn current_daemon_runtime_info() -> DaemonRuntimeInfo {
+    DaemonRuntimeInfo {
+        ipc_protocol_version: Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION)),
+        build_commit: (!crate::build_info::is_unknown()).then(|| crate::build_info::COMMIT.into()),
+        build_branch: (!crate::build_info::is_unknown()).then(|| crate::build_info::BRANCH.into()),
+        executable: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+    }
 }
 
 // ---- Daemon-client commands (no identity load needed) ---------------
@@ -527,6 +558,19 @@ pub async fn run_status(socket: PathBuf) -> Result<(), Box<dyn std::error::Error
     let status = client.status().await?;
     println!("peer_id:        {}", status.peer_id);
     println!("uptime_seconds: {}", status.uptime_seconds);
+    if let Some(version) = status.ipc_protocol_version {
+        println!("ipc_protocol:   {version}");
+    }
+    if let Some(commit) = status.build_commit.as_deref() {
+        let short = &commit[..commit.len().min(12)];
+        println!("build:          {short}");
+    }
+    if let Some(branch) = status.build_branch.as_deref() {
+        println!("branch:         {branch}");
+    }
+    if let Some(executable) = status.executable.as_deref() {
+        println!("executable:     {executable}");
+    }
     Ok(())
 }
 
@@ -832,4 +876,41 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
         headers.insert(HEADER_AIRC_CLIENT.to_string(), client);
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(commit: Option<&str>, protocol: Option<u32>) -> airc_ipc::StatusResponse {
+        airc_ipc::StatusResponse {
+            peer_id: "07e7ad58-ba56-4535-b4e5-a161a110e487".to_string(),
+            uptime_seconds: 1,
+            ipc_protocol_version: protocol,
+            build_commit: commit.map(str::to_string),
+            build_branch: Some("rust-rewrite".to_string()),
+            executable: Some("/tmp/airc".to_string()),
+        }
+    }
+
+    #[test]
+    fn daemon_status_current_requires_matching_protocol_and_build() {
+        assert!(daemon_status_is_current(&status(
+            Some(crate::build_info::COMMIT),
+            Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION))
+        )));
+        assert!(!daemon_status_is_current(&status(
+            Some("old-build"),
+            Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION))
+        )));
+        assert!(!daemon_status_is_current(&status(
+            Some(crate::build_info::COMMIT),
+            Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION) + 1)
+        )));
+    }
+
+    #[test]
+    fn daemon_status_without_metadata_is_stale() {
+        assert!(!daemon_status_is_current(&status(None, None)));
+    }
 }

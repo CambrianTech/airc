@@ -40,6 +40,10 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Status => Response::Status(StatusResponse {
             peer_id: state.peer_id.to_string(),
             uptime_seconds: state.uptime_seconds(),
+            ipc_protocol_version: state.runtime.ipc_protocol_version,
+            build_commit: state.runtime.build_commit.clone(),
+            build_branch: state.runtime.build_branch.clone(),
+            executable: state.runtime.executable.clone(),
         }),
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
