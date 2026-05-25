@@ -125,7 +125,7 @@ pub use work::{
     ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
     HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace,
     ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
-    ReportAgentAvailability, RequestWorkspace,
+    ReportAgentAvailability, RequestWorkspace, WorkQueueStatus, WorkQueueStatusQuery,
 };
 pub use work_subscription::{
     WorkEventFilter, HEADER_WORK_CARD_ID, HEADER_WORK_LANE_ID, HEADER_WORK_REPO,
@@ -140,9 +140,9 @@ pub use airc_core::{
     ClientId, EventId, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
 };
 pub use airc_work::{
-    AgentAvailabilityRecord, AgentAvailabilityState, BoardSnapshot, BranchName, CardState, ClaimId,
-    DirtyState, GitObjectId, LaneId, LaneState, LocalGitSnapshot, ManagerHat, Priority,
-    ProjectionError, RepoId, WorkBoardProjection, WorkCard, WorkCardId, WorkEvent, WorkspaceId,
-    WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_EVENT_KIND,
-    HEADER_FORGE_WORK_REPO,
+    AgentAvailabilityRecord, AgentAvailabilityReported, AgentAvailabilityState, BoardSnapshot,
+    BranchName, CardState, ClaimId, DirtyState, GitObjectId, LaneId, LaneState, LocalGitSnapshot,
+    ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection, WorkCard, WorkCardId,
+    WorkEvent, WorkspaceId, WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT,
+    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
 };
