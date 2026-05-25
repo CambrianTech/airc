@@ -172,6 +172,53 @@ fn work_next_surfaces_availability_and_idle_guidance() {
 }
 
 #[test]
+fn work_roster_surfaces_availability_and_claims() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(
+        &home,
+        &[
+            "work",
+            "availability",
+            "--repo",
+            "CambrianTech/airc",
+            "--state",
+            "ready",
+            "--note",
+            "ready for roster work",
+            "--ttl-ms",
+            "60000",
+        ],
+    );
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "show who is doing what",
+            "--priority",
+            "p1",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("card id");
+    run_ok(&home, &["work", "claim", card_id, "--ttl-ms", "60000"]);
+
+    let roster = run_ok(&home, &["work", "roster", "--event-limit", "128"]);
+    assert!(roster.contains("work roster: 1 agent(s)"), "{roster}");
+    assert!(roster.contains("ready=1"), "{roster}");
+    assert!(roster.contains("availability=Ready"), "{roster}");
+    assert!(roster.contains("ready for roster work"), "{roster}");
+    assert!(roster.contains("claims=1"), "{roster}");
+    assert!(roster.contains(card_id), "{roster}");
+    assert!(roster.contains("show who is doing what"), "{roster}");
+}
+
+#[test]
 fn work_next_suggests_claimable_priority_cards() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
