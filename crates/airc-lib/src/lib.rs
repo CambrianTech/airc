@@ -137,6 +137,7 @@ pub use work::{
     ReportAgentAvailability, RequestWorkspace, WorkQueueStatus, WorkQueueStatusQuery,
 };
 pub use work_manager::{
+    SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,
     WorkManagerAgent, WorkManagerQuery, WorkManagerReason, WorkManagerRecommendation,
     WorkManagerRecommendationKind, WorkManagerStatus,
 };

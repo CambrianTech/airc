@@ -5,8 +5,8 @@ use airc_lib::{
     ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, ClaimableWorkQuery,
     CreateWorkCard, CreateWorkLane, DirtyState, HeartbeatKind, HeartbeatWorkspace, LaneState,
     ObserveLocalGitWorkspace, Priority, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
-    RepoId, ReportAgentAvailability, RequestWorkspace, WorkCardId, WorkRosterQuery,
-    WorkspaceStatus,
+    RepoId, ReportAgentAvailability, RequestWorkspace, WorkBacklogSeedCandidate,
+    WorkBacklogSeedOutcome, WorkCardId, WorkRosterQuery, WorkspaceStatus,
 };
 use tempfile::TempDir;
 
@@ -297,6 +297,105 @@ async fn scheduling_finds_claimable_cards_beyond_small_recent_window() {
         .await
         .unwrap();
     assert_eq!(roster.claimable_count, 1);
+}
+
+#[tokio::test]
+async fn manager_seed_backlog_creates_only_missing_room_cards() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-manager-seed").await.unwrap();
+
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+    let first = WorkBacklogSeedCandidate {
+        repo: repo.clone(),
+        title: "Roadmap gap: manager loop".to_string(),
+        body: Some("evidence: roadmap phase 1".to_string()),
+        priority: Priority::P0,
+        lane_id: None,
+        evidence_key: Some("roadmap:manager-loop".to_string()),
+    };
+    let second = WorkBacklogSeedCandidate {
+        repo,
+        title: "Roadmap gap: budgeted context".to_string(),
+        body: Some("evidence: roadmap phase 5".to_string()),
+        priority: Priority::P1,
+        lane_id: None,
+        evidence_key: Some("roadmap:budgeted-context".to_string()),
+    };
+
+    let created = airc
+        .seed_work_backlog(vec![first.clone(), second.clone()])
+        .await
+        .unwrap();
+    assert_eq!(created.created_count(), 2);
+    assert_eq!(created.represented_count(), 0);
+
+    for idx in 0..600 {
+        airc.say(&format!("manager seed noise {idx}"))
+            .await
+            .unwrap();
+    }
+    assert!(
+        airc.work_board(512)
+            .await
+            .unwrap()
+            .card(created.items[0].card_id)
+            .is_none(),
+        "recent board should not be enough to dedupe seed candidates"
+    );
+
+    let repeated = airc
+        .seed_work_backlog(vec![first.clone(), second.clone()])
+        .await
+        .unwrap();
+    assert_eq!(repeated.created_count(), 0);
+    assert_eq!(repeated.represented_count(), 2);
+    assert_eq!(
+        repeated
+            .items
+            .iter()
+            .map(|item| item.outcome)
+            .collect::<Vec<_>>(),
+        vec![
+            WorkBacklogSeedOutcome::AlreadyRepresented,
+            WorkBacklogSeedOutcome::AlreadyRepresented
+        ]
+    );
+}
+
+#[tokio::test]
+async fn manager_seed_backlog_treats_completed_cards_as_base_case() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-manager-seed-complete").await.unwrap();
+
+    let candidate = WorkBacklogSeedCandidate {
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        title: "Completed roadmap gap".to_string(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        evidence_key: Some("roadmap:done".to_string()),
+    };
+
+    let created = airc
+        .seed_work_backlog(vec![candidate.clone()])
+        .await
+        .unwrap();
+    airc.change_work_card_state(ChangeWorkCardState {
+        card_id: created.items[0].card_id,
+        state: CardState::Closed,
+    })
+    .await
+    .unwrap();
+
+    let repeated = airc.seed_work_backlog(vec![candidate]).await.unwrap();
+    assert_eq!(repeated.created_count(), 0);
+    assert_eq!(repeated.completed_count(), 1);
+    assert_eq!(
+        repeated.items[0].outcome,
+        WorkBacklogSeedOutcome::AlreadyCompleted
+    );
 }
 
 #[tokio::test]

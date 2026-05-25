@@ -88,6 +88,58 @@ fn work_create_claim_release_projects_on_board() {
 }
 
 #[test]
+fn work_seed_is_idempotent_for_manager_candidates() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let first = run_ok(
+        &home,
+        &[
+            "work",
+            "seed",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "manager generated card",
+            "--priority",
+            "p1",
+            "--body",
+            "evidence from roadmap",
+            "--evidence-key",
+            "roadmap:manager-generated-card",
+        ],
+    );
+    assert!(first.contains("outcome=created"), "{first}");
+    let card_id = extract_seed_card_id(&first).expect("seed prints card id");
+
+    let second = run_ok(
+        &home,
+        &[
+            "work",
+            "seed",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "manager   generated   card",
+            "--priority",
+            "p1",
+            "--evidence-key",
+            "roadmap:wording-changed",
+        ],
+    );
+    assert!(second.contains("outcome=already_represented"), "{second}");
+    assert!(second.contains(card_id), "{second}");
+
+    let board = run_ok(&home, &["work", "board"]);
+    assert_eq!(
+        board.matches("manager generated card").count(),
+        1,
+        "{board}"
+    );
+}
+
+#[test]
 fn work_board_surfaces_stale_claims() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
@@ -518,4 +570,9 @@ fn run_expect_failure(home: &Path, args: &[&str]) -> String {
 fn extract_field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.lines()
         .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+}
+
+fn extract_seed_card_id(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .find_map(|field| field.strip_prefix("card_id="))
 }

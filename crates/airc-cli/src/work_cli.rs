@@ -28,6 +28,27 @@ pub enum WorkAction {
         #[arg(long, value_enum, default_value = "p2")]
         priority: CliPriority,
     },
+    /// Idempotently seed a manager/roadmap/RAG candidate into this room.
+    Seed {
+        /// Repository key, e.g. `CambrianTech/airc`.
+        #[arg(long)]
+        repo: String,
+        /// Human-readable card title.
+        #[arg(long)]
+        title: String,
+        /// Optional card body.
+        #[arg(long)]
+        body: Option<String>,
+        /// Optional lane UUID to attach this card to.
+        #[arg(long)]
+        lane_id: Option<String>,
+        /// Scheduling priority.
+        #[arg(long, value_enum, default_value = "p2")]
+        priority: CliPriority,
+        /// Stable source key from a roadmap/RAG/issue adapter.
+        #[arg(long)]
+        evidence_key: Option<String>,
+    },
     /// Claim an existing work card for this peer.
     ///
     /// Refuses when the current directory is not under
