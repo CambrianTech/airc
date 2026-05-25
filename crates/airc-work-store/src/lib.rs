@@ -68,7 +68,7 @@ where
         limit: usize,
     ) -> Result<WorkBoardProjection, WorkStoreError> {
         let page = self.page_recent(channel, limit).await?;
-        Ok(WorkBoardProjection::replay(page.events)?)
+        Ok(WorkBoardProjection::replay_window(page.events)?)
     }
 
     pub async fn project_from(

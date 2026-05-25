@@ -72,6 +72,23 @@ impl WorkBoardProjection {
         Ok(projection)
     }
 
+    /// Replay a bounded transcript window. Events whose anchor entity
+    /// was created before the window are skipped; structural errors
+    /// inside the window still fail.
+    pub fn replay_window(
+        events: impl IntoIterator<Item = WorkEvent>,
+    ) -> Result<Self, ProjectionError> {
+        let mut projection = Self::new();
+        for event in events {
+            match projection.apply(&event) {
+                Ok(()) => {}
+                Err(error) if error.is_missing_window_anchor() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(projection)
+    }
+
     pub fn snapshot(&self) -> BoardSnapshot {
         BoardSnapshot {
             cards: self.cards.values().cloned().collect(),

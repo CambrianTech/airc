@@ -124,6 +124,36 @@ async fn project_recent_rebuilds_board_from_persisted_events() {
 }
 
 #[tokio::test]
+async fn project_recent_skips_events_whose_anchor_is_outside_window() {
+    let store = InMemoryEventStore::new();
+    let room = RoomId::from_u128(10);
+    let old_card = WorkCardId::from_u128(20);
+    let visible_card = WorkCardId::from_u128(21);
+
+    store
+        .append(work_transcript(1, room, 1, &card_created(old_card)))
+        .await
+        .unwrap();
+    store
+        .append(work_transcript(2, room, 2, &card_state_changed(old_card)))
+        .await
+        .unwrap();
+    store
+        .append(work_transcript(3, room, 3, &card_created(visible_card)))
+        .await
+        .unwrap();
+
+    let projection = WorkEventStore::new(&store)
+        .project_recent(Some(room), 2)
+        .await
+        .unwrap();
+
+    assert!(projection.card(old_card).is_none());
+    let card = projection.card(visible_card).unwrap();
+    assert_eq!(card.state, CardState::Open);
+}
+
+#[tokio::test]
 async fn resume_from_uses_store_cursor_contract() {
     let store = InMemoryEventStore::new();
     let room = RoomId::from_u128(10);

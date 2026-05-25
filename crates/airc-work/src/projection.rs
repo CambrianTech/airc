@@ -241,5 +241,14 @@ pub enum ProjectionError {
     },
 }
 
+impl ProjectionError {
+    pub fn is_missing_window_anchor(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownCard(_) | Self::UnknownLane(_) | Self::UnknownWorkspace(_)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;
