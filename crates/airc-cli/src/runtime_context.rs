@@ -56,7 +56,7 @@ impl RuntimeContext {
     pub fn client_id(&self) -> Option<&str> {
         match self {
             Self::Agent { client_id, .. } => client_id.as_deref(),
-            _ => None,
+            Self::InteractiveTerminal | Self::Automation | Self::TestHarness => None,
         }
     }
 }
