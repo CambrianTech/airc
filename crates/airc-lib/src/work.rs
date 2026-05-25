@@ -272,6 +272,9 @@ impl Airc {
     /// Claim a work card for this peer. Returns the UUIDv4 claim id
     /// generated locally for the lease.
     pub async fn claim_work_card(&self, request: ClaimWorkCard) -> Result<ClaimId, AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        self.ensure_work_card_unclaimed(request.card_id).await?;
         let claim_id = ClaimId::new();
         let event = WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: request.card_id,
@@ -286,6 +289,8 @@ impl Airc {
 
     /// Release this peer's work claim.
     pub async fn release_work_claim(&self, request: ReleaseWorkClaim) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
         let event = WorkEvent::ClaimReleased(ClaimReleased {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -304,6 +309,8 @@ impl Airc {
         &self,
         request: ChangeWorkCardState,
     ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
         let event = WorkEvent::CardStateChanged(CardStateChanged {
             card_id: request.card_id,
             state: request.state,
@@ -318,6 +325,8 @@ impl Airc {
     /// heartbeat long-running work so stale claims become visible when
     /// a tab goes idle or dies instead of locking a lane indefinitely.
     pub async fn heartbeat_work_claim(&self, request: HeartbeatWorkClaim) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
         let event = WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -645,6 +654,44 @@ impl Airc {
     async fn publish_work_event(&self, event: &WorkEvent) -> Result<EventId, AircError> {
         let (headers, body) = encode_work_event(event)?;
         self.send_frame(FrameKind::Event, body, headers).await
+    }
+
+    async fn ensure_work_card_in_current_room(&self, card_id: WorkCardId) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        self.ensure_room_subscriber(&room).await?;
+        let store = WorkEventStore::new(self.event_store());
+        let board = store.project_recent(Some(room.channel), 512).await?;
+        if board.card(card_id).is_some() {
+            return Ok(());
+        }
+
+        Err(AircError::WorkCardNotInCurrentRoom {
+            card_id,
+            room_name: room.name,
+            room_id: room.channel,
+        })
+    }
+
+    async fn ensure_work_card_unclaimed(&self, card_id: WorkCardId) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        let store = WorkEventStore::new(self.event_store());
+        let board = store.project_recent(Some(room.channel), 512).await?;
+        let Some(card) = board.card(card_id) else {
+            return Err(AircError::WorkCardNotInCurrentRoom {
+                card_id,
+                room_name: room.name,
+                room_id: room.channel,
+            });
+        };
+        if card.claim_id.is_none() {
+            return Ok(());
+        }
+
+        Err(AircError::WorkCardAlreadyClaimed {
+            card_id,
+            claim_id: card.claim_id,
+            owner: card.owner,
+        })
     }
 }
 
