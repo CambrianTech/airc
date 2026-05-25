@@ -179,7 +179,12 @@ impl WorkBoardProjection {
     fn apply_claim_released(&mut self, e: &ClaimReleased) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
         ensure_claim(card, e.claim_id)?;
-        card.state = CardState::Open;
+        card.state = match card.state {
+            CardState::Claimed | CardState::InProgress | CardState::Blocked => CardState::Open,
+            CardState::Open | CardState::Review | CardState::Merged | CardState::Closed => {
+                card.state
+            }
+        };
         card.owner = None;
         card.claim_id = None;
         card.claim_expires_at_ms = None;

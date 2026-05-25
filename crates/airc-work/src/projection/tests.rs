@@ -63,6 +63,52 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
 }
 
 #[test]
+fn releasing_claim_clears_owner_without_reopening_closed_card() {
+    let card_id = WorkCardId::from_u128(10);
+    let claim_id = ClaimId::from_u128(11);
+    let owner = peer(12);
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "close before release".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 100,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id,
+            owner,
+            ttl_ms: 100,
+            claimed_at_ms: 110,
+        }),
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id,
+            state: CardState::Closed,
+            changed_by: owner,
+            changed_at_ms: 120,
+        }),
+        WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id,
+            owner,
+            reason: Some("merged".to_string()),
+            released_at_ms: 130,
+        }),
+    ])
+    .unwrap();
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(card.state, CardState::Closed);
+    assert_eq!(card.owner, None);
+    assert_eq!(card.claim_id, None);
+}
+
+#[test]
 fn availability_projection_keeps_latest_peer_state_per_repo() {
     let repo = repo();
     let other_repo = RepoId::new("CambrianTech/continuum").unwrap();
