@@ -43,6 +43,7 @@ mod knock_cli;
 mod knock_commands;
 mod lane_cli;
 mod lane_commands;
+mod lease;
 mod legacy_envelope;
 mod legacy_identity;
 mod monitor;
@@ -572,9 +573,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 lane_id,
                 priority,
             } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
-            WorkAction::Claim { card_id, ttl_ms } => {
-                work_commands::run_claim(&home, card_id, ttl_ms).await
-            }
+            WorkAction::Claim {
+                card_id,
+                ttl_ms,
+                no_lease_required,
+            } => work_commands::run_claim(&home, card_id, ttl_ms, no_lease_required).await,
             WorkAction::Heartbeat {
                 card_id,
                 claim_id,

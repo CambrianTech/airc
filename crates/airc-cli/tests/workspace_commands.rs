@@ -27,7 +27,17 @@ fn workspace_request_allocate_heartbeat_release_projects_on_list() {
         ],
     );
     let card_id = extract_field(&card, "card_id:").expect("create prints card_id");
-    let claim = run_ok(&home, &["work", "claim", card_id, "--ttl-ms", "60000"]);
+    let claim = run_ok(
+        &home,
+        &[
+            "work",
+            "claim",
+            card_id,
+            "--ttl-ms",
+            "60000",
+            "--no-lease-required",
+        ],
+    );
     let claim_id = extract_field(&claim, "claim_id:").expect("claim prints claim_id");
 
     let request = run_ok(

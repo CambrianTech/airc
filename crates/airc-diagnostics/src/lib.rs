@@ -29,6 +29,7 @@ pub enum DiagnosticComponent {
     Subscriber,
     Transport,
     WebRtc,
+    Work,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,7 @@ pub enum DiagnosticCode {
     UnverifiableReplayFrameSkipped,
     ReplayFramesSkipped,
     WebRtcOfferAnswerFailed,
+    WorkspaceLeaseViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -173,6 +173,7 @@ fn component_header_value(component: DiagnosticComponent) -> &'static str {
         DiagnosticComponent::Subscriber => "subscriber",
         DiagnosticComponent::Transport => "transport",
         DiagnosticComponent::WebRtc => "webrtc",
+        DiagnosticComponent::Work => "work",
     }
 }
 
@@ -187,6 +188,7 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnverifiableReplayFrameSkipped => "unverifiable_replay_frame_skipped",
         DiagnosticCode::ReplayFramesSkipped => "replay_frames_skipped",
         DiagnosticCode::WebRtcOfferAnswerFailed => "webrtc_offer_answer_failed",
+        DiagnosticCode::WorkspaceLeaseViolation => "workspace_lease_violation",
     }
 }
 
@@ -211,6 +213,7 @@ mod tests {
             DiagnosticComponent::Subscriber,
             DiagnosticComponent::Transport,
             DiagnosticComponent::WebRtc,
+            DiagnosticComponent::Work,
         ] {
             let header = component_header_value(component);
             assert!(!header.is_empty(), "{component:?} should map to non-empty");
@@ -229,6 +232,7 @@ mod tests {
             DiagnosticCode::UnverifiableReplayFrameSkipped,
             DiagnosticCode::ReplayFramesSkipped,
             DiagnosticCode::WebRtcOfferAnswerFailed,
+            DiagnosticCode::WorkspaceLeaseViolation,
         ] {
             let header = code_header_value(code);
             assert!(!header.is_empty(), "{code:?} should map to non-empty");
