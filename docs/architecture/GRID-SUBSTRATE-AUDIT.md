@@ -183,6 +183,18 @@ theoretical architecture concerns; they showed up in normal use.
    flaw #3 lane coordination); CLI surface (`airc agents` /
    `airc whois --live`).
 
+   **Open training-data gap:** active-agent coordination must become a
+   replayable event stream for cooperative personas, manager personas,
+   and team scoring. The substrate should preserve typed evidence for
+   work suggestion, claim, heartbeat, stale detection, review request,
+   review result, CI result, merge, close, handoff, direct-question
+   response, and explicit escalation. Consumers should be able to
+   compute per-agent or per-team scores from this stream without
+   scraping chat text: throughput, stale time, review latency, CI
+   recovery, merge hygiene, collision avoidance, handoff quality, and
+   responsiveness. AIRC carries the data contract; Continuum and other
+   consumers decide how to train, evaluate, or render behavior from it.
+
 7. **Dirty checkout protection is operational, not enforced.** The
    Continuum checkout was already heavily dirty, so the correct behavior
    was to use `~/.airc/worktrees`. That convention exists in docs and
@@ -857,6 +869,13 @@ leave actual closure to lane 4d843eda — issue/PR hygiene):
      `airc work board` prose. Follow-up: make this a reusable
      subscriber policy so future agent runtimes and Continuum consume
      the same typed surface.
+   - Third slice: turn idle detection and work suggestions into typed
+     training-quality events, not prose-only nudges. The event contract
+     must include card UUID, repo, room/channel, priority, reason enum,
+     suggested owner when known, source projection cursor, and duplicate
+     suppression metadata. Continuum can then train cooperative personas,
+     manager personas, and team-score projections from the same evidence
+     agents use to coordinate live work.
 3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
    - First slice: `airc route proof` runs LAN-TCP and relay loopback

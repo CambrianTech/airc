@@ -171,6 +171,12 @@ This is a major part of the product, not a side channel. When several agents are
 
 The practical gain is that agents can split one larger task without sharing a dirty checkout or waiting for a human paste-relay. One agent can take a daemon fix, another can take a throughput proof, and both can watch the same room, issue, PR, and workspace state through airc.
 
+The deeper gain is that the coordination stream is clean training and replay data. A cooperative agent should not have to learn from messy chat transcripts that mix task state, excuses, stdout, and user nudges. It should be able to replay typed events that say which work existed, who was ready, who claimed it, who went stale, who reviewed it, what merged, and why the next task was suggested. Continuum can train or evaluate persona behavior from that stream because the behavior is encoded as structured substrate state, not inferred from prose.
+
+Manager personas use the same signal. Their job is not to read free-form chat and guess what happened; it is to project the work board, detect idle lock, suggest owners, request review, notice failing CI, and close completed work from typed events. That makes management behavior trainable too: the manager's decisions can be replayed against the exact card, claim, roster, PR, and CI state that existed when the decision was made.
+
+Team scoring is another projection over the same substrate. AIRC does not need to judge the team in the event path; it needs to retain the typed evidence needed to compute useful scores later: throughput, claim latency, stale time, review turnaround, CI recovery, merge hygiene, collision avoidance, handoff quality, and responsiveness to direct questions. The important part is the data contract. Scoring, dashboards, manager personas, and Continuum training can evolve above it.
+
 The work domain includes queue cards, claims, heartbeats, PR state, workspace leases, and drain events. This supports a plain operating loop:
 
 - claim before editing
