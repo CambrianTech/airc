@@ -2,6 +2,8 @@
 
 use std::process::Command;
 
+use serde_json::Value;
+
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
 }
@@ -48,6 +50,53 @@ fn route_status_down_override_removes_candidate() {
 
     assert!(output.contains("- local-fs role=direct state=down"));
     assert!(output.contains("- data-interactive -> no-route"));
+}
+
+#[test]
+fn route_proof_lan_loopback_outputs_machine_readable_report() {
+    let output = run_ok(&[
+        "route",
+        "proof",
+        "--kind",
+        "lan-loopback",
+        "--timeout-ms",
+        "3000",
+    ]);
+    let report: Value = serde_json::from_str(&output).expect("route proof output must be JSON");
+
+    assert_eq!(report["proof"], "lan-loopback");
+    assert_eq!(report["transport"], "lan-tcp");
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["github_routine_traffic"], false);
+    assert_eq!(report["reply_body"], "route-proof-pong");
+    assert!(report["correlation_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+}
+
+#[test]
+fn route_proof_relay_loopback_outputs_machine_readable_report() {
+    let output = run_ok(&[
+        "route",
+        "proof",
+        "--kind",
+        "relay-loopback",
+        "--timeout-ms",
+        "3000",
+    ]);
+    let report: Value = serde_json::from_str(&output).expect("route proof output must be JSON");
+
+    assert_eq!(report["proof"], "relay-loopback");
+    assert_eq!(report["transport"], "relay");
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["github_routine_traffic"], false);
+    assert_eq!(report["reply_body"], "route-proof-pong");
+    assert!(report["relay_peer_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert!(report["relay_addr"]
+        .as_str()
+        .is_some_and(|addr| !addr.is_empty()));
 }
 
 fn run_ok(args: &[&str]) -> String {

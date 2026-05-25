@@ -18,6 +18,7 @@ airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
 airc-protocol = { path = "../airc-protocol" }
+airc-relay = { path = "../airc-relay" }
 airc-transport = { path = "../airc-transport" }
 airc-trust = { path = "../airc-trust" }
 airc-daemon = { path = "../airc-daemon" }

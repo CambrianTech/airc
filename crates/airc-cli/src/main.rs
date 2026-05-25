@@ -58,6 +58,7 @@ mod queue_card_runtime;
 mod queue_card_staleness;
 mod route_cli;
 mod route_commands;
+mod route_proof_commands;
 mod runtime_context;
 mod transport_cli;
 mod transport_commands;
@@ -376,6 +377,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Route(args) => match args.action {
             RouteAction::Status(args) => route_commands::run_status(args),
+            RouteAction::Proof(args) => route_proof_commands::run(args).await,
         },
 
         Command::Transport(args) => match args.action {

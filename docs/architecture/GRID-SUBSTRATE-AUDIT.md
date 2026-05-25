@@ -752,8 +752,12 @@ through the command-bus over LAN-TCP without GitHub.
 **Cross-cutting substrate gaps still open**:
 
 - **Real-machine tailnet/relay proof.** Same-machine LAN/relay is
-  proven via the consumer-shapes fixture, but multi-host Tailnet
-  routing is still aspirational. Tracked as work card c877e142.
+  proven via the consumer-shapes fixture. The first route-proof
+  command surface now exists (`airc route proof --kind lan-loopback`
+  and `airc route proof --kind relay-loopback`) and emits structured
+  JSON with `github_routine_traffic=false`, giving CI/agents a stable
+  proof contract that does not parse prose. Multi-host Tailnet
+  execution remains the open field proof for card c877e142.
 - **AR pose-stream contract benchmark.** The WebRTC media stack
   (#955/#957/#960/#961/#962/#963) ships the full transport story.
   The 60-90Hz × sub-25ms p99 *contract benchmark* is partially
@@ -855,6 +859,11 @@ leave actual closure to lane 4d843eda — issue/PR hygiene):
      the same typed surface.
 3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
+   - First slice: `airc route proof` runs LAN-TCP and relay loopback
+     request/reply proofs from the public CLI and prints JSON only.
+     This gives agents/CI a stable command contract and keeps GitHub
+     out of routine traffic. Follow-up: run the same proof against a
+     second physical/Tailnet host and record the report.
 4. Add a consumer-throughput proof for Continuum-shaped live traffic:
    synthetic room producers at configurable Hz, subscribers in separate
    scopes first and separate Tailnet/LAN hosts next, with p50/p99

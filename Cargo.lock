@@ -68,6 +68,7 @@ dependencies = [
  "airc-ipc",
  "airc-lib",
  "airc-protocol",
+ "airc-relay",
  "airc-store",
  "airc-transport",
  "airc-trust",
