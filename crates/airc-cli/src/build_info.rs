@@ -19,3 +19,7 @@ pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn is_unknown() -> bool {
     COMMIT == "unknown"
 }
+
+pub fn is_unknown_or_matches(commit: Option<&str>) -> bool {
+    is_unknown() || commit == Some(COMMIT)
+}

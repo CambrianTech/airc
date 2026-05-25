@@ -35,4 +35,4 @@ pub mod state;
 pub mod trust_refresh;
 
 pub use server::{run, DaemonError};
-pub use state::DaemonState;
+pub use state::{DaemonRuntimeInfo, DaemonState};

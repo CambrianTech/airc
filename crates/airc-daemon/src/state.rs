@@ -65,6 +65,10 @@ pub struct DaemonState {
     pub live_tx: broadcast::Sender<airc_core::TranscriptEvent>,
     /// Notified when the daemon should stop accepting + exit cleanly.
     pub shutdown: Notify,
+    /// Runtime metadata reported through IPC status so clients can
+    /// replace stale daemons after updates without guessing from
+    /// process lists or socket names.
+    pub runtime: DaemonRuntimeInfo,
 }
 
 impl DaemonState {
@@ -80,6 +84,26 @@ impl DaemonState {
         home: PathBuf,
         event_store: Arc<dyn EventStore>,
     ) -> Self {
+        Self::new_with_runtime(
+            peer_id,
+            keypair,
+            registry,
+            policy,
+            home,
+            event_store,
+            DaemonRuntimeInfo::unknown(),
+        )
+    }
+
+    pub fn new_with_runtime(
+        peer_id: PeerId,
+        keypair: PeerKeypair,
+        registry: Arc<PeerKeyRegistry>,
+        policy: VerificationPolicy,
+        home: PathBuf,
+        event_store: Arc<dyn EventStore>,
+        runtime: DaemonRuntimeInfo,
+    ) -> Self {
         let (live_tx, _) = broadcast::channel(1024);
         Self {
             peer_id,
@@ -94,6 +118,7 @@ impl DaemonState {
             trusted_roots: Mutex::new(HashMap::new()),
             live_tx,
             shutdown: Notify::new(),
+            runtime,
         }
     }
 
@@ -186,5 +211,19 @@ impl DaemonState {
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DaemonRuntimeInfo {
+    pub ipc_protocol_version: Option<u32>,
+    pub build_commit: Option<String>,
+    pub build_branch: Option<String>,
+    pub executable: Option<String>,
+}
+
+impl DaemonRuntimeInfo {
+    pub fn unknown() -> Self {
+        Self::default()
     }
 }

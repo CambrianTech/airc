@@ -23,6 +23,7 @@ use crate::request::{
 use crate::response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBSCRIBE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
@@ -155,7 +156,14 @@ impl DaemonClient {
     }
 
     pub async fn status(&self) -> Result<StatusResponse, ClientError> {
-        match self.call(Request::Status).await? {
+        self.status_with_timeout(DEFAULT_RPC_TIMEOUT).await
+    }
+
+    pub async fn status_with_timeout(
+        &self,
+        deadline: Duration,
+    ) -> Result<StatusResponse, ClientError> {
+        match self.call_with_timeout(Request::Status, deadline).await? {
             Response::Status(status) => Ok(status),
             other @ (Response::Pong
             | Response::Inbox(_)
@@ -194,7 +202,19 @@ impl DaemonClient {
     }
 
     pub async fn subscribe(&self, request: SubscribeRequest) -> Result<(), ClientError> {
-        match self.call(Request::Subscribe(request)).await? {
+        self.subscribe_with_timeout(request, SUBSCRIBE_RPC_TIMEOUT)
+            .await
+    }
+
+    pub async fn subscribe_with_timeout(
+        &self,
+        request: SubscribeRequest,
+        deadline: Duration,
+    ) -> Result<(), ClientError> {
+        match self
+            .call_with_timeout(Request::Subscribe(request), deadline)
+            .await?
+        {
             Response::Ok => Ok(()),
             other @ (Response::Pong
             | Response::Status(_)
