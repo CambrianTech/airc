@@ -25,13 +25,13 @@ pub mod transport;
 /// that an already-running daemon cannot parse. The default CLI socket
 /// includes this value so `airc join` starts a current daemon instead of
 /// connecting to a stale daemon that speaks the previous protocol.
-pub const IPC_PROTOCOL_VERSION: u16 = 2;
+pub const IPC_PROTOCOL_VERSION: u16 = 3;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{
-    AddPeerRequest, AttachRequest, InboxRequest, RemovePeerRequest, Request, SendRequest,
-    SubscribeRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
+    SendRequest, SubscribeRequest,
 };
-pub use response::{InboxResponse, PeersResponse, Response, StatusResponse};
+pub use response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 // IpcListener / IpcStream stay under `transport` because only the
 // daemon host and low-level tests need the raw byte transport.

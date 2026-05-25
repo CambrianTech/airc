@@ -17,10 +17,10 @@ use crate::codec::{read_frame, write_frame};
 use crate::transport::IpcStream;
 
 use crate::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, RemovePeerRequest, Request, SendRequest,
-    SubscribeRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
+    SendRequest, SubscribeRequest,
 };
-use crate::response::{InboxResponse, PeersResponse, Response, StatusResponse};
+use crate::response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -131,6 +131,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok) => Ok(other),
         }
@@ -146,6 +147,7 @@ impl DaemonClient {
             other @ (Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -158,6 +160,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -171,7 +174,21 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    pub async fn publish(&self, request: PublishRequest) -> Result<PublishResponse, ClientError> {
+        match self.call(Request::Publish(request)).await? {
+            Response::Publish(response) => Ok(response),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Event { .. }
+            | Response::Peers(_)
+            | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -183,6 +200,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -194,6 +212,7 @@ impl DaemonClient {
             other @ (Response::Pong
             | Response::Status(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -207,6 +226,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -219,6 +239,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -231,6 +252,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
@@ -246,6 +268,7 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }

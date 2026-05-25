@@ -52,6 +52,7 @@ pub mod lifecycle;
 pub mod mesh_identity;
 mod messaging;
 mod peers;
+pub mod publish;
 pub mod registry;
 mod relay;
 pub mod room;
@@ -110,6 +111,7 @@ pub use mesh_identity::{
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
 pub use peers::EnrolledPeer;
+pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
 pub use route::{
