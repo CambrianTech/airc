@@ -783,6 +783,53 @@ Existing cards already covering parts of the gap:
 - `c877e142` — real-machine tailnet/relay proof.
 - `399cef36` — Continuum throughput proof (P0).
 
+### Roadmap-to-Card Coverage Audit — 2026-05-24
+
+Audit work card b5cb761c. Cross-walked every entry in this document
+against the current work board projection. Findings:
+
+**Immediate PR Queue → cards** (all covered):
+
+| Queue # | Card | Status |
+|---|---|---|
+| 1. PR source adapter | `fdf98f86` | shipped via #947 / #950 — stale Open |
+| 2. Work subscription API | `e1f8e2e0` | shipped via #974 / #975 / #976 — closed |
+| 3. Real-machine tailnet/relay proof | `c877e142` | claimable |
+| 4. Consumer-throughput proof | `399cef36` | partial (#954 local); tailnet still open |
+| 5. Bind to Continuum/OpenClaw/Hermes | `d61d7853` | Continuum lane formalized (e9ca8a09 audit); OpenClaw/Hermes blocked on repos in workspace |
+| 6. UDP + WebRTC route execution | (no single card — shipped) | covered by #955/#957/#960/#961/#962/#963 |
+
+**Observed Flaws #1-#8 → cards**:
+
+| Flaw | Card(s) | Status |
+|---|---|---|
+| #1 skill/CLI drift | `38c295b8` | drift-detection shipped (#972) — stale Open |
+| #2 weak roster UX | none | **missing card** — new card created below |
+| #3 prose lane claims | `e1f8e2e0` | shipped — closed |
+| #4 lifecycle inbox noise | `a02ed96a` (Ephemeral event kind) | claimable; partial overlap |
+| #5 scope identity confusion | none | **missing card** — new card created below |
+| #6 active-agent heartbeat | `cdcac2ee` | shipped via #969/#971 — stale Open |
+| #7 unenforced worktree leases | `ac3f1b36` (adjacent) | not direct; new card created below |
+| #8 stdout/stderr diagnostic | `49ba8abf`, `524c7727` | both shipped — stale Open |
+
+**Stale-Open cards** (work shipped but state still Open in projection;
+leave actual closure to lane 4d843eda — issue/PR hygiene):
+- `fdf98f86` PR source adapter — covered by #947 / #950
+- `38c295b8` installed runtime convergence — covered by #972
+- `cdcac2ee` make idle agents visible — covered by #969 / #971 / #975 / #976
+- `c96b8abf` typed agent availability — covered by #971
+- `49ba8abf` typed diagnostic sink — covered by #973
+- `524c7727` diagnostic sink follow-up — covered by #978
+- `0fe802ed` WebRTC media proof — covered by #961 / #962 / #963
+
+**Missing cards created from this audit**:
+- `400b5c3c` (P1) — Roster UX renderer over typed liveness +
+  availability + claim state (flaw #2).
+- `c29506b8` (P2) — Scope identity UX: same agent appearing under
+  different peer_ids across project scopes (flaw #5).
+- `7cdffa82` (P1) — Enforce lane work happens inside
+  `~/.airc/worktrees/` leases (flaw #7).
+
 ## Immediate PR Queue
 
 1. Add a real PR source adapter that feeds the landed
