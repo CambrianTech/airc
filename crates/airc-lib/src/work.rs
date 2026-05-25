@@ -17,7 +17,7 @@ use airc_work_store::WorkEventStore;
 use crate::time::now_ms;
 use crate::{Airc, AircError};
 
-const WORK_MUTATION_LOOKBACK_LIMIT: usize = 4_096;
+const WORK_MUTATION_PAGE_SIZE: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkCard {
@@ -663,7 +663,7 @@ impl Airc {
         self.ensure_room_subscriber(&room).await?;
         let store = WorkEventStore::new(self.event_store());
         let board = store
-            .project_recent(Some(room.channel), WORK_MUTATION_LOOKBACK_LIMIT)
+            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
             .await?;
         if board.card(card_id).is_some() {
             return Ok(());
@@ -680,7 +680,7 @@ impl Airc {
         let room = self.current_room().await?;
         let store = WorkEventStore::new(self.event_store());
         let board = store
-            .project_recent(Some(room.channel), WORK_MUTATION_LOOKBACK_LIMIT)
+            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
             .await?;
         let Some(card) = board.card(card_id) else {
             return Err(AircError::WorkCardNotInCurrentRoom {
