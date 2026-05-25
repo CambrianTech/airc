@@ -24,6 +24,9 @@ pub enum EventsAction {
         /// Recent events to scan before filtering.
         #[arg(long, default_value_t = 128)]
         limit: usize,
+        /// Emit a machine-readable JSON object instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 

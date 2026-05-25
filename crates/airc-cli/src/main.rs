@@ -402,7 +402,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 header,
                 header_prefix,
                 limit,
-            } => events_commands::run_list(&home, kind, header, header_prefix, limit).await,
+                json,
+            } => events_commands::run_list(&home, kind, header, header_prefix, limit, json).await,
         },
 
         Command::Gist(args) => match args.action {
