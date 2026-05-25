@@ -569,6 +569,46 @@ async fn claimable_work_can_surface_stale_claims_for_recovery() {
 }
 
 #[tokio::test]
+async fn stale_claim_can_be_reclaimed_by_new_claim() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("stale-claim-reclaim-api").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "reclaim abandoned work".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    let expired_claim = airc
+        .claim_work_card(ClaimWorkCard { card_id, ttl_ms: 1 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let new_claim = airc
+        .claim_work_card(ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+    assert_ne!(expired_claim, new_claim);
+
+    let board = airc.work_board_complete(128).await.unwrap();
+    let card = board.card(card_id).unwrap();
+    assert_eq!(card.claim_id, Some(new_claim));
+    assert_eq!(card.owner, Some(airc.peer_id()));
+    assert!(card
+        .claim_expires_at_ms
+        .is_some_and(|expires_at_ms| expires_at_ms > 1));
+}
+
+#[tokio::test]
 async fn work_roster_status_combines_liveness_availability_and_claims() {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();

@@ -618,7 +618,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkAction::Next {
                 repo,
                 max_priority,
-                include_stale,
+                exclude_stale,
                 limit,
                 event_limit,
             } => {
@@ -626,7 +626,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &home,
                     repo,
                     max_priority,
-                    include_stale,
+                    !exclude_stale,
                     limit,
                     event_limit,
                 )
@@ -640,7 +640,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkAction::Manage {
                 repo,
                 max_priority,
-                include_stale,
+                exclude_stale,
                 limit,
                 event_limit,
                 active_within_ms,
@@ -649,7 +649,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &home,
                     repo,
                     max_priority,
-                    include_stale,
+                    !exclude_stale,
                     limit,
                     event_limit,
                     active_within_ms,

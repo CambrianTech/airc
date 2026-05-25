@@ -204,6 +204,49 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
 }
 
 #[test]
+fn expired_claim_can_be_superseded_by_new_claim() {
+    let card_id = WorkCardId::from_u128(21);
+    let expired_claim = ClaimId::from_u128(22);
+    let new_claim = ClaimId::from_u128(23);
+    let expired_owner = peer(24);
+    let new_owner = peer(25);
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "recover abandoned claim".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: expired_owner,
+            created_at_ms: 100,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: expired_claim,
+            owner: expired_owner,
+            ttl_ms: 100,
+            claimed_at_ms: 110,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: new_claim,
+            owner: new_owner,
+            ttl_ms: 100,
+            claimed_at_ms: 210,
+        }),
+    ])
+    .unwrap();
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(card.owner, Some(new_owner));
+    assert_eq!(card.claim_id, Some(new_claim));
+    assert_eq!(card.claim_expires_at_ms, Some(310));
+    assert!(projection.stale_claims(309).is_empty());
+}
+
+#[test]
 fn availability_projection_keeps_latest_peer_state_per_repo() {
     let repo = repo();
     let other_repo = RepoId::new("CambrianTech/continuum").unwrap();
