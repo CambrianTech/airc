@@ -20,6 +20,7 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
+mod context_commands;
 mod daemon_scope;
 mod doctor;
 mod envelope_cli;
@@ -353,6 +354,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             headers,
             kind,
         } => publish_commands::run_publish(&home, room, body_text, body_json, headers, kind).await,
+
+        Command::Context {
+            max_items,
+            max_age_ms,
+        } => context_commands::run_context(&home, max_items, max_age_ms).await,
 
         Command::Inbox {
             socket,

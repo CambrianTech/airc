@@ -56,6 +56,7 @@ pub mod publish;
 pub mod registry;
 mod relay;
 pub mod room;
+pub mod room_context;
 pub mod route;
 mod stream;
 pub mod subscriptions;
@@ -115,6 +116,10 @@ pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
+pub use room_context::{
+    CardSummary, ClaimSummary, ContextBudget, ContextItem, ContextSlice, ContextTotals,
+    EventSummary,
+};
 pub use route::{
     ImportedInvite, InviteBeacon, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint,
     RoutePolicy, TransportCandidate, TransportHealthSample, TransportHealthState,

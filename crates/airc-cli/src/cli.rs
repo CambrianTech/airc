@@ -268,6 +268,22 @@ pub enum Command {
         kind: PublishFrameKind,
     },
 
+    /// Emit a budgeted JSON slice of the current room's evidence
+    /// (recent events, work cards, active claims) for manager
+    /// loops, hooks injecting context at prompt boundaries, and
+    /// RAG-style consumers. Deterministic ordering; ContextTotals
+    /// reports what was seen vs kept so consumers can detect
+    /// truncation.
+    Context {
+        /// Maximum total items across all evidence types.
+        #[arg(long, default_value_t = 64)]
+        max_items: usize,
+        /// Optional age cap in milliseconds; drop evidence older
+        /// than this.
+        #[arg(long)]
+        max_age_ms: Option<u64>,
+    },
+
     /// Pull buffered frames from the daemon's inbox for the current
     /// room's wire.
     Inbox {
