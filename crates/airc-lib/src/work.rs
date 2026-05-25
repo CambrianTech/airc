@@ -126,7 +126,7 @@ impl Default for ClaimableWorkQuery {
         Self {
             repo: None,
             max_priority: Priority::P1,
-            include_stale_claims: false,
+            include_stale_claims: true,
             event_limit: 512,
             limit: 8,
         }
@@ -159,7 +159,7 @@ impl Default for WorkQueueStatusQuery {
         Self {
             repo: None,
             max_priority: Priority::P1,
-            include_stale_claims: false,
+            include_stale_claims: true,
             event_limit: 512,
             limit: 8,
         }
@@ -705,7 +705,12 @@ impl Airc {
                 room_id: room.channel,
             });
         };
-        if card.claim_id.is_none() {
+        let now_ms = now_ms()?;
+        if card.claim_id.is_none()
+            || card
+                .claim_expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+        {
             return Ok(());
         }
 

@@ -158,7 +158,10 @@ impl WorkBoardProjection {
 
     fn apply_card_claimed(&mut self, e: &WorkCardClaimed) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
-        if card.claim_id.is_some() {
+        if card
+            .claim_expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms > e.claimed_at_ms)
+        {
             return Ok(());
         }
         card.state = CardState::Claimed;

@@ -154,6 +154,8 @@ fn work_board_surfaces_stale_claims() {
             "CambrianTech/airc",
             "--title",
             "do not let abandoned claims idle-lock a lane",
+            "--priority",
+            "p1",
         ],
     );
     let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
@@ -176,6 +178,18 @@ fn work_board_surfaces_stale_claims() {
     assert!(stale_board.contains("stale claims: 1"), "{stale_board}");
     assert!(stale_board.contains(card_id), "{stale_board}");
     assert!(stale_board.contains(claim_id), "{stale_board}");
+
+    let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(next.contains("claimable work: 1"), "{next}");
+    assert!(next.contains("stale_claim="), "{next}");
+    assert!(next.contains(card_id), "{next}");
+
+    let hidden = run_ok(
+        &home,
+        &["work", "next", "--exclude-stale", "--event-limit", "128"],
+    );
+    assert!(hidden.contains("(no claimable work)"), "{hidden}");
+    assert!(!hidden.contains(card_id), "{hidden}");
 }
 
 #[test]

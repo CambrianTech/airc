@@ -113,9 +113,9 @@ pub enum WorkAction {
         /// Highest priority to include.
         #[arg(long, value_enum, default_value = "p1")]
         max_priority: CliPriority,
-        /// Include expired claims as recoverable work.
+        /// Hide expired claims. Normal scheduling treats them as recoverable work.
         #[arg(long)]
-        include_stale: bool,
+        exclude_stale: bool,
         /// Maximum suggestions to print.
         #[arg(long, default_value_t = 8)]
         limit: usize,
@@ -143,9 +143,9 @@ pub enum WorkAction {
         /// Highest priority to include.
         #[arg(long, value_enum, default_value = "p1")]
         max_priority: CliPriority,
-        /// Include expired claims as recoverable work.
+        /// Hide expired claims. Normal scheduling treats them as recoverable work.
         #[arg(long)]
-        include_stale: bool,
+        exclude_stale: bool,
         /// Maximum work suggestions to evaluate.
         #[arg(long, default_value_t = 8)]
         limit: usize,
