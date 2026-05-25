@@ -757,8 +757,10 @@ through the command-bus over LAN-TCP without GitHub.
 - **AR pose-stream contract benchmark.** The WebRTC media stack
   (#955/#957/#960/#961/#962/#963) ships the full transport story.
   The 60-90Hz × sub-25ms p99 *contract benchmark* is partially
-  proven via #954's local consumer-throughput fixture; the
-  tailnet/multi-machine version is still open. Tracked as work
+  proven via #954's local consumer-throughput fixture; the follow-up
+  local fan-out fixture drives a 90Hz Continuum-shaped pose stream to
+  three independent subscribers with zero-drop and p99 assertions.
+  The tailnet/multi-machine version is still open. Tracked as work
   card 399cef36 (Continuum throughput proof, P0).
 - **Personas-as-rooms mapping.** Audit text mentions personas
   living in rooms; consumer_shapes::continuum.rs models
@@ -795,7 +797,7 @@ against the current work board projection. Findings:
 | 1. PR source adapter | `fdf98f86` | shipped via #947 / #950 — stale Open |
 | 2. Work subscription API | `e1f8e2e0` | shipped via #974 / #975 / #976 — closed |
 | 3. Real-machine tailnet/relay proof | `c877e142` | claimable |
-| 4. Consumer-throughput proof | `399cef36` | partial (#954 local); tailnet still open |
+| 4. Consumer-throughput proof | `399cef36` | local 60Hz + 90Hz fan-out proof; tailnet still open |
 | 5. Bind to Continuum/OpenClaw/Hermes | `d61d7853` | Continuum lane formalized (e9ca8a09 audit); OpenClaw/Hermes blocked on repos in workspace |
 | 6. UDP + WebRTC route execution | (no single card — shipped) | covered by #955/#957/#960/#961/#962/#963 |
 
