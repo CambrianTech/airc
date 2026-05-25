@@ -3,8 +3,15 @@
 use std::path::Path;
 
 use airc_lib::{Airc, Body, EventFilter, HeaderFilter, TranscriptEvent, TranscriptKind};
+use serde::Serialize;
 
 use crate::events_cli::CliTranscriptKind;
+
+#[derive(Debug, Serialize)]
+struct EventsListJson<'a> {
+    count: usize,
+    events: &'a [TranscriptEvent],
+}
 
 pub async fn run_list(
     home: &Path,
@@ -12,6 +19,7 @@ pub async fn run_list(
     exact_headers: Vec<String>,
     prefix_headers: Vec<String>,
     limit: usize,
+    as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     let filter = EventFilter {
@@ -20,7 +28,22 @@ pub async fn run_list(
         ..EventFilter::default()
     };
     let events = airc.page_recent_subscribed_filtered(filter, limit).await?;
-    print_events(&events);
+    if as_json {
+        print_events_json(&events)?;
+    } else {
+        print_events(&events);
+    }
+    Ok(())
+}
+
+fn print_events_json(events: &[TranscriptEvent]) -> Result<(), serde_json::Error> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&EventsListJson {
+            count: events.len(),
+            events,
+        })?
+    );
     Ok(())
 }
 
