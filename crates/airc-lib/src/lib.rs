@@ -41,6 +41,7 @@ mod broadcast_deduper;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;
+pub mod diagnostic_event_sink;
 pub mod error;
 pub mod gh_account_registry;
 pub mod join_context;
@@ -86,6 +87,9 @@ pub use coordinator::{
     CoordinatorError, CoordinatorSnapshot, PresenceBeacon, RefreshLockOutcome,
     DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
+};
+pub use diagnostic_event_sink::{
+    AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
 pub use error::AircError;
 pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};

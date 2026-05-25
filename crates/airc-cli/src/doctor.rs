@@ -107,6 +107,7 @@ pub async fn run(home: &Path, fix: bool, health: bool) -> Result<(), Box<dyn std
     findings.extend(check_identity(home).await);
     findings.extend(check_daemon(home).await);
     findings.extend(check_binary_freshness());
+    findings.extend(check_recent_diagnostics(home).await);
 
     if health {
         findings.extend(check_health(home).await);
@@ -322,6 +323,76 @@ fn source_tree_head() -> Option<String> {
         None
     } else {
         Some(value)
+    }
+}
+
+/// Recent diagnostic visibility check. Pulls the last N transcript
+/// events, decodes typed `DiagnosticEvent`s emitted via the AIRC
+/// event sink, and surfaces error/warn counts so operators see
+/// substrate trouble without inspecting the wire by hand.
+async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
+    use airc_diagnostics::DiagnosticSeverity;
+    use airc_lib::Airc;
+
+    let airc = match Airc::open(home).await {
+        Ok(airc) => airc,
+        Err(_) => {
+            return vec![Finding::info(
+                "diagnostics",
+                "airc handle unavailable; skipping recent-diagnostic scan",
+            )];
+        }
+    };
+
+    let recent = match airc.recent_diagnostic_events(256).await {
+        Ok(recent) => recent,
+        Err(_) => {
+            return vec![Finding::info(
+                "diagnostics",
+                "couldn't read recent diagnostics from transcript",
+            )];
+        }
+    };
+
+    if recent.is_empty() {
+        return vec![Finding::ok(
+            "diagnostics",
+            "no recent diagnostic events on the wire",
+        )];
+    }
+
+    let mut errors = 0usize;
+    let mut warns = 0usize;
+    for diag in &recent {
+        match diag.severity {
+            DiagnosticSeverity::Error => errors += 1,
+            DiagnosticSeverity::Warn => warns += 1,
+            DiagnosticSeverity::Info | DiagnosticSeverity::Debug => {}
+        }
+    }
+
+    if errors > 0 {
+        vec![Finding::warn(
+            "diagnostics",
+            format!(
+                "{errors} error / {warns} warn diagnostic(s) in last {} events",
+                recent.len()
+            ),
+            "review with `airc events list --header-prefix airc.diag.severity=`",
+        )]
+    } else if warns > 0 {
+        vec![Finding::info(
+            "diagnostics",
+            format!(
+                "{warns} warn diagnostic(s) in last {} events; no errors",
+                recent.len()
+            ),
+        )]
+    } else {
+        vec![Finding::ok(
+            "diagnostics",
+            format!("{} diagnostic event(s); none at warn/error", recent.len()),
+        )]
     }
 }
 

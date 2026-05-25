@@ -63,6 +63,7 @@ version = "0.1.0"
 dependencies = [
  "airc-core",
  "airc-daemon",
+ "airc-diagnostics",
  "airc-identity",
  "airc-ipc",
  "airc-lib",
