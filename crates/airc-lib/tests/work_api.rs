@@ -209,6 +209,46 @@ async fn work_card_transitions_refuse_cards_from_another_room() {
 }
 
 #[tokio::test]
+async fn work_card_mutations_find_cards_beyond_small_recent_window() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-mutation-lookback").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "old but active work".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    wait_for_card(&airc, card_id).await;
+
+    for idx in 0..600 {
+        airc.say(&format!("non-work coordination message {idx}"))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        airc.work_board(512).await.unwrap().card(card_id).is_none(),
+        "the small recent window reproduces the production failure"
+    );
+
+    airc.change_work_card_state(ChangeWorkCardState {
+        card_id,
+        state: CardState::Closed,
+    })
+    .await
+    .unwrap();
+
+    let board = airc.work_board(1_024).await.unwrap();
+    assert_eq!(board.card(card_id).unwrap().state, CardState::Closed);
+}
+
+#[tokio::test]
 async fn duplicate_work_card_claims_fail_before_poisoning_projection() {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();

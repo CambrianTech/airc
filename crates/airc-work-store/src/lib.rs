@@ -8,7 +8,7 @@
 
 #![deny(unsafe_code)]
 
-use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
+use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::{EventStore, StoreError};
 use airc_work::{
     decode_transcript_work_event, transcript_is_work_event, ProjectionError, WorkBoardProjection,
@@ -79,6 +79,35 @@ where
     ) -> Result<WorkBoardProjection, WorkStoreError> {
         let page = self.resume_from(cursor, channel, limit).await?;
         Ok(WorkBoardProjection::replay(page.events)?)
+    }
+
+    pub async fn project_complete(
+        &self,
+        channel: Option<RoomId>,
+        page_size: usize,
+    ) -> Result<WorkBoardProjection, WorkStoreError> {
+        let page_size = page_size.max(1);
+        let mut cursor = TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        };
+        let mut events = Vec::new();
+
+        loop {
+            let transcripts = self.store.resume_from(&cursor, channel, page_size).await?;
+            let transcript_count = transcripts.len();
+            let Some(newest_cursor) = transcripts.last().map(TranscriptEvent::cursor) else {
+                break;
+            };
+            let page = decode_page(transcripts)?;
+            events.extend(page.events);
+            cursor = newest_cursor;
+            if transcript_count < page_size {
+                break;
+            }
+        }
+
+        Ok(WorkBoardProjection::replay(events)?)
     }
 }
 

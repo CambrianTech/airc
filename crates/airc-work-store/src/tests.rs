@@ -154,6 +154,41 @@ async fn project_recent_skips_events_whose_anchor_is_outside_window() {
 }
 
 #[tokio::test]
+async fn project_complete_pages_from_start_without_recent_window_loss() {
+    let store = InMemoryEventStore::new();
+    let room = RoomId::from_u128(10);
+    let old_card = WorkCardId::from_u128(20);
+
+    store
+        .append(work_transcript(1, room, 1, &card_created(old_card)))
+        .await
+        .unwrap();
+    for idx in 0..8 {
+        store
+            .append(chat_transcript(100 + idx, room, 2 + idx as u64))
+            .await
+            .unwrap();
+    }
+    store
+        .append(work_transcript(2, room, 20, &card_state_changed(old_card)))
+        .await
+        .unwrap();
+
+    let recent = WorkEventStore::new(&store)
+        .project_recent(Some(room), 4)
+        .await
+        .unwrap();
+    assert!(recent.card(old_card).is_none());
+
+    let complete = WorkEventStore::new(&store)
+        .project_complete(Some(room), 3)
+        .await
+        .unwrap();
+    let card = complete.card(old_card).unwrap();
+    assert_eq!(card.state, CardState::Review);
+}
+
+#[tokio::test]
 async fn resume_from_uses_store_cursor_contract() {
     let store = InMemoryEventStore::new();
     let room = RoomId::from_u128(10);
