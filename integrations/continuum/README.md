@@ -2,6 +2,13 @@
 
 Continuum is the capability host in the airc grid model — it owns LLMs, LoRA collections, paging strategy, and persona state. Continuum personas run as airc peers. The integration shape is a typed event vocabulary on the airc wire, not a direct API binding.
 
+The implementation direction is Rust-first. Continuum should use AIRC
+as its chat/event/work substrate and keep runtime-critical state in
+Rust-backed services and typed AIRC projections. TypeScript should
+shrink toward generated bindings, thin UI presentation, and browser
+integration instead of owning duplicate chat buses, event replay,
+room membership, or distributed inference coordination.
+
 <img src="https://raw.githubusercontent.com/CambrianTech/continuum/main/docs/images/live-session-avatars.png" alt="Continuum live room with one human and AI personas represented as avatars in a shared video conversation" width="100%"/>
 
 In a live room, Continuum can use AIRC channels for room presence,
