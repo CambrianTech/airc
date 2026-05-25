@@ -189,6 +189,71 @@ fn join_without_args_uses_default_account_context() {
 }
 
 #[test]
+fn join_streaming_agent_publishes_roster_heartbeat() {
+    let machine = TempDir::new().expect("tempdir");
+    let repo = machine.path().join("continuum");
+    let home = repo.join(".airc");
+    create_repo_with_origin(&repo, "https://github.com/CambrianTech/continuum.git");
+    seed_mesh_identity(&home, "joelteply");
+
+    let mut join = Command::new(airc_core());
+    join.env("HOME", machine.path())
+        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+        .env("AI_AGENT", "1")
+        .env("AIRC_CLIENT_ID", "agent:e2e-roster")
+        .args(["--home", home.to_str().unwrap(), "join"])
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    strip_cargo_harness_env(&mut join);
+    let stdout = run_join_until_attached(join, JOIN_ATTACH_TIMEOUT).join("\n");
+    assert!(stdout.contains("attached"), "{stdout}");
+
+    let mut roster_command = Command::new(airc_core());
+    roster_command.env("HOME", machine.path()).args([
+        "--home",
+        home.to_str().unwrap(),
+        "work",
+        "roster",
+        "--event-limit",
+        "128",
+    ]);
+    let roster = output_with_timeout(roster_command, Duration::from_secs(10), "airc work roster");
+    assert!(
+        roster.status.success(),
+        "roster failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&roster.stdout),
+        String::from_utf8_lossy(&roster.stderr),
+    );
+    let roster_stdout = String::from_utf8_lossy(&roster.stdout);
+    assert!(
+        roster_stdout.contains("work roster: 1 agent(s)"),
+        "{roster_stdout}"
+    );
+    assert!(roster_stdout.contains("runtime=agent"), "{roster_stdout}");
+    assert!(
+        roster_stdout.contains("client=agent:e2e-roster"),
+        "{roster_stdout}"
+    );
+    assert!(
+        roster_stdout.contains(repo.to_str().unwrap()),
+        "{roster_stdout}"
+    );
+
+    let mut stop_command = Command::new(airc_core());
+    stop_command
+        .env("HOME", machine.path())
+        .args(["--home", home.to_str().unwrap(), "stop"]);
+    let stop = output_with_timeout(stop_command, Duration::from_secs(10), "airc stop");
+    assert!(
+        stop.status.success(),
+        "stop failed after roster heartbeat proof: stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
 fn join_sets_up_codex_hook_when_codex_home_exists() {
     let machine = TempDir::new().expect("tempdir");
     let repo = machine.path().join("continuum");

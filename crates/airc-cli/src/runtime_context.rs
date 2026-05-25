@@ -43,6 +43,32 @@ impl RuntimeContext {
     pub fn should_stream_join(&self) -> bool {
         matches!(self, Self::InteractiveTerminal | Self::Agent { .. })
     }
+
+    pub fn runtime_label(&self) -> &'static str {
+        match self {
+            Self::InteractiveTerminal => "interactive",
+            Self::Agent { kind, .. } => kind.label(),
+            Self::Automation => "automation",
+            Self::TestHarness => "test",
+        }
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent { client_id, .. } => client_id.as_deref(),
+            Self::InteractiveTerminal | Self::Automation | Self::TestHarness => None,
+        }
+    }
+}
+
+impl AgentRuntimeKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Generic => "agent",
+        }
+    }
 }
 
 fn classify<I, K, V>(env: I, stdout_is_tty: bool, runtime_client: Option<String>) -> RuntimeContext

@@ -26,7 +26,7 @@ use airc_identity::LocalIdentity;
 use airc_ipc::{
     AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
 };
-use airc_lib::{Airc, Body, Headers, PeerSpec};
+use airc_lib::{Airc, Body, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_trust as peers_store;
 
@@ -95,6 +95,7 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// With a room, join that arbitrary channel and make it default.
 pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
+    let runtime_context = crate::runtime_context::RuntimeContext::current();
     match room {
         Some(room) => {
             let joined = airc.join(&room).await?;
@@ -121,10 +122,43 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     subscribe_daemon_to_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
-    if crate::runtime_context::RuntimeContext::current().should_stream_join() {
+    let _heartbeat = if runtime_context.should_stream_join() {
+        Some(start_join_heartbeat(&airc, home, &runtime_context).await?)
+    } else {
+        None
+    };
+
+    if runtime_context.should_stream_join() {
         crate::join_feed::run(&airc).await?;
     }
     Ok(())
+}
+
+async fn start_join_heartbeat(
+    airc: &Airc,
+    home: &Path,
+    runtime_context: &crate::runtime_context::RuntimeContext,
+) -> Result<HeartbeatTask, Box<dyn std::error::Error>> {
+    let scope = join_scope_label(home);
+    let runtime = runtime_context.runtime_label().to_string();
+    let client_id = runtime_context.client_id().map(ToString::to_string);
+    let build = (!crate::build_info::is_unknown()).then(|| crate::build_info::COMMIT_SHORT.into());
+    Ok(airc
+        .start_agent_heartbeat_with_metadata(
+            runtime,
+            client_id,
+            Some(scope),
+            build,
+            DEFAULT_HEARTBEAT_INTERVAL,
+        )
+        .await?)
+}
+
+fn join_scope_label(home: &Path) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.display().to_string(),
+        Err(_) => home.display().to_string(),
+    }
 }
 
 fn ensure_runtime_integrations() {
