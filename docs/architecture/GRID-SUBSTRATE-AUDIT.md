@@ -696,6 +696,93 @@ context.
   Remaining broader proof: tailnet/relay across real machines before
   promoting the rewrite beyond local/LAN/relay confidence.
 
+### Consumer Integration Gap Audit — 2026-05-24
+
+Audit work card e9ca8a09. Compared Phase 5 consumer proofs against
+the actual `consumer_shapes` example crate (`crates/examples/
+consumer_shapes/`) and downstream consumer state. Findings:
+
+**Substrate-side contracts already shipped** (in `consumer_shapes`):
+
+- **Continuum** (`continuum.rs`) — `PersonaEvent::{TurnRequested,
+  TurnEmitted, ActivityStarted, ActivityEnded}`. Headers
+  `forge.persona.kind` / `forge.persona.id`. Body hint
+  `forge.persona.event.v1`.
+- **OpenClaw** (`openclaw.rs`) — `OpenClawEvent::{ChatMessagePosted,
+  ThreadCreated}`. Headers `forge.openclaw.kind`.
+- **Hermes** (`hermes.rs`) — `HermesEvent::{AgentCommandIssued,
+  AgentResultReturned}` with `command_id` correlation. Headers
+  `forge.hermes.kind`.
+
+The `consumer-shapes` fixture also proves these payloads round-trip
+through the command-bus over LAN-TCP without GitHub.
+
+**Substrate-side intentional non-coverage**:
+
+- **opencode / Codex / Claude** (agent-inbound subscription shape).
+  `consumer_shapes::lib.rs` explicitly defers: *"opencode/Codex/
+  Claude (the agent-INBOUND subscription shape) is deliberately
+  omitted from this slice — Codex's PR-I2 dogfood lane covers that
+  surface."* Not a gap; tracked elsewhere.
+
+**Open consumer-side adoption gaps** (live work, not substrate gaps):
+
+1. **Continuum TS-layer migration to AIRC types.** Continuum's
+   Rust-native AIRC integration is already shipped in
+   `continuum/src/workers/continuum-core/src/airc/` (client,
+   process, realtime, realtime_store, types — including
+   `AircRealtimeEnvelope` / `AircMediaControlEvent` /
+   `AircPresenceEvent` / `AircSubscriptionEvent` etc.). The
+   TS-generated bindings at `continuum/src/shared/generated/airc/`
+   exist but are NOT yet imported by the TS layer. Concrete
+   migration order: chat (`services/chat/` → AIRC rooms + typed
+   events) → events (`system/events/` → AIRC subscriber) →
+   room-membership (`daemons/room-membership-daemon/` → projection
+   over lifecycle events) → signaling (`scripts/signaling/` →
+   `SignalingMessage`) → media (`widgets/live/` + LiveKit → AIRC
+   WebRTC media tracks for direct calls; LiveKit hybrid for SFU).
+   Lane owner: claude-tab-1 per the cambriantech room.
+
+2. **OpenClaw repo not in workspace** — can't audit adoption directly.
+   Substrate contract exists; adoption gap is on the OpenClaw side
+   when/if that repo lands locally.
+
+3. **Hermes repo not in workspace** — same shape as OpenClaw.
+
+**Cross-cutting substrate gaps still open**:
+
+- **Real-machine tailnet/relay proof.** Same-machine LAN/relay is
+  proven via the consumer-shapes fixture, but multi-host Tailnet
+  routing is still aspirational. Tracked as work card c877e142.
+- **AR pose-stream contract benchmark.** The WebRTC media stack
+  (#955/#957/#960/#961/#962/#963) ships the full transport story.
+  The 60-90Hz × sub-25ms p99 *contract benchmark* is partially
+  proven via #954's local consumer-throughput fixture; the
+  tailnet/multi-machine version is still open. Tracked as work
+  card 399cef36 (Continuum throughput proof, P0).
+- **Personas-as-rooms mapping.** Audit text mentions personas
+  living in rooms; consumer_shapes::continuum.rs models
+  per-persona events but not the room/persona binding semantics.
+  Worth a follow-up doc card if Continuum's migration surfaces
+  the contract.
+- **External-identity → PeerId for bridges** (Slack/GChat). Flagged
+  in the post-WebRTC audit work as needed for chat-protocol
+  bridges; no substrate contract exists yet. Worth a follow-up
+  design card.
+
+**Concrete follow-up cards created from this audit**:
+- `d61d7853` (P1) — Continuum TS-layer AIRC migration: chat services first.
+  Formalizes claude-tab-1's lane so it appears in `airc work next`.
+- `de0ec298` (P2) — Personas-as-rooms binding semantics doc. Clarify how a
+  `PersonaEvent` maps to an AIRC room in the Continuum runtime.
+- `fdc4b753` (P1) — External-identity bridge contract.
+  `ExternalIdentity { source, handle, display_name }` shape for
+  Slack/GChat/Discord/etc. integrations that don't have native PeerIds.
+
+Existing cards already covering parts of the gap:
+- `c877e142` — real-machine tailnet/relay proof.
+- `399cef36` — Continuum throughput proof (P0).
+
 ## Immediate PR Queue
 
 1. Add a real PR source adapter that feeds the landed
