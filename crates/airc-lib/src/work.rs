@@ -537,14 +537,30 @@ impl Airc {
     }
 
     /// Rebuild the current room's work board from persisted work
-    /// events. `limit` is the transcript page size; callers that need
-    /// complete history should pass a sufficiently high limit until a
-    /// dedicated paged board API lands.
+    /// events. `limit` is the transcript page size for interactive
+    /// board views; scheduling code should use
+    /// [`Airc::work_board_complete`] instead.
     pub async fn work_board(&self, limit: usize) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
         self.ensure_room_subscriber(&room).await?;
         let store = WorkEventStore::new(self.event_store());
         Ok(store.project_recent(Some(room.channel), limit).await?)
+    }
+
+    /// Rebuild the current room's complete work board in bounded store
+    /// pages. Scheduling and mutation paths use this so old active
+    /// cards do not disappear just because chat/status traffic pushed
+    /// their creation event outside a recent transcript window.
+    pub async fn work_board_complete(
+        &self,
+        page_size: usize,
+    ) -> Result<WorkBoardProjection, AircError> {
+        let room = self.current_room().await?;
+        self.ensure_room_subscriber(&room).await?;
+        let store = WorkEventStore::new(self.event_store());
+        Ok(store
+            .project_complete(Some(room.channel), page_size)
+            .await?)
     }
 
     /// Return work cards this peer could reasonably take next. This
@@ -565,7 +581,7 @@ impl Airc {
         &self,
         query: WorkQueueStatusQuery,
     ) -> Result<WorkQueueStatus, AircError> {
-        let board = self.work_board(query.event_limit).await?;
+        let board = self.work_board_complete(query.event_limit).await?;
         let now_ms = now_ms()?;
         let stale_claims = board.stale_claims(now_ms);
         let snapshot = board.snapshot();
