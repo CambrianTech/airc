@@ -249,6 +249,8 @@ history to recover a session manager.
 
 Before Continuum integration, the implementation needs:
 
+- structured publish API with typed receipt for library, daemon, and
+  JSON-command callers
 - two local subscribers exchanging chat plus typing/thinking presence
 - deterministic replay after one subscriber restarts
 - self-filter test with two clients under one peer

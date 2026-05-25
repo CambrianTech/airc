@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use airc_core::{Headers, PeerId};
+use airc_core::{Body, Headers, MentionTarget, PeerId};
+use airc_protocol::FrameKind;
 
 /// A single client-issued operation. Wire-tagged by `op`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Liveness probe. Returns `Response::Pong`.
@@ -30,6 +31,9 @@ pub enum Request {
     /// Send a text Message frame. Daemon signs + dispatches via its
     /// owned `SignedTransport`.
     Send(SendRequest),
+    /// Publish a structured frame. Daemon signs + dispatches via its
+    /// owned transport and returns event metadata in `Response::Publish`.
+    Publish(PublishRequest),
     /// Start a subscription on `wire` if one isn't already running.
     /// Daemon buffers received frames into an in-memory inbox per
     /// wire. Idempotent — repeated calls return Ok without
@@ -117,6 +121,29 @@ pub struct SendRequest {
     pub headers: Headers,
 }
 
+/// Parameters for `Publish`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PublishRequest {
+    /// Wire directory the daemon should write to.
+    pub wire: PathBuf,
+    /// Channel UUID. Use a stable value across peers in the same room.
+    pub channel: Uuid,
+    /// Frame kind to publish.
+    pub kind: FrameKind,
+    /// Target for the envelope. Most consumer publishes use `All`.
+    #[serde(default = "mention_all")]
+    pub target: MentionTarget,
+    /// Opaque body carried by the substrate.
+    pub body: Body,
+    /// Optional envelope headers supplied by the caller.
+    #[serde(default)]
+    pub headers: Headers,
+}
+
+fn mention_all() -> MentionTarget {
+    MentionTarget::All
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +173,21 @@ mod tests {
             wire: PathBuf::from("/tmp/wire"),
             channel: Uuid::nil(),
             text: "hello".to_string(),
+            headers: Headers::new(),
+        });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn publish_roundtrips_with_typed_body_and_kind() {
+        let original = Request::Publish(PublishRequest {
+            wire: PathBuf::from("/tmp/wire"),
+            channel: Uuid::nil(),
+            kind: FrameKind::Event,
+            target: MentionTarget::All,
+            body: Body::text("hello"),
             headers: Headers::new(),
         });
         let encoded = serde_json::to_string(&original).unwrap();

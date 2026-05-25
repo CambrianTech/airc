@@ -44,7 +44,11 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
                 }
             }
             Response::Error { message } => return Err(message.into()),
-            Response::Pong | Response::Status(_) | Response::Inbox(_) | Response::Peers(_) => {}
+            Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Publish(_)
+            | Response::Peers(_) => {}
         }
     }
 }

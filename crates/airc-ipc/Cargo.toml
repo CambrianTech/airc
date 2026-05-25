@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
 
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -4,10 +4,12 @@
 //! the daemon's typed IPC client instead of making apps construct
 //! daemon requests directly.
 
-use airc_core::{EventId, Headers, TranscriptCursor, TranscriptEvent};
-use airc_ipc::{InboxRequest, SendRequest, SubscribeRequest};
+use airc_core::{Body, EventId, Headers, MentionTarget, TranscriptCursor, TranscriptEvent};
+use airc_ipc::{InboxRequest, PublishRequest, SendRequest, SubscribeRequest};
+use airc_protocol::FrameKind;
 
 use crate::error::AircError;
+use crate::publish::PublishReceipt;
 use crate::room::Room;
 use crate::Airc;
 
@@ -37,6 +39,34 @@ impl Airc {
         // API remains fallible/synchronous without inventing a second
         // response path in the CLI.
         Ok(EventId::new())
+    }
+
+    pub(crate) async fn daemon_publish(
+        &self,
+        room: &Room,
+        kind: FrameKind,
+        body: Body,
+        headers: Headers,
+    ) -> Result<PublishReceipt, AircError> {
+        let response = self
+            .daemon_client()
+            .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?
+            .publish(PublishRequest {
+                wire: room.wire.clone(),
+                channel: room.channel.as_uuid(),
+                kind,
+                target: MentionTarget::All,
+                body,
+                headers,
+            })
+            .await?;
+        Ok(PublishReceipt {
+            event_id: response.event_id,
+            lamport: response.lamport,
+            occurred_at_ms: response.occurred_at_ms,
+            channel_id: response.channel_id,
+            channel_name: room.name.clone(),
+        })
     }
 
     pub(crate) async fn daemon_page_recent(

@@ -1,14 +1,10 @@
 //! Structured publish API for AIRC consumers (Continuum chat,
 //! OpenClaw, Hermes, etc.).
 //!
-//! Closes work card a0d740fa (P1): "Structured AIRC publish API
-//! for Continuum chat dual-write". The previous publish path for
-//! a typed body forced consumers to either (a) link `airc-lib` and
-//! reach into private internals, or (b) shell out to `airc msg`
-//! with a JSON-stringified payload, losing the typed event id /
-//! lamport / channel in the human-prose output, AND having to
-//! mutate this scope's "current room" pointer to route to a
-//! different room.
+//! Work card a0d740fa (P1): "Structured AIRC publish API for
+//! Continuum chat dual-write". This module gives consumers one
+//! typed publish path for opaque bodies + headers, with a receipt
+//! carrying event id, lamport, and channel.
 //!
 //! This module ships the substrate-level publish primitive:
 //!
@@ -24,12 +20,8 @@
 //! routing + receipt). SDK consumers compose it idiomatically. The
 //! CLI is a thin pass-through over the same call.
 //!
-//! Scope cut: this PR ships the in-process embedding path
-//! ([`Airc::open`]). A follow-up extends the daemon IPC protocol
-//! (`SendRequest` is text-only today) to carry typed body +
-//! structured response so daemon-attached consumers get a real
-//! event id rather than the locally-minted placeholder the text
-//! send currently returns.
+//! The same call works for in-process [`Airc::open`] handles and
+//! daemon-attached [`Airc::attach`] handles.
 
 use airc_core::{Body, EventId, Headers, MentionTarget, RoomId};
 use airc_protocol::FrameKind;
@@ -41,10 +33,10 @@ use crate::Airc;
 
 /// Where a [`PublishReceipt`] should land.
 ///
-/// `CurrentRoom` is the legacy shape — route to whatever this
-/// scope considers default. `RoomByName(name)` requires the
-/// channel name to be in this scope's subscription set and routes
-/// to that room directly; it does NOT auto-join.
+/// `CurrentRoom` routes to whatever this scope considers default.
+/// `RoomByName(name)` requires the channel name to be in this
+/// scope's subscription set and routes to that room directly; it
+/// does NOT auto-join.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishTarget {
     /// Route to this scope's default subscribed room.
@@ -94,6 +86,9 @@ impl Airc {
         headers: Headers,
     ) -> Result<PublishReceipt, AircError> {
         let room = self.resolve_publish_target(&target).await?;
+        if self.is_daemon_attached() {
+            return self.daemon_publish(&room, kind, body, headers).await;
+        }
         let result = self
             .send_frame_to_room(kind, MentionTarget::All, body, headers, &room)
             .await?;

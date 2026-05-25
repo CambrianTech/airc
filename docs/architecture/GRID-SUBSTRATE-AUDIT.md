@@ -926,6 +926,17 @@ Status:
   for check + merge state; review-state translation is deferred until
   the GitHub-login → `PeerId` mapping question has a real answer (the
   shape is in place, it just emits empty `reviews` from this source).
+- In flight: structured publish API for consumer dual-write
+  (`a0d740fa`). `airc-lib::Airc::publish` accepts a typed
+  `PublishTarget`, `FrameKind`, opaque `Body`, and `Headers`, then
+  returns a serializable receipt with event id, lamport, timestamp,
+  and concrete channel. `airc publish` is a thin command surface over
+  the same API and emits one JSON receipt line for script callers.
+  The daemon IPC protocol now has `PublishRequest` /
+  `PublishResponse`, so daemon-attached consumers get the same receipt
+  instead of a text-only ack. This is still generic AIRC: Continuum,
+  OpenClaw, Hermes, and bridge processes provide their own body/header
+  conventions above the substrate.
 
 Done or superseded:
 

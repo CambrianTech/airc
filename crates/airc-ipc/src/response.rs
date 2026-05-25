@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use airc_core::PeerId;
+use airc_core::{EventId, PeerId, RoomId};
 
 /// One response to a `Request`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,6 +21,8 @@ pub enum Response {
     Event {
         event: Box<airc_core::TranscriptEvent>,
     },
+    /// Response to `Publish`.
+    Publish(PublishResponse),
     /// Response to `ListPeers` — the daemon's currently-enrolled
     /// peers (peer_id + URL-safe-no-padding base64 pubkey).
     Peers(PeersResponse),
@@ -70,6 +72,15 @@ pub struct InboxResponse {
     pub newest: Option<airc_core::TranscriptCursor>,
 }
 
+/// Event metadata returned by daemon-backed structured publish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishResponse {
+    pub event_id: EventId,
+    pub lamport: u64,
+    pub occurred_at_ms: u64,
+    pub channel_id: RoomId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +113,19 @@ mod tests {
         assert!(encoded.contains("boom"));
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn publish_response_roundtrips() {
+        let original = Response::Publish(PublishResponse {
+            event_id: EventId::from_u128(1),
+            lamport: 2,
+            occurred_at_ms: 3,
+            channel_id: RoomId::from_u128(4),
+        });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
     }
 
     #[test]

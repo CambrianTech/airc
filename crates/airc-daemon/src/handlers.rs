@@ -15,9 +15,12 @@ use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, RemovePeerRequest, Request, SendRequest, SubscribeRequest,
+    AddPeerRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request, SendRequest,
+    SubscribeRequest,
 };
-use airc_ipc::response::{InboxResponse, PeerEntry, PeersResponse, Response, StatusResponse};
+use airc_ipc::response::{
+    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, StatusResponse,
+};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
 use futures::stream::StreamExt;
@@ -39,6 +42,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             uptime_seconds: state.uptime_seconds(),
         }),
         Request::Send(send) => handle_send(state, send).await,
+        Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Subscribe(sub) => handle_subscribe(state, sub).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::Attach(_) => Response::Error {
@@ -183,7 +187,14 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
 
 async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
     let transport = state.local_fs_for(&send.wire).await;
-    let frame = match build_message_frame(&state, send.channel, &send.text, send.headers) {
+    let frame = match build_frame(
+        &state,
+        FrameKind::Message,
+        send.channel,
+        MentionTarget::All,
+        Body::text(send.text),
+        send.headers,
+    ) {
         Ok(frame) => frame,
         Err(error) => {
             return Response::Error {
@@ -195,6 +206,40 @@ async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
         Ok(()) => Response::Ok,
         Err(error) => Response::Error {
             message: format!("send: {error}"),
+        },
+    }
+}
+
+async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Response {
+    let transport = state.local_fs_for(&publish.wire).await;
+    let frame = match build_frame(
+        &state,
+        publish.kind,
+        publish.channel,
+        publish.target,
+        publish.body,
+        publish.headers,
+    ) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Response::Error {
+                message: format!("publish: clock before UNIX_EPOCH: {error}"),
+            };
+        }
+    };
+    let event_id = frame.envelope.event_id;
+    let lamport = frame.envelope.lamport;
+    let occurred_at_ms = frame.envelope.occurred_at_ms;
+    let channel_id = frame.envelope.channel;
+    match transport.send(frame).await {
+        Ok(()) => Response::Publish(PublishResponse {
+            event_id,
+            lamport,
+            occurred_at_ms,
+            channel_id,
+        }),
+        Err(error) => Response::Error {
+            message: format!("publish: {error}"),
         },
     }
 }
@@ -258,28 +303,30 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
     Response::Peers(PeersResponse { peers: entries })
 }
 
-fn build_message_frame(
+fn build_frame(
     state: &DaemonState,
+    kind: FrameKind,
     channel: uuid::Uuid,
-    text: &str,
+    target: MentionTarget,
+    body: Body,
     headers: Headers,
 ) -> Result<Frame, std::time::SystemTimeError> {
     let lamport = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
     Ok(Frame {
-        kind: FrameKind::Message,
+        kind,
         envelope: Envelope {
             event_id: EventId::new(),
             sender: state.peer_id,
             sender_client: ClientId::new(),
             channel: RoomId::from_uuid(channel),
-            target: MentionTarget::All,
+            target,
             lamport,
             occurred_at_ms: lamport,
             reply_to: None,
             headers,
-            body: Some(Body::text(text)),
+            body: Some(body),
             media: Vec::new(),
             // Unsigned at this layer — SignedTransport replaces it
             // with Ed25519 on the way out.
@@ -391,6 +438,35 @@ mod tests {
         assert_eq!(contents.lines().count(), 1);
     }
 
+    #[tokio::test]
+    async fn publish_dispatches_structured_frame_and_returns_receipt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_state();
+        let response = dispatch(
+            state,
+            Request::Publish(PublishRequest {
+                wire: dir.path().to_path_buf(),
+                channel: Uuid::nil(),
+                kind: FrameKind::Event,
+                target: MentionTarget::All,
+                body: Body::text("structured"),
+                headers: Headers::new(),
+            }),
+        )
+        .await;
+        match response {
+            Response::Publish(receipt) => {
+                assert_eq!(receipt.channel_id, RoomId::from_uuid(Uuid::nil()));
+                assert!(receipt.lamport > 0);
+                assert!(receipt.occurred_at_ms > 0);
+            }
+            other => panic!("expected publish response, got {other:?}"),
+        }
+        let frames = dir.path().join("frames.jsonl");
+        let contents = std::fs::read_to_string(frames).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+    }
+
     #[test]
     fn trust_root_prefers_airc_wire_root_but_accepts_raw_wire_dirs() {
         let airc_wire = PathBuf::from("/tmp/home/.airc/wires/general");
@@ -459,10 +535,12 @@ mod tests {
 
         sender
             .send(
-                build_message_frame(
+                build_frame(
                     &sender_state,
+                    FrameKind::Message,
                     Uuid::nil(),
-                    "sibling scope frame after trust refresh",
+                    MentionTarget::All,
+                    Body::text("sibling scope frame after trust refresh"),
                     Headers::new(),
                 )
                 .unwrap(),
