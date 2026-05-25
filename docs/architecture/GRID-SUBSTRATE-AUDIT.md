@@ -711,6 +711,12 @@ context.
      and `airc work next` is only a terminal wrapper around that SDK
      call. Default policy surfaces open P0/P1 work; callers can opt
      into stale-claim recovery.
+   - Second slice in flight: Codex hook and Monitor attach detect
+     queue-changing `forge.work.*` events and render claimable-work
+     suggestions from `Airc::claimable_work`, not by parsing
+     `airc work board` prose. Follow-up: make this a reusable
+     subscriber policy so future agent runtimes and Continuum consume
+     the same typed surface.
 3. Add real-machine tailnet/relay proof that exercises the same route
    execution across host boundaries without GitHub routine traffic.
 4. Add a consumer-throughput proof for Continuum-shaped live traffic:

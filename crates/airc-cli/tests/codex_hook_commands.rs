@@ -103,6 +103,34 @@ fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
 }
 
 #[test]
+fn codex_hook_suggests_claimable_work_on_work_events() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "wire claimable work into agent feed",
+            "--priority",
+            "p0",
+        ],
+    );
+
+    let output = run_hook(&home, &["codex-hook", "user-prompt-submit"], "{}");
+    let context = additional_context(&output);
+
+    assert!(context.contains("AIRC work: 1 claimable P0/P1"));
+    assert!(context.contains("wire claimable work into agent feed"));
+    assert!(context.contains("airc work claim"));
+}
+
+#[test]
 fn codex_hook_raw_mode_preserves_full_event_lines() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");

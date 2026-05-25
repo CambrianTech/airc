@@ -134,6 +134,7 @@ pub use airc_core::{
 pub use airc_work::{
     AgentAvailabilityRecord, AgentAvailabilityState, BoardSnapshot, BranchName, CardState, ClaimId,
     DirtyState, GitObjectId, LaneId, LaneState, LocalGitSnapshot, ManagerHat, Priority,
-    ProjectionError, RepoId, WorkBoardProjection, WorkCardId, WorkEvent, WorkspaceId,
-    WorkspaceStatus,
+    ProjectionError, RepoId, WorkBoardProjection, WorkCard, WorkCardId, WorkEvent, WorkspaceId,
+    WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_EVENT_KIND,
+    HEADER_FORGE_WORK_REPO,
 };
