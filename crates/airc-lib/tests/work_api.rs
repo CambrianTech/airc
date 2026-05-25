@@ -445,6 +445,121 @@ async fn work_roster_status_combines_liveness_availability_and_claims() {
 }
 
 #[tokio::test]
+async fn work_roster_attaches_peer_claim_to_only_live_client_row() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-roster-client-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    airc.emit_agent_heartbeat_with_metadata(
+        HeartbeatKind::Alive,
+        "codex",
+        Some("codex:one".to_string()),
+        Some("airc-worktree".to_string()),
+        Some("abc123".to_string()),
+    )
+    .await
+    .unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo,
+            title: "correlate claim to live client".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    airc.claim_work_card(ClaimWorkCard {
+        card_id,
+        ttl_ms: 60_000,
+    })
+    .await
+    .unwrap();
+
+    let roster = airc
+        .work_roster_status(WorkRosterQuery {
+            event_limit: 128,
+            ..WorkRosterQuery::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(roster.rows.len(), 1);
+    let row = &roster.rows[0];
+    assert_eq!(row.peer, airc.peer_id());
+    assert_eq!(row.client_id.as_deref(), Some("codex:one"));
+    assert_eq!(row.active_claims.len(), 1);
+    assert_eq!(row.active_claims[0].card_id, card_id);
+    let liveness = row.liveness.as_ref().unwrap();
+    assert_eq!(liveness.runtime, "codex");
+    assert_eq!(liveness.build.as_deref(), Some("abc123"));
+}
+
+#[tokio::test]
+async fn work_roster_keeps_peer_claim_separate_when_multiple_clients_are_live() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-roster-multi-client-api").await.unwrap();
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+
+    for client in ["codex:one", "codex:two"] {
+        airc.emit_agent_heartbeat_with_metadata(
+            HeartbeatKind::Alive,
+            "codex",
+            Some(client.to_string()),
+            Some("airc-worktree".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo,
+            title: "ambiguous peer claim".to_string(),
+            body: None,
+            priority: Priority::P0,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    airc.claim_work_card(ClaimWorkCard {
+        card_id,
+        ttl_ms: 60_000,
+    })
+    .await
+    .unwrap();
+
+    let roster = airc
+        .work_roster_status(WorkRosterQuery {
+            event_limit: 128,
+            ..WorkRosterQuery::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(roster.rows.len(), 3);
+    assert_eq!(
+        roster
+            .rows
+            .iter()
+            .filter(|row| row.liveness.is_some())
+            .count(),
+        2
+    );
+    let claim_row = roster
+        .rows
+        .iter()
+        .find(|row| !row.active_claims.is_empty())
+        .unwrap();
+    assert_eq!(claim_row.client_id, None);
+    assert_eq!(claim_row.active_claims[0].card_id, card_id);
+}
+
+#[tokio::test]
 async fn lane_create_attach_card_and_state_change_project_from_store() {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();

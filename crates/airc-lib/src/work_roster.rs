@@ -172,7 +172,11 @@ impl RosterRows {
         let Some(owner) = card.owner else {
             return;
         };
-        self.row_mut(owner).active_claims.push(card);
+        let key = self.claim_row_key(owner);
+        let client_id = self.rows.get(&key).and_then(|row| row.client_id.clone());
+        self.row_mut_with_key(key, owner, client_id)
+            .active_claims
+            .push(card);
     }
 
     fn row_mut(&mut self, peer: PeerId) -> &mut WorkRosterRow {
@@ -234,6 +238,21 @@ fn row_key(peer: PeerId, client_id: Option<&str>) -> String {
     match client_id {
         Some(client_id) => format!("{peer}\0{client_id}"),
         None => peer.to_string(),
+    }
+}
+
+impl RosterRows {
+    fn claim_row_key(&self, peer: PeerId) -> String {
+        let mut live_keys = self.rows.iter().filter_map(|(key, row)| {
+            (row.peer == peer && row.liveness.is_some()).then_some(key.as_str())
+        });
+        let Some(first) = live_keys.next() else {
+            return row_key(peer, None);
+        };
+        if live_keys.next().is_some() {
+            return row_key(peer, None);
+        }
+        first.to_string()
     }
 }
 
