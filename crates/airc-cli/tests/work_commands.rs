@@ -183,6 +183,39 @@ fn work_next_suggests_claimable_priority_cards() {
 }
 
 #[test]
+fn work_close_removes_card_from_claimable_next() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "done work should not stay claimable",
+            "--priority",
+            "p0",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("card id");
+
+    let close = run_ok(&home, &["work", "close", card_id]);
+    assert!(close.contains("card_state_changed"), "{close}");
+    assert!(close.contains("Closed"), "{close}");
+
+    let board = run_ok(&home, &["work", "board"]);
+    assert!(board.contains(card_id), "{board}");
+    assert!(board.contains("Closed"), "{board}");
+
+    let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(!next.contains(card_id), "{next}");
+}
+
+#[test]
 fn lane_create_status_and_state_drive_work_projection() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");

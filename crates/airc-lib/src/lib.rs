@@ -116,11 +116,11 @@ pub use webrtc_media::{
     OutgoingSampleTrack, OutgoingVideoTrack, WebRtcConnectionBuilder, WebRtcMediaCodec,
 };
 pub use work::{
-    AllocateWorkspace, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard, ClaimableWorkItem,
-    ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim, HeartbeatWorkspace,
-    ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests,
-    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability,
-    RequestWorkspace,
+    AllocateWorkspace, ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
+    ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
+    HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace,
+    ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
+    ReportAgentAvailability, RequestWorkspace,
 };
 
 // Convenience re-exports so consumers don't need to pull airc-core
