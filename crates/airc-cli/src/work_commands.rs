@@ -15,7 +15,8 @@ use uuid::Uuid;
 use airc_lib::{
     AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
     CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBoardProjection, WorkCardId,
-    WorkQueueStatus, WorkRosterStatus,
+    WorkManagerRecommendation, WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus,
+    WorkRosterStatus,
 };
 
 use crate::lease;
@@ -231,6 +232,30 @@ pub async fn run_roster(
     Ok(())
 }
 
+pub async fn run_manage(
+    home: &Path,
+    repo: Option<String>,
+    max_priority: CliPriority,
+    include_stale: bool,
+    limit: usize,
+    event_limit: usize,
+    active_within_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let status = airc
+        .work_manager_status(airc_lib::WorkManagerQuery {
+            repo: repo.map(RepoId::new).transpose()?,
+            max_priority: max_priority.into(),
+            include_stale_claims: include_stale,
+            event_limit,
+            limit,
+            active_within_ms,
+        })
+        .await?;
+    print_work_manager(&status);
+    Ok(())
+}
+
 pub async fn run_availability(
     home: &Path,
     repo: String,
@@ -400,6 +425,74 @@ fn print_work_roster(status: &WorkRosterStatus) {
             );
         }
     }
+}
+
+fn print_work_manager(status: &WorkManagerStatus) {
+    let now_ms = now_ms();
+    println!(
+        "work manager: recommendations={} claimable={} agents={} live={} ready={} busy={} away={}",
+        status.recommendations.len(),
+        status.queue.claimable.len(),
+        status.roster.rows.len(),
+        status.roster.alive_count(),
+        status.roster.ready_count(now_ms),
+        status.roster.busy_count(now_ms),
+        status.roster.away_count(now_ms),
+    );
+    if status.recommendations.is_empty() {
+        println!("action: none");
+        return;
+    }
+    for recommendation in &status.recommendations {
+        print_manager_recommendation(recommendation);
+    }
+}
+
+fn print_manager_recommendation(recommendation: &WorkManagerRecommendation) {
+    let action = match recommendation.kind {
+        WorkManagerRecommendationKind::ClaimWork => "claim-work",
+        WorkManagerRecommendationKind::RecoverStaleClaim => "recover-stale-claim",
+        WorkManagerRecommendationKind::PublishAvailability => "publish-availability",
+        WorkManagerRecommendationKind::SeedBacklog => "seed-backlog",
+        WorkManagerRecommendationKind::Wait => "wait",
+    };
+    let card = recommendation
+        .card
+        .as_ref()
+        .map(|card| {
+            format!(
+                " card={} priority={:?} repo={} title={}",
+                card.card_id, card.priority, card.repo, card.title
+            )
+        })
+        .unwrap_or_default();
+    let stale = recommendation
+        .stale_claim
+        .as_ref()
+        .map(|claim| {
+            format!(
+                " stale_claim={} stale_owner={}",
+                claim.claim_id, claim.owner
+            )
+        })
+        .unwrap_or_default();
+    let agent = recommendation
+        .agent
+        .as_ref()
+        .map(|agent| {
+            format!(
+                " agent={} client={} runtime={} scope={}",
+                agent.peer,
+                agent.client_id.as_deref().unwrap_or("-"),
+                agent.runtime.as_deref().unwrap_or("-"),
+                agent.scope.as_deref().unwrap_or("-"),
+            )
+        })
+        .unwrap_or_default();
+    println!(
+        "action={action} reason={reason:?}{card}{stale}{agent}",
+        reason = recommendation.reason
+    );
 }
 
 fn now_ms() -> u64 {

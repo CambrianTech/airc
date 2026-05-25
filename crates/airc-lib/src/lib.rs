@@ -67,6 +67,7 @@ pub mod webrtc_media;
 pub mod webrtc_signaling;
 mod wire_replay;
 pub mod work;
+pub mod work_manager;
 pub mod work_roster;
 pub mod work_subscription;
 
@@ -134,6 +135,10 @@ pub use work::{
     HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace,
     ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
     ReportAgentAvailability, RequestWorkspace, WorkQueueStatus, WorkQueueStatusQuery,
+};
+pub use work_manager::{
+    WorkManagerAgent, WorkManagerQuery, WorkManagerReason, WorkManagerRecommendation,
+    WorkManagerRecommendationKind, WorkManagerStatus,
 };
 pub use work_roster::{WorkRosterQuery, WorkRosterRow, WorkRosterStatus};
 pub use work_subscription::{

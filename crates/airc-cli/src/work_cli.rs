@@ -114,6 +114,27 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 180_000)]
         active_within_ms: u64,
     },
+    /// Evaluate the typed manager loop: work, roster, and idle-lock cause.
+    Manage {
+        /// Optional repository filter, e.g. `CambrianTech/airc`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Highest priority to include.
+        #[arg(long, value_enum, default_value = "p1")]
+        max_priority: CliPriority,
+        /// Include expired claims as recoverable work.
+        #[arg(long)]
+        include_stale: bool,
+        /// Maximum work suggestions to evaluate.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Recent transcript events to replay into the projection.
+        #[arg(long, default_value_t = 512)]
+        event_limit: usize,
+        /// Heartbeat age to consider live.
+        #[arg(long, default_value_t = 180_000)]
+        active_within_ms: u64,
+    },
     /// Publish this agent's availability for a repo.
     Availability {
         /// Repository key, e.g. `CambrianTech/airc`.
