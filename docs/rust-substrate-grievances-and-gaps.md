@@ -904,6 +904,53 @@ Slice 7 (PR 1–7) closes most of what Python currently owns at runtime:
 
 Once PR 1–6 land, the only Python left is install/update/uninstall bootstrapping plus migration shims. That clears Gate 5.
 
+## Audit Refresh: 2026-05-25
+
+Six days after the 2026-05-19 audit. The substrate landed 12 PRs to `rust-rewrite` in that window (#983–#994). This refresh syncs the doc to the current work-card board and to the post-#994 binary state.
+
+### Closed since 2026-05-19
+
+The following items from the 2026-05-19 "Critical remaining gaps" list now have closure evidence on `rust-rewrite`:
+
+- **"Queue/lane/workspace/kanban are still legacy operational surfaces, not Rust substrate objects."** Closed: `airc-work` crate ships typed work cards + lanes + leases + workspaces + the `airc work {create,claim,heartbeat,release,state,close,board,next,roster,availability}` CLI surface. Lease-zone enforcement landed in #988; wrong-room transitions rejected in #993; duplicate-release idempotency in #987.
+- **"Persistent live subscription streams over daemon IPC are still not complete."** Partially closed: structured publish via IPC v3 + `airc publish` JSON receipt CLI landed in #990. JSON-shaped event list landed in #991. Subscription stream is still the missing primitive (see new gaps below).
+- **No live presence/roster projection.** Closed: typed agent roster rendered in #986; availability surfaced in queue status in #983. The roster currently reports `live=false` for all agents pending heartbeat work (cardded as `e6c377b7`).
+- **External-identity bridge.** Closed: bridge contract landed in #985.
+- **Route health proof.** Closed: JSON route proof harness landed in #989.
+- **Stale daemon detection in `airc join`.** Closed: typed daemon status metadata + auto-replace of stale daemon builds landed in #994. Verified in production on a non-author scope.
+
+### In flight on the work board (as of 2026-05-25)
+
+  | Card | Priority | State | Owner | Title |
+  |---|---|---|---|---|
+  | `348983c8` | P0 | Open | — | Manager loop keeps work queue non-empty |
+  | `e6c377b7` | P0 | Claimed | codex | Active-agent roster heartbeat drives idle detection |
+  | `fe57c6fa` | P1 | Claimed | claude-tab-1 | Roadmap/gap audit to work-card sync (this refresh) |
+
+Closed since 2026-05-19: `9d365956` (join self-heal — landed via #994), `38c581a6` (Stage 1 chat dual-write smoke proof — landed via continuum#1435).
+
+### Continuum integration delta
+
+Continuum-side adapter work shipped four PRs in the same window: `continuum#1432` (Stage 1 chat dual-write via CLI bridge), `#1433` (Stage 2 structured `airc publish` JSON CLI), `#1435` (smoke proof), `#1434` (C2 adapter design doc — proposes `AircSubstrate` / `AircWorkSource` / `AircLifecycleSource` traits naming the next slice).
+
+This partially closes "Consumer Integration Gaps — Continuum: persona/chat/activity events over AIRC envelopes with forge-alloy contracts." Chat dual-write is live with structured publish; persona + activity events still depend on the typed subscription stream gap below.
+
+### Uncardded gaps named here
+
+The following gaps from earlier sections still lack work cards and were not picked up by the 2026-05-19→2026-05-25 window. Filing as new cards in parallel with this PR:
+
+  1. **Persistent live subscription stream over daemon IPC** (grievance §5 + §6, also Slice 7 PR 6 second sub-slice). Required before continuum-side Step 2 events / Step 3 lifecycle migrations and before the C2 `LibAircSubstrate` wiring (continuum#1434) can wrap typed subscribe.
+  2. **WebRTC datachannel + UDP transport adapters** (grievance §15, §3). Modeled per `WEBRTC-MEDIA-TRACKS-PLAN.md` but not implemented. Required before Continuum live-mode / game / realtime control claims are credible.
+  3. **Forge-alloy contract registry + validation layer** (grievance §12). Headers and opaque bodies are right, but no contract registry / schema versioning / validation exists. Each consumer reinvents the contract today; consequence is a real risk for the multi-consumer integration claims.
+  4. **Production persona record/replay path** (grievance §14, §7). AIRC stores transcript events; Continuum cognition/RAG replay on top is not implemented.
+  5. **Tailscale discovery + relay adapter** (grievance §3). LAN-TCP + local-fs cover today, but cross-tailnet / NAT / cross-grid claims require these.
+
+### What this refresh does NOT do
+
+  - Does not rewrite the operating-control-board sections (Branch Truth, Stop-Doing List, First Remediation Slices, Acceptance Gates). Those remain authoritative.
+  - Does not relitigate the Slice 7 PR sequence. Codex's binding design from the prior section holds; the new substrate landings (#983–#994) execute against it.
+  - Does not file cards for the substrate-internal items already in flight under the broader `airc-work` lane — e.g. lease-zone enforcement, room-routing fixes — those are tracked by their merged PRs.
+
 ## Non-Negotiables
 
 - No silent fallback to insecure/plain/slow paths.
