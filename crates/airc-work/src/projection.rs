@@ -233,12 +233,6 @@ pub enum ProjectionError {
     UnknownLane(LaneId),
     #[error("unknown workspace {0}")]
     UnknownWorkspace(WorkspaceId),
-    #[error("claim mismatch for card {card_id}: expected {expected:?}, got {got}")]
-    ClaimMismatch {
-        card_id: WorkCardId,
-        expected: Option<ClaimId>,
-        got: ClaimId,
-    },
 }
 
 impl ProjectionError {

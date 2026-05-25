@@ -568,7 +568,13 @@ fn git_and_pr_adapter_events_project_without_polling() {
 }
 
 #[test]
-fn mismatched_claim_is_rejected() {
+fn heartbeat_for_non_active_claim_is_dropped_silently() {
+    // Closes work card c29506b8 ("Work board replay window must
+    // not fail on partial history"). A heartbeat that names a
+    // claim the projection has never observed as active (e.g. a
+    // racing second claimant that lost the first-write-wins
+    // contest in `apply_card_claimed`) must NOT poison the
+    // board — drop the event and let the projection move on.
     let card_id = WorkCardId::from_u128(1);
     let owner = peer(3);
     let mut projection = WorkBoardProjection::new();
@@ -576,7 +582,7 @@ fn mismatched_claim_is_rejected() {
         .apply(&WorkEvent::CardCreated(CardCreated {
             card_id,
             repo: repo(),
-            title: "claim mismatch".to_string(),
+            title: "ghost heartbeat".to_string(),
             body: None,
             priority: Priority::P2,
             lane_id: None,
@@ -584,7 +590,7 @@ fn mismatched_claim_is_rejected() {
             created_at_ms: 1,
         }))
         .unwrap();
-    let err = projection
+    projection
         .apply(&WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
             card_id,
             claim_id: ClaimId::from_u128(9),
@@ -592,6 +598,78 @@ fn mismatched_claim_is_rejected() {
             ttl_ms: 1,
             heartbeat_at_ms: 2,
         }))
-        .unwrap_err();
-    assert!(matches!(err, ProjectionError::ClaimMismatch { .. }));
+        .expect("ghost heartbeat must be tolerated, not panic");
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(
+        card.claim_id, None,
+        "ghost heartbeat must not invent a claim"
+    );
+}
+
+#[test]
+fn release_for_superseded_claim_does_not_poison_projection() {
+    // Closes work card c29506b8 (the production poison-pill that
+    // motivated this fix). Real wire shape: Create → Claim A →
+    // Claim B (silently dropped by first-write-wins) → Release B.
+    // The release names a claim id the projection never accepted;
+    // refusing it would freeze every consumer's board.
+    let card_id = WorkCardId::from_u128(1);
+    let owner_a = peer(3);
+    let owner_b = peer(4);
+    let claim_a = ClaimId::from_u128(10);
+    let claim_b = ClaimId::from_u128(11);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "race release".to_string(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            created_by: owner_a,
+            created_at_ms: 1,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: claim_a,
+            owner: owner_a,
+            ttl_ms: 60_000,
+            claimed_at_ms: 2,
+        }))
+        .unwrap();
+    // Second claim — silently ignored by first-write-wins.
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: claim_b,
+            owner: owner_b,
+            ttl_ms: 60_000,
+            claimed_at_ms: 3,
+        }))
+        .unwrap();
+    // The losing claimant later emits a release for *their* claim
+    // id. Before this fix, this errored with `ClaimMismatch` and
+    // halted every consumer's projection.
+    projection
+        .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id: claim_b,
+            owner: owner_b,
+            reason: None,
+            released_at_ms: 4,
+        }))
+        .expect("release of superseded claim must be tolerated");
+
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(
+        card.claim_id,
+        Some(claim_a),
+        "first-write claim must still be active after the ghost release"
+    );
+    assert_eq!(card.owner, Some(owner_a));
+    assert_eq!(card.state, CardState::Claimed);
 }
