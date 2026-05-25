@@ -38,7 +38,7 @@ impl PoseEvent {
 }
 
 #[tokio::test]
-async fn continuum_shaped_pose_stream_delivers_at_60hz_without_drop() {
+async fn continuum_shaped_pose_stream_delivers_without_drop() {
     let result = run_pose_stream_fixture(StreamProfile {
         event_count: SINGLE_SUBSCRIBER_EVENT_COUNT,
         event_hz: SINGLE_SUBSCRIBER_EVENT_HZ,
@@ -58,10 +58,7 @@ async fn continuum_shaped_pose_stream_delivers_at_60hz_without_drop() {
         p50 = result.p50,
         p99 = result.p99,
     );
-}
 
-#[tokio::test]
-async fn continuum_shaped_pose_stream_fans_out_to_three_subscribers_at_90hz() {
     let result = run_pose_stream_fixture(StreamProfile {
         event_count: FANOUT_EVENT_COUNT,
         event_hz: FANOUT_EVENT_HZ,
