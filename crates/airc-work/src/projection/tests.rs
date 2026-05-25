@@ -109,6 +109,53 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
 }
 
 #[test]
+fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
+    let card_id = WorkCardId::from_u128(13);
+    let claim_id = ClaimId::from_u128(14);
+    let owner = peer(15);
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "duplicate release".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 100,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id,
+            owner,
+            ttl_ms: 100,
+            claimed_at_ms: 110,
+        }),
+        WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id,
+            owner,
+            reason: Some("first release".to_string()),
+            released_at_ms: 120,
+        }),
+        WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id,
+            owner,
+            reason: Some("duplicate release".to_string()),
+            released_at_ms: 130,
+        }),
+    ])
+    .unwrap();
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(card.state, CardState::Open);
+    assert_eq!(card.owner, None);
+    assert_eq!(card.claim_id, None);
+}
+
+#[test]
 fn availability_projection_keeps_latest_peer_state_per_repo() {
     let repo = repo();
     let other_repo = RepoId::new("CambrianTech/continuum").unwrap();
