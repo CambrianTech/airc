@@ -249,6 +249,57 @@ async fn work_card_mutations_find_cards_beyond_small_recent_window() {
 }
 
 #[tokio::test]
+async fn scheduling_finds_claimable_cards_beyond_small_recent_window() {
+    let home = TempDir::new().unwrap();
+    let airc = Airc::open(home.path()).await.unwrap();
+    airc.join("work-scheduling-complete-board").await.unwrap();
+
+    let card_id = airc
+        .create_work_card(CreateWorkCard {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "old claimable work".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+        })
+        .await
+        .unwrap();
+    wait_for_card(&airc, card_id).await;
+
+    for idx in 0..600 {
+        airc.say(&format!("non-work scheduling noise {idx}"))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        airc.work_board(512).await.unwrap().card(card_id).is_none(),
+        "interactive recent board no longer contains the old card"
+    );
+
+    let claimable = airc
+        .claimable_work(ClaimableWorkQuery {
+            event_limit: 128,
+            ..ClaimableWorkQuery::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        claimable.iter().any(|item| item.card.card_id == card_id),
+        "scheduler must use complete projection, not the recent board window"
+    );
+
+    let roster = airc
+        .work_roster_status(WorkRosterQuery {
+            event_limit: 128,
+            ..WorkRosterQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(roster.claimable_count, 1);
+}
+
+#[tokio::test]
 async fn duplicate_work_card_claims_fail_before_poisoning_projection() {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();

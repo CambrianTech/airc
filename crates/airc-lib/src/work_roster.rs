@@ -102,7 +102,7 @@ impl Airc {
         &self,
         query: WorkRosterQuery,
     ) -> Result<WorkRosterStatus, AircError> {
-        let board = self.work_board(query.event_limit).await?;
+        let board = self.work_board_complete(query.event_limit).await?;
         let snapshot = board.snapshot();
         let now_ms = now_ms()?;
         let active_agents = self
