@@ -429,7 +429,25 @@ impl Airc {
     /// the identity, the same channel name fractured into two room_ids
     /// that silently could not see each other. The coordinator store
     /// is the machine-global convergence point the contract requires.
+    ///
+    /// If the coordinator has no cached identity yet but this scope's
+    /// per-scope store does (older state, or a scope that resolved
+    /// before the coordinator was seeded), adopt the per-scope value
+    /// and promote it into the coordinator — keeping the coordinator
+    /// authoritative while honoring an already-resolved identity. This
+    /// avoids re-running the gh/git resolver and avoids fracturing
+    /// rooms when the coordinator path differs from the scope path —
+    /// e.g. on Windows, where `machine_account_home` collapses temp
+    /// homes that live under `USERPROFILE` onto one coordinator store.
     pub(crate) async fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
+        if mesh_identity::load_cached(self.coordinator_store())
+            .await?
+            .is_none()
+        {
+            if let Some(local) = mesh_identity::load_cached(self.event_store()).await? {
+                mesh_identity::save(self.coordinator_store(), &local).await?;
+            }
+        }
         let cached = mesh_identity::resolve(self.coordinator_store()).await?;
         Ok(cached.as_mesh_identity())
     }
