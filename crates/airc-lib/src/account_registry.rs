@@ -557,81 +557,54 @@ mod tests {
         );
     }
 
-    /// Serializes the HOME/USERPROFILE env mutations below — env vars are
-    /// process-global and the test suite runs in parallel.
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    // Two SEPARATE machine accounts (distinct HOME), same gh identity,
-    // bridged ONLY through the remote registry. Each machine's
-    // coordinator store must be its own, so HOME/USERPROFILE is pinned
-    // per machine across each `Airc::open` (the guard is held across the
-    // sync `block_on`s, never across an await). Without this, on Windows
-    // the temp homes fall under the real USERPROFILE and
-    // `machine_account_home()` collapses both onto one shared coordinator
-    // store — breaking isolation and making the bridge assertion pass
-    // trivially (or fail on cross-test pollution).
-    #[test]
-    fn sqlite_registry_bridges_two_isolated_machine_homes() {
-        let _home_env_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    // Two SEPARATE machine accounts, same gh identity, bridged ONLY
+    // through the remote registry. Each machine gets its own EXPLICIT
+    // wire root (coordinator store) via `open_with_wire_root_for_test`,
+    // so `machine_account_home`/`HOME` never collapses them onto one
+    // store — no process-global env mutation (which would race the
+    // parallel test runner), and identical behavior on Unix and Windows.
+    #[tokio::test]
+    async fn sqlite_registry_bridges_two_isolated_machine_homes() {
         let dir = tempdir().unwrap();
-        let home_a = dir.path().join("machine-a");
-        let home_b = dir.path().join("machine-b");
-        let machine_a = home_a.join(".airc");
-        let machine_b = home_b.join(".airc");
-
-        // Seed each machine's per-scope store; with HOME pinned per
-        // machine these ARE the coordinator stores.
-        let store = rt.block_on(async {
-            write_identity(&machine_a).await;
-            write_identity(&machine_b).await;
-            sqlite_registry_store_at(&dir.path().join("remote-registry")).await
-        });
-
-        let vars = |home: &std::path::Path| {
-            let h = home.to_string_lossy().into_owned();
-            vec![
-                ("HOME".to_string(), Some(h.clone())),
-                ("USERPROFILE".to_string(), Some(h)),
-            ]
-        };
+        let machine_a = dir.path().join("machine-a/.airc");
+        let machine_b = dir.path().join("machine-b/.airc");
+        let wire_a = dir.path().join("wire-a");
+        let wire_b = dir.path().join("wire-b");
+        // Seed each machine's coordinator (wire-root) store with the
+        // shared gh identity so mesh resolution is deterministic.
+        write_identity(&wire_a).await;
+        write_identity(&wire_b).await;
+        let store = sqlite_registry_store_at(&dir.path().join("remote-registry")).await;
 
         // Machine A publishes its presence/registry to the remote store.
-        let airc_a = temp_env::with_vars(vars(&home_a), || {
-            rt.block_on(async {
-                let airc_a = Airc::open(&machine_a).await.unwrap();
-                airc_a.join("general").await.unwrap();
-                airc_a.publish_account_registry(&store).await.unwrap();
-                airc_a
-            })
-        });
-
-        // Machine B refreshes from the remote store — airc_a's beacon
-        // reaches B's coordinator ONLY through this bridge.
-        let airc_b = temp_env::with_vars(vars(&home_b), || {
-            rt.block_on(async {
-                let airc_b = Airc::open(&machine_b).await.unwrap();
-                let refreshed = airc_b.refresh_account_registry(&store).await.unwrap();
-                assert!(refreshed.is_some());
-                airc_b
-            })
-        });
-
-        rt.block_on(async {
-            let peers = airc_trust::load(&airc_b.inner.wire_root).await.unwrap();
-            assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
-            let snapshot = crate::coordinator::snapshot_store(
-                airc_b.coordinator_store(),
-                &mesh(),
-                &Default::default(),
-                u64::MAX,
-            )
+        let airc_a = Airc::open_with_wire_root_for_test(&machine_a, &wire_a)
             .await
             .unwrap();
-            assert!(snapshot
-                .stale
-                .iter()
-                .any(|peer| peer.peer_id == airc_a.peer_id()));
-        });
+        airc_a.join("general").await.unwrap();
+        airc_a.publish_account_registry(&store).await.unwrap();
+
+        // Machine B refreshes from the remote store — airc_a's beacon
+        // reaches B's coordinator ONLY through this bridge (separate
+        // wire roots, so it cannot leak via a shared store).
+        let airc_b = Airc::open_with_wire_root_for_test(&machine_b, &wire_b)
+            .await
+            .unwrap();
+        let refreshed = airc_b.refresh_account_registry(&store).await.unwrap();
+        assert!(refreshed.is_some());
+
+        let peers = airc_trust::load(&airc_b.inner.wire_root).await.unwrap();
+        assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
+        let snapshot = crate::coordinator::snapshot_store(
+            airc_b.coordinator_store(),
+            &mesh(),
+            &Default::default(),
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(snapshot
+            .stale
+            .iter()
+            .any(|peer| peer.peer_id == airc_a.peer_id()));
     }
 }

@@ -210,8 +210,31 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let identity = LocalIdentity::load_or_generate(&home).await?;
         let wire_root = machine_account_home(&home);
+        Self::open_inner(home, wire_root, policy).await
+    }
+
+    /// Test-only: open with an explicit machine-account wire root rather
+    /// than deriving it from `HOME`/`USERPROFILE` via
+    /// `machine_account_home`. Lets in-process tests give each simulated
+    /// "machine" its own isolated coordinator store + wire root WITHOUT
+    /// mutating process-global env, which would race other parallel
+    /// tests. Strict verification, matching `open`.
+    #[doc(hidden)]
+    pub async fn open_with_wire_root_for_test(
+        home: impl Into<PathBuf>,
+        wire_root: impl Into<PathBuf>,
+    ) -> Result<Self, AircError> {
+        Self::open_inner(home.into(), wire_root.into(), VerificationPolicy::Strict).await
+    }
+
+    async fn open_inner(
+        home: PathBuf,
+        wire_root: PathBuf,
+        policy: VerificationPolicy,
+    ) -> Result<Self, AircError> {
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let identity = LocalIdentity::load_or_generate(&home).await?;
         std::fs::create_dir_all(&wire_root).map_err(IdentityError::Io)?;
         peers_store::add(
             &wire_root,
