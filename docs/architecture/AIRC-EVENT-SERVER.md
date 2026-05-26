@@ -52,8 +52,14 @@ struct Envelope {
     target: Target,            // All | Endpoint(addr) | Peer(id) | Reply(correlation)
     kind: Kind,                // Message | Event | Command | CommandResult | Signal | StreamChunk | Control
     delivery: DeliveryClass,   // Durable | EphemeralLatest | EphemeralWindow | RequestResponse | StreamChunk
-    lamport: u64,              // logical order (assigned by owner on publish)
-    occurred_at_ms: u64,
+    seq: Seq,                  // owner-assigned order = (epoch: u64, counter: u64).
+                               // epoch is persisted and bumped on every daemon
+                               // start, so post-crash events sort strictly AFTER
+                               // anything pre-crash even if the in-memory counter
+                               // rewinds (deliver-first can ack a counter the ORM
+                               // hasn't flushed yet — see §3.8). A bare u64 counter
+                               // is NOT safe here.
+    occurred_at_ms: u64,       // owner-stamped via an injectable clock (deterministic tests)
     correlation_id: Option<Uuid>, // command ↔ result, request ↔ response
     coalesce_key: Option<String>, // for EphemeralLatest
     headers: BTreeMap<String,String>, // routable metadata; airc routes on these, never parses payload
@@ -63,6 +69,13 @@ struct Envelope {
 
 The server routes on `channel` / `target` / `headers` / `delivery` and **never
 interprets `payload`**. That opacity is what keeps it generic across towers.
+
+**Signature scope:** the sender signs the sender-authored fields only. `seq` is
+owner-assigned metadata *outside* the sender's signature — otherwise a remote
+owner re-injecting an event (§3.7) would invalidate the signature when it stamps
+its own seq. Verification covers `{event_id, channel, from, target, kind,
+correlation_id, headers, payload}`; `seq`/`occurred_at_ms` are owner-stamped and
+covered (if at all) by a separate owner signature.
 
 ## 3. The layers (the "good efficient server")
 
@@ -110,13 +123,22 @@ Routing is a memory operation; it never touches the DB.
 - Rebuildable from recent events; it's a projection, not a log.
 
 ### 3.5 Cursor engine — efficient replay
-- Cursor = monotonic `(lamport, event_id)`; durable per-subscriber position.
+- Cursor = `(seq, event_id)`, `seq = (epoch, counter)`; durable per-subscriber
+  position. **Scoped per-owner-per-channel** — a channel's total order is
+  authoritative only within one owner daemon. Cross-machine order of a shared
+  channel is deliberately NOT assumed here (§9); slice 1 must not bake in a single
+  global authority.
 - **One atomic contract:** "deliver everything strictly after my cursor, then go
-  live" — no poll gap, no double-delivery (recent served from ring, deep from
-  ORM via `(channel, lamport)` index, then attach to the live broadcast under a
-  lock that guarantees no event is missed or duplicated at the seam).
-- Lagged subscribers get an explicit lag signal + forced resume from store —
-  never silent loss on the durable path.
+  live" — no poll gap, no double-delivery. **Precondition that makes "no gap"
+  true:** a `Durable` ring entry is not evictable until the write-behind confirms
+  it is persisted (§3.8), so the seam's deep-replay can never miss an event that
+  is neither in the ring nor in the ORM yet. Recent from ring, deep from ORM via
+  the `(channel, epoch, counter)` index, then attach to the live broadcast at a
+  seam that admits no miss/dup.
+- **Slow subscriber = lagged, never a stall.** Fan-out NEVER blocks on a slow
+  `Durable` subscriber (that would head-of-line-block the whole shard). It is
+  marked lagged, the live push dropped, and it resumes from the store via its
+  cursor (§3.8).
 
 ### 3.6 IPC — sessions attach
 - `attach{filter, from_cursor}` → server replays-then-streams. `publish{envelope}`
@@ -129,6 +151,35 @@ Routing is a memory operation; it never touches the DB.
   once and re-injected into the local router (so a remote `data:*` reaches local
   subscribers identically to a local one). The `grid-router-daemon` policy
   (BGP-style, from GRID-BUS) lives here.
+
+### 3.8 Crash-safety, ordering & backpressure invariants
+The preconditions that make §3.5's cursor contract actually hold under
+deliver-first + persist-async. **Slice 1 implements these; it must not assume
+them away** — they're where a naive cursor contract silently drops or reorders.
+
+- **Generational order (`seq = (epoch, counter)`).** `epoch` persisted, bumped
+  every daemon start; `counter` the in-memory monotonic. Deliver-first acks a
+  `counter` before the ORM flushes it, so a crash loses the tail and a counter
+  rebuilt from ORM-max would *reissue* numbers live subscribers already observed.
+  Bumping `epoch` makes post-crash events sort strictly after anything pre-crash
+  regardless of counter rewind. `(epoch, counter, event_id)` is the total order
+  within one owner+channel.
+- **Ring entries pinned until persisted.** A `Durable` ring entry is not evictable
+  until write-behind confirms it's in the ORM — the precondition for "no gap"
+  (otherwise an event can be neither in the ring nor persisted at a seam replay).
+  Sets a **ring capacity floor ≥ max un-persisted backlog**.
+- **Durable receipt + `await_durable` opt-in.** Default receipt `(event_id, seq)`
+  returns after fan-out, before persistence — correct for fire-and-forget chat.
+  Durability-critical flows (a command/result the publisher acts on) pass
+  `await_durable: true`; publish resolves only after the group-commit. Fast path
+  stays default.
+- **Bounded write-behind + explicit full policy.** Queue is bounded (≥ ring
+  floor). When full: durable/`await_durable` publishers **block** (publisher-side
+  backpressure); fire-and-forget sheds with a surfaced `WriteBehindSaturated`
+  error. Never silently drop a `Durable`; never OOM.
+- **WAL checkpoint off the hot path.** Sustained durable writes grow the WAL;
+  checkpoints run on the writer task by cadence/size trigger, off the publish hot
+  path, so they can't spike publish→subscriber p95 (§6 benches this).
 
 ## 4. Data flow
 
@@ -148,10 +199,15 @@ verifies + re-injects → its local subscribers receive it. Symmetric inbound.
 ## 5. Concurrency model
 
 - Tokio multi-thread. Per-channel sharding for the router; one **dedicated ORM
-  writer task** draining a batch queue (single writer, group commit). Broadcast
-  via bounded per-subscriber channels (backpressure on `Durable`, drop-and-count
-  on ephemeral). **No lock held across `.await`; no global mutable state** (the
-  reliability invariant — also what makes tests deterministic).
+  writer task** draining a **bounded** batch queue (single writer, group commit).
+- **Backpressure is on the publisher, never on fan-out.** When the write-behind
+  queue is full the *publisher* blocks (or sheds with a surfaced error for
+  fire-and-forget) — §3.8. Fan-out to subscribers is **never** blocked by a slow
+  consumer: a lagging `Durable` subscriber is marked lagged and resumes from the
+  store (§3.5); ephemeral drops-and-counts. Neither stalls the shard, so this
+  doesn't contradict "no blocking across `.await`."
+- **No lock held across `.await`; no global mutable state; injectable clock + seq
+  counter** — the reliability invariant, and what makes §9's tests deterministic.
 
 ## 6. Performance targets (gated, not claimed)
 
@@ -161,7 +217,9 @@ verifies + re-injects → its local subscribers receive it. Symmetric inbound.
   for consumed events; no per-room file or poll).
 - Ephemeral burst (typing/presence/signaling) does **not** touch the ORM.
 - Bench: extend `crates/airc-lib/tests/fanout_bench.rs` with many-rooms,
-  burst-ephemeral, deep-replay, and idle-CPU cases.
+  burst-ephemeral, deep-replay, idle-CPU, and a **sustained-durable-write** case
+  long enough to trigger real WAL checkpoints (not just bursts) — proves
+  checkpoint stalls don't blow p95.
 
 ## 7. What this deletes / replaces
 
@@ -186,11 +244,21 @@ verifies + re-injects → its local subscribers receive it. Symmetric inbound.
 ## 9. Reliability invariants
 
 Deterministic convergence (account-canonical identity → stable room_id); no
-shared mutable global state (runtime or tests); tests run against isolated
-embeddable owner instances with explicit lifecycle (every spawned daemon reaped);
-durable path never loses an event, ephemeral drops counted; **every CI job green
-before merge** (this repo doesn't enforce required checks — the merging agent
-verifies each, esp. `windows-latest`; no `--auto`).
+shared mutable global state (runtime or tests); **injectable clock + seq counter**
+so tests are bit-deterministic; tests run against isolated embeddable owner
+instances with explicit lifecycle (every spawned daemon reaped); durable path
+never loses an event (§3.8), ephemeral drops counted; **every CI job green before
+merge** (this repo doesn't enforce required checks — the merging agent verifies
+each, esp. `windows-latest`; no `--auto`).
+
+**Cross-machine ordering is an open problem, scoped OUT of slice 1 (and not
+precluded).** When account-canonical identity lets two owner daemons write the
+same `room_id`, each has its own `(epoch, counter)` authority — there is no single
+per-channel total order across owners, so re-injection (§3.7) can interleave/dup.
+Slice 1's cursor contract is therefore **per-owner-per-channel** (§3.5); the
+cross-machine resolution (hybrid logical clock, or per-channel owner election)
+lands in slices 4-5. Slice 1 must not inherit a single-global-authority
+assumption that slice 4 then has to tear out.
 
 ## 10. Implementation slices (top-down, each benchmark + reliability gated)
 
