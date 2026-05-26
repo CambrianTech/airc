@@ -416,6 +416,12 @@ fn default_join_context_subscribes_general_and_repo_owner_on_shared_account_wire
             let alice_home = alice_repo.join(".airc");
             let bob_home = bob_repo.join(".airc");
 
+            // Mesh identity resolves against the machine-global
+            // coordinator store (`$HOME/.airc/events.sqlite`), not the
+            // per-scope store — see `Airc::mesh_identity`. Seed the
+            // coordinator so both scopes converge on "joelteply"
+            // deterministically without a `gh` shell-out.
+            seed_mesh_identity(&machine.path().join(".airc"), "joelteply").await;
             seed_mesh_identity(&alice_home, "joelteply").await;
             seed_mesh_identity(&bob_home, "joelteply").await;
 
