@@ -1,6 +1,8 @@
 //! Daemon → client responses. Symmetric to `request.rs` — typed
 //! enum, wire-tagged by `kind`.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use airc_core::{EventId, PeerId, RoomId};
@@ -23,6 +25,10 @@ pub enum Response {
     },
     /// Response to `Publish`.
     Publish(PublishResponse),
+    /// Response to `ResolveWire`. `wire` is `None` when the
+    /// channel UUID isn't subscribed in this daemon's scope —
+    /// caller must join the channel first.
+    ResolveWire(ResolveWireResponse),
     /// Response to `ListPeers` — the daemon's currently-enrolled
     /// peers (peer_id + URL-safe-no-padding base64 pubkey).
     Peers(PeersResponse),
@@ -97,6 +103,19 @@ pub struct PublishResponse {
     pub channel_id: RoomId,
 }
 
+/// Result of a `ResolveWire` request.
+///
+/// `wire` is `Some(path)` when the daemon's subscription store
+/// has a subscription on the requested channel UUID; `None`
+/// when the daemon has never seen that channel (caller must
+/// join it first — `ResolveWire` does not auto-subscribe, same
+/// non-auto-join discipline as `Airc::publish`'s
+/// `PublishTarget::RoomByName`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveWireResponse {
+    pub wire: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +181,24 @@ mod tests {
             occurred_at_ms: 3,
             channel_id: RoomId::from_u128(4),
         });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn resolve_wire_roundtrips_with_path() {
+        let original = Response::ResolveWire(ResolveWireResponse {
+            wire: Some(PathBuf::from("/var/lib/airc/wires/project-x")),
+        });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn resolve_wire_roundtrips_with_none() {
+        let original = Response::ResolveWire(ResolveWireResponse { wire: None });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);

@@ -48,7 +48,8 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Publish(_)
-            | Response::Peers(_) => {}
+            | Response::Peers(_)
+            | Response::ResolveWire(_) => {}
         }
     }
 }

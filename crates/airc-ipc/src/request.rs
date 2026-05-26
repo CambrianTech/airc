@@ -39,6 +39,12 @@ pub enum Request {
     /// wire. Idempotent — repeated calls return Ok without
     /// duplicating subscriptions.
     Subscribe(SubscribeRequest),
+    /// Look up the wire path for a channel UUID. Daemon answers
+    /// from its subscription store so consumer-side code (e.g.
+    /// continuum's `DaemonAircRealtimeStore`) can fill
+    /// `PublishRequest.wire` without knowing the daemon's
+    /// filesystem layout. Closes work card 6e525958.
+    ResolveWire(ResolveWireRequest),
     /// Read events from the daemon's durable event store, strictly
     /// after `since` (a `(lamport, event_id)` cursor) and optionally
     /// filtered to a single channel. Pass back the response's
@@ -59,6 +65,18 @@ pub struct SubscribeRequest {
     /// Wire directory to subscribe on (creates the local-fs adapter
     /// + replay-anchored subscription if not already running).
     pub wire: std::path::PathBuf,
+}
+
+/// Parameters for `ResolveWire`. The daemon answers from its
+/// own subscription store; consumer-side callers (continuum's
+/// `DaemonAircRealtimeStore`, OpenClaw/Hermes bridges) get the
+/// wire path without ever needing to construct it themselves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveWireRequest {
+    /// Channel UUID to resolve. Same value the consumer holds
+    /// from prior `Subscribe`, `Publish`, or `airc room`
+    /// interactions.
+    pub channel: Uuid,
 }
 
 /// Parameters for `Inbox`.
@@ -201,5 +219,15 @@ mod tests {
             serde_json::to_string(&Request::Stop).unwrap(),
             r#"{"op":"stop"}"#
         );
+    }
+
+    #[test]
+    fn resolve_wire_roundtrips_with_typed_channel() {
+        let original = Request::ResolveWire(ResolveWireRequest {
+            channel: Uuid::from_u128(0xabcd_1234),
+        });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
     }
 }

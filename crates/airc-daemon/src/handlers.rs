@@ -15,11 +15,12 @@ use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request, SendRequest,
-    SubscribeRequest,
+    AddPeerRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request, ResolveWireRequest,
+    SendRequest, SubscribeRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, StatusResponse,
+    InboxResponse, PeerEntry, PeersResponse, PublishResponse, ResolveWireResponse, Response,
+    StatusResponse,
 };
 use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
 use airc_transport::Transport;
@@ -48,6 +49,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Subscribe(sub) => handle_subscribe(state, sub).await,
+        Request::ResolveWire(req) => handle_resolve_wire(state, req).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
@@ -160,6 +162,32 @@ fn trust_root_for_wire(wire: &Path) -> Option<PathBuf> {
         }
         _ => Some(wire.to_path_buf()),
     }
+}
+
+/// `ResolveWire` handler — answer "what wire path serves this
+/// channel UUID?" from the daemon's subscription store. Returns
+/// `wire: None` when the channel isn't subscribed, so callers
+/// can distinguish "not joined yet" from "lookup failed."
+///
+/// Closes work card 6e525958. Consumer-side callers (continuum's
+/// `DaemonAircRealtimeStore`, OpenClaw/Hermes bridges) use this
+/// to fill `PublishRequest.wire` without having to know the
+/// daemon's filesystem layout.
+async fn handle_resolve_wire(state: Arc<DaemonState>, request: ResolveWireRequest) -> Response {
+    let channel = airc_core::RoomId::from_uuid(request.channel);
+    let subscriptions = match state.event_store.load_subscriptions().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return Response::Error {
+                message: format!("resolve_wire: load subscriptions: {error}"),
+            };
+        }
+    };
+    let wire = subscriptions
+        .into_iter()
+        .find(|sub| !sub.parted && sub.room_id == channel)
+        .map(|sub| PathBuf::from(sub.wire));
+    Response::ResolveWire(ResolveWireResponse { wire })
 }
 
 async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
@@ -393,6 +421,106 @@ mod tests {
                 assert!(status.uptime_seconds >= 1, "uptime must accumulate");
             }
             other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_wire_returns_none_for_unsubscribed_channel() {
+        // Fresh daemon → no subscriptions → unknown channel
+        // resolves to None (NOT an error — the caller knows to
+        // join first).
+        let state = test_state();
+        let response = dispatch(
+            state,
+            Request::ResolveWire(ResolveWireRequest {
+                channel: Uuid::from_u128(0xdead_beef),
+            }),
+        )
+        .await;
+        match response {
+            Response::ResolveWire(payload) => assert!(
+                payload.wire.is_none(),
+                "unsubscribed channel must resolve to None"
+            ),
+            other => panic!("expected ResolveWire, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_wire_returns_subscription_wire_when_known() {
+        use airc_core::RoomId;
+        use airc_store::StoredSubscription;
+
+        let state = test_state();
+        let room_id = RoomId::new();
+        let wire_path = "/tmp/airc-test/wires/project-x";
+        // Seed the store directly so we don't pull in the full
+        // join lifecycle for a unit test.
+        state
+            .event_store
+            .replace_subscriptions(vec![StoredSubscription {
+                channel_name: "project-x".to_string(),
+                room_id,
+                wire: wire_path.to_string(),
+                joined_at_ms: 0,
+                is_default: true,
+                parted: false,
+            }])
+            .await
+            .expect("seed subscription");
+
+        let response = dispatch(
+            state,
+            Request::ResolveWire(ResolveWireRequest {
+                channel: room_id.as_uuid(),
+            }),
+        )
+        .await;
+        match response {
+            Response::ResolveWire(payload) => assert_eq!(
+                payload.wire,
+                Some(PathBuf::from(wire_path)),
+                "subscribed channel must resolve to its wire path"
+            ),
+            other => panic!("expected ResolveWire, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_wire_skips_parted_subscriptions() {
+        // A parted subscription should NOT be resolvable —
+        // matches the non-auto-rejoin discipline.
+        use airc_core::RoomId;
+        use airc_store::StoredSubscription;
+
+        let state = test_state();
+        let room_id = RoomId::new();
+        state
+            .event_store
+            .replace_subscriptions(vec![StoredSubscription {
+                channel_name: "old-room".to_string(),
+                room_id,
+                wire: "/tmp/airc-test/wires/old-room".to_string(),
+                joined_at_ms: 0,
+                is_default: false,
+                parted: true,
+            }])
+            .await
+            .expect("seed parted subscription");
+
+        let response = dispatch(
+            state,
+            Request::ResolveWire(ResolveWireRequest {
+                channel: room_id.as_uuid(),
+            }),
+        )
+        .await;
+        match response {
+            Response::ResolveWire(payload) => assert!(
+                payload.wire.is_none(),
+                "parted channel must not resolve to a wire"
+            ),
+            other => panic!("expected ResolveWire, got {other:?}"),
         }
     }
 
