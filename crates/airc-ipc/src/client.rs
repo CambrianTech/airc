@@ -18,9 +18,11 @@ use crate::transport::IpcStream;
 
 use crate::request::{
     AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
-    SendRequest, SubscribeRequest,
+    ResolveWireRequest, SendRequest, SubscribeRequest,
 };
-use crate::response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
+use crate::response::{
+    InboxResponse, PeersResponse, PublishResponse, ResolveWireResponse, Response, StatusResponse,
+};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBSCRIBE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -134,6 +136,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Ok) => Ok(other),
         }
     }
@@ -151,6 +154,7 @@ impl DaemonClient {
             | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -171,6 +175,7 @@ impl DaemonClient {
             | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -184,6 +189,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -195,6 +201,28 @@ impl DaemonClient {
             | Response::Status(_)
             | Response::Inbox(_)
             | Response::Event { .. }
+            | Response::Peers(_)
+            | Response::Ok
+            | Response::ResolveWire(_)
+            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Look up the wire path the daemon uses for a given channel
+    /// UUID. Returns `None` inside [`ResolveWireResponse`] when the
+    /// daemon has not subscribed that channel yet — same non-auto-
+    /// join discipline as [`Airc::publish`](airc-lib's publish API).
+    pub async fn resolve_wire(
+        &self,
+        request: ResolveWireRequest,
+    ) -> Result<ResolveWireResponse, ClientError> {
+        match self.call(Request::ResolveWire(request)).await? {
+            Response::ResolveWire(response) => Ok(response),
+            other @ (Response::Pong
+            | Response::Status(_)
+            | Response::Inbox(_)
+            | Response::Event { .. }
+            | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
@@ -222,6 +250,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -235,6 +264,7 @@ impl DaemonClient {
             | Response::Publish(_)
             | Response::Peers(_)
             | Response::Ok
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -248,6 +278,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -261,6 +292,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -274,6 +306,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Peers(_)
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
@@ -290,6 +323,7 @@ impl DaemonClient {
             | Response::Event { .. }
             | Response::Publish(_)
             | Response::Ok
+            | Response::ResolveWire(_)
             | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
         }
     }
