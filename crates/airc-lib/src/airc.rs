@@ -418,8 +418,19 @@ impl Airc {
     /// re-resolves after [`crate::mesh_identity::DEFAULT_TTL_MS`] so
     /// concurrent callers don't hammer `gh`. See the module docs for
     /// the resolver chain.
+    ///
+    /// Resolves against the machine-global **coordinator** store
+    /// (`~/.airc/events.sqlite`), NOT the per-scope store. Per
+    /// `docs/architecture/ACCOUNT-MESH-JOIN-CONTRACT.md`, "the account
+    /// identity, not the machine [scope], is the room namespace." A
+    /// per-scope cache let two scopes on the same machine resolve
+    /// divergent identities (`gh_api_user` "joelteply" vs `git_email`
+    /// "joelteply@yahoo.com"), and since the RoomId is derived from
+    /// the identity, the same channel name fractured into two room_ids
+    /// that silently could not see each other. The coordinator store
+    /// is the machine-global convergence point the contract requires.
     pub(crate) async fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
-        let cached = mesh_identity::resolve(self.event_store()).await?;
+        let cached = mesh_identity::resolve(self.coordinator_store()).await?;
         Ok(cached.as_mesh_identity())
     }
 

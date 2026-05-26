@@ -126,6 +126,95 @@ fn two_airc_core_processes_chat_over_local_fs() {
     );
 }
 
+/// Two scopes (project dirs) on ONE machine account, each running
+/// `join`, must deliver chat to each other over the shared
+/// machine-account wire — with NO explicit `--peer` pairing.
+///
+/// This is the real multi-tab topology (e.g. `…/airc` and
+/// `…/continuum` open at once) and the one the in-process
+/// `external_identity_bridge` tests never exercise: there the two
+/// `Airc` instances live in a single process, so the wire subscriber
+/// runs in the same address space. Here they are two real daemons,
+/// which is where same-machine delivery actually breaks.
+#[test]
+fn two_join_scopes_same_machine_deliver_over_shared_wire() {
+    let machine = TempDir::new().expect("tempdir");
+    let repo_a = machine.path().join("airc");
+    let repo_b = machine.path().join("continuum");
+    let home_a = repo_a.join(".airc");
+    let home_b = repo_b.join(".airc");
+    // Same owner → both auto-scope to #cambriantech, the shared room.
+    create_repo_with_origin(&repo_a, "https://github.com/CambrianTech/airc.git");
+    create_repo_with_origin(&repo_b, "https://github.com/CambrianTech/continuum.git");
+
+    // Reproduce the real-world divergence that fractured #cambriantech:
+    // the two scopes resolved DIFFERENT mesh identities for the same
+    // user — scope A via `git_email` ("joelteply@yahoo.com"), scope B
+    // via `gh_api_user` ("joelteply"). Because the RoomId is derived
+    // from the mesh identity, the same channel name produced two
+    // room_ids and the scopes silently filtered out each other's
+    // frames. We seed each scope's PER-SCOPE store with the divergent
+    // values, and the machine-global COORDINATOR store
+    // (`$HOME/.airc/events.sqlite`) with the canonical one.
+    //
+    // Pre-fix, resolution read the per-scope store → divergent room_ids
+    // → scope B never receives scope A's message (this assertion fails).
+    // Post-fix, resolution reads the coordinator store → both converge
+    // on "joelteply" → delivery works. Deterministic: Operator-source
+    // seeds never expire, so no `gh`/`git` shell-out is involved.
+    let coordinator_home = machine.path().join(".airc");
+    seed_mesh_identity(&coordinator_home, "joelteply");
+    seed_mesh_identity(&home_a, "joelteply@yahoo.com");
+    seed_mesh_identity(&home_b, "joelteply");
+
+    let spawn_join = |home: &Path, repo: &Path, client: &str| {
+        let mut join = Command::new(airc_core());
+        join.env("HOME", machine.path())
+            .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+            .env("AIRC_CLIENT_ID", client)
+            .args(["--home", home.to_str().unwrap(), "join"])
+            .current_dir(repo)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        strip_cargo_harness_env(&mut join);
+        let mut child = join.spawn().expect("airc join must spawn");
+        let stdout = spawn_line_reader(child.stdout.take().expect("join stdout"));
+        wait_for_channel_line_contains(&stdout, "attached", JOIN_ATTACH_TIMEOUT)
+            .unwrap_or_else(|| panic!("{client} did not attach"));
+        (child, stdout)
+    };
+
+    let (mut child_a, _a_out) = spawn_join(&home_a, &repo_a, "agent:scope-a");
+    let (mut child_b, b_out) = spawn_join(&home_b, &repo_b, "agent:scope-b");
+
+    // Scope A broadcasts to the default shared channel. No --peer.
+    let needle = "hello-from-scope-a-7f3c91";
+    let mut msg = Command::new(airc_core());
+    msg.env("HOME", machine.path())
+        .args(["--home", home_a.to_str().unwrap(), "msg", needle]);
+    let sent = output_with_timeout(msg, Duration::from_secs(10), "airc msg");
+    assert!(
+        sent.status.success(),
+        "scope A msg failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sent.stdout),
+        String::from_utf8_lossy(&sent.stderr),
+    );
+
+    // Scope B's live feed MUST surface A's message.
+    let got = wait_for_channel_line_contains(&b_out, needle, Duration::from_secs(10));
+
+    let _ = child_a.kill();
+    let _ = child_a.wait();
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+
+    assert!(
+        got.is_some(),
+        "scope B never received scope A's message over the shared machine-account wire — \
+         same-machine cross-process delivery is broken"
+    );
+}
+
 /// Run `airc-core --home <dir> room <name> --wire <wire>`. Used by
 /// tests to pin two peers to the same shared-wire room.
 fn run_room(home: &Path, name: &str, wire: &Path) {
