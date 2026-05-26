@@ -359,7 +359,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             since_lamport,
             since_event_id,
             limit,
-        } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit).await,
+            json,
+        } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit, json).await,
 
         Command::Room { name, wire } => commands::run_room(&home, name, wire).await,
 
