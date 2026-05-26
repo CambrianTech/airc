@@ -23,6 +23,18 @@ Non-negotiable bar (Joel, 2026-05-26): **an extremely quick, efficient router +
 data access + caching + cursors — a good efficient server.** `frames.jsonl` +
 50ms polling violated every one of those and is **deleted**, not optimized.
 
+**Rust-only runtime; runs in VR without Node.js (Joel, 2026-05-26).** All logic,
+daemons, routers, and this event server are **Rust**. The Node/TypeScript layer
+is *pure thin expression over web* — UI/presentation, zero business logic (even
+though it was done wrong before). Consequence: **Continuum integrates Rust-to-
+Rust** — `continuum-core` (Rust) embeds `airc-lib` / speaks `airc-ipc` directly;
+the TS `Commands.execute`/`Events.emit` are thin façades over the Rust core, NOT
+the integration seam. The `.mjs` bridge and TS dual-write are doubly wrong (logic
+in Node) and are deleted. The whole runtime must be self-sufficient Rust with
+**zero Node dependency** so it runs inside VR; the only non-Rust surface is the
+thin web/UI expression (WASM-capable). If logic lived in Node it couldn't run in
+VR — which is why it must be Rust.
+
 ## 1. Topology
 
 ```
@@ -180,6 +192,43 @@ them away** — they're where a naive cursor contract silently drops or reorders
 - **WAL checkpoint off the hot path.** Sustained durable writes grow the WAL;
   checkpoints run on the writer task by cadence/size trigger, off the publish hot
   path, so they can't spike publish→subscriber p95 (§6 benches this).
+
+### 3.9 Domain flow patterns (validated against Continuum recipes/academy/rooms/grid)
+The entity/flow cut holds for all four domains (entities → ORM: RecipeEntity,
+AcademySessionEntity, RoomEntity metadata, grid topology snapshot; flows → airc:
+sentinel progress, academy curriculum/training/exam events, chat/presence/
+membership, grid node/route/contract events). Four flow patterns must be
+*first-class so slice 1 doesn't preclude them* (the primitives live in the
+slice-1/2 envelope; the orchestration is realized in slices 3-4):
+
+- **Long-running operations.** A `Command` returns a handle = its `correlation_id`
+  immediately; progress arrives as `StreamChunk` events on that correlation;
+  the terminal result is a `Durable` `CommandResult`. **Cancellation** is a
+  `Control` envelope addressed to the `correlation_id` that the executor observes
+  (academy `pause`/`stop`, recipe step abort). Covers academy training hours/days
+  and sentinel/recipe pipelines — which today only emit on completion.
+- **Fan-out / scatter-gather.** `target` may be a **capability/query** (e.g.
+  `inference:* on a gpu peer`), which the grid-router resolves to a peer *set* —
+  1-to-N addressing. Each replies tagged with the `correlation_id`. **Aggregation
+  policy (all / majority / first / quorum / timeout) is a client/router concern**
+  built on target-set + correlation — NOT a new substrate primitive. The GRID-BUS
+  bid loop (`command:bid-request → bid-response → bid-accepted`) is the canonical
+  realization. Slice 1 must include the capability/query `Target` variant + the
+  `Control` kind so this isn't precluded.
+- **Lease-bounded coordination waits.** A watcher of a long-running producer must
+  rely on the producer's heartbeat — an `EphemeralLatest` presence / the existing
+  `airc-work` claim lease (TTL + heartbeat) — to detect death (lease expiry → fail
+  clean), never an indefinite `timeout=0` watch (today's teacher/student sentinel
+  hang). "Watch with lease" = a subscription + a presence lease; no new primitive,
+  but stated so coordination is crash-safe.
+- **State-changes are events; snapshots are entities.** A room membership
+  change, an academy status transition, a grid node join/leave is a `Durable`
+  event on the relevant channel (`room:member:joined`, `node:joined`); the
+  queryable *current* snapshot (room metadata + member list, session entity,
+  routing table) is the ORM entity tier or an in-memory projection folded from
+  those events. Mutations flow; queryable state is the entity. (This is the
+  GRID-BUS migration for rooms — membership/presence/messages move onto the bus;
+  room metadata stays ORM.)
 
 ## 4. Data flow
 
