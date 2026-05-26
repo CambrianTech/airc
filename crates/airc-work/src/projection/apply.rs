@@ -113,6 +113,7 @@ impl WorkBoardProjection {
     pub fn stale_claims(&self, now_ms: u64) -> Vec<StaleClaim> {
         self.cards
             .values()
+            .filter(|card| !matches!(card.state, CardState::Merged | CardState::Closed))
             .filter_map(|card| {
                 let (owner, claim_id, expires_at_ms) =
                     (card.owner?, card.claim_id?, card.claim_expires_at_ms?);

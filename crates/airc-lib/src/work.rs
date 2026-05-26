@@ -610,7 +610,12 @@ impl Airc {
                 .find(|claim| claim.card_id == card.card_id)
                 .cloned();
             let open = card.state == airc_work::CardState::Open && card.claim_id.is_none();
-            let stale_claimable = query.include_stale_claims && stale_claim.is_some();
+            let stale_claimable = query.include_stale_claims
+                && stale_claim.is_some()
+                && !matches!(
+                    card.state,
+                    airc_work::CardState::Merged | airc_work::CardState::Closed
+                );
             if !open && !stale_claimable {
                 continue;
             }

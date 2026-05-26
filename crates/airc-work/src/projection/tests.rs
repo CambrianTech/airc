@@ -63,6 +63,67 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
 }
 
 #[test]
+fn terminal_cards_do_not_surface_stale_claims() {
+    let owner = peer(6);
+    let merged_card = WorkCardId::from_u128(7);
+    let merged_claim = ClaimId::from_u128(8);
+    let closed_card = WorkCardId::from_u128(9);
+    let closed_claim = ClaimId::from_u128(10);
+
+    let projection = WorkBoardProjection::replay(vec![
+        WorkEvent::CardCreated(CardCreated {
+            card_id: merged_card,
+            repo: repo(),
+            title: "merged stale claim".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 100,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id: merged_card,
+            claim_id: merged_claim,
+            owner,
+            ttl_ms: 10,
+            claimed_at_ms: 110,
+        }),
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id: merged_card,
+            state: CardState::Merged,
+            changed_by: owner,
+            changed_at_ms: 120,
+        }),
+        WorkEvent::CardCreated(CardCreated {
+            card_id: closed_card,
+            repo: repo(),
+            title: "closed stale claim".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 100,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id: closed_card,
+            claim_id: closed_claim,
+            owner,
+            ttl_ms: 10,
+            claimed_at_ms: 110,
+        }),
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id: closed_card,
+            state: CardState::Closed,
+            changed_by: owner,
+            changed_at_ms: 120,
+        }),
+    ])
+    .unwrap();
+
+    assert!(projection.stale_claims(121).is_empty());
+}
+
+#[test]
 fn releasing_claim_clears_owner_without_reopening_closed_card() {
     let card_id = WorkCardId::from_u128(10);
     let claim_id = ClaimId::from_u128(11);
