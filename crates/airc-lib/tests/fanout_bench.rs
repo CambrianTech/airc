@@ -98,9 +98,19 @@ async fn fanout_latency_polled_wire_vs_in_process_broadcast() {
         rows.push(("A", k, sample));
     }
     for &k in &SUBSCRIBER_COUNTS {
-        let sample = run_path_b_in_process(k).await;
+        let sample = run_path_b_in_process(k, FrameKind::Event).await;
         print_row("B in-process (live_tx)", k, &sample);
         rows.push(("B", k, sample));
+    }
+    // Durable (Message-kind) over the same in-process broadcast. This
+    // is the slice-1 proof: deliver-first reorder moved the ~27ms wire
+    // fsync AFTER the live_tx fan-out, so Durable receive latency should
+    // now be low-ms (broadcast time), not ~27ms. Pre-reorder this row
+    // would read ~27ms.
+    for &k in &SUBSCRIBER_COUNTS {
+        let sample = run_path_b_in_process(k, FrameKind::Message).await;
+        print_row("B-durable (live_tx, Message)", k, &sample);
+        rows.push(("B-durable", k, sample));
     }
 
     println!("{}", "-".repeat(92));
@@ -192,6 +202,21 @@ fn run_sanity_checks(rows: &[(&'static str, usize, Sample)]) {
         all_ok &= ok;
         println!(
             "[{}] Path B K={k} p50={:?} p99={:?} poll-free low-single-digit-ms (p99<25ms expected)",
+            mark(ok),
+            sample.p50,
+            sample.p99
+        );
+    }
+
+    // Check 2b (slice-1 deliver-first proof): Durable/Message-kind over
+    // the in-process broadcast must ALSO be low-ms. The wire fsync
+    // (~27ms) now runs AFTER the live_tx fan-out, so receive latency is
+    // the broadcast time, not the fsync. Pre-reorder this read ~27ms.
+    for (_path, k, sample) in rows.iter().filter(|(p, _, _)| *p == "B-durable") {
+        let ok = sample.p99 < Duration::from_millis(25);
+        all_ok &= ok;
+        println!(
+            "[{}] B-durable K={k} p50={:?} p99={:?} fsync now AFTER fan-out (p99<25ms expected; ~27ms pre-reorder)",
             mark(ok),
             sample.p50,
             sample.p99
@@ -299,7 +324,7 @@ async fn run_path_a_polled_wire(subscriber_count: usize) -> Sample {
     // start of the stream.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let sent = send_stream(&publisher).await;
+    let sent = send_stream(&publisher, FrameKind::Event).await;
     let send_started = sent.first().map(|p| p.1).unwrap();
 
     collect(receivers, sent, send_started).await
@@ -308,7 +333,7 @@ async fn run_path_a_polled_wire(subscriber_count: usize) -> Sample {
 // ---------------------------------------------------------------------
 // Path B: in-process broadcast (one instance, K subscribe() streams).
 // ---------------------------------------------------------------------
-async fn run_path_b_in_process(subscriber_count: usize) -> Sample {
+async fn run_path_b_in_process(subscriber_count: usize, kind: FrameKind) -> Sample {
     let home = TempDir::new().unwrap();
     let airc = Airc::open(home.path()).await.unwrap();
     airc.join("fanout-bench").await.unwrap();
@@ -327,7 +352,7 @@ async fn run_path_b_in_process(subscriber_count: usize) -> Sample {
     // the handle so sends share the same live_tx the streams subscribed
     // to (a fresh open would allocate a different broadcast channel).
     let publisher = airc.clone();
-    let sent = send_stream(&publisher).await;
+    let sent = send_stream(&publisher, kind).await;
     let send_started = sent.first().map(|p| p.1).unwrap();
 
     collect(receivers, sent, send_started).await
@@ -342,19 +367,20 @@ async fn run_path_b_in_process(subscriber_count: usize) -> Sample {
 /// deliberately not serialized — the receiver reports seq, and we look
 /// up the matching sent_at here.
 ///
-/// FrameKind::Event (not Message) is deliberate. It isolates the
-/// structural delivery cost the bus design cares about — 50ms poll
-/// (Path A) vs in-process broadcast (Path B) — from the orthogonal
-/// macOS `sync_data()` fsync that Message frames pay on every wire
-/// write (local_fs.rs `write_then_maybe_sync`, ~27ms on this box).
-/// That fsync is sequenced BEFORE the live_tx fan-out in
-/// `send_frame_to_room` (execute_send_route at messaging.rs:131, then
-/// append_sent_frame at :133), so a Message-kind Path B would report
-/// ~27ms even though the broadcast itself is sub-microsecond. Event
-/// frames skip fsync (local_fs.rs:218-223) and are exactly what
-/// continuum's high-frequency persona traffic (pose/typing/turn) rides
-/// on per the local_fs.rs module docs.
-async fn send_stream(publisher: &Airc) -> Vec<(usize, Instant)> {
+/// `kind` is parameterized. Path A and the primary Path B row use
+/// `FrameKind::Event`, which isolates the structural delivery cost the
+/// bus design cares about — 50ms poll (Path A) vs in-process broadcast
+/// (Path B) — from the orthogonal macOS `sync_data()` fsync that
+/// Message frames pay on every wire write (local_fs.rs
+/// `write_then_maybe_sync`, ~27ms on this box). The extra
+/// "B-durable" row sends `FrameKind::Message` specifically to measure
+/// the deliver-first reorder: `append_sent_frame` (persist + live_tx
+/// fan-out) now runs BEFORE `execute_send_route` (the fsync'ing wire
+/// write) in `send_frame_to_room`, so Durable receive latency should be
+/// low-ms (broadcast time) instead of ~27ms (post-fsync). Event frames
+/// skip fsync (local_fs.rs:218-223) and are what continuum's
+/// high-frequency persona traffic (pose/typing/turn) rides on.
+async fn send_stream(publisher: &Airc, kind: FrameKind) -> Vec<(usize, Instant)> {
     let mut sent = Vec::with_capacity(EVENT_COUNT);
     for seq in 0..EVENT_COUNT {
         let mut headers = Headers::new();
@@ -363,7 +389,7 @@ async fn send_stream(publisher: &Airc) -> Vec<(usize, Instant)> {
         let now = Instant::now();
         publisher
             .send_frame_to_for_test(
-                FrameKind::Event,
+                kind,
                 MentionTarget::All,
                 Body::text(format!("{SEQ_PREFIX}{seq}")),
                 headers,
