@@ -557,23 +557,41 @@ mod tests {
         );
     }
 
+    // Two SEPARATE machine accounts, same gh identity, bridged ONLY
+    // through the remote registry. Each machine gets its own EXPLICIT
+    // wire root (coordinator store) via `open_with_wire_root_for_test`,
+    // so `machine_account_home`/`HOME` never collapses them onto one
+    // store — no process-global env mutation (which would race the
+    // parallel test runner), and identical behavior on Unix and Windows.
     #[tokio::test]
     async fn sqlite_registry_bridges_two_isolated_machine_homes() {
         let dir = tempdir().unwrap();
         let machine_a = dir.path().join("machine-a/.airc");
         let machine_b = dir.path().join("machine-b/.airc");
-        write_identity(&machine_a).await;
-        write_identity(&machine_b).await;
+        let wire_a = dir.path().join("wire-a");
+        let wire_b = dir.path().join("wire-b");
+        // Seed each machine's coordinator (wire-root) store with the
+        // shared gh identity so mesh resolution is deterministic.
+        write_identity(&wire_a).await;
+        write_identity(&wire_b).await;
         let store = sqlite_registry_store_at(&dir.path().join("remote-registry")).await;
 
-        let airc_a = Airc::open(&machine_a).await.unwrap();
+        // Machine A publishes its presence/registry to the remote store.
+        let airc_a = Airc::open_with_wire_root_for_test(&machine_a, &wire_a)
+            .await
+            .unwrap();
         airc_a.join("general").await.unwrap();
         airc_a.publish_account_registry(&store).await.unwrap();
 
-        let airc_b = Airc::open(&machine_b).await.unwrap();
+        // Machine B refreshes from the remote store — airc_a's beacon
+        // reaches B's coordinator ONLY through this bridge (separate
+        // wire roots, so it cannot leak via a shared store).
+        let airc_b = Airc::open_with_wire_root_for_test(&machine_b, &wire_b)
+            .await
+            .unwrap();
         let refreshed = airc_b.refresh_account_registry(&store).await.unwrap();
-
         assert!(refreshed.is_some());
+
         let peers = airc_trust::load(&airc_b.inner.wire_root).await.unwrap();
         assert!(peers.iter().any(|peer| peer.peer_id == airc_a.peer_id()));
         let snapshot = crate::coordinator::snapshot_store(
