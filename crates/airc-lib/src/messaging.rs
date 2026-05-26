@@ -128,9 +128,23 @@ impl Airc {
             .keypair
             .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
             .map_err(|error| AircError::Crypto(error.to_string()))?;
-        self.execute_send_route(route.kind, room, frame.clone())
-            .await?;
-        self.append_sent_frame(frame).await?;
+        // Deliver-first, persist-then-transport. `append_sent_frame`
+        // persists to the local ORM (durability source of truth) and
+        // fans out to in-process subscribers via `live_tx`;
+        // `execute_send_route` writes the frame to the wire for
+        // cross-process/remote delivery and does a ~27ms `fsync` for
+        // Durable/Control frames. Running the wire write FIRST put that
+        // fsync stall in front of every local delivery — see
+        // docs/realtime-event-bus.md "Decoupled Delivery". Local
+        // subscribers now see the event as soon as the ORM append
+        // commits (sub-ms); the wire write no longer blocks fan-out.
+        //
+        // Ordering/dedup is preserved: `append_sent_frame` marks the
+        // event_id in the broadcast ring BEFORE the wire write, so the
+        // wire subscriber's later re-read of the same frame still skips
+        // a duplicate fan-out.
+        self.append_sent_frame(frame.clone()).await?;
+        self.execute_send_route(route.kind, room, frame).await?;
         Ok(SendFrameResult {
             event_id,
             lamport,
