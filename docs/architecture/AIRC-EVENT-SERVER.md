@@ -229,6 +229,20 @@ slice-1/2 envelope; the orchestration is realized in slices 3-4):
   those events. Mutations flow; queryable state is the entity. (This is the
   GRID-BUS migration for rooms — membership/presence/messages move onto the bus;
   room metadata stays ORM.)
+- **Real-time avatar rooms (mixed persona + human, audio/video).** A call/VR room
+  is ONE airc channel whose sessions are a MIX of AI personas and humans — same
+  channel, same events, no distinction at the bus. airc carries the
+  **control-plane**: signaling (offer/answer/ICE), participant join/leave,
+  mute/speaking/turn state, call lifecycle. **Animated-avatar state — pose /
+  expression / lip-sync at 60-90Hz per participant — is the canonical
+  `EphemeralLatest` firehose:** coalesced latest-wins by `(channel, participant,
+  state_kind)`, TTL'd, push-fanned, and **never an ORM row.** This is at once the
+  hardest perf case (N participants × 60-90Hz × fan-out, sub-ms, zero DB — the
+  existing `consumer_throughput` pose fixture already drives this) and the live
+  proof that the ephemeral tier keeps the firehose off the ORM. Audio/video
+  *frames* stay on the WebRTC media path; **airc coordinates the room, it never
+  carries media.** The file-poll bus dies here; in-memory-coalesced + push is
+  built for it.
 
 ## 4. Data flow
 
@@ -353,6 +367,7 @@ Lives in `crates/airc-lib/tests/` (extends `fanout_bench.rs` for the perf cases)
 | ephemeral-off-ORM | 1000 `EphemeralLatest` updates → 0 ORM rows; only latest delivered (TTL) | 2 |
 | many-rooms idle | 1000 idle channels ≈ 0 CPU; cheap create; one pattern subscription spans them | 1 |
 | durable replay | late joiner catches up N from cursor (ring recent + ORM deep) | 1 |
+| cursor pagination | tail-N from ring then page deeper through ORM via `(channel,epoch,counter)`; stable, monotonic, no dup across pages | 1 |
 | `await_durable` | receipt only after group-commit; crash after receipt → event survives | 1 |
 | perf gates | p95 publish→subscriber < 20ms under K subs + burst-ephemeral + **sustained-durable (WAL checkpoint)** | 1-2 |
 
@@ -368,7 +383,7 @@ Lives in `crates/airc-lib/tests/` (extends `fanout_bench.rs` for the perf cases)
 | fan-out | command to N capability-matched peers | responses correlated; client quorum/first/timeout aggregation | 4 |
 | grid | manifest broadcast; cross-machine dispatch | routing table folds manifests; remote command→result; contract chain (proposed→…→paid) replayable from cursor | 4-5 |
 | cross-machine convergence | two machine owners, same account | same `#room` without pasted invite; per-owner-per-channel order respected | 5 |
-| webrtc | offer/answer/ICE between two sessions | signaling rides airc as events; **media never enters airc** (asserted) | 5 |
+| webrtc avatar room | mixed persona+human room; audio/video; animated avatars | signaling + participant/speaking lifecycle on airc; per-participant avatar pose 60-90Hz coalesced (`EphemeralLatest`, **0 ORM rows**); fan-out to all participants under p95<20ms; **media frames never enter airc** | 5 |
 | continuum embed | `continuum-core` (Rust) embeds `airc-lib` | Rust-to-Rust send/subscribe; no Node; dual-write path absent | 6 |
 
 Each row is one realistic, isolated, deterministic integration test. Together they
