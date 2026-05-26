@@ -20,10 +20,8 @@
 //!   `live_tx` is per-instance — the publisher's `live_tx` is a
 //!   different broadcast channel from each subscriber's. The only way
 //!   the bytes reach a subscriber's `live_tx` is via that subscriber's
-//!   own wire tail loop:
-//!     local_fs.rs `sleep(POLL_INTERVAL)` (50ms) -> tail loop yields
-//!     frame -> transport.rs `append_received_frame(frame)` ->
-//!     transport.rs `live_tx.send(...)`.
+//!   own wire tail loop: local_fs.rs poll -> tail loop yields frame ->
+//!   transport.rs `append_received_frame` -> `live_tx.send`.
 //!
 //! - Path B — IN-PROCESS BROADCAST (what embedding airc-lib gives
 //!   continuum): ONE `Airc` instance with K `subscribe()` streams
@@ -85,8 +83,8 @@ async fn fanout_latency_polled_wire_vs_in_process_broadcast() {
     );
     println!();
     println!(
-        "{:<28} {:>3} {:>12} {:>12} {:>14}  {}",
-        "path", "K", "p50", "p99", "events/sec", "delivered"
+        "{:<28} {:>3} {:>12} {:>12} {:>14}  delivered",
+        "path", "K", "p50", "p99", "events/sec"
     );
     println!("{}", "-".repeat(92));
 
