@@ -69,7 +69,21 @@ const FRAMES_FILENAME: &str = "frames.jsonl";
 /// gives uniform "serialize writers without blocking readers"
 /// semantics across both platforms.
 const LOCK_FILENAME: &str = "frames.jsonl.lock";
+/// Idle poll cadence. When no frames are arriving the tail loop checks
+/// the file at this interval — slow enough to keep idle CPU near zero
+/// across many subscribers.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Active poll cadence. While frames are actively arriving the tail
+/// loop polls this fast so cross-process same-machine delivery isn't
+/// pinned to the 50ms idle floor — the realtime/WebRTC-signaling
+/// latency target (see docs/realtime-event-bus.md "Decoupled
+/// Delivery"). A `metadata()` stat is ~µs, so 2ms under load is a
+/// negligible CPU cost on the active wire.
+const FAST_POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// How many consecutive empty polls before backing off from
+/// FAST_POLL_INTERVAL to POLL_INTERVAL. ~64 * 2ms ≈ 128ms of quiet
+/// tolerates a normal inter-message gap before the loop goes idle.
+const ACTIVE_POLLS_BEFORE_BACKOFF: u32 = 64;
 const RECEIVER_CHANNEL_DEPTH: usize = 64;
 
 /// Same-machine wire backed by `<wire-dir>/frames.jsonl`.
@@ -305,6 +319,10 @@ async fn tail_loop(
         }
     };
 
+    // Adaptive cadence: poll fast while frames are actively arriving,
+    // back off to the idle interval after a stretch of quiet. Counts
+    // consecutive polls that found nothing new.
+    let mut idle_polls: u32 = 0;
     loop {
         // Stop if the subscriber dropped the stream. Avoids waking
         // for the next poll just to discover the channel is closed.
@@ -317,8 +335,10 @@ async fn tail_loop(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // File deleted under us (logrotate, manual cleanup,
                 // teardown). Forget our position so when a writer
-                // recreates the file we read from the start.
+                // recreates the file we read from the start. Treat as
+                // idle — there is nothing to fast-poll for yet.
                 offset = 0;
+                idle_polls = idle_polls.saturating_add(1);
                 sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -334,11 +354,25 @@ async fn tail_loop(
             offset = 0;
         }
 
-        if len > offset {
+        let had_new = len > offset;
+        if had_new {
             offset = drain_new_lines(&path, offset, &subscription, &tx).await?;
         }
 
-        sleep(POLL_INTERVAL).await;
+        // Stay fast while the wire is active; relax to the idle cadence
+        // after ACTIVE_POLLS_BEFORE_BACKOFF empty checks so an idle
+        // wire costs almost nothing.
+        if had_new {
+            idle_polls = 0;
+        } else {
+            idle_polls = idle_polls.saturating_add(1);
+        }
+        let wait = if idle_polls < ACTIVE_POLLS_BEFORE_BACKOFF {
+            FAST_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
+        sleep(wait).await;
     }
 }
 
