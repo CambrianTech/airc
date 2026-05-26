@@ -648,6 +648,7 @@ pub async fn run_inbox(
     since_lamport: Option<u64>,
     since_event_id: Option<String>,
     limit: Option<usize>,
+    as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
         Some(socket) => Airc::attach(home, socket).await?,
@@ -673,6 +674,10 @@ pub async fn run_inbox(
         Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
         None => airc.page_recent(effective_limit).await?,
     };
+    if as_json {
+        print_inbox_json(&events)?;
+        return Ok(());
+    }
     if events.is_empty() {
         println!("(no events)");
         return Ok(());
@@ -687,6 +692,45 @@ pub async fn run_inbox(
             cursor.lamport, cursor.event_id
         );
     }
+    Ok(())
+}
+
+/// Emit a single JSON document for `airc inbox --json`.
+///
+/// Shape: `{ count, events, cursor: {lamport, event_id} | null }`.
+/// The cursor is the paging hint pointing at the newest event in
+/// this page; pass both halves back as `--since-lamport` /
+/// `--since-event-id` for the next call. Mirrors `airc events
+/// list --json` for the `{count, events}` shape and extends it
+/// with the paging tuple inbox callers need.
+fn print_inbox_json(events: &[airc_core::TranscriptEvent]) -> Result<(), serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct InboxJson<'a> {
+        count: usize,
+        events: &'a [airc_core::TranscriptEvent],
+        cursor: Option<InboxCursorJson>,
+    }
+    #[derive(serde::Serialize)]
+    struct InboxCursorJson {
+        lamport: u64,
+        event_id: String,
+    }
+
+    let cursor = events
+        .last()
+        .map(airc_core::TranscriptEvent::cursor)
+        .map(|cursor| InboxCursorJson {
+            lamport: cursor.lamport,
+            event_id: cursor.event_id.to_string(),
+        });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&InboxJson {
+            count: events.len(),
+            events,
+            cursor,
+        })?
+    );
     Ok(())
 }
 

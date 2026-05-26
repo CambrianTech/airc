@@ -283,6 +283,13 @@ pub enum Command {
         since_event_id: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Emit a single JSON document on stdout instead of
+        /// human-readable text. Shape mirrors `airc events list
+        /// --json` and `airc publish` for machine consumers
+        /// (continuum's CliAircRealtimeStore, shell scripts, CI
+        /// smoke tests).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print or switch the current room. With no name, prints the
