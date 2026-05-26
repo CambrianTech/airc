@@ -327,3 +327,50 @@ assumption that slice 4 then has to tear out.
 
 Slice 1 is the keystone and dissolves the file-poll, the leaked-daemon class, and
 the macOS test-flake class structurally.
+
+## 11. Battle-harden acceptance suite (the gate)
+
+airc is hardened **in isolation** — every continuum use case is modeled as airc
+envelopes + scripted sessions against isolated embeddable owner instances, with
+**no continuum/Node dependency**. The test model *is* the production model
+(§3.8/§9: isolated instances, injectable clock+seq, no global state, reaped). Each
+test is deterministic and asserts an invariant; continuum's patterns are
+*fixtures* (envelope shapes + session scripts), so we prove behavior under
+realistic shapes before wiring the full stack. **A slice is not done until its
+acceptance tests are green on every CI job.**
+
+Harness: spin N isolated owner instances + M scripted client sessions; injectable
+clock/seq; assert delivery, order, persistence, coalescing, lag, and latency.
+Lives in `crates/airc-lib/tests/` (extends `fanout_bench.rs` for the perf cases).
+
+### 11.1 Substrate reliability — gates slice 1-2
+| Test | Asserts | Slice |
+|---|---|---|
+| convergence | 2 owners, same account → same room_id; A→B delivers | 1 |
+| crash-safety/seq | kill before write-behind flush → restart never reissues a `seq`; epoch bumped; cursor monotonic | 1 |
+| no-gap cursor | attach mid-stream (incl. ring eviction during deliver-first) → replay-then-live, zero miss/dup at seam | 1 |
+| slow subscriber | one lagging `Durable` consumer never stalls fan-out to others; lagged→resume from store | 1 |
+| ephemeral-off-ORM | 1000 `EphemeralLatest` updates → 0 ORM rows; only latest delivered (TTL) | 2 |
+| many-rooms idle | 1000 idle channels ≈ 0 CPU; cheap create; one pattern subscription spans them | 1 |
+| durable replay | late joiner catches up N from cursor (ring recent + ORM deep) | 1 |
+| `await_durable` | receipt only after group-commit; crash after receipt → event survives | 1 |
+| perf gates | p95 publish→subscriber < 20ms under K subs + burst-ephemeral + **sustained-durable (WAL checkpoint)** | 1-2 |
+
+### 11.2 Continuum domains (patterns as fixtures) — gates slice 3-6
+| Test | Scenario (fixture) | Asserts | Slice |
+|---|---|---|---|
+| rooms | create room; sessions join/leave | `room:member:*` Durable on channel; room-list = snapshot + one pattern sub; voice/video signaling routes | 3 |
+| chat | post from one session | Durable; delivered to all room sessions; late-joiner replay from cursor | 3 |
+| presence | typing/online churn | `EphemeralLatest` coalesced; TTL expiry; never an ORM row | 2-3 |
+| commands | `screenshot`/`ping` to an endpoint | routed to endpoint (env/grid scope); correlated `CommandResult` back | 3-4 |
+| events | `data:users:created` broadcast | wildcard/pattern subscribers across sessions receive it | 3 |
+| long-running | academy/recipe run | handle → `StreamChunk` progress → `Control` cancel honored → terminal `Durable` result; **lease-wait detects producer death** (no hang) | 4 |
+| fan-out | command to N capability-matched peers | responses correlated; client quorum/first/timeout aggregation | 4 |
+| grid | manifest broadcast; cross-machine dispatch | routing table folds manifests; remote command→result; contract chain (proposed→…→paid) replayable from cursor | 4-5 |
+| cross-machine convergence | two machine owners, same account | same `#room` without pasted invite; per-owner-per-channel order respected | 5 |
+| webrtc | offer/answer/ICE between two sessions | signaling rides airc as events; **media never enters airc** (asserted) | 5 |
+| continuum embed | `continuum-core` (Rust) embeds `airc-lib` | Rust-to-Rust send/subscribe; no Node; dual-write path absent | 6 |
+
+Each row is one realistic, isolated, deterministic integration test. Together they
+are the proof that airc carries *everything* continuum needs — before the full
+stack is wired — and the regression wall that keeps it that way.
