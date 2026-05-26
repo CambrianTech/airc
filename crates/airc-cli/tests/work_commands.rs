@@ -390,6 +390,56 @@ fn work_close_removes_card_from_claimable_next() {
 }
 
 #[test]
+fn work_next_ignores_stale_claim_after_card_is_closed() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "closed stale work should not resurrect",
+            "--priority",
+            "p0",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("card id");
+
+    let claim = run_ok(
+        &home,
+        &[
+            "work",
+            "claim",
+            card_id,
+            "--ttl-ms",
+            "1",
+            "--no-lease-required",
+        ],
+    );
+    let claim_id = extract_field(&claim, "claim_id:").expect("claim id");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let stale_next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(stale_next.contains(card_id), "{stale_next}");
+    assert!(stale_next.contains(claim_id), "{stale_next}");
+
+    run_ok(&home, &["work", "close", card_id]);
+
+    let board = run_ok(&home, &["work", "board"]);
+    assert!(board.contains("Closed"), "{board}");
+    assert!(!board.contains("stale claims: 1"), "{board}");
+
+    let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
+    assert!(!next.contains(card_id), "{next}");
+    assert!(!next.contains(claim_id), "{next}");
+}
+
+#[test]
 fn lane_create_status_and_state_drive_work_projection() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("agent");
