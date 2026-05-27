@@ -846,7 +846,17 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         .output()
         .expect("stop must spawn");
     assert!(stop.status.success(), "stop failed");
-    let _ = daemon.wait();
+
+    // The daemon MUST exit promptly after a successful `stop`. Bound the
+    // wait: a shutdown regression then fails fast here instead of wedging
+    // the test binary (and CI) until the job timeout — a lost shutdown
+    // notification once hung this for the full 6h ceiling.
+    let exited = wait_for_process_exit(&mut daemon, SPAWN_ROUNDTRIP_TIMEOUT);
+    if !exited {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    assert!(exited, "daemon did not exit after a successful stop");
 }
 
 #[test]
@@ -962,6 +972,26 @@ fn wait_for_channel_line_contains(
                     return None;
                 }
             }
+        }
+    }
+}
+
+/// Poll `child.try_wait()` until the process exits or the deadline
+/// passes; returns true if it exited. Replaces an unbounded `wait()` so
+/// a process that never exits fails the test fast instead of hanging the
+/// whole binary (and CI) indefinitely.
+fn wait_for_process_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return false,
         }
     }
 }

@@ -188,9 +188,14 @@ impl DaemonState {
     pub fn spawn_trust_refresher(self: &Arc<Self>, root: PathBuf) {
         let state = self.clone();
         tokio::spawn(async move {
+            // Pin one `Notified` future across iterations so a
+            // `notify_waiters()` shutdown signal can't be lost in the gap
+            // between `select!` turns (see `server::run`).
+            let shutdown = state.shutdown.notified();
+            tokio::pin!(shutdown);
             loop {
                 tokio::select! {
-                    _ = state.shutdown.notified() => break,
+                    _ = &mut shutdown => break,
                     _ = tokio::time::sleep(TRUST_REFRESH_INTERVAL) => {
                         if let Err(error) = state.refresh_trust_root(&root).await {
                             StderrJsonDiagnosticSink.emit(
