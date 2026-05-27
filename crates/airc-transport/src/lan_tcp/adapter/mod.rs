@@ -45,7 +45,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::Stream;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use airc_core::PeerId;
@@ -53,7 +53,7 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    Inner, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
+    Inner, Outbound, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
@@ -226,18 +226,39 @@ impl Transport for LanTcpAdapter {
                 .collect()
         };
 
-        // Broadcast: send to each connected peer. Per-peer failures
-        // tolerated (peer may have dropped between snapshot + send;
-        // the read loop will GC the dead entry). Success if at least
-        // one peer received.
-        let mut delivered_any = false;
+        // Broadcast: enqueue to each connected peer's write loop, each
+        // with a `flushed` oneshot. Per-peer failures tolerated (peer may
+        // have dropped between snapshot + send; the read loop GCs the dead
+        // entry).
+        let mut pending: Vec<oneshot::Receiver<()>> = Vec::new();
         let mut last_error: Option<LanTcpError> = None;
         for (_peer, tx) in targets {
-            match tx.send(payload.clone()).await {
-                Ok(()) => delivered_any = true,
+            let (flushed, flushed_rx) = oneshot::channel();
+            match tx
+                .send(Outbound {
+                    payload: payload.clone(),
+                    flushed,
+                })
+                .await
+            {
+                Ok(()) => pending.push(flushed_rx),
                 Err(_closed) => {
                     last_error = Some(LanTcpError::NoActivePeers);
                 }
+            }
+        }
+
+        // Await flush-to-wire, NOT merely enqueue. `send()` returns only
+        // once at least one peer's write loop confirmed the frame is on
+        // the wire — so a caller that exits immediately after (the
+        // `lan-send` CLI) cannot lose the frame to its own teardown. A
+        // dropped sender (write loop hit a dead socket) resolves to Err
+        // and counts as non-delivery.
+        let mut delivered_any = false;
+        for flushed_rx in pending {
+            match flushed_rx.await {
+                Ok(()) => delivered_any = true,
+                Err(_dropped) => last_error = Some(LanTcpError::NoActivePeers),
             }
         }
         if delivered_any {

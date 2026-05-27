@@ -17,7 +17,7 @@ use airc_protocol::Frame;
 
 use crate::lan_tcp::adapter::dispatch::dispatch_to_subscribers;
 use crate::lan_tcp::adapter::error::LanTcpError;
-use crate::lan_tcp::adapter::inner::{Inner, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH};
+use crate::lan_tcp::adapter::inner::{Inner, Outbound, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH};
 use crate::lan_tcp::cert::extract_ed25519_pubkey;
 
 /// Post-handshake server-side connection handler: bind the peer
@@ -91,7 +91,7 @@ async fn install_and_spawn_loops<R, W>(
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_DEPTH);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_CHANNEL_DEPTH);
     // Install synchronously — when this function returns, the
     // connection IS ready to receive sends.
     inner.connections.lock().await.insert(peer_id, outbound_tx);
@@ -143,18 +143,26 @@ where
 }
 
 /// Write loop: drain the outbound channel, length-prefix the
-/// already-validated payload, write framed bytes to TLS.
+/// already-validated payload, write framed bytes to TLS, then signal
+/// the sender that the frame is flushed to the wire.
 ///
 /// The payload is pre-serialized and size-checked by
 /// `LanTcpAdapter::send` before it lands in the channel — by the
 /// time it reaches this loop the bytes are known-valid, so the
 /// only failure mode is a dead socket (which terminates the loop).
 /// No silent drops.
-async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Vec<u8>>)
+///
+/// The `flushed` signal is fired ONLY after a successful `flush()`, so a
+/// caller awaiting it knows the bytes are in the kernel send buffer and
+/// will survive the caller exiting. On any write/flush error the loop
+/// returns and drops the remaining `flushed` senders — their awaiting
+/// `send()` calls observe the closed channel and report non-delivery
+/// rather than a false success.
+async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Outbound>)
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    while let Some(payload) = outbound_rx.recv().await {
+    while let Some(Outbound { payload, flushed }) = outbound_rx.recv().await {
         // Defense-in-depth assertion: the sender already enforced
         // this, but if a future regression bypasses pre-validation
         // we'd rather fail loudly here than silently truncate.
@@ -174,5 +182,8 @@ where
         if write_half.flush().await.is_err() {
             return;
         }
+        // Flushed to the wire — release the sender. A dropped receiver
+        // (caller no longer waiting) is fine: delivery still happened.
+        let _ = flushed.send(());
     }
 }

@@ -133,7 +133,7 @@ fn two_airc_core_processes_chat_over_local_fs() {
 
     assert!(
         body_arrived,
-        "Alice's stdout did not contain Bob's message within 6s — substrate e2e is broken"
+        "Alice's stdout did not contain Bob's message within the receive timeout — substrate e2e is broken"
     );
 }
 
@@ -776,7 +776,7 @@ fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
 
     assert!(
         body_arrived,
-        "Alice's LAN listener did not print Bob's message within 6s"
+        "Alice's LAN listener did not print Bob's message within the receive timeout"
     );
 }
 
