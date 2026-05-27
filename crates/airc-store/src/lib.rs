@@ -21,6 +21,13 @@
 //!     for v1; migrations applied on `open`.
 //!   - [`InMemoryEventStore`]: trait-only test double, no I/O. Use
 //!     in unit tests that don't need durability.
+//!
+//! The owner-core durable tier ships here too: [`SqliteDurableSink`]
+//! is a SeaORM-backed SQLite implementation of `airc_bus::DurableSink`
+//! (§3.3 of `docs/architecture/AIRC-EVENT-SERVER.md`) — the real
+//! persistence behind the bus's `Durable` envelopes, replacing the
+//! in-memory test sink. `airc-store` depends on `airc-bus` (the lower-
+//! level generic crate), never the reverse.
 
 #![deny(unsafe_code)]
 // `rust_2018_idioms` would force `&SchemaManager<'_>` syntax on the
@@ -31,6 +38,7 @@
 
 pub mod account_registry;
 pub mod beacon;
+pub mod bus_sink;
 pub mod entities;
 pub mod error;
 pub mod local_identity;
@@ -45,6 +53,7 @@ pub mod subscriptions;
 
 pub use account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 pub use beacon::StoredBeacon;
+pub use bus_sink::SqliteDurableSink;
 pub use error::StoreError;
 pub use local_identity::StoredLocalIdentity;
 pub use memory::InMemoryEventStore;

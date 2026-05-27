@@ -244,9 +244,12 @@ dependencies = [
 name = "airc-store"
 version = "0.1.0"
 dependencies = [
+ "airc-bus",
  "airc-core",
  "async-trait",
  "base64",
+ "bytes",
+ "futures",
  "sea-orm",
  "sea-orm-migration",
  "serde",
