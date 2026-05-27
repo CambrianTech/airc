@@ -5,6 +5,11 @@
 //!     `TranscriptEvent`. Indexes on `(channel_id, lamport, event_id)`
 //!     keep `page_recent` and `resume_from` O(log n + page) instead
 //!     of O(n).
+//!   - `bus_events` — the owner-core durable tier (§3.3). One row per
+//!     persisted `airc_bus::Envelope` (a CLEAN schema, NOT
+//!     `TranscriptEvent`). Composite index on
+//!     `(room_id, epoch, counter, event_id)` — the generational cursor
+//!     order — keeps `DurableSink::page` a single indexed range scan.
 //!   - `runtime_cursors` — per-consumer replay cursors.
 //!   - `peer_trust` / `peer_rotation_audit` — trust anchors and
 //!     signed key-rotation audit rows.
@@ -24,6 +29,7 @@
 pub mod account_registry;
 pub mod beacon;
 pub mod beacon_channel;
+pub mod bus_event;
 pub mod event;
 pub mod local_identity;
 pub mod mesh_identity;
