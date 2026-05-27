@@ -38,6 +38,7 @@
 
 pub mod account_registry;
 pub mod beacon;
+pub mod bus_epoch_store;
 pub mod bus_sink;
 pub mod entities;
 pub mod error;
@@ -53,6 +54,7 @@ pub mod subscriptions;
 
 pub use account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 pub use beacon::StoredBeacon;
+pub use bus_epoch_store::SqliteEpochStore;
 pub use bus_sink::SqliteDurableSink;
 pub use error::StoreError;
 pub use local_identity::StoredLocalIdentity;
