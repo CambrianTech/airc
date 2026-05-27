@@ -58,6 +58,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "airc-bus"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "airc-cli"
 version = "0.1.0"
 dependencies = [

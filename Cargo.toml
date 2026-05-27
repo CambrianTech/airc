@@ -6,6 +6,7 @@ members = [
     "crates/airc-protocol",
     "crates/airc-transport",
     "crates/airc-store",
+    "crates/airc-bus",
     "crates/airc-identity",
     "crates/airc-trust",
     "crates/airc-work",
