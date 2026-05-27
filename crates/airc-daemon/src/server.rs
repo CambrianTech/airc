@@ -80,10 +80,21 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
 
+    // Keep ONE `Notified` future alive across loop iterations. `select!`
+    // otherwise creates and drops a fresh `notified()` each turn, leaving
+    // a window between iterations where no waiter is registered. `Stop`
+    // signals shutdown with `notify_waiters()`, which wakes only the
+    // waiters registered at that instant and stores no permit — so a
+    // notify landing in that window is LOST and the daemon never exits
+    // (`accept()` then blocks forever waiting for a connection that never
+    // comes). A persistently-registered pinned waiter cannot miss it.
+    let shutdown = state.shutdown.notified();
+    tokio::pin!(shutdown);
+
     loop {
         tokio::select! {
             biased;
-            _ = state.shutdown.notified() => {
+            _ = &mut shutdown => {
                 break;
             }
             accept = listener.accept() => {

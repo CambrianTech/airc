@@ -521,9 +521,20 @@ pub async fn run_lan_listen(
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
+    // Subscribe BEFORE binding the listener. `listen_lan` starts the LAN
+    // frame-ingest task, which fans each received frame into `live_tx`
+    // (see `append_received_frame`). `subscribe()` is a live broadcast
+    // receiver with no backlog for a not-yet-created subscriber, and
+    // `lan-listen` does not replay the store — so a frame that arrives in
+    // the gap between bind and subscribe is fanned out to no receiver and
+    // lost to this consumer (still persisted, just never printed).
+    // Creating the receiver first guarantees it predates any ingested
+    // frame, closing an intermittent CI frame-drop ("listener did not
+    // print the message"). subscribe() does not depend on the listener
+    // being bound.
+    let mut stream = airc.subscribe().await?;
     let actual = airc.listen_lan(bind).await?;
     println!("listening on {actual} (peer_id {}) …", airc.peer_id());
-    let mut stream = airc.subscribe().await?;
     print_event_stream_until_signal(&mut stream).await
 }
 
