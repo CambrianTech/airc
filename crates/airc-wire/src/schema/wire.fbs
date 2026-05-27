@@ -1,0 +1,123 @@
+// airc wire format — the single well-defined binary encoding for
+// `airc_bus::Envelope` (the wire + IPC data plane).
+//
+// SOURCE OF TRUTH. The Rust accessors in `wire_generated.rs` are produced
+// from THIS file by planus (pure-Rust FlatBuffers compiler). Regenerate
+// with:
+//
+//   planus rust -o crates/airc-wire/src/wire_generated.rs \
+//       crates/airc-wire/src/schema/wire.fbs
+//
+// Design intent (see crate docs): this is a media-stream bus carrying
+// 60-90Hz pose/avatar data AND a durable chat bus. The encoding is a
+// proper binary FlatBuffer; the opaque `payload` is forwarded verbatim,
+// zero-copy — never decoded or re-encoded. Per-envelope overhead is kept
+// tiny so a pose packet (a few floats) is not dwarfed by its header.
+
+namespace airc.wire;
+
+// A UUID inlined as a fixed 16-byte struct (no vector header, no offset
+// indirection) — zero-copy and lean. `hi`/`lo` are the big-endian halves
+// of the 128-bit value (`hi` = most-significant 64 bits). This mirrors
+// `uuid::Uuid::as_u64_pair()` / `Uuid::from_u64_pair(hi, lo)`.
+struct Uuid {
+  hi: ulong;
+  lo: ulong;
+}
+
+// Envelope category (§2). Mirrors `airc_bus::envelope::Kind` exactly.
+// Default (0) is `Message` — FlatBuffers enums need a zero variant.
+enum Kind : ubyte {
+  Message = 0,
+  Event,
+  Command,
+  CommandResult,
+  Signal,
+  StreamChunk,
+  Control,
+}
+
+// Delivery + retention class (§2, §3.3, §3.4). Mirrors
+// `airc_bus::envelope::DeliveryClass` exactly.
+enum DeliveryClass : ubyte {
+  Durable = 0,
+  EphemeralLatest,
+  EphemeralWindow,
+  RequestResponse,
+  StreamChunk,
+}
+
+// Discriminant for the `Target` addressing enum (§2). Mirrors
+// `airc_bus::envelope::Target` variants exactly. The per-variant data
+// lives in the dedicated `target_peer` / `target_reply` / `target_text`
+// fields on `Envelope` (see notes there). `All` carries no data.
+enum TargetTag : ubyte {
+  All = 0,
+  Endpoint,
+  Peer,
+  Reply,
+  Capability,
+}
+
+// One routable header entry. `headers` is a `BTreeMap<String,String>` in
+// Rust; encoded as a vector of these, sorted by key on encode so the wire
+// bytes are deterministic and decode rebuilds the map verbatim.
+table Header {
+  key: string;
+  value: string;
+}
+
+// The generic envelope (§2). Field order is laid out small-metadata-first;
+// `payload` is the only large field and the only one whose bytes are
+// forwarded verbatim / zero-copy.
+table Envelope {
+  // Identity / routing ids — inline 16-byte structs, never null in a
+  // well-formed envelope.
+  event_id: Uuid;
+  channel: Uuid;
+  peer_id: Uuid;   // from.0
+  client_id: Uuid; // from.1
+
+  // Category + delivery — single bytes.
+  kind: Kind;
+  delivery: DeliveryClass;
+
+  // Owner-assigned total order `seq = (epoch, counter)` (§2, §3.8) and the
+  // owner-stamped wall clock.
+  epoch: ulong;
+  counter: ulong;
+  occurred_at_ms: ulong;
+
+  // Optional `correlation_id: Option<Uuid>`. A FlatBuffers inline struct
+  // field is optional by nature (absent => None); presence is read back
+  // with the generated accessor returning Option.
+  correlation_id: Uuid;
+
+  // Optional `coalesce_key: Option<String>`. Absent string => None.
+  coalesce_key: string;
+
+  // Addressing (§2). `target_tag` selects the variant; the data lives in
+  // the matching field below:
+  //   All        -> (no data)
+  //   Peer       -> target_peer  (Uuid)
+  //   Reply      -> target_reply (Uuid)        [Reply wraps a bare Uuid]
+  //   Endpoint   -> target_text  (string)
+  //   Capability -> target_text  (string)
+  // Endpoint and Capability share `target_text` since both carry exactly
+  // one string and the tag already disambiguates them — no need for two
+  // string fields and the extra vtable slot.
+  target_tag: TargetTag;
+  target_peer: Uuid;
+  target_reply: Uuid;
+  target_text: string;
+
+  // Routable metadata; airc routes on these, never parses payload.
+  headers: [Header];
+
+  // OPAQUE consumer payload — forwarded verbatim, zero-copy. Reading it
+  // back yields a slice INTO this buffer (`bytes::Bytes::slice_ref`); it
+  // is never decoded, re-encoded, or copied.
+  payload: [ubyte];
+}
+
+root_type Envelope;
