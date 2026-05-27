@@ -16,6 +16,17 @@ use tempfile::TempDir;
 
 const JOIN_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadline for process-spawn round-trips: spawn a real subprocess,
+/// complete the handshake, receive, and print the expected line. The
+/// send is asserted to succeed *before* this wait, so it only bounds the
+/// listener's receive+print — yet at 6s it was the shortest deadline in
+/// the file while being the heaviest path, and flaked intermittently on
+/// loaded macOS CI runners ("did not print within Ns"). These assertions
+/// still require real delivery, so generous headroom removes the
+/// false-negative without weakening the check (matches the 30s the
+/// attach path already uses).
+const SPAWN_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
 }
@@ -114,7 +125,7 @@ fn two_airc_core_processes_chat_over_local_fs() {
     let body_arrived = wait_for_line_contains(
         alice_stdout,
         "hello from bob over rust substrate",
-        Duration::from_secs(6),
+        SPAWN_ROUNDTRIP_TIMEOUT,
     );
 
     let _ = alice.kill();
@@ -689,7 +700,7 @@ fn listen_rejects_unenrolled_signer() {
 
     let alice_stderr = alice.stderr.take().expect("alice stderr");
     let saw_rejection =
-        wait_for_line_contains(alice_stderr, "verification failed", Duration::from_secs(6));
+        wait_for_line_contains(alice_stderr, "verification failed", SPAWN_ROUNDTRIP_TIMEOUT);
 
     let _ = alice.kill();
     let _ = alice.wait();
@@ -730,7 +741,7 @@ fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
     let alice_stdout = alice.stdout.take().expect("alice stdout");
     let lines = spawn_line_reader(alice_stdout);
     let listen_line =
-        wait_for_channel_line_contains(&lines, "listening on", Duration::from_secs(6))
+        wait_for_channel_line_contains(&lines, "listening on", SPAWN_ROUNDTRIP_TIMEOUT)
             .expect("alice must print bound LAN address");
     let bound_addr = parse_listening_addr(&listen_line);
 
@@ -757,7 +768,7 @@ fn two_airc_core_processes_chat_over_lan_via_sdk_route() {
     );
 
     let body_arrived =
-        wait_for_channel_line_contains(&lines, "hello over cli sdk lan", Duration::from_secs(6))
+        wait_for_channel_line_contains(&lines, "hello over cli sdk lan", SPAWN_ROUNDTRIP_TIMEOUT)
             .is_some();
 
     let _ = alice.kill();
@@ -792,7 +803,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
     wait_for_line_contains(
         daemon.stdout.take().expect("daemon stdout"),
         "listening on",
-        Duration::from_secs(6),
+        SPAWN_ROUNDTRIP_TIMEOUT,
     );
 
     let msg = command_for_home(&home)
@@ -817,7 +828,7 @@ fn daemon_msg_and_inbox_use_sdk_attach_path() {
         &home,
         &socket,
         "hello through cli attach",
-        Duration::from_secs(6),
+        SPAWN_ROUNDTRIP_TIMEOUT,
     );
     assert!(
         inbox,
