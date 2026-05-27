@@ -70,13 +70,13 @@ impl InMemoryDurableSink {
     /// `ephemeral-off-sink` test asserts this stays `0` for an
     /// `EphemeralLatest` firehose.
     pub fn append_count(&self) -> u64 {
-        self.inner.lock().expect("sink mutex poisoned").append_count
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).append_count
     }
 
     /// The total max cursor across all channels, for restart-counter seeding
     /// in the crash-safe-seq test (models "rebuild counter from ORM max").
     pub fn max_counter(&self) -> u64 {
-        let guard = self.inner.lock().expect("sink mutex poisoned");
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard
             .events
             .values()
@@ -88,7 +88,7 @@ impl InMemoryDurableSink {
 
     /// Snapshot count of persisted events on a channel (test helper).
     pub fn len(&self, channel: RoomId) -> usize {
-        let guard = self.inner.lock().expect("sink mutex poisoned");
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard
             .events
             .get(&channel.0.as_u128())
@@ -99,7 +99,7 @@ impl InMemoryDurableSink {
 #[async_trait]
 impl DurableSink for InMemoryDurableSink {
     async fn append(&self, e: &Envelope) -> Result<()> {
-        let mut guard = self.inner.lock().expect("sink mutex poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let bucket = guard.events.entry(e.channel.0.as_u128()).or_default();
         // Idempotent on event_id — a replay/re-inject must not double-store.
         if bucket.iter().any(|x| x.event_id == e.event_id) {
@@ -122,7 +122,7 @@ impl DurableSink for InMemoryDurableSink {
         from_cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>> {
-        let guard = self.inner.lock().expect("sink mutex poisoned");
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
             return Ok(Vec::new());
         };

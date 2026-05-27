@@ -205,7 +205,7 @@ impl EventRouter {
         // --- synchronous hot path: NO await while the shard lock is held ---
         {
             let shard = self.shard_for(env.channel);
-            let mut map = shard.channels.lock().expect("shard mutex poisoned");
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = env.channel.0.as_u128();
             let is_new = !map.contains_key(&key);
             let state = map.entry(key).or_insert_with(|| {
@@ -293,7 +293,7 @@ impl EventRouter {
             let n = inner.shards.len();
             let idx = (item.env.channel.0.as_u128() % n as u128) as usize;
             let shard = &inner.shards[idx];
-            let mut map = shard.channels.lock().expect("shard mutex poisoned");
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(state) = map.get_mut(&item.env.channel.0.as_u128()) {
                 state.ring.mark_persisted(item.env.event_id);
             }
@@ -344,7 +344,7 @@ impl EventRouter {
             let n = inner.shards.len();
             let idx = (channel.0.as_u128() % n as u128) as usize;
             let shard = &inner.shards[idx];
-            let mut map = shard.channels.lock().expect("shard mutex poisoned");
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = channel.0.as_u128();
             let is_new = !map.contains_key(&key);
             let state = map.entry(key).or_insert_with(|| {
@@ -438,7 +438,7 @@ impl EventRouter {
         // Recent from ring (snapshot under lock; no await held).
         let (ring_events, ring_oldest) = {
             let shard = self.shard_for(channel);
-            let map = shard.channels.lock().expect("shard mutex poisoned");
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             match map.get(&channel.0.as_u128()) {
                 Some(state) => (
                     state.ring.replay_after(from_cursor),
@@ -487,7 +487,7 @@ impl EventRouter {
     pub fn ephemeral_latest(&self, channel: RoomId, key: &str) -> Option<Envelope> {
         let now = self.inner.clock.now_ms();
         let shard = self.shard_for(channel);
-        let map = shard.channels.lock().expect("shard mutex poisoned");
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128())
             .and_then(|s| s.ephemeral.get(key, now).cloned())
     }
@@ -509,7 +509,7 @@ impl EventRouter {
     /// ring — the live un-persisted backlog (§3.8 floor).
     pub fn pinned_in_ring(&self, channel: RoomId) -> usize {
         let shard = self.shard_for(channel);
-        let map = shard.channels.lock().expect("shard mutex poisoned");
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128())
             .map_or(0, |s| s.ring.pinned_count())
     }
@@ -517,7 +517,7 @@ impl EventRouter {
     /// Test/diagnostic: snapshot the count of retained ring entries.
     pub fn ring_len(&self, channel: RoomId) -> usize {
         let shard = self.shard_for(channel);
-        let map = shard.channels.lock().expect("shard mutex poisoned");
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128()).map_or(0, |s| s.ring.len())
     }
 }
