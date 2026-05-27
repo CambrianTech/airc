@@ -18,6 +18,7 @@ mod m20260522_000008_create_beacons;
 mod m20260522_000009_add_local_identity_card;
 mod m20260523_000010_create_refresh_locks;
 mod m20260526_000011_create_bus_events;
+mod m20260527_000012_create_bus_epoch;
 
 pub struct Migrator;
 
@@ -36,6 +37,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260522_000009_add_local_identity_card::Migration),
             Box::new(m20260523_000010_create_refresh_locks::Migration),
             Box::new(m20260526_000011_create_bus_events::Migration),
+            Box::new(m20260527_000012_create_bus_epoch::Migration),
         ]
     }
 }
