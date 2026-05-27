@@ -16,12 +16,13 @@
 //! shard mutex and never holds that lock across an `.await`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::envelope::{Cursor, Envelope};
 
 /// One slot in the ring.
 struct Slot {
-    env: Envelope,
+    env: Arc<Envelope>,
     /// A `Durable` slot is pinned until the sink confirms persistence. While
     /// pinned it cannot be evicted (the no-gap precondition). Non-durable
     /// slots are never pinned.
@@ -50,7 +51,7 @@ impl HotRing {
     /// [`HotRing::mark_persisted`] before it can be evicted). Returns nothing;
     /// the ring never drops a pinned entry, so an un-persisted `Durable` is
     /// always replayable from RAM until it's in the sink.
-    pub fn push(&mut self, env: Envelope) {
+    pub fn push(&mut self, env: Arc<Envelope>) {
         let pinned = env.delivery.is_durable();
         self.slots.push_back(Slot { env, pinned });
         self.evict_to_capacity();
@@ -85,17 +86,19 @@ impl HotRing {
         }
     }
 
-    /// Return clones of every entry strictly *after* `from` (the recent leg of
-    /// the cursor replay), in total order. `from == None` returns the whole
-    /// ring. Used at the replay-then-live seam (§3.5).
-    pub fn replay_after(&self, from: Option<Cursor>) -> Vec<Envelope> {
+    /// Return refcount-bumped handles to every entry strictly *after* `from`
+    /// (the recent leg of the cursor replay), in total order. `from == None`
+    /// returns the whole ring. Each handle is an [`Arc::clone`] — zero deep
+    /// copy of the envelope or its headers. Used at the replay-then-live seam
+    /// (§3.5).
+    pub fn replay_after(&self, from: Option<Cursor>) -> Vec<Arc<Envelope>> {
         self.slots
             .iter()
             .filter(|slot| match &from {
                 None => true,
                 Some(c) => slot.env.cursor().is_after(c),
             })
-            .map(|slot| slot.env.clone())
+            .map(|slot| Arc::clone(&slot.env))
             .collect()
     }
 
@@ -148,7 +151,7 @@ mod tests {
     fn evicts_unpinned_to_capacity() {
         let mut ring = HotRing::new(3);
         for c in 0..5 {
-            ring.push(env_at(c, DeliveryClass::EphemeralWindow));
+            ring.push(Arc::new(env_at(c, DeliveryClass::EphemeralWindow)));
         }
         assert_eq!(ring.len(), 3, "non-durable entries evict to capacity");
         // oldest retained is counter 2 (0,1 evicted)
@@ -159,10 +162,10 @@ mod tests {
     fn pinned_durable_is_not_evicted_until_persisted() {
         let mut ring = HotRing::new(2);
         // Two durable, both unpersisted -> both pinned.
-        ring.push(env_at(0, DeliveryClass::Durable));
-        ring.push(env_at(1, DeliveryClass::Durable));
+        ring.push(Arc::new(env_at(0, DeliveryClass::Durable)));
+        ring.push(Arc::new(env_at(1, DeliveryClass::Durable)));
         // Third push wants to evict counter 0, but it's pinned -> ring grows.
-        ring.push(env_at(2, DeliveryClass::Durable));
+        ring.push(Arc::new(env_at(2, DeliveryClass::Durable)));
         assert_eq!(
             ring.len(),
             3,
@@ -180,7 +183,7 @@ mod tests {
     fn replay_after_returns_strictly_newer_in_order() {
         let mut ring = HotRing::new(10);
         for c in 0..5 {
-            ring.push(env_at(c, DeliveryClass::Durable));
+            ring.push(Arc::new(env_at(c, DeliveryClass::Durable)));
         }
         let from = env_at(1, DeliveryClass::Durable).cursor();
         let got: Vec<u64> = ring

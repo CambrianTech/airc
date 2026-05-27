@@ -12,13 +12,14 @@
 //! never holds that lock across `.await`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::envelope::Envelope;
 
 /// One coalesced entry: the latest envelope for its key, with the wall-clock
 /// time it landed (for TTL).
 struct Entry {
-    env: Envelope,
+    env: Arc<Envelope>,
     stored_at_ms: u64,
 }
 
@@ -42,7 +43,7 @@ impl EphemeralCache {
     /// Coalesce an `EphemeralLatest` envelope: overwrite the entry for its
     /// `coalesce_key`. An envelope without a `coalesce_key` is keyed by its
     /// `event_id` (degenerate — no coalescing, but still bounded by TTL).
-    pub fn coalesce(&mut self, env: Envelope, now_ms: u64) {
+    pub fn coalesce(&mut self, env: Arc<Envelope>, now_ms: u64) {
         let key = env
             .coalesce_key
             .clone()
@@ -57,7 +58,7 @@ impl EphemeralCache {
     }
 
     /// The current latest value for `key`, if present and not TTL-expired.
-    pub fn get(&self, key: &str, now_ms: u64) -> Option<&Envelope> {
+    pub fn get(&self, key: &str, now_ms: u64) -> Option<&Arc<Envelope>> {
         self.latest.get(key).and_then(|e| {
             if self.expired(e, now_ms) {
                 None
@@ -79,12 +80,13 @@ impl EphemeralCache {
     }
 
     /// All currently-live (non-expired) latest values, for replay-on-attach of
-    /// the ephemeral projection.
-    pub fn snapshot(&self, now_ms: u64) -> Vec<Envelope> {
+    /// the ephemeral projection. Each handle is an [`Arc::clone`] — zero deep
+    /// copy.
+    pub fn snapshot(&self, now_ms: u64) -> Vec<Arc<Envelope>> {
         self.latest
             .values()
             .filter(|e| !self.expired(e, now_ms))
-            .map(|e| e.env.clone())
+            .map(|e| Arc::clone(&e.env))
             .collect()
     }
 
@@ -128,7 +130,7 @@ mod tests {
     fn latest_wins_by_coalesce_key() {
         let mut cache = EphemeralCache::new(0);
         for i in 0..1000u32 {
-            cache.coalesce(presence((i % 256) as u8, "typing:alice"), 100);
+            cache.coalesce(Arc::new(presence((i % 256) as u8, "typing:alice")), 100);
         }
         assert_eq!(cache.live_len(100), 1, "1000 updates coalesce to one entry");
         let last = presence((999 % 256) as u8, "typing:alice");
@@ -141,7 +143,7 @@ mod tests {
     #[test]
     fn ttl_expires_entries() {
         let mut cache = EphemeralCache::new(50);
-        cache.coalesce(presence(1, "k"), 1000);
+        cache.coalesce(Arc::new(presence(1, "k")), 1000);
         assert!(cache.get("k", 1049).is_some(), "within TTL");
         assert!(
             cache.get("k", 1050).is_none(),
@@ -154,8 +156,8 @@ mod tests {
     #[test]
     fn distinct_keys_do_not_coalesce() {
         let mut cache = EphemeralCache::new(0);
-        cache.coalesce(presence(1, "typing:alice"), 0);
-        cache.coalesce(presence(2, "typing:bob"), 0);
+        cache.coalesce(Arc::new(presence(1, "typing:alice")), 0);
+        cache.coalesce(Arc::new(presence(2, "typing:bob")), 0);
         assert_eq!(cache.live_len(0), 2);
     }
 }

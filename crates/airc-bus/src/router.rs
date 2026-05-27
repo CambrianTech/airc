@@ -77,7 +77,7 @@ impl Default for RouterConfig {
 /// A registered subscriber's live delivery handle, held in the channel's
 /// subscriber list.
 struct SubscriberHandle {
-    tx: mpsc::Sender<Envelope>,
+    tx: mpsc::Sender<Arc<Envelope>>,
     filter: Filter,
     /// Set when a `try_send` failed because the bounded channel was full
     /// (§3.5). Shared with the subscriber's stream so it can observe "I
@@ -111,7 +111,7 @@ struct Shard {
 /// A durable envelope queued for the write-behind task, paired with the shard
 /// index so the task can re-lock and unpin the ring entry on confirmation.
 struct WriteBehindItem {
-    env: Envelope,
+    env: Arc<Envelope>,
 }
 
 /// The owner-core event router (§3).
@@ -202,6 +202,12 @@ impl EventRouter {
         env.seq = seq;
         env.occurred_at_ms = self.inner.clock.now_ms();
 
+        // Wrap ONCE: from here on every delivery (ring, ephemeral, fan-out,
+        // write-behind) is an `Arc::clone` — a refcount bump, never a deep copy
+        // of the envelope or its `headers` BTreeMap. This is the hot-path
+        // zero-copy keystone: per-subscriber CPU is one atomic increment.
+        let env = Arc::new(env);
+
         // --- synchronous hot path: NO await while the shard lock is held ---
         {
             let shard = self.shard_for(env.channel);
@@ -221,19 +227,22 @@ impl EventRouter {
             if env.delivery.is_ephemeral_latest() {
                 // §3.4: coalesce latest-wins; do NOT ring it (it's a
                 // projection, not a log) and do NOT persist it.
-                state.ephemeral.coalesce(env.clone(), env.occurred_at_ms);
+                state
+                    .ephemeral
+                    .coalesce(Arc::clone(&env), env.occurred_at_ms);
             } else {
                 // Recent log: ring it (pins if Durable, §3.8).
-                state.ring.push(env.clone());
+                state.ring.push(Arc::clone(&env));
             }
 
             // Fan out live to matching subscribers. try_send only — a slow
-            // subscriber is marked lagged, never blocks the shard (§3.5).
+            // subscriber is marked lagged, never blocks the shard (§3.5). Each
+            // send is an `Arc::clone` (refcount bump), NOT a deep copy.
             state.subscribers.retain(|sub| {
                 if !sub.filter.matches(&env) {
                     return true; // not for this subscriber, keep it
                 }
-                match sub.tx.try_send(env.clone()) {
+                match sub.tx.try_send(Arc::clone(&env)) {
                     Ok(()) => true,
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Lagged: drop the live push, flag it; the subscriber
@@ -251,11 +260,9 @@ impl EventRouter {
 
         // --- write-behind (durable only), off the hot lock ---
         if env.delivery.is_durable() {
-            match self
-                .inner
-                .write_behind_tx
-                .try_send(WriteBehindItem { env: env.clone() })
-            {
+            match self.inner.write_behind_tx.try_send(WriteBehindItem {
+                env: Arc::clone(&env),
+            }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // §3.8: bounded write-behind full. Slice-1 fire-and-forget
@@ -321,7 +328,7 @@ impl EventRouter {
         &self,
         filter: Filter,
         from_cursor: Option<Cursor>,
-    ) -> impl Stream<Item = Envelope> {
+    ) -> impl Stream<Item = Arc<Envelope>> {
         self.subscribe_with_lag(filter, from_cursor).0
     }
 
@@ -333,13 +340,13 @@ impl EventRouter {
         &self,
         filter: Filter,
         from_cursor: Option<Cursor>,
-    ) -> (impl Stream<Item = Envelope>, LagFlag) {
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
         let inner = Arc::clone(&self.inner);
         let channel = filter.channel;
 
         // --- step 1: register live + snapshot ring under one lock ---
         let lagged = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = mpsc::channel::<Envelope>(inner.config.subscriber_buffer.max(1));
+        let (tx, mut rx) = mpsc::channel::<Arc<Envelope>>(inner.config.subscriber_buffer.max(1));
         let (ring_snapshot, ring_oldest) = {
             let n = inner.shards.len();
             let idx = (channel.0.as_u128() % n as u128) as usize;
@@ -380,6 +387,11 @@ impl EventRouter {
                 .await
                 .unwrap_or_default();
             for env in deep {
+                // The sink (persistence) is a real copy boundary, so the deep
+                // leg arrives as owned `Envelope`s; wrap each once in `Arc` so
+                // the stream item type is uniform with the (already-`Arc`) ring
+                // and live legs and downstream stays zero-copy.
+                let env = Arc::new(env);
                 // Only emit sink events strictly before the ring snapshot's
                 // window — the ring snapshot is authoritative for the recent
                 // tail (it may hold un-persisted Durable the sink lacks).
@@ -434,7 +446,7 @@ impl EventRouter {
         &self,
         channel: RoomId,
         from_cursor: Option<Cursor>,
-    ) -> crate::Result<Vec<Envelope>> {
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
         // Recent from ring (snapshot under lock; no await held).
         let (ring_events, ring_oldest) = {
             let shard = self.shard_for(channel);
@@ -455,8 +467,11 @@ impl EventRouter {
             .page(channel, from_cursor, usize::MAX)
             .await?;
 
-        let mut out: Vec<Envelope> = Vec::new();
+        let mut out: Vec<Arc<Envelope>> = Vec::new();
         for env in deep {
+            // Deep leg is owned `Envelope` from the sink copy boundary; wrap
+            // once so the merged output is uniformly `Arc<Envelope>`.
+            let env = Arc::new(env);
             let before_ring = match ring_oldest {
                 Some(o) => env.cursor().is_before(&o),
                 None => true,
@@ -484,12 +499,12 @@ impl EventRouter {
     /// The latest coalesced ephemeral value for `(channel, coalesce_key)`, if
     /// live (§3.4). Used to seed a freshly-attached subscriber with current
     /// presence/pose.
-    pub fn ephemeral_latest(&self, channel: RoomId, key: &str) -> Option<Envelope> {
+    pub fn ephemeral_latest(&self, channel: RoomId, key: &str) -> Option<Arc<Envelope>> {
         let now = self.inner.clock.now_ms();
         let shard = self.shard_for(channel);
         let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128())
-            .and_then(|s| s.ephemeral.get(key, now).cloned())
+            .and_then(|s| s.ephemeral.get(key, now).map(Arc::clone))
     }
 
     /// Number of distinct channels that have ever had state allocated. The

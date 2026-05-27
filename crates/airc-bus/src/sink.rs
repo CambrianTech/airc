@@ -70,7 +70,10 @@ impl InMemoryDurableSink {
     /// `ephemeral-off-sink` test asserts this stays `0` for an
     /// `EphemeralLatest` firehose.
     pub fn append_count(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).append_count
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .append_count
     }
 
     /// The total max cursor across all channels, for restart-counter seeding

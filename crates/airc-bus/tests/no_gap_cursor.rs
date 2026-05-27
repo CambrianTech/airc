@@ -18,10 +18,11 @@ use airc_core::RoomId;
 use common::{durable, GatedSink};
 
 /// Helper: drain `n` events from a stream with a timeout so a missed event
-/// fails loud (a hang) rather than passing trivially.
-async fn take_n<S>(mut stream: S, n: usize) -> Vec<airc_bus::Envelope>
+/// fails loud (a hang) rather than passing trivially. Items are `Arc<Envelope>`
+/// — the zero-copy fan-out yields refcounted handles, not owned envelopes.
+async fn take_n<S>(mut stream: S, n: usize) -> Vec<Arc<airc_bus::Envelope>>
 where
-    S: futures::Stream<Item = airc_bus::Envelope> + Unpin,
+    S: futures::Stream<Item = Arc<airc_bus::Envelope>> + Unpin,
 {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
