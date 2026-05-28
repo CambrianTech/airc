@@ -36,6 +36,7 @@ mod event_render;
 mod events_cli;
 mod events_commands;
 mod gh_cli;
+mod gh_client;
 mod gh_commands;
 mod gh_state;
 mod gist_cli;

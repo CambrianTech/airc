@@ -76,6 +76,12 @@ pub async fn run(
     );
     eprintln!("airc-merger: peer_id={}", airc.peer_id());
 
+    // Card dec35ec7: one GhClient per merger session. Reserved for
+    // future session-scoped state (rate-limit backoff cursor, cached
+    // auth status); today it's stateless but lives at the right
+    // scope.
+    let gh = crate::gh_client::GhClient::new();
+
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -90,7 +96,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                if let Err(error) = tick_once(&airc, dry_run).await {
+                if let Err(error) = tick_once(&gh, &airc, dry_run).await {
                     // A tick failing should NOT bring down the loop —
                     // gh might be rate-limited, the daemon might be
                     // momentarily unreachable, etc. Log and continue.
@@ -102,7 +108,11 @@ pub async fn run(
 }
 
 /// One pass over the board: scan eligible cards, gate, merge.
-async fn tick_once(airc: &Airc, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn tick_once(
+    gh: &crate::gh_client::GhClient,
+    airc: &Airc,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Limit chosen large enough to surface every Review card with a
     // PR in practice. The board fetch already filters heartbeats
     // (card 79953b4d), so 256 work events back is several days of
@@ -111,7 +121,7 @@ async fn tick_once(airc: &Airc, dry_run: bool) -> Result<(), Box<dyn std::error:
     let snapshot = board.snapshot();
 
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(card).await? else {
+        let Some(decision) = evaluate(gh, card).await? else {
             continue;
         };
         match decision {
@@ -123,7 +133,7 @@ async fn tick_once(airc: &Airc, dry_run: bool) -> Result<(), Box<dyn std::error:
                     );
                     continue;
                 }
-                match perform_merge(card, &pr, airc).await {
+                match perform_merge(gh, card, &pr, airc).await {
                     Ok(()) => eprintln!(
                         "airc-merger: merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -151,7 +161,10 @@ enum MergeDecision {
 /// even a candidate (not in Review, no PR linked); `Ok(Some(Merge))`
 /// if everything passes; `Ok(Some(Skip(reason)))` if it's a candidate
 /// that failed a gate (so we can log it instead of silently dropping).
-async fn evaluate(card: &WorkCard) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
+async fn evaluate(
+    gh: &crate::gh_client::GhClient,
+    card: &WorkCard,
+) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
     if card.state != CardState::Review {
         return Ok(None);
@@ -160,7 +173,7 @@ async fn evaluate(card: &WorkCard) -> Result<Option<MergeDecision>, Box<dyn std:
         return Ok(None);
     };
 
-    match check_pr_gate(&pr).await {
+    match check_pr_gate(gh, &pr).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
         Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
@@ -175,35 +188,26 @@ enum GateResult {
 }
 
 /// Query `gh pr view --json statusCheckRollup,mergeable,state` and
-/// apply [`evaluate_gh_view`] to the response. The IO half is here;
-/// the decision half is the pure function so it can be unit-tested
-/// without shelling out.
+/// apply [`evaluate_gh_view`] to the response.
+///
+/// Card dec35ec7: the IO half routes through the typed
+/// [`crate::gh_client::GhClient`] instead of a raw
+/// `tokio::process::Command::new("gh")`. Errors come back as
+/// typed [`crate::gh_client::GhError`] variants (rate-limited,
+/// auth-required, …) so callers can pattern-match on them; the
+/// decision half (`evaluate_gh_view`) remains pure for unit tests.
 async fn check_pr_gate(
+    gh: &crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
-) -> Result<GateResult, Box<dyn std::error::Error>> {
-    let pr_ref = format!("{}#{}", pr.repo.as_str(), pr.number);
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr.number.to_string(),
-            "--repo",
-            pr.repo.as_str(),
-            "--json",
-            "statusCheckRollup,mergeable,state",
-        ])
-        .output()
+) -> Result<GateResult, crate::gh_client::GhError> {
+    let view = gh
+        .pr_view(crate::gh_client::PrViewArgs {
+            repo: pr.repo.as_str(),
+            number: pr.number,
+            cwd: None,
+        })
         .await?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh pr view {pr_ref} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-
-    let parsed: GhPrView = serde_json::from_slice(&output.stdout)?;
-    Ok(evaluate_gh_view(&parsed))
+    Ok(evaluate_gh_view(&view))
 }
 
 /// Decide whether a PR is ready to merge, given the parsed `gh pr
@@ -216,7 +220,7 @@ async fn check_pr_gate(
 ///
 /// The strictly-less-red-than-base doctrine refinement (#1033) is a
 /// separate, more lenient gate carded as a follow-up.
-fn evaluate_gh_view(view: &GhPrView) -> GateResult {
+fn evaluate_gh_view(view: &crate::gh_client::PrView) -> GateResult {
     if view.state != "OPEN" {
         return GateResult::NotReady(format!("PR state is {} (not OPEN)", view.state));
     }
@@ -251,31 +255,22 @@ fn evaluate_gh_view(view: &GhPrView) -> GateResult {
 /// convention every recent PR has used (see merged-PR survey in card
 /// 28f1440c). On success, publish `MarkPullRequestMerged` so the
 /// projection transitions to `Merged`.
+/// Card dec35ec7: typed `gh pr merge` via `GhClient`. `GhError`
+/// surfaces conflicts as `PrNotMergeable` so an upcoming
+/// less-red-than-base bypass can match the case and skip rather
+/// than retry indefinitely. `MarkPullRequestMerged` still fires
+/// after the merge succeeds — the projection contract is unchanged.
 async fn perform_merge(
+    gh: &crate::gh_client::GhClient,
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
     airc: &Airc,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr",
-            "merge",
-            &pr.number.to_string(),
-            "--repo",
-            pr.repo.as_str(),
-            "--squash",
-            "--delete-branch",
-        ])
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh pr merge #{} failed: {}",
-            pr.number,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
+    gh.pr_merge(crate::gh_client::PrMergeArgs {
+        repo: pr.repo.as_str(),
+        number: pr.number,
+    })
+    .await?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -288,24 +283,6 @@ async fn perform_merge(
     })
     .await?;
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct GhPrView {
-    #[serde(default)]
-    state: String,
-    #[serde(default, rename = "mergeable")]
-    mergeable: String,
-    #[serde(default, rename = "statusCheckRollup")]
-    status_check_rollup: Option<Vec<GhCheck>>,
-}
-
-#[derive(serde::Deserialize)]
-struct GhCheck {
-    #[serde(default)]
-    conclusion: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
 }
 
 /// Acquire a non-blocking exclusive lock at `<home>/merger.lock`.
@@ -342,7 +319,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn parse(payload: serde_json::Value) -> GhPrView {
+    fn parse(payload: serde_json::Value) -> crate::gh_client::PrView {
+        // Card dec35ec7: tests now exercise the typed PrView from
+        // GhClient, not a merger-local duplicate struct.
         serde_json::from_value(payload).expect("test fixture must parse")
     }
 

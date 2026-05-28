@@ -60,7 +60,16 @@ fn work_create_claim_release_projects_on_board() {
 
     let claimed_board = run_ok(&home, &["work", "board"]);
     assert!(claimed_board.contains(card_id));
-    assert!(claimed_board.contains(claim_id));
+    // Card 0e8e6fa shipped short claim_id rendering in the board
+    // output; the assertion needs to match the rendered prefix, not
+    // the full UUID. Same fix peer applied to the sibling
+    // work_board_surfaces_stale_claims test in e9b12e6 (kink
+    // b1735261). Drive-by while landing dec35ec7.
+    let claim_short: String = claim_id.chars().take(8).collect();
+    assert!(
+        claimed_board.contains(&claim_short),
+        "expected short claim_id prefix {claim_short} in: {claimed_board}",
+    );
     assert!(claimed_board.contains("Claimed"));
 
     let heartbeat = run_ok(

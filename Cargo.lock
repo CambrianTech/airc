@@ -105,6 +105,7 @@ dependencies = [
  "sha2",
  "temp-env",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "toml_edit",
  "uuid",
