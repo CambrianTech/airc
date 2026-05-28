@@ -327,7 +327,26 @@ impl SqliteEventStore {
     /// with the on-disk `identity.key` to decide whether to load,
     /// generate, or surface a partial-state error.
     pub async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
-        let row = local_identity::Entity::find_by_id(local_identity::SINGLETON_ID)
+        // Backwards-compat path: the default-agent row. Card 8384cc18
+        // Sub-C added a by-name variant; this one resolves to the
+        // legacy/default discriminator so pre-Sub-D callers keep
+        // working unchanged.
+        self.load_local_identity_by_agent_name(local_identity::DEFAULT_AGENT_NAME)
+            .await
+    }
+
+    /// Look up a `local_identity` row by its `agent_name`
+    /// discriminator. Card 8384cc18 Sub-C — multi-agent read API.
+    ///
+    /// `agent_name` is the natural read key now that Sub-B dropped
+    /// the singleton CHECK; the unique index added in
+    /// `m20260528_000014` makes this an O(log n) point lookup.
+    pub async fn load_local_identity_by_agent_name(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        let row = local_identity::Entity::find()
+            .filter(local_identity::Column::AgentName.eq(agent_name))
             .one(&self.db)
             .await?;
         row.map(|m| {
@@ -579,6 +598,13 @@ fn has_windows_drive_prefix(path: &str) -> bool {
 impl EventStore for SqliteEventStore {
     async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
         SqliteEventStore::load_local_identity(self).await
+    }
+
+    async fn load_local_identity_by_agent_name(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        SqliteEventStore::load_local_identity_by_agent_name(self, agent_name).await
     }
 
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError> {
@@ -1185,8 +1211,15 @@ mod tests {
             .await
             .unwrap();
 
+        // Card 8384cc18 Sub-C: `load_local_identity()` is now
+        // explicitly the default-agent path; round-tripping a
+        // non-default name uses the by-name lookup. This is the
+        // change in contract Sub-C ships — the test still proves
+        // the original intent (Sub-A's "agent_name actually
+        // persists, not silently re-defaults") but routes through
+        // the API surface that multi-agent callers will use.
         let stored = store_api
-            .load_local_identity()
+            .load_local_identity_by_agent_name("claude-tab-2")
             .await
             .unwrap()
             .expect("local identity row");
@@ -1198,6 +1231,16 @@ mod tests {
         // INSERT … SELECT step.)
         assert_eq!(stored.peer_id, PeerId::from_u128(0xa2));
         assert_eq!(stored.client_id, ClientId::from_u128(0xc2));
+
+        // And the legacy `load_local_identity()` path (which now
+        // means "default agent") correctly returns None when no
+        // default-agent row exists in the table.
+        let legacy_default = store_api.load_local_identity().await.unwrap();
+        assert!(
+            legacy_default.is_none(),
+            "load_local_identity() now resolves to the default agent only; \
+             a table holding only `claude-tab-2` must surface None",
+        );
     }
 
     /// Card 8384cc18 Sub-B — the final schema no longer enforces the
@@ -1250,6 +1293,87 @@ mod tests {
         assert_eq!(rows[0].agent_name, crate::DEFAULT_AGENT_NAME);
         assert_eq!(rows[1].id, 2);
         assert_eq!(rows[1].agent_name, "codex");
+    }
+
+    /// Card 8384cc18 Sub-C — `load_local_identity_by_agent_name`
+    /// resolves the row whose `agent_name` matches. With two distinct
+    /// agents in the table, looking up "default" returns the original
+    /// row and "codex" returns the second; the legacy
+    /// `load_local_identity()` keeps returning the default-agent row
+    /// (backwards-compat: every pre-Sub-C caller is implicitly
+    /// asking for that one).
+    #[tokio::test]
+    async fn load_local_identity_by_agent_name_disambiguates_rows() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let store_api: &dyn EventStore = &store;
+
+        // Default-agent row via the API (id auto-resolved to
+        // SINGLETON_ID by insert_local_identity).
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xb1),
+                client_id: ClientId::from_u128(0xd1),
+                version: 1,
+                created_at_ms: 200,
+                identity: Identity::new("primary"),
+                agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Second agent inserted directly (Sub-D will wire the
+        // multi-row write surface; for Sub-C's read-side test, the
+        // direct insert is enough to populate the schema).
+        local_identity::Entity::insert(local_identity::ActiveModel {
+            id: Set(2),
+            peer_id: Set(PeerId::from_u128(0xb2).as_uuid()),
+            client_id: Set(ClientId::from_u128(0xd2).as_uuid()),
+            version: Set(1),
+            created_at_ms: Set(201),
+            name: Set("codex".to_string()),
+            pronouns: Set("".to_string()),
+            role: Set("agent".to_string()),
+            bio: Set("".to_string()),
+            status: Set("active".to_string()),
+            fingerprint: Set("".to_string()),
+            integrations_json: Set(json!({})),
+            agent_name: Set("codex".to_string()),
+        })
+        .exec(&store.db)
+        .await
+        .unwrap();
+
+        // By-name lookup: default vs codex resolves to distinct rows.
+        let default_row = store_api
+            .load_local_identity_by_agent_name(crate::DEFAULT_AGENT_NAME)
+            .await
+            .unwrap()
+            .expect("default-agent row present");
+        assert_eq!(default_row.peer_id, PeerId::from_u128(0xb1));
+        assert_eq!(default_row.identity.name, "primary");
+
+        let codex_row = store_api
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .expect("codex-agent row present");
+        assert_eq!(codex_row.peer_id, PeerId::from_u128(0xb2));
+        assert_eq!(codex_row.identity.name, "codex");
+        assert_ne!(default_row.peer_id, codex_row.peer_id);
+
+        // Missing agent_name resolves to None — the substrate contract
+        // for "this scope has never been initialized for that agent."
+        let missing = store_api
+            .load_local_identity_by_agent_name("hermes")
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        // Backwards-compat: legacy load_local_identity() still
+        // returns the default-agent row. Sub-D wires the override.
+        let legacy = store_api.load_local_identity().await.unwrap().unwrap();
+        assert_eq!(legacy.peer_id, default_row.peer_id);
+        assert_eq!(legacy.agent_name, crate::DEFAULT_AGENT_NAME);
     }
 
     #[tokio::test]

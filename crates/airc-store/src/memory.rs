@@ -57,6 +57,23 @@ impl EventStore for InMemoryEventStore {
         Ok(identity.clone())
     }
 
+    async fn load_local_identity_by_agent_name(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<StoredLocalIdentity>, StoreError> {
+        // The in-memory store still holds one identity; faithfully
+        // honour the trait contract by filtering on agent_name and
+        // returning None for a mismatch. Card 8384cc18 Sub-C.
+        let identity = self
+            .local_identity
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(identity
+            .as_ref()
+            .filter(|i| i.agent_name == agent_name)
+            .cloned())
+    }
+
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError> {
         let mut stored = self
             .local_identity
