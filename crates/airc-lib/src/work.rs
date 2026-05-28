@@ -161,6 +161,17 @@ pub struct LinkCardPullRequest {
     pub pull_request: airc_work::model::PullRequestRef,
 }
 
+/// Card f16650cd: attest that a PR has been merged. Published by the
+/// continuous-merge background task (`airc work merger run`) AFTER it
+/// successfully calls `gh pr merge`. The projection picks this up and
+/// transitions the card to `CardState::Merged` automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkPullRequestMerged {
+    pub card_id: WorkCardId,
+    pub pull_request: airc_work::model::PullRequestRef,
+    pub merged_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatWorkClaim {
     pub card_id: WorkCardId,
@@ -485,6 +496,28 @@ impl Airc {
             pull_request: request.pull_request,
             linked_by: self.peer_id(),
             linked_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Card f16650cd: attest that the linked PR has been merged. The
+    /// continuous-merge background task calls this AFTER a successful
+    /// `gh pr merge`. The projection then transitions the card to
+    /// `CardState::Merged`. `merged_by` is the calling peer
+    /// (the merger's identity) — agents reviewing the transcript can
+    /// see who shipped the merge, separate from the card's author.
+    pub async fn mark_pull_request_merged(
+        &self,
+        request: MarkPullRequestMerged,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
+            card_id: request.card_id,
+            pull_request: request.pull_request,
+            merged_by: self.peer_id(),
+            merged_at_ms: request.merged_at_ms,
         });
         self.publish_work_event(&event).await?;
         Ok(())

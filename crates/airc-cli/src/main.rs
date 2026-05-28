@@ -55,6 +55,7 @@ mod lane_commands;
 mod lease;
 mod legacy_envelope;
 mod legacy_identity;
+mod merger;
 mod monitor;
 mod network_commands;
 mod pending_cli;
@@ -696,6 +697,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 note,
                 ttl_ms,
             } => work_commands::run_availability(&home, repo, state, note, ttl_ms).await,
+            WorkAction::Merger { action } => match action {
+                work_cli::MergerAction::Run {
+                    interval_secs,
+                    dry_run,
+                } => {
+                    merger::run(
+                        &home,
+                        std::time::Duration::from_secs(interval_secs),
+                        dry_run,
+                    )
+                    .await
+                }
+            },
         },
 
         Command::Lane(args) => match args.action {
