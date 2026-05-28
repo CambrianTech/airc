@@ -260,6 +260,7 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 1,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,

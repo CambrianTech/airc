@@ -85,6 +85,18 @@ pub struct CardCreated {
     pub lane_id: Option<LaneId>,
     pub created_by: PeerId,
     pub created_at_ms: u64,
+    /// If this card is a sibling review of another card, the
+    /// reviewed card's id. Card ad7e100b (peer-agent review loop)
+    /// Sub-A: makes "this card is a review of X" a typed link
+    /// rather than a body-string convention, so observers /
+    /// scheduling logic can ask the projection
+    /// (`WorkBoardProjection::review_cards_for(parent_id)`) which
+    /// reviews exist for a card.
+    ///
+    /// Optional: regular cards omit it. Serde-back-compat: legacy
+    /// `CardCreated` events on the wire decode with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews: Option<WorkCardId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +358,7 @@ mod tests {
             lane_id: None,
             created_by: PeerId::from_u128(2),
             created_at_ms: 10,
+            reviews: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "card_created");

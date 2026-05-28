@@ -38,6 +38,7 @@ pub async fn run_create(
             body,
             priority: priority.into(),
             lane_id: parse_optional_lane_id(lane_id.as_deref())?,
+            reviews: None,
         })
         .await?;
     println!("card_id: {card_id}");
@@ -837,6 +838,7 @@ mod tests {
             created_by: PeerId::from_u128(99),
             created_at_ms: 0,
             updated_at_ms: 0,
+            reviews: None,
         }
     }
 

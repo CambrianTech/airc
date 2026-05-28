@@ -110,6 +110,26 @@ impl WorkBoardProjection {
         self.workspaces.get(&workspace_id)
     }
 
+    /// Cards whose `reviews` link points at `parent_id` — i.e. the
+    /// review cards that exist for the given card. Card ad7e100b
+    /// (peer-agent review loop) Sub-A: lets schedulers and CLI
+    /// renderers ask "what reviews exist for this PR's card?"
+    /// without scanning bodies.
+    ///
+    /// Returns an iterator over `&WorkCard` so callers can filter
+    /// further (e.g. by state, to find unclaimed reviews) without
+    /// the projection imposing a policy. Iteration order is
+    /// unspecified; callers that need it deterministic should sort
+    /// on `created_at_ms` or `card_id`.
+    pub fn review_cards_for(
+        &self,
+        parent_id: WorkCardId,
+    ) -> impl Iterator<Item = &WorkCard> + '_ {
+        self.cards
+            .values()
+            .filter(move |card| card.reviews == Some(parent_id))
+    }
+
     pub fn stale_claims(&self, now_ms: u64) -> Vec<StaleClaim> {
         self.cards
             .values()
@@ -147,6 +167,7 @@ impl WorkBoardProjection {
             created_by: e.created_by,
             created_at_ms: e.created_at_ms,
             updated_at_ms: e.created_at_ms,
+            reviews: e.reviews,
         };
         self.cards.insert(e.card_id, card);
         if let Some(lane_id) = e.lane_id {

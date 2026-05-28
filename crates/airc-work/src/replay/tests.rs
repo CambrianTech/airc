@@ -20,6 +20,7 @@ fn card_created(card_id: WorkCardId, created_at_ms: u64) -> WorkEvent {
         lane_id: None,
         created_by: PeerId::from_u128(101),
         created_at_ms,
+        reviews: None,
     })
 }
 

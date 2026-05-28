@@ -31,6 +31,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -80,6 +81,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: merged_card,
@@ -103,6 +105,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: closed_card,
@@ -139,6 +142,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -185,6 +189,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -234,6 +239,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             lane_id: None,
             created_by: first_owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -282,6 +288,7 @@ fn expired_claim_can_be_superseded_by_new_claim() {
             lane_id: None,
             created_by: expired_owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -383,6 +390,7 @@ fn lane_card_and_pr_merge_projection_is_deterministic() {
             lane_id: Some(lane_id),
             created_by: owner,
             created_at_ms: 2,
+            reviews: None,
         }),
         WorkEvent::PullRequestLinked(PullRequestLinked {
             card_id,
@@ -424,6 +432,7 @@ fn workspace_lease_lifecycle_projects_status_and_disk() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -692,6 +701,7 @@ fn heartbeat_for_non_active_claim_is_dropped_silently() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -734,6 +744,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             lane_id: None,
             created_by: owner_a,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -802,6 +813,7 @@ fn concurrent_card_creates_with_distinct_ids_project_independently() {
             lane_id: None,
             created_by: alice,
             created_at_ms: 100,
+            reviews: None,
         }))
         .expect("alice's create projects");
     projection
@@ -814,6 +826,7 @@ fn concurrent_card_creates_with_distinct_ids_project_independently() {
             lane_id: None,
             created_by: bob,
             created_at_ms: 101,
+            reviews: None,
         }))
         .expect("bob's create projects independently");
 
@@ -846,6 +859,7 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
             lane_id: None,
             created_by: peer(1),
             created_at_ms: 100,
+            reviews: None,
         }))
         .expect("first create projects");
     let err = projection
@@ -858,6 +872,7 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
             lane_id: None,
             created_by: peer(2),
             created_at_ms: 200,
+            reviews: None,
         }))
         .expect_err("duplicate card_id must surface as an error");
     assert!(
@@ -869,4 +884,222 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
     assert_eq!(card.title, "original");
     assert_eq!(card.priority, Priority::P1);
     assert_eq!(card.created_by, peer(1));
+}
+
+// -------------------------------------------------------------------------
+// Card ad7e100b Sub-A — typed `reviews` link on `WorkCard`.
+//
+// Reviews are a sibling-card relationship: a "review" card carries a
+// `reviews = Some(parent_id)` link so observers can ask the projection
+// (`review_cards_for(parent_id)`) which reviews exist for a parent
+// without scanning bodies. The link must:
+//   * project onto `WorkCard.reviews` when the event carries it;
+//   * default to `None` when the event omits it (back-compat — legacy
+//     events on the wire decode without a `reviews` field);
+//   * surface on `review_cards_for(parent_id)`, including the case
+//     where multiple sibling reviewers race (every review surfaces,
+//     not just the first).
+// -------------------------------------------------------------------------
+
+#[test]
+fn cards_omitting_reviews_link_project_with_none() {
+    let card_id = WorkCardId::from_u128(0xAD7E_100B);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "ordinary card".into(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 1,
+            reviews: None,
+        }))
+        .expect("ordinary create projects");
+
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(card.reviews, None);
+    assert_eq!(
+        projection.review_cards_for(card_id).count(),
+        0,
+        "no review cards exist for an unreviewed parent"
+    );
+}
+
+#[test]
+fn review_card_links_to_parent_and_surfaces_on_query() {
+    let parent_id = WorkCardId::from_u128(0xAD7E_100B);
+    let review_id = WorkCardId::from_u128(0xAD7E_F001);
+    let mut projection = WorkBoardProjection::new();
+
+    // Parent card: a normal piece of work.
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: parent_id,
+            repo: repo(),
+            title: "parent: peer-agent review loop".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 1,
+            reviews: None,
+        }))
+        .expect("parent create projects");
+
+    // Review card: same repo, sibling, typed link back at the parent.
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: review_id,
+            repo: repo(),
+            title: "review: peer-agent review loop".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(2),
+            created_at_ms: 2,
+            reviews: Some(parent_id),
+        }))
+        .expect("review create projects");
+
+    let review = projection.card(review_id).expect("review present");
+    assert_eq!(review.reviews, Some(parent_id));
+
+    let reviews: Vec<_> = projection.review_cards_for(parent_id).collect();
+    assert_eq!(reviews.len(), 1, "exactly one review for the parent");
+    assert_eq!(reviews[0].card_id, review_id);
+    assert_eq!(
+        reviews[0].created_by,
+        peer(2),
+        "review card created_by attribution preserved (reviewer ≠ author)"
+    );
+}
+
+#[test]
+fn multiple_reviewers_each_surface_for_the_same_parent() {
+    // Two agents racing to review the same PR each spawn their own
+    // review card. The projection MUST surface both: review work is
+    // peer-parallel by AGENTS.md §8 (no "lead reviewer" gate).
+    let parent_id = WorkCardId::from_u128(0xAD7E_100B);
+    let alice_review = WorkCardId::from_u128(0xAD7E_A11C_AAAA);
+    let bob_review = WorkCardId::from_u128(0xAD7E_B0B0_BBBB);
+    let unrelated = WorkCardId::from_u128(0xCAFE_BABE);
+
+    let mut projection = WorkBoardProjection::new();
+    for (id, by, ts, title, reviews) in [
+        (
+            parent_id,
+            peer(1),
+            1u64,
+            "parent",
+            None,
+        ),
+        (
+            alice_review,
+            peer(2),
+            2,
+            "alice's review",
+            Some(parent_id),
+        ),
+        (
+            bob_review,
+            peer(3),
+            3,
+            "bob's review",
+            Some(parent_id),
+        ),
+        (
+            unrelated,
+            peer(4),
+            4,
+            "unrelated card — wrong parent",
+            Some(WorkCardId::from_u128(0xDEAD_BEEF)),
+        ),
+    ] {
+        projection
+            .apply(&WorkEvent::CardCreated(CardCreated {
+                card_id: id,
+                repo: repo(),
+                title: title.into(),
+                body: None,
+                priority: Priority::P2,
+                lane_id: None,
+                created_by: by,
+                created_at_ms: ts,
+                reviews,
+            }))
+            .expect("create projects");
+    }
+
+    let mut review_ids: Vec<_> = projection
+        .review_cards_for(parent_id)
+        .map(|card| card.card_id)
+        .collect();
+    review_ids.sort_by_key(|id| id.as_uuid());
+    let mut expected = vec![alice_review, bob_review];
+    expected.sort_by_key(|id| id.as_uuid());
+    assert_eq!(
+        review_ids, expected,
+        "review_cards_for must surface every reviewer, not just the first"
+    );
+
+    assert_eq!(
+        projection
+            .review_cards_for(WorkCardId::from_u128(0xDEAD_BEEF))
+            .count(),
+        1,
+        "review_cards_for filters by parent_id exactly — the 'unrelated' \
+         card is only a review of 0xDEAD_BEEF, not of the parent"
+    );
+}
+
+#[test]
+fn reviews_field_round_trips_through_serde_with_back_compat() {
+    // Forward direction: an event WITH a reviews link round-trips
+    // every field byte-identically, and the typed field is what's
+    // recorded on the wire (not stuffed into the body).
+    let parent = WorkCardId::new();
+    let review_event = CardCreated {
+        card_id: WorkCardId::new(),
+        repo: repo(),
+        title: "review card".into(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        created_by: PeerId::new(),
+        created_at_ms: 200,
+        reviews: Some(parent),
+    };
+    let json = serde_json::to_value(&review_event).expect("encode");
+    assert_eq!(
+        json["reviews"],
+        serde_json::json!(parent.as_uuid().to_string())
+    );
+    let decoded: CardCreated = serde_json::from_value(json).expect("decode");
+    assert_eq!(decoded, review_event);
+
+    // Back-compat: a legacy event (encoded by a peer on pre-ad7e100b
+    // code, or a non-review card) carries no `reviews` key on the
+    // wire. We synthesize one from a real `CardCreated` with
+    // `reviews: None` so the fixture uses typed UUID newtypes
+    // throughout (PeerId / WorkCardId / RepoId) — never hand-rolled
+    // UUID strings, which can be malformed or collide in p2p.
+    let plain = CardCreated {
+        reviews: None,
+        ..review_event
+    };
+    let plain_json = serde_json::to_value(&plain).expect("encode plain");
+    assert!(
+        plain_json.get("reviews").is_none(),
+        "None reviews must not appear in JSON (skip_serializing_if); got {plain_json}"
+    );
+    let decoded_plain: CardCreated =
+        serde_json::from_value(plain_json).expect("legacy-shape decode");
+    assert_eq!(
+        decoded_plain.reviews, None,
+        "missing `reviews` key must deserialize as None, not error"
+    );
+    assert_eq!(decoded_plain, plain);
 }

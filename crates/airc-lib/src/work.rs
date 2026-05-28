@@ -26,6 +26,37 @@ pub struct CreateWorkCard {
     pub body: Option<String>,
     pub priority: Priority,
     pub lane_id: Option<LaneId>,
+    /// If this card is a review of another card, the reviewed
+    /// card's id. Card ad7e100b (peer-agent review loop) Sub-A:
+    /// makes the relationship a typed link rather than a
+    /// body-string convention. Defaults to `None` for non-review
+    /// cards.
+    #[doc(hidden)]
+    pub reviews: Option<WorkCardId>,
+}
+
+impl CreateWorkCard {
+    /// Default to `None` for the optional fields so the common
+    /// path (a non-review card) doesn't need to spell out every
+    /// new optional field as the request struct grows.
+    pub fn new(repo: RepoId, title: impl Into<String>, priority: Priority) -> Self {
+        Self {
+            repo,
+            title: title.into(),
+            body: None,
+            priority,
+            lane_id: None,
+            reviews: None,
+        }
+    }
+
+    /// Builder-style setter for the typed reviews link.
+    /// Convention: `airc work review <PARENT>` will populate
+    /// this; manual callers can chain `.reviewing(parent)`.
+    pub fn reviewing(mut self, parent: WorkCardId) -> Self {
+        self.reviews = Some(parent);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +297,7 @@ impl Airc {
             lane_id: request.lane_id,
             created_by: self.peer_id(),
             created_at_ms: now_ms()?,
+            reviews: request.reviews,
         });
         self.publish_work_event(&event).await?;
         Ok(card_id)

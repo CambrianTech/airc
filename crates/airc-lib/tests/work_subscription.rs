@@ -41,6 +41,7 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
             body: Some("subscription proof".to_string()),
             priority: Priority::P1,
             lane_id: None,
+            reviews: None,
         })
         .await
         .expect("alice creates card");
@@ -84,6 +85,7 @@ async fn recent_work_events_reads_back_from_transcript() {
             body: None,
             priority: Priority::P2,
             lane_id: None,
+            reviews: None,
         })
         .await
         .expect("create card");

@@ -196,6 +196,13 @@ pub struct WorkCard {
     pub created_by: PeerId,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// If this card is a sibling review of another card, the
+    /// reviewed card's id. Card ad7e100b Sub-A: typed link so
+    /// `WorkBoardProjection::review_cards_for(parent_id)` can
+    /// answer "what reviews exist for card X" without parsing
+    /// body prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews: Option<WorkCardId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
