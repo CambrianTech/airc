@@ -19,8 +19,14 @@ pub enum HeaderFilter {
     /// Matches every envelope — the default (no header scoping).
     #[default]
     Any,
-    Exact { key: String, value: String },
-    Prefix { key: String, value_prefix: String },
+    Exact {
+        key: String,
+        value: String,
+    },
+    Prefix {
+        key: String,
+        value_prefix: String,
+    },
     All(Vec<HeaderFilter>),
     AnyOf(Vec<HeaderFilter>),
 }

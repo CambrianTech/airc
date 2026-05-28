@@ -880,7 +880,9 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
         "wrong error variant: {err:?}",
     );
     // Original card unchanged — silent overwrite would be a bug.
-    let card = projection.card(card_id).expect("original card still present");
+    let card = projection
+        .card(card_id)
+        .expect("original card still present");
     assert_eq!(card.title, "original");
     assert_eq!(card.priority, Priority::P1);
     assert_eq!(card.created_by, peer(1));
@@ -989,27 +991,9 @@ fn multiple_reviewers_each_surface_for_the_same_parent() {
 
     let mut projection = WorkBoardProjection::new();
     for (id, by, ts, title, reviews) in [
-        (
-            parent_id,
-            peer(1),
-            1u64,
-            "parent",
-            None,
-        ),
-        (
-            alice_review,
-            peer(2),
-            2,
-            "alice's review",
-            Some(parent_id),
-        ),
-        (
-            bob_review,
-            peer(3),
-            3,
-            "bob's review",
-            Some(parent_id),
-        ),
+        (parent_id, peer(1), 1u64, "parent", None),
+        (alice_review, peer(2), 2, "alice's review", Some(parent_id)),
+        (bob_review, peer(3), 3, "bob's review", Some(parent_id)),
         (
             unrelated,
             peer(4),
@@ -1285,7 +1269,14 @@ fn card_updated_all_none_bumps_updated_at_only() {
     // must accept it and bump updated_at_ms.
     let card_id = WorkCardId::new();
     let mut projection = WorkBoardProjection::new();
-    project_card_with(&mut projection, card_id, "untouched", None, Priority::P1, 100);
+    project_card_with(
+        &mut projection,
+        card_id,
+        "untouched",
+        None,
+        Priority::P1,
+        100,
+    );
     let snapshot_before = projection.card(card_id).cloned().unwrap();
 
     projection
@@ -1307,7 +1298,10 @@ fn card_updated_all_none_bumps_updated_at_only() {
     assert_eq!(after.owner, snapshot_before.owner);
     assert_eq!(after.claim_id, snapshot_before.claim_id);
     assert_eq!(after.reviews, snapshot_before.reviews);
-    assert_eq!(after.updated_at_ms, 500, "updated_at_ms moves even on no-op");
+    assert_eq!(
+        after.updated_at_ms, 500,
+        "updated_at_ms moves even on no-op"
+    );
 }
 
 #[test]

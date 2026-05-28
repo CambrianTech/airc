@@ -604,15 +604,21 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
         ));
         worker_ready.wait().await;
         let cmd = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) =
-                tokio::time::timeout(Duration::from_secs(10), read_frame::<_, Response>(&mut stream))
-                    .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut stream),
+            )
+            .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode command");
             }
         };
         assert_eq!(cmd.kind, Kind::Command, "worker only sees Commands");
-        assert_eq!(cmd.correlation_id, Some(corr), "command carries correlation");
+        assert_eq!(
+            cmd.correlation_id,
+            Some(corr),
+            "command carries correlation"
+        );
         client
             .publish(PublishRequest {
                 channel: channel.as_uuid(),
@@ -650,14 +656,20 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
         ));
         req_ready.wait().await;
         let result = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) =
-                tokio::time::timeout(Duration::from_secs(10), read_frame::<_, Response>(&mut stream))
-                    .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut stream),
+            )
+            .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode result");
             }
         };
-        assert_eq!(result.kind, Kind::CommandResult, "requester only sees results");
+        assert_eq!(
+            result.kind,
+            Kind::CommandResult,
+            "requester only sees results"
+        );
         assert_eq!(result.correlation_id, Some(corr), "result pairs to request");
         result.payload.to_vec()
     });

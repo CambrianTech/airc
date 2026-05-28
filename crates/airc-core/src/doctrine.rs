@@ -83,10 +83,9 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: DoctrineEvent = serde_json::from_str(&json).expect("deserialize");
         match (event, decoded) {
-            (
-                DoctrineEvent::RoomDoctrinePublished(a),
-                DoctrineEvent::RoomDoctrinePublished(b),
-            ) => assert_eq!(a, b),
+            (DoctrineEvent::RoomDoctrinePublished(a), DoctrineEvent::RoomDoctrinePublished(b)) => {
+                assert_eq!(a, b)
+            }
         }
     }
 
@@ -115,8 +114,7 @@ mod tests {
         // Future-version event a current consumer doesn't know about
         // must surface as a decode error (not silently mis-decode
         // into the one known variant). Keeps the upgrade path honest.
-        let raw =
-            r#"{"kind":"room_doctrine_deprecated","room_id":"00000000-0000-0000-0000-000000000001"}"#;
+        let raw = r#"{"kind":"room_doctrine_deprecated","room_id":"00000000-0000-0000-0000-000000000001"}"#;
         let result: Result<DoctrineEvent, _> = serde_json::from_str(raw);
         assert!(result.is_err(), "unknown kind must error");
     }

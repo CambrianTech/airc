@@ -1155,7 +1155,8 @@ mod tests {
         // 2026-05-28+ default for pre-multi-agent installs is
         // "default", set by the column default. The DTO surfaces it.
         assert_eq!(
-            stored.agent_name, crate::DEFAULT_AGENT_NAME,
+            stored.agent_name,
+            crate::DEFAULT_AGENT_NAME,
             "Sub-A: row inserted without an explicit agent_name still surfaces \
              the documented default through the DTO"
         );

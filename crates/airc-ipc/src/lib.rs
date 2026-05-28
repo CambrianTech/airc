@@ -13,6 +13,15 @@
 //! local transport, and a client. The daemon implements the server side;
 //! consumers can use the client without depending on daemon internals.
 
+// Card 7b87da8f / ef168afe: client RPC matches uniformly follow the
+// "expected one Response variant, everything else is an
+// UnexpectedResponse" idiom — that's the contract the client surfaces
+// to callers. Enumerating every Response variant at every callsite
+// would force this crate to track every server-side response shape
+// forever; the wildcard arm IS the type-safe expression of the
+// "anything else here is a substrate bug, not a runtime branch" intent.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 pub mod client;
 pub mod codec;
 pub mod request;
@@ -35,8 +44,6 @@ pub use request::{
     AddPeerRequest, AttachRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
     PublishRequest, RemovePeerRequest, Request, SendRequest,
 };
-pub use response::{
-    InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse,
-};
+pub use response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 // IpcListener / IpcStream stay under `transport` because only the
 // daemon host and low-level tests need the raw byte transport.

@@ -61,9 +61,9 @@ fn default_home_dir_for(cwd: &Path) -> PathBuf {
 
 /// Card a1b4552a — pure-function half of the resolution so tests can
 /// drive it with synthetic paths instead of needing a real `$HOME`
-/// + git repo. `machine_account_home` is the path we MUST NOT resolve
-/// to (typically `$HOME/.airc`); `git_main_working_tree_fn` resolves
-/// the main working tree of a git checkout from any of its
+/// and git repo. `machine_account_home` is the path we MUST NOT
+/// resolve to (typically `$HOME/.airc`); `git_main_working_tree_fn`
+/// resolves the main working tree of a git checkout from any of its
 /// worktrees (production: shells `git rev-parse --git-common-dir`).
 fn default_home_dir_for_with(
     cwd: &Path,
@@ -559,8 +559,7 @@ mod tests {
         // Stub git_main_working_tree_fn to a known main repo working tree.
         let main_repo = PathBuf::from("/Users/test/Development/airc");
         let stub = |_: &Path| -> Option<PathBuf> { Some(main_repo.clone()) };
-        let resolved =
-            default_home_dir_for_with(&cwd, Some(machine_account.as_path()), &stub);
+        let resolved = default_home_dir_for_with(&cwd, Some(machine_account.as_path()), &stub);
         assert_eq!(
             resolved,
             main_repo.join(".airc"),
@@ -582,8 +581,7 @@ mod tests {
         let nested = scope.join("debug");
         std::fs::create_dir_all(&nested).unwrap();
         let stub = |_: &Path| -> Option<PathBuf> { None };
-        let resolved =
-            default_home_dir_for_with(&nested, Some(machine_account.as_path()), &stub);
+        let resolved = default_home_dir_for_with(&nested, Some(machine_account.as_path()), &stub);
         assert_eq!(resolved, scope);
     }
 

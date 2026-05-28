@@ -524,10 +524,12 @@ impl Airc {
     /// is never exposed, so a later device-bound / Secure-Enclave
     /// signer (for hardware attestation) is a drop-in.
     pub fn sign_assertion(&self, context: &str, challenge: &[u8]) -> IdentityAssertion {
-        self.inner
-            .identity
-            .keypair
-            .sign_assertion(self.inner.identity.peer_id, 0, context, challenge)
+        self.inner.identity.keypair.sign_assertion(
+            self.inner.identity.peer_id,
+            0,
+            context,
+            challenge,
+        )
     }
 
     pub fn is_daemon_attached(&self) -> bool {
@@ -752,10 +754,7 @@ impl Airc {
     /// just by uuid); will also be used on nick / profile change in a
     /// follow-up slice. No-op when no local identity is persisted
     /// yet (e.g. fresh scope mid-bootstrap).
-    async fn emit_peer_identity_card(
-        &self,
-        room_id: airc_core::RoomId,
-    ) -> Result<(), AircError> {
+    async fn emit_peer_identity_card(&self, room_id: airc_core::RoomId) -> Result<(), AircError> {
         let local = self
             .event_store()
             .load_local_identity()
@@ -768,16 +767,11 @@ impl Airc {
             emitted_at_ms: time::now_ms()?,
         };
         let event = airc_core::identity::IdentityEvent::PeerIdentityCard(card);
-        let body_json = serde_json::to_value(&event).map_err(|e| {
-            AircError::Crypto(format!("identity event serialize: {e}"))
-        })?;
+        let body_json = serde_json::to_value(&event)
+            .map_err(|e| AircError::Crypto(format!("identity event serialize: {e}")))?;
         let body = airc_core::Body::Json(body_json);
-        self.emit_lifecycle(
-            airc_core::TranscriptKind::IdentityPublished,
-            room_id,
-            body,
-        )
-        .await
+        self.emit_lifecycle(airc_core::TranscriptKind::IdentityPublished, room_id, body)
+            .await
     }
 
     /// Subscribe this scope to the default account context:

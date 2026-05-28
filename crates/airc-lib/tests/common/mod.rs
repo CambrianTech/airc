@@ -151,9 +151,13 @@ impl Machine {
     /// Attach a new scope ("tab"/agent) to this machine's daemon.
     pub async fn attach(&self, scope: &str) -> Airc {
         let home = self.root.path().join(scope);
-        Airc::attach_with_wire_root_for_test(home, self.root.path().to_path_buf(), &self.daemon.socket)
-            .await
-            .expect("attach scope to daemon")
+        Airc::attach_with_wire_root_for_test(
+            home,
+            self.root.path().to_path_buf(),
+            &self.daemon.socket,
+        )
+        .await
+        .expect("attach scope to daemon")
     }
 
     /// Attach one agent and join `room` — the single-participant setup.

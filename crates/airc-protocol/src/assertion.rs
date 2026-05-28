@@ -143,7 +143,10 @@ mod tests {
 
         let mut wrong_ctx = assertion.clone();
         wrong_ctx.context = "continuum.other".to_string();
-        assert_eq!(wrong_ctx.verify(&registry), Err(AssertionError::BadSignature));
+        assert_eq!(
+            wrong_ctx.verify(&registry),
+            Err(AssertionError::BadSignature)
+        );
 
         let mut wrong_chal = assertion.clone();
         wrong_chal.challenge = b"nonce-43".to_vec();
@@ -154,7 +157,10 @@ mod tests {
 
         let mut wrong_sig = assertion.clone();
         wrong_sig.signature[0] ^= 0xFF;
-        assert_eq!(wrong_sig.verify(&registry), Err(AssertionError::BadSignature));
+        assert_eq!(
+            wrong_sig.verify(&registry),
+            Err(AssertionError::BadSignature)
+        );
     }
 
     #[test]

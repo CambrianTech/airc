@@ -237,8 +237,7 @@ mod wire_event_tests {
         id.role = "claude-arch".into();
         id.bio = "owner-daemon architect".into();
         id.fingerprint = "ff00aa11".into();
-        id.integrations
-            .insert("github".into(), "alice-gh".into());
+        id.integrations.insert("github".into(), "alice-gh".into());
         id
     }
 
@@ -293,4 +292,3 @@ mod wire_event_tests {
         assert!(result.is_err(), "unknown kind must error");
     }
 }
-

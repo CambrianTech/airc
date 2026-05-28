@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn chat_text_renders_verbatim() {
-        assert_eq!(body_detail(Some(&Body::text("hello"))), Some("hello".into()));
+        assert_eq!(
+            body_detail(Some(&Body::text("hello"))),
+            Some("hello".into())
+        );
     }
 
     #[test]
@@ -140,7 +143,10 @@ mod tests {
     #[test]
     fn unknown_structured_body_names_its_kind() {
         let other = Body::Json(json!({ "kind": "some_future_event", "x": 1 }));
-        assert_eq!(body_detail(Some(&other)), Some("⟨some_future_event⟩".into()));
+        assert_eq!(
+            body_detail(Some(&other)),
+            Some("⟨some_future_event⟩".into())
+        );
     }
 
     #[test]

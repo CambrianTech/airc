@@ -5,8 +5,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    ChangeWorkLaneState, ClaimManagerHat, CreateWorkLane, LaneId, LaneState,
-    ReleaseManagerHat, RepoId, WorkBoardProjection,
+    ChangeWorkLaneState, ClaimManagerHat, CreateWorkLane, LaneId, LaneState, ReleaseManagerHat,
+    RepoId, WorkBoardProjection,
 };
 
 use crate::lane_cli::CliLaneState;

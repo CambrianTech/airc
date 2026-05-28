@@ -63,7 +63,12 @@ fn same_machine_round_trips_via_daemon_with_no_frames_jsonl() {
     // One scope sends; another scope under the SAME $HOME reads it back —
     // they share the one machine daemon, so the message converges.
     run(account.path(), "agent", "claude:dogfood", &["init"]);
-    run(account.path(), "agent", "claude:dogfood", &["room", "general"]);
+    run(
+        account.path(),
+        "agent",
+        "claude:dogfood",
+        &["room", "general"],
+    );
     run(
         account.path(),
         "agent",

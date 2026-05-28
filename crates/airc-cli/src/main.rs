@@ -3,6 +3,15 @@
 //! State lives under `<home>` (default `$HOME/.airc`):
 //!   - `identity.key`   — 32-byte Ed25519 secret (0600)
 //!   - `daemon.sock`    — IPC socket
+
+// Card 7b87da8f / ef168afe: CLI rendering + refusal-message paths
+// uniformly use a wildcard arm to mean "any other variant — show the
+// debug label" (event_render) or "any future substrate-owned target —
+// bug in airc-cli, not a runtime branch" (refusal_message). The
+// wildcards ARE the idiom; enumerating every variant would force the
+// CLI to track every domain enum's variant set forever, which trades
+// genuine future-proofing for surface-area churn.
+#![allow(clippy::wildcard_enum_match_arm)]
 //!   - `events.sqlite`  — ORM-backed identity metadata, events, cursors, peer
 //!     trust, subscriptions, and coordinator state
 //!

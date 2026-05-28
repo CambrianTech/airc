@@ -51,10 +51,7 @@ pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `room` — print current room. `room <name>` — switch to a
 /// deterministic room derived from `<name>`.
-pub async fn run_room(
-    home: &Path,
-    name: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
@@ -104,16 +101,16 @@ pub async fn run_doctrine_publish(
             PathBuf::from(root).join("AGENTS.md")
         }
     };
-    let body = std::fs::read_to_string(&path).map_err(|e| {
-        format!("cannot read doctrine file {}: {e}", path.display())
-    })?;
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read doctrine file {}: {e}", path.display()))?;
 
     let version = short_content_hash(body.as_bytes());
 
     let socket = crate::cli::default_socket_path_in(home);
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     let airc = Airc::attach(home, socket).await?;
-    airc.publish_room_doctrine(body.clone(), version.clone()).await?;
+    airc.publish_room_doctrine(body.clone(), version.clone())
+        .await?;
     println!(
         "doctrine_published: file={file} version={version} bytes={bytes}",
         file = path.display(),
@@ -764,7 +761,10 @@ pub async fn run_inbox(
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
-        Some(socket) => { ensure_daemon_running(home, socket.clone(), Vec::new()).await?; Airc::attach(home, socket).await? }
+        Some(socket) => {
+            ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+            Airc::attach(home, socket).await?
+        }
         None => attached_airc(home).await?,
     };
     // Both --since-lamport and --since-event-id must be supplied
@@ -1042,11 +1042,31 @@ pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std
             match airc.peer_identity_card(peer.peer_id).await {
                 Ok(Some(card)) => {
                     let id = &card.identity;
-                    let name = if id.name.is_empty() { "(unset)" } else { id.name.as_str() };
-                    let pronouns = if id.pronouns.is_empty() { "(unset)" } else { id.pronouns.as_str() };
-                    let role = if id.role.is_empty() { "(unset)" } else { id.role.as_str() };
-                    let bio = if id.bio.is_empty() { "(unset)" } else { id.bio.as_str() };
-                    let status = if id.status.is_empty() { "(none)" } else { id.status.as_str() };
+                    let name = if id.name.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.name.as_str()
+                    };
+                    let pronouns = if id.pronouns.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.pronouns.as_str()
+                    };
+                    let role = if id.role.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.role.as_str()
+                    };
+                    let bio = if id.bio.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.bio.as_str()
+                    };
+                    let status = if id.status.is_empty() {
+                        "(none)"
+                    } else {
+                        id.status.as_str()
+                    };
                     let fingerprint = if id.fingerprint.is_empty() {
                         "(unset)"
                     } else {

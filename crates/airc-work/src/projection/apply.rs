@@ -1,11 +1,11 @@
 use crate::event::{
-    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimReleased,
-    GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
-    LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
-    PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
-    WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
-    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
-    WorkspaceRequested,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat,
+    ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
+    LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
+    PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
+    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkspaceAllocated,
+    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
@@ -122,10 +122,7 @@ impl WorkBoardProjection {
     /// the projection imposing a policy. Iteration order is
     /// unspecified; callers that need it deterministic should sort
     /// on `created_at_ms` or `card_id`.
-    pub fn review_cards_for(
-        &self,
-        parent_id: WorkCardId,
-    ) -> impl Iterator<Item = &WorkCard> + '_ {
+    pub fn review_cards_for(&self, parent_id: WorkCardId) -> impl Iterator<Item = &WorkCard> + '_ {
         self.cards
             .values()
             .filter(move |card| card.reviews == Some(parent_id))

@@ -240,8 +240,8 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
     let alice = PeerId::from_u128(0xA11CE);
     let bob = PeerId::from_u128(0xB0B);
     let card_id = WorkCardId::from_u128(0x75B5_4D0A);
-    let alice_claim = ClaimId::from_u128(0xA11CE_C1A1);
-    let bob_claim = ClaimId::from_u128(0xB0B_C1A1);
+    let alice_claim = ClaimId::from_u128(0x000A_11CE_C1A1);
+    let bob_claim = ClaimId::from_u128(0x00B0_BC1A_1000);
 
     // The churn transcript. Times are synthetic; the projection's
     // arbitration is purely event-driven — `expires_at_ms` is
@@ -311,7 +311,10 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
     for event in &transcript {
         publisher
             .publish(publish_work_event_request(
-                channel, from_peer, from_client, event,
+                channel,
+                from_peer,
+                from_client,
+                event,
             ))
             .await
             .expect("publish work event");
@@ -389,7 +392,9 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
     let proj_a = project(decoded_a);
     let proj_b = project(decoded_b);
     for (who, proj) in [("observer A", &proj_a), ("observer B", &proj_b)] {
-        let card = proj.card(card_id).unwrap_or_else(|| panic!("{who}: card present"));
+        let card = proj
+            .card(card_id)
+            .unwrap_or_else(|| panic!("{who}: card present"));
         assert_eq!(card.state, CardState::Closed, "{who}: card terminal");
         assert_eq!(
             card.claim_id, None,
