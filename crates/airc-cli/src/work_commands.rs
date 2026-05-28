@@ -227,14 +227,21 @@ fn short_id<T: std::fmt::Display>(id: T) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-/// Render a peer-id for the board: 'me' when it matches this peer's
-/// identity, short-uuid otherwise. Full alias resolution for OTHER
-/// peers needs the rich-peer-identity-card substrate (blocker card
-/// af40f46d); until then 'me + short uuid' substantially improves the
-/// at-a-glance readability complaint from kink 6f111211.
-fn format_peer(peer: airc_lib::PeerId, me: airc_lib::PeerId) -> String {
+/// Render a peer-id for the board: 'me' for self, the published alias
+/// when known (kink 6f111211 / card c397567a — looked up via
+/// Airc::peer_alias and pre-fetched into the map by run_board), else
+/// short-uuid fallback. Honest "unknown" rendering keeps the board
+/// readable even when a peer hasn't published an identity card to
+/// this room yet.
+fn format_peer(
+    peer: airc_lib::PeerId,
+    me: airc_lib::PeerId,
+    aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
+) -> String {
     if peer == me {
         "me".to_string()
+    } else if let Some(alias) = aliases.get(&peer) {
+        alias.clone()
     } else {
         short_id(peer)
     }
@@ -312,7 +319,38 @@ pub async fn run_board(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
-    print_board(&board, airc.peer_id(), filter);
+    let me = airc.peer_id();
+
+    // Pre-fetch published aliases for every distinct non-self owner on
+    // the board (kink 6f111211 / card c397567a). One scan per peer for
+    // now — N is small, and peer_alias is page_recent-backed; if this
+    // becomes a hot path the follow-up is one shared scan + a
+    // local index.
+    let snapshot = board.snapshot();
+    let now = now_ms();
+    let mut owner_peers: std::collections::HashSet<airc_lib::PeerId> =
+        std::collections::HashSet::new();
+    for card in &snapshot.cards {
+        if let Some(owner) = card.owner {
+            if owner != me {
+                owner_peers.insert(owner);
+            }
+        }
+    }
+    for claim in board.stale_claims(now) {
+        if claim.owner != me {
+            owner_peers.insert(claim.owner);
+        }
+    }
+    let mut aliases: std::collections::HashMap<airc_lib::PeerId, String> =
+        std::collections::HashMap::new();
+    for peer in owner_peers {
+        if let Ok(Some(alias)) = airc.peer_alias(peer).await {
+            aliases.insert(peer, alias);
+        }
+    }
+
+    print_board(&board, me, filter, &aliases);
     Ok(())
 }
 
@@ -435,7 +473,12 @@ pub async fn run_availability(
     Ok(())
 }
 
-fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId, filter: BoardFilter) {
+fn print_board(
+    board: &WorkBoardProjection,
+    me: airc_lib::PeerId,
+    filter: BoardFilter,
+    aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
+) {
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");
@@ -466,7 +509,7 @@ fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId, filter: BoardF
     for card in &visible {
         let owner = card
             .owner
-            .map(|peer| format_peer(peer, me))
+            .map(|peer| format_peer(peer, me, aliases))
             .unwrap_or_else(|| "-".to_string());
         let claim = card
             .claim_id
@@ -489,7 +532,7 @@ fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId, filter: BoardF
             println!(
                 "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
                 card_id = claim.card_id,
-                owner = format_peer(claim.owner, me),
+                owner = format_peer(claim.owner, me, aliases),
                 claim_id = short_id(claim.claim_id),
                 expired_at_ms = claim.expired_at_ms,
             );
@@ -845,6 +888,24 @@ mod tests {
         assert!(BoardFilter::Others.matches(&theirs, me, 1_000));
         assert!(!BoardFilter::Others.matches(&mine, me, 1_000));
         assert!(!BoardFilter::Others.matches(&unclaimed, me, 1_000));
+    }
+
+    #[test]
+    fn format_peer_renders_alias_when_known_short_uuid_otherwise() {
+        let me = PeerId::from_u128(10);
+        let alice = PeerId::from_u128(20);
+        let bob = PeerId::from_u128(30);
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(alice, "alice".to_string());
+
+        // Self is always "me", even if a stale alias exists for self.
+        assert_eq!(format_peer(me, me, &aliases), "me");
+        // Known peer renders by alias.
+        assert_eq!(format_peer(alice, me, &aliases), "alice");
+        // Unknown peer falls back to short-uuid — never empty string.
+        let bob_short = format_peer(bob, me, &aliases);
+        assert_eq!(bob_short.len(), 8);
+        assert_ne!(bob_short, "me");
     }
 
     #[test]
