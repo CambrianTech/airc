@@ -19,6 +19,20 @@
 //!    the persisted [`Source`] field) so the operator knows the
 //!    machine couldn't authenticate against GitHub.
 //!
+//! ## One identity per machine (provisional sources self-heal)
+//!
+//! Only `gh_api_user` (and an explicit `operator` override) are
+//! *sticky*. `git_email` and `local_host_user` are **provisional** —
+//! they're used only because `gh` was unreachable at resolve time and
+//! they do NOT converge across a user's scopes/machines. So a
+//! provisional value never sticks: every resolve re-probes `gh` and
+//! overwrites it the instant `gh` answers. This self-heals a scope that
+//! forked onto `git config user.email` during a brief `gh` outage —
+//! e.g. one tab resolving `joelteply` via gh and another
+//! `joelteply@yahoo.com` via git, which silently splits the account
+//! into two `RoomId`s (two `#general`s) — instead of stranding it for
+//! `DEFAULT_TTL_MS`.
+//!
 //! ## Caching
 //!
 //! Persisted to the `mesh_identity` ORM table. Re-resolution kicks in
@@ -148,33 +162,58 @@ where
     F: FnOnce() -> Option<(String, Source)>,
 {
     if let Some(cached) = load_cached(store).await? {
-        // Operator-source caches are trusted as-is and never expire —
-        // they were explicitly set by the user (env var, CLI override,
-        // test seed). Treating them as TTL-bounded forces a fall-through
-        // to gh/git shell-outs that the operator was trying to avoid.
-        // Caught when the e2e join_without_args test seeded
-        // `resolved_at_ms: 1` for hermetic mesh-identity in CI, and
-        // Windows runners hung on the gh shell-out because the
-        // tiny-resolved_at made is_expired return true on every call.
-        if cached.source == Source::Operator || !cached.is_expired(now_ms) {
+        // Operator caches are explicit overrides (env var, CLI override,
+        // test seed) — trusted as-is, never expire, never re-resolved.
+        // Treating them as TTL-bounded forces a fall-through to gh/git
+        // shell-outs the operator was trying to avoid (Windows CI runners
+        // hung on the gh shell-out when a tiny seeded `resolved_at_ms`
+        // made is_expired return true on every call).
+        if cached.source == Source::Operator {
             return Ok(cached);
+        }
+        // `GhApiUser` is the canonical, machine-wide identity. Honor it
+        // while fresh; only re-probe once the TTL lapses.
+        if cached.source == Source::GhApiUser && !cached.is_expired(now_ms) {
+            return Ok(cached);
+        }
+        // `GitEmail` / `LocalHostUser` are PROVISIONAL (or this is an
+        // expired `GhApiUser`): re-probe and, the instant `gh` answers,
+        // overwrite with the canonical login. This enforces one identity
+        // per machine — a scope that forked onto `git config user.email`
+        // during a brief `gh` outage self-heals instead of stranding the
+        // account in a second room. See the module docs.
+        match resolver() {
+            Some((identity, Source::GhApiUser)) => {
+                let entry = persisted_entry(identity, Source::GhApiUser, now_ms);
+                save(store, &entry).await?;
+                return Ok(entry);
+            }
+            // gh still unreachable — keep the existing value rather than
+            // churning it for an equally-non-canonical one (stability
+            // until gh returns; never downgrade a cached value to local).
+            _ => return Ok(cached),
         }
     }
 
-    let (identity, source) = match resolver() {
-        Some(pair) => pair,
-        None => (local_fallback_identity(), Source::LocalHostUser),
-    };
+    // No cache yet: resolve fresh, falling back to a deterministic
+    // machine-local identity if neither gh nor git can answer.
+    let (identity, source) =
+        resolver().unwrap_or_else(|| (local_fallback_identity(), Source::LocalHostUser));
+    let entry = persisted_entry(identity, source, now_ms);
+    save(store, &entry).await?;
+    Ok(entry)
+}
 
-    let entry = CachedIdentity {
+/// Build a cache entry with the standard version + TTL. Centralizes the
+/// two construction sites in [`resolve_with`] so they can't drift.
+fn persisted_entry(identity: String, source: Source, now_ms: u64) -> CachedIdentity {
+    CachedIdentity {
         version: 1,
         identity,
         source,
         resolved_at_ms: now_ms,
         ttl_ms: DEFAULT_TTL_MS,
-    };
-    save(store, &entry).await?;
-    Ok(entry)
+    }
 }
 
 /// Read the cache without resolving. Returns `None` if the file
@@ -390,6 +429,88 @@ mod tests {
         // (fresh cache) returns the cached fallback value too.
         let entry2 = resolve_with(&store, mock_none, 1_100).await.unwrap();
         assert_eq!(entry2.identity, entry.identity);
+    }
+
+    fn mock_git_email(value: &'static str) -> impl FnOnce() -> Option<(String, Source)> {
+        move || Some((value.to_string(), Source::GitEmail))
+    }
+
+    #[tokio::test]
+    async fn provisional_git_email_self_heals_to_gh() {
+        let store = InMemoryEventStore::new();
+        // A scope forked onto git-email because gh missed once.
+        save(
+            &store,
+            &CachedIdentity {
+                version: 1,
+                identity: "joelteply@yahoo.com".to_string(),
+                source: Source::GitEmail,
+                resolved_at_ms: 1_000,
+                ttl_ms: DEFAULT_TTL_MS,
+            },
+        )
+        .await
+        .unwrap();
+        // Even though the git-email cache is FRESH, gh answering must win
+        // and overwrite it — one identity per machine.
+        let entry = resolve_with(&store, mock_gh("joelteply"), 1_500)
+            .await
+            .unwrap();
+        assert_eq!(entry.identity, "joelteply");
+        assert_eq!(entry.source, Source::GhApiUser);
+        // Persisted, so every later scope/resolve sees the healed login.
+        let reloaded = load_cached(&store).await.unwrap().unwrap();
+        assert_eq!(reloaded.identity, "joelteply");
+        assert_eq!(reloaded.source, Source::GhApiUser);
+    }
+
+    #[tokio::test]
+    async fn provisional_git_email_retained_when_gh_still_unavailable() {
+        let store = InMemoryEventStore::new();
+        save(
+            &store,
+            &CachedIdentity {
+                version: 1,
+                identity: "joelteply@yahoo.com".to_string(),
+                source: Source::GitEmail,
+                resolved_at_ms: 1_000,
+                ttl_ms: DEFAULT_TTL_MS,
+            },
+        )
+        .await
+        .unwrap();
+        // gh still unreachable (resolver yields None): keep the provisional
+        // value — do NOT churn it down to a machine-local fallback.
+        let entry = resolve_with(&store, mock_none, 1_500).await.unwrap();
+        assert_eq!(entry.identity, "joelteply@yahoo.com");
+        assert_eq!(entry.source, Source::GitEmail);
+        // A non-canonical git resolver also must not displace the cache.
+        let entry2 = resolve_with(&store, mock_git_email("other@x.com"), 1_600)
+            .await
+            .unwrap();
+        assert_eq!(entry2.identity, "joelteply@yahoo.com");
+    }
+
+    #[tokio::test]
+    async fn operator_override_is_never_overwritten_by_gh() {
+        let store = InMemoryEventStore::new();
+        save(
+            &store,
+            &CachedIdentity {
+                version: 1,
+                identity: "pinned-id".to_string(),
+                source: Source::Operator,
+                resolved_at_ms: 1,
+                ttl_ms: DEFAULT_TTL_MS,
+            },
+        )
+        .await
+        .unwrap();
+        let entry = resolve_with(&store, mock_gh("joelteply"), 9_999_999)
+            .await
+            .unwrap();
+        assert_eq!(entry.identity, "pinned-id");
+        assert_eq!(entry.source, Source::Operator);
     }
 
     #[test]
