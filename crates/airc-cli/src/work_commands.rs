@@ -240,6 +240,52 @@ fn format_peer(peer: airc_lib::PeerId, me: airc_lib::PeerId) -> String {
     }
 }
 
+/// Filter for `airc work board` output — clap enforces mutual exclusion
+/// on the underlying flags, but the runtime collapses them into one
+/// value so the rest of the code doesn't carry three booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardFilter {
+    All,
+    /// No active claim, or claim's lease has expired (eligible for
+    /// reclaim per the flywheel-continuity doctrine). Closed/Merged
+    /// terminal cards are excluded.
+    Available,
+    /// Owned by this peer right now.
+    Mine,
+    /// Owned by another peer (active claim).
+    Others,
+}
+
+impl BoardFilter {
+    pub fn from_flags(available: bool, mine: bool, others: bool) -> Self {
+        match (available, mine, others) {
+            (true, _, _) => Self::Available,
+            (_, true, _) => Self::Mine,
+            (_, _, true) => Self::Others,
+            _ => Self::All,
+        }
+    }
+
+    fn matches(self, card: &airc_work::WorkCard, me: airc_lib::PeerId, now_ms: u64) -> bool {
+        match self {
+            Self::All => true,
+            Self::Available => {
+                use airc_work::model::CardState;
+                if matches!(card.state, CardState::Closed | CardState::Merged) {
+                    return false;
+                }
+                match (card.claim_id, card.claim_expires_at_ms) {
+                    (None, _) => true,
+                    (Some(_), Some(exp)) if exp <= now_ms => true,
+                    _ => false,
+                }
+            }
+            Self::Mine => card.owner == Some(me),
+            Self::Others => card.owner.is_some_and(|owner| owner != me),
+        }
+    }
+}
+
 /// Render claim-lease liveness inline on the board (kink ac6affc7):
 /// '-' = no claim, '<STALE>' = lease expired (eligible for reclaim per
 /// the flywheel-continuity doctrine), otherwise time remaining as
@@ -259,10 +305,14 @@ fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
     }
 }
 
-pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_board(
+    home: &Path,
+    limit: usize,
+    filter: BoardFilter,
+) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
-    print_board(&board, airc.peer_id());
+    print_board(&board, airc.peer_id(), filter);
     Ok(())
 }
 
@@ -385,7 +435,7 @@ pub async fn run_availability(
     Ok(())
 }
 
-fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId) {
+fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId, filter: BoardFilter) {
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");
@@ -393,11 +443,27 @@ fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId) {
     }
     let stale_claims = board.stale_claims(now_ms());
 
-    if !snapshot.cards.is_empty() {
-        println!("work cards: {}", snapshot.cards.len());
-    }
     let now = now_ms();
-    for card in &snapshot.cards {
+    let visible: Vec<&airc_work::WorkCard> = snapshot
+        .cards
+        .iter()
+        .filter(|card| filter.matches(card, me, now))
+        .collect();
+    if !visible.is_empty() {
+        if matches!(filter, BoardFilter::All) {
+            println!("work cards: {}", visible.len());
+        } else {
+            println!(
+                "work cards: {} (filter={:?}, hidden={})",
+                visible.len(),
+                filter,
+                snapshot.cards.len() - visible.len(),
+            );
+        }
+    } else if !matches!(filter, BoardFilter::All) {
+        println!("(no cards match filter {:?})", filter);
+    }
+    for card in &visible {
         let owner = card
             .owner
             .map(|peer| format_peer(peer, me))
@@ -700,5 +766,98 @@ mod tests {
     fn short_id_truncates_to_8_chars() {
         assert_eq!(short_id("cdff6a9d-e995-4b4a-a119-10bc1faf1747"), "cdff6a9d");
         assert_eq!(short_id("short"), "short");
+    }
+
+    use airc_core::PeerId;
+    use airc_work::model::CardState;
+    use airc_work::{ClaimId, Priority, RepoId, WorkCard, WorkCardId};
+
+    fn make_card(
+        state: CardState,
+        owner: Option<PeerId>,
+        claim_id: Option<ClaimId>,
+        claim_expires_at_ms: Option<u64>,
+    ) -> WorkCard {
+        WorkCard {
+            card_id: WorkCardId::from_u128(1),
+            repo: RepoId::new("test/test").unwrap(),
+            title: "t".into(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            state,
+            owner,
+            claim_id,
+            claim_expires_at_ms,
+            last_heartbeat_at_ms: None,
+            pull_request: None,
+            created_by: PeerId::from_u128(99),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn from_flags_picks_filter_or_defaults_to_all() {
+        assert_eq!(BoardFilter::from_flags(false, false, false), BoardFilter::All);
+        assert_eq!(BoardFilter::from_flags(true, false, false), BoardFilter::Available);
+        assert_eq!(BoardFilter::from_flags(false, true, false), BoardFilter::Mine);
+        assert_eq!(BoardFilter::from_flags(false, false, true), BoardFilter::Others);
+    }
+
+    #[test]
+    fn available_filter_includes_open_unclaimed_and_stale_claims() {
+        let me = PeerId::from_u128(10);
+        let other = PeerId::from_u128(20);
+        let claim = ClaimId::from_u128(30);
+
+        // Open, no claim → available
+        let card = make_card(CardState::Open, None, None, None);
+        assert!(BoardFilter::Available.matches(&card, me, 1_000));
+
+        // Open with stale claim (expired) → available for reclaim
+        let card = make_card(CardState::Claimed, Some(other), Some(claim), Some(500));
+        assert!(BoardFilter::Available.matches(&card, me, 1_000));
+
+        // Open with active claim → NOT available
+        let card = make_card(CardState::InProgress, Some(other), Some(claim), Some(5_000));
+        assert!(!BoardFilter::Available.matches(&card, me, 1_000));
+
+        // Closed terminal → never available (even with no claim)
+        let card = make_card(CardState::Closed, None, None, None);
+        assert!(!BoardFilter::Available.matches(&card, me, 1_000));
+    }
+
+    #[test]
+    fn mine_and_others_split_ownership_cleanly() {
+        let me = PeerId::from_u128(10);
+        let other = PeerId::from_u128(20);
+        let claim = ClaimId::from_u128(30);
+
+        let mine = make_card(CardState::InProgress, Some(me), Some(claim), Some(5_000));
+        let theirs = make_card(CardState::InProgress, Some(other), Some(claim), Some(5_000));
+        let unclaimed = make_card(CardState::Open, None, None, None);
+
+        assert!(BoardFilter::Mine.matches(&mine, me, 1_000));
+        assert!(!BoardFilter::Mine.matches(&theirs, me, 1_000));
+        assert!(!BoardFilter::Mine.matches(&unclaimed, me, 1_000));
+
+        assert!(BoardFilter::Others.matches(&theirs, me, 1_000));
+        assert!(!BoardFilter::Others.matches(&mine, me, 1_000));
+        assert!(!BoardFilter::Others.matches(&unclaimed, me, 1_000));
+    }
+
+    #[test]
+    fn all_filter_admits_everything() {
+        let me = PeerId::from_u128(10);
+        let claim = ClaimId::from_u128(30);
+        let cases = [
+            make_card(CardState::Open, None, None, None),
+            make_card(CardState::Closed, Some(me), Some(claim), Some(5_000)),
+            make_card(CardState::Merged, None, None, None),
+        ];
+        for card in &cases {
+            assert!(BoardFilter::All.matches(card, me, 1_000));
+        }
     }
 }

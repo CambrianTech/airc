@@ -111,10 +111,25 @@ pub enum WorkAction {
         card_id: String,
     },
     /// Print the current room's projected work board.
+    ///
+    /// `--available`, `--mine`, `--others` are mutually exclusive filters
+    /// over the projection so peers can see their slice fast (kink
+    /// b408698c). When none are passed, the full board is shown.
     Board {
         /// Recent transcript events to replay into the projection.
         #[arg(long, default_value_t = 128)]
         limit: usize,
+        /// Show only cards available to claim now: no active claim, or
+        /// claim's lease has expired (reclaim-eligible per the
+        /// flywheel-continuity doctrine). Closed / Merged are hidden.
+        #[arg(long, group = "board_filter")]
+        available: bool,
+        /// Show only cards currently claimed by this peer.
+        #[arg(long, group = "board_filter")]
+        mine: bool,
+        /// Show only cards currently claimed by another peer.
+        #[arg(long, group = "board_filter")]
+        others: bool,
     },
     /// Suggest claimable work for this agent.
     Next {

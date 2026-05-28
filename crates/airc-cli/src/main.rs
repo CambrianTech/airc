@@ -615,7 +615,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 work_commands::run_state(&home, card_id, state).await
             }
             WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
-            WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
+            WorkAction::Board {
+                limit,
+                available,
+                mine,
+                others,
+            } => {
+                let filter = work_commands::BoardFilter::from_flags(available, mine, others);
+                work_commands::run_board(&home, limit, filter).await
+            }
             WorkAction::Next {
                 repo,
                 max_priority,
