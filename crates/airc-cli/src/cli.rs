@@ -151,19 +151,57 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 
 /// Default daemon IPC endpoint for `home`.
 ///
-/// The socket lives **inside the machine-account home** (`~/.airc`), not
-/// a temp dir: every scope under one user's `$HOME` resolves to the same
-/// `~/.airc/daemon-v<N>.sock`, so they all reach the ONE machine-singular
-/// daemon (§1), and there's no hashing — the home dir IS the unique key.
-/// The per-socket `DaemonBindGuard` then guarantees a single owner: the
-/// first scope to start binds it, the rest attach.
+/// Card 7e88c34d: the socket now lives at the platform's **runtime
+/// directory** keyed by the **project root** hash, not at the
+/// home-private `~/.airc/daemon-v<N>.sock`. This eliminates the
+/// `/tmp/airc-discovery-<uid>/` indirection from card 282850c2 /
+/// PR #1036: every agent resolving the same project_root computes
+/// the same socket path → reaches the same daemon → no discovery
+/// file needed.
 ///
-/// The filename includes `airc_ipc::IPC_PROTOCOL_VERSION`: if the local
-/// daemon wire protocol changes, a new client must not talk to an old
-/// daemon that still owns the prior socket.
+/// Resolution:
+///   - Project-scoped home (parent is a git working tree):
+///     `<runtime-dir>/airc-<project-hash>-v<N>.sock`
+///   - Machine-account home (`~/.airc/` directly):
+///     `<runtime-dir>/airc-machine-v<N>.sock` (one per user)
+///
+/// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]:
+///   `$AIRC_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/airc` → `$TMPDIR/airc`
+///   (macOS only) → `~/.airc/runtime`. All four are namespaced under
+///   the user (no shared-machine collisions) and reachable across
+///   sandbox boundaries in the common case.
+///
+/// The filename includes `airc_ipc::IPC_PROTOCOL_VERSION`: if the
+/// local daemon wire protocol changes, a new client must not talk
+/// to an old daemon that still owns the prior socket.
+///
+/// On runtime_dir failure (extremely rare — only if HOME isn't set
+/// and every other env hint failed), falls back to the legacy
+/// home-private path so the substrate still functions; the legacy
+/// path is what existed before this card and remains backwards-
+/// compatible for old binaries.
 pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
-    airc_lib::machine_account_home(home)
-        .join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION))
+    let machine_home = airc_lib::machine_account_home(home);
+    let socket_name = if home == machine_home {
+        // Machine-account home — one daemon per user.
+        format!("airc-machine-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION)
+    } else {
+        // Project-scoped home — its parent is the git working tree.
+        let project_root = home.parent().unwrap_or(home);
+        match crate::runtime_dir::project_socket_path(project_root) {
+            Ok(path) => return path,
+            Err(_) => {
+                // Runtime dir unreachable; fall through to legacy
+                // home-private path so daemon still binds.
+                return machine_home
+                    .join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
+            }
+        }
+    };
+    match crate::runtime_dir::runtime_dir() {
+        Ok(dir) => dir.join(socket_name),
+        Err(_) => machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION)),
+    }
 }
 
 /// AIRC substrate CLI.

@@ -73,6 +73,7 @@ mod route_cli;
 mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
+mod runtime_dir;
 mod staleness;
 mod transport_cli;
 mod transport_commands;
