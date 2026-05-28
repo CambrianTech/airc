@@ -79,6 +79,7 @@ pub use agent_heartbeat::{
     DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::{machine_account_home, Airc};
+pub use airc_protocol::{AssertionError, IdentityAssertion};
 pub use command_bus::PendingCommand;
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
@@ -111,7 +112,6 @@ pub use mesh_identity::{
     resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
-pub use airc_protocol::{AssertionError, IdentityAssertion};
 pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
@@ -135,8 +135,8 @@ pub use work::{
     ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
     HeartbeatWorkspace, LinkCardPullRequest, ObserveLocalGitWorkspace, ObservePullRequests,
     ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim,
-    ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace, UpdateWorkCard,
-    WorkQueueStatus, WorkQueueStatusQuery,
+    ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace, UpdateWorkCard, WorkQueueStatus,
+    WorkQueueStatusQuery,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,
@@ -159,7 +159,7 @@ pub use airc_core::{
 pub use airc_work::{
     AgentAvailabilityRecord, AgentAvailabilityReported, AgentAvailabilityState, BoardSnapshot,
     BranchName, CardState, CardUpdated, ClaimId, DirtyState, GitObjectId, LaneId, LaneState,
-    LocalGitSnapshot, ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection,
-    WorkCard, WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus,
-    BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
+    LocalGitSnapshot, ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection, WorkCard,
+    WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT,
+    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
 };

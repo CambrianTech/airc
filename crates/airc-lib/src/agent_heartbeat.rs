@@ -505,7 +505,7 @@ fn parse_heartbeat(event: &TranscriptEvent) -> Option<AgentHeartbeat> {
 
 /// Card d4e3e350: re-compute the dynamic fields of `CoordinationSignal`
 /// against the live work-board projection. Preserves `doctrine_version`
-/// + `availability` from `baseline` (those are session-scoped and
+/// and `availability` from `baseline` (those are session-scoped and
 /// don't change tick-to-tick); overrides `active_claims` with the
 /// current room's cards owned by this peer. Caller passes the
 /// baseline so a transient board-query failure can degrade to it

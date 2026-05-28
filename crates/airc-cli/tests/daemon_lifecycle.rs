@@ -70,7 +70,9 @@ fn daemon_id(account: &Path, scope: &str) -> DaemonId {
     };
     DaemonId {
         peer_id: field("peer_id:"),
-        uptime: field("uptime_seconds:").parse().expect("uptime is a number"),
+        uptime: field("uptime_seconds:")
+            .parse()
+            .expect("uptime is a number"),
     }
 }
 
@@ -105,7 +107,12 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
     // --- Launch: the first tab brings up exactly one daemon. ---
     ok(acct, "claude", "claude:main", &["init"]);
     ok(acct, "claude", "claude:main", &["room", "general"]);
-    ok(acct, "claude", "claude:main", &["send", "hello from claude"]);
+    ok(
+        acct,
+        "claude",
+        "claude:main",
+        &["send", "hello from claude"],
+    );
     let launched = daemon_id(acct, "claude");
 
     // --- Convergence: a different tab on the same machine shares the
@@ -125,7 +132,12 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
                 let scope = format!("tab{i}");
                 let client = format!("claude:tab{i}");
                 ok(&acct, &scope, &client, &["room", "general"]);
-                ok(&acct, &scope, &client, &["send", &format!("ping from {scope}")]);
+                ok(
+                    &acct,
+                    &scope,
+                    &client,
+                    &["send", &format!("ping from {scope}")],
+                );
             });
         }
     });

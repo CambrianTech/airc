@@ -27,13 +27,13 @@ pub use drain_policy::{
     PolicyInputs, PrStatus, PrTerminalState, ReportOnlyReason, DEFAULT_HEARTBEAT_STALE_MS,
 };
 pub use event::{
-    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimReleased,
-    GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
-    LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
-    PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
-    WorkCardClaimed, WorkEvent, WorkspaceAllocated, WorkspaceDrainCompleted,
-    WorkspaceDrainRequested, WorkspaceHeartbeat, WorkspacePressureReported, WorkspaceReleased,
-    WorkspaceRequested,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat,
+    ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
+    LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
+    PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
+    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkspaceAllocated,
+    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 pub use local_git::{

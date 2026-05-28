@@ -13,11 +13,10 @@ use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
 use uuid::Uuid;
 
 use airc_lib::{
-    AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
-    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, UpdateWorkCard,
-    WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId,
-    WorkManagerRecommendation, WorkManagerRecommendationKind, WorkManagerStatus,
-    WorkQueueStatus, WorkRosterStatus,
+    AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard, CreateWorkCard,
+    LaneId, Priority, ReleaseWorkClaim, RepoId, UpdateWorkCard, WorkBacklogSeedCandidate,
+    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
+    WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
 use crate::lease;
@@ -141,15 +140,13 @@ pub async fn run_review(
 
     // Priority — inherits the parent's unless overridden. Reviews
     // of high-priority work are themselves high-priority.
-    let final_priority = priority
-        .map(Into::into)
-        .unwrap_or(parent.priority);
+    let final_priority = priority.map(Into::into).unwrap_or(parent.priority);
 
     // Construct via the airc-lib request type with the typed link
     // populated. Sub-A added `.reviewing(parent)` precisely so this
     // call doesn't have to spell out `reviews: Some(parent)` inline.
-    let request = CreateWorkCard::new(parent.repo.clone(), title, final_priority)
-        .reviewing(parent_card_id);
+    let request =
+        CreateWorkCard::new(parent.repo.clone(), title, final_priority).reviewing(parent_card_id);
     let request = CreateWorkCard {
         body: Some(body_buf),
         ..request
@@ -268,14 +265,13 @@ async fn spawn_claim_worktree(
     // cross-repo resolver (~/.airc config mapping RepoId → local
     // clone path) is a richer follow-up; this check at minimum
     // prevents silent damage.
-    let cwd_repo_id = cwd_github_repo_id(&repo_root)
-        .ok_or_else(|| {
-            format!(
-                "cannot determine github repo from cwd ({repo_root}); \
+    let cwd_repo_id = cwd_github_repo_id(&repo_root).ok_or_else(|| {
+        format!(
+            "cannot determine github repo from cwd ({repo_root}); \
                  ensure `git remote get-url origin` points at a github.com URL, \
                  or pass --no-lease-required to skip worktree spawn"
-            )
-        })?;
+        )
+    })?;
     if cwd_repo_id != card.repo.to_string() {
         return Err(format!(
             "card belongs to repo {card_repo}, but cwd is in {cwd_repo}; \
@@ -289,14 +285,7 @@ async fn spawn_claim_worktree(
 
     let branch = format!("{short}/{slug}");
     let add_out = std::process::Command::new("git")
-        .args([
-            "-C",
-            &repo_root,
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-        ])
+        .args(["-C", &repo_root, "worktree", "add", "-b", &branch])
         .arg(&worktree_path)
         .output()?;
     if !add_out.status.success() {
@@ -337,15 +326,12 @@ fn cwd_github_repo_id(repo_root: &str) -> Option<String> {
 /// real git repo.
 fn parse_github_repo_id(url: &str) -> Option<String> {
     // SSH: git@github.com:owner/repo[.git]
-    let owner_repo = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        rest
-    } else {
-        return None;
-    };
+    // HTTPS: https://github.com/owner/repo[.git]
+    // HTTP:  http://github.com/owner/repo[.git]
+    let owner_repo = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
     let owner_repo = owner_repo.trim().trim_end_matches('/');
     let owner_repo = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
     // Expect exactly one '/' separating owner and repo.
@@ -1447,7 +1433,10 @@ mod tests {
     #[test]
     fn lease_renders_remaining_as_minutes_seconds() {
         // 8 minutes 12 seconds remaining.
-        assert_eq!(format_lease(Some(1_000 + 8 * 60_000 + 12_000), 1_000), "8m12s");
+        assert_eq!(
+            format_lease(Some(1_000 + 8 * 60_000 + 12_000), 1_000),
+            "8m12s"
+        );
         // Sub-minute pads seconds with leading zero.
         assert_eq!(format_lease(Some(1_000 + 5_000), 1_000), "0m05s");
     }
@@ -1490,10 +1479,22 @@ mod tests {
 
     #[test]
     fn from_flags_picks_filter_or_defaults_to_all() {
-        assert_eq!(BoardFilter::from_flags(false, false, false), BoardFilter::All);
-        assert_eq!(BoardFilter::from_flags(true, false, false), BoardFilter::Available);
-        assert_eq!(BoardFilter::from_flags(false, true, false), BoardFilter::Mine);
-        assert_eq!(BoardFilter::from_flags(false, false, true), BoardFilter::Others);
+        assert_eq!(
+            BoardFilter::from_flags(false, false, false),
+            BoardFilter::All
+        );
+        assert_eq!(
+            BoardFilter::from_flags(true, false, false),
+            BoardFilter::Available
+        );
+        assert_eq!(
+            BoardFilter::from_flags(false, true, false),
+            BoardFilter::Mine
+        );
+        assert_eq!(
+            BoardFilter::from_flags(false, false, true),
+            BoardFilter::Others
+        );
     }
 
     #[test]
@@ -1680,19 +1681,19 @@ mod tests {
     fn review_title_truncates_long_parent_with_ellipsis_marker() {
         // Eighty Xs is exactly at the limit and must NOT truncate;
         // adding the 81st character must add the ellipsis.
-        let parent_at_limit: String = std::iter::repeat('x').take(80).collect();
+        let parent_at_limit: String = "x".repeat(80);
         let title_at_limit = format_review_title(&parent_at_limit);
         assert_eq!(title_at_limit, format!("review: {parent_at_limit}"));
         assert!(!title_at_limit.ends_with('…'));
 
-        let parent_too_long: String = std::iter::repeat('x').take(120).collect();
+        let parent_too_long: String = "x".repeat(120);
         let title_too_long = format_review_title(&parent_too_long);
         assert!(title_too_long.ends_with('…'));
         // The visible portion + the "review: " prefix should sum to
         // the 80-char limit + the ellipsis suffix, so reviewers see
         // a recognizable parent title without the board renderer
         // wrapping.
-        let expected_prefix: String = std::iter::repeat('x').take(80).collect();
+        let expected_prefix: String = "x".repeat(80);
         assert_eq!(title_too_long, format!("review: {expected_prefix}…"));
     }
 
@@ -1703,12 +1704,12 @@ mod tests {
         // middle of a UTF-8 sequence and panic. Use a 3-byte glyph
         // ('日') 90 times — well past the 80-char limit but under
         // any byte-based slice.
-        let parent: String = std::iter::repeat('日').take(90).collect();
+        let parent: String = "日".repeat(90);
         let title = format_review_title(&parent);
         // No panic = the truncation respects char boundaries. The
         // truncated portion must be exactly 80 chars of '日' + the
         // ellipsis.
-        let expected_visible: String = std::iter::repeat('日').take(80).collect();
+        let expected_visible: String = "日".repeat(80);
         assert_eq!(title, format!("review: {expected_visible}…"));
     }
 
@@ -1759,10 +1760,19 @@ mod tests {
     fn refusal_message_for_merged_carries_actionable_guidance() {
         let card_id = airc_lib::WorkCardId::new();
         let msg = refusal_message(card_id, CardState::Merged);
-        assert!(msg.contains("PullRequestMerged"), "names the substrate event");
+        assert!(
+            msg.contains("PullRequestMerged"),
+            "names the substrate event"
+        );
         assert!(msg.contains("gh observer"), "points at the event source");
-        assert!(msg.contains("airc work close"), "names the cancellation alternative");
-        assert!(msg.contains("9656a836"), "cross-references the close-guard card");
+        assert!(
+            msg.contains("airc work close"),
+            "names the cancellation alternative"
+        );
+        assert!(
+            msg.contains("9656a836"),
+            "cross-references the close-guard card"
+        );
         assert!(msg.contains("a1bc62b3"), "cross-references THIS card");
         // The id must appear so the agent can copy-paste it into
         // the corrective command.

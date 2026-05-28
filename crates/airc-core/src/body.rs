@@ -70,6 +70,13 @@ impl Body {
     /// (inverse of [`Body::from_payload`]). `Body` is always
     /// serde-serializable (`Json(Value)` | `Binary(Vec<u8>)`), so a
     /// failure here is a serializer bug, not a runtime condition.
+    ///
+    /// The `expect` is structurally safe — both variants serialize
+    /// via derived `Serialize` over `serde_json::Value` / `Vec<u8>`,
+    /// neither of which can fail. Allowlisting rather than threading
+    /// `Result` through 8 call sites for an impossible failure mode
+    /// (card ef168afe, CI strict-gate re-green).
+    #[allow(clippy::expect_used)]
     pub fn to_payload(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Body always serializes to JSON")
     }

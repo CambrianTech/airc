@@ -422,18 +422,18 @@ impl Airc {
                 loop {
                     loop {
                         match read_frame::<_, Response>(&mut stream).await {
-                            Ok(Some(Response::Event { envelope })) => match decode_wire_event(
-                                envelope,
-                            ) {
-                                Ok(event) => {
-                                    from = Some(cursor_after(&event));
-                                    if tx.send(Arc::new(event)).await.is_err() {
-                                        return; // consumer gone
+                            Ok(Some(Response::Event { envelope })) => {
+                                match decode_wire_event(envelope) {
+                                    Ok(event) => {
+                                        from = Some(cursor_after(&event));
+                                        if tx.send(Arc::new(event)).await.is_err() {
+                                            return; // consumer gone
+                                        }
+                                        backoff_ms = RECONNECT_BACKOFF_START_MS;
                                     }
-                                    backoff_ms = RECONNECT_BACKOFF_START_MS;
+                                    Err(_) => return,
                                 }
-                                Err(_) => return,
-                            },
+                            }
                             Ok(Some(_)) => {}
                             Ok(None) | Err(_) => break, // stream died → reconnect
                         }

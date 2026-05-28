@@ -295,7 +295,10 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
     for event in &transcript {
         publisher
             .publish(publish_work_event_request(
-                channel, from_peer, from_client, event,
+                channel,
+                from_peer,
+                from_client,
+                event,
             ))
             .await
             .expect("publish work event");

@@ -433,10 +433,7 @@ impl Airc {
     /// Refuses on `WorkCardNotInCurrentRoom` so an amendment can't
     /// silently target a card from a different room — same guard
     /// `change_work_card_state` uses.
-    pub async fn update_work_card(
-        &self,
-        request: UpdateWorkCard,
-    ) -> Result<(), AircError> {
+    pub async fn update_work_card(&self, request: UpdateWorkCard) -> Result<(), AircError> {
         self.ensure_work_card_in_current_room(request.card_id)
             .await?;
         let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
@@ -983,12 +980,16 @@ mod tests {
         assert!(is_work_event_transcript(&event_with_headers(work_headers)));
 
         // Empty headers (e.g. raw heartbeat alive) → drop.
-        assert!(!is_work_event_transcript(&event_with_headers(Headers::new())));
+        assert!(!is_work_event_transcript(&event_with_headers(
+            Headers::new()
+        )));
 
         // Unrelated header only (e.g. a chat msg with bridge headers) → drop.
         let mut other_headers = Headers::new();
         other_headers.insert("airc.bridge.source".to_owned(), "slack".to_owned());
-        assert!(!is_work_event_transcript(&event_with_headers(other_headers)));
+        assert!(!is_work_event_transcript(&event_with_headers(
+            other_headers
+        )));
 
         // Mixed headers including the work-kind header → keep
         // (work events often carry several headers like
