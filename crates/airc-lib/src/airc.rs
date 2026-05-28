@@ -399,6 +399,39 @@ impl Airc {
         Ok(None)
     }
 
+    /// Look up the latest doctrine published for the current room
+    /// (card b898f713 — slice 3/4 of 2903a8ef). Same MVP shape as
+    /// `Airc::peer_identity_card`: scan recent transcript events for
+    /// the latest `TranscriptKind::DoctrinePublished`, decode the
+    /// JSON body into `DoctrineEvent::RoomDoctrinePublished`, return
+    /// it. Returns `Ok(None)` when the room has no published
+    /// doctrine in the recent window (an honest "unknown" rather
+    /// than rendering empty body).
+    ///
+    /// Consumer: slice 4/4 (card 745e93f0) — auto-load on attach so
+    /// every newly-attaching agent has the operating contract in
+    /// context without external onboarding.
+    pub async fn room_doctrine(
+        &self,
+    ) -> Result<Option<airc_core::doctrine::RoomDoctrinePublished>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::DoctrinePublished {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished(card)) =
+                serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value)
+            else {
+                continue;
+            };
+            return Ok(Some(card));
+        }
+        Ok(None)
+    }
+
     /// Publish the room operating doctrine — card a9767579 (slice 2/4
     /// of engine-keystone 2903a8ef). Emits a
     /// `TranscriptKind::DoctrinePublished` lifecycle event on the
