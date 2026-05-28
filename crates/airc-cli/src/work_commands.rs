@@ -81,98 +81,6 @@ pub async fn run_seed(
     Ok(())
 }
 
-/// `airc work review <PARENT> [--pr URL] [--priority P] [--body B]` —
-/// spawn a sibling review card with a typed `reviews` link back to
-/// the parent. Card ad7e100b Sub-B (the CLI half of the peer-agent
-/// review loop); Sub-A shipped the typed substrate.
-///
-/// Lookup rules:
-///   * Parent must exist in the current room's board projection. The
-///     review card is created in the SAME repo as the parent (cross-
-///     repo reviews aren't a thing — reviews live where the work
-///     lives).
-///   * Priority defaults to the parent's priority. The review of a
-///     P0 is P0-eligible work; the default keeps that visible
-///     without the caller having to spell it out.
-///   * Title is generated as `review: <parent.title>` (truncated at
-///     a reasonable bound to stay board-renderable).
-///   * Body prepends the parent card id and any `--pr` URL so a
-///     reviewer who pulls just this card has the navigation anchors;
-///     `--body` content (if any) follows.
-pub async fn run_review(
-    home: &Path,
-    parent_id: String,
-    pr: Option<String>,
-    priority: Option<CliPriority>,
-    body: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let parent_card_id = parse_work_card_id(&parent_id)?;
-    let airc = crate::commands::attached_airc(home).await?;
-
-    // Resolve the parent off the current room's board. Refusing on
-    // "no parent" is more useful than spawning an orphan review.
-    let board = airc.work_board(usize::MAX).await?;
-    let parent = board.card(parent_card_id).ok_or_else(|| {
-        format!(
-            "parent card {parent_card_id} not found in the current room's board; \
-             switch to the room that owns it, or pass the correct id"
-        )
-    })?;
-
-    // Title — same convention an auto-spawn (Sub-C) would use, so
-    // manual and auto-created review cards render identically.
-    let title = format_review_title(&parent.title);
-
-    // Body — the navigation anchors a reviewer needs, then the
-    // caller's prose. The parent id is a UUID so reviewers can
-    // `airc work board` and find the parent fast; `--pr` URL gives
-    // them the diff directly.
-    let mut body_buf = String::new();
-    body_buf.push_str(&format!("review of card {parent_card_id}"));
-    if let Some(ref url) = pr {
-        body_buf.push_str("\nPR: ");
-        body_buf.push_str(url);
-    }
-    if let Some(extra) = body {
-        body_buf.push_str("\n\n");
-        body_buf.push_str(&extra);
-    }
-
-    // Priority — inherits the parent's unless overridden. Reviews
-    // of high-priority work are themselves high-priority.
-    let final_priority = priority.map(Into::into).unwrap_or(parent.priority);
-
-    // Construct via the airc-lib request type with the typed link
-    // populated. Sub-A added `.reviewing(parent)` precisely so this
-    // call doesn't have to spell out `reviews: Some(parent)` inline.
-    let request =
-        CreateWorkCard::new(parent.repo.clone(), title, final_priority).reviewing(parent_card_id);
-    let request = CreateWorkCard {
-        body: Some(body_buf),
-        ..request
-    };
-
-    let review_card_id = airc.create_work_card(request).await?;
-    println!("review_card_id: {review_card_id} parent_card_id: {parent_card_id}");
-    Ok(())
-}
-
-/// Generate the review card's title from the parent's. Format is
-/// stable so Sub-C (auto-spawn) and Sub-B (CLI) produce identical
-/// titles — observers that filter on `title.starts_with("review:")`
-/// pick up both paths.
-fn format_review_title(parent_title: &str) -> String {
-    // 80-char body keeps board rendering tidy without aggressively
-    // truncating informative parent titles.
-    const MAX_PARENT_LEN: usize = 80;
-    let parent_short: String = parent_title.chars().take(MAX_PARENT_LEN).collect();
-    if parent_short.chars().count() < parent_title.chars().count() {
-        format!("review: {parent_short}…")
-    } else {
-        format!("review: {parent_short}")
-    }
-}
-
 pub async fn run_claim(
     home: &Path,
     card_id: String,
@@ -665,74 +573,12 @@ async fn open_pr_and_link(
     // here must not undo the state transition or the PR link, and
     // re-running `state review` on a card whose review card already
     // exists is a no-op.
-    if let Err(error) = auto_spawn_review_card(airc, card_id, pr_url).await {
+    if let Err(error) =
+        crate::work_commands_review::auto_spawn_review_card(airc, card_id, pr_url).await
+    {
         eprintln!("airc: review card auto-spawn skipped — {error}");
     }
 
-    Ok(())
-}
-
-/// Spawn a sibling review card for `parent_id` if one doesn't already
-/// exist. Card ad7e100b Sub-C — the auto-spawn side of the
-/// peer-agent review loop. Manual spawning still works via
-/// `airc work review` (Sub-B); both paths produce structurally
-/// identical cards (same title format, same typed `reviews` link)
-/// so observers cannot tell them apart and observer filters built on
-/// `title.starts_with("review:")` pick up both.
-///
-/// Idempotency: `WorkBoardProjection::review_cards_for(parent_id)`
-/// (added in Sub-A) is the canonical "does a review already exist?"
-/// query. Skipping on a non-empty match means re-running
-/// `airc work state X review` is a no-op for the review-spawn side,
-/// matching the no-op semantics of the PR link.
-///
-/// Architectural note: auto-spawn lives in the CLI rather than the
-/// projection-apply layer on purpose. Projections must stay pure
-/// (replay determinism); emitting a new event inside `apply_*` would
-/// couple the projection to a side-effectful publish path. The CLI
-/// is the right place: it's the orchestration layer that already
-/// composes other side-effects (gh pr create, link). A future
-/// command-bus subscriber on `PullRequestLinked` could hoist this
-/// out of the CLI for consumers that bypass it (Continuum, OpenClaw),
-/// but the wire shape is stable — that move doesn't break this
-/// emit.
-async fn auto_spawn_review_card(
-    airc: &airc_lib::Airc,
-    parent_id: airc_lib::WorkCardId,
-    pr_url: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let board = airc.work_board(usize::MAX).await?;
-    let parent = board
-        .card(parent_id)
-        .ok_or_else(|| format!("parent card {parent_id} no longer in board projection"))?;
-
-    // Idempotency guard: any pre-existing review for this parent
-    // (manual via Sub-B, or a prior auto-spawn) wins. We never spawn
-    // a second.
-    if board.review_cards_for(parent_id).next().is_some() {
-        return Ok(());
-    }
-
-    // Title — `format_review_title` is the shared formatter Sub-B
-    // (manual CLI) also uses, so observers can't tell auto-spawned
-    // from manual cards apart.
-    let title = format_review_title(&parent.title);
-
-    let mut body = format!("review of card {parent_id}");
-    if !pr_url.is_empty() {
-        body.push_str("\nPR: ");
-        body.push_str(pr_url);
-    }
-    body.push_str("\n\nAuto-spawned on Review-state transition (card ad7e100b Sub-C).");
-
-    let request = airc_lib::CreateWorkCard::new(parent.repo.clone(), title, parent.priority)
-        .reviewing(parent_id);
-    let request = airc_lib::CreateWorkCard {
-        body: Some(body),
-        ..request
-    };
-    let review_card_id = airc.create_work_card(request).await?;
-    println!("review_card_id: {review_card_id} parent_card_id: {parent_id} (auto-spawned)");
     Ok(())
 }
 
@@ -1397,7 +1243,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
+pub(crate) fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
     let uuid = Uuid::parse_str(input)
         .map_err(|error| format!("work card id {input:?} is not a valid UUID: {error}"))?;
     Ok(WorkCardId::from_uuid(uuid))
@@ -1711,7 +1557,8 @@ mod tests {
 
     #[test]
     fn review_title_preserves_short_parent_title_verbatim() {
-        let title = format_review_title("typed reviews link on WorkCard");
+        let title =
+            crate::work_commands_review::format_review_title("typed reviews link on WorkCard");
         assert_eq!(title, "review: typed reviews link on WorkCard");
         assert!(
             title.starts_with("review: "),
@@ -1724,12 +1571,12 @@ mod tests {
         // Eighty Xs is exactly at the limit and must NOT truncate;
         // adding the 81st character must add the ellipsis.
         let parent_at_limit: String = "x".repeat(80);
-        let title_at_limit = format_review_title(&parent_at_limit);
+        let title_at_limit = crate::work_commands_review::format_review_title(&parent_at_limit);
         assert_eq!(title_at_limit, format!("review: {parent_at_limit}"));
         assert!(!title_at_limit.ends_with('…'));
 
         let parent_too_long: String = "x".repeat(120);
-        let title_too_long = format_review_title(&parent_too_long);
+        let title_too_long = crate::work_commands_review::format_review_title(&parent_too_long);
         assert!(title_too_long.ends_with('…'));
         // The visible portion + the "review: " prefix should sum to
         // the 80-char limit + the ellipsis suffix, so reviewers see
@@ -1747,7 +1594,7 @@ mod tests {
         // ('日') 90 times — well past the 80-char limit but under
         // any byte-based slice.
         let parent: String = "日".repeat(90);
-        let title = format_review_title(&parent);
+        let title = crate::work_commands_review::format_review_title(&parent);
         // No panic = the truncation respects char boundaries. The
         // truncated portion must be exactly 80 chars of '日' + the
         // ellipsis.
@@ -1821,3 +1668,5 @@ mod tests {
         assert!(msg.contains(&card_id.to_string()), "carries the card UUID");
     }
 }
+
+pub use crate::work_commands_review::run_review;
