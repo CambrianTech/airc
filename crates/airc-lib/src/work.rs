@@ -78,6 +78,54 @@ pub struct ChangeWorkCardState {
     pub state: CardState,
 }
 
+/// Amend a card's editable fields after creation. Card 5ac0a359 —
+/// addresses the recurring friction of needing to update a card's
+/// title/body/priority post-creation without losing its id (which
+/// would break `reviews` links, observer subscriptions, and the
+/// projection's continuity guarantee).
+///
+/// Each field is `Option`; `None` means "leave alone." To clear a
+/// body, pass `Some("".into())` — empty string is the markdown
+/// "no body" idiom.
+///
+/// Construct via [`UpdateWorkCard::amend`] for convenience.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWorkCard {
+    pub card_id: WorkCardId,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub priority: Option<Priority>,
+}
+
+impl UpdateWorkCard {
+    /// Builder constructor: start with `card_id` and chain
+    /// `.with_title(...) / .with_body(...) / .with_priority(...)`.
+    pub fn amend(card_id: WorkCardId) -> Self {
+        Self {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+        }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the body. Pass `""` to clear (markdown "no body" idiom).
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+}
+
 /// Link a pull request to a work card (card 820629e9). The projection
 /// (`apply_pull_request_linked`) atomically transitions the card into
 /// `CardState::Review` and populates `WorkCard.pull_request` so any
@@ -343,6 +391,38 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Amend a work card's editable fields (title, body, priority)
+    /// post-creation. Card 5ac0a359 — `None` on a field means "leave
+    /// alone"; `body` is double-`Option` so the caller can
+    /// distinguish "don't change body" from "clear the body".
+    ///
+    /// An all-`None` request still emits an event (with the latest
+    /// `updated_at_ms`), which is useful as a liveness marker — a
+    /// peer can "touch" a card to advertise that they're tracking it
+    /// without changing semantics. The projection treats this as a
+    /// pure `updated_at_ms` bump.
+    ///
+    /// Refuses on `WorkCardNotInCurrentRoom` so an amendment can't
+    /// silently target a card from a different room — same guard
+    /// `change_work_card_state` uses.
+    pub async fn update_work_card(
+        &self,
+        request: UpdateWorkCard,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
+            card_id: request.card_id,
+            title: request.title,
+            body: request.body,
+            priority: request.priority,
+            updated_by: self.peer_id(),
+            updated_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

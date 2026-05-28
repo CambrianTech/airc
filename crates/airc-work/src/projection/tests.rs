@@ -1103,3 +1103,284 @@ fn reviews_field_round_trips_through_serde_with_back_compat() {
     );
     assert_eq!(decoded_plain, plain);
 }
+
+// -------------------------------------------------------------------------
+// Card 5ac0a359 — `CardUpdated` amendment event + projection.
+//
+// Each editable field is `Option`; `None` = leave alone. `body` is
+// double-`Option` so the outer `None` distinguishes "don't touch
+// body" from `Some(None)` (clear) and `Some(Some(s))` (set). The
+// projection always bumps `updated_at_ms` — even a no-op all-`None`
+// amendment moves it (liveness marker without a semantic change).
+// Unknown card_id surfaces as `UnknownCard` so an out-of-room
+// amendment doesn't silently succeed.
+// -------------------------------------------------------------------------
+
+fn project_card_with(
+    projection: &mut WorkBoardProjection,
+    card_id: WorkCardId,
+    title: &str,
+    body: Option<&str>,
+    priority: Priority,
+    created_at_ms: u64,
+) {
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: title.into(),
+            body: body.map(Into::into),
+            priority,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms,
+            reviews: None,
+        }))
+        .expect("create projects");
+}
+
+#[test]
+fn card_updated_title_only_preserves_body_and_priority() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(
+        &mut projection,
+        card_id,
+        "original",
+        Some("original body"),
+        Priority::P2,
+        100,
+    );
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: Some("amended title".into()),
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 200,
+        }))
+        .expect("title amend projects");
+
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(card.title, "amended title");
+    assert_eq!(
+        card.body.as_deref(),
+        Some("original body"),
+        "body untouched when amendment field is None"
+    );
+    assert_eq!(
+        card.priority,
+        Priority::P2,
+        "priority untouched when amendment field is None"
+    );
+    assert_eq!(
+        card.updated_at_ms, 200,
+        "updated_at_ms moves to the amendment's timestamp"
+    );
+    assert_eq!(
+        card.created_at_ms, 100,
+        "created_at_ms is append-only (attribution / temporal anchor)"
+    );
+    assert_eq!(
+        card.created_by,
+        peer(1),
+        "created_by attribution preserved (not the amender)"
+    );
+}
+
+#[test]
+fn card_updated_body_leave_alone_vs_set_vs_empty_string_clear() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(
+        &mut projection,
+        card_id,
+        "title",
+        Some("original body"),
+        Priority::P2,
+        100,
+    );
+
+    // `body: None` — leave alone. Body stays.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 110,
+        }))
+        .expect("no-op amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some("original body"),
+        "None body must NOT touch the existing body"
+    );
+
+    // `body: Some("new")` — set to the new value.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: Some("amended body".into()),
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 120,
+        }))
+        .expect("set-body amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some("amended body"),
+    );
+
+    // `body: Some("")` — the canonical clear path. The projection
+    // records exactly what's supplied; renderers treat empty string
+    // and None as "no body" identically.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: Some(String::new()),
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 130,
+        }))
+        .expect("clear-body amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some(""),
+        "Some(\"\") body sets the body to empty (markdown 'no body' idiom)"
+    );
+}
+
+#[test]
+fn card_updated_priority_only_rewrites_priority() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(&mut projection, card_id, "p2 card", None, Priority::P2, 100);
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: Some(Priority::P0),
+            updated_by: peer(2),
+            updated_at_ms: 200,
+        }))
+        .expect("priority amend projects");
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(card.priority, Priority::P0);
+    assert_eq!(card.title, "p2 card", "title untouched");
+}
+
+#[test]
+fn card_updated_all_none_bumps_updated_at_only() {
+    // The no-op amendment doubles as a liveness marker: an agent
+    // "touches" a card without changing semantics. The projection
+    // must accept it and bump updated_at_ms.
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(&mut projection, card_id, "untouched", None, Priority::P1, 100);
+    let snapshot_before = projection.card(card_id).cloned().unwrap();
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 500,
+        }))
+        .expect("no-op amend projects");
+
+    let after = projection.card(card_id).unwrap();
+    assert_eq!(after.title, snapshot_before.title);
+    assert_eq!(after.body, snapshot_before.body);
+    assert_eq!(after.priority, snapshot_before.priority);
+    assert_eq!(after.state, snapshot_before.state);
+    assert_eq!(after.owner, snapshot_before.owner);
+    assert_eq!(after.claim_id, snapshot_before.claim_id);
+    assert_eq!(after.reviews, snapshot_before.reviews);
+    assert_eq!(after.updated_at_ms, 500, "updated_at_ms moves even on no-op");
+}
+
+#[test]
+fn card_updated_for_unknown_card_surfaces_error() {
+    // An out-of-room amendment would silently succeed if the
+    // projection treated missing cards as a no-op — `airc-lib`'s
+    // ensure_work_card_in_current_room guard depends on the
+    // projection surfacing the error so the typed AircError can be
+    // returned.
+    let mut projection = WorkBoardProjection::new();
+    let err = projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id: WorkCardId::new(),
+            title: Some("would silently fail".into()),
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 100,
+        }))
+        .expect_err("amend on missing card must surface");
+    assert!(
+        matches!(err, super::ProjectionError::UnknownCard(_)),
+        "wrong error variant: {err:?}",
+    );
+}
+
+#[test]
+fn card_updated_round_trips_through_serde_with_skip_on_none() {
+    // Wire shape contract: every `None` field is omitted via
+    // skip_serializing_if so partial amendments stay small on the
+    // wire. UUID-typed identity fields are constructed via
+    // PeerId::new() / WorkCardId::new() (uuid v4) — no hand-rolled
+    // UUID strings in tests.
+    let amend = CardUpdated {
+        card_id: WorkCardId::new(),
+        title: Some("only title".into()),
+        body: None,
+        priority: None,
+        updated_by: PeerId::new(),
+        updated_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&amend).expect("encode");
+    assert!(json.get("title").is_some());
+    assert!(
+        json.get("body").is_none(),
+        "None body must be omitted; got {json}"
+    );
+    assert!(
+        json.get("priority").is_none(),
+        "None priority must be omitted; got {json}"
+    );
+    let decoded: CardUpdated = serde_json::from_value(json).expect("decode");
+    assert_eq!(decoded, amend);
+
+    // Clear-body shape: Some("") — empty string round-trips
+    // cleanly (unlike Option<Option<String>>'s Some(None), which
+    // collapses to None on serde's default decode path). This is
+    // the canonical "clear" idiom — observers that render the body
+    // treat empty string and None identically (no body).
+    let clear = CardUpdated {
+        card_id: WorkCardId::new(),
+        title: None,
+        body: Some(String::new()),
+        priority: None,
+        updated_by: PeerId::new(),
+        updated_at_ms: 1_700_000_000_001,
+    };
+    let json = serde_json::to_value(&clear).expect("encode clear");
+    assert_eq!(
+        json.get("body"),
+        Some(&serde_json::Value::String(String::new())),
+        "Some(\"\") body must appear as the empty string on the wire; got {json}"
+    );
+    let decoded: CardUpdated = serde_json::from_value(json).expect("decode clear");
+    assert_eq!(decoded, clear);
+}

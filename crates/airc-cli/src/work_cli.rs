@@ -97,6 +97,34 @@ pub enum WorkAction {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Amend a card's editable fields (title / body / priority) post-creation.
+    ///
+    /// Card 5ac0a359 — the substrate had no typed way to update a
+    /// card after creation, so refining a card's body during
+    /// decomposition meant closing + recreating, which broke
+    /// references (the new card had a new UUID) and forced every
+    /// observer to re-project. `airc work update` emits a typed
+    /// `CardUpdated` event whose projection writes only the supplied
+    /// fields, leaving everything else (including the card id,
+    /// `reviews` link, owner, claim) alone.
+    ///
+    /// Passing no field flags is legal — it acts as a liveness
+    /// marker (bumps `updated_at_ms` without changing semantics).
+    /// To clear a body, pass `--body ""` (empty string is the
+    /// canonical "no body" idiom for markdown).
+    Update {
+        /// Work card UUID.
+        card_id: String,
+        /// New title (omit to leave unchanged).
+        #[arg(long)]
+        title: Option<String>,
+        /// New body (omit to leave unchanged). Pass `""` to clear.
+        #[arg(long)]
+        body: Option<String>,
+        /// New priority (omit to leave unchanged).
+        #[arg(long, value_enum)]
+        priority: Option<CliPriority>,
+    },
     /// Change a work card's lifecycle state.
     State {
         /// Work card UUID.

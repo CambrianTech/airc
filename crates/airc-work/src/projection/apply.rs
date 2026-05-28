@@ -1,5 +1,5 @@
 use crate::event::{
-    AgentAvailabilityReported, CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimReleased,
     GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
     LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
     PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
@@ -24,6 +24,7 @@ impl WorkBoardProjection {
     pub fn apply(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
         match event {
             WorkEvent::CardCreated(e) => self.apply_card_created(e),
+            WorkEvent::CardUpdated(e) => self.apply_card_updated(e),
             WorkEvent::CardClaimed(e) => self.apply_card_claimed(e),
             WorkEvent::ClaimHeartbeat(e) => self.apply_claim_heartbeat(e),
             WorkEvent::ClaimReleased(e) => self.apply_claim_released(e),
@@ -247,6 +248,36 @@ impl WorkBoardProjection {
         card.claim_id = None;
         card.claim_expires_at_ms = None;
         card.updated_at_ms = e.released_at_ms;
+        Ok(())
+    }
+
+    /// Card 5ac0a359 — apply an amendment to a card's editable fields.
+    /// Each `Some(...)` field writes; each `None` leaves the existing
+    /// projection value alone. Per-event `updated_at_ms` always moves
+    /// (even for an all-`None` no-op amendment), giving observers a
+    /// liveness signal.
+    ///
+    /// Replay determinism: this is a pure event apply. Out-of-order
+    /// updates (a later `updated_at_ms` arriving before an earlier
+    /// one due to lamport churn) project deterministically — the
+    /// projection writes whatever the latest applied event says.
+    /// Callers depending on causality between two updates should
+    /// sequence them via lamport, the same way other event chains
+    /// already do.
+    fn apply_card_updated(&mut self, e: &CardUpdated) -> Result<(), ProjectionError> {
+        let card = self.card_mut(e.card_id)?;
+        if let Some(ref title) = e.title {
+            card.title = title.clone();
+        }
+        if let Some(body) = &e.body {
+            // Set the body to whatever the amendment carries.
+            // Empty string is the "clear" idiom.
+            card.body = Some(body.clone());
+        }
+        if let Some(priority) = e.priority {
+            card.priority = priority;
+        }
+        card.updated_at_ms = e.updated_at_ms;
         Ok(())
     }
 
