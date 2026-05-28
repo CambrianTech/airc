@@ -78,6 +78,18 @@ pub struct ChangeWorkCardState {
     pub state: CardState,
 }
 
+/// Link a pull request to a work card (card 820629e9). The projection
+/// (`apply_pull_request_linked`) atomically transitions the card into
+/// `CardState::Review` and populates `WorkCard.pull_request` so any
+/// downstream consumer — auto-spawn review card on Review state
+/// (ad7e100b Sub-C), board renderers, gh check-suite observers —
+/// reads from one source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCardPullRequest {
+    pub card_id: WorkCardId,
+    pub pull_request: airc_work::model::PullRequestRef,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatWorkClaim {
     pub card_id: WorkCardId,
@@ -350,6 +362,29 @@ impl Airc {
             state: request.state,
             changed_by: self.peer_id(),
             changed_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Link a pull request to a work card (card 820629e9). Emits
+    /// `WorkEvent::PullRequestLinked` whose projection atomically sets
+    /// `card.pull_request = Some(pr)` and transitions
+    /// `card.state = Review`. Used by `airc work state ... review`
+    /// after `gh pr create` returns a PR number; future card-state
+    /// observers don't need to ask "did the agent forget to fill the
+    /// pr field" — the link IS the state transition.
+    pub async fn link_card_pull_request(
+        &self,
+        request: LinkCardPullRequest,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::PullRequestLinked(airc_work::event::PullRequestLinked {
+            card_id: request.card_id,
+            pull_request: request.pull_request,
+            linked_by: self.peer_id(),
+            linked_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

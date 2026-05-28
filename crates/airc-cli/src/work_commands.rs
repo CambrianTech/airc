@@ -412,12 +412,154 @@ pub async fn run_state(
     state: CliCardState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_id = parse_work_card_id(&card_id)?;
-    let state = CardState::from(state);
-    airc.change_work_card_state(ChangeWorkCardState { card_id, state })
-        .await?;
-    println!("card_state_changed: card_id={card_id} state={state:?}");
+    let card_uuid = parse_work_card_id(&card_id)?;
+    let card_state = CardState::from(state);
+    airc.change_work_card_state(ChangeWorkCardState {
+        card_id: card_uuid,
+        state: card_state,
+    })
+    .await?;
+    println!("card_state_changed: card_id={card_uuid} state={card_state:?}");
+
+    // Card 820629e9: on transition to Review, open a PR via `gh` from
+    // the card's worktree and link it to the card. Best-effort — a gh
+    // failure (no commits, no remote, gh not installed) prints a
+    // warning but does not undo the state transition. The link is
+    // recorded as a separate WorkEvent::PullRequestLinked, whose
+    // projection re-sets state=Review idempotently and populates
+    // card.pull_request — so downstream consumers (ad7e100b Sub-C
+    // auto-spawn review card, board renderers) read one source of
+    // truth.
+    if card_state == CardState::Review {
+        if let Err(error) = open_pr_and_link(&airc, card_uuid).await {
+            eprintln!("airc: gh pr create skipped — {error}");
+        }
+    }
     Ok(())
+}
+
+/// Best-effort: open a GitHub PR for the work card's worktree branch
+/// and link it via `WorkEvent::PullRequestLinked`. Returns Err so
+/// run_state can surface as a warning without aborting the state
+/// transition.
+async fn open_pr_and_link(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use airc_work::model::{BranchName, PullRequestRef};
+
+    let board = airc.work_board(usize::MAX).await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    if card.pull_request.is_some() {
+        // Already linked; nothing to do. Re-running `state review` on
+        // a card that's already been reviewed is a no-op for the PR
+        // side.
+        return Ok(());
+    }
+
+    let short: String = card.card_id.to_string().chars().take(8).collect();
+    let lease_root = lease::lease_root()
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    let worktree_path = lease_root.join(&short);
+    if !worktree_path.exists() {
+        return Err(format!(
+            "no worktree at {} — claim was made before card d1b2798d shipped, or with --no-lease-required (re-claim from a worktree to get auto-PR on review)",
+            worktree_path.display()
+        )
+        .into());
+    }
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+
+    // gh pr create — --fill takes title/body from commits, so a clean
+    // workflow (claim → commit → state review) produces a PR titled
+    // from the last commit. Head is the worktree's current branch.
+    let create_out = std::process::Command::new("gh")
+        .args([
+            "-C",
+            &worktree_str,
+            "pr",
+            "create",
+            "--fill",
+        ])
+        .output()?;
+    if !create_out.status.success() {
+        return Err(format!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&create_out.stderr).trim()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(create_out.stdout)?;
+    let pr_url = stdout.trim().lines().last().unwrap_or("").trim();
+    let pr_number = extract_pr_number(pr_url)
+        .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
+
+    // Resolve head/base from the worktree's git state.
+    let head_branch = git_rev_parse_branch(&worktree_str)?;
+    let base_branch = gh_default_branch(&worktree_str).unwrap_or_else(|_| "main".to_string());
+
+    let pull_request = PullRequestRef {
+        repo: card.repo.clone(),
+        number: pr_number,
+        head: BranchName::new(head_branch)?,
+        base: BranchName::new(base_branch)?,
+    };
+    airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
+        card_id,
+        pull_request,
+    })
+    .await?;
+
+    println!("pull_request: {pr_url}");
+    Ok(())
+}
+
+/// Extract the PR number from a gh pr create URL line like
+/// `https://github.com/owner/repo/pull/123`. Returns None for any
+/// shape we don't recognise (so callers can degrade gracefully).
+fn extract_pr_number(url: &str) -> Option<u64> {
+    let trimmed = url.trim();
+    let tail = trimmed.rsplit('/').next()?;
+    tail.parse::<u64>().ok()
+}
+
+fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("git")
+        .args(["-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "-C",
+            worktree,
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh repo view failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
 pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -1095,6 +1237,21 @@ mod tests {
         assert!(BoardFilter::Others.matches(&theirs, me, 1_000));
         assert!(!BoardFilter::Others.matches(&mine, me, 1_000));
         assert!(!BoardFilter::Others.matches(&unclaimed, me, 1_000));
+    }
+
+    #[test]
+    fn extract_pr_number_parses_gh_url_or_returns_none() {
+        assert_eq!(
+            extract_pr_number("https://github.com/CambrianTech/airc/pull/123"),
+            Some(123),
+        );
+        assert_eq!(
+            extract_pr_number("  https://github.com/owner/repo/pull/1  "),
+            Some(1),
+        );
+        // Non-numeric tail → None (degrade gracefully).
+        assert_eq!(extract_pr_number("https://example.com/no-pr-here"), None);
+        assert_eq!(extract_pr_number(""), None);
     }
 
     #[test]
