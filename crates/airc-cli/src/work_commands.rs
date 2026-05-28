@@ -15,7 +15,7 @@ use uuid::Uuid;
 use airc_lib::{
     AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard, CreateWorkCard,
     LaneId, Priority, ReleaseWorkClaim, RepoId, UpdateWorkCard, WorkBacklogSeedCandidate,
-    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
+    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCard, WorkCardId, WorkManagerRecommendation,
     WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
@@ -523,18 +523,39 @@ pub async fn run_state(
         let card = board.card(card_uuid).ok_or_else(|| {
             format!("card {card_uuid} not visible in current room's board projection")
         })?;
-        if !close_transition_allowed_from(card.state) {
+        if !close_transition_allowed_from_card(card) {
+            // Card fae3c28e: tailor the refusal so review-only cards
+            // get the right next step. Review cards have no PR to
+            // merge — the review IS the work — so the "state review →
+            // PR → Merged" path doesn't apply to them. But review
+            // cards from {Open, Claimed, Blocked} are still allowed
+            // by the work-not-yet-started branch above, so reaching
+            // here from a review card means InProgress, which is
+            // exactly the gap this fix closes.
+            let next_step = if card.reviews.is_some() {
+                format!(
+                    "Review-only cards close directly from InProgress (no PR to merge — \
+                     the review IS the work). This refusal means the gap fae3c28e fixed is \
+                     not in the running binary; reinstall airc or use `airc work state \
+                     {card_uuid} blocked` as a workaround until then."
+                )
+            } else {
+                format!(
+                    "If work is in flight ({actual:?}), the next step is:\n  \
+                     - state Review: open a PR via `airc work state {card_uuid} review`\n  \
+                     - wait for the PR to merge (state → Merged via gh observer)\n  \
+                     - THEN `airc work close {card_uuid}` succeeds.\n\n\
+                     If you want to abandon the work, `airc work release {card_uuid}` \
+                     drops the claim and returns the card to its prior state — close \
+                     from there.",
+                    actual = card.state,
+                )
+            };
             return Err(format!(
                 "refusing to close card {card_uuid}: current state is {actual:?}, but \
                  Closed requires Merged (PR merged) or {{Open, Claimed, Blocked}} \
-                 (cancellation before work landed).\n\n\
-                 If work is in flight ({actual:?}), the next step is:\n  \
-                 - state Review: open a PR via `airc work state {card_uuid} review`\n  \
-                 - wait for the PR to merge (state → Merged via gh observer)\n  \
-                 - THEN `airc work close {card_uuid}` succeeds.\n\n\
-                 If you want to abandon the work, `airc work release {card_uuid}` \
-                 drops the claim and returns the card to its prior state — close \
-                 from there.",
+                 (cancellation before work landed), or InProgress on a review-only \
+                 card (the review IS the work).\n\n{next_step}",
                 actual = card.state,
             )
             .into());
@@ -733,26 +754,38 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
-/// Card 9656a836: gate the close transition. Returns `true` when a
-/// card in `state` is allowed to transition to Closed.
+/// Card 9656a836 + fae3c28e: gate the close transition.
+/// Returns `true` when `card` is allowed to transition to Closed.
 ///
 /// Closed has substrate meaning: this card was shipped (PR merged)
-/// OR cancelled before any real work landed. An agent who calls
-/// `airc work close` from InProgress/Review/Closed is doing the
-/// thing we caught today — self-reporting work as done without it
-/// actually going through review + merge. Per Joel's "lesser persona
-/// intelligences" framing, this MUST refuse strictly — the persona
-/// can't be trusted to "know better," the substrate refuses.
+/// OR cancelled before any real work landed OR — for review-only
+/// cards — the review work itself completed. An agent who calls
+/// `airc work close` from InProgress/Review/Closed on a regular
+/// work card is doing the thing we caught: self-reporting work as
+/// done without it actually going through review + merge. Per
+/// Joel's "lesser persona intelligences" framing, that MUST refuse
+/// strictly — the persona can't be trusted to "know better," the
+/// substrate refuses.
+///
+/// Card fae3c28e exception: review-only cards (`card.reviews` is
+/// Some, the typed sibling link added in card ad7e100b Sub-A) have
+/// no PR to ship. The review IS the work — its artifact is the
+/// LGTM/feedback comment on the parent card's PR, not a separate
+/// merge. For those cards, InProgress → Closed is the natural
+/// completion path. Without this, Codex-style workflows had to
+/// route through Blocked → Closed as a workaround, which is
+/// semantic noise ("blocked" means waiting on something external).
 ///
 /// "Workflow is workflow" — for non-coding recipes, swap PR-merged
 /// for the recipe-specific "verified done" signal; this rule's
-/// shape (Closed requires verified-done OR pre-work cancellation)
-/// generalizes.
-pub(crate) fn close_transition_allowed_from(state: CardState) -> bool {
-    matches!(
-        state,
-        CardState::Merged | CardState::Open | CardState::Claimed | CardState::Blocked
-    )
+/// shape (Closed requires verified-done OR pre-work cancellation
+/// OR review-only completion) generalizes.
+pub(crate) fn close_transition_allowed_from_card(card: &WorkCard) -> bool {
+    match card.state {
+        CardState::Merged | CardState::Open | CardState::Claimed | CardState::Blocked => true,
+        CardState::InProgress if card.reviews.is_some() => true,
+        _ => false,
+    }
 }
 
 /// First 8 chars of a UUID-style id — enough to disambiguate at the
@@ -1499,21 +1532,98 @@ mod tests {
     }
 
     #[test]
-    fn close_transition_allowed_from_pins_the_close_lifecycle_gate() {
+    fn close_transition_allowed_from_card_pins_the_close_lifecycle_gate() {
         // Allowed: Merged (PR-merged happy path) + Open/Claimed/Blocked
-        // (cancellation before any commits landed).
-        assert!(close_transition_allowed_from(CardState::Merged));
-        assert!(close_transition_allowed_from(CardState::Open));
-        assert!(close_transition_allowed_from(CardState::Claimed));
-        assert!(close_transition_allowed_from(CardState::Blocked));
+        // (cancellation before any commits landed). Regular non-review
+        // cards (reviews: None) exercise the pre-fae3c28e gate.
+        let regular = |state| make_card(state, None, None, None);
+        assert!(close_transition_allowed_from_card(&regular(
+            CardState::Merged
+        )));
+        assert!(close_transition_allowed_from_card(&regular(
+            CardState::Open
+        )));
+        assert!(close_transition_allowed_from_card(&regular(
+            CardState::Claimed
+        )));
+        assert!(close_transition_allowed_from_card(&regular(
+            CardState::Blocked
+        )));
         // Refused: any state representing in-flight work. An agent
         // calling close from these is exactly the 2026-05-28 bypass.
-        assert!(!close_transition_allowed_from(CardState::InProgress));
-        assert!(!close_transition_allowed_from(CardState::Review));
+        assert!(!close_transition_allowed_from_card(&regular(
+            CardState::InProgress
+        )));
+        assert!(!close_transition_allowed_from_card(&regular(
+            CardState::Review
+        )));
         // Refused: Closed → Closed is a no-op masquerading as work.
         // Forcing the caller to recognise the card is already closed
         // (read the board) before re-issuing.
-        assert!(!close_transition_allowed_from(CardState::Closed));
+        assert!(!close_transition_allowed_from_card(&regular(
+            CardState::Closed
+        )));
+    }
+
+    /// Card fae3c28e — review-only cards (where `reviews.is_some()`)
+    /// can transition InProgress → Closed because the review IS the
+    /// work; there's no PR/Merged to gate on. Without this, review
+    /// cards had to route through Blocked → Closed as a workaround,
+    /// which is semantic noise (Blocked means waiting on something
+    /// external, not "review-complete").
+    #[test]
+    fn close_transition_allowed_from_card_opens_review_only_in_progress_path() {
+        let mut review = make_card(CardState::InProgress, None, None, None);
+        review.reviews = Some(WorkCardId::from_u128(42));
+
+        // The review-only InProgress path is the fae3c28e fix:
+        // allowed for review cards, refused for everything else.
+        assert!(
+            close_transition_allowed_from_card(&review),
+            "review-only card (reviews.is_some()) closes from InProgress",
+        );
+
+        // A regular card (reviews: None) in InProgress still refuses,
+        // matching the 9656a836 rule — agents must ship via Review →
+        // Merged for actual work, not self-attest Closed.
+        let regular = make_card(CardState::InProgress, None, None, None);
+        assert!(
+            !close_transition_allowed_from_card(&regular),
+            "non-review InProgress still refuses — 9656a836 rule",
+        );
+
+        // Review-only cards from Review state still refuse — review
+        // cards don't transition to Review (no PR to open), so seeing
+        // one in Review is an indicator of either a stale state from a
+        // pre-fae3c28e binary or a misuse. Refuse and force the
+        // caller to look.
+        let mut review_in_review = make_card(CardState::Review, None, None, None);
+        review_in_review.reviews = Some(WorkCardId::from_u128(42));
+        assert!(
+            !close_transition_allowed_from_card(&review_in_review),
+            "review-only Review state still refuses — review cards don't reach Review",
+        );
+
+        // Sanity: the pre-existing allowed transitions are unchanged
+        // when applied to the new function (regression guard).
+        for state in [
+            CardState::Merged,
+            CardState::Open,
+            CardState::Claimed,
+            CardState::Blocked,
+        ] {
+            let mut review = make_card(state, None, None, None);
+            review.reviews = Some(WorkCardId::from_u128(42));
+            assert!(
+                close_transition_allowed_from_card(&review),
+                "review-only state {state:?} preserves pre-fae3c28e allow",
+            );
+            let regular = make_card(state, None, None, None);
+            assert!(
+                close_transition_allowed_from_card(&regular),
+                "regular state {state:?} preserves pre-fae3c28e allow",
+            );
+        }
     }
 
     #[test]
