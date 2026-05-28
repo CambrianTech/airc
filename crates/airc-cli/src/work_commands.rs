@@ -240,6 +240,25 @@ fn format_peer(peer: airc_lib::PeerId, me: airc_lib::PeerId) -> String {
     }
 }
 
+/// Render claim-lease liveness inline on the board (kink ac6affc7):
+/// '-' = no claim, '<STALE>' = lease expired (eligible for reclaim per
+/// the flywheel-continuity doctrine), otherwise time remaining as
+/// 'Mm SS s'. Lets at-a-glance scanning of the board surface stale
+/// claims without having to cross-reference 'work roster' + ttl.
+fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
+    match expires_at_ms {
+        None => "-".to_string(),
+        Some(expires_at_ms) if expires_at_ms <= now_ms => "<STALE>".to_string(),
+        Some(expires_at_ms) => {
+            let ms_left = expires_at_ms - now_ms;
+            let s_left = ms_left / 1000;
+            let m = s_left / 60;
+            let s = s_left % 60;
+            format!("{m}m{s:02}s")
+        }
+    }
+}
+
 pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
@@ -377,6 +396,7 @@ fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId) {
     if !snapshot.cards.is_empty() {
         println!("work cards: {}", snapshot.cards.len());
     }
+    let now = now_ms();
     for card in &snapshot.cards {
         let owner = card
             .owner
@@ -386,8 +406,9 @@ fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId) {
             .claim_id
             .map(short_id)
             .unwrap_or_else(|| "-".to_string());
+        let lease = format_lease(card.claim_expires_at_ms, now);
         println!(
-            "{card_id}  {priority:?}  {state:?}  owner={owner}  claim={claim}  repo={repo}  title={title}",
+            "{card_id}  {priority:?}  {state:?}  owner={owner}  claim={claim}  lease={lease}  repo={repo}  title={title}",
             card_id = card.card_id,
             priority = card.priority,
             state = card.state,
@@ -648,5 +669,36 @@ impl From<CliCardState> for CardState {
             CliCardState::Merged => Self::Merged,
             CliCardState::Closed => Self::Closed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_renders_dash_when_no_claim() {
+        assert_eq!(format_lease(None, 1_000), "-");
+    }
+
+    #[test]
+    fn lease_renders_stale_marker_when_expired() {
+        assert_eq!(format_lease(Some(500), 1_000), "<STALE>");
+        // Exact-equal counts as expired — eligible for reclaim now.
+        assert_eq!(format_lease(Some(1_000), 1_000), "<STALE>");
+    }
+
+    #[test]
+    fn lease_renders_remaining_as_minutes_seconds() {
+        // 8 minutes 12 seconds remaining.
+        assert_eq!(format_lease(Some(1_000 + 8 * 60_000 + 12_000), 1_000), "8m12s");
+        // Sub-minute pads seconds with leading zero.
+        assert_eq!(format_lease(Some(1_000 + 5_000), 1_000), "0m05s");
+    }
+
+    #[test]
+    fn short_id_truncates_to_8_chars() {
+        assert_eq!(short_id("cdff6a9d-e995-4b4a-a119-10bc1faf1747"), "cdff6a9d");
+        assert_eq!(short_id("short"), "short");
     }
 }
