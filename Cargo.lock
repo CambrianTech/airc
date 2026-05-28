@@ -88,6 +88,7 @@ dependencies = [
  "airc-transport",
  "airc-trust",
  "airc-work",
+ "async-trait",
  "base64",
  "chacha20poly1305",
  "chrono",
