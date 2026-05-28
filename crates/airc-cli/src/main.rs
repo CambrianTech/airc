@@ -73,6 +73,7 @@ mod route_cli;
 mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
+mod staleness;
 mod transport_cli;
 mod transport_commands;
 mod update_commands;
@@ -167,6 +168,11 @@ fn run_main() -> ExitCode {
 
 async fn async_main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Card f10c951e — print a banner if this binary is behind
+    // origin/rust-rewrite tip for any airc crate. Best-effort, cheap,
+    // never blocks. The single highest-friction onboarding issue.
+    staleness::warn_if_stale();
 
     let parsed = Cli::parse();
     match dispatch(parsed).await {
