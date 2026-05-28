@@ -85,6 +85,15 @@ pub enum TranscriptKind {
     /// emitted_at_ms per peer_id. Part of card a63ad10a/2f74b8a1
     /// (identity-roster substrate, parent af40f46d).
     IdentityPublished,
+    /// A peer published the room's operating doctrine — the
+    /// "how we work here" markdown every attaching agent loads on
+    /// join. Body: serialized
+    /// `airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished`,
+    /// kind="room_doctrine_published", carrying { room_id, body,
+    /// version, published_by, published_at_ms }. Projections take
+    /// the latest per room_id (LWW on published_at_ms). Part of
+    /// card 2903a8ef — engine keystone "the user is not the engine."
+    DoctrinePublished,
 }
 
 impl TranscriptKind {
@@ -102,6 +111,7 @@ impl TranscriptKind {
                 | TranscriptKind::RoomParted
                 | TranscriptKind::SubscriptionAdvanced
                 | TranscriptKind::IdentityPublished
+                | TranscriptKind::DoctrinePublished
         )
     }
 
@@ -138,6 +148,7 @@ impl TranscriptKind {
             TranscriptKind::RoomParted => "room_parted",
             TranscriptKind::SubscriptionAdvanced => "subscription_advanced",
             TranscriptKind::IdentityPublished => "identity_published",
+            TranscriptKind::DoctrinePublished => "doctrine_published",
         }
     }
 
@@ -160,6 +171,7 @@ impl TranscriptKind {
             "room_parted" => TranscriptKind::RoomParted,
             "subscription_advanced" => TranscriptKind::SubscriptionAdvanced,
             "identity_published" => TranscriptKind::IdentityPublished,
+            "doctrine_published" => TranscriptKind::DoctrinePublished,
             _ => return None,
         })
     }
@@ -184,6 +196,7 @@ impl TranscriptKind {
         TranscriptKind::RoomParted,
         TranscriptKind::SubscriptionAdvanced,
         TranscriptKind::IdentityPublished,
+        TranscriptKind::DoctrinePublished,
     ];
 }
 
