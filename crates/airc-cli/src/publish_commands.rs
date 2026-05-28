@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::Path;
 
 use airc_core::{Body, Headers};
-use airc_lib::{Airc, PublishTarget};
+use airc_lib::PublishTarget;
 use airc_protocol::FrameKind;
 
 use crate::cli::PublishFrameKind;
@@ -30,7 +30,7 @@ pub async fn run_publish(
         None => PublishTarget::CurrentRoom,
     };
 
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let receipt = airc
         .publish(target, frame_kind_from(kind), body, parsed_headers)
         .await?;

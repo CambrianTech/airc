@@ -87,32 +87,19 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 
 /// Default daemon IPC endpoint for `home`.
 ///
-/// The endpoint includes `airc_ipc::IPC_PROTOCOL_VERSION`. If the
-/// local daemon wire protocol changes, a new client must not talk to an
-/// old daemon that still owns the prior socket; `airc join` should start
-/// a current daemon immediately and leave stale process cleanup to the
-/// drain path.
+/// The socket lives **inside the machine-account home** (`~/.airc`), not
+/// a temp dir: every scope under one user's `$HOME` resolves to the same
+/// `~/.airc/daemon-v<N>.sock`, so they all reach the ONE machine-singular
+/// daemon (§1), and there's no hashing — the home dir IS the unique key.
+/// The per-socket `DaemonBindGuard` then guarantees a single owner: the
+/// first scope to start binds it, the rest attach.
+///
+/// The filename includes `airc_ipc::IPC_PROTOCOL_VERSION`: if the local
+/// daemon wire protocol changes, a new client must not talk to an old
+/// daemon that still owns the prior socket.
 pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use sha2::{Digest, Sha256};
-        let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-        let mut hasher = Sha256::new();
-        hasher.update(airc_ipc::IPC_PROTOCOL_VERSION.to_be_bytes());
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        let digest = hasher.finalize();
-        let hex = digest
-            .iter()
-            .take(12)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        std::env::temp_dir().join(format!(
-            "airc-ipc-v{}-{hex}.sock",
-            airc_ipc::IPC_PROTOCOL_VERSION
-        ))
-    }
-    #[cfg(not(unix))]
-    home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION))
+    airc_lib::machine_account_home(home)
+        .join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION))
 }
 
 /// AIRC substrate CLI.
@@ -300,11 +287,6 @@ pub enum Command {
     Room {
         /// Room name. Omit to just print the current room.
         name: Option<String>,
-        /// Override the default wire path (`<home>/wires/<name>/`).
-        /// Use for shared-wire setups (e.g. local-fs tests where two
-        /// processes need to read/write the same dir).
-        #[arg(long)]
-        wire: Option<PathBuf>,
     },
 
     /// Leave a subscribed room without deleting identity or trust.
@@ -447,12 +429,6 @@ pub enum Command {
     IsoToEpoch {
         /// Timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.
         timestamp: String,
-    },
-
-    /// Print the stable daemon service suffix for an airc scope path.
-    DaemonScopeId {
-        /// Scope path. Defaults to `$AIRC_HOME`, then `$HOME/.airc`.
-        scope: Option<String>,
     },
 }
 

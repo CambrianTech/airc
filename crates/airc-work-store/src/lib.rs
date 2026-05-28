@@ -111,6 +111,17 @@ where
     }
 }
 
+/// Project a complete work board from a caller-supplied transcript page
+/// (e.g. events fetched via the daemon inbox) — no `EventStore` needed.
+/// Same decode + replay as [`WorkEventStore::project_complete`], for the
+/// daemon-attached read path.
+pub fn project_transcripts(
+    transcripts: Vec<TranscriptEvent>,
+) -> Result<WorkBoardProjection, WorkStoreError> {
+    let page = decode_page(transcripts)?;
+    Ok(WorkBoardProjection::replay_window(page.events)?)
+}
+
 fn decode_page(transcripts: Vec<TranscriptEvent>) -> Result<WorkEventPage, WorkStoreError> {
     let newest_cursor = transcripts.last().map(TranscriptEvent::cursor);
     let mut events = Vec::new();

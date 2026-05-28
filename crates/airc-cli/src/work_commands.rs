@@ -13,7 +13,7 @@ use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
 use uuid::Uuid;
 
 use airc_lib::{
-    AgentAvailabilityState, Airc, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
+    AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
     CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBacklogSeedCandidate,
     WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
     WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
@@ -30,7 +30,7 @@ pub async fn run_create(
     lane_id: Option<String>,
     priority: CliPriority,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let card_id = airc
         .create_work_card(CreateWorkCard {
             repo: RepoId::new(repo)?,
@@ -53,7 +53,7 @@ pub async fn run_seed(
     priority: CliPriority,
     evidence_key: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let result = airc
         .seed_work_backlog(vec![WorkBacklogSeedCandidate {
             repo: RepoId::new(repo)?,
@@ -99,7 +99,7 @@ pub async fn run_claim(
             .into());
         }
     }
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let card_id = parse_work_card_id(&card_id)?;
     let claim_id = airc
         .claim_work_card(ClaimWorkCard { card_id, ttl_ms })
@@ -114,7 +114,7 @@ pub async fn run_release(
     claim_id: String,
     reason: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     airc.release_work_claim(ReleaseWorkClaim {
         card_id: parse_work_card_id(&card_id)?,
         claim_id: parse_claim_id(&claim_id)?,
@@ -131,7 +131,7 @@ pub async fn run_heartbeat(
     claim_id: String,
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_uuid = parse_claim_id(&claim_id)?;
     airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
@@ -173,7 +173,7 @@ pub async fn run_state(
     card_id: String,
     state: CliCardState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let card_id = parse_work_card_id(&card_id)?;
     let state = CardState::from(state);
     airc.change_work_card_state(ChangeWorkCardState { card_id, state })
@@ -187,7 +187,7 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
 }
 
 pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
     print_board(&board);
     Ok(())
@@ -201,7 +201,7 @@ pub async fn run_next(
     limit: usize,
     event_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let query = airc_lib::WorkQueueStatusQuery {
         repo: repo.map(RepoId::new).transpose()?,
         max_priority: max_priority.into(),
@@ -256,7 +256,7 @@ pub async fn run_roster(
     event_limit: usize,
     active_within_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let status = airc
         .work_roster_status(airc_lib::WorkRosterQuery {
             repo: repo.map(RepoId::new).transpose()?,
@@ -277,7 +277,7 @@ pub async fn run_manage(
     event_limit: usize,
     active_within_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let status = airc
         .work_manager_status(airc_lib::WorkManagerQuery {
             repo: repo.map(RepoId::new).transpose()?,
@@ -299,7 +299,7 @@ pub async fn run_availability(
     note: Option<String>,
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let repo = RepoId::new(repo)?;
     airc.report_agent_availability(airc_lib::ReportAgentAvailability {
         repo: repo.clone(),

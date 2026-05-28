@@ -81,7 +81,6 @@ fn print_sample(sample: TransportHealthSample) {
 
 fn format_kind(kind: TransportKind) -> &'static str {
     match kind {
-        TransportKind::LocalFs => "local-fs",
         TransportKind::LanTcp => "lan-tcp",
         TransportKind::Tailscale => "tailscale",
         TransportKind::Udp => "udp",

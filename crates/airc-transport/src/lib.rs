@@ -23,7 +23,6 @@
 pub mod error;
 pub mod gh_gist;
 pub mod lan_tcp;
-pub mod local_fs;
 pub mod relay;
 pub mod signed;
 pub mod transport;
@@ -38,7 +37,6 @@ pub use lan_tcp::{
     CertGenError, CertParseError, LanTcpAdapter, LanTcpError, PinnedClientVerifier,
     PinnedServerVerifier, TlsConfigError,
 };
-pub use local_fs::LocalFsAdapter;
 pub use relay::{RelayAdapter, RelayClientConfig, RelayClientError};
 pub use signed::{SignedError, SignedTransport};
 pub use transport::{FrameStream, Transport};

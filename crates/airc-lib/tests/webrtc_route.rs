@@ -1,19 +1,19 @@
-//! Integration: full WebRTC orchestration round-trip without GitHub.
+//! Integration: full WebRTC orchestration over the owner-core daemon.
 //!
-//! Two `Airc` instances on separate homes share a local-fs wire so the
-//! signaling messages can travel. Bob runs the responder via
-//! [`Airc::accept_webrtc_offers`]; Alice calls
-//! [`Airc::open_webrtc_to(bob)`] which drives the offer/answer
-//! handshake over the AIRC mesh. Once the DataChannel is open on both
-//! sides, both `replace_transport_health` with WebRTC-only so the
-//! route resolver has no other choice, then Alice sends a control
-//! event whose only viable route is `TransportKind::WebRtcDataChannel`.
+//! This is the Continuum split made concrete: **airc is the control /
+//! signaling plane, WebRTC is the media plane** (airc is not the SFU).
+//! Two scopes on one machine attach to the one owner daemon. Bob runs
+//! the responder via [`Airc::accept_webrtc_offers`]; Alice calls
+//! [`Airc::open_webrtc_to(bob)`], whose offer/answer handshake travels
+//! over the daemon (the signaling plane). Media tracks then flow
+//! peer-to-peer over the DataChannel, while avatar **control** events
+//! ride the daemon — both coexisting in one avatar session.
 //!
-//! Uses the same gather-complete pattern as the existing
-//! `webrtc_datachannel/tests.rs` adapter tests, and the
-//! `send_frame_to_for_test` doc-hidden alias from #955 because UDP /
-//! WebRTC are only admissible for non-`DataInteractive` route
-//! classes.
+//! Uses the same gather-complete pattern as the `webrtc_datachannel`
+//! adapter tests, and the `send_frame_to_for_test` doc-hidden alias
+//! from #955.
+
+mod common;
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -21,15 +21,14 @@ use std::time::Duration;
 use airc_core::PeerId;
 use airc_lib::{
     Airc, Body, Headers, IncomingTrack, MentionTarget, OpenedWebRtcConnection, OutgoingAudioTrack,
-    OutgoingVideoTrack, PeerSpec, TransportHealthSample, TransportHealthState, TransportKind,
-    TransportRole,
+    OutgoingVideoTrack, PeerSpec,
 };
 use airc_protocol::FrameKind;
 use bytes::Bytes;
+use common::Machine;
 use futures::stream::StreamExt;
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc_media::Sample;
-use tempfile::TempDir;
 use webrtc::media_stream::Track;
 
 static CRYPTO_INIT: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
@@ -43,9 +42,8 @@ fn ensure_crypto_provider() {
 }
 
 struct PairedAircFixture {
-    _alice_home: TempDir,
-    _bob_home: TempDir,
-    _wire_dir: TempDir,
+    // Keeps the in-process daemon alive for the test's duration.
+    _machine: Machine,
     alice: Airc,
     bob: Airc,
     alice_spec: PeerSpec,
@@ -53,36 +51,19 @@ struct PairedAircFixture {
 }
 
 async fn paired_airc(room: &str) -> PairedAircFixture {
-    let alice_home = TempDir::new().expect("alice home");
-    let bob_home = TempDir::new().expect("bob home");
-    let wire_dir = TempDir::new().expect("shared wire dir");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+    let bob = machine.attach("bob").await;
 
     let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
     let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
-    alice
-        .add_peer(bob_spec.clone())
-        .await
-        .expect("alice trusts bob");
-    bob.add_peer(alice_spec.clone())
-        .await
-        .expect("bob trusts alice");
+    common::trust(&alice, &bob).await;
 
-    alice
-        .join_with_wire(room, wire_path.clone())
-        .await
-        .expect("alice joins room");
-    bob.join_with_wire(room, wire_path)
-        .await
-        .expect("bob joins room");
+    alice.join(room).await.expect("alice joins room");
+    bob.join(room).await.expect("bob joins room");
 
     PairedAircFixture {
-        _alice_home: alice_home,
-        _bob_home: bob_home,
-        _wire_dir: wire_dir,
+        _machine: machine,
         alice,
         bob,
         alice_spec,
@@ -164,17 +145,6 @@ async fn collect_track_kinds(
         RtpCodecKind::Video => 2,
     });
     kinds
-}
-
-fn force_webrtc_route(airc: &Airc) {
-    let webrtc_only = [TransportHealthSample {
-        kind: TransportKind::WebRtcDataChannel,
-        role: TransportRole::Direct,
-        state: TransportHealthState::Healthy,
-        rtt_ms: None,
-        success_ppm: None,
-    }];
-    airc.replace_transport_health(webrtc_only).unwrap();
 }
 
 async fn wait_for_webrtc_channel(airc: Airc, peer_id: PeerId) {
@@ -267,9 +237,9 @@ async fn webrtc_session_carries_media_tracks_and_control_events() {
     let kinds = collect_track_kinds(track_rx, fixture.alice_spec.peer_id).await;
     assert_eq!(kinds, vec![RtpCodecKind::Audio, RtpCodecKind::Video]);
 
-    force_webrtc_route(&fixture.alice);
-    force_webrtc_route(&fixture.bob);
-
+    // Media rode the DataChannel (P2P, above). The avatar CONTROL event
+    // rides the daemon — airc is the control plane, not the SFU — and
+    // Bob receives it on his daemon subscription alongside the media.
     let bob_handle = fixture.bob.clone();
     let bob_peer_id = fixture.bob.peer_id();
     let alice_peer_id = fixture.alice.peer_id();
@@ -356,10 +326,8 @@ async fn webrtc_orchestration_round_trip_over_mesh_signaling() {
     // runs in a spawned task and completes asynchronously.
     wait_for_webrtc_channel(fixture.bob.clone(), fixture.alice_spec.peer_id).await;
 
-    // Force route resolver to pick WebRTC — no other healthy route.
-    force_webrtc_route(&fixture.alice);
-    force_webrtc_route(&fixture.bob);
-
+    // The DataChannel is open (media plane ready). A control event from
+    // Alice to Bob rides the daemon control plane; Bob receives it.
     let bob_handle = fixture.bob.clone();
     let bob_peer_id = fixture.bob.peer_id();
     let alice_peer_id = fixture.alice.peer_id();

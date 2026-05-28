@@ -123,6 +123,7 @@ dependencies = [
 name = "airc-daemon"
 version = "0.1.0"
 dependencies = [
+ "airc-bus",
  "airc-core",
  "airc-diagnostics",
  "airc-identity",
@@ -131,8 +132,10 @@ dependencies = [
  "airc-store",
  "airc-transport",
  "airc-trust",
+ "airc-wire",
  "async-trait",
  "base64",
+ "bytes",
  "fs2",
  "futures",
  "tempfile",
@@ -179,6 +182,7 @@ dependencies = [
 name = "airc-lib"
 version = "0.1.0"
 dependencies = [
+ "airc-bus",
  "airc-core",
  "airc-daemon",
  "airc-diagnostics",
@@ -189,6 +193,7 @@ dependencies = [
  "airc-store",
  "airc-transport",
  "airc-trust",
+ "airc-wire",
  "airc-work",
  "airc-work-store",
  "async-trait",
@@ -1178,7 +1183,11 @@ dependencies = [
 name = "embedded-consumer-smoke"
 version = "0.1.0"
 dependencies = [
+ "airc-core",
+ "airc-daemon",
  "airc-lib",
+ "airc-protocol",
+ "airc-store",
  "futures",
  "tempfile",
  "tokio",

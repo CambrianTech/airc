@@ -1,22 +1,24 @@
 //! End-to-end proof: two `Airc` consumers, each in its own `home`,
-//! exchange messages through the SDK and replay from the store —
-//! without daemon IPC, without the CLI, and without reaching into
-//! substrate internals.
+//! attach to the one machine daemon, exchange messages through the SDK,
+//! and replay from the transcript — without the CLI and without
+//! reaching into substrate internals (the runtime surface is airc-lib
+//! only; the test provides the in-process daemon the install ships).
 //!
 //! This is the Gate-4 minimum: a downstream consumer linking only
 //! `airc-lib` can stand up an agent, hold a conversation, and walk
-//! history from the typed store.
+//! history via the typed cursor API.
+
+mod common;
 
 use std::time::Duration;
 
-use airc_lib::{Airc, Body, PeerSpec, TranscriptCursor};
+use airc_lib::{Airc, Body, TranscriptCursor};
+use common::Machine;
 use futures::stream::StreamExt;
-use tempfile::TempDir;
 
 /// Poll `page_recent` until the expected body text shows up, with a
-/// deadline. The local-fs wire flushes asynchronously; a deterministic
-/// polling helper avoids flakes on slow CI runners while still
-/// failing loudly past the timeout.
+/// deadline — keeps slow CI runners from flaking while still failing
+/// loudly past the timeout.
 async fn wait_for_body_text(
     airc: &Airc,
     expected: &str,
@@ -38,45 +40,29 @@ async fn wait_for_body_text(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_agents_in_separate_homes_exchange_and_replay_via_sdk() {
-    // Two distinct identity homes. Each consumer maintains its own
-    // PeerId, keypair, room state, and event store. A real embedder
-    // gives every agent its own home; nothing about the SDK assumes
-    // a single global home.
-    let alice_home = TempDir::new().unwrap();
-    let bob_home = TempDir::new().unwrap();
+    // One machine daemon; two consumers, each its own identity home,
+    // attached to it. A real embedder gives every agent its own home;
+    // the shared machine daemon is what carries same-machine delivery.
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+    let bob = machine.attach("bob").await;
 
-    // Shared wire — a local-fs append-only log both consumers can
-    // attach to. This is the in-process equivalent of a relay or
-    // LAN-TCP: a shared transport surface without daemon IPC.
-    let wire_dir = TempDir::new().unwrap();
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.unwrap();
-    let bob = Airc::open(bob_home.path()).await.unwrap();
-
-    // Trust bootstrap: each consumer must enrol the other's pubkey
-    // before its verifier will accept signed frames on the wire.
-    // This is the "explicit trust" half of the audit's grievance §8
-    // fix — silent acceptance is forbidden by the substrate; each
-    // consumer signs frames and the receiver verifies against its
-    // own enrolled registry. Real embedders typically wire this from
-    // an out-of-band trust source (invite, paired QR, signed config).
-    let alice_spec: PeerSpec = alice.peer_spec().parse().unwrap();
-    let bob_spec: PeerSpec = bob.peer_spec().parse().unwrap();
-    alice.add_peer(bob_spec).await.unwrap();
-    bob.add_peer(alice_spec).await.unwrap();
+    // Trust bootstrap: each consumer enrols the other's pubkey before
+    // its verifier will accept the other's signed frames (audit §8 —
+    // no silent acceptance). Real embedders wire this from an
+    // out-of-band trust source (invite, paired QR, signed config).
+    common::trust(&alice, &bob).await;
 
     let room = "embedded-smoke";
-    alice.join_with_wire(room, wire_path.clone()).await.unwrap();
-    bob.join_with_wire(room, wire_path.clone()).await.unwrap();
+    alice.join(room).await.unwrap();
+    bob.join(room).await.unwrap();
 
-    // Bob installs a live subscription BEFORE Alice sends so the
-    // "no prompt-time polling" path is exercised. The Codex hook
-    // case the audit calls out: a consumer subscribes to typed
-    // events and receives them as they happen, instead of shelling
-    // out to a log-scraping command between turns.
+    // Bob installs a live subscription BEFORE Alice sends, so the
+    // "no prompt-time polling" path is exercised: a consumer subscribes
+    // to typed events and receives them as they happen, instead of
+    // shelling out to a log-scraping command between turns.
     let mut bob_stream = bob.subscribe().await.unwrap();
 
     let first = "hello bob, from alice via sdk";
@@ -94,16 +80,14 @@ async fn two_agents_in_separate_homes_exchange_and_replay_via_sdk() {
         "live subscribe must deliver the alice→bob text exactly",
     );
 
-    // Store replay. By the time the live event arrived, the wire-side
-    // tail must have committed the event to Bob's store too.
+    // Durable replay from the daemon transcript.
     let recent = wait_for_body_text(&bob, first, Duration::from_secs(3)).await;
     assert_eq!(recent.event_id, live.event_id);
 
     // Cursor-based catch-up. A real embedder restarts on its own
     // schedule and uses the cursor to resume without re-receiving
-    // events it already processed. Verify that with a second message:
-    // the cursor we capture here MUST exclude `first` from the
-    // resume_from page, and INCLUDE the next message Alice sends.
+    // events it already processed. The cursor we capture here MUST
+    // exclude `first` from the resume page and include the next message.
     let cursor_after_first = TranscriptCursor {
         lamport: live.lamport,
         event_id: live.event_id,
@@ -112,8 +96,6 @@ async fn two_agents_in_separate_homes_exchange_and_replay_via_sdk() {
     let second = "second message — proves resume_from excludes prior cursor";
     alice.say(second).await.unwrap();
 
-    // Poll resume_from until the new event shows up. A vacuum read
-    // against just-after-first must yield `second` and NOT `first`.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let after_cursor = loop {
         let page = bob.resume_from(&cursor_after_first, 64).await.unwrap();

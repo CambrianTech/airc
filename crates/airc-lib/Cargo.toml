@@ -23,11 +23,13 @@ publish = false
 workspace = true
 
 [dependencies]
+airc-bus = { path = "../airc-bus" }
 airc-core = { path = "../airc-core" }
 airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
 airc-protocol = { path = "../airc-protocol" }
+airc-wire = { path = "../airc-wire" }
 airc-store = { path = "../airc-store" }
 airc-trust = { path = "../airc-trust" }
 airc-transport = { path = "../airc-transport" }

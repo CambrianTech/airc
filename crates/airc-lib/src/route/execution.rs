@@ -6,7 +6,7 @@
 //! signed frame.
 
 use airc_protocol::Frame;
-use airc_transport::{LocalFsAdapter, Transport};
+use airc_transport::Transport;
 
 use crate::error::AircError;
 use crate::route::policy::TransportKind;
@@ -16,17 +16,10 @@ impl Airc {
     pub(crate) async fn execute_send_route(
         &self,
         route: TransportKind,
-        room: &Room,
+        _room: &Room,
         frame: Frame,
     ) -> Result<(), AircError> {
         match route {
-            TransportKind::LocalFs => {
-                self.ensure_wire_subscriber(&room.wire).await?;
-                LocalFsAdapter::new(&room.wire)
-                    .send(frame)
-                    .await
-                    .map_err(|error| AircError::Transport(error.to_string()))
-            }
             TransportKind::LanTcp | TransportKind::Tailscale => {
                 self.ensure_lan_subscriber().await?;
                 self.lan_adapter()

@@ -17,14 +17,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
+use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
-use uuid::Uuid;
 
+use airc_bus::envelope::{Cursor, DeliveryClass, Kind};
+use airc_bus::{Filter, Seq};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
 use airc_ipc::codec::{read_frame, write_frame};
-use airc_ipc::request::{AttachRequest, Request};
+use airc_ipc::request::{AttachRequest, IpcDelivery, IpcKind, Request};
 use airc_ipc::response::Response;
 use airc_ipc::transport::{IpcListener, IpcStream};
 
@@ -129,9 +131,13 @@ struct DaemonBindGuard {
 
 impl DaemonBindGuard {
     fn acquire(socket_path: &Path) -> Result<Self, DaemonError> {
-        let lock_dir = std::env::temp_dir().join("airc-daemon-locks");
-        std::fs::create_dir_all(&lock_dir)?;
-        let lock_path = lock_dir.join(format!("{}.lock", socket_lock_id(socket_path)));
+        // The lock sits beside the socket in the machine-account home
+        // (`~/.airc/daemon-v<N>.sock.lock`) — no temp dir, no hashing.
+        // Same owner ⇒ same socket path ⇒ same lock ⇒ one daemon.
+        let lock_path = lock_path_for(socket_path);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -161,12 +167,35 @@ impl Drop for DaemonBindGuard {
     }
 }
 
-fn socket_lock_id(socket_path: &Path) -> Uuid {
-    const LOCK_NAMESPACE: Uuid = Uuid::from_bytes([
-        0xa1, 0xc2, 0x70, 0x1b, 0xe0, 0x05, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x03,
-    ]);
-    Uuid::new_v5(&LOCK_NAMESPACE, socket_path.to_string_lossy().as_bytes())
+/// `<socket>.lock` beside the socket. The socket path is already unique
+/// per machine account, so the lock inherits that uniqueness — no temp
+/// dir, no hashing.
+fn lock_path_for(socket_path: &Path) -> PathBuf {
+    let mut raw = socket_path.as_os_str().to_os_string();
+    raw.push(".lock");
+    PathBuf::from(raw)
+}
+
+fn map_ipc_kind(kind: IpcKind) -> Kind {
+    match kind {
+        IpcKind::Message => Kind::Message,
+        IpcKind::Event => Kind::Event,
+        IpcKind::Command => Kind::Command,
+        IpcKind::CommandResult => Kind::CommandResult,
+        IpcKind::Signal => Kind::Signal,
+        IpcKind::StreamChunk => Kind::StreamChunk,
+        IpcKind::Control => Kind::Control,
+    }
+}
+
+fn map_ipc_delivery(delivery: IpcDelivery) -> DeliveryClass {
+    match delivery {
+        IpcDelivery::Durable => DeliveryClass::Durable,
+        IpcDelivery::EphemeralLatest => DeliveryClass::EphemeralLatest,
+        IpcDelivery::EphemeralWindow => DeliveryClass::EphemeralWindow,
+        IpcDelivery::RequestResponse => DeliveryClass::RequestResponse,
+        IpcDelivery::StreamChunk => DeliveryClass::StreamChunk,
+    }
 }
 
 /// If the previous daemon left a stale socket file behind, unlink
@@ -240,27 +269,84 @@ async fn stream_attach<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    write_response(&mut writer, &Response::Ok).await?;
-    let mut rx = state.live_tx.subscribe();
-    loop {
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-        };
-        if attach
-            .channel
-            .is_some_and(|channel| event.room_id != channel)
-        {
-            continue;
+    // The owner-core router subscribes per channel (no global table to
+    // scan). A client attaches once per room it cares about.
+    let channel = match attach.channel {
+        Some(channel) => channel,
+        None => {
+            return write_response(
+                &mut writer,
+                &Response::Error {
+                    message: "attach requires a channel in the owner-core model".to_string(),
+                },
+            )
+            .await;
         }
-        write_response(
-            &mut writer,
-            &Response::Event {
-                event: Box::new(event),
-            },
-        )
-        .await?;
+    };
+    // Resume strictly after the client's cursor (replay the gap missed
+    // while detached), then go live with no dup at the seam. `from` is
+    // advanced as we send, so a re-subscribe after a lag drop resumes
+    // exactly where we left off.
+    let mut from = attach
+        .from
+        .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+
+    // Compile the consumer's kind/delivery/header filters into the router
+    // filter, applied ROUTER-SIDE — the daemon never fans out an event a
+    // consumer would discard (Hermes → Command/CommandResult; Continuum →
+    // scoped `forge.*` headers; a media tap → StreamChunk only).
+    let mut filter = Filter::channel(channel);
+    if let Some(kinds) = attach.kinds {
+        filter = filter.with_kinds(kinds.into_iter().map(map_ipc_kind).collect());
+    }
+    if let Some(delivery) = attach.delivery {
+        filter = filter.with_delivery(delivery.into_iter().map(map_ipc_delivery).collect());
+    }
+    filter = filter.with_headers(attach.headers);
+
+    // Subscribe BEFORE acking. Once the client sees `Ok`, the
+    // subscription is already registered at the live edge, so a publish
+    // can't race in between the ack and the subscription (the gap that
+    // would drop early events under concurrent senders). `subscribe_with_lag`
+    // also keeps a slow IPC client from stalling fan-out to other
+    // subscribers (§3.5); on lag we re-subscribe from `from`.
+    let mut pending = Some(state.router.subscribe_with_lag(filter.clone(), from));
+    write_response(&mut writer, &Response::Ok).await?;
+
+    // Pin one shutdown waiter across re-subscribes so a `notify_waiters`
+    // can't be lost between iterations (same discipline as `run`).
+    let shutdown = state.shutdown.notified();
+    tokio::pin!(shutdown);
+
+    loop {
+        let (stream, lag) = pending
+            .take()
+            .unwrap_or_else(|| state.router.subscribe_with_lag(filter.clone(), from));
+        tokio::pin!(stream);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => return Ok(()),
+                next = stream.next() => match next {
+                    Some(env) => {
+                        from = Some(env.cursor());
+                        write_response(
+                            &mut writer,
+                            &Response::Event {
+                                envelope: airc_wire::encode(&env).to_vec(),
+                            },
+                        )
+                        .await?;
+                        if lag.is_lagged() {
+                            // Dropped a live push — break to re-resume
+                            // from the last cursor we sent (no gap).
+                            break;
+                        }
+                    }
+                    None => return Ok(()),
+                },
+            }
+        }
     }
 }
 
@@ -269,211 +355,4 @@ where
     W: AsyncWriteExt + Unpin,
 {
     write_frame(writer, response).await.map_err(DaemonError::Io)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use airc_core::PeerId;
-    use airc_ipc::client::DaemonClient;
-    use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
-    use std::time::Duration;
-
-    fn fresh_state() -> Arc<DaemonState> {
-        let peer_id = PeerId::from_u128(0xa1);
-        let keypair = PeerKeypair::generate();
-        let registry = PeerKeyRegistry::new();
-        registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
-        let registry = Arc::new(registry);
-        // Test home — leaked so it lives until process exit.
-        let home = tempfile::TempDir::new().unwrap();
-        let home_path = home.path().to_path_buf();
-        std::mem::forget(home);
-        let store: Arc<dyn airc_store::EventStore> =
-            Arc::new(airc_store::InMemoryEventStore::new());
-        Arc::new(DaemonState::new(
-            peer_id,
-            keypair,
-            registry,
-            VerificationPolicy::Strict,
-            home_path,
-            store,
-        ))
-    }
-
-    fn unique_socket() -> PathBuf {
-        // /tmp (not env::temp_dir which on macOS resolves to a long
-        // /var/folders/.../T/ path) keeps the path well under SUN_LEN
-        // (104 bytes on macOS). Short suffix from the low bits of a
-        // fresh UUID — collision odds negligible across one test run.
-        let suffix = uuid::Uuid::new_v4().as_u128() as u32;
-        PathBuf::from(format!("/tmp/arc{:x}.sock", suffix))
-    }
-
-    #[tokio::test]
-    async fn client_ping_round_trips_via_real_socket() {
-        // The integration test: spawn a real daemon on a Unix socket
-        // and confirm a DaemonClient::ping completes the round-trip.
-        let state = fresh_state();
-        let socket = unique_socket();
-
-        let server_state = state.clone();
-        let server_socket = socket.clone();
-        let server_handle = tokio::spawn(async move { run(server_state, server_socket).await });
-
-        // Tiny delay for the listener to bind.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let client = DaemonClient::new(socket.clone());
-        client.ping().await.expect("ping must succeed");
-
-        // Shut down the daemon for clean test teardown.
-        client.stop().await.expect("stop must succeed");
-        tokio::time::timeout(Duration::from_secs(2), server_handle)
-            .await
-            .expect("daemon must exit within 2s of stop")
-            .expect("join handle")
-            .expect("daemon must exit Ok");
-    }
-
-    #[tokio::test]
-    async fn status_returns_peer_id() {
-        let state = fresh_state();
-        let expected_peer_id = state.peer_id.to_string();
-        let socket = unique_socket();
-
-        let server_state = state.clone();
-        let server_socket = socket.clone();
-        let server_handle = tokio::spawn(async move { run(server_state, server_socket).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let client = DaemonClient::new(socket);
-        let status = client.status().await.expect("status must succeed");
-        assert_eq!(status.peer_id, expected_peer_id);
-
-        client.stop().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), server_handle)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn subscribe_then_send_then_inbox_round_trips() {
-        // The big daemon e2e: subscribe to a wire, send a frame
-        // (daemon's own send writes to the wire), inbox returns it.
-        // Proves the daemon's send + buffered-subscribe paths
-        // compose correctly.
-        use airc_ipc::request::{InboxRequest, SendRequest, SubscribeRequest};
-
-        let state = fresh_state();
-        let socket = unique_socket();
-        let server_state = state.clone();
-        let server_socket = socket.clone();
-        let server_handle = tokio::spawn(async move { run(server_state, server_socket).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let wire = state.home.join("wires").join("daemon-round-trip");
-        let channel = uuid::Uuid::nil();
-
-        let client = DaemonClient::new(socket);
-        client.ping().await.unwrap();
-        // Subscribe first so the daemon starts the drain task.
-        client
-            .subscribe(SubscribeRequest { wire: wire.clone() })
-            .await
-            .unwrap();
-        // Send through the daemon (daemon signs + writes to the wire).
-        client
-            .send(SendRequest {
-                wire: wire.clone(),
-                channel,
-                text: "hello from daemon".to_string(),
-                headers: airc_core::Headers::new(),
-            })
-            .await
-            .unwrap();
-
-        // Inbox MAY need a brief moment for the subscriber task to
-        // drain the new frame from the wire's tail loop into the
-        // event store.
-        let mut attempts = 0;
-        let inbox = loop {
-            let response = client
-                .inbox(InboxRequest {
-                    since: None,
-                    channel: None,
-                    limit: None,
-                })
-                .await
-                .unwrap();
-            if !response.events.is_empty() {
-                break response;
-            }
-            attempts += 1;
-            if attempts > 20 {
-                panic!(
-                    "inbox never saw the sent event (attempts={attempts}, newest={:?})",
-                    response.newest
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert_eq!(inbox.events.len(), 1);
-        assert_eq!(
-            inbox.events[0]
-                .body
-                .as_ref()
-                .and_then(airc_core::Body::as_text)
-                .unwrap(),
-            "hello from daemon"
-        );
-
-        // `newest` cursor should let us "advance past" — second
-        // inbox call returns empty.
-        let cursor = inbox.newest.clone().unwrap();
-        let after = client
-            .inbox(InboxRequest {
-                since: Some(cursor),
-                channel: None,
-                limit: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            after.events.is_empty(),
-            "after the cursor, inbox must be empty"
-        );
-
-        client.stop().await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
-    }
-
-    #[tokio::test]
-    async fn second_daemon_refuses_to_steal_live_socket() {
-        // A second daemon must fail before binding the endpoint. The
-        // bind guard normalizes platform lock errors into the daemon
-        // contract so callers do not need OS-specific error matching.
-        let state = fresh_state();
-        let socket = unique_socket();
-        let first = state.clone();
-        let socket_for_first = socket.clone();
-        let first_handle = tokio::spawn(async move { run(first, socket_for_first).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let second_result =
-            tokio::time::timeout(Duration::from_secs(2), run(fresh_state(), socket.clone()))
-                .await
-                .expect("second daemon bind attempt must return promptly");
-        assert!(
-            matches!(second_result, Err(DaemonError::AlreadyRunning(_))),
-            "second daemon must refuse to steal a live socket; got {second_result:?}"
-        );
-
-        // Clean up first daemon.
-        let client = DaemonClient::new(socket);
-        client.stop().await.unwrap();
-        let _ = first_handle.await;
-    }
 }

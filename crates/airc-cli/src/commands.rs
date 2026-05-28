@@ -23,9 +23,7 @@ use futures::stream::StreamExt;
 
 use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
 use airc_identity::LocalIdentity;
-use airc_ipc::{
-    AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
-};
+use airc_ipc::{AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response};
 use airc_lib::{Airc, Body, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_trust as peers_store;
@@ -52,20 +50,15 @@ pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `room` — print current room. `room <name>` — switch to a
-/// deterministic room derived from `<name>`. `--wire` overrides the
-/// per-home default wire dir (test-only shared-wire setup).
+/// deterministic room derived from `<name>`.
 pub async fn run_room(
     home: &Path,
     name: Option<String>,
-    wire: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
-            let next = match wire {
-                Some(wire) => airc.join_with_wire(&name, wire).await?,
-                None => airc.join(&name).await?,
-            };
+            let next = airc.join(&name).await?;
             println!("switched room: {}", next.name);
             println!("  wire:    {}", next.wire.display());
             println!("  channel: {}", next.channel);
@@ -94,7 +87,11 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
 pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    // Start the machine-singular daemon and attach: join, heartbeat, and
+    // the live feed all route through the daemon's router (one path).
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let airc = Airc::attach(home, socket.clone()).await?;
     let runtime_context = crate::runtime_context::RuntimeContext::current();
     match room {
         Some(room) => {
@@ -117,9 +114,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             print_scope_context(home, &current.wire);
         }
     }
-    let socket = crate::cli::default_socket_path_in(home);
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    subscribe_daemon_to_current_rooms(home, socket).await?;
+    sync_daemon_peers_for_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
     let _heartbeat = if runtime_context.should_stream_join() {
@@ -296,7 +291,12 @@ fn detach_daemon(command: &mut Command) {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
-async fn subscribe_daemon_to_current_rooms(
+/// Push the current scope's peer trust into the running daemon's
+/// in-memory registry. In the owner-core there is no per-wire subscribe:
+/// the one machine daemon already routes every channel through its
+/// `EventRouter`, so a scope just needs the daemon to know its peers
+/// (for cross-machine verify), nothing more.
+async fn sync_daemon_peers_for_current_rooms(
     home: &Path,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -304,13 +304,6 @@ async fn subscribe_daemon_to_current_rooms(
     let client = DaemonClient::new(socket);
     let set = airc.subscription_set().await?;
     sync_daemon_peers(&client, home, &set).await?;
-    for subscription in set.all() {
-        client
-            .subscribe(SubscribeRequest {
-                wire: subscription.as_room().wire,
-            })
-            .await?;
-    }
     Ok(())
 }
 
@@ -417,12 +410,21 @@ fn canonical_machine_account_home() -> Option<PathBuf> {
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
+/// Open an `Airc` attached to this machine's singular daemon, starting
+/// it if needed. Same-machine send/read/subscribe route through the
+/// daemon's router — the only same-machine path (no more `frames.jsonl`).
+pub(crate) async fn attached_airc(home: &Path) -> Result<Airc, Box<dyn std::error::Error>> {
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    Ok(Airc::attach(home, socket).await?)
+}
+
 pub async fn run_send(
     home: &Path,
     peers: Vec<PeerSpec>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
@@ -468,7 +470,7 @@ pub async fn run_listen(
     peers: Vec<PeerSpec>,
     _replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
@@ -553,21 +555,29 @@ pub async fn run_daemon(
         }
     }
 
-    // The durable event store lives under `<home>/events.sqlite`.
-    // Migrations are applied on open; consumers that subscribed
-    // before the daemon was last restarted can resume from the
-    // same `(lamport, event_id)` cursor on next boot.
-    let store_path = home.join("events.sqlite");
-    let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
-    let state = Arc::new(DaemonState::new_with_runtime(
-        identity.peer_id,
-        identity.keypair,
-        registry,
-        VerificationPolicy::Strict,
-        home.to_path_buf(),
-        store,
-        current_daemon_runtime_info(),
-    ));
+    // ONE ORM per machine account (§3.3). The daemon is the single
+    // owner: every scope under this user's `$HOME` resolves the same
+    // machine-account home, so they share one `events.sqlite` — the
+    // router's durable transcript + persisted epoch, and the coordinator
+    // store's subscriptions / beacons / identity. No per-scope store.
+    let machine_home = airc_lib::machine_account_home(home);
+    std::fs::create_dir_all(&machine_home)?;
+    let db_path = machine_home.join("events.sqlite");
+    let coordinator_store: Arc<dyn EventStore> =
+        Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let state = Arc::new(
+        DaemonState::build(
+            identity.peer_id,
+            identity.keypair,
+            registry,
+            VerificationPolicy::Strict,
+            machine_home,
+            &db_path,
+            coordinator_store,
+            current_daemon_runtime_info(),
+        )
+        .await?,
+    );
     println!(
         "airc daemon: peer_id={} listening on {}",
         identity.peer_id,
@@ -632,7 +642,7 @@ pub async fn run_msg(
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    subscribe_daemon_to_current_rooms(home, socket.clone()).await?;
+    sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
     airc.say_with_headers(text, runtime_headers()?).await?;
@@ -662,8 +672,8 @@ pub async fn run_inbox(
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
-        Some(socket) => Airc::attach(home, socket).await?,
-        None => Airc::open(home).await?,
+        Some(socket) => { ensure_daemon_running(home, socket.clone(), Vec::new()).await?; Airc::attach(home, socket).await? }
+        None => attached_airc(home).await?,
     };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.

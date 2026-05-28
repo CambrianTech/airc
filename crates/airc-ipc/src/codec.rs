@@ -82,8 +82,9 @@ mod tests {
     async fn frame_round_trips_newline_bearing_payload() {
         let mut bytes = Vec::new();
         let request = Request::Send(crate::request::SendRequest {
-            wire: "/tmp/airc-wire".into(),
             channel: uuid::Uuid::nil(),
+            from_peer: uuid::Uuid::from_u128(0x1),
+            from_client: uuid::Uuid::from_u128(0x2),
             text: "first line\nsecond line".to_string(),
             headers: airc_core::Headers::new(),
         });

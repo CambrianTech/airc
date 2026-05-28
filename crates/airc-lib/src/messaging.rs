@@ -1,7 +1,6 @@
 use airc_core::{Body, EventId, Headers, MentionTarget, TranscriptCursor, TranscriptEvent};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature};
 use std::sync::Arc;
-use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::AircError;
 use crate::route::{RouteClass, RouteDecision, TransportResolver, TransportRoute};
@@ -100,6 +99,14 @@ impl Airc {
         headers: Headers,
         room: &crate::Room,
     ) -> Result<SendFrameResult, AircError> {
+        // Daemon-attached: ALL structured sends (publish, work events,
+        // lifecycle) route through the daemon's router — not just `say`.
+        // Keeps the write path consistent with the daemon read path.
+        if self.is_daemon_attached() {
+            return self
+                .daemon_send_frame(room, kind, target, body, headers)
+                .await;
+        }
         self.sync_account_peer_registry().await?;
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
@@ -196,11 +203,11 @@ impl Airc {
     /// Subscribe to the live event stream.
     pub async fn subscribe(&self) -> Result<EventStream, AircError> {
         let room = self.current_room().await?;
+        if self.is_daemon_attached() {
+            return self.daemon_subscribe(vec![room.channel]).await;
+        }
         let rx = self.inner.live_tx.subscribe();
-        self.ensure_wire_subscriber(&room.wire).await?;
-        Ok(EventStream {
-            inner: BroadcastStream::new(rx),
-        })
+        Ok(EventStream::from_broadcast(rx))
     }
 
     /// Subscribe to live events matching `filter`. If the filter does
@@ -223,12 +230,21 @@ impl Airc {
         filter: EventFilter,
     ) -> Result<FilteredEventStream, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
+        if self.is_daemon_attached() {
+            let channels: Vec<airc_core::RoomId> = self
+                .subscription_set()
+                .await?
+                .all()
+                .map(|sub| sub.as_room().channel)
+                .collect();
+            return Ok(FilteredEventStream {
+                inner: self.daemon_subscribe(channels).await?,
+                filter,
+            });
+        }
         let rx = self.inner.live_tx.subscribe();
-        self.ensure_subscribed_room_subscribers().await?;
         Ok(FilteredEventStream {
-            inner: EventStream {
-                inner: BroadcastStream::new(rx),
-            },
+            inner: EventStream::from_broadcast(rx),
             filter,
         })
     }
@@ -239,8 +255,6 @@ impl Airc {
         if self.is_daemon_attached() {
             return self.daemon_page_recent(&room, limit).await;
         }
-        self.replay_wire_once(&room.wire).await?;
-        self.ensure_wire_subscriber(&room.wire).await?;
         Ok(self
             .inner
             .store
@@ -256,9 +270,6 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        let room = self.current_room().await?;
-        self.replay_wire_once(&room.wire).await?;
-        self.ensure_current_room_subscriber().await?;
         Ok(self
             .inner
             .store
@@ -276,8 +287,14 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
-        self.replay_subscribed_wires_once().await?;
-        self.ensure_subscribed_room_subscribers().await?;
+        if self.is_daemon_attached() {
+            return Ok(self
+                .daemon_page_recent_subscribed(limit)
+                .await?
+                .into_iter()
+                .filter(|event| filter.matches(event))
+                .collect());
+        }
         Ok(self
             .inner
             .store
@@ -298,7 +315,6 @@ impl Airc {
         if self.is_daemon_attached() {
             return self.daemon_resume_from(&room, cursor, limit).await;
         }
-        self.replay_wire_once(&room.wire).await?;
         Ok(self
             .inner
             .store
@@ -316,8 +332,6 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        let room = self.current_room().await?;
-        self.replay_wire_once(&room.wire).await?;
         Ok(self
             .inner
             .store
@@ -336,7 +350,14 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
-        self.replay_subscribed_wires_once().await?;
+        if self.is_daemon_attached() {
+            return Ok(self
+                .daemon_resume_from_subscribed(cursor, limit)
+                .await?
+                .into_iter()
+                .filter(|event| filter.matches(event))
+                .collect());
+        }
         Ok(self
             .inner
             .store
@@ -366,11 +387,6 @@ impl Airc {
             filter.channel = Some(self.current_room().await?.channel);
         }
         Ok(filter)
-    }
-
-    async fn ensure_current_room_subscriber(&self) -> Result<(), AircError> {
-        let room = self.current_room().await?;
-        self.ensure_wire_subscriber(&room.wire).await
     }
 }
 

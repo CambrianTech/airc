@@ -530,13 +530,6 @@ impl Airc {
         Ok(filter)
     }
 
-    pub(crate) async fn ensure_subscribed_room_subscribers(&self) -> Result<(), AircError> {
-        for wire in self.subscribed_wires().await? {
-            self.ensure_wire_subscriber(&wire).await?;
-        }
-        Ok(())
-    }
-
     async fn subscribed_room_ids(&self) -> Result<Vec<RoomId>, AircError> {
         let mut room_ids = Vec::new();
         let mut seen = HashSet::new();
@@ -560,30 +553,6 @@ impl Airc {
             }
         }
         Ok(room_ids)
-    }
-
-    pub(crate) async fn subscribed_wires(&self) -> Result<Vec<PathBuf>, AircError> {
-        let mut wires = Vec::new();
-        let mut seen = BTreeSet::new();
-        let set = self.subscription_set().await?;
-        for subscription in set.all() {
-            if seen.insert(subscription.wire.clone()) {
-                wires.push(subscription.wire.clone());
-            }
-        }
-        if wires.is_empty() {
-            let identity = self.mesh_identity().await?;
-            let wire = Subscription::new_with_wire_root(
-                &self.inner.wire_root,
-                &identity,
-                ChannelName::new("general").map_err(SubscriptionError::from)?,
-            )?
-            .wire;
-            if seen.insert(wire.clone()) {
-                wires.push(wire);
-            }
-        }
-        Ok(wires)
     }
 }
 

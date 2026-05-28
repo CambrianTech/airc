@@ -19,6 +19,7 @@
 //! so callers say `use airc_protocol::Envelope;` rather than reach
 //! into module paths.
 
+pub mod assertion;
 pub mod canonical;
 pub mod envelope;
 pub mod headers_keys;
@@ -33,6 +34,7 @@ pub mod trust_rotation;
 
 // Re-exports — the stable public API surface.
 
+pub use assertion::{AssertionError, IdentityAssertion, ASSERTION_DOMAIN};
 pub use canonical::{canonical_signed_bytes, CanonicalError};
 pub use envelope::{ChannelId, Envelope, Frame, FrameKind};
 pub use headers_keys::{

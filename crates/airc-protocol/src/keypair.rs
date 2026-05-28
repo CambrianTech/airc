@@ -98,6 +98,30 @@ impl PeerKeypair {
         self.signing.sign(msg).to_bytes()
     }
 
+    /// Sign a domain-separated identity assertion — the airc analogue
+    /// of a WebAuthn assertion. The signature covers a versioned domain
+    /// tag + `context` (the RP/"type" binding) + `challenge`, in a
+    /// space DISJOINT from envelope/frame signatures (see
+    /// [`crate::assertion`]). Consumers build session tokens +
+    /// credential bindings on top; the raw key is never exposed, so a
+    /// later device-bound / Secure-Enclave signer is a drop-in.
+    pub fn sign_assertion(
+        &self,
+        signer: PeerId,
+        key_id: u32,
+        context: &str,
+        challenge: &[u8],
+    ) -> crate::assertion::IdentityAssertion {
+        let bytes = crate::assertion::assertion_signing_bytes(context, challenge);
+        crate::assertion::IdentityAssertion {
+            peer_id: signer,
+            key_id,
+            context: context.to_string(),
+            challenge: challenge.to_vec(),
+            signature: self.sign_bytes(&bytes),
+        }
+    }
+
     /// Sign an envelope: produces a `Signature::Ed25519` carrying the
     /// signer's PeerId, key_id (for rotation), and 64-byte signature
     /// over the envelope's canonical CBOR encoding.

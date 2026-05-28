@@ -27,7 +27,7 @@ use std::sync::Arc;
 use airc_core::{ClientId, PeerId, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
-use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
+use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::{udp::UdpAdapter, LanTcpAdapter, RelayAdapter};
 use airc_trust as peers_store;
@@ -41,8 +41,8 @@ use crate::room::Room;
 use crate::route::health::TransportHealthTable;
 use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
-use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
-use crate::transport::{FrameSubscriber, WireSubscriber};
+use crate::subscriptions::{self, ChannelName, MeshIdentity};
+use crate::transport::FrameSubscriber;
 use crate::webrtc_media::{IncomingTrack, IncomingTrackHandler, IncomingTrackRegistry};
 use crate::{coordinator, time};
 
@@ -55,7 +55,11 @@ const EVENTS_DB_FILENAME: &str = "events.sqlite";
 /// that need durable replay use `Airc::resume_from` against the store.
 const LIVE_BROADCAST_CAPACITY: usize = 1024;
 
-fn machine_account_home(scope_home: &Path) -> PathBuf {
+/// The machine-account home (`$HOME/.airc`) that owns the singular
+/// daemon + the one ORM for every scope under this user's home. Scopes
+/// outside `$HOME` (CI temp dirs, isolated test roots) get their own
+/// `scope_home` back — they are their own account boundary.
+pub fn machine_account_home(scope_home: &Path) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         let normalized_home = home.canonicalize().unwrap_or(home);
@@ -148,10 +152,6 @@ pub(crate) struct AircInner {
     pub(crate) webrtc_incoming_track_handler: Mutex<Option<IncomingTrackHandler>>,
     /// Runtime registry of inbound WebRTC media tracks by peer.
     pub(crate) webrtc_incoming_tracks: IncomingTrackRegistry,
-    /// Per-wire background subscriber tasks. Spawned lazily on first
-    /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
-    /// Held in a Mutex so concurrent calls can't double-spawn.
-    pub(crate) subscribers: Mutex<HashMap<PathBuf, WireSubscriber>>,
     /// Live event fan-out. Every event the subscribers append to the
     /// store is also forwarded here so consumers tailing via
     /// [`Airc::subscribe`] see it immediately.
@@ -198,6 +198,22 @@ impl Airc {
         socket: impl Into<PathBuf>,
     ) -> Result<Self, AircError> {
         let airc = Self::open(home).await?;
+        Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
+    }
+
+    /// Test-only [`attach`] that pins the machine-account wire root
+    /// explicitly instead of deriving it from `HOME`/`USERPROFILE`.
+    /// Two scopes sharing one `wire_root` resolve the same mesh
+    /// identity (hence the same `RoomId`) and converge through the
+    /// daemon — without mutating process-global env, which would race
+    /// parallel tests. Strict verification, matching [`attach`].
+    #[doc(hidden)]
+    pub async fn attach_with_wire_root_for_test(
+        home: impl Into<PathBuf>,
+        wire_root: impl Into<PathBuf>,
+        socket: impl Into<PathBuf>,
+    ) -> Result<Self, AircError> {
+        let airc = Self::open_with_wire_root_for_test(home, wire_root).await?;
         Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
     }
 
@@ -295,7 +311,6 @@ impl Airc {
                 webrtc_peer_connections: Mutex::new(HashMap::new()),
                 webrtc_incoming_track_handler: Mutex::new(None),
                 webrtc_incoming_tracks: IncomingTrackRegistry::default(),
-                subscribers: Mutex::new(HashMap::new()),
                 live_tx,
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                     RECENTLY_BROADCAST_CAPACITY,
@@ -328,6 +343,22 @@ impl Airc {
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id
+    }
+
+    /// Sign a domain-separated identity assertion — the airc analogue
+    /// of a WebAuthn assertion. The signature covers a versioned domain
+    /// tag + `context` (the relying-party / "type" binding) + the
+    /// `challenge` bytes (a server nonce, a session descriptor, or a
+    /// Forge-alloy Merkle-context root), in a space disjoint from frame
+    /// signatures. Consumers (Continuum / jtag / browser / server)
+    /// build session tokens + credential bindings on top; the raw key
+    /// is never exposed, so a later device-bound / Secure-Enclave
+    /// signer (for hardware attestation) is a drop-in.
+    pub fn sign_assertion(&self, context: &str, challenge: &[u8]) -> IdentityAssertion {
+        self.inner
+            .identity
+            .keypair
+            .sign_assertion(self.inner.identity.peer_id, 0, context, challenge)
     }
 
     pub fn is_daemon_attached(&self) -> bool {
@@ -399,7 +430,6 @@ impl Airc {
             webrtc_peer_connections: Mutex::new(HashMap::new()),
             webrtc_incoming_track_handler: Mutex::new(None),
             webrtc_incoming_tracks: IncomingTrackRegistry::default(),
-            subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
@@ -520,7 +550,6 @@ impl Airc {
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
-        self.ensure_wire_subscriber(&room.wire).await?;
 
         // Emit the lifecycle event after the subscription is durable
         // and the wire is up. Lifecycle is part of the substrate
@@ -585,30 +614,7 @@ impl Airc {
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
 
-        for room in &rooms {
-            self.ensure_wire_subscriber(&room.wire).await?;
-        }
-
         Ok(rooms)
-    }
-
-    /// Variant of [`join`] that overrides the per-home default wire
-    /// dir. Used for shared-wire setups (local-fs tests where two
-    /// processes on one machine tail the same `frames.jsonl`).
-    /// Production users want [`join`].
-    pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
-        let channel = ChannelName::new(name)?;
-        let identity = self.mesh_identity().await?;
-        let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
-        set.parted.remove(&channel);
-        set.subscribed.insert(channel.clone(), subscription.clone());
-        set.set_default(channel)?;
-        subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set).await?;
-        let room = subscription.as_room();
-        self.ensure_wire_subscriber(&room.wire).await?;
-        Ok(room)
     }
 
     /// Leave a subscribed channel without deleting identity or trust.

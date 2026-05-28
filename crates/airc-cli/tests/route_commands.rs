@@ -9,12 +9,15 @@ fn airc_core() -> &'static str {
 }
 
 #[test]
-fn route_status_defaults_to_local_runtime_route() {
+fn route_status_defaults_to_no_local_transport() {
+    // Same-machine delivery is the daemon's in-memory router, not a
+    // registered transport — a bare `route status` has no direct local
+    // transport and no live route until a cross-machine one is added.
     let output = run_ok(&["route", "status"]);
 
-    assert!(output.contains("- local-fs role=direct state=healthy"));
-    assert!(output.contains("- data-interactive -> local-fs"));
-    assert!(output.contains("- presence-ephemeral -> local-fs"));
+    assert!(!output.contains("local-fs"));
+    assert!(output.contains("- data-interactive -> no-route"));
+    assert!(output.contains("- presence-ephemeral -> no-route"));
     assert!(!output.contains("gh-gist"));
 }
 
@@ -46,9 +49,9 @@ fn route_status_prefers_direct_route_over_rendezvous_github() {
 
 #[test]
 fn route_status_down_override_removes_candidate() {
-    let output = run_ok(&["route", "status", "--down", "local-fs:direct"]);
+    let output = run_ok(&["route", "status", "--down", "lan-tcp:direct"]);
 
-    assert!(output.contains("- local-fs role=direct state=down"));
+    assert!(output.contains("- lan-tcp role=direct state=down"));
     assert!(output.contains("- data-interactive -> no-route"));
 }
 

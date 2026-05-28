@@ -1,41 +1,27 @@
-//! Integration: AIRC-event diagnostic sink round-trip.
+//! Integration: AIRC-event diagnostic sink round-trip, over the daemon.
 //!
 //! Proves work card 524c7727: a substrate emitter publishes a
-//! `DiagnosticEvent` via the AIRC-event sink; a separate Airc
-//! instance subscribed over a shared wire receives it as a typed
-//! `DiagnosticEvent`. No stdout parsing.
+//! `DiagnosticEvent` via the AIRC-event sink; a separate scope on the
+//! same machine — attached to the one owner-core daemon — receives it
+//! as a typed `DiagnosticEvent`, and `recent_diagnostic_events` reads
+//! it back from the daemon's durable transcript. No stdout parsing,
+//! no file wire.
+
+mod common;
 
 use std::time::Duration;
 
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSeverity, DiagnosticSink,
 };
-use airc_lib::{Airc, AircEventDiagnosticSink, PeerSpec};
+use airc_lib::AircEventDiagnosticSink;
+use common::Machine;
 use futures::stream::StreamExt;
-use tempfile::TempDir;
 
 #[tokio::test]
-async fn diagnostic_event_sink_publishes_to_airc_subscribers() {
-    let alice_home = TempDir::new().expect("alice home");
-    let bob_home = TempDir::new().expect("bob home");
-    let wire_dir = TempDir::new().expect("shared wire");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
-
-    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
-    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
-    alice.add_peer(bob_spec).await.expect("trust");
-    bob.add_peer(alice_spec).await.expect("trust");
-
-    alice
-        .join_with_wire("diag-sink-test", wire_path.clone())
-        .await
-        .expect("alice joins");
-    bob.join_with_wire("diag-sink-test", wire_path)
-        .await
-        .expect("bob joins");
+async fn diagnostic_event_sink_publishes_to_daemon_subscribers() {
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("diag-sink-test").await;
 
     // Bob subscribes to typed diagnostic events BEFORE alice emits.
     let mut stream = Box::pin(
@@ -44,7 +30,7 @@ async fn diagnostic_event_sink_publishes_to_airc_subscribers() {
             .expect("subscribe diagnostics"),
     );
 
-    // Tiny settle so bob's subscriber attaches.
+    // Tiny settle so bob's daemon attach is live.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice constructs the AIRC-event sink and emits a real
@@ -88,15 +74,9 @@ async fn diagnostic_event_sink_publishes_to_airc_subscribers() {
 }
 
 #[tokio::test]
-async fn recent_diagnostic_events_reads_back_from_transcript() {
-    let home = TempDir::new().expect("tempdir");
-    let wire_dir = TempDir::new().expect("wire");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let airc = Airc::open(home.path()).await.expect("open");
-    airc.join_with_wire("recent-diag-test", wire_path)
-        .await
-        .expect("join");
+async fn recent_diagnostic_events_reads_back_from_daemon_transcript() {
+    let machine = Machine::boot().await;
+    let airc = machine.solo("recent-diag-test").await;
 
     let sink = AircEventDiagnosticSink::new(airc.clone());
     let diag = DiagnosticEvent::error(

@@ -2,29 +2,28 @@
 //!
 //! This is the only file that imports both `Request` and `Response`
 //! types; every other module either produces or consumes one side.
-//! Adding a new op = add Request variant + add arm here. The
-//! compiler enforces exhaustiveness.
+//! Adding a new op = add Request variant + add arm here. The compiler
+//! enforces exhaustiveness.
+//!
+//! Owner-core model: `Send`/`Publish` author an `airc_bus::Envelope` and
+//! hand it to the daemon's `EventRouter`; `Inbox` resumes from the
+//! router (hot ring + SQLite durable tier, no gap). There is no wire,
+//! no per-subscriber verify, no file poll. Live events leave via the
+//! `Attach` stream in `server.rs`.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use airc_core::{
-    headers::Headers, transcript::MentionTarget, Body, ClientId, EventId, RoomId, TranscriptCursor,
-};
-use airc_diagnostics::{
-    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
-};
+use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
+use airc_bus::{Clock, Seq, SystemClock};
+use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request, ResolveWireRequest,
-    SendRequest, SubscribeRequest,
+    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
+    RemovePeerRequest, Request, SendRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, PeerEntry, PeersResponse, PublishResponse, ResolveWireResponse, Response,
-    StatusResponse,
+    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, StatusResponse,
 };
-use airc_protocol::{Envelope, Frame, FrameKind, Signature, Subscription};
-use airc_transport::Transport;
-use futures::stream::StreamExt;
+use bytes::Bytes;
 
 use crate::state::DaemonState;
 
@@ -48,8 +47,6 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         }),
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
-        Request::Subscribe(sub) => handle_subscribe(state, sub).await,
-        Request::ResolveWire(req) => handle_resolve_wire(state, req).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
@@ -58,222 +55,188 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::RemovePeer(remove) => handle_remove_peer(state, remove).await,
         Request::ListPeers => handle_list_peers(state).await,
         Request::Stop => {
-            // Don't actually stop here; just signal. The server's
-            // accept loop watches the same notifier and exits after
-            // sending this response.
+            // Don't actually stop here; just signal. The server's accept
+            // loop watches the same notifier and exits after sending
+            // this response.
             state.shutdown.notify_waiters();
             Response::Ok
         }
     }
 }
 
-async fn handle_subscribe(state: Arc<DaemonState>, sub: SubscribeRequest) -> Response {
-    let trust_root = match trust_root_for_wire(&sub.wire) {
-        Some(root) => root,
-        None => {
-            return Response::Error {
-                message: format!("subscribe: invalid wire path {}", sub.wire.display()),
-            };
-        }
-    };
-    match state.refresh_trust_root(&trust_root).await {
-        Ok(_) => {}
-        Err(error) => {
-            return Response::Error {
-                message: format!("subscribe: trust refresh: {error}"),
-            };
-        }
-    }
-    if state.register_trust_root(&trust_root).await {
-        state.spawn_trust_refresher(trust_root);
-    }
-
-    // Idempotent: if a subscriber task is already running for this
-    // wire, return Ok without spawning a duplicate.
-    if !state.register_subscriber(&sub.wire).await {
-        return Response::Ok;
-    }
-
-    let transport = state.local_fs_for(&sub.wire).await;
-    let subscription = Subscription {
-        // Replay from the start of the wire — late `Inbox` calls
-        // still see pre-existing frames via the store.
-        from_cursor: Some(TranscriptCursor {
-            lamport: 0,
-            event_id: EventId::from_u128(0),
-        }),
-        ..Default::default()
-    };
-
-    let mut stream = match transport.subscribe(subscription).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            return Response::Error {
-                message: format!("subscribe: {error}"),
-            };
-        }
-    };
-
-    let store = state.event_store.clone();
-    tokio::spawn(async move {
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(frame) => {
-                    let event = frame.into_transcript_event();
-                    let event_id = event.event_id;
-                    match store.append(event.clone()).await {
-                        Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
-                            let _ = state.live_tx.send(event);
-                        }
-                        Err(err) => {
-                            StderrJsonDiagnosticSink.emit(
-                                DiagnosticEvent::error(
-                                    DiagnosticComponent::Daemon,
-                                    DiagnosticCode::StoreAppendFailed,
-                                    "daemon subscriber store append failed",
-                                )
-                                .with_field("event_id", event_id)
-                                .with_field("error", err),
-                            );
-                        }
-                    }
-                }
-                Err(verify_error) => {
-                    StderrJsonDiagnosticSink.emit(
-                        DiagnosticEvent::warn(
-                            DiagnosticComponent::Daemon,
-                            DiagnosticCode::FrameVerificationFailed,
-                            "daemon subscriber frame verification failed",
-                        )
-                        .with_field("error", verify_error),
-                    );
-                }
-            }
-        }
-    });
-
-    Response::Ok
-}
-
-fn trust_root_for_wire(wire: &Path) -> Option<PathBuf> {
-    match wire.parent() {
-        Some(parent) if parent.file_name().is_some_and(|name| name == "wires") => {
-            parent.parent().map(Path::to_path_buf)
-        }
-        _ => Some(wire.to_path_buf()),
+fn map_kind(kind: IpcKind) -> Kind {
+    match kind {
+        IpcKind::Message => Kind::Message,
+        IpcKind::Event => Kind::Event,
+        IpcKind::Command => Kind::Command,
+        IpcKind::CommandResult => Kind::CommandResult,
+        IpcKind::Signal => Kind::Signal,
+        IpcKind::StreamChunk => Kind::StreamChunk,
+        IpcKind::Control => Kind::Control,
     }
 }
 
-/// `ResolveWire` handler — answer "what wire path serves this
-/// channel UUID?" from the daemon's subscription store. Returns
-/// `wire: None` when the channel isn't subscribed, so callers
-/// can distinguish "not joined yet" from "lookup failed."
-///
-/// Closes work card 6e525958. Consumer-side callers (continuum's
-/// `DaemonAircRealtimeStore`, OpenClaw/Hermes bridges) use this
-/// to fill `PublishRequest.wire` without having to know the
-/// daemon's filesystem layout.
-async fn handle_resolve_wire(state: Arc<DaemonState>, request: ResolveWireRequest) -> Response {
-    let channel = airc_core::RoomId::from_uuid(request.channel);
-    let subscriptions = match state.event_store.load_subscriptions().await {
-        Ok(rows) => rows,
-        Err(error) => {
-            return Response::Error {
-                message: format!("resolve_wire: load subscriptions: {error}"),
-            };
-        }
-    };
-    let wire = subscriptions
-        .into_iter()
-        .find(|sub| !sub.parted && sub.room_id == channel)
-        .map(|sub| PathBuf::from(sub.wire));
-    Response::ResolveWire(ResolveWireResponse { wire })
-}
-
-async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
-    let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
-    let events = match request.since.as_ref() {
-        Some(cursor) => {
-            state
-                .event_store
-                .resume_from(cursor, request.channel, limit)
-                .await
-        }
-        None => state.event_store.page_recent(request.channel, limit).await,
-    };
-    let events = match events {
-        Ok(events) => events,
-        Err(err) => {
-            return Response::Error {
-                message: format!("inbox: {err}"),
-            };
-        }
-    };
-    // Newest cursor in the response is the cursor of the last event
-    // returned, so the client can hand it back as `since` next time.
-    // Empty page: return None so the caller knows to keep its existing
-    // cursor rather than reset to 0.
-    let newest = events.last().map(|e| e.cursor());
-    Response::Inbox(InboxResponse { events, newest })
-}
-
-async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
-    let transport = state.local_fs_for(&send.wire).await;
-    let frame = match build_frame(
-        &state,
-        FrameKind::Message,
-        send.channel,
-        MentionTarget::All,
-        Body::text(send.text),
-        send.headers,
-    ) {
-        Ok(frame) => frame,
-        Err(error) => {
-            return Response::Error {
-                message: format!("send: clock before UNIX_EPOCH: {error}"),
-            };
-        }
-    };
-    match transport.send(frame).await {
-        Ok(()) => Response::Ok,
-        Err(error) => Response::Error {
-            message: format!("send: {error}"),
-        },
+fn map_delivery(delivery: IpcDelivery) -> DeliveryClass {
+    match delivery {
+        IpcDelivery::Durable => DeliveryClass::Durable,
+        IpcDelivery::EphemeralLatest => DeliveryClass::EphemeralLatest,
+        IpcDelivery::EphemeralWindow => DeliveryClass::EphemeralWindow,
+        IpcDelivery::RequestResponse => DeliveryClass::RequestResponse,
+        IpcDelivery::StreamChunk => DeliveryClass::StreamChunk,
     }
 }
 
-async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Response {
-    let transport = state.local_fs_for(&publish.wire).await;
-    let frame = match build_frame(
-        &state,
-        publish.kind,
-        publish.channel,
-        publish.target,
-        publish.body,
-        publish.headers,
-    ) {
-        Ok(frame) => frame,
-        Err(error) => {
-            return Response::Error {
-                message: format!("publish: clock before UNIX_EPOCH: {error}"),
-            };
-        }
-    };
-    let event_id = frame.envelope.event_id;
-    let lamport = frame.envelope.lamport;
-    let occurred_at_ms = frame.envelope.occurred_at_ms;
-    let channel_id = frame.envelope.channel;
-    match transport.send(frame).await {
-        Ok(()) => Response::Publish(PublishResponse {
+fn map_target(target: IpcTarget) -> Target {
+    match target {
+        IpcTarget::All => Target::All,
+        IpcTarget::Peer(peer) => Target::Peer(peer),
+        IpcTarget::Endpoint(name) => Target::Endpoint(name),
+        IpcTarget::Reply(id) => Target::Reply(id),
+        IpcTarget::Capability(cap) => Target::Capability(cap),
+    }
+}
+
+/// Author a bus envelope from the IPC fields and publish it through the
+/// router. The router stamps `(epoch, counter)` + `occurred_at` and
+/// fans out (and, for `Durable`, write-behinds to the ORM).
+#[allow(clippy::too_many_arguments)]
+async fn publish_envelope(
+    state: &DaemonState,
+    channel: uuid::Uuid,
+    from: (PeerId, ClientId),
+    kind: Kind,
+    delivery: DeliveryClass,
+    target: Target,
+    correlation_id: Option<uuid::Uuid>,
+    coalesce_key: Option<String>,
+    payload: Vec<u8>,
+    headers: airc_core::Headers,
+) -> Response {
+    let channel = RoomId::from_uuid(channel);
+    let mut env = Envelope::new(
+        channel,
+        // Broker, not author: the envelope carries the originating
+        // participant's identity (supplied by the attached client), not
+        // the daemon's machine peer. That keeps per-agent attribution
+        // intact across the one-daemon-per-machine fan-out.
+        from,
+        kind,
+        delivery,
+        // Opaque consumer bytes — moved straight into the envelope; the
+        // daemon never parses the payload (boundary-encoding discipline).
+        Bytes::from(payload),
+    );
+    env.target = target;
+    env.correlation_id = correlation_id;
+    env.coalesce_key = coalesce_key;
+    env.headers = headers;
+    let event_id = env.event_id;
+    let occurred_at_ms = SystemClock.now_ms();
+    match state.router.publish(env).await {
+        Ok(seq) => Response::Publish(PublishResponse {
             event_id,
-            lamport,
+            epoch: seq.epoch,
+            counter: seq.counter,
             occurred_at_ms,
-            channel_id,
+            channel_id: channel,
         }),
         Err(error) => Response::Error {
             message: format!("publish: {error}"),
         },
     }
+}
+
+async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
+    // Chat text is the one place the daemon authors a payload codec:
+    // the canonical `{"text":...}` `Body`. Everything structured/raw
+    // arrives pre-encoded via `Publish`.
+    publish_envelope(
+        &state,
+        send.channel,
+        (
+            PeerId::from_uuid(send.from_peer),
+            ClientId::from_uuid(send.from_client),
+        ),
+        Kind::Message,
+        DeliveryClass::Durable,
+        Target::All,
+        None,
+        None,
+        Body::text(send.text).to_payload(),
+        send.headers,
+    )
+    .await
+}
+
+async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Response {
+    publish_envelope(
+        &state,
+        publish.channel,
+        (
+            PeerId::from_uuid(publish.from_peer),
+            ClientId::from_uuid(publish.from_client),
+        ),
+        map_kind(publish.kind),
+        map_delivery(publish.delivery),
+        map_target(publish.target),
+        publish.correlation_id,
+        publish.coalesce_key,
+        publish.payload,
+        publish.headers,
+    )
+    .await
+}
+
+async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Response {
+    // The owner-core router pages per channel — durable replay is always
+    // scoped to a room (no global transcript table to scan).
+    let channel = match request.channel {
+        Some(channel) => channel,
+        None => {
+            return Response::Error {
+                message: "inbox requires a channel in the owner-core model".to_string(),
+            }
+        }
+    };
+    let from = request
+        .since
+        .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+    let mut events = match state.router.resume_from_cursor(channel, from).await {
+        Ok(events) => events,
+        Err(error) => {
+            return Response::Error {
+                message: format!("inbox: {error}"),
+            }
+        }
+    };
+    // `inbox` is the DURABLE transcript. `resume_from_cursor` merges the
+    // hot ring (which transiently holds every class, incl. StreamChunk /
+    // EphemeralLatest for live attach-replay) with the sink, so filter to
+    // durable here — non-durable classes never belong in a replay (§3.4).
+    events.retain(|env| env.delivery.is_durable());
+    let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
+    if events.len() > limit {
+        if request.since.is_none() {
+            // "Most recent N" when no cursor: keep the newest `limit`.
+            events = events.split_off(events.len() - limit);
+        } else {
+            // "First N after the cursor" when resuming.
+            events.truncate(limit);
+        }
+    }
+    let envelopes: Vec<Vec<u8>> = events
+        .iter()
+        .map(|e| airc_wire::encode(e).to_vec())
+        .collect();
+    let newest = events.last().map(|e| {
+        let cursor = e.cursor();
+        IpcCursor {
+            epoch: cursor.seq.epoch,
+            counter: cursor.seq.counter,
+            event_id: cursor.event_id,
+        }
+    });
+    Response::Inbox(InboxResponse { envelopes, newest })
 }
 
 async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Response {
@@ -308,12 +271,6 @@ async fn handle_remove_peer(state: Arc<DaemonState>, remove: RemovePeerRequest) 
 }
 
 async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    // We don't currently expose registry iteration on
-    // PeerKeyRegistry (only by-peer lookup + find_peer). Read the
-    // persisted peer trust store instead — the source of truth that
-    // both the daemon and CLI write to.
     let peers = match airc_trust::load(&state.home).await {
         Ok(peers) => peers,
         Err(error) => {
@@ -329,399 +286,5 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
             pubkey_b64: p.pubkey_b64,
         })
         .collect();
-    // URL_SAFE_NO_PAD pulled in to keep imports stable across future
-    // additions (e.g. signed list responses).
-    let _ = URL_SAFE_NO_PAD.encode([0u8; 0]);
     Response::Peers(PeersResponse { peers: entries })
-}
-
-fn build_frame(
-    state: &DaemonState,
-    kind: FrameKind,
-    channel: uuid::Uuid,
-    target: MentionTarget,
-    body: Body,
-    headers: Headers,
-) -> Result<Frame, std::time::SystemTimeError> {
-    let lamport = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as u64;
-    Ok(Frame {
-        kind,
-        envelope: Envelope {
-            event_id: EventId::new(),
-            sender: state.peer_id,
-            sender_client: ClientId::new(),
-            channel: RoomId::from_uuid(channel),
-            target,
-            lamport,
-            occurred_at_ms: lamport,
-            reply_to: None,
-            headers,
-            body: Some(body),
-            media: Vec::new(),
-            // Unsigned at this layer — SignedTransport replaces it
-            // with Ed25519 on the way out.
-            signature: Signature::Unsigned,
-        },
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use airc_core::PeerId;
-    use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
-    use airc_transport::{LocalFsAdapter, SignedTransport};
-    use std::path::PathBuf;
-    use std::time::Duration;
-    use uuid::Uuid;
-
-    fn test_state() -> Arc<DaemonState> {
-        let peer_id = PeerId::from_u128(0xa1);
-        let keypair = PeerKeypair::generate();
-        let registry = PeerKeyRegistry::new();
-        registry.enrol(peer_id, 0, keypair.public_bytes()).unwrap();
-        let registry = Arc::new(registry);
-        // Test home is fresh per-call — empty peer trust store is
-        // fine for dispatcher tests; no preexisting state required.
-        let home = tempfile::TempDir::new().unwrap();
-        let home_path = home.path().to_path_buf();
-        // Keep the TempDir alive for the test's lifetime by leaking
-        // it. (This is a unit-test pattern: cheap, predictable.)
-        std::mem::forget(home);
-        let store: Arc<dyn airc_store::EventStore> =
-            Arc::new(airc_store::InMemoryEventStore::new());
-        Arc::new(DaemonState::new(
-            peer_id,
-            keypair,
-            registry,
-            VerificationPolicy::Strict,
-            home_path,
-            store,
-        ))
-    }
-
-    #[tokio::test]
-    async fn ping_returns_pong() {
-        let state = test_state();
-        let response = dispatch(state, Request::Ping).await;
-        assert_eq!(response, Response::Pong);
-    }
-
-    #[tokio::test]
-    async fn status_carries_peer_id_and_uptime() {
-        let state = test_state();
-        // Sleep so uptime > 0 — pins that the field is wired.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let response = dispatch(state.clone(), Request::Status).await;
-        match response {
-            Response::Status(status) => {
-                assert_eq!(status.peer_id, state.peer_id.to_string());
-                assert!(status.uptime_seconds >= 1, "uptime must accumulate");
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_wire_returns_none_for_unsubscribed_channel() {
-        // Fresh daemon → no subscriptions → unknown channel
-        // resolves to None (NOT an error — the caller knows to
-        // join first).
-        let state = test_state();
-        let response = dispatch(
-            state,
-            Request::ResolveWire(ResolveWireRequest {
-                channel: Uuid::from_u128(0xdead_beef),
-            }),
-        )
-        .await;
-        match response {
-            Response::ResolveWire(payload) => assert!(
-                payload.wire.is_none(),
-                "unsubscribed channel must resolve to None"
-            ),
-            other => panic!("expected ResolveWire, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_wire_returns_subscription_wire_when_known() {
-        use airc_core::RoomId;
-        use airc_store::StoredSubscription;
-
-        let state = test_state();
-        let room_id = RoomId::new();
-        let wire_path = "/tmp/airc-test/wires/project-x";
-        // Seed the store directly so we don't pull in the full
-        // join lifecycle for a unit test.
-        state
-            .event_store
-            .replace_subscriptions(vec![StoredSubscription {
-                channel_name: "project-x".to_string(),
-                room_id,
-                wire: wire_path.to_string(),
-                joined_at_ms: 0,
-                is_default: true,
-                parted: false,
-            }])
-            .await
-            .expect("seed subscription");
-
-        let response = dispatch(
-            state,
-            Request::ResolveWire(ResolveWireRequest {
-                channel: room_id.as_uuid(),
-            }),
-        )
-        .await;
-        match response {
-            Response::ResolveWire(payload) => assert_eq!(
-                payload.wire,
-                Some(PathBuf::from(wire_path)),
-                "subscribed channel must resolve to its wire path"
-            ),
-            other => panic!("expected ResolveWire, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_wire_skips_parted_subscriptions() {
-        // A parted subscription should NOT be resolvable —
-        // matches the non-auto-rejoin discipline.
-        use airc_core::RoomId;
-        use airc_store::StoredSubscription;
-
-        let state = test_state();
-        let room_id = RoomId::new();
-        state
-            .event_store
-            .replace_subscriptions(vec![StoredSubscription {
-                channel_name: "old-room".to_string(),
-                room_id,
-                wire: "/tmp/airc-test/wires/old-room".to_string(),
-                joined_at_ms: 0,
-                is_default: false,
-                parted: true,
-            }])
-            .await
-            .expect("seed parted subscription");
-
-        let response = dispatch(
-            state,
-            Request::ResolveWire(ResolveWireRequest {
-                channel: room_id.as_uuid(),
-            }),
-        )
-        .await;
-        match response {
-            Response::ResolveWire(payload) => assert!(
-                payload.wire.is_none(),
-                "parted channel must not resolve to a wire"
-            ),
-            other => panic!("expected ResolveWire, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn stop_signals_shutdown_and_returns_ok() {
-        let state = test_state();
-        // Clone the Arc so we can hand one to dispatch (consumed) and
-        // keep one to subscribe on the shutdown notifier (borrowed).
-        let dispatch_state = state.clone();
-        // Subscribe to the shutdown notifier before dispatching so
-        // notify_waiters wakes us. (Notify drops notifications sent
-        // before any waiter exists; the test pin is that AFTER a
-        // listener is set up, dispatch(Stop) wakes it.)
-        let listener = state.shutdown.notified();
-        tokio::pin!(listener);
-
-        let response = dispatch(dispatch_state, Request::Stop).await;
-        assert_eq!(response, Response::Ok);
-
-        // The notifier should fire promptly — yield once to let the
-        // signal propagate.
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut listener)
-            .await
-            .expect("shutdown signal must fire after Stop");
-    }
-
-    #[tokio::test]
-    async fn send_dispatches_against_local_fs_transport() {
-        // End-to-end through dispatch: a Send request hits the
-        // (lazily-created) local-fs adapter and Ok comes back.
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = test_state();
-        let response = dispatch(
-            state,
-            Request::Send(SendRequest {
-                wire: dir.path().to_path_buf(),
-                channel: Uuid::nil(),
-                text: "hello".to_string(),
-                headers: Headers::new(),
-            }),
-        )
-        .await;
-        assert_eq!(response, Response::Ok);
-        // Frame file should exist with one line.
-        let frames = dir.path().join("frames.jsonl");
-        let contents = std::fs::read_to_string(frames).unwrap();
-        assert_eq!(contents.lines().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn publish_dispatches_structured_frame_and_returns_receipt() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = test_state();
-        let response = dispatch(
-            state,
-            Request::Publish(PublishRequest {
-                wire: dir.path().to_path_buf(),
-                channel: Uuid::nil(),
-                kind: FrameKind::Event,
-                target: MentionTarget::All,
-                body: Body::text("structured"),
-                headers: Headers::new(),
-            }),
-        )
-        .await;
-        match response {
-            Response::Publish(receipt) => {
-                assert_eq!(receipt.channel_id, RoomId::from_uuid(Uuid::nil()));
-                assert!(receipt.lamport > 0);
-                assert!(receipt.occurred_at_ms > 0);
-            }
-            other => panic!("expected publish response, got {other:?}"),
-        }
-        let frames = dir.path().join("frames.jsonl");
-        let contents = std::fs::read_to_string(frames).unwrap();
-        assert_eq!(contents.lines().count(), 1);
-    }
-
-    #[test]
-    fn trust_root_prefers_airc_wire_root_but_accepts_raw_wire_dirs() {
-        let airc_wire = PathBuf::from("/tmp/home/.airc/wires/general");
-        assert_eq!(
-            trust_root_for_wire(&airc_wire),
-            Some(PathBuf::from("/tmp/home/.airc"))
-        );
-
-        let raw_wire = PathBuf::from("/tmp/raw-wire-dir");
-        assert_eq!(trust_root_for_wire(&raw_wire), Some(raw_wire));
-    }
-
-    #[tokio::test]
-    async fn subscribed_daemon_learns_wire_root_trust_before_ingest() {
-        let root = tempfile::TempDir::new().unwrap();
-        let wire_root = root.path().join(".airc");
-        let wire = wire_root.join("wires").join("general");
-
-        let daemon = test_state();
-        assert_eq!(
-            dispatch(
-                daemon.clone(),
-                Request::Subscribe(SubscribeRequest { wire: wire.clone() }),
-            )
-            .await,
-            Response::Ok
-        );
-
-        let sibling_peer = PeerId::from_u128(0xc1a0de);
-        let sibling_keypair = PeerKeypair::generate();
-        airc_trust::add(&wire_root, sibling_peer, sibling_keypair.public_bytes())
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if daemon.registry.lookup(sibling_peer, 0).is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("daemon verifier must learn sibling trust from the wire root");
-
-        let sender_registry = Arc::new(PeerKeyRegistry::new());
-        sender_registry
-            .enrol(sibling_peer, 0, sibling_keypair.public_bytes())
-            .unwrap();
-        let sender_state = DaemonState::new(
-            sibling_peer,
-            sibling_keypair.clone(),
-            sender_registry.clone(),
-            VerificationPolicy::Strict,
-            wire_root.clone(),
-            Arc::new(airc_store::InMemoryEventStore::new()),
-        );
-        let sender = SignedTransport::new(
-            LocalFsAdapter::new(&wire),
-            sibling_keypair,
-            sibling_peer,
-            sender_registry,
-            VerificationPolicy::Strict,
-        );
-        let mut live = daemon.live_tx.subscribe();
-
-        sender
-            .send(
-                build_frame(
-                    &sender_state,
-                    FrameKind::Message,
-                    Uuid::nil(),
-                    MentionTarget::All,
-                    Body::text("sibling scope frame after trust refresh"),
-                    Headers::new(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(Duration::from_secs(2), live.recv())
-            .await
-            .expect("daemon live stream must receive refreshed-trust frame")
-            .expect("live sender must remain open");
-        assert_eq!(event.peer_id, sibling_peer);
-    }
-
-    #[tokio::test]
-    async fn remove_peer_updates_in_memory_registry() {
-        let state = test_state();
-        let peer_id = PeerId::from_u128(0xb0b);
-        let keypair = PeerKeypair::generate();
-        let pubkey_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            keypair.public_bytes(),
-        );
-        assert_eq!(
-            dispatch(
-                state.clone(),
-                Request::AddPeer(AddPeerRequest {
-                    peer_id,
-                    pubkey_b64,
-                }),
-            )
-            .await,
-            Response::Ok
-        );
-        assert!(state.registry.lookup(peer_id, 0).is_some());
-
-        assert_eq!(
-            dispatch(
-                state.clone(),
-                Request::RemovePeer(RemovePeerRequest { peer_id }),
-            )
-            .await,
-            Response::Ok
-        );
-        assert!(state.registry.lookup(peer_id, 0).is_none());
-    }
-
-    // Pull PathBuf into scope so the import isn't unused when only
-    // one test references it (silences clippy without #[allow]).
-    #[allow(dead_code)]
-    const _UNUSED_TYPE_KEEPALIVE: Option<PathBuf> = None;
 }

@@ -65,7 +65,6 @@ mod udp;
 mod webrtc;
 pub mod webrtc_media;
 pub mod webrtc_signaling;
-mod wire_replay;
 pub mod work;
 pub mod work_manager;
 pub mod work_roster;
@@ -79,7 +78,7 @@ pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, HeartbeatKind, HeartbeatTask, DEFAULT_HEARTBEAT_INTERVAL,
     HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
-pub use airc::Airc;
+pub use airc::{machine_account_home, Airc};
 pub use command_bus::PendingCommand;
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
@@ -92,6 +91,7 @@ pub use coordinator::{
     DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
 };
+pub use daemon::decode_wire_event;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
@@ -111,6 +111,7 @@ pub use mesh_identity::{
     resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
+pub use airc_protocol::{AssertionError, IdentityAssertion};
 pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};

@@ -542,21 +542,44 @@ impl Airc {
     /// [`Airc::work_board_complete`] instead.
     pub async fn work_board(&self, limit: usize) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
+        // Recent-window view (not the complete board): daemon reads the
+        // most-recent `limit`; direct reads the recent store page.
+        if self.is_daemon_attached() {
+            let transcripts = self.daemon_page_recent(&room, limit).await?;
+            return Ok(airc_work_store::project_transcripts(transcripts)?);
+        }
         let store = WorkEventStore::new(self.event_store());
         Ok(store.project_recent(Some(room.channel), limit).await?)
     }
 
-    /// Rebuild the current room's complete work board in bounded store
-    /// pages. Scheduling and mutation paths use this so old active
-    /// cards do not disappear just because chat/status traffic pushed
-    /// their creation event outside a recent transcript window.
+    /// Rebuild the current room's complete work board. Scheduling and
+    /// mutation paths use this so old active cards do not disappear just
+    /// because chat/status traffic pushed their creation event outside a
+    /// recent transcript window.
     pub async fn work_board_complete(
         &self,
         page_size: usize,
     ) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
+        self.project_room_work_board(&room, page_size).await
+    }
+
+    /// Project `room`'s work board, reading work events from the daemon
+    /// when attached (the one same-machine path) or the local store
+    /// otherwise. Centralises the read so the whole work subsystem is
+    /// daemon-aware — work is event-sourced, so its reads must follow the
+    /// same path as its writes (`send_frame` → daemon when attached).
+    async fn project_room_work_board(
+        &self,
+        room: &crate::Room,
+        page_size: usize,
+    ) -> Result<WorkBoardProjection, AircError> {
+        if self.is_daemon_attached() {
+            let transcripts = self
+                .daemon_room_transcripts(room.channel, page_size)
+                .await?;
+            return Ok(airc_work_store::project_transcripts(transcripts)?);
+        }
         let store = WorkEventStore::new(self.event_store());
         Ok(store
             .project_complete(Some(room.channel), page_size)
@@ -681,10 +704,8 @@ impl Airc {
 
     async fn ensure_work_card_in_current_room(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
-        let store = WorkEventStore::new(self.event_store());
-        let board = store
-            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         if board.card(card_id).is_some() {
             return Ok(());
@@ -699,9 +720,8 @@ impl Airc {
 
     async fn ensure_work_card_unclaimed(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
-        let store = WorkEventStore::new(self.event_store());
-        let board = store
-            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         let Some(card) = board.card(card_id) else {
             return Err(AircError::WorkCardNotInCurrentRoom {

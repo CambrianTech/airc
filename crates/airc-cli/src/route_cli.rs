@@ -59,7 +59,6 @@ pub enum RouteProofKind {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RouteTransport {
-    LocalFs,
     LanTcp,
     Tailscale,
     Udp,

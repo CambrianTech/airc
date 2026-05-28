@@ -1,41 +1,26 @@
 //! Integration: bridged messages round-trip with attribution
-//! preserved.
+//! preserved, over the daemon.
 //!
 //! Proves work card fdc4b753: a bridge process (Alice) publishes a
-//! message claiming "user X on Slack posted this." Bob, subscribed
-//! over the shared wire, receives the typed `BridgedMessage` —
-//! cryptographically signed by Alice's PeerId, with `ExternalIdentity`
-//! describing the external user. Bob can filter by source/handle
-//! before decoding bodies.
+//! message claiming "user X on Slack posted this." Bob — another scope
+//! on the same machine, attached to the one owner-core daemon —
+//! receives the typed `BridgedMessage`, cryptographically signed by
+//! Alice's PeerId, with `ExternalIdentity` describing the external
+//! user. Bob can filter by source/handle before decoding bodies.
+
+mod common;
 
 use std::time::Duration;
 
-use airc_lib::{Airc, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource, PeerSpec};
+use airc_lib::{BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource};
+use common::Machine;
 use futures::stream::StreamExt;
-use tempfile::TempDir;
 
 #[tokio::test]
 async fn bridged_message_round_trip_with_typed_external_identity() {
-    let alice_home = TempDir::new().expect("alice home");
-    let bob_home = TempDir::new().expect("bob home");
-    let wire_dir = TempDir::new().expect("shared wire");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
-
-    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
-    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
-    alice.add_peer(bob_spec).await.expect("trust");
-    bob.add_peer(alice_spec.clone()).await.expect("trust");
-
-    alice
-        .join_with_wire("bridge-test", wire_path.clone())
-        .await
-        .expect("alice joins");
-    bob.join_with_wire("bridge-test", wire_path)
-        .await
-        .expect("bob joins");
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("bridge-test").await;
+    let alice_peer = alice.peer_id();
 
     // Bob subscribes filtered by Slack source. Box::pin because the
     // filter_map closures aren't Unpin.
@@ -49,8 +34,8 @@ async fn bridged_message_round_trip_with_typed_external_identity() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice acts as a Slack bridge — publishes a message claiming a
-    // Slack user posted it. The wire frame is signed by Alice (the
-    // bridge), and the body carries the ExternalIdentity.
+    // Slack user posted it. The frame is signed by Alice (the bridge),
+    // and the body carries the ExternalIdentity.
     let identity = ExternalIdentity {
         source: ExternalIdentitySource::Slack,
         handle: "U012ABCD".to_string(),
@@ -71,12 +56,13 @@ async fn bridged_message_round_trip_with_typed_external_identity() {
         match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
             Ok(Some((event, message))) => {
                 if message.text == "hello from slack" {
-                    // The frame is signed by Alice (the bridge), NOT
-                    // by a synthetic per-user PeerId — that's the
-                    // whole point.
+                    // The daemon is a broker: it preserves the bridge's
+                    // (Alice's) participant identity as the substrate
+                    // author — NOT a synthetic per-Slack-user PeerId.
+                    // The external user lives in the body's identity.
                     assert_eq!(
-                        event.peer_id, alice_spec.peer_id,
-                        "frame must be signed by the bridge, not a synthetic per-user id"
+                        event.peer_id, alice_peer,
+                        "frame must be authored by the bridge participant"
                     );
                     got = Some(message);
                     break;
@@ -95,15 +81,8 @@ async fn bridged_message_round_trip_with_typed_external_identity() {
 
 #[tokio::test]
 async fn source_filter_excludes_other_platforms() {
-    let alice_home = TempDir::new().expect("alice home");
-    let wire_dir = TempDir::new().expect("shared wire");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    alice
-        .join_with_wire("bridge-filter-test", wire_path)
-        .await
-        .expect("alice joins");
+    let machine = Machine::boot().await;
+    let alice = machine.solo("bridge-filter-test").await;
 
     // Alice publishes one Slack message + one Discord message.
     alice
@@ -170,15 +149,8 @@ async fn source_filter_excludes_other_platforms() {
 
 #[tokio::test]
 async fn handle_filter_excludes_other_users_on_same_platform() {
-    let alice_home = TempDir::new().expect("alice home");
-    let wire_dir = TempDir::new().expect("shared wire");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    alice
-        .join_with_wire("bridge-handle-filter", wire_path)
-        .await
-        .expect("alice joins");
+    let machine = Machine::boot().await;
+    let alice = machine.solo("bridge-handle-filter").await;
 
     for handle in ["U001", "U002", "U003"] {
         alice

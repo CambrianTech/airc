@@ -3,48 +3,38 @@
 //! The consumer here behaves like an agent hook/monitor loop: subscribe
 //! first, receive inbound typed events live, persist a cursor, and
 //! resume after restart without processing its own sends as inbound
-//! work. It depends only on `embedded_consumer_smoke`, whose runtime
-//! AIRC dependency is only `airc-lib`.
+//! work. The runtime AIRC dependency of `embedded_consumer_smoke` is
+//! only `airc-lib`; the test stands up an in-process owner-core daemon
+//! (the airc install provides it in production) and the consumers
+//! `Airc::attach` to it.
+
+mod common;
 
 use std::time::Duration;
 
 use airc_lib::Body;
+use common::Machine;
 use embedded_consumer_smoke::agent::{
     AgentConsumer, AgentProfile, HEADER_AGENT_KIND, HEADER_AGENT_NAME,
 };
-use tempfile::TempDir;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_and_claude_style_agents_exchange_without_self_echo_or_polling() {
-    let codex_home = TempDir::new().unwrap();
-    let claude_home = TempDir::new().unwrap();
-    let wire_dir = TempDir::new().unwrap();
-    let wire = wire_dir.path().join("agent-wire.jsonl");
-
-    let codex = AgentConsumer::open(
-        codex_home.path(),
+    let machine = Machine::boot().await;
+    let codex = AgentConsumer::new(
+        machine.attach("codex").await,
         AgentProfile::new("codex", "codex-run-001"),
-    )
-    .await
-    .unwrap();
-    let claude = AgentConsumer::open(
-        claude_home.path(),
+    );
+    let claude = AgentConsumer::new(
+        machine.attach("claude").await,
         AgentProfile::new("claude", "claude-run-001"),
-    )
-    .await
-    .unwrap();
+    );
 
     codex.trust_peer_spec(&claude.peer_spec()).await.unwrap();
     claude.trust_peer_spec(&codex.peer_spec()).await.unwrap();
 
-    codex
-        .join_shared_wire("agent-dogfood", &wire)
-        .await
-        .unwrap();
-    claude
-        .join_shared_wire("agent-dogfood", &wire)
-        .await
-        .unwrap();
+    codex.join("agent-dogfood").await.unwrap();
+    claude.join("agent-dogfood").await.unwrap();
 
     let mut codex_inbox = codex.subscribe_prompts().await.unwrap();
     let mut claude_inbox = claude.subscribe_prompts().await.unwrap();

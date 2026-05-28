@@ -5,7 +5,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    Airc, ChangeWorkLaneState, ClaimManagerHat, CreateWorkLane, LaneId, LaneState,
+    ChangeWorkLaneState, ClaimManagerHat, CreateWorkLane, LaneId, LaneState,
     ReleaseManagerHat, RepoId, WorkBoardProjection,
 };
 
@@ -17,7 +17,7 @@ pub async fn run_create(
     title: String,
     state: CliLaneState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let lane_id = airc
         .create_work_lane(CreateWorkLane {
             repo: RepoId::new(repo)?,
@@ -34,7 +34,7 @@ pub async fn run_state(
     lane_id: String,
     state: CliLaneState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     airc.change_work_lane_state(ChangeWorkLaneState {
         lane_id: parse_lane_id(&lane_id)?,
         state: state.into(),
@@ -45,7 +45,7 @@ pub async fn run_state(
 }
 
 pub async fn run_status(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
     print_status(&board);
     Ok(())
@@ -56,7 +56,7 @@ pub async fn run_manager_claim(
     repo: String,
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let repo = RepoId::new(repo)?;
     airc.claim_manager_hat(ClaimManagerHat {
         repo: repo.clone(),
@@ -71,7 +71,7 @@ pub async fn run_manager_release(
     home: &Path,
     repo: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let repo = RepoId::new(repo)?;
     airc.release_manager_hat(ReleaseManagerHat { repo: repo.clone() })
         .await?;
@@ -83,7 +83,7 @@ pub async fn run_manager_status(
     home: &Path,
     limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
     print_manager_status(&board);
     Ok(())

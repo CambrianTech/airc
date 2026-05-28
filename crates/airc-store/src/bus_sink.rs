@@ -90,6 +90,15 @@ impl SqliteDurableSink {
     pub async fn in_memory() -> Result<Self, BusError> {
         Self::open("sqlite::memory:").await
     }
+
+    /// Bump the persisted generational epoch on **this** ORM and return
+    /// the [`SqliteEpochStore`] capturing the new value. Run once per
+    /// daemon start. Sharing the sink's connection keeps the durable
+    /// transcript (`bus_event`) and the epoch cell (`bus_epoch`) in one
+    /// ORM — the single-writer machine store (§3.3 / §3.8).
+    pub async fn bump_epoch(&self) -> Result<crate::SqliteEpochStore, BusError> {
+        crate::SqliteEpochStore::bump(&self.db).await
+    }
 }
 
 #[async_trait]

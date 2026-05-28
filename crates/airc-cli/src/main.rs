@@ -20,7 +20,6 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
-mod daemon_scope;
 mod doctor;
 mod envelope_cli;
 mod events_cli;
@@ -362,7 +361,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit, json).await,
 
-        Command::Room { name, wire } => commands::run_room(&home, name, wire).await,
+        Command::Room { name } => commands::run_room(&home, name).await,
 
         Command::Part { room } => commands::run_part(&home, room).await,
 
@@ -946,12 +945,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::IsoToEpoch { timestamp } => {
             println!("{}", airc_core::iso_to_epoch(&timestamp)?);
-            Ok(())
-        }
-
-        Command::DaemonScopeId { scope } => {
-            let scope = scope.unwrap_or_else(daemon_scope::default_scope);
-            println!("{}", daemon_scope::scope_id(&scope));
             Ok(())
         }
     }

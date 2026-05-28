@@ -5,14 +5,16 @@
 //! transcript stream. Proves the adapter contract is wired without
 //! taking a dependency on `gh` or network I/O.
 
+mod common;
+
 use airc_core::TranscriptKind;
-use airc_lib::{Airc, ObservePullRequests};
+use airc_lib::ObservePullRequests;
 use airc_work::{
     BranchName, InMemoryPullRequestSource, PrCheckState, PrMergeState, PrReviewState,
     PullRequestObserver, PullRequestRef, PullRequestSnapshot, RepoId, RepoPullRequestSnapshot,
 };
+use common::Machine;
 use std::collections::HashMap;
-use tempfile::TempDir;
 
 fn test_repo() -> RepoId {
     RepoId::new("test-org/test-repo").unwrap()
@@ -38,11 +40,8 @@ fn snapshot_with_one_pr(check: PrCheckState, merge: PrMergeState) -> RepoPullReq
 
 #[tokio::test]
 async fn observe_publishes_check_and_merge_on_cold_start() {
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-    let _room = airc.join("pr-adapter-test").await.expect("join");
+    let machine = Machine::boot().await;
+    let airc = machine.solo("pr-adapter-test").await;
 
     let source = InMemoryPullRequestSource::new().with_snapshot(snapshot_with_one_pr(
         PrCheckState::Running,
@@ -86,11 +85,8 @@ async fn observe_publishes_check_and_merge_on_cold_start() {
 
 #[tokio::test]
 async fn observe_emits_nothing_when_snapshot_unchanged() {
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-    let _room = airc.join("pr-adapter-idempotent").await.expect("join");
+    let machine = Machine::boot().await;
+    let airc = machine.solo("pr-adapter-idempotent").await;
 
     let snapshot = snapshot_with_one_pr(PrCheckState::Passed, PrMergeState::Ready);
     let source = InMemoryPullRequestSource::new().with_snapshot(snapshot.clone());
@@ -130,11 +126,8 @@ async fn observe_emits_nothing_when_snapshot_unchanged() {
 
 #[tokio::test]
 async fn observe_emits_one_event_per_review_state_change() {
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-    let _room = airc.join("pr-adapter-review").await.expect("join");
+    let machine = Machine::boot().await;
+    let airc = machine.solo("pr-adapter-review").await;
 
     let reviewer = airc_core::PeerId::new();
 
