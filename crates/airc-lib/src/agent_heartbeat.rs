@@ -335,15 +335,52 @@ impl Airc {
         build: Option<String>,
         interval: Duration,
     ) -> Result<HeartbeatTask, AircError> {
+        self.start_agent_heartbeat_with_coordination(
+            runtime,
+            client_id,
+            scope,
+            build,
+            interval,
+            CoordinationSignal::default(),
+        )
+        .await
+    }
+
+    /// Spawn a heartbeat task that emits the coordination signal on
+    /// every tick. Card 0bf262eb: closes the populator gap left by
+    /// aacf2162 (which added the field but no caller passed one).
+    ///
+    /// The `coordination` snapshot is captured by the spawned task
+    /// and re-emitted on every interval. For MVP scope this is a
+    /// static-per-session snapshot — caller-supplied at session
+    /// start, never mutated by the task. Future work refreshes
+    /// fields like `active_claims` from the live work-board
+    /// projection on each tick (tracked as a follow-up to this
+    /// card); the wire shape and method signature are stable, so
+    /// that refinement is back-compat.
+    ///
+    /// When `coordination.is_empty()`, the beats are byte-identical
+    /// to `start_agent_heartbeat_with_metadata` — observers see no
+    /// `coordination` key (skip_serializing_if).
+    pub async fn start_agent_heartbeat_with_coordination(
+        &self,
+        runtime: impl Into<String>,
+        client_id: Option<String>,
+        scope: Option<String>,
+        build: Option<String>,
+        interval: Duration,
+        coordination: CoordinationSignal,
+    ) -> Result<HeartbeatTask, AircError> {
         let runtime = runtime.into();
         // Emit one beat synchronously so observers see the agent
         // alive immediately, before the first interval tick.
-        self.emit_agent_heartbeat_with_metadata(
+        self.emit_agent_heartbeat_with_coordination(
             HeartbeatKind::Alive,
             runtime.clone(),
             client_id.clone(),
             scope.clone(),
             build.clone(),
+            coordination.clone(),
         )
         .await?;
 
@@ -355,12 +392,13 @@ impl Airc {
             loop {
                 ticker.tick().await;
                 if let Err(error) = airc
-                    .emit_agent_heartbeat_with_metadata(
+                    .emit_agent_heartbeat_with_coordination(
                         HeartbeatKind::Alive,
                         runtime.clone(),
                         client_id.clone(),
                         scope.clone(),
                         build.clone(),
+                        coordination.clone(),
                     )
                     .await
                 {
@@ -637,6 +675,54 @@ mod tests {
             let decoded: AgentHeartbeat = serde_json::from_str(&json).expect("decode");
             assert_eq!(decoded.coordination, signal);
         }
+    }
+
+    /// Card 0bf262eb: the `start_*_with_coordination` task captures
+    /// the supplied snapshot and re-emits it on every tick. Today the
+    /// snapshot is static for the session (refresh-from-board-each-tick
+    /// is a follow-up); this test pins the bytes that go on the wire
+    /// per beat so the static-snapshot contract is explicit.
+    #[test]
+    fn coordination_snapshot_emit_path_round_trips() {
+        // The MVP populator in airc-cli/src/commands.rs supplies the
+        // build SHA as `doctrine_version` and leaves the other fields
+        // default — that's the wire shape an observer must currently
+        // expect from `airc join` on this commit.
+        let snapshot = CoordinationSignal {
+            doctrine_version: Some("b56c735".to_string()),
+            ..Default::default()
+        };
+        assert!(!snapshot.is_empty(), "MVP snapshot must serialize");
+
+        let beat = AgentHeartbeat {
+            kind: HeartbeatKind::Alive,
+            peer: PeerId::new(),
+            runtime: "claude".to_string(),
+            client_id: None,
+            scope: Some("/work/airc".to_string()),
+            build: Some("b56c735".to_string()),
+            emitted_at_ms: 1_700_000_000_000,
+            coordination: snapshot.clone(),
+        };
+        let json = serde_json::to_string(&beat).expect("encode");
+        // The MVP populator emits exactly one coordination field.
+        assert!(
+            json.contains("\"doctrine_version\":\"b56c735\""),
+            "doctrine_version must appear on the wire; got {json}"
+        );
+        // The other two fields are still defaulted away by
+        // `skip_serializing_if` — keeps beats small and the wire
+        // shape forward-compatible for future populators.
+        assert!(
+            !json.contains("\"active_claims\""),
+            "MVP must NOT emit active_claims yet (default empty Vec); got {json}"
+        );
+        assert!(
+            !json.contains("\"availability\""),
+            "MVP must NOT emit availability yet (default None); got {json}"
+        );
+        let decoded: AgentHeartbeat = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.coordination, snapshot);
     }
 
     /// `is_empty` is the predicate `skip_serializing_if` and observer

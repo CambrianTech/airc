@@ -75,8 +75,8 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
 };
 pub use agent_heartbeat::{
-    AgentHeartbeat, AgentLiveness, HeartbeatKind, HeartbeatTask, DEFAULT_HEARTBEAT_INTERVAL,
-    HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
+    AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask,
+    DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::{machine_account_home, Airc};
 pub use command_bus::PendingCommand;

@@ -138,13 +138,27 @@ async fn start_join_heartbeat(
     let runtime = runtime_context.runtime_label().to_string();
     let client_id = runtime_context.client_id().map(ToString::to_string);
     let build = (!crate::build_info::is_unknown()).then(|| crate::build_info::COMMIT_SHORT.into());
+
+    // Card 0bf262eb: populate the coordination signal added in
+    // aacf2162. This is the minimum-viable slice — the build SHA
+    // stands in for `doctrine_version` (the build tree includes
+    // AGENTS.md, so observers can still detect peers on stale
+    // doctrine), and the other two fields stay default. A follow-up
+    // card refreshes `active_claims` from the board projection on
+    // every tick.
+    let coordination = airc_lib::CoordinationSignal {
+        doctrine_version: build.clone(),
+        ..Default::default()
+    };
+
     Ok(airc
-        .start_agent_heartbeat_with_metadata(
+        .start_agent_heartbeat_with_coordination(
             runtime,
             client_id,
             Some(scope),
             build,
             DEFAULT_HEARTBEAT_INTERVAL,
+            coordination,
         )
         .await?)
 }
