@@ -471,6 +471,91 @@ impl Airc {
         .await
     }
 
+    /// Card b4742d9c: pin a wall post in the current room.
+    ///
+    /// The wall is the room's living document — multiple typed posts
+    /// (rules / agenda / principles / rag / consumer-defined) that any
+    /// attaching agent or human can browse. Each post has a stable
+    /// `post_id`; edits don't mutate the original, they emit a new
+    /// post with `supersedes = Some(prior.post_id)` so the audit trail
+    /// remains in the transcript.
+    ///
+    /// `category` is consumer-defined — common values include
+    /// `"doctrine"`, `"rules"`, `"agenda"`, `"principles"`, `"rag"`,
+    /// `"decision"`. The substrate has no opinion on the string;
+    /// middleware (continuum routers, agent renderers, hermes /
+    /// openclaw adapters) filter on it via header pattern.
+    ///
+    /// Returns the new post's `post_id` so the caller can later
+    /// supersede it.
+    pub async fn publish_wall_post(
+        &self,
+        category: String,
+        body: String,
+        supersedes: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, AircError> {
+        let room = self.current_room().await?;
+        let post_id = uuid::Uuid::new_v4();
+        let event = airc_core::doctrine::DoctrineEvent::WallPostPublished(
+            airc_core::doctrine::WallPostPublished {
+                room_id: room.channel,
+                post_id,
+                category,
+                body,
+                supersedes,
+                published_by: self.inner.identity.peer_id,
+                published_at_ms: crate::time::now_ms()?,
+            },
+        );
+        let body_json = serde_json::to_value(&event)
+            .map_err(|e| AircError::Crypto(format!("wall post serialize: {e}")))?;
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::WallPostPublished,
+            room.channel,
+            airc_core::Body::Json(body_json),
+        )
+        .await?;
+        Ok(post_id)
+    }
+
+    /// Card b4742d9c: fetch the current pinned wall posts for the
+    /// current room, optionally filtered by `category`.
+    ///
+    /// Walks the recent transcript window, applies the supersede
+    /// chain (a post is dropped from the result if a later post
+    /// points to it via `supersedes`), and returns the surviving
+    /// posts in published-time order. History (superseded versions)
+    /// stays in the transcript — call `page_recent` directly to
+    /// inspect it.
+    ///
+    /// Window size is generous (500) because a busy room may
+    /// accumulate many pinned posts over time. If profiling shows
+    /// this is too small for a long-lived room, the projection
+    /// moves to a durable index — but for the substrate slice,
+    /// scan-on-query is honest and avoids a cache that can drift.
+    pub async fn wall_posts(
+        &self,
+        category_filter: Option<&str>,
+    ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
+        let events = self.page_recent(500).await?;
+        let mut posts = Vec::with_capacity(events.len());
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::WallPostPublished {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::doctrine::DoctrineEvent::WallPostPublished(post)) =
+                serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value)
+            else {
+                continue;
+            };
+            posts.push(post);
+        }
+        Ok(project_wall_posts(posts, category_filter))
+    }
+
     /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
     ///
     /// Scans recent transcript events in the current room for the
@@ -964,5 +1049,235 @@ impl Airc {
                 Err(observed) => current = observed,
             }
         }
+    }
+}
+
+/// Card b4742d9c — pure projection: walk a set of WallPostPublished
+/// events (in transcript order) and return the currently-pinned set,
+/// applying supersede chains.
+///
+/// The substrate guarantees the transcript replay order is stable;
+/// this function takes that as input and applies the supersede
+/// semantics: if a later post points at an earlier `post_id` via
+/// `supersedes`, the earlier post is no longer "pinned" — only the
+/// latest in each chain survives.
+///
+/// `category_filter` is applied BEFORE supersede resolution. This
+/// matters: a `Some("doctrine")` filter shows only doctrine posts
+/// and their doctrine-category supersedes; doctrine posts don't
+/// supersede `"rules"` posts even if they share a post_id by
+/// accident (post_ids are UUIDv4, so accidental sharing is
+/// astronomically unlikely, but the semantics MUST be category-
+/// scoped regardless).
+///
+/// Pure, sync, no IO — the IO half is `Airc::wall_posts`, which
+/// reads the transcript and hands the result here.
+fn project_wall_posts(
+    mut events: Vec<airc_core::doctrine::WallPostPublished>,
+    category_filter: Option<&str>,
+) -> Vec<airc_core::doctrine::WallPostPublished> {
+    if let Some(cat) = category_filter {
+        events.retain(|p| p.category == cat);
+    }
+    // Two-pass: first collect the set of post_ids that have been
+    // superseded by ANY later post in the SAME CATEGORY. Then return
+    // only the posts that aren't in that set.
+    //
+    // Same-category gate: a `"rules"` post's supersedes pointing at
+    // a `"doctrine"` post_id is treated as a no-op (consumer bug),
+    // not as a cross-category supersede. The substrate doesn't let
+    // categories interfere with each other.
+    let mut superseded: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    // Group by category for the integrity gate.
+    let mut category_of: std::collections::HashMap<uuid::Uuid, String> =
+        std::collections::HashMap::new();
+    for p in &events {
+        category_of.insert(p.post_id, p.category.clone());
+    }
+    for p in &events {
+        if let Some(parent) = p.supersedes {
+            if category_of.get(&parent) == Some(&p.category) {
+                superseded.insert(parent);
+            }
+        }
+    }
+    let mut result: Vec<_> = events
+        .into_iter()
+        .filter(|p| !superseded.contains(&p.post_id))
+        .collect();
+    // Stable order by published_at_ms so a consumer rendering the
+    // wall sees posts in pin-time order regardless of how the
+    // transcript scan happened to traverse them.
+    result.sort_by_key(|p| p.published_at_ms);
+    result
+}
+
+#[cfg(test)]
+mod wall_projection_tests {
+    use super::project_wall_posts;
+    use airc_core::doctrine::WallPostPublished;
+    use airc_core::{PeerId, RoomId};
+    use uuid::Uuid;
+
+    fn post(
+        post_id: u128,
+        category: &str,
+        body: &str,
+        supersedes: Option<u128>,
+        published_at_ms: u64,
+    ) -> WallPostPublished {
+        WallPostPublished {
+            room_id: RoomId::from_u128(1),
+            post_id: Uuid::from_u128(post_id),
+            category: category.to_string(),
+            body: body.to_string(),
+            supersedes: supersedes.map(Uuid::from_u128),
+            published_by: PeerId::from_u128(99),
+            published_at_ms,
+        }
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        let result = project_wall_posts(Vec::new(), None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn single_post_with_no_supersedes_survives() {
+        let events = vec![post(1, "rules", "use rust-rewrite", None, 100)];
+        let result = project_wall_posts(events.clone(), None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "use rust-rewrite");
+    }
+
+    #[test]
+    fn revision_supersedes_original_within_same_category() {
+        // The living-document core case: edit a "rules" post and
+        // the original drops off the wall.
+        let events = vec![
+            post(1, "rules", "original", None, 100),
+            post(2, "rules", "revised", Some(1), 200),
+        ];
+        let result = project_wall_posts(events, None);
+        assert_eq!(result.len(), 1, "only the latest revision survives");
+        assert_eq!(result[0].body, "revised");
+    }
+
+    #[test]
+    fn supersede_chain_of_three_yields_only_the_latest() {
+        // A series of revisions: v1 → v2 → v3. The wall shows v3
+        // only; v1 and v2 are history (still in the transcript,
+        // not in the result).
+        let events = vec![
+            post(1, "rules", "v1", None, 100),
+            post(2, "rules", "v2", Some(1), 200),
+            post(3, "rules", "v3", Some(2), 300),
+        ];
+        let result = project_wall_posts(events, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "v3");
+    }
+
+    #[test]
+    fn cross_category_supersede_is_a_noop_substrate_does_not_let_categories_interfere() {
+        // A "rules" post whose supersedes points at a "doctrine"
+        // post_id is a CONSUMER bug. The substrate must NOT honor
+        // it — categories are independent walls sharing the same
+        // event-kind discriminator.
+        let events = vec![
+            post(1, "doctrine", "auto-loaded on attach", None, 100),
+            post(
+                2,
+                "rules",
+                "this rules post tries to supersede the doctrine",
+                Some(1),
+                200,
+            ),
+        ];
+        let result = project_wall_posts(events, None);
+        // BOTH posts survive: the cross-category supersede was a no-op.
+        assert_eq!(result.len(), 2);
+        // The doctrine post is still pinned despite the rules-post
+        // claiming to supersede it.
+        assert!(result.iter().any(|p| p.body == "auto-loaded on attach"));
+        assert!(result.iter().any(|p| p.body.contains("rules post tries")));
+    }
+
+    #[test]
+    fn category_filter_returns_only_matching_posts() {
+        let events = vec![
+            post(1, "doctrine", "agent ops", None, 100),
+            post(2, "rules", "use rust-rewrite", None, 200),
+            post(3, "agenda", "ship cell-grid", None, 300),
+        ];
+        let result = project_wall_posts(events.clone(), Some("rules"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "use rust-rewrite");
+    }
+
+    #[test]
+    fn category_filter_applied_before_supersede_so_chains_remain_intact() {
+        // The filter must NOT make a supersede chain disappear by
+        // hiding the parent: if the filter is "rules", both rules
+        // posts are visible to the projection, supersede is applied
+        // within rules, and only the latest survives.
+        let events = vec![
+            post(1, "rules", "v1", None, 100),
+            post(2, "doctrine", "unrelated", None, 150),
+            post(3, "rules", "v2", Some(1), 200),
+        ];
+        let result = project_wall_posts(events, Some("rules"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "v2");
+    }
+
+    #[test]
+    fn results_ordered_by_published_at_ms_ascending() {
+        // Wall renderers display posts in pin-time order so the
+        // room's evolution reads naturally top-to-bottom. Pin this
+        // order so a consumer can always count on it.
+        let events = vec![
+            post(3, "rules", "latest", None, 300),
+            post(1, "rules", "earliest", None, 100),
+            post(2, "rules", "middle", None, 200),
+        ];
+        let result = project_wall_posts(events, None);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].published_at_ms, 100);
+        assert_eq!(result[1].published_at_ms, 200);
+        assert_eq!(result[2].published_at_ms, 300);
+    }
+
+    #[test]
+    fn consumer_defined_category_strings_are_carried_verbatim() {
+        // The substrate doesn't normalize / canonicalize category
+        // strings. hermes can use `"plan-step"`, continuum can use
+        // `"capability-ad"`, openclaw can use `"tool-permission"`,
+        // a friend's adapter can use whatever — and filtering on
+        // the exact string works without coordination.
+        let events = vec![
+            post(1, "hermes:plan-step", "extract intent", None, 100),
+            post(2, "continuum:capability-ad", "gpu 5090 24gb", None, 200),
+            post(3, "joel:reminders", "ship the wall card", None, 300),
+        ];
+        let hermes = project_wall_posts(events.clone(), Some("hermes:plan-step"));
+        let continuum = project_wall_posts(events.clone(), Some("continuum:capability-ad"));
+        let reminders = project_wall_posts(events, Some("joel:reminders"));
+        assert_eq!(hermes.len(), 1);
+        assert_eq!(continuum.len(), 1);
+        assert_eq!(reminders.len(), 1);
+    }
+
+    #[test]
+    fn supersedes_pointing_at_unknown_post_id_is_a_noop() {
+        // A post whose supersedes references a post_id we've never
+        // seen (window-truncation, replay-from-future) is treated
+        // as a fresh pin in the visible window. Conservative: the
+        // unknown parent isn't in our view, so we can't honor the
+        // supersede; we just keep the new post.
+        let events = vec![post(1, "rules", "supersedes a phantom", Some(999_999), 100)];
+        let result = project_wall_posts(events, None);
+        assert_eq!(result.len(), 1, "post survives despite unknown parent");
     }
 }
