@@ -352,7 +352,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
-        Command::Status { socket } => commands::run_status(default_or(socket, &home)).await,
+        Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
         Command::Msg { socket, text } => {

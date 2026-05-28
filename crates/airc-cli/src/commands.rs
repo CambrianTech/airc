@@ -770,7 +770,18 @@ pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-pub async fn run_status(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+/// `status` — daemon health snapshot.
+///
+/// Card 2bdae532: regression-fix. Earlier builds auto-spawned the
+/// daemon if the socket wasn't reachable, so `airc status` doubled as
+/// a "make the daemon ready" command. The current binary had lost
+/// that, so a fresh attach (cargo install then airc status) failed
+/// with "daemon not reachable: No such file or directory" with no
+/// next step — Codex hit this on first onboard 2026-05-28. Restoring
+/// `ensure_daemon_running` before the probe gives every recipe that
+/// says "run `airc status` first" a working contract again.
+pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     let client = DaemonClient::new(socket);
     let status = client.status().await?;
     println!("peer_id:        {}", status.peer_id);
