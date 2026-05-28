@@ -111,18 +111,50 @@ pub async fn run_claim(
 pub async fn run_release(
     home: &Path,
     card_id: String,
-    claim_id: String,
+    claim_id: Option<String>,
     reason: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    let card_uuid = parse_work_card_id(&card_id)?;
+    // Default: resolve THIS peer's active claim from the board so
+    // callers don't have to track claim_ids the system already knows
+    // (kink card acb8bfcd: release ergonomics).
+    let claim_uuid = match claim_id {
+        Some(raw) => parse_claim_id(&raw)?,
+        None => resolve_my_active_claim(&airc, card_uuid).await?,
+    };
     airc.release_work_claim(ReleaseWorkClaim {
-        card_id: parse_work_card_id(&card_id)?,
-        claim_id: parse_claim_id(&claim_id)?,
+        card_id: card_uuid,
+        claim_id: claim_uuid,
         reason,
     })
     .await?;
-    println!("released: card_id={card_id} claim_id={claim_id}");
+    println!("released: card_id={card_id} claim_id={claim_uuid}");
     Ok(())
+}
+
+/// Look up the active claim on `card_id` held by this peer via the
+/// board projection. Surfaces clear errors when there is no claim, or
+/// the claim is held by another peer — so the default never silently
+/// releases someone else's work.
+async fn resolve_my_active_claim(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+) -> Result<airc_lib::ClaimId, Box<dyn std::error::Error>> {
+    let board = airc.work_board(usize::MAX).await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} not present in the board projection"))?;
+    let me = airc.peer_id();
+    match (card.owner, card.claim_id) {
+        (Some(owner), Some(claim_id)) if owner == me => Ok(claim_id),
+        (Some(owner), _) => Err(format!(
+            "card {card_id} is currently claimed by {owner}, not this peer ({me}); \
+             pass CLAIM_ID explicitly to release a claim you don't own"
+        )
+        .into()),
+        (None, _) => Err(format!("card {card_id} has no active claim to release").into()),
+    }
 }
 
 pub async fn run_heartbeat(

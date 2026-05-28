@@ -77,11 +77,22 @@ pub enum WorkAction {
         ttl_ms: u64,
     },
     /// Release this peer's claim on a work card.
+    ///
+    /// `CLAIM_ID` is optional — when omitted, defaults to THIS peer's
+    /// active claim on the card (looked up via the board projection).
+    /// Pass an explicit `CLAIM_ID` only to release a specific claim
+    /// when you have multiple, or to release someone else's claim
+    /// (which the daemon will reject if you don't own it).
+    ///
+    /// Unlike `claim`, `release` does not enforce a `~/.airc/worktrees/`
+    /// lease check — an agent must always be able to release a claim it
+    /// holds, regardless of cwd. So there is no `--no-lease-required`
+    /// flag here; release is unconditionally permitted.
     Release {
         /// Work card UUID.
         card_id: String,
-        /// Claim UUID returned by `work claim`.
-        claim_id: String,
+        /// Claim UUID returned by `work claim`. Optional — see command help.
+        claim_id: Option<String>,
         /// Optional release reason.
         #[arg(long)]
         reason: Option<String>,
