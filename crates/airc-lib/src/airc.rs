@@ -567,7 +567,48 @@ impl Airc {
         self.emit_lifecycle(airc_core::TranscriptKind::RoomJoined, room.channel, body)
             .await?;
 
+        // Publish this peer's identity card to the new room so peers
+        // already attached populate their roster on the next event
+        // they receive (card 2f74b8a1 — identity-roster substrate
+        // slice, parent af40f46d). Re-loaded from the store on each
+        // join so any local-identity edits since startup propagate.
+        self.emit_peer_identity_card(room.channel).await?;
+
         Ok(room)
+    }
+
+    /// Build + emit a `PeerIdentityCard` for this scope on the given
+    /// room as an `IdentityPublished` lifecycle event. Used on join
+    /// (so the room's roster sees this peer arrive identifiable, not
+    /// just by uuid); will also be used on nick / profile change in a
+    /// follow-up slice. No-op when no local identity is persisted
+    /// yet (e.g. fresh scope mid-bootstrap).
+    async fn emit_peer_identity_card(
+        &self,
+        room_id: airc_core::RoomId,
+    ) -> Result<(), AircError> {
+        let local = self
+            .event_store()
+            .load_local_identity()
+            .await
+            .map_err(AircError::from)?;
+        let Some(stored) = local else { return Ok(()) };
+        let card = airc_core::identity::PeerIdentityCard {
+            peer_id: self.inner.identity.peer_id,
+            identity: stored.identity,
+            emitted_at_ms: time::now_ms()?,
+        };
+        let event = airc_core::identity::IdentityEvent::PeerIdentityCard(card);
+        let body_json = serde_json::to_value(&event).map_err(|e| {
+            AircError::Crypto(format!("identity event serialize: {e}"))
+        })?;
+        let body = airc_core::Body::Json(body_json);
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::IdentityPublished,
+            room_id,
+            body,
+        )
+        .await
     }
 
     /// Subscribe this scope to the default account context:

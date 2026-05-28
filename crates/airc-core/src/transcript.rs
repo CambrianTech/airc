@@ -76,6 +76,15 @@ pub enum TranscriptKind {
     ///    "event_id": <uuid> }`. Useful for "I've caught up to
     /// here" signals between cooperating consumers.
     SubscriptionAdvanced,
+    /// A peer published their identity card to a room — emitted on
+    /// join (so other peers populate their roster on attach) and
+    /// on nick / profile change. Body: serialized
+    /// `airc_core::identity::IdentityEvent::PeerIdentityCard`,
+    /// kind="peer_identity_card", carrying { peer_id, identity,
+    /// emitted_at_ms }. Roster projections take the highest
+    /// emitted_at_ms per peer_id. Part of card a63ad10a/2f74b8a1
+    /// (identity-roster substrate, parent af40f46d).
+    IdentityPublished,
 }
 
 impl TranscriptKind {
@@ -92,6 +101,7 @@ impl TranscriptKind {
                 | TranscriptKind::RoomJoined
                 | TranscriptKind::RoomParted
                 | TranscriptKind::SubscriptionAdvanced
+                | TranscriptKind::IdentityPublished
         )
     }
 }
