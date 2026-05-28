@@ -29,6 +29,7 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
+mod discovery;
 mod doctor;
 mod envelope_cli;
 mod event_render;
@@ -766,7 +767,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             MonitorAction::Attach { my_name } => {
                 let socket = default_or(None, &home);
-                commands::ensure_daemon_running(&home, socket.clone(), parsed.peers).await?;
+                // Return-value ignored: this call site only uses the
+                // daemon-side state (monitor::run_attach reads the
+                // store, not the socket). If discovery routes to a
+                // different socket, the home is what matters here.
+                let _socket = commands::ensure_daemon_running(&home, socket, parsed.peers).await?;
                 monitor::run_attach(&home, &my_name).await
             }
         },

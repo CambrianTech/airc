@@ -107,7 +107,7 @@ pub async fn run_doctrine_publish(
     let version = short_content_hash(body.as_bytes());
 
     let socket = crate::cli::default_socket_path_in(home);
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     let airc = Airc::attach(home, socket).await?;
     airc.publish_room_doctrine(body.clone(), version.clone())
         .await?;
@@ -152,7 +152,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     // Start the machine-singular daemon and attach: join, heartbeat, and
     // the live feed all route through the daemon's router (one path).
     let socket = crate::cli::default_socket_path_in(home);
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     let airc = Airc::attach(home, socket.clone()).await?;
     let runtime_context = crate::runtime_context::RuntimeContext::current();
     match room {
@@ -285,20 +285,58 @@ pub fn run_version() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Make sure a daemon serving `home` is reachable; return the socket
+/// the caller should attach to.
+///
+/// The returned socket is USUALLY equal to `socket` — every agent
+/// resolving the same `home` finds the existing daemon on the same
+/// socket. For sandboxed agents (Codex etc.) whose home-resolved
+/// socket has no daemon, the cross-sandbox discovery directory
+/// (card 282850c2) is consulted and we route to the project's
+/// actual daemon instead of spawning a competing orphan in the
+/// agent's tmpdir. If neither path finds an existing daemon, a fresh
+/// one is spawned at `socket` and announced for future agents.
 pub async fn ensure_daemon_running(
     home: &Path,
     socket: PathBuf,
     _peers: Vec<PeerSpec>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // 1. Fast path: home-resolved socket already has a current daemon.
     let client = DaemonClient::new(socket.clone());
     if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
         if daemon_status_is_current(&status) {
-            return Ok(());
+            return Ok(socket);
         }
         let _ = client.stop().await;
         wait_for_daemon_exit(&client, Duration::from_secs(3)).await;
     }
 
+    // 2. Card 282850c2: no daemon at the home-resolved socket. Before
+    // spawning, consult cross-sandbox discovery for a daemon serving
+    // the SAME project root. Sandboxed agents whose `$HOME` was
+    // forced into a tmpdir would otherwise orphan a fresh daemon
+    // every invocation. We only auto-attach when the discovered
+    // daemon's `home` matches ours — different homes mean different
+    // identities, and attaching across them would silently borrow
+    // the wrong agent's keys (card a1b4552a was the prior class of
+    // this kind of attribution leak). In practice the Codex case
+    // DOES match: both agents resolve home from the same project
+    // root, so the home values agree.
+    let project_root = home.parent().map(Path::to_path_buf);
+    if let Some(ref pr) = project_root {
+        if let Some(discovered) = crate::discovery::find_for_project(pr) {
+            if discovered.home == home {
+                let alt = DaemonClient::new(discovered.socket.clone());
+                if let Ok(status) = alt.status_with_timeout(Duration::from_millis(250)).await {
+                    if daemon_status_is_current(&status) {
+                        return Ok(discovered.socket);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Spawn a fresh daemon at the home-resolved socket.
     std::fs::create_dir_all(home)?;
     let log = home.join("airc-daemon.log");
     let stdout = std::fs::OpenOptions::new()
@@ -318,9 +356,10 @@ pub async fn ensure_daemon_running(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     detach_daemon(&mut command);
-    command.spawn()?;
+    let child = command.spawn()?;
+    let daemon_pid = child.id();
 
-    let client = DaemonClient::new(socket);
+    let client = DaemonClient::new(socket.clone());
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if client
@@ -328,7 +367,12 @@ pub async fn ensure_daemon_running(
             .await
             .is_ok()
         {
-            return Ok(());
+            // 4. Card 282850c2: announce so a sandboxed agent
+            // attaching later finds this daemon instead of orphaning
+            // a new one. Best-effort — if the announcement fails,
+            // the normal singleton-per-home model still works.
+            announce_running_daemon(home, &socket, project_root.as_deref(), daemon_pid).await;
+            return Ok(socket);
         }
         if Instant::now() >= deadline {
             break;
@@ -336,6 +380,35 @@ pub async fn ensure_daemon_running(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!("daemon did not become ready; see {}", log.display()).into())
+}
+
+/// Read `peer_id`/`build` from the freshly-ready daemon and write a
+/// discovery entry. Called from `ensure_daemon_running` after the
+/// readiness ping succeeds; failure is silent.
+async fn announce_running_daemon(
+    home: &Path,
+    socket: &Path,
+    project_root: Option<&Path>,
+    pid: u32,
+) {
+    let client = DaemonClient::new(socket.to_path_buf());
+    let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let entry = crate::discovery::DiscoveredDaemon {
+        socket: socket.to_path_buf(),
+        home: home.to_path_buf(),
+        project_root: project_root.map(Path::to_path_buf),
+        peer_id: status.peer_id,
+        pid,
+        started_at_ms: now_ms,
+        build: status.build_commit.unwrap_or_else(|| "unknown".to_string()),
+    };
+    let _ = crate::discovery::announce(&entry);
 }
 
 fn daemon_status_is_current(status: &airc_ipc::StatusResponse) -> bool {
@@ -504,7 +577,7 @@ fn canonical_machine_account_home() -> Option<PathBuf> {
 /// daemon's router — the only same-machine path (no more `frames.jsonl`).
 pub(crate) async fn attached_airc(home: &Path) -> Result<Airc, Box<dyn std::error::Error>> {
     let socket = crate::cli::default_socket_path_in(home);
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     Ok(Airc::attach(home, socket).await?)
 }
 
@@ -730,7 +803,7 @@ pub async fn run_msg(
     socket: PathBuf,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
@@ -762,7 +835,7 @@ pub async fn run_inbox(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
         Some(socket) => {
-            ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+            let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
             Airc::attach(home, socket).await?
         }
         None => attached_airc(home).await?,
