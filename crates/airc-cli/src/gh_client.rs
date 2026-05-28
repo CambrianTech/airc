@@ -1,140 +1,61 @@
-// Card dec35ec7 ships the substrate; the merger consumes pr_view +
-// pr_merge in this PR. The remaining methods (pr_create, pr_edit_base,
-// parse_pr_url, the OutputParse error variant, the pr_create-shaped
-// argument types) are wired into work_commands.rs as a follow-up
-// (#1041) so this PR doesn't conflict with peer's c0bd865c
-// (work_commands split). Each is dead-code today; the allowlist is
-// per-module and scoped to that explicit follow-up.
+// Card a094aa81 split this module:
+// - airc-lib::gh_client owns the trait, error enum, arg/result
+//   types, and the pure parse helpers — that's the consumer-facing
+//   half (Continuum, OpenClaw, Hermes, codex, headless workers).
+// - airc-cli::gh_client owns the shell-based implementation — the
+//   `tokio::process::Command::new("gh")` spawn lives here only.
+//
+// Reason for the split: card a094aa81 (substrate-vision consumer
+// embedding). Consumers that want the gh boundary without the
+// entire CLI binary linked in need a trait-shaped surface; the
+// shell impl is the airc CLI's choice of backend, not the
+// consumer's obligation.
+//
+// pr_create / pr_edit_base remain wired in subsequent PRs (the
+// merger only consumes pr_view + pr_merge today). The crate-level
+// allow is scoped to those known follow-ups.
 #![allow(dead_code)]
 
-//! Typed wrapper around the `gh` CLI.
+//! Default shell-based [`GhClient`] implementation backed by the
+//! `gh` CLI binary on PATH.
 //!
-//! Card dec35ec7. Before this module, every airc-cli command that
-//! talked to GitHub built its own `tokio::process::Command::new("gh")`,
-//! parsed stderr into a human string, decoded stdout via inline
-//! `serde_json::from_slice`, and returned `Box<dyn std::error::Error>`.
-//! 21+ sites across the workspace; three of them lived in
-//! `work_commands.rs` alone, none sharing helpers.
-//!
-//! Net effect: every consumer (continuum, openclaw, hermes, codex)
-//! looking to embed airc had to re-implement the same gh
-//! orchestration in their language, or fork the airc CLI per
-//! operation. Neither is what the substrate is for.
-//!
-//! [`GhClient`] is the typed boundary. Callers get:
-//!
-//! - **Typed responses** ([`PrView`], [`PrCreated`], [`MergeReceipt`])
-//!   instead of raw JSON `Value`.
-//! - **Typed errors** ([`GhError`]) instead of `Box<dyn Error>`. The
-//!   merger can match `GhError::RateLimited` and back off; the
-//!   close-guard can match `GhError::PrConflicts` and refuse rather
-//!   than swallowing.
-//! - **One place** for the "set cwd, not `gh -C`" lesson (card
-//!   a4fe899f), for the rate-limit detection logic, for the JSON
-//!   parsing that has to evolve as gh's schema does.
-//! - **Pure parse helpers** ([`parse_pr_view`], [`parse_pr_url`])
-//!   that don't need a real `gh` to test — synthetic JSON in,
-//!   typed value out.
-//!
-//! Future cards expand the surface (gh issue, gh repo view's other
-//! fields, gh api PATCH for the body-edit workaround tracked as
-//! 3bf62fbb). This module is the place to add them.
+//! The trait and value types are re-exported here from
+//! [`airc_lib::gh_client`] so existing crate-internal `use
+//! crate::gh_client::PrView` paths continue to work — the types
+//! remain a single source of truth in airc-lib; the CLI just
+//! pulls them in for its own consumers.
 
-use std::path::Path;
-
-use serde::Deserialize;
-use thiserror::Error;
+use async_trait::async_trait;
 use tokio::process::Command;
 
-/// Typed errors from any `gh` invocation. Variants are the *actions*
-/// a caller can take in response, not the exit codes — so a future
-/// migration to `gh api`'s structured error shape doesn't churn the
-/// downstream `match`es.
-#[derive(Debug, Error)]
-pub enum GhError {
-    /// `gh` binary not on PATH or not executable. Operator config
-    /// problem; nothing to retry.
-    #[error("gh binary not found on PATH: {0}")]
-    GhNotFound(std::io::Error),
+pub use airc_lib::gh_client::{
+    parse_pr_url, parse_pr_view, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
+    PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+};
 
-    /// `gh auth status` failed when the call attempted authentication.
-    /// Operator needs `gh auth login`.
-    #[error("gh authentication required: run `gh auth login` ({stderr})")]
-    AuthRequired { stderr: String },
-
-    /// `gh` ran but the cwd isn't a github checkout (no `origin`
-    /// remote, non-github origin, etc.). Card 59243bee already gates
-    /// some of this on the airc side; this is the gh-side surface.
-    #[error("not in a github checkout: {stderr}")]
-    NotInGithubRepo { stderr: String },
-
-    /// Hit GitHub's rate limit. Callers should back off and retry.
-    /// The merger's tick failure path should match this and skip
-    /// rather than logging an opaque "tick failed".
-    #[error("github rate limit reached: {stderr}")]
-    RateLimited { stderr: String },
-
-    /// The PR exists but cannot be merged in its current state —
-    /// conflicts, branch protection failure, or non-OPEN state.
-    /// Distinct from a JSON-parse failure so the merger can hold
-    /// the card in Review and wait.
-    #[error("pr not mergeable: {stderr}")]
-    PrNotMergeable { stderr: String },
-
-    /// Catch-all for `gh` exiting non-zero in a way we haven't
-    /// classified yet. Includes the stderr so the operator can act,
-    /// but downstream code should NOT pattern-match on the string —
-    /// upgrade to a typed variant if the case recurs.
-    #[error("gh exited {code:?}: {stderr}")]
-    GhExited { code: Option<i32>, stderr: String },
-
-    /// `gh`'s JSON output didn't deserialize. Either a gh schema
-    /// drift or we passed the wrong --json fields. Bug, not runtime
-    /// condition.
-    #[error("could not parse gh json output: {0}")]
-    JsonParse(#[from] serde_json::Error),
-
-    /// `gh`'s stdout was the wrong shape (e.g. expected a PR URL on
-    /// the last non-empty line, got something else). Distinct from
-    /// `JsonParse` because gh's pr-create output is plain text, not
-    /// JSON.
-    #[error("could not parse gh output: {0}")]
-    OutputParse(String),
-
-    /// Process management failed (couldn't spawn, couldn't read
-    /// stdout). Underlying io::Error included.
-    #[error("gh process failed: {0}")]
-    Process(#[from] std::io::Error),
-}
-
-/// Stateless typed wrapper around `gh`. Held by the CLI for the
-/// session; methods are `&self` so callers can share one instance.
+/// Default [`GhClient`] backed by spawning `gh` as a subprocess.
 ///
-/// Holding a wrapper rather than a free function is deliberate: it
+/// Holding a struct rather than free functions is deliberate: it
 /// gives a place to add session-scoped state (a cached `gh auth
-/// status`, a rate-limit backoff cursor, a shared tokio runtime) and
-/// makes mocking possible in tests without polluting every callsite
-/// with a generic parameter.
+/// status`, a rate-limit backoff cursor, a shared tokio runtime).
+/// Empty today; adding fields here doesn't break callers because
+/// `ShellGhClient::default()` is the only ctor.
 #[derive(Debug, Default, Clone)]
-pub struct GhClient {
-    // Reserved for session state. Empty struct today; adding fields
-    // here doesn't break callers because `GhClient::default()` is
-    // the only ctor.
+pub struct ShellGhClient {
+    // Reserved for session state.
 }
 
-impl GhClient {
+impl ShellGhClient {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    /// `gh pr view <number> --repo <owner/name> --json state,mergeable,statusCheckRollup`.
-    ///
-    /// Used by the continuous-merger (#1037) to gate auto-merge.
-    /// `cwd` is the worktree the call should run from — gh resolves
-    /// the origin remote from cwd, NOT from `-C` (card a4fe899f).
-    pub async fn pr_view(&self, args: PrViewArgs<'_>) -> Result<PrView, GhError> {
+#[async_trait]
+impl GhClient for ShellGhClient {
+    async fn pr_view(&self, args: PrViewArgs) -> Result<PrView, GhError> {
         let mut cmd = Command::new("gh");
-        if let Some(cwd) = args.cwd {
+        if let Some(ref cwd) = args.cwd {
             cmd.current_dir(cwd);
         }
         let output = cmd
@@ -143,31 +64,26 @@ impl GhClient {
                 "view",
                 &args.number.to_string(),
                 "--repo",
-                args.repo,
+                args.repo.as_str(),
                 "--json",
                 "state,mergeable,statusCheckRollup",
             ])
             .output()
             .await
-            .map_err(self::map_spawn_error)?;
+            .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
         parse_pr_view(&output.stdout)
     }
 
-    /// `gh pr create --fill --base <branch>` from `cwd`.
-    ///
-    /// gh's pr-create output is plain text (the PR URL on the last
-    /// non-empty line of stdout), not JSON. Card 13131f1c tracks
-    /// the title-derivation issue; not this module's concern.
-    pub async fn pr_create(&self, args: PrCreateArgs<'_>) -> Result<PrCreated, GhError> {
+    async fn pr_create(&self, args: PrCreateArgs) -> Result<PrCreated, GhError> {
         let output = Command::new("gh")
-            .current_dir(args.cwd)
-            .args(["pr", "create", "--fill", "--base", args.base])
+            .current_dir(&args.cwd)
+            .args(["pr", "create", "--fill", "--base", args.base.as_str()])
             .output()
             .await
-            .map_err(self::map_spawn_error)?;
+            .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
@@ -176,45 +92,37 @@ impl GhClient {
         parse_pr_url(stdout)
     }
 
-    /// `gh pr merge <number> --repo <owner/name> --squash --delete-branch`.
-    /// The merger's terminal call once gate logic passes.
-    pub async fn pr_merge(&self, args: PrMergeArgs<'_>) -> Result<MergeReceipt, GhError> {
+    async fn pr_merge(&self, args: PrMergeArgs) -> Result<MergeReceipt, GhError> {
         let output = Command::new("gh")
             .args([
                 "pr",
                 "merge",
                 &args.number.to_string(),
                 "--repo",
-                args.repo,
+                args.repo.as_str(),
                 "--squash",
                 "--delete-branch",
             ])
             .output()
             .await
-            .map_err(self::map_spawn_error)?;
+            .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
         Ok(MergeReceipt {
             number: args.number,
-            repo: args.repo.to_string(),
+            repo: args.repo,
         })
     }
 
-    /// `gh api -X PATCH repos/{owner}/{repo}/pulls/{number}` with the
-    /// supplied `base` ref. Workaround for the Projects-classic
-    /// deprecation that breaks `gh pr edit --base` (card 3bf62fbb).
-    /// The plain `gh pr edit` path emits a hard error from the
-    /// GraphQL projectCards subselection; the REST PATCH route is
-    /// the documented workaround until gh upgrades.
-    pub async fn pr_edit_base(&self, args: PrEditBaseArgs<'_>) -> Result<(), GhError> {
+    async fn pr_edit_base(&self, args: PrEditBaseArgs) -> Result<(), GhError> {
         let path = format!("repos/{}/pulls/{}", args.repo, args.number);
         let base_field = format!("base={}", args.base);
         let output = Command::new("gh")
             .args(["api", "-X", "PATCH", &path, "-f", &base_field])
             .output()
             .await
-            .map_err(self::map_spawn_error)?;
+            .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
@@ -222,115 +130,11 @@ impl GhClient {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PrViewArgs<'a> {
-    pub repo: &'a str,
-    pub number: u64,
-    /// Optional cwd. None = process cwd; Some(p) = gh resolves
-    /// origin remote from p.
-    pub cwd: Option<&'a Path>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PrCreateArgs<'a> {
-    /// Worktree directory the new PR is opened from. gh reads
-    /// `git remote get-url origin` here.
-    pub cwd: &'a Path,
-    /// Integration branch the PR targets. For airc that's
-    /// `rust-rewrite` (card 28f1440c).
-    pub base: &'a str,
-}
-
-#[derive(Debug, Clone)]
-pub struct PrMergeArgs<'a> {
-    pub repo: &'a str,
-    pub number: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PrEditBaseArgs<'a> {
-    pub repo: &'a str,
-    pub number: u64,
-    pub base: &'a str,
-}
-
-/// `gh pr view --json state,mergeable,statusCheckRollup` shape.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct PrView {
-    #[serde(default)]
-    pub state: String,
-    #[serde(default)]
-    pub mergeable: String,
-    #[serde(default, rename = "statusCheckRollup")]
-    pub status_check_rollup: Option<Vec<GhCheck>>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct GhCheck {
-    #[serde(default)]
-    pub conclusion: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrCreated {
-    pub url: String,
-    pub number: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeReceipt {
-    pub repo: String,
-    pub number: u64,
-}
-
-// --- pure parsers (testable without spawning gh) ---
-
-/// Decode the JSON body of `gh pr view --json ...` into [`PrView`].
-/// Pure — synthetic JSON in, typed value out. The merger and the
-/// close-guard both depend on this shape, so this is where the
-/// schema round-trip is pinned in tests.
-pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
-    Ok(serde_json::from_slice(json)?)
-}
-
-/// Extract the PR URL + number from `gh pr create`'s plain-text
-/// stdout. gh prints the URL on the last non-empty line; the number
-/// is the trailing path segment.
-///
-/// Returns [`GhError::OutputParse`] when the shape doesn't match —
-/// callers should NOT fall back to "extract from any line that looks
-/// URL-shaped" (gh's output evolves; bug surface should surface).
-pub fn parse_pr_url(stdout: &str) -> Result<PrCreated, GhError> {
-    let url = stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .ok_or_else(|| GhError::OutputParse("gh pr create produced no output lines".into()))?;
-    let number = url
-        .rsplit('/')
-        .next()
-        .and_then(|tail| tail.parse::<u64>().ok())
-        .ok_or_else(|| {
-            GhError::OutputParse(format!(
-                "could not extract PR number from gh output line: {url:?}"
-            ))
-        })?;
-    Ok(PrCreated {
-        url: url.to_string(),
-        number,
-    })
-}
-
-/// Classify a non-zero `gh` exit. The substrings are intentionally
-/// matched against gh's English error messages — if gh's locale or
-/// error wording changes, this stops working, which is exactly what
-/// we want (silent mis-classification would be worse). Each branch
-/// here exists because the calling code has a different action to
-/// take per case.
+/// Classify a non-zero `gh` exit. Substrings are matched against
+/// gh's English error messages — if gh's locale or error wording
+/// changes, this stops working, which is exactly what we want
+/// (silent mis-classification would be worse). Each branch here
+/// exists because the calling code has a different action to take.
 fn classify_gh_failure(output: &std::process::Output) -> GhError {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let lowered = stderr.to_lowercase();
@@ -368,64 +172,6 @@ fn map_spawn_error(error: std::io::Error) -> GhError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_pr_view_decodes_all_fields() {
-        let json = br#"{
-            "state": "OPEN",
-            "mergeable": "MERGEABLE",
-            "statusCheckRollup": [
-                {"name": "fmt",     "status": "COMPLETED",  "conclusion": "SUCCESS"},
-                {"name": "tests",   "status": "IN_PROGRESS", "conclusion": null},
-                {"name": "clippy",  "status": "COMPLETED",  "conclusion": "FAILURE"}
-            ]
-        }"#;
-        let view = parse_pr_view(json).expect("parse");
-        assert_eq!(view.state, "OPEN");
-        assert_eq!(view.mergeable, "MERGEABLE");
-        let checks = view.status_check_rollup.unwrap();
-        assert_eq!(checks.len(), 3);
-        assert_eq!(
-            checks[1].conclusion, None,
-            "in-flight check has null conclusion"
-        );
-    }
-
-    #[test]
-    fn parse_pr_view_tolerates_missing_optional_fields() {
-        let json = br#"{}"#;
-        let view = parse_pr_view(json).expect("empty object decodes");
-        assert!(view.state.is_empty());
-        assert!(view.mergeable.is_empty());
-        assert!(view.status_check_rollup.is_none());
-    }
-
-    #[test]
-    fn parse_pr_url_extracts_last_url_and_number() {
-        let stdout = "Creating draft pull request for refs/heads/feat/x into rust-rewrite\n\
-                      https://github.com/CambrianTech/airc/pull/1038\n";
-        let created = parse_pr_url(stdout).expect("parse");
-        assert_eq!(created.number, 1038);
-        assert_eq!(
-            created.url,
-            "https://github.com/CambrianTech/airc/pull/1038"
-        );
-    }
-
-    #[test]
-    fn parse_pr_url_rejects_unparseable_tail() {
-        let stdout = "https://github.com/owner/repo/pull/not-a-number\n";
-        assert!(matches!(parse_pr_url(stdout), Err(GhError::OutputParse(_))));
-    }
-
-    #[test]
-    fn parse_pr_url_rejects_empty_output() {
-        assert!(matches!(parse_pr_url(""), Err(GhError::OutputParse(_))));
-        assert!(matches!(
-            parse_pr_url("\n\n  \n"),
-            Err(GhError::OutputParse(_))
-        ));
-    }
 
     /// Card a4fe899f's gh-not-found case (operator missing gh CLI):
     /// distinguish from generic IO failure so the operator gets a

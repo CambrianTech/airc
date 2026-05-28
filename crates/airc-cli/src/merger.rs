@@ -76,11 +76,11 @@ pub async fn run(
     );
     eprintln!("airc-merger: peer_id={}", airc.peer_id());
 
-    // Card dec35ec7: one GhClient per merger session. Reserved for
-    // future session-scoped state (rate-limit backoff cursor, cached
-    // auth status); today it's stateless but lives at the right
-    // scope.
-    let gh = crate::gh_client::GhClient::new();
+    // Cards dec35ec7 + a094aa81: one ShellGhClient per merger session,
+    // passed downstream as `&dyn GhClient` so an alternative impl
+    // (mock, HTTP-direct) can substitute at the boundary without
+    // touching the merger's gate logic.
+    let gh = crate::gh_client::ShellGhClient::new();
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -109,7 +109,7 @@ pub async fn run(
 
 /// One pass over the board: scan eligible cards, gate, merge.
 async fn tick_once(
-    gh: &crate::gh_client::GhClient,
+    gh: &dyn crate::gh_client::GhClient,
     airc: &Airc,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -162,7 +162,7 @@ enum MergeDecision {
 /// if everything passes; `Ok(Some(Skip(reason)))` if it's a candidate
 /// that failed a gate (so we can log it instead of silently dropping).
 async fn evaluate(
-    gh: &crate::gh_client::GhClient,
+    gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
 ) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
@@ -197,12 +197,12 @@ enum GateResult {
 /// auth-required, …) so callers can pattern-match on them; the
 /// decision half (`evaluate_gh_view`) remains pure for unit tests.
 async fn check_pr_gate(
-    gh: &crate::gh_client::GhClient,
+    gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
 ) -> Result<GateResult, crate::gh_client::GhError> {
     let view = gh
         .pr_view(crate::gh_client::PrViewArgs {
-            repo: pr.repo.as_str(),
+            repo: pr.repo.as_str().to_string(),
             number: pr.number,
             cwd: None,
         })
@@ -261,13 +261,13 @@ fn evaluate_gh_view(view: &crate::gh_client::PrView) -> GateResult {
 /// than retry indefinitely. `MarkPullRequestMerged` still fires
 /// after the merge succeeds — the projection contract is unchanged.
 async fn perform_merge(
-    gh: &crate::gh_client::GhClient,
+    gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
     airc: &Airc,
 ) -> Result<(), Box<dyn std::error::Error>> {
     gh.pr_merge(crate::gh_client::PrMergeArgs {
-        repo: pr.repo.as_str(),
+        repo: pr.repo.as_str().to_string(),
         number: pr.number,
     })
     .await?;
