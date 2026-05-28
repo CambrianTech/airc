@@ -514,23 +514,45 @@ pub async fn run_state(
     let card_uuid = parse_work_card_id(&card_id)?;
     let card_state = CardState::from(state);
 
-    // Card a1bc62b3 — substrate-only target states refused from the CLI.
-    // Symmetric to 9656a836's close-side guard, which refuses
-    // self-attested closure. Without this gate, 9656a836 has a clean
-    // bypass:
-    //
-    //   airc work state X review        # legitimate
-    //   airc work state X merged        # ← agent self-attests merged
-    //   airc work close X               # passes 9656a836 (state == Merged)
-    //
-    // Closing that hole is what makes the close-guard's
-    // "shipped = PR merged" promise real. When the gh observer ships,
-    // it routes through `Airc::change_work_card_state` directly,
-    // bypassing this CLI path — that's the correct architectural
-    // boundary (agent input through the CLI guard, substrate
-    // mechanisms write events directly).
+    // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
+    // to states that should only come from substrate observers (e.g.
+    // Merged must come from PullRequestMerged, not `airc work state X
+    // merged` by an agent). Architectural boundary: agent input goes
+    // through this CLI guard; substrate mechanisms write events
+    // directly via Airc::change_work_card_state.
     if !cli_can_set_state_directly(card_state) {
         return Err(refusal_message(card_uuid, card_state).into());
+    }
+
+    // Card 9656a836 (close-lifecycle gate): Closed must come from
+    // Merged (PR merged) or {Open, Claimed, Blocked} (cancellation
+    // before any real work landed). Refuses Closed from InProgress
+    // or Review — there's claimed work in flight; the agent should
+    // either ship via state review → merge, or release the claim.
+    // Complementary to a1bc62b3 above: that one refuses agents from
+    // self-attesting Merged; this one refuses agents from
+    // self-attesting Closed without a Merged predecessor.
+    if card_state == CardState::Closed {
+        let board = airc.work_board(usize::MAX).await?;
+        let card = board.card(card_uuid).ok_or_else(|| {
+            format!("card {card_uuid} not visible in current room's board projection")
+        })?;
+        if !close_transition_allowed_from(card.state) {
+            return Err(format!(
+                "refusing to close card {card_uuid}: current state is {actual:?}, but \
+                 Closed requires Merged (PR merged) or {{Open, Claimed, Blocked}} \
+                 (cancellation before work landed).\n\n\
+                 If work is in flight ({actual:?}), the next step is:\n  \
+                 - state Review: open a PR via `airc work state {card_uuid} review`\n  \
+                 - wait for the PR to merge (state → Merged via gh observer)\n  \
+                 - THEN `airc work close {card_uuid}` succeeds.\n\n\
+                 If you want to abandon the work, `airc work release {card_uuid}` \
+                 drops the claim and returns the card to its prior state — close \
+                 from there.",
+                actual = card.state,
+            )
+            .into());
+        }
     }
 
     airc.change_work_card_state(ChangeWorkCardState {
@@ -819,6 +841,28 @@ fn refusal_message(card_uuid: airc_lib::WorkCardId, target: CardState) -> String
 
 pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
     run_state(home, card_id, CliCardState::Closed).await
+}
+
+/// Card 9656a836: gate the close transition. Returns `true` when a
+/// card in `state` is allowed to transition to Closed.
+///
+/// Closed has substrate meaning: this card was shipped (PR merged)
+/// OR cancelled before any real work landed. An agent who calls
+/// `airc work close` from InProgress/Review/Closed is doing the
+/// thing we caught today — self-reporting work as done without it
+/// actually going through review + merge. Per Joel's "lesser persona
+/// intelligences" framing, this MUST refuse strictly — the persona
+/// can't be trusted to "know better," the substrate refuses.
+///
+/// "Workflow is workflow" — for non-coding recipes, swap PR-merged
+/// for the recipe-specific "verified done" signal; this rule's
+/// shape (Closed requires verified-done OR pre-work cancellation)
+/// generalizes.
+pub(crate) fn close_transition_allowed_from(state: CardState) -> bool {
+    matches!(
+        state,
+        CardState::Merged | CardState::Open | CardState::Claimed | CardState::Blocked
+    )
 }
 
 /// First 8 chars of a UUID-style id — enough to disambiguate at the
@@ -1542,6 +1586,24 @@ mod tests {
             parse_github_repo_id("https://github.com/owner/repo/pull/123"),
             None,
         );
+    }
+
+    #[test]
+    fn close_transition_allowed_from_pins_the_close_lifecycle_gate() {
+        // Allowed: Merged (PR-merged happy path) + Open/Claimed/Blocked
+        // (cancellation before any commits landed).
+        assert!(close_transition_allowed_from(CardState::Merged));
+        assert!(close_transition_allowed_from(CardState::Open));
+        assert!(close_transition_allowed_from(CardState::Claimed));
+        assert!(close_transition_allowed_from(CardState::Blocked));
+        // Refused: any state representing in-flight work. An agent
+        // calling close from these is exactly the 2026-05-28 bypass.
+        assert!(!close_transition_allowed_from(CardState::InProgress));
+        assert!(!close_transition_allowed_from(CardState::Review));
+        // Refused: Closed → Closed is a no-op masquerading as work.
+        // Forcing the caller to recognise the card is already closed
+        // (read the board) before re-issuing.
+        assert!(!close_transition_allowed_from(CardState::Closed));
     }
 
     #[test]
