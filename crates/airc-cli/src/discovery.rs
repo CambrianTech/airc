@@ -46,16 +46,35 @@ pub struct DiscoveredDaemon {
     pub build: String,
 }
 
-/// `/tmp/airc-discovery-<uid>/`. Per-UID so the file owner is always the
-/// same OS user, eliminating cross-user collisions on a shared box.
-/// Created if absent. Failure means no discovery — the spawn-or-attach
+/// `/tmp/airc-discovery-<uid>/` on Unix. Per-UID so the file owner is
+/// always the same OS user, eliminating cross-user collisions on a
+/// shared box. Created if absent.
+///
+/// On Windows the discovery layer is a no-op (`libc::getuid` doesn't
+/// exist; the sandboxed-`$HOME` failure mode discovery addresses is
+/// a Unix sandbox phenomenon — Codex etc. on Windows host their own
+/// user-scoped tmp areas differently). Returning an unreachable
+/// path keeps `live_daemons` / `find_for_project` defensively
+/// returning empty, which is what we want: the spawn-or-attach
 /// path falls back to the existing home-resolved socket only.
+#[cfg(unix)]
 fn discovery_dir() -> std::io::Result<PathBuf> {
     // SAFETY: getuid is async-signal-safe and has no precondition.
     let uid = unsafe { libc::getuid() };
     let dir = std::env::temp_dir().join(format!("airc-discovery-{uid}"));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(not(unix))]
+fn discovery_dir() -> std::io::Result<PathBuf> {
+    // No-op on non-Unix — return an error so live_daemons() / announce()
+    // short-circuit cleanly.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "airc daemon discovery is Unix-only (Codex sandbox failure mode \
+         this addresses is a Unix-specific phenomenon)",
+    ))
 }
 
 /// 16-char hex prefix of SHA-256(canonical(project_root)). Stable across
@@ -117,8 +136,13 @@ pub fn forget(project_root_or_home: &Path) {
 /// by another OS user is still "running"; the per-UID discovery dir
 /// keeps such daemons out of our view in the first place. errno is
 /// read via `std::io::Error::last_os_error().raw_os_error()` for
-/// cross-platform compatibility — direct `libc::__error()` access
-/// is macOS-specific (Linux uses `__errno_location`).
+/// cross-platform compatibility (Linux/macOS differ on the errno
+/// accessor symbol).
+///
+/// On Windows discovery is disabled at `discovery_dir()`, so this
+/// function is never called; we stub it to keep the module type-
+/// checked across all targets.
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -130,6 +154,13 @@ fn pid_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    // No discovery → no callers; conservatively report not-alive so
+    // any leaked entries get pruned on read.
+    false
 }
 
 /// Read every `.json` file in the discovery dir, drop the ones whose
@@ -204,16 +235,17 @@ mod tests {
         assert!(!pid_alive(0), "pid 0 is never a real process");
     }
 
+    #[cfg(unix)]
     #[test]
     fn current_pid_is_alive() {
-        // SAFETY: getpid is async-signal-safe and has no precondition.
-        let me = unsafe { libc::getpid() } as u32;
+        let me = std::process::id();
         assert!(
             pid_alive(me),
             "the current process is, by definition, alive"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn announce_then_find_then_forget_roundtrip() {
         // Use a unique project root so concurrent test invocations don't
@@ -221,8 +253,7 @@ mod tests {
         // process state — and we write to a shared dir).
         let unique = std::env::temp_dir().join(format!(
             "airc-discovery-test-{}-{}",
-            // SAFETY: getpid is async-signal-safe.
-            unsafe { libc::getpid() },
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -230,8 +261,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&unique).unwrap_or_default();
 
-        // SAFETY: getpid is async-signal-safe.
-        let me = unsafe { libc::getpid() } as u32;
+        let me = std::process::id();
         let daemon = DiscoveredDaemon {
             socket: PathBuf::from("/tmp/fake.sock"),
             home: PathBuf::from("/tmp/fake-home"),
