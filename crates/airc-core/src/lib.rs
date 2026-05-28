@@ -29,6 +29,7 @@ pub mod attachment;
 pub mod body;
 pub mod cursor;
 pub mod datetime;
+pub mod doctrine;
 pub mod filter;
 pub mod headers;
 pub mod humanhash;
