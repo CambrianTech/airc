@@ -391,6 +391,17 @@ impl Airc {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                // Card d4e3e350: refresh active_claims from the live
+                // board projection on every tick. Preserves the
+                // caller's doctrine_version + availability snapshot
+                // (those don't change tick-to-tick in this scope);
+                // only the claim list is dynamic. A board query that
+                // fails (daemon transient, no current room) degrades
+                // to the baseline snapshot — better to send a stale
+                // claim list than skip the heartbeat entirely.
+                let refreshed = refresh_coordination(&airc, &coordination)
+                    .await
+                    .unwrap_or_else(|_| coordination.clone());
                 if let Err(error) = airc
                     .emit_agent_heartbeat_with_coordination(
                         HeartbeatKind::Alive,
@@ -398,7 +409,7 @@ impl Airc {
                         client_id.clone(),
                         scope.clone(),
                         build.clone(),
-                        coordination.clone(),
+                        refreshed,
                     )
                     .await
                 {
@@ -490,6 +501,37 @@ fn parse_heartbeat(event: &TranscriptEvent) -> Option<AgentHeartbeat> {
         _ => return None,
     };
     serde_json::from_value(value).ok()
+}
+
+/// Card d4e3e350: re-compute the dynamic fields of `CoordinationSignal`
+/// against the live work-board projection. Preserves `doctrine_version`
+/// + `availability` from `baseline` (those are session-scoped and
+/// don't change tick-to-tick); overrides `active_claims` with the
+/// current room's cards owned by this peer. Caller passes the
+/// baseline so a transient board-query failure can degrade to it
+/// rather than emitting an empty signal.
+///
+/// Returns `Err` only on a genuine query failure. The heartbeat task
+/// surfaces that as a falls-back to baseline and keeps beating —
+/// "stale claim list" beats "no heartbeat at all" for liveness.
+async fn refresh_coordination(
+    airc: &crate::Airc,
+    baseline: &CoordinationSignal,
+) -> Result<CoordinationSignal, AircError> {
+    let board = airc.work_board(usize::MAX).await?;
+    let me = airc.peer_id();
+    let active_claims: Vec<WorkCardId> = board
+        .snapshot()
+        .cards
+        .iter()
+        .filter(|card| card.owner == Some(me) && card.claim_id.is_some())
+        .map(|card| card.card_id)
+        .collect();
+    Ok(CoordinationSignal {
+        active_claims,
+        doctrine_version: baseline.doctrine_version.clone(),
+        availability: baseline.availability,
+    })
 }
 
 #[cfg(test)]
