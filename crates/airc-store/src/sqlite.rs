@@ -340,6 +340,7 @@ impl SqliteEventStore {
                 })?,
                 created_at_ms: i64_to_u64("local_identity.created_at_ms", m.created_at_ms)?,
                 identity: identity_from_row(&m),
+                agent_name: m.agent_name,
             })
         })
         .transpose()
@@ -375,6 +376,7 @@ impl SqliteEventStore {
             status: Set(identity.identity.status),
             fingerprint: Set(identity.identity.fingerprint),
             integrations_json: Set(serde_json::to_value(identity.identity.integrations)?),
+            agent_name: Set(identity.agent_name),
         };
         local_identity::Entity::insert(active)
             .exec(&self.db)
@@ -1126,6 +1128,7 @@ mod tests {
                 version: 1,
                 created_at_ms: 42,
                 identity,
+                agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
             })
             .await
             .unwrap();
@@ -1148,6 +1151,52 @@ mod tests {
         assert_eq!(stored.peer_id, PeerId::from_u128(0xa1));
         assert_eq!(stored.client_id, ClientId::from_u128(0xc1));
         assert_eq!(stored.identity, updated);
+        // Card 8384cc18 Sub-A: every row carries an agent_name; the
+        // 2026-05-28+ default for pre-multi-agent installs is
+        // "default", set by the column default. The DTO surfaces it.
+        assert_eq!(
+            stored.agent_name, crate::DEFAULT_AGENT_NAME,
+            "Sub-A: row inserted without an explicit agent_name still surfaces \
+             the documented default through the DTO"
+        );
+    }
+
+    /// Card 8384cc18 Sub-A — explicit `agent_name` round-trips
+    /// through the insert / load path. Even though Sub-A doesn't
+    /// yet allow multiple rows (the singleton CHECK is dropped in
+    /// Sub-B), the column has to actually carry whatever the caller
+    /// supplies, not silently force the default — otherwise Sub-B
+    /// would have to re-validate this and would carry the risk of
+    /// silently re-defaulting.
+    #[tokio::test]
+    async fn explicit_agent_name_round_trips_through_local_identity() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let store_api: &dyn EventStore = &store;
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa2),
+                client_id: ClientId::from_u128(0xc2),
+                version: 1,
+                created_at_ms: 100,
+                identity: Identity::new("bob"),
+                agent_name: "claude-tab-2".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = store_api
+            .load_local_identity()
+            .await
+            .unwrap()
+            .expect("local identity row");
+        assert_eq!(stored.agent_name, "claude-tab-2");
+        // The rest of the DTO is unaffected — Sub-A is purely
+        // additive on this field. (Pinning lets a future Sub-B
+        // table-recreate migration catch a regression where it
+        // forgets to preserve agent_name during the
+        // INSERT … SELECT step.)
+        assert_eq!(stored.peer_id, PeerId::from_u128(0xa2));
+        assert_eq!(stored.client_id, ClientId::from_u128(0xc2));
     }
 
     #[tokio::test]
