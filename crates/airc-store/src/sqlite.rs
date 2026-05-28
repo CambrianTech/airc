@@ -21,7 +21,6 @@ use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::Value as JsonValue;
 
 use airc_core::{
@@ -39,7 +38,6 @@ use crate::entities::{
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
-use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
 use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::store::EventStore;
@@ -64,7 +62,10 @@ impl SqliteEventStore {
             .acquire_timeout(std::time::Duration::from_secs(5))
             .max_connections(1);
         let db = Database::connect(opts).await?;
-        Migrator::up(&db, None)
+        // Forward-compatible BOTH directions: apply our pending
+        // migrations, but tolerate a DB already migrated AHEAD of this
+        // binary (version skew must not brick the store).
+        crate::migration::apply_migrations(&db)
             .await
             .map_err(|err| StoreError::Migration(err.to_string()))?;
         Ok(Self { db })

@@ -34,14 +34,12 @@ use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
 };
-use sea_orm_migration::MigratorTrait;
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
 use airc_bus::{BusError, DurableSink, Seq};
 use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
 
 use crate::entities::bus_event;
-use crate::migration::Migrator;
 
 /// SQLite-backed durable tier for the owner-core (§3.3).
 ///
@@ -69,7 +67,9 @@ impl SqliteDurableSink {
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
         set_wal(&db).await?;
-        Migrator::up(&db, None)
+        // Forward-compatible both directions: tolerate a DB migrated
+        // ahead of this binary (version skew must not brick the sink).
+        crate::migration::apply_migrations(&db)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
         Ok(Self { db })

@@ -5,7 +5,9 @@
 //! (new table / new column / new index) and never destructive — the
 //! store treats older databases as forward-compatible.
 
+use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::seaql_migrations;
 
 mod m20260519_000001_create_events;
 mod m20260522_000002_create_runtime_cursors;
@@ -39,5 +41,111 @@ impl MigratorTrait for Migrator {
             Box::new(m20260526_000011_create_bus_events::Migration),
             Box::new(m20260527_000012_create_bus_epoch::Migration),
         ]
+    }
+}
+
+/// Apply pending migrations, tolerating a database that is AHEAD of this
+/// binary.
+///
+/// `Migrator::up` hard-fails when the DB has applied migrations this
+/// binary has no file for (SeaORM: "migration file is missing"). That
+/// happens under version skew — a newer build migrates the DB forward,
+/// then an older binary opens it (e.g. a stale `~/.local/bin/airc`
+/// against a DB a dev build already migrated). Our migrations are
+/// additive and never destructive, so a DB ahead of us is harmless: the
+/// extra tables/columns are simply unused. So if `up` fails ONLY because
+/// the DB is ahead — every migration WE define is already applied — we
+/// proceed. A genuine divergence (we still have unapplied migrations of
+/// our own) surfaces the error instead of silently skipping schema we
+/// actually need.
+pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    match Migrator::up(db, None).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if all_defined_migrations_applied(db).await? {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// True when every migration this binary defines is already recorded in
+/// the DB's `seaql_migrations` table — i.e. the DB is at or ahead of us,
+/// never behind on one of ours.
+async fn all_defined_migrations_applied(db: &DatabaseConnection) -> Result<bool, sea_orm::DbErr> {
+    // Read the applied set through SeaORM's own `seaql_migrations`
+    // entity — not raw SQL (the migration table is a first-class entity;
+    // hand-written SQL here would be a "bad ORM" smell + violate the
+    // no-raw-SQL rule).
+    let applied: std::collections::HashSet<String> = seaql_migrations::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.version)
+        .collect();
+    Ok(Migrator::migrations()
+        .iter()
+        .all(|migration| applied.contains(migration.name())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    async fn memory_db() -> DatabaseConnection {
+        Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory")
+    }
+
+    #[tokio::test]
+    async fn tolerates_a_db_migrated_ahead_of_this_binary() {
+        let db = memory_db().await;
+        apply_migrations(&db).await.expect("initial migrate");
+        // Simulate a newer build recording a migration we have no file for.
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO seaql_migrations (version, applied_at) \
+             VALUES ('m99999999_999999_future', 0)"
+                .to_owned(),
+        ))
+        .await
+        .expect("insert future migration");
+        // Re-opening must NOT hard-fail on the unknown-applied migration —
+        // the DB is merely ahead of us, and our schema is all present.
+        apply_migrations(&db)
+            .await
+            .expect("must tolerate a DB ahead of this binary");
+    }
+
+    #[tokio::test]
+    async fn surfaces_error_when_our_own_migrations_are_unapplied() {
+        // A DB whose ONLY recorded migration is foreign (none of ours) —
+        // we genuinely have pending schema, so we must NOT silently skip
+        // it; the error surfaces instead.
+        let db = memory_db().await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "CREATE TABLE seaql_migrations \
+             (version varchar PRIMARY KEY, applied_at bigint NOT NULL)"
+                .to_owned(),
+        ))
+        .await
+        .expect("create migrations table");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO seaql_migrations (version, applied_at) \
+             VALUES ('m99999999_999999_foreign', 0)"
+                .to_owned(),
+        ))
+        .await
+        .expect("insert foreign migration");
+        assert!(
+            apply_migrations(&db).await.is_err(),
+            "divergence (our migrations unapplied) must surface, not silently skip"
+        );
     }
 }
