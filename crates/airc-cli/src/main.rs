@@ -191,7 +191,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let home = parsed.home.clone().unwrap_or_else(cli::default_home_dir);
 
     match parsed.command {
-        Command::Init => commands::run_init(&home).await,
+        Command::Init { agent_name } => commands::run_init(&home, agent_name).await,
 
         Command::LanIp => network_commands::run_lan_ip(),
 

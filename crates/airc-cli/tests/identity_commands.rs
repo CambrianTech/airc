@@ -58,6 +58,41 @@ fn identity_pretty_defaults_unset_fields() {
 }
 
 #[test]
+fn init_as_records_agent_name() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    let init = run_ok(home, &["init", "--as", "codex"], "");
+    assert!(init.contains("agent_name:  codex\n"));
+
+    let repeat = run_ok(home, &["init", "--as", "codex"], "");
+    assert!(repeat.contains("agent_name:  codex\n"));
+}
+
+#[test]
+fn init_uses_airc_agent_name_env_when_as_is_absent() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path();
+
+    let output = Command::new(airc_core())
+        .arg("--home")
+        .arg(home)
+        .arg("init")
+        .env("AIRC_AGENT_NAME", "claude")
+        .output()
+        .expect("airc-core must spawn");
+
+    assert!(
+        output.status.success(),
+        "airc-core failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("agent_name:  claude\n"));
+}
+
+#[test]
 fn identity_set_link_and_show_round_trip_through_store() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path();

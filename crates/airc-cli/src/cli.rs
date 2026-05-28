@@ -199,7 +199,12 @@ pub enum Command {
     /// plus ORM-backed metadata), then print this peer's spec for
     /// out-of-band sharing. Idempotent — repeat runs return the same
     /// peer_id.
-    Init,
+    Init {
+        /// Local agent identity name. Same effect as `AIRC_AGENT_NAME`,
+        /// but explicit CLI input takes precedence.
+        #[arg(long = "as", value_name = "AGENT_NAME")]
+        agent_name: Option<String>,
+    },
 
     /// Print the primary non-loopback LAN IPv4 address, if detectable.
     LanIp,

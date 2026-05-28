@@ -35,9 +35,13 @@ use airc_protocol::PeerKeypair;
 use airc_store::{SqliteEventStore, StoreError, StoredLocalIdentity};
 use serde::Deserialize;
 
-/// On-disk schema version for the singleton row. Bump when the
+/// On-disk schema version for local identity rows. Bump when the
 /// stored shape changes incompatibly.
 const IDENTITY_STATE_VERSION: u32 = 1;
+
+/// Environment override for selecting the local agent identity row.
+/// Card 8384cc18 Sub-D pairs this with `airc init --as <name>`.
+pub const AIRC_AGENT_NAME_ENV: &str = "AIRC_AGENT_NAME";
 
 const IDENTITY_KEY_FILENAME: &str = "identity.key";
 const LEGACY_IDENTITY_JSON_FILENAME: &str = "identity.json";
@@ -49,6 +53,7 @@ pub struct LocalIdentity {
     pub keypair: PeerKeypair,
     pub peer_id: PeerId,
     pub client_id: ClientId,
+    pub agent_name: String,
 }
 
 #[derive(Debug)]
@@ -61,7 +66,7 @@ pub enum IdentityError {
         found: u32,
         expected: u32,
     },
-    /// `identity.key` exists but the paired singleton row is missing
+    /// `identity.key` exists but the paired local-identity row is missing
     /// (or vice versa). The pair is required to disambiguate
     /// identity — refusing rather than regenerating prevents silent
     /// peer-id rotation.
@@ -77,6 +82,16 @@ pub enum IdentityError {
     /// System clock is before UNIX_EPOCH; refuse to write a corrupt
     /// timestamp into the identity audit record.
     Clock(std::time::SystemTimeError),
+    /// Requested local agent names are persisted as stable keys, so
+    /// they must be explicit and printable.
+    InvalidAgentName(String),
+    /// A caller requested one local agent, but the only row available
+    /// through the current store API describes another. Sub-C replaces
+    /// the singleton read with lookup-by-agent-name.
+    AgentNameMismatch {
+        requested: String,
+        found: String,
+    },
 }
 
 impl std::fmt::Display for IdentityError {
@@ -111,6 +126,14 @@ impl std::fmt::Display for IdentityError {
                 )
             }
             IdentityError::Clock(error) => write!(f, "identity timestamp clock error: {error}"),
+            IdentityError::InvalidAgentName(value) => write!(
+                f,
+                "invalid agent name {value:?}; use a non-empty printable name"
+            ),
+            IdentityError::AgentNameMismatch { requested, found } => write!(
+                f,
+                "requested local agent {requested:?}, but stored local_identity row is {found:?}"
+            ),
         }
     }
 }
@@ -124,7 +147,9 @@ impl std::error::Error for IdentityError {
             IdentityError::Clock(error) => Some(error),
             IdentityError::SchemaVersionMismatch { .. }
             | IdentityError::PartialState { .. }
-            | IdentityError::BadKeyLength(_) => None,
+            | IdentityError::BadKeyLength(_)
+            | IdentityError::InvalidAgentName(_)
+            | IdentityError::AgentNameMismatch { .. } => None,
         }
     }
 }
@@ -159,20 +184,39 @@ impl LocalIdentity {
     /// one (writing both halves) if neither exists. Refuses to
     /// recover from a half-initialised state.
     pub async fn load_or_generate(home: &Path) -> Result<Self, IdentityError> {
+        let agent_name = requested_agent_name(None)?;
+        Self::load_or_generate_as(home, agent_name).await
+    }
+
+    /// Load or generate the local identity for an explicit agent name.
+    /// This is the programmatic partner of `airc init --as <name>`.
+    pub async fn load_or_generate_as(
+        home: &Path,
+        agent_name: impl AsRef<str>,
+    ) -> Result<Self, IdentityError> {
+        let agent_name = normalise_agent_name(agent_name.as_ref())?;
         let store = open_store(home).await?;
         let key_path = Self::key_path(home);
         let key_exists = key_path.exists();
-        let stored = store.load_local_identity().await?;
+        let stored = store.load_local_identity_by_agent_name(&agent_name).await?;
         match (key_exists, stored) {
-            (true, Some(stored)) => Self::load_with_metadata(home, stored),
+            (true, Some(stored)) => Self::load_with_metadata_for_agent(home, stored, &agent_name),
             (true, None) => match migrate_legacy_identity_json(home, &store).await? {
-                Some(stored) => Self::load_with_metadata(home, stored),
+                Some(stored) if stored.agent_name == agent_name => {
+                    Self::load_with_metadata(home, stored)
+                }
+                Some(_) => {
+                    Self::generate_and_save_agent_with_existing_key(home, &store, &agent_name).await
+                }
+                None if store.has_local_identity_rows().await? => {
+                    Self::generate_and_save_agent_with_existing_key(home, &store, &agent_name).await
+                }
                 None => Err(IdentityError::PartialState {
                     key_exists: true,
                     state_exists: false,
                 }),
             },
-            (false, None) => Self::generate_and_save(home, &store).await,
+            (false, None) => Self::generate_and_save_as(home, &store, &agent_name).await,
             (key, state) => Err(IdentityError::PartialState {
                 key_exists: key,
                 state_exists: state.is_some(),
@@ -184,14 +228,29 @@ impl LocalIdentity {
     /// for the cases that already know they have a populated
     /// install and want to fail loudly if either half is missing.
     pub async fn load(home: &Path) -> Result<Self, IdentityError> {
+        let agent_name = requested_agent_name(None)?;
         let store = open_store(home).await?;
         let stored = store
-            .load_local_identity()
+            .load_local_identity_by_agent_name(&agent_name)
             .await?
             .ok_or(IdentityError::PartialState {
                 key_exists: Self::key_path(home).exists(),
                 state_exists: false,
             })?;
+        Self::load_with_metadata(home, stored)
+    }
+
+    fn load_with_metadata_for_agent(
+        home: &Path,
+        stored: StoredLocalIdentity,
+        requested_agent_name: &str,
+    ) -> Result<Self, IdentityError> {
+        if stored.agent_name != requested_agent_name {
+            return Err(IdentityError::AgentNameMismatch {
+                requested: requested_agent_name.to_string(),
+                found: stored.agent_name,
+            });
+        }
         Self::load_with_metadata(home, stored)
     }
 
@@ -213,17 +272,63 @@ impl LocalIdentity {
             keypair,
             peer_id: stored.peer_id,
             client_id: stored.client_id,
+            agent_name: stored.agent_name,
+        })
+    }
+
+    async fn generate_and_save_agent_with_existing_key(
+        home: &Path,
+        store: &SqliteEventStore,
+        agent_name: &str,
+    ) -> Result<Self, IdentityError> {
+        let key_bytes = std::fs::read(Self::key_path(home))?;
+        if key_bytes.len() != 32 {
+            return Err(IdentityError::BadKeyLength(key_bytes.len()));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&key_bytes);
+        let keypair = PeerKeypair::from_secret_bytes(&secret);
+        let peer_id = PeerId::new();
+        let client_id = ClientId::new();
+        let created_at_ms = now_ms()?;
+
+        store
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id,
+                client_id,
+                version: IDENTITY_STATE_VERSION,
+                created_at_ms,
+                identity: Identity::default(),
+                agent_name: agent_name.to_string(),
+            })
+            .await?;
+
+        Ok(Self {
+            keypair,
+            peer_id,
+            client_id,
+            agent_name: agent_name.to_string(),
         })
     }
 
     /// Generate a fresh identity + persist it. Writes the secret
-    /// key file (0600) and inserts the singleton row in one logical
-    /// step; if the row insert fails after the key was written, the
-    /// caller can clean up by removing `identity.key` and retrying.
+    /// key file (0600) and inserts the default-agent row in one
+    /// logical step; if the row insert fails after the key was
+    /// written, the caller can clean up by removing `identity.key`
+    /// and retrying.
     pub async fn generate_and_save(
         home: &Path,
         store: &SqliteEventStore,
     ) -> Result<Self, IdentityError> {
+        Self::generate_and_save_as(home, store, airc_store::DEFAULT_AGENT_NAME).await
+    }
+
+    pub async fn generate_and_save_as(
+        home: &Path,
+        store: &SqliteEventStore,
+        agent_name: impl AsRef<str>,
+    ) -> Result<Self, IdentityError> {
+        let agent_name = normalise_agent_name(agent_name.as_ref())?;
         ensure_home_dir(home)?;
         let keypair = PeerKeypair::generate();
         let peer_id = PeerId::new();
@@ -239,7 +344,7 @@ impl LocalIdentity {
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms,
                 identity: Identity::default(),
-                agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
+                agent_name: agent_name.clone(),
             })
             .await?;
 
@@ -247,6 +352,7 @@ impl LocalIdentity {
             keypair,
             peer_id,
             client_id,
+            agent_name,
         })
     }
 }
@@ -286,6 +392,24 @@ async fn migrate_legacy_identity_json(
     store.insert_local_identity(stored.clone()).await?;
     let _ = std::fs::remove_file(path);
     Ok(Some(stored))
+}
+
+fn requested_agent_name(explicit: Option<&str>) -> Result<String, IdentityError> {
+    if let Some(value) = explicit {
+        return normalise_agent_name(value);
+    }
+    match std::env::var_os(AIRC_AGENT_NAME_ENV) {
+        Some(value) => normalise_agent_name(&value.to_string_lossy()),
+        None => Ok(airc_store::DEFAULT_AGENT_NAME.to_string()),
+    }
+}
+
+fn normalise_agent_name(value: &str) -> Result<String, IdentityError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(IdentityError::InvalidAgentName(value.to_string()));
+    }
+    Ok(trimmed.to_string())
 }
 
 async fn open_store(home: &Path) -> Result<SqliteEventStore, IdentityError> {
@@ -356,6 +480,76 @@ mod tests {
         assert_eq!(first.keypair.secret_bytes(), second.keypair.secret_bytes());
         assert_eq!(first.peer_id, second.peer_id);
         assert_eq!(first.client_id, second.client_id);
+        assert_eq!(first.agent_name, airc_store::DEFAULT_AGENT_NAME);
+    }
+
+    #[tokio::test]
+    async fn load_or_generate_as_records_agent_name() {
+        let home = TempDir::new().unwrap();
+        let identity = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+
+        assert_eq!(identity.agent_name, "codex");
+        let store = open_store(home.path()).await.unwrap();
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.agent_name, "codex");
+        assert!(store.load_local_identity().await.unwrap().is_none());
+
+        let second = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+        assert_eq!(second.peer_id, identity.peer_id);
+        assert_eq!(second.agent_name, "codex");
+
+        let default = LocalIdentity::load_or_generate(home.path()).await.unwrap();
+        assert_eq!(default.agent_name, airc_store::DEFAULT_AGENT_NAME);
+        assert_ne!(default.peer_id, identity.peer_id);
+        assert_eq!(
+            default.keypair.secret_bytes(),
+            identity.keypair.secret_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_or_generate_as_adds_named_agent_to_existing_scope() {
+        let home = TempDir::new().unwrap();
+        let default = LocalIdentity::load_or_generate(home.path()).await.unwrap();
+        let codex = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+
+        assert_eq!(codex.agent_name, "codex");
+        assert_ne!(default.peer_id, codex.peer_id);
+        assert_ne!(default.client_id, codex.client_id);
+        assert_eq!(default.keypair.secret_bytes(), codex.keypair.secret_bytes());
+
+        let store = open_store(home.path()).await.unwrap();
+        let default_row = store.load_local_identity().await.unwrap().unwrap();
+        let codex_row = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(default_row.peer_id, default.peer_id);
+        assert_eq!(codex_row.peer_id, codex.peer_id);
+    }
+
+    #[test]
+    fn agent_name_is_trimmed_and_must_be_printable() {
+        assert_eq!(normalise_agent_name("  codex  ").unwrap(), "codex");
+        assert!(matches!(
+            normalise_agent_name(" \n "),
+            Err(IdentityError::InvalidAgentName(_))
+        ));
+        assert!(matches!(
+            normalise_agent_name("codex\nmain"),
+            Err(IdentityError::InvalidAgentName(_))
+        ));
     }
 
     #[tokio::test]

@@ -189,6 +189,16 @@ impl Airc {
         Self::open_with_policy(home, VerificationPolicy::Strict).await
     }
 
+    /// Open the substrate for an explicit local agent name. This is
+    /// the embeddable API behind `airc init --as <name>`; callers that
+    /// do not pass a name can set `AIRC_AGENT_NAME` and use [`open`].
+    pub async fn open_as(
+        home: impl Into<PathBuf>,
+        agent_name: impl Into<String>,
+    ) -> Result<Self, AircError> {
+        Self::open_with_policy_as(home, VerificationPolicy::Strict, agent_name).await
+    }
+
     /// Attach to an already-running daemon. The handle still opens
     /// local identity/store state so consumers can inspect identity,
     /// room, and replay state through the same `Airc` facade, but
@@ -227,7 +237,20 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let wire_root = machine_account_home(&home);
-        Self::open_inner(home, wire_root, policy).await
+        Self::open_inner(home, wire_root, policy, None).await
+    }
+
+    /// Variant of [`open_with_policy`] that pins the local agent name
+    /// explicitly instead of reading `AIRC_AGENT_NAME`.
+    pub async fn open_with_policy_as(
+        home: impl Into<PathBuf>,
+        policy: VerificationPolicy,
+        agent_name: impl Into<String>,
+    ) -> Result<Self, AircError> {
+        let home: PathBuf = home.into();
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let wire_root = machine_account_home(&home);
+        Self::open_inner(home, wire_root, policy, Some(agent_name.into())).await
     }
 
     /// Test-only: open with an explicit machine-account wire root rather
@@ -241,16 +264,26 @@ impl Airc {
         home: impl Into<PathBuf>,
         wire_root: impl Into<PathBuf>,
     ) -> Result<Self, AircError> {
-        Self::open_inner(home.into(), wire_root.into(), VerificationPolicy::Strict).await
+        Self::open_inner(
+            home.into(),
+            wire_root.into(),
+            VerificationPolicy::Strict,
+            None,
+        )
+        .await
     }
 
     async fn open_inner(
         home: PathBuf,
         wire_root: PathBuf,
         policy: VerificationPolicy,
+        agent_name: Option<String>,
     ) -> Result<Self, AircError> {
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let identity = LocalIdentity::load_or_generate(&home).await?;
+        let identity = match agent_name {
+            Some(agent_name) => LocalIdentity::load_or_generate_as(&home, agent_name).await?,
+            None => LocalIdentity::load_or_generate(&home).await?,
+        };
         std::fs::create_dir_all(&wire_root).map_err(IdentityError::Io)?;
         peers_store::add(
             &wire_root,
@@ -343,6 +376,11 @@ impl Airc {
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id
+    }
+
+    /// Local agent-name discriminator for this identity row.
+    pub fn agent_name(&self) -> &str {
+        &self.inner.identity.agent_name
     }
 
     /// Persist a new local-identity card and broadcast the update to

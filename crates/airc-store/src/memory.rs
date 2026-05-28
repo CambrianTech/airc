@@ -18,7 +18,7 @@ use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
 pub struct InMemoryEventStore {
-    local_identity: Mutex<Option<StoredLocalIdentity>>,
+    local_identities: Mutex<BTreeMap<String, StoredLocalIdentity>>,
     events: Mutex<Vec<TranscriptEvent>>,
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
     subscriptions: Mutex<Vec<StoredSubscription>>,
@@ -30,7 +30,7 @@ pub struct InMemoryEventStore {
 impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
-            local_identity: Mutex::new(None),
+            local_identities: Mutex::new(BTreeMap::new()),
             events: Mutex::new(Vec::new()),
             runtime_cursors: Mutex::new(BTreeMap::new()),
             subscriptions: Mutex::new(Vec::new()),
@@ -58,28 +58,22 @@ impl EventStore for InMemoryEventStore {
         &self,
         agent_name: &str,
     ) -> Result<Option<StoredLocalIdentity>, StoreError> {
-        // The in-memory store still holds one identity; faithfully
-        // honour the trait contract by filtering on agent_name and
-        // returning None for a mismatch. Card 8384cc18 Sub-C.
-        let identity = self
-            .local_identity
+        let identities = self
+            .local_identities
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
-        Ok(identity
-            .as_ref()
-            .filter(|i| i.agent_name == agent_name)
-            .cloned())
+        Ok(identities.get(agent_name).cloned())
     }
 
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError> {
         let mut stored = self
-            .local_identity
+            .local_identities
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
-        if stored.is_some() {
+        if stored.contains_key(&identity.agent_name) {
             return Err(StoreError::Database(sea_orm::DbErr::RecordNotInserted));
         }
-        *stored = Some(identity);
+        stored.insert(identity.agent_name.clone(), identity);
         Ok(())
     }
 
@@ -88,10 +82,10 @@ impl EventStore for InMemoryEventStore {
         identity: airc_core::identity::Identity,
     ) -> Result<(), StoreError> {
         let mut stored = self
-            .local_identity
+            .local_identities
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
-        let Some(row) = stored.as_mut() else {
+        let Some(row) = stored.get_mut(crate::DEFAULT_AGENT_NAME) else {
             return Err(StoreError::NotFound("local_identity"));
         };
         row.identity = identity;
