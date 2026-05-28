@@ -182,6 +182,19 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     sync_daemon_peers_for_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
 
+    // Card 745e93f0 (slice 4/4 of engine-keystone 2903a8ef): surface
+    // the room's operating doctrine to the attaching agent. Agent
+    // runner harnesses scrape this region from join stdout and
+    // inject it into the agent's system context — the "user is not
+    // the engine" fix lands here. Marked with stable BEGIN/END
+    // markers so the scrape is unambiguous; silent when the room
+    // has no published doctrine.
+    if let Ok(Some(doctrine)) = airc.room_doctrine().await {
+        println!("--- BEGIN ROOM DOCTRINE (version={}) ---", doctrine.version);
+        println!("{}", doctrine.body);
+        println!("--- END ROOM DOCTRINE ---");
+    }
+
     let _heartbeat = if runtime_context.should_stream_join() {
         Some(start_join_heartbeat(&airc, home, &runtime_context).await?)
     } else {
