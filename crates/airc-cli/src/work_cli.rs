@@ -258,6 +258,29 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 600_000)]
         ttl_ms: u64,
     },
+    /// Card f16650cd: continuous-merge daemon. Long-running process
+    /// that polls Review-state cards, merges PRs whose CI is green,
+    /// and publishes `PullRequestMerged` so the projection transitions
+    /// the card. Runs until Ctrl-C / SIGTERM. One per scope at a time
+    /// (`<home>/merger.lock` flock).
+    Merger {
+        #[command(subcommand)]
+        action: MergerAction,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum MergerAction {
+    /// Start the continuous-merge loop.
+    Run {
+        /// Poll interval in seconds (default: 30).
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+        /// Don't actually call `gh pr merge` — log what WOULD be
+        /// merged. Useful while validating the gate logic.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
