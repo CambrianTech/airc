@@ -90,7 +90,16 @@ fn workspace_request_allocate_heartbeat_release_projects_on_list() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
+    // Card 303f2384: --no-lease-required is gated on cwd being a
+    // scope-owner / lease-zone / project-root. `airc init` creates
+    // `.airc/` in HOME (the machine home dir), not the --home arg.
+    // So we point HOME and cwd at the tempdir root, which becomes
+    // the scope owner after init.
+    let machine_home = home.parent().unwrap_or(home);
     let output = Command::new(airc_core())
+        .current_dir(machine_home)
+        .env("HOME", machine_home)
+        .env("USERPROFILE", machine_home)
         .arg("--home")
         .arg(home)
         .args(args)
