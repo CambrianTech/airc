@@ -6,6 +6,17 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 const INSTRUCTIONS_START: &str = "# AIRC-CODEX-INSTRUCTIONS-START";
 const INSTRUCTIONS_END: &str = "# AIRC-CODEX-INSTRUCTIONS-END";
+const MANAGED_DEVELOPER_INSTRUCTIONS: &str = r#"# AIRC-CODEX-INSTRUCTIONS-START - managed by airc codex-hook install-hooks; remove this section through AIRC-CODEX-INSTRUCTIONS-END to opt out
+developer_instructions = """
+AIRC Codex runtime contract:
+- Keep airc join running as this session's live AIRC feed when coordinating with peer agents.
+- If no live join session id is available during a turn, run airc codex-hook poll --wait-ms 1000 between tool steps. It is the bounded mid-turn feed and shares the same runtime cursor as the hook.
+- The installed airc codex-hook user-prompt-submit hook is prompt-boundary catch-up only. Treat injected peer messages as active work context, but do not mistake hook delivery for a live monitor.
+- Reply to direct peer questions with airc msg, not user-chat stdout. The peer sees AIRC, not this transcript.
+- Distinguish transport/process liveness from whether this Codex session has actually seen peer traffic.
+"""
+# AIRC-CODEX-INSTRUCTIONS-END
+"#;
 
 pub fn enable_hooks_feature(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let original = read_text(path)?;
@@ -55,24 +66,38 @@ pub fn remove_managed_developer_instructions(
     if !original.contains(INSTRUCTIONS_START) {
         return Ok(false);
     }
-    let mut out = Vec::new();
-    let mut skipping = false;
-    for line in original.lines() {
-        if line.starts_with(INSTRUCTIONS_START) {
-            skipping = true;
-            continue;
-        }
-        if skipping {
-            if line.starts_with(INSTRUCTIONS_END) {
-                skipping = false;
-            }
-            continue;
-        }
-        out.push(line);
-    }
-    let rendered = out.join("\n").trim().to_string();
+    let rendered = strip_managed_developer_instructions(&original)
+        .trim()
+        .to_string();
     write_text(path, &(rendered + "\n"))?;
     Ok(true)
+}
+
+pub fn upsert_managed_developer_instructions(
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    let without_managed = strip_managed_developer_instructions(&original);
+    let doc = parse_toml_document(&without_managed)?;
+    if doc.get("developer_instructions").is_some() {
+        if without_managed != original {
+            write_text(path, &without_managed)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let mut rendered = String::new();
+    rendered.push_str(MANAGED_DEVELOPER_INSTRUCTIONS);
+    if !without_managed.trim().is_empty() {
+        rendered.push('\n');
+        rendered.push_str(without_managed.trim_start());
+    }
+    if rendered != original {
+        write_text(path, &rendered)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub fn remove_stale_airc_filesystem_permissions(
@@ -111,6 +136,28 @@ pub fn remove_stale_airc_filesystem_permissions(
     }
     write_text(path, &rendered)?;
     Ok(true)
+}
+
+fn strip_managed_developer_instructions(text: &str) -> String {
+    if !text.contains(INSTRUCTIONS_START) {
+        return text.to_string();
+    }
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.starts_with(INSTRUCTIONS_START) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.starts_with(INSTRUCTIONS_END) {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    collapse_blank_lines(&out.join("\n"))
 }
 
 fn parse_toml_document(text: &str) -> Result<DocumentMut, Box<dyn std::error::Error>> {

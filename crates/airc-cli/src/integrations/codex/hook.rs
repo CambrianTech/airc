@@ -299,7 +299,7 @@ fn dedupe(events: &[TranscriptEvent]) -> Vec<DigestMessage> {
     let mut seen = BTreeSet::new();
     let mut messages = Vec::new();
     for event in events {
-        if is_work_queue_event(event) {
+        if is_work_queue_event(event) || is_runtime_alive_event(event) {
             continue;
         }
         let peer = event.peer_id.to_string();
@@ -309,6 +309,26 @@ fn dedupe(events: &[TranscriptEvent]) -> Vec<DigestMessage> {
         }
     }
     messages
+}
+
+fn is_runtime_alive_event(event: &TranscriptEvent) -> bool {
+    let Some(body) = &event.body else {
+        return false;
+    };
+    match body {
+        Body::Binary(_) => false,
+        Body::Json(value) => {
+            body_kind_is_alive(value)
+                || body.as_text().is_some_and(|text| {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .is_ok_and(|value| body_kind_is_alive(&value))
+                })
+        }
+    }
+}
+
+fn body_kind_is_alive(value: &serde_json::Value) -> bool {
+    value.get("kind").and_then(|kind| kind.as_str()) == Some("alive")
 }
 
 fn summarize_body(event: &TranscriptEvent) -> String {
@@ -338,7 +358,13 @@ fn summarize_text(value: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::consumer_id;
+    use airc_core::{
+        Body, ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptEvent,
+        TranscriptKind,
+    };
+    use serde_json::json;
+
+    use super::{consumer_id, render_digest, render_raw};
 
     #[test]
     fn consumer_id_uses_runtime_client_when_present() {
@@ -347,5 +373,58 @@ mod tests {
             "codex-hook:codex:thread-1"
         );
         assert_eq!(consumer_id(None), "codex-hook:default");
+    }
+
+    #[test]
+    fn digest_suppresses_runtime_alive_events() {
+        let events = vec![
+            event(Body::Json(json!({
+                "kind": "alive",
+                "client_id": "claude:session-1",
+            }))),
+            event(Body::text("real update")),
+        ];
+
+        let digest = render_digest(&events, 8);
+
+        assert!(digest.contains("AIRC: 1 unread"));
+        assert!(digest.contains("real update"));
+        assert!(!digest.contains("\"kind\":\"alive\""));
+    }
+
+    #[test]
+    fn raw_output_keeps_runtime_alive_events_for_debugging() {
+        let events = vec![event(Body::Json(json!({ "kind": "alive" })))];
+
+        let raw = render_raw(&events);
+
+        assert!(raw.contains("\"kind\":\"alive\""));
+    }
+
+    #[test]
+    fn digest_suppresses_text_encoded_runtime_alive_events() {
+        let events = vec![event(Body::text(r#"{"kind":"alive"}"#))];
+
+        let digest = render_digest(&events, 8);
+
+        assert!(digest.is_empty());
+    }
+
+    fn event(body: Body) -> TranscriptEvent {
+        TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::System,
+            occurred_at_ms: 1,
+            lamport: 1,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(body),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
     }
 }

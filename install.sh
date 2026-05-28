@@ -760,21 +760,8 @@ fi
 
 _install_airc_codex_developer_instructions() {
   local config="$HOME/.codex/config.toml"
-  local hooks_json="$HOME/.codex/hooks.json"
   [ "${AIRC_SKIP_CODEX_INSTRUCTIONS:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
-
-  if grep -qE '^[[:space:]]*(hooks|codex_hooks)[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
-     && [ -f "$hooks_json" ] \
-     && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
-    if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
-      local _tmp; _tmp=$(mktemp)
-      sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
-      mv "$_tmp" "$config"
-    fi
-    info "  Codex AIRC hook already installed; skipping developer_instructions polling contract"
-    return 0
-  fi
 
   if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
     local _tmp; _tmp=$(mktemp)
