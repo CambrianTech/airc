@@ -345,6 +345,36 @@ impl Airc {
         self.inner.identity.client_id
     }
 
+    /// Richer roster lookup — return the full `PeerIdentityCard` if
+    /// `peer_id` has published one in the current room's recent
+    /// window. Powers `airc whois <peer>` (card 20066c49) and any
+    /// future caller that needs more than just the display name.
+    /// Same scan window + on-demand model as [`Self::peer_alias`].
+    pub async fn peer_identity_card(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::IdentityPublished {
+                continue;
+            }
+            if event.peer_id != peer_id {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
+            else {
+                continue;
+            };
+            return Ok(Some(card));
+        }
+        Ok(None)
+    }
+
     /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
     ///
     /// Scans recent transcript events in the current room for the

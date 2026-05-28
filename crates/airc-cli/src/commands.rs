@@ -942,7 +942,42 @@ pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std
         [peer] => {
             println!("  peer_id:   {}", peer.peer_id);
             println!("  pubkey:    {}", peer.pubkey_b64);
-            println!("  identity:  not published yet");
+            // Card 20066c49: read the identity card the peer published
+            // via the substrate (IdentityPublished events emitted on
+            // join — cards 088af06 / cd638b8) when known. Falls back
+            // to the honest "not published yet" line so the user can
+            // tell unknown from blank-but-known.
+            match airc.peer_identity_card(peer.peer_id).await {
+                Ok(Some(card)) => {
+                    let id = &card.identity;
+                    let name = if id.name.is_empty() { "(unset)" } else { id.name.as_str() };
+                    let pronouns = if id.pronouns.is_empty() { "(unset)" } else { id.pronouns.as_str() };
+                    let role = if id.role.is_empty() { "(unset)" } else { id.role.as_str() };
+                    let bio = if id.bio.is_empty() { "(unset)" } else { id.bio.as_str() };
+                    let status = if id.status.is_empty() { "(none)" } else { id.status.as_str() };
+                    let fingerprint = if id.fingerprint.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.fingerprint.as_str()
+                    };
+                    println!("  identity:  published");
+                    println!("    name:        {name}");
+                    println!("    pronouns:    {pronouns}");
+                    println!("    role:        {role}");
+                    println!("    bio:         {bio}");
+                    println!("    status:      {status}");
+                    println!("    fingerprint: {fingerprint}");
+                    if !id.integrations.is_empty() {
+                        println!("    integrations:");
+                        for (k, v) in &id.integrations {
+                            println!("      {k}: {v}");
+                        }
+                    }
+                    println!("    emitted_at:  {} ms", card.emitted_at_ms);
+                }
+                Ok(None) => println!("  identity:  not published yet"),
+                Err(error) => println!("  identity:  lookup failed: {error}"),
+            }
             println!("  source:    peer trust store");
             Ok(())
         }
