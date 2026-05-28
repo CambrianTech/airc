@@ -115,7 +115,10 @@ pub fn forget(project_root_or_home: &Path) {
 /// otherwise sets errno (ESRCH for dead, EPERM for live-but-unowned).
 /// We treat EPERM as "alive" because for our purposes a daemon owned
 /// by another OS user is still "running"; the per-UID discovery dir
-/// keeps such daemons out of our view in the first place.
+/// keeps such daemons out of our view in the first place. errno is
+/// read via `std::io::Error::last_os_error().raw_os_error()` for
+/// cross-platform compatibility — direct `libc::__error()` access
+/// is macOS-specific (Linux uses `__errno_location`).
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -126,11 +129,7 @@ fn pid_alive(pid: u32) -> bool {
     if res == 0 {
         return true;
     }
-    // errno == EPERM means the process exists but we can't signal it.
-    // SAFETY: errno is a thread-local int; reading it after a libc call
-    // is well-defined.
-    let errno = unsafe { *libc::__error() };
-    errno == libc::EPERM
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Read every `.json` file in the discovery dir, drop the ones whose
