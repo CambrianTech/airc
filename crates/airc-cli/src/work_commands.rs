@@ -513,6 +513,26 @@ pub async fn run_state(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let card_state = CardState::from(state);
+
+    // Card a1bc62b3 — substrate-only target states refused from the CLI.
+    // Symmetric to 9656a836's close-side guard, which refuses
+    // self-attested closure. Without this gate, 9656a836 has a clean
+    // bypass:
+    //
+    //   airc work state X review        # legitimate
+    //   airc work state X merged        # ← agent self-attests merged
+    //   airc work close X               # passes 9656a836 (state == Merged)
+    //
+    // Closing that hole is what makes the close-guard's
+    // "shipped = PR merged" promise real. When the gh observer ships,
+    // it routes through `Airc::change_work_card_state` directly,
+    // bypassing this CLI path — that's the correct architectural
+    // boundary (agent input through the CLI guard, substrate
+    // mechanisms write events directly).
+    if !cli_can_set_state_directly(card_state) {
+        return Err(refusal_message(card_uuid, card_state).into());
+    }
+
     airc.change_work_card_state(ChangeWorkCardState {
         card_id: card_uuid,
         state: card_state,
@@ -734,6 +754,62 @@ fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error
         .into());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// Card a1bc62b3 — gate on direct CLI state writes.
+///
+/// Returns `true` when the CLI's `airc work state <id> <target>` is
+/// allowed to drive a card into `target` by direct event emission.
+///
+/// `false` for substrate-owned target states:
+///   * [`CardState::Merged`] — only the gh observer's
+///     `WorkEvent::PullRequestMerged` should set Merged; an agent
+///     self-attesting Merged from the CLI defeats 9656a836's
+///     close-guard.
+///
+/// `true` for everything else the workflow currently surfaces
+/// (Open / Claimed / InProgress / Blocked / Review / Closed). 9656a836's
+/// `close_transition_allowed_from` already gates Closed by FROM-state.
+/// This gate is its sibling on the TO-state axis.
+///
+/// "Workflow is workflow" — for non-coding recipes, swap PR-merged
+/// for the recipe-specific verified-done signal; the substrate gate
+/// is the same shape.
+pub(crate) fn cli_can_set_state_directly(target: CardState) -> bool {
+    !matches!(target, CardState::Merged)
+}
+
+/// Per-state actionable refusal message for the gate above. Lesser-
+/// capable agents read this verbatim, so the corrective steps for
+/// each refused state are explicit.
+fn refusal_message(card_uuid: airc_lib::WorkCardId, target: CardState) -> String {
+    match target {
+        CardState::Merged => format!(
+            "refusing to set card {card_uuid} to Merged from the CLI: Merged is \
+             reserved for the PullRequestMerged event from the gh observer, \
+             which fires automatically when the linked PR merges on github.\n\n\
+             What you almost certainly want instead:\n  \
+             - If the PR has been merged on github: wait for the gh observer \
+             event to land (or check the card's pull_request field on the \
+             board — if it shows merged_at populated, the observer event is \
+             in flight).\n  \
+             - If you want to mark the card done without going through \
+             github (e.g. cancellation): `airc work close {card_uuid}` from \
+             a pre-work state (Open / Claimed / Blocked) succeeds directly \
+             per card 9656a836's close-guard.\n  \
+             - If you want to override for testing / recovery: this CLI \
+             surface is deliberately disabled (card a1bc62b3); patch the \
+             substrate or use a substrate-internal recovery tool."
+        ),
+        // Future substrate-owned states extend this match. The
+        // compiler enforces exhaustiveness on the gate function;
+        // the refusal message follows it.
+        other => format!(
+            "refusing to set card {card_uuid} to {other:?} from the CLI \
+             (no actionable next step encoded yet — this is a bug in \
+             airc-cli's refusal_message)"
+        ),
+    }
 }
 
 pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -1567,5 +1643,62 @@ mod tests {
         // ellipsis.
         let expected_visible: String = std::iter::repeat('日').take(80).collect();
         assert_eq!(title, format!("review: {expected_visible}…"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Card a1bc62b3 — substrate-only target-state gate
+    // ---------------------------------------------------------------------
+
+    /// The gate refuses ONLY [`CardState::Merged`] today. Every other
+    /// `CardState` variant is allowed through, because:
+    ///   - Open / Claimed / Blocked: pre-work states the agent
+    ///     legitimately drives.
+    ///   - InProgress: agent's "I'm actively working" signal.
+    ///   - Review: opens a PR (card 820629e9).
+    ///   - Closed: 9656a836's close-guard handles the FROM-state
+    ///     gate; this gate is the TO-state sibling.
+    ///
+    /// Future substrate-owned target states extend the match in
+    /// `cli_can_set_state_directly`. This test catches any new
+    /// CardState variant that's added without an explicit
+    /// allow/refuse decision (the test fails closed: every variant
+    /// is asserted on, so a new one needs an arm added here).
+    #[test]
+    fn cli_can_set_state_directly_only_refuses_merged() {
+        // Refused targets:
+        assert!(
+            !cli_can_set_state_directly(CardState::Merged),
+            "Merged is substrate-owned (gh PullRequestMerged event); \
+             CLI must not self-attest"
+        );
+
+        // Allowed targets — every other current CardState variant.
+        // Listed explicitly (not via a default arm) so a new variant
+        // added to CardState surfaces here at test-time, forcing the
+        // author to classify it.
+        assert!(cli_can_set_state_directly(CardState::Open));
+        assert!(cli_can_set_state_directly(CardState::Claimed));
+        assert!(cli_can_set_state_directly(CardState::InProgress));
+        assert!(cli_can_set_state_directly(CardState::Blocked));
+        assert!(cli_can_set_state_directly(CardState::Review));
+        assert!(cli_can_set_state_directly(CardState::Closed));
+    }
+
+    /// Refusal message is what a lesser-capable agent reads
+    /// verbatim to figure out the corrective action. Pin the
+    /// substantive guidance phrases so a future tweak that drops
+    /// them surfaces here.
+    #[test]
+    fn refusal_message_for_merged_carries_actionable_guidance() {
+        let card_id = airc_lib::WorkCardId::new();
+        let msg = refusal_message(card_id, CardState::Merged);
+        assert!(msg.contains("PullRequestMerged"), "names the substrate event");
+        assert!(msg.contains("gh observer"), "points at the event source");
+        assert!(msg.contains("airc work close"), "names the cancellation alternative");
+        assert!(msg.contains("9656a836"), "cross-references the close-guard card");
+        assert!(msg.contains("a1bc62b3"), "cross-references THIS card");
+        // The id must appear so the agent can copy-paste it into
+        // the corrective command.
+        assert!(msg.contains(&card_id.to_string()), "carries the card UUID");
     }
 }
