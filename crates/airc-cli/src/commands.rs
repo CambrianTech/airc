@@ -24,7 +24,7 @@ use futures::stream::StreamExt;
 use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
 use airc_identity::LocalIdentity;
 use airc_ipc::{AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response};
-use airc_lib::{Airc, Body, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
+use airc_lib::{Airc, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_trust as peers_store;
 
@@ -794,17 +794,11 @@ where
 }
 
 fn print_event(event: &airc_core::TranscriptEvent) {
-    let text = event
-        .body
-        .as_ref()
-        .and_then(Body::as_text)
-        .unwrap_or("<non-text body>");
-    println!(
-        "[{kind:?}] {sender} → {channel}: {text}",
-        kind = event.kind,
-        sender = event.peer_id,
-        channel = event.room_id,
-    );
+    // Structured events render by kind; `alive` heartbeats are suppressed
+    // (None) so they don't drown the feed. See `event_render`.
+    if let Some(line) = crate::event_render::render_feed_line(event) {
+        println!("{line}");
+    }
 }
 
 /// Build the runtime `PeerKeyRegistry` from persistent peers

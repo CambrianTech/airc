@@ -22,6 +22,7 @@ mod collaboration_peers;
 mod commands;
 mod doctor;
 mod envelope_cli;
+mod event_render;
 mod events_cli;
 mod events_commands;
 mod gh_cli;

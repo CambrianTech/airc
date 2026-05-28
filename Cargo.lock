@@ -87,6 +87,7 @@ dependencies = [
  "airc-store",
  "airc-transport",
  "airc-trust",
+ "airc-work",
  "base64",
  "chacha20poly1305",
  "chrono",

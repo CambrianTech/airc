@@ -24,6 +24,7 @@ airc-trust = { path = "../airc-trust" }
 airc-daemon = { path = "../airc-daemon" }
 airc-store = { path = "../airc-store" }
 airc-lib = { path = "../airc-lib" }
+airc-work = { path = "../airc-work" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
