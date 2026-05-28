@@ -220,35 +220,29 @@ authority to review — atomic claim picks one if multiple race.
 
 ---
 
-## 9. Identity model: airc peers ≡ Continuum personas
+## 9. Identity model: airc-first, Continuum-persona assist later
 
-**Architectural constraint** (Joel, 2026-05-27: "in continuum agents
-and persona are first class citizens"). airc does NOT invent a parallel
-agent / persona registry. Personas — with role, skills, authority,
-history, availability — are first-class in Continuum. airc's
-peer-identity surfaces (the existing local_identity card, the in-flight
-`af40f46d` roster work) are projections / cached views of those
-personas, not separate truth.
+**Mission framing** (Joel, 2026-05-27: "we are trying to build an
+autonomous team of agents like yourself from within airc … later with
+continuum persona to also assist"). airc owns its own identity
+substrate — the `Identity` card already lives in `airc-core`, with
+name/pronouns/role/bio/status/fingerprint/integrations. Roster work
+(`af40f46d` + sub-cards) projects this airc-native data, **not a
+mirror of Continuum.** The autonomous team is built standalone in
+airc; Continuum personas are a *future enrichment* (richer skill
+metadata, cross-product persona binding) that assists but is never a
+prerequisite.
 
-Persona attributes are **descriptive metadata, not gating.** Skill
+Identity attributes are **descriptive metadata, not gating.** Skill
 tags, role labels, history — they help peers *find* the right peer
 for a thing ("who has Rust skill" for review suggestion); they do NOT
-grant or restrict authority. Every persona has equal power. No
-"lead" persona can dispatch; no "peer" persona is blocked.
+grant or restrict authority. Every peer has equal power. No "lead"
+can dispatch; no "peer" is blocked.
 
-Implications across the open work:
-
-- **Alias resolution** (`6f111211`) — look up by peer_id in Continuum's
-  persona registry; alias = `persona.display_name`.
-- **Reviewer suggestion** (`ad7e100b`) — `airc work next` can *bias*
-  suggestion by persona skill match, but any peer can still claim any
-  review card.
-- **Heartbeat coordination signal** (`aacf2162`) — availability lives
-  on the persona; airc heartbeats reference a persona-snapshot
-  version, not duplicate fields.
-
-If you find yourself adding identity fields in airc that overlap with
-Continuum personas, stop and check `5842c35c` — the integration card.
+When Continuum integration lands (card `5842c35c` reframed as future
+assist), it augments — additional fields and queries cross-product —
+without replacing airc's roster as the source of truth for who's in
+this room right now.
 
 ---
 
