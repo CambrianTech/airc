@@ -345,6 +345,30 @@ impl Airc {
         self.inner.identity.client_id
     }
 
+    /// Persist a new local-identity card and broadcast the update to
+    /// every currently-subscribed room so attached peers see the
+    /// updated profile without rejoining (card da586598 — last
+    /// identity-roster slice).
+    ///
+    /// Replaces the old direct-store save in the CLI's nick / identity
+    /// edit path: storage + emission are now atomic from the caller's
+    /// view (one fails, neither effect is visible to peers). Per-room
+    /// emission iterates the SubscriptionSet's `subscribed` map.
+    pub async fn set_local_identity_card(
+        &self,
+        identity: airc_core::identity::Identity,
+    ) -> Result<(), AircError> {
+        self.event_store()
+            .save_local_identity_card(identity)
+            .await
+            .map_err(AircError::from)?;
+        let set = subscriptions::load_or_init(self.event_store()).await?;
+        for subscription in set.subscribed.values() {
+            self.emit_peer_identity_card(subscription.room_id).await?;
+        }
+        Ok(())
+    }
+
     /// Richer roster lookup — return the full `PeerIdentityCard` if
     /// `peer_id` has published one in the current room's recent
     /// window. Powers `airc whois <peer>` (card 20066c49) and any
