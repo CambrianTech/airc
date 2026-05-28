@@ -134,6 +134,7 @@ dependencies = [
  "airc-transport",
  "airc-trust",
  "airc-wire",
+ "airc-work",
  "async-trait",
  "base64",
  "bytes",
