@@ -43,6 +43,33 @@ pub struct WorkBoardProjection {
     pub(super) manager_hats: BTreeMap<RepoId, ManagerHat>,
     pub(super) agent_availability: BTreeMap<String, AgentAvailabilityRecord>,
     pub(super) hygiene_reports: Vec<HygieneReport>,
+    /// Card 267d68f5 — set of peers who've cast LGTM for each card.
+    /// Used by the continuous-merger to gate multi-author rooms: a
+    /// non-author LGTM is required before auto-merge. Idempotent
+    /// across re-votes (set semantics).
+    pub(super) work_lgtm_votes: BTreeMap<WorkCardId, std::collections::HashSet<PeerId>>,
+}
+
+impl WorkBoardProjection {
+    /// Set of peers who've cast LGTM for `card_id`. Empty if none.
+    /// Card 267d68f5 — consumed by the continuous-merger and by
+    /// `airc work board` renderers that want to surface review
+    /// progress (`✓ 1 lgtm`).
+    pub fn lgtm_voters(&self, card_id: WorkCardId) -> impl Iterator<Item = &PeerId> + '_ {
+        self.work_lgtm_votes
+            .get(&card_id)
+            .into_iter()
+            .flat_map(|set| set.iter())
+    }
+
+    /// True when at least one peer DIFFERENT from `author` has cast
+    /// LGTM for `card_id`. The continuous-merger's gate for
+    /// multi-author rooms: an author can't approve their own work.
+    pub fn has_non_author_lgtm(&self, card_id: WorkCardId, author: &PeerId) -> bool {
+        self.work_lgtm_votes
+            .get(&card_id)
+            .is_some_and(|set| set.iter().any(|p| p != author))
+    }
 }
 
 impl WorkBoardProjection {

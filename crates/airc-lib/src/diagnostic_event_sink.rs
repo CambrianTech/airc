@@ -168,6 +168,7 @@ fn severity_header_value(severity: DiagnosticSeverity) -> &'static str {
 fn component_header_value(component: DiagnosticComponent) -> &'static str {
     match component {
         DiagnosticComponent::Daemon => "daemon",
+        DiagnosticComponent::Merger => "merger",
         DiagnosticComponent::Monitor => "monitor",
         DiagnosticComponent::Replay => "replay",
         DiagnosticComponent::Subscriber => "subscriber",
@@ -189,6 +190,12 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ReplayFramesSkipped => "replay_frames_skipped",
         DiagnosticCode::WebRtcOfferAnswerFailed => "webrtc_offer_answer_failed",
         DiagnosticCode::WorkspaceLeaseViolation => "workspace_lease_violation",
+        DiagnosticCode::MergerStarted => "merger_started",
+        DiagnosticCode::MergerShutdown => "merger_shutdown",
+        DiagnosticCode::MergerTickFailed => "merger_tick_failed",
+        DiagnosticCode::MergerSkipped => "merger_skipped",
+        DiagnosticCode::MergerMerged => "merger_merged",
+        DiagnosticCode::MergerMergeFailed => "merger_merge_failed",
     }
 }
 

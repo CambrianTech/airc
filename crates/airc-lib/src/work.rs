@@ -172,6 +172,15 @@ pub struct MarkPullRequestMerged {
     pub merged_at_ms: u64,
 }
 
+/// Card 267d68f5: peer LGTM. A peer (presumed non-author — the
+/// projection enforces author-distinct semantics on consumption)
+/// approves the card's PR for merge. Idempotent: repeated casts by
+/// the same peer collapse into one set entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastWorkLgtm {
+    pub card_id: WorkCardId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatWorkClaim {
     pub card_id: WorkCardId,
@@ -496,6 +505,23 @@ impl Airc {
             pull_request: request.pull_request,
             linked_by: self.peer_id(),
             linked_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Card 267d68f5: cast a peer LGTM. The continuous-merger gates
+    /// auto-merge on at least one LGTM from a non-author peer for
+    /// multi-author rooms. Idempotent — voting twice is harmless.
+    /// `voted_by` is the calling peer's id; the projection enforces
+    /// author-distinct semantics, not the publish path.
+    pub async fn cast_work_lgtm(&self, request: CastWorkLgtm) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::WorkLgtmCast(airc_work::event::WorkLgtmCast {
+            card_id: request.card_id,
+            voted_by: self.peer_id(),
+            voted_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())

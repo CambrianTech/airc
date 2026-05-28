@@ -106,6 +106,7 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::PullRequestMergeStateChanged(_) => "pull_request_merge_state_changed",
         WorkEvent::PullRequestLinked(_) => "pull_request_linked",
         WorkEvent::PullRequestMerged(_) => "pull_request_merged",
+        WorkEvent::WorkLgtmCast(_) => "work_lgtm_cast",
         WorkEvent::HygieneReportRecorded(_) => "hygiene_report_recorded",
         WorkEvent::ManagerHatClaimed(_) => "manager_hat_claimed",
         WorkEvent::ManagerHatReleased(_) => "manager_hat_released",

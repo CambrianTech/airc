@@ -3,8 +3,8 @@ use crate::event::{
     ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
-    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkspaceAllocated,
-    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkLgtmCast,
+    WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
@@ -55,6 +55,10 @@ impl WorkBoardProjection {
             }
             WorkEvent::PullRequestLinked(e) => self.apply_pull_request_linked(e),
             WorkEvent::PullRequestMerged(e) => self.apply_pull_request_merged(e),
+            WorkEvent::WorkLgtmCast(e) => {
+                self.apply_work_lgtm_cast(e);
+                Ok(())
+            }
             WorkEvent::HygieneReportRecorded(e) => self.apply_hygiene_report_recorded(e),
             WorkEvent::ManagerHatClaimed(e) => self.apply_manager_hat_claimed(e),
             WorkEvent::ManagerHatReleased(e) => self.apply_manager_hat_released(e),
@@ -482,6 +486,20 @@ impl WorkBoardProjection {
         card.state = CardState::Merged;
         card.updated_at_ms = e.merged_at_ms;
         Ok(())
+    }
+
+    /// Card 267d68f5 — record a peer's LGTM. Set semantics: re-voting
+    /// is harmless (idempotent). Unlike most apply_* functions this
+    /// doesn't require the card to exist in the projection first; an
+    /// LGTM landing in a transcript window before its CardCreated
+    /// (rare but possible during replay-window scans) still gets
+    /// retained so the `has_non_author_lgtm` check is conservative
+    /// after a CardCreated catches up.
+    fn apply_work_lgtm_cast(&mut self, e: &WorkLgtmCast) {
+        self.work_lgtm_votes
+            .entry(e.card_id)
+            .or_default()
+            .insert(e.voted_by);
     }
 
     fn apply_hygiene_report_recorded(

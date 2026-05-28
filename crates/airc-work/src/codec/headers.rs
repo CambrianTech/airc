@@ -129,6 +129,9 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             project_pull_request(headers, &e.pull_request);
         }
+        WorkEvent::WorkLgtmCast(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+        }
         WorkEvent::HygieneReportRecorded(e) => {
             headers.insert(
                 HEADER_FORGE_WORK_REPO.to_string(),

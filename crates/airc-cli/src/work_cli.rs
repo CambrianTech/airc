@@ -267,6 +267,15 @@ pub enum WorkAction {
         #[command(subcommand)]
         action: MergerAction,
     },
+    /// Card 267d68f5: cast a peer LGTM on a card's PR. Gates the
+    /// continuous-merger's auto-merge for multi-author rooms — the
+    /// merger requires at least one LGTM from a non-author peer
+    /// before shipping. Idempotent (re-voting collapses into one
+    /// entry in the projection's set).
+    Lgtm {
+        /// Card UUID being approved.
+        card_id: String,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]

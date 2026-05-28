@@ -48,7 +48,22 @@
 use std::path::Path;
 use std::time::Duration;
 
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_lib::{Airc, MarkPullRequestMerged, WorkCard};
+
+/// All merger output goes through here — JSON-structured stderr per
+/// the log-hygiene doctrine (card 8864c548): no `println!` /
+/// `eprintln!` of operational status. Stdout/stderr are reserved for
+/// debug macros; substrate emits structured events the consumer
+/// process (launchd, systemd, Android foreground service, log
+/// aggregator) can filter and route. `StderrJsonDiagnosticSink` is
+/// the same sink the daemon uses; events appear as one JSON object
+/// per line on fd 2.
+fn sink() -> StderrJsonDiagnosticSink {
+    StderrJsonDiagnosticSink
+}
 
 /// Run the continuous-merge loop until shutdown (Ctrl-C / SIGTERM).
 /// Default interval at the CLI layer is 30 seconds — CI pipelines on
@@ -68,13 +83,17 @@ pub async fn run(
     crate::commands::ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     let airc = Airc::attach(home, socket).await?;
 
-    eprintln!(
-        "airc-merger: started (home={}, interval={:?}, dry_run={})",
-        home.display(),
-        interval,
-        dry_run
+    sink().emit(
+        DiagnosticEvent::info(
+            DiagnosticComponent::Merger,
+            DiagnosticCode::MergerStarted,
+            "continuous-merge loop started",
+        )
+        .with_field("home", home.display())
+        .with_field("interval_ms", interval.as_millis())
+        .with_field("dry_run", dry_run)
+        .with_field("peer_id", airc.peer_id()),
     );
-    eprintln!("airc-merger: peer_id={}", airc.peer_id());
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -86,7 +105,11 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = &mut shutdown => {
-                eprintln!("airc-merger: shutdown signal received, exiting cleanly");
+                sink().emit(DiagnosticEvent::info(
+                    DiagnosticComponent::Merger,
+                    DiagnosticCode::MergerShutdown,
+                    "shutdown signal received, exiting cleanly",
+                ));
                 return Ok(());
             }
             _ = ticker.tick() => {
@@ -94,7 +117,14 @@ pub async fn run(
                     // A tick failing should NOT bring down the loop —
                     // gh might be rate-limited, the daemon might be
                     // momentarily unreachable, etc. Log and continue.
-                    eprintln!("airc-merger: tick failed: {error}");
+                    sink().emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Merger,
+                            DiagnosticCode::MergerTickFailed,
+                            "merger tick failed",
+                        )
+                        .with_field("error", error),
+                    );
                 }
             }
         }
@@ -109,37 +139,83 @@ async fn tick_once(airc: &Airc, dry_run: bool) -> Result<(), Box<dyn std::error:
     // realistic mutation rate.
     let board = airc.work_board(256).await?;
     let snapshot = board.snapshot();
+    let multi_author = is_multi_author_room(&snapshot);
 
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(card).await? else {
+        let Some(decision) = evaluate(card, &board, multi_author).await? else {
             continue;
         };
         match decision {
             MergeDecision::Merge(pr) => {
                 if dry_run {
-                    eprintln!(
-                        "airc-merger: [DRY-RUN] would merge card={} pr=#{} ({})",
-                        card.card_id, pr.number, pr.repo
+                    sink().emit(
+                        DiagnosticEvent::info(
+                            DiagnosticComponent::Merger,
+                            DiagnosticCode::MergerMerged,
+                            "[dry-run] would merge",
+                        )
+                        .with_field("card_id", card.card_id)
+                        .with_field("pr_number", pr.number)
+                        .with_field("repo", &pr.repo)
+                        .with_field("dry_run", true),
                     );
                     continue;
                 }
                 match perform_merge(card, &pr, airc).await {
-                    Ok(()) => eprintln!(
-                        "airc-merger: merged card={} pr=#{} ({})",
-                        card.card_id, pr.number, pr.repo
+                    Ok(()) => sink().emit(
+                        DiagnosticEvent::info(
+                            DiagnosticComponent::Merger,
+                            DiagnosticCode::MergerMerged,
+                            "merged",
+                        )
+                        .with_field("card_id", card.card_id)
+                        .with_field("pr_number", pr.number)
+                        .with_field("repo", &pr.repo),
                     ),
-                    Err(error) => eprintln!(
-                        "airc-merger: merge failed card={} pr=#{}: {error}",
-                        card.card_id, pr.number
+                    Err(error) => sink().emit(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Merger,
+                            DiagnosticCode::MergerMergeFailed,
+                            "merge failed",
+                        )
+                        .with_field("card_id", card.card_id)
+                        .with_field("pr_number", pr.number)
+                        .with_field("error", error),
                     ),
                 }
             }
             MergeDecision::Skip(reason) => {
-                eprintln!("airc-merger: skip card={} reason={reason}", card.card_id);
+                sink().emit(
+                    DiagnosticEvent::info(
+                        DiagnosticComponent::Merger,
+                        DiagnosticCode::MergerSkipped,
+                        "skip",
+                    )
+                    .with_field("card_id", card.card_id)
+                    .with_field("reason", reason),
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Card 267d68f5: multi-author room detection. The merger's LGTM gate
+/// requires a non-author peer LGTM ONLY in multi-author rooms — solo
+/// scopes (one peer ever created any card) merge their own work
+/// without a co-signer. Using `created_by` over `owner` is
+/// deliberate: claims churn (release/reclaim), but author is fixed
+/// at creation. A room with two distinct creators IS multi-author
+/// even if one peer has all current claims.
+fn is_multi_author_room(snapshot: &airc_work::BoardSnapshot) -> bool {
+    let mut creators = std::collections::HashSet::new();
+    for card in &snapshot.cards {
+        creators.insert(card.created_by);
+        if creators.len() > 1 {
+            return true;
+        }
+    }
+    false
 }
 
 enum MergeDecision {
@@ -151,7 +227,11 @@ enum MergeDecision {
 /// even a candidate (not in Review, no PR linked); `Ok(Some(Merge))`
 /// if everything passes; `Ok(Some(Skip(reason)))` if it's a candidate
 /// that failed a gate (so we can log it instead of silently dropping).
-async fn evaluate(card: &WorkCard) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
+async fn evaluate(
+    card: &WorkCard,
+    projection: &airc_work::WorkBoardProjection,
+    multi_author: bool,
+) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
     if card.state != CardState::Review {
         return Ok(None);
@@ -159,6 +239,15 @@ async fn evaluate(card: &WorkCard) -> Result<Option<MergeDecision>, Box<dyn std:
     let Some(pr) = card.pull_request.clone() else {
         return Ok(None);
     };
+
+    // Card 267d68f5: peer-LGTM gate. Solo rooms (single creator
+    // ever) bypass; multi-author rooms require a non-author LGTM.
+    if multi_author && !projection.has_non_author_lgtm(card.card_id, &card.created_by) {
+        return Ok(Some(MergeDecision::Skip(format!(
+            "needs peer LGTM (multi-author room, author={})",
+            card.created_by
+        ))));
+    }
 
     match check_pr_gate(&pr).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),

@@ -905,6 +905,23 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
+/// Card 267d68f5: cast a peer LGTM on a card's PR. Publishes a
+/// `WorkLgtmCast` event signed by this peer. Idempotent. The
+/// continuous-merger consults the projection's set on the next tick
+/// to decide whether a Review-state card can auto-merge.
+pub async fn run_lgtm(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
+    use airc_lib::CastWorkLgtm;
+    let card_uuid = parse_work_card_id(&card_id)?;
+    let airc = crate::commands::attached_airc(home).await?;
+    airc.cast_work_lgtm(CastWorkLgtm { card_id: card_uuid })
+        .await?;
+    println!(
+        "work_lgtm_cast: card_id={card_id} voted_by={}",
+        airc.peer_id()
+    );
+    Ok(())
+}
+
 /// Card 9656a836: gate the close transition. Returns `true` when a
 /// card in `state` is allowed to transition to Closed.
 ///

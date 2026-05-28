@@ -710,6 +710,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 }
             },
+            WorkAction::Lgtm { card_id } => work_commands::run_lgtm(&home, card_id).await,
         },
 
         Command::Lane(args) => match args.action {

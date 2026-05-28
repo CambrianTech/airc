@@ -24,6 +24,7 @@ pub enum DiagnosticSeverity {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticComponent {
     Daemon,
+    Merger,
     Monitor,
     Replay,
     Subscriber,
@@ -45,6 +46,16 @@ pub enum DiagnosticCode {
     ReplayFramesSkipped,
     WebRtcOfferAnswerFailed,
     WorkspaceLeaseViolation,
+    // Card f16650cd + log-hygiene card 8864c548: continuous-merger
+    // emits these from its loop instead of eprintln. Structured
+    // events survive non-tty contexts (launchd, systemd, Android
+    // foreground service) where stdout/stderr would be eaten.
+    MergerStarted,
+    MergerShutdown,
+    MergerTickFailed,
+    MergerSkipped,
+    MergerMerged,
+    MergerMergeFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +83,14 @@ impl DiagnosticEvent {
             fields: BTreeMap::new(),
             occurred_at_ms: now_ms(),
         }
+    }
+
+    pub fn info(
+        component: DiagnosticComponent,
+        code: DiagnosticCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(DiagnosticSeverity::Info, component, code, message)
     }
 
     pub fn warn(

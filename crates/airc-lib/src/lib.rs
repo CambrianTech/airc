@@ -131,12 +131,12 @@ pub use webrtc_media::{
     OutgoingSampleTrack, OutgoingVideoTrack, WebRtcConnectionBuilder, WebRtcMediaCodec,
 };
 pub use work::{
-    AllocateWorkspace, ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
-    ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
-    HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged, ObserveLocalGitWorkspace,
-    ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
-    ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace, UpdateWorkCard,
-    WorkQueueStatus, WorkQueueStatusQuery,
+    AllocateWorkspace, CastWorkLgtm, ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat,
+    ClaimWorkCard, ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane,
+    HeartbeatWorkClaim, HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged,
+    ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests,
+    ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability,
+    RequestWorkspace, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,

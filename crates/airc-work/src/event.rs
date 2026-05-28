@@ -37,6 +37,7 @@ pub enum WorkEvent {
     PullRequestMergeStateChanged(PullRequestMergeStateChanged),
     PullRequestLinked(PullRequestLinked),
     PullRequestMerged(PullRequestMerged),
+    WorkLgtmCast(WorkLgtmCast),
     HygieneReportRecorded(HygieneReportRecorded),
     ManagerHatClaimed(ManagerHatClaimed),
     ManagerHatReleased(ManagerHatReleased),
@@ -69,6 +70,7 @@ impl WorkEvent {
             WorkEvent::PullRequestMergeStateChanged(e) => e.changed_at_ms,
             WorkEvent::PullRequestLinked(e) => e.linked_at_ms,
             WorkEvent::PullRequestMerged(e) => e.merged_at_ms,
+            WorkEvent::WorkLgtmCast(e) => e.voted_at_ms,
             WorkEvent::HygieneReportRecorded(e) => e.report.recorded_at_ms,
             WorkEvent::ManagerHatClaimed(e) => e.claimed_at_ms,
             WorkEvent::ManagerHatReleased(e) => e.released_at_ms,
@@ -369,6 +371,18 @@ pub struct PullRequestMerged {
     pub pull_request: PullRequestRef,
     pub merged_by: PeerId,
     pub merged_at_ms: u64,
+}
+
+/// Card 267d68f5 — peer LGTM: a non-author peer signals the card's
+/// PR is approved for merge. Substrate-native (no GitHub round-trip);
+/// the continuous-merger consults the projection's lgtm voter set
+/// before auto-merging in multi-author rooms. Idempotent: re-voting
+/// is harmless (the projection stores a set, not a list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkLgtmCast {
+    pub card_id: WorkCardId,
+    pub voted_by: PeerId,
+    pub voted_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
