@@ -50,11 +50,8 @@ impl Default for InMemoryEventStore {
 #[async_trait]
 impl EventStore for InMemoryEventStore {
     async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError> {
-        let identity = self
-            .local_identity
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?;
-        Ok(identity.clone())
+        self.load_local_identity_by_agent_name(crate::DEFAULT_AGENT_NAME)
+            .await
     }
 
     async fn load_local_identity_by_agent_name(
@@ -395,6 +392,32 @@ mod tests {
 
         let stored = store_api.load_local_identity().await.unwrap().unwrap();
         assert_eq!(stored.identity, updated);
+    }
+
+    #[tokio::test]
+    async fn in_memory_load_local_identity_is_default_agent_path() {
+        let store = InMemoryEventStore::new();
+        let store_api: &dyn EventStore = &store;
+
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa2),
+                client_id: airc_core::ClientId::from_u128(0xc2),
+                version: 1,
+                created_at_ms: 43,
+                identity: airc_core::identity::Identity::new("codex"),
+                agent_name: "codex".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store_api.load_local_identity().await.unwrap().is_none());
+        let by_name = store_api
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .expect("codex row");
+        assert_eq!(by_name.agent_name, "codex");
     }
 
     #[tokio::test]
