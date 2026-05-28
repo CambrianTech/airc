@@ -898,6 +898,7 @@ pub async fn run_next(
     include_stale: bool,
     limit: usize,
     event_limit: usize,
+    check_idle: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let query = airc_lib::WorkQueueStatusQuery {
@@ -908,6 +909,20 @@ pub async fn run_next(
         limit,
     };
     let status = airc.work_queue_status(query).await?;
+    // Card e4cad280 ENGINE: in --check-idle mode, suppress the
+    // human-readable suggestion list and return a script-friendly
+    // exit code. Status 0 = there IS claimable work for this peer;
+    // status 1 = board is idle for this peer, agent should consult
+    // wall recipes and generate next-step cards. The substrate
+    // provides the signal; domain-level recipe handling lives in
+    // the consumer (Claude tab / Codex / hermes adapter / continuum
+    // runner).
+    if check_idle {
+        if status.claimable.is_empty() {
+            return Err("idle: no claimable work for this peer".into());
+        }
+        return Ok(());
+    }
     if status.claimable.is_empty() {
         println!("(no claimable work)");
     } else {

@@ -653,6 +653,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 exclude_stale,
                 limit,
                 event_limit,
+                check_idle,
             } => {
                 work_commands::run_next(
                     &home,
@@ -661,6 +662,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     !exclude_stale,
                     limit,
                     event_limit,
+                    check_idle,
                 )
                 .await
             }
