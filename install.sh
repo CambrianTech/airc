@@ -492,6 +492,70 @@ _add_path_entry() {
   fi
 }
 
+# Minimum cargo version that can build this tree. Tracks Cargo.lock's
+# lockfile format: lockfile v4 (current) requires Cargo >= 1.78. Bump
+# this alongside any future Cargo.lock format bump or declared MSRV.
+AIRC_MIN_CARGO="${AIRC_MIN_CARGO:-1.78.0}"
+
+# _version_ge A B -> success (0) iff version A >= version B. Uses sort -V
+# (version sort) so 1.70.0 vs 1.78.0 compares numerically, not lexically.
+_version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+# Cargo present-but-too-old is a real first-time-user failure mode: a
+# machine with an old rustup default (e.g. 1.70 from 2023) passes the
+# `cargo --version` prereq probe, then `cargo build` dies with the
+# cryptic "lock file version 4 was found, but this version of Cargo does
+# not understand this lock file" and `set -e` aborts the whole install
+# with no guidance. ensure_prereqs only checks presence, not version, so
+# this gate + auto-recovery lives right before the build. Recovery order:
+# rustup (the common case) -> brew -> clear manual instructions.
+ensure_cargo_recent() {
+  command -v cargo >/dev/null 2>&1 || return 0  # absence handled by _install_airc_binary
+  local have
+  have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+    return 0
+  fi
+  warn "cargo ${have:-unknown} is too old to build airc (need >= $AIRC_MIN_CARGO; Cargo.lock is lockfile v4)."
+
+  if command -v rustup >/dev/null 2>&1; then
+    info "Updating the Rust toolchain via rustup (rustup update stable)..."
+    if rustup update stable; then
+      # Make sure the just-updated stable is what cargo resolves to. If a
+      # different toolchain is the rustup default, the shim still serves
+      # the old cargo; only switch when no per-directory override pins it.
+      rustup default stable >/dev/null 2>&1 || true
+      have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+      if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+        ok "Rust toolchain updated to cargo $have"
+        return 0
+      fi
+      warn "rustup update ran but cargo is still ${have:-unknown} (a rust-toolchain override may be pinning an old version)."
+    else
+      warn "rustup update stable failed."
+    fi
+  fi
+
+  # brew-managed rust (cargo from Homebrew rather than rustup).
+  if command -v brew >/dev/null 2>&1 && brew list rust >/dev/null 2>&1; then
+    info "Upgrading Homebrew rust (brew upgrade rust)..."
+    if brew upgrade rust 2>/dev/null || true; then
+      have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+      if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+        ok "Rust toolchain updated to cargo $have"
+        return 0
+      fi
+    fi
+  fi
+
+  fail "Could not obtain cargo >= $AIRC_MIN_CARGO (have ${have:-unknown}). Update Rust and re-run install.sh:
+         rustup:    rustup update stable
+         Homebrew:  brew upgrade rust
+         no rustup: install from https://rustup.rs"
+}
+
 # Build the Rust binary and place it on PATH as `airc`. No shell
 # wrapper, no .shim/.cmd/.ps1 trampolines — the Rust binary is the
 # user surface. Copy the built binary into BIN_DIR so PATH never points
@@ -501,6 +565,7 @@ _install_airc_binary() {
   if ! command -v cargo >/dev/null 2>&1; then
     fail "cargo is required to build airc. Install Rust, then re-run install.sh."
   fi
+  ensure_cargo_recent
   info "Building Rust CLI: airc"
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
   mkdir -p "$BIN_DIR"
