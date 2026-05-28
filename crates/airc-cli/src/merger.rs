@@ -592,4 +592,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // ========================================================================
+    // Card 267d68f5 — multi-author room detection. The merger uses this
+    // ONCE per tick to decide whether the LGTM gate applies; pinning the
+    // semantics with tests so future "improvements" don't accidentally
+    // flip a solo room into LGTM-required (which would deadlock single-
+    // peer scopes that have no co-signer).
+    // ========================================================================
+    use airc_work::model::{CardState, PullRequestRef as PrRef};
+    use airc_work::{BoardSnapshot, RepoId, WorkCard, WorkCardId};
+
+    fn snapshot_with_creators(creators: &[u128]) -> BoardSnapshot {
+        let cards: Vec<WorkCard> = creators
+            .iter()
+            .enumerate()
+            .map(|(i, seed)| WorkCard {
+                card_id: WorkCardId::from_u128((i + 1) as u128),
+                repo: RepoId::new("test/repo").unwrap(),
+                title: format!("card-{i}"),
+                body: None,
+                priority: airc_work::Priority::P1,
+                lane_id: None,
+                state: CardState::Open,
+                owner: None,
+                claim_id: None,
+                claim_expires_at_ms: None,
+                last_heartbeat_at_ms: None,
+                created_by: airc_core::PeerId::from_u128(*seed),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                pull_request: None,
+                reviews: None,
+            })
+            .collect();
+        BoardSnapshot {
+            cards,
+            lanes: Vec::new(),
+            workspaces: Vec::new(),
+            repo_tracking: Vec::new(),
+            pull_requests: Vec::new(),
+            manager_hats: Vec::new(),
+            agent_availability: Vec::new(),
+            hygiene_reports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn solo_room_is_not_multi_author() {
+        // One peer, three cards — still solo. The LGTM gate must NOT
+        // apply (sole-author scopes ship their own work).
+        let snapshot = snapshot_with_creators(&[1, 1, 1]);
+        assert!(!is_multi_author_room(&snapshot));
+    }
+
+    #[test]
+    fn two_distinct_creators_make_it_multi_author() {
+        let snapshot = snapshot_with_creators(&[1, 2]);
+        assert!(is_multi_author_room(&snapshot));
+    }
+
+    #[test]
+    fn empty_room_is_not_multi_author() {
+        // No cards yet → no contributors visible → solo bypass. A first-
+        // card scenario shouldn't deadlock on missing peers.
+        let snapshot = snapshot_with_creators(&[]);
+        assert!(!is_multi_author_room(&snapshot));
+    }
+
+    #[test]
+    fn three_distinct_creators_still_multi_author() {
+        let snapshot = snapshot_with_creators(&[1, 2, 3]);
+        assert!(is_multi_author_room(&snapshot));
+    }
+
+    // Silence the unused-import warnings on these `use` lines if a
+    // future refactor drops some of the symbols above.
+    #[allow(dead_code)]
+    fn _silence(_p: PrRef) {}
 }

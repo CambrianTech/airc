@@ -1378,3 +1378,175 @@ fn card_updated_round_trips_through_serde_with_skip_on_none() {
     let decoded: CardUpdated = serde_json::from_value(json).expect("decode clear");
     assert_eq!(decoded, clear);
 }
+
+// ============================================================================
+// Card 267d68f5 — peer LGTM projection accessors. The merger consults
+// `has_non_author_lgtm(card_id, author)` on every tick in multi-author
+// rooms; these tests pin the contract.
+// ============================================================================
+
+fn card_created(card_id: WorkCardId, author: PeerId, at_ms: u64) -> WorkEvent {
+    WorkEvent::CardCreated(CardCreated {
+        card_id,
+        repo: repo(),
+        title: "lgtm-gated work".to_string(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        created_by: author,
+        created_at_ms: at_ms,
+        reviews: None,
+    })
+}
+
+fn lgtm(card_id: WorkCardId, voter: PeerId, at_ms: u64) -> WorkEvent {
+    WorkEvent::WorkLgtmCast(WorkLgtmCast {
+        card_id,
+        voted_by: voter,
+        voted_at_ms: at_ms,
+    })
+}
+
+#[test]
+fn lgtm_cast_records_vote_in_projection() {
+    let card_id = WorkCardId::from_u128(101);
+    let author = peer(1);
+    let voter = peer(2);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, voter, 150)).unwrap();
+
+    let voters: Vec<&PeerId> = projection.lgtm_voters(card_id).collect();
+    assert_eq!(voters.len(), 1, "exactly one voter recorded");
+    assert_eq!(*voters[0], voter, "the recorded voter is the one who voted");
+}
+
+#[test]
+fn lgtm_double_vote_by_same_peer_is_idempotent() {
+    // Set semantics: a peer voting twice doesn't compound. Important
+    // because re-running `airc work lgtm <id>` should be safe.
+    let card_id = WorkCardId::from_u128(102);
+    let author = peer(1);
+    let voter = peer(2);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, voter, 150)).unwrap();
+    projection.apply(&lgtm(card_id, voter, 160)).unwrap();
+    projection.apply(&lgtm(card_id, voter, 170)).unwrap();
+
+    let count = projection.lgtm_voters(card_id).count();
+    assert_eq!(count, 1, "re-voting collapses into one set entry");
+}
+
+#[test]
+fn lgtm_distinct_voters_accumulate() {
+    let card_id = WorkCardId::from_u128(103);
+    let author = peer(1);
+    let voter_a = peer(2);
+    let voter_b = peer(3);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, voter_a, 150)).unwrap();
+    projection.apply(&lgtm(card_id, voter_b, 160)).unwrap();
+
+    let count = projection.lgtm_voters(card_id).count();
+    assert_eq!(count, 2, "two distinct voters yields two set entries");
+}
+
+#[test]
+fn has_non_author_lgtm_false_when_no_votes() {
+    let card_id = WorkCardId::from_u128(104);
+    let author = peer(1);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+
+    assert!(
+        !projection.has_non_author_lgtm(card_id, &author),
+        "zero votes → no non-author LGTM"
+    );
+}
+
+#[test]
+fn has_non_author_lgtm_false_when_only_author_voted() {
+    // The merger MUST reject self-approval: an author casting LGTM
+    // on their own card doesn't satisfy the gate. This is the core
+    // safety property of the LGTM convention.
+    let card_id = WorkCardId::from_u128(105);
+    let author = peer(1);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, author, 150)).unwrap();
+
+    assert!(
+        !projection.has_non_author_lgtm(card_id, &author),
+        "author voting for own card does NOT unlock the gate"
+    );
+}
+
+#[test]
+fn has_non_author_lgtm_true_when_peer_voted() {
+    let card_id = WorkCardId::from_u128(106);
+    let author = peer(1);
+    let peer_b = peer(2);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, peer_b, 150)).unwrap();
+
+    assert!(
+        projection.has_non_author_lgtm(card_id, &author),
+        "any peer != author satisfies the gate"
+    );
+}
+
+#[test]
+fn has_non_author_lgtm_true_when_author_also_voted_alongside_peer() {
+    // Author self-LGTM is harmless if a peer ALSO voted — the gate
+    // just needs ONE non-author voter; the author's own vote in the
+    // set doesn't subtract from that.
+    let card_id = WorkCardId::from_u128(107);
+    let author = peer(1);
+    let peer_b = peer(2);
+    let mut projection = WorkBoardProjection::new();
+
+    projection
+        .apply(&card_created(card_id, author, 100))
+        .unwrap();
+    projection.apply(&lgtm(card_id, author, 150)).unwrap();
+    projection.apply(&lgtm(card_id, peer_b, 160)).unwrap();
+
+    assert!(
+        projection.has_non_author_lgtm(card_id, &author),
+        "author + peer voting both → gate open (peer's vote counts)"
+    );
+}
+
+#[test]
+fn lgtm_for_unrecorded_card_does_not_panic() {
+    // Card 267d68f5 has an explicit looseness in apply_work_lgtm_cast:
+    // an LGTM landing in a transcript window before its CardCreated
+    // still gets retained. Verify the projection doesn't error.
+    let card_id = WorkCardId::from_u128(108);
+    let voter = peer(2);
+    let mut projection = WorkBoardProjection::new();
+
+    projection.apply(&lgtm(card_id, voter, 150)).unwrap();
+    let count = projection.lgtm_voters(card_id).count();
+    assert_eq!(count, 1, "vote preserved even without a CardCreated event");
+}
