@@ -176,8 +176,15 @@ fn work_board_surfaces_stale_claims() {
 
     let stale_board = run_ok(&home, &["work", "board"]);
     assert!(stale_board.contains("stale claims: 1"), "{stale_board}");
+    // card_id stays full on the board (it's the API key — callers
+    // copy-paste it into claim/state/close); claim_id renders short
+    // (kink 6f111211 / commit 0e8e6fa). Pin both shapes.
     assert!(stale_board.contains(card_id), "{stale_board}");
-    assert!(stale_board.contains(claim_id), "{stale_board}");
+    let claim_short: String = claim_id.chars().take(8).collect();
+    assert!(
+        stale_board.contains(&claim_short),
+        "expected short claim_id prefix {claim_short} in: {stale_board}",
+    );
 
     let next = run_ok(&home, &["work", "next", "--event-limit", "128"]);
     assert!(next.contains("claimable work: 1"), "{next}");
