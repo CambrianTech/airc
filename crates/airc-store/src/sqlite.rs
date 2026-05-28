@@ -1200,6 +1200,58 @@ mod tests {
         assert_eq!(stored.client_id, ClientId::from_u128(0xc2));
     }
 
+    /// Card 8384cc18 Sub-B — the final schema no longer enforces the
+    /// singleton `CHECK (id = 1)`. Store APIs still load the default row
+    /// until Sub-C/Sub-D add agent-name lookup and init surfaces, but
+    /// the database must now accept a second agent row so those slices
+    /// have a schema to target.
+    #[tokio::test]
+    async fn local_identity_schema_accepts_a_second_agent_row() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let store_api: &dyn EventStore = &store;
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa3),
+                client_id: ClientId::from_u128(0xc3),
+                version: 1,
+                created_at_ms: 100,
+                identity: Identity::new("default-agent"),
+                agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            })
+            .await
+            .unwrap();
+
+        local_identity::Entity::insert(local_identity::ActiveModel {
+            id: Set(2),
+            peer_id: Set(PeerId::from_u128(0xa4).as_uuid()),
+            client_id: Set(ClientId::from_u128(0xc4).as_uuid()),
+            version: Set(1),
+            created_at_ms: Set(101),
+            name: Set("codex".to_string()),
+            pronouns: Set("".to_string()),
+            role: Set("agent".to_string()),
+            bio: Set("".to_string()),
+            status: Set("active".to_string()),
+            fingerprint: Set("".to_string()),
+            integrations_json: Set(json!({})),
+            agent_name: Set("codex".to_string()),
+        })
+        .exec(&store.db)
+        .await
+        .expect("Sub-B schema accepts a non-singleton local_identity row");
+
+        let rows = local_identity::Entity::find()
+            .order_by_asc(local_identity::Column::Id)
+            .all(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, local_identity::SINGLETON_ID);
+        assert_eq!(rows[0].agent_name, crate::DEFAULT_AGENT_NAME);
+        assert_eq!(rows[1].id, 2);
+        assert_eq!(rows[1].agent_name, "codex");
+    }
+
     #[tokio::test]
     async fn page_recent_returns_oldest_to_newest_with_limit() {
         // Substrate contract: page is ordered oldest → newest within

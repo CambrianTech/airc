@@ -1,9 +1,10 @@
 //! SeaORM migrations.
 //!
 //! Run automatically by `SqliteEventStore::open` so consumers don't
-//! need a separate "init" step. Each migration is an additive change
-//! (new table / new column / new index) and never destructive — the
-//! store treats older databases as forward-compatible.
+//! need a separate "init" step. Migrations preserve user data; most are
+//! additive, and the few SQLite table-recreate migrations copy rows
+//! before dropping their legacy tables. The store treats older
+//! databases as forward-compatible.
 
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm_migration::prelude::*;
@@ -22,6 +23,7 @@ mod m20260523_000010_create_refresh_locks;
 mod m20260526_000011_create_bus_events;
 mod m20260527_000012_create_bus_epoch;
 mod m20260528_000013_add_local_identity_agent_name;
+mod m20260528_000014_drop_local_identity_singleton_check;
 
 pub struct Migrator;
 
@@ -42,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260526_000011_create_bus_events::Migration),
             Box::new(m20260527_000012_create_bus_epoch::Migration),
             Box::new(m20260528_000013_add_local_identity_agent_name::Migration),
+            Box::new(m20260528_000014_drop_local_identity_singleton_check::Migration),
         ]
     }
 }
@@ -53,13 +56,13 @@ impl MigratorTrait for Migrator {
 /// binary has no file for (SeaORM: "migration file is missing"). That
 /// happens under version skew — a newer build migrates the DB forward,
 /// then an older binary opens it (e.g. a stale `~/.local/bin/airc`
-/// against a DB a dev build already migrated). Our migrations are
-/// additive and never destructive, so a DB ahead of us is harmless: the
-/// extra tables/columns are simply unused. So if `up` fails ONLY because
-/// the DB is ahead — every migration WE define is already applied — we
-/// proceed. A genuine divergence (we still have unapplied migrations of
-/// our own) surfaces the error instead of silently skipping schema we
-/// actually need.
+/// against a DB a dev build already migrated). Our migrations preserve
+/// existing data and older binaries simply ignore schema they do not
+/// understand, so a DB ahead of us is harmless: the extra tables/columns
+/// are unused. If `up` fails ONLY because the DB is ahead — every
+/// migration WE define is already applied — we proceed. A genuine
+/// divergence (we still have unapplied migrations of our own) surfaces
+/// the error instead of silently skipping schema we actually need.
 pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
     match Migrator::up(db, None).await {
         Ok(()) => Ok(()),
