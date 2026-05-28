@@ -399,6 +399,45 @@ impl Airc {
         Ok(None)
     }
 
+    /// Publish the room operating doctrine — card a9767579 (slice 2/4
+    /// of engine-keystone 2903a8ef). Emits a
+    /// `TranscriptKind::DoctrinePublished` lifecycle event on the
+    /// CURRENT room carrying a serialized
+    /// `DoctrineEvent::RoomDoctrinePublished` with the body and
+    /// version. Every attaching agent's subscribe stream surfaces it;
+    /// future slice 4/4 auto-loads it into agent context on join.
+    ///
+    /// `version` is a short content discriminator (e.g. first 12 chars
+    /// of SHA-256 of `body`); caller chooses the function so older
+    /// CLIs don't need a `sha2` dep to render `airc room doctrine
+    /// publish --from-file AGENTS.md`. Idempotency is the publisher's
+    /// responsibility — the substrate stores every event;
+    /// projections take latest by `published_at_ms`.
+    pub async fn publish_room_doctrine(
+        &self,
+        body: String,
+        version: String,
+    ) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        let event = airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished(
+            airc_core::doctrine::RoomDoctrinePublished {
+                room_id: room.channel,
+                body,
+                version,
+                published_by: self.inner.identity.peer_id,
+                published_at_ms: time::now_ms()?,
+            },
+        );
+        let body_json = serde_json::to_value(&event)
+            .map_err(|e| AircError::Crypto(format!("doctrine event serialize: {e}")))?;
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::DoctrinePublished,
+            room.channel,
+            airc_core::Body::Json(body_json),
+        )
+        .await
+    }
+
     /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
     ///
     /// Scans recent transcript events in the current room for the

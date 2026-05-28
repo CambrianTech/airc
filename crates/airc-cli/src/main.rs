@@ -364,6 +364,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Room { name } => commands::run_room(&home, name).await,
 
+        Command::DoctrinePublish { from_file } => {
+            commands::run_doctrine_publish(&home, from_file).await
+        }
+
         Command::Part { room } => commands::run_part(&home, room).await,
 
         Command::Peer(args) => match args.action {
@@ -611,6 +615,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 claim_id,
                 reason,
             } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            WorkAction::Update {
+                card_id,
+                title,
+                body,
+                priority,
+            } => work_commands::run_update(&home, card_id, title, body, priority).await,
             WorkAction::State { card_id, state } => {
                 work_commands::run_state(&home, card_id, state).await
             }

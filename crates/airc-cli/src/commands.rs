@@ -73,6 +73,71 @@ pub async fn run_room(
     Ok(())
 }
 
+/// `doctrine-publish` — read a markdown file (default: AGENTS.md at
+/// the git repo root) and publish it as the room's operating
+/// doctrine via `Airc::publish_room_doctrine`. Card 2903a8ef slice
+/// 2/4 of the engine keystone — gets the "how we work here" contract
+/// onto the substrate so attaching agents in any scope load it.
+///
+/// Version: short SHA-256 prefix of the body bytes. Future tooling
+/// can compare versions to detect "doctrine on my scope is stale."
+pub async fn run_doctrine_publish(
+    home: &Path,
+    from_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve the source path. Default: `<git-repo-root>/AGENTS.md`.
+    let path = match from_file {
+        Some(p) => p,
+        None => {
+            let repo_root = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .output()?;
+            if !repo_root.status.success() {
+                return Err(format!(
+                    "no --from-file passed and git rev-parse --show-toplevel \
+                     failed (not in a git repo?): {}",
+                    String::from_utf8_lossy(&repo_root.stderr).trim()
+                )
+                .into());
+            }
+            let root = String::from_utf8(repo_root.stdout)?.trim().to_string();
+            PathBuf::from(root).join("AGENTS.md")
+        }
+    };
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        format!("cannot read doctrine file {}: {e}", path.display())
+    })?;
+
+    let version = short_content_hash(body.as_bytes());
+
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let airc = Airc::attach(home, socket).await?;
+    airc.publish_room_doctrine(body.clone(), version.clone()).await?;
+    println!(
+        "doctrine_published: file={file} version={version} bytes={bytes}",
+        file = path.display(),
+        bytes = body.len(),
+    );
+    Ok(())
+}
+
+/// Short content discriminator — first 12 chars of SHA-256 hex of
+/// `body`. Twelve chars are enough to distinguish unrelated revisions
+/// of a kilobyte-scale doctrine file (the AGENTS.md target) without
+/// pulling in a heavier hash; collisions at this scale are
+/// astronomically unlikely and the substrate stores every event so a
+/// "version" collision degrades to "two latest with the same tag,"
+/// not data loss.
+fn short_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hex.chars().take(12).collect()
+}
+
 /// `part` — leave a subscribed room without deleting identity, trust,
 /// or other room subscriptions.
 pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {

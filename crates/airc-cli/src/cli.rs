@@ -289,6 +289,18 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// Publish the room's operating doctrine (card 2903a8ef slice 2/4).
+    /// Reads a markdown file and emits a `RoomDoctrinePublished`
+    /// substrate event so every attaching agent loads the latest
+    /// doctrine on join. Default file is `AGENTS.md` at the git repo
+    /// root; pass `--from-file` to override.
+    DoctrinePublish {
+        /// Path to the markdown file. Defaults to `AGENTS.md` at the
+        /// git repo root if omitted.
+        #[arg(long)]
+        from_file: Option<std::path::PathBuf>,
+    },
+
     /// Leave a subscribed room without deleting identity or trust.
     /// With no room, leaves the current default channel.
     Part {
