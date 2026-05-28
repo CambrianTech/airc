@@ -513,6 +513,81 @@ async fn open_pr_and_link(
     .await?;
 
     println!("pull_request: {pr_url}");
+
+    // Card ad7e100b Sub-C: with PR linked, spawn a sibling review
+    // card so any peer (other than the author) can claim it and
+    // review the diff. Best-effort and idempotent — a spawn failure
+    // here must not undo the state transition or the PR link, and
+    // re-running `state review` on a card whose review card already
+    // exists is a no-op.
+    if let Err(error) = auto_spawn_review_card(airc, card_id, pr_url).await {
+        eprintln!("airc: review card auto-spawn skipped — {error}");
+    }
+
+    Ok(())
+}
+
+/// Spawn a sibling review card for `parent_id` if one doesn't already
+/// exist. Card ad7e100b Sub-C — the auto-spawn side of the
+/// peer-agent review loop. Manual spawning still works via
+/// `airc work review` (Sub-B); both paths produce structurally
+/// identical cards (same title format, same typed `reviews` link)
+/// so observers cannot tell them apart and observer filters built on
+/// `title.starts_with("review:")` pick up both.
+///
+/// Idempotency: `WorkBoardProjection::review_cards_for(parent_id)`
+/// (added in Sub-A) is the canonical "does a review already exist?"
+/// query. Skipping on a non-empty match means re-running
+/// `airc work state X review` is a no-op for the review-spawn side,
+/// matching the no-op semantics of the PR link.
+///
+/// Architectural note: auto-spawn lives in the CLI rather than the
+/// projection-apply layer on purpose. Projections must stay pure
+/// (replay determinism); emitting a new event inside `apply_*` would
+/// couple the projection to a side-effectful publish path. The CLI
+/// is the right place: it's the orchestration layer that already
+/// composes other side-effects (gh pr create, link). A future
+/// command-bus subscriber on `PullRequestLinked` could hoist this
+/// out of the CLI for consumers that bypass it (Continuum, OpenClaw),
+/// but the wire shape is stable — that move doesn't break this
+/// emit.
+async fn auto_spawn_review_card(
+    airc: &airc_lib::Airc,
+    parent_id: airc_lib::WorkCardId,
+    pr_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let board = airc.work_board(usize::MAX).await?;
+    let parent = board
+        .card(parent_id)
+        .ok_or_else(|| format!("parent card {parent_id} no longer in board projection"))?;
+
+    // Idempotency guard: any pre-existing review for this parent
+    // (manual via Sub-B, or a prior auto-spawn) wins. We never spawn
+    // a second.
+    if board.review_cards_for(parent_id).next().is_some() {
+        return Ok(());
+    }
+
+    // Title — `format_review_title` is the shared formatter Sub-B
+    // (manual CLI) also uses, so observers can't tell auto-spawned
+    // from manual cards apart.
+    let title = format_review_title(&parent.title);
+
+    let mut body = format!("review of card {parent_id}");
+    if !pr_url.is_empty() {
+        body.push_str("\nPR: ");
+        body.push_str(pr_url);
+    }
+    body.push_str("\n\nAuto-spawned on Review-state transition (card ad7e100b Sub-C).");
+
+    let request = airc_lib::CreateWorkCard::new(parent.repo.clone(), title, parent.priority)
+        .reviewing(parent_id);
+    let request = airc_lib::CreateWorkCard {
+        body: Some(body),
+        ..request
+    };
+    let review_card_id = airc.create_work_card(request).await?;
+    println!("review_card_id: {review_card_id} parent_card_id: {parent_id} (auto-spawned)");
     Ok(())
 }
 
