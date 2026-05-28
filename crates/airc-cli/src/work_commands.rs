@@ -599,9 +599,15 @@ async fn open_pr_and_link(
     }
     let worktree_str = worktree_path.to_string_lossy().to_string();
 
-    // gh pr create — --fill takes title/body from commits, so a clean
-    // workflow (claim → commit → state review) produces a PR titled
-    // from the last commit. Head is the worktree's current branch.
+    // gh pr create — pass --title + --body explicitly from the HEAD
+    // commit's metadata. `--fill` SOUNDS right but its heuristic
+    // sometimes falls back to a slugified branch name as the title
+    // (observed live on cards 53698eb9 and ef168afe — branch
+    // `53698eb9/agents-md-encode-engineering-staff-not-a` became
+    // PR title `53698eb9/agents md encode engineering staff not a`,
+    // which stripped the `docs(agents):` prefix the canary-gate's
+    // bypass regex needs). Reading the commit subject directly is
+    // deterministic and matches what the author actually wrote.
     //
     // Card a4fe899f: `gh` does NOT accept `-C` (that's git's flag).
     // The cwd has to be set via `Command::current_dir(...)` so gh's
@@ -610,9 +616,18 @@ async fn open_pr_and_link(
     // silently ran against whatever the shell's cwd was at invoke
     // time — usually the wrong repo — and the whole Review-state →
     // PR-link pipeline failed (best-effort warning was swallowed).
+    let subject = git_show_format(&worktree_str, "%s")?;
+    let body = git_show_format(&worktree_str, "%b")?;
     let create_out = std::process::Command::new("gh")
         .current_dir(&worktree_str)
-        .args(["pr", "create", "--fill"])
+        .args([
+            "pr",
+            "create",
+            "--title",
+            subject.trim(),
+            "--body",
+            body.trim(),
+        ])
         .output()?;
     if !create_out.status.success() {
         return Err(format!(
@@ -742,6 +757,33 @@ fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std::error::Er
         .into());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// `git show -s --format=<format> HEAD` from inside `worktree`. Used
+/// to read the HEAD commit's subject (%s) and body (%b) to pass as
+/// `gh pr create --title` / `--body`, since `gh pr create --fill`'s
+/// heuristic sometimes falls back to a slugified branch name (card
+/// 13131f1c). Empty stdout is valid (commits often have an empty
+/// body) and propagates as an empty `String`.
+fn git_show_format(worktree: &str, format: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            worktree,
+            "show",
+            "-s",
+            &format!("--format={format}"),
+            "HEAD",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "git show --format={format} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(out.stdout)?)
 }
 
 fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
