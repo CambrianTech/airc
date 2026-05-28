@@ -70,8 +70,8 @@ pub(crate) async fn open_pr_and_link(
     // silently ran against whatever the shell's cwd was at invoke
     // time — usually the wrong repo — and the whole Review-state →
     // PR-link pipeline failed (best-effort warning was swallowed).
-    let subject = crate::work_commands::git_show_format(&worktree_str, "%s")?;
-    let body = crate::work_commands::git_show_format(&worktree_str, "%b")?;
+    let subject = crate::work_commands_git::git_show_format(&worktree_str, "%s")?;
+    let body = crate::work_commands_git::git_show_format(&worktree_str, "%b")?;
     // Card 812b5a1b: pin --base to pr_create_base_branch() (rust-rewrite),
     // not gh's default. Without --base, `gh pr create` picks the repo's
     // GitHub default branch (`main` on this repo), and every auto-spawned
@@ -106,7 +106,7 @@ pub(crate) async fn open_pr_and_link(
     // Resolve head from the worktree's git state. Base is the same
     // pinned value we passed to gh — the projection must record what
     // we actually opened the PR against, not gh's repo default.
-    let head_branch = crate::work_commands::git_rev_parse_branch(&worktree_str)?;
+    let head_branch = crate::work_commands_git::git_rev_parse_branch(&worktree_str)?;
 
     let pull_request = PullRequestRef {
         repo: card.repo.clone(),
