@@ -459,6 +459,7 @@ mod tests {
                 runtime: "agent".to_string(),
                 scope: Some("/tmp/agent".to_string()),
                 last_seen_ms: now_ms().unwrap_or(1),
+                coordination: Default::default(),
             }),
             availability,
             active_claims,

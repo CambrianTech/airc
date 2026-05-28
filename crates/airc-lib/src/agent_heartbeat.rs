@@ -36,6 +36,7 @@ use airc_core::headers::Headers;
 use airc_core::transcript::MentionTarget;
 use airc_core::{Body, PeerId, TranscriptEvent};
 use airc_protocol::FrameKind;
+use airc_work::{AgentAvailabilityState, WorkCardId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -99,6 +100,69 @@ pub struct AgentHeartbeat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
     pub emitted_at_ms: u64,
+    /// Optional coordination signal: what this agent is currently
+    /// claiming, whether it can accept new work, and which doctrine
+    /// it's following. Lets observers answer "what is each agent
+    /// doing right now?" from a single beat instead of projecting
+    /// the work board. Card aacf2162.
+    ///
+    /// Defaults to an empty signal for back-compat: peers on
+    /// pre-aacf2162 code emit beats without this field, and decoders
+    /// see an empty `CoordinationSignal`. New peers populate the
+    /// fields they have data for; consumers must treat each sub-field
+    /// as optional.
+    #[serde(default, skip_serializing_if = "CoordinationSignal::is_empty")]
+    pub coordination: CoordinationSignal,
+}
+
+/// Coordination payload carried on `AgentHeartbeat`. Every field is
+/// optional (defaults to empty/`None`) so older emitters round-trip
+/// cleanly and observers can pick up the fields they understand.
+///
+/// Card aacf2162. The shape captures the three signals AGENTS.md §6
+/// names ("current claims, availability, doctrine version") — enough
+/// to drive cross-peer "what is everyone doing right now?" displays,
+/// scheduling heuristics ("don't propose work to a Busy agent"), and
+/// staleness alerts ("this agent is on the wrong doctrine version").
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CoordinationSignal {
+    /// Work cards this agent currently holds active claims on at
+    /// emit time. Empty when idle. The list is a snapshot — observers
+    /// MUST NOT treat it as authoritative once newer events have
+    /// landed (the work-board projection remains the source of truth
+    /// for claim state, by the store-as-arbiter contract). What this
+    /// gives them is a `O(beats)` view of cross-peer activity that
+    /// doesn't require replaying the whole board.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_claims: Vec<WorkCardId>,
+    /// Self-reported availability: Ready / Busy / Away. Distinct from
+    /// the substrate's `AgentAvailabilityReported` event (which is
+    /// per-repo and explicit); this is a per-beat, per-agent quick
+    /// signal that observers can use to route DMs or task proposals.
+    /// `None` means "didn't report" (e.g. non-agent runtimes that
+    /// don't model availability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AgentAvailabilityState>,
+    /// Stable identifier of the operating doctrine this agent is
+    /// following — typically the commit hash of the `AGENTS.md` it
+    /// loaded on attach. Lets observers detect agents on stale
+    /// doctrine (`doctrine_version` mismatch is reason to suggest
+    /// `airc update` or re-pull). Free-form string; convention is a
+    /// short hex sha or a semver-like label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctrine_version: Option<String>,
+}
+
+impl CoordinationSignal {
+    /// True when every field is empty. Used by serde
+    /// `skip_serializing_if` to keep beats from pre-aacf2162 callers
+    /// (and idle agents with nothing to report) byte-identical to
+    /// the original heartbeat shape on the wire.
+    pub fn is_empty(&self) -> bool {
+        self.active_claims.is_empty()
+            && self.availability.is_none()
+            && self.doctrine_version.is_none()
+    }
 }
 
 /// Summary of one currently-alive agent. Returned by
@@ -111,6 +175,12 @@ pub struct AgentLiveness {
     pub scope: Option<String>,
     pub build: Option<String>,
     pub last_seen_ms: u64,
+    /// Coordination snapshot from the latest beat (card aacf2162).
+    /// Empty when the emitter didn't report any coordination signal
+    /// — observers should treat absent fields as "unknown", not
+    /// "absent": an idle agent and a pre-aacf2162 agent both surface
+    /// here the same way.
+    pub coordination: CoordinationSignal,
 }
 
 /// Handle to a running heartbeat emit task. Dropping or calling
@@ -180,6 +250,32 @@ impl Airc {
         scope: Option<String>,
         build: Option<String>,
     ) -> Result<(), AircError> {
+        self.emit_agent_heartbeat_with_coordination(
+            kind,
+            runtime,
+            client_id,
+            scope,
+            build,
+            CoordinationSignal::default(),
+        )
+        .await
+    }
+
+    /// Emit a heartbeat with the full enriched payload — runtime
+    /// metadata plus the coordination signal (active claims,
+    /// availability, doctrine version) from card aacf2162. Older
+    /// `emit_*` methods compose onto this with an empty
+    /// `CoordinationSignal`; the wire bytes are byte-identical to
+    /// the pre-aacf2162 shape when `coordination.is_empty()`.
+    pub async fn emit_agent_heartbeat_with_coordination(
+        &self,
+        kind: HeartbeatKind,
+        runtime: impl Into<String>,
+        client_id: Option<String>,
+        scope: Option<String>,
+        build: Option<String>,
+        coordination: CoordinationSignal,
+    ) -> Result<(), AircError> {
         let runtime = runtime.into();
         let heartbeat = AgentHeartbeat {
             kind,
@@ -189,6 +285,7 @@ impl Airc {
             scope,
             build,
             emitted_at_ms: now_ms()?,
+            coordination,
         };
         let body = serde_json::to_value(&heartbeat)
             .map_err(|error| AircError::Crypto(format!("agent heartbeat encode: {error}")))?;
@@ -318,6 +415,7 @@ impl Airc {
                 scope: beat.scope,
                 build: beat.build,
                 last_seen_ms: beat.emitted_at_ms,
+                coordination: beat.coordination,
             })
             .collect();
         alive.sort_by_key(|liveness| {
@@ -369,6 +467,7 @@ mod tests {
             scope: Some("/work/airc".to_string()),
             build: Some("abc123".to_string()),
             emitted_at_ms: 1_700_000_000_000,
+            coordination: CoordinationSignal::default(),
         }
     }
 
@@ -381,6 +480,18 @@ mod tests {
             scope: None,
             build: None,
             emitted_at_ms: 1_700_000_001_000,
+            coordination: CoordinationSignal::default(),
+        }
+    }
+
+    fn sample_coordination() -> CoordinationSignal {
+        CoordinationSignal {
+            active_claims: vec![
+                WorkCardId::from_u128(0xAACF_2162),
+                WorkCardId::from_u128(0x75B5_4D0A),
+            ],
+            availability: Some(AgentAvailabilityState::Busy),
+            doctrine_version: Some("agents-md@08eb758".to_string()),
         }
     }
 
@@ -416,6 +527,7 @@ mod tests {
             scope: None,
             build: None,
             emitted_at_ms: 0,
+            coordination: CoordinationSignal::default(),
         };
         let json = serde_json::to_string(&beat).expect("encode");
         // `serde(skip_serializing_if = "Option::is_none")` should
@@ -423,5 +535,129 @@ mod tests {
         assert!(!json.contains("\"scope\""));
         let decoded: AgentHeartbeat = serde_json::from_str(&json).expect("decode");
         assert_eq!(decoded.scope, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Card aacf2162 — coordination signal on the heartbeat.
+    // -----------------------------------------------------------------
+
+    /// A new beat that populates the coordination signal must
+    /// round-trip every field byte-identically. This is the wire
+    /// contract: an observer that sees this beat must reconstruct
+    /// "Busy, holding cards X and Y, doctrine 08eb758" without loss.
+    #[test]
+    fn coordination_signal_round_trips_through_json() {
+        let mut beat = sample_alive();
+        beat.coordination = sample_coordination();
+        let json = serde_json::to_string(&beat).expect("encode");
+        let decoded: AgentHeartbeat = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded, beat);
+        assert_eq!(decoded.coordination.active_claims.len(), 2);
+        assert_eq!(
+            decoded.coordination.availability,
+            Some(AgentAvailabilityState::Busy)
+        );
+        assert_eq!(
+            decoded.coordination.doctrine_version.as_deref(),
+            Some("agents-md@08eb758"),
+        );
+    }
+
+    /// An empty `CoordinationSignal` must not appear in the JSON at
+    /// all. That keeps the wire bytes byte-identical to the
+    /// pre-aacf2162 shape for idle agents and pre-aacf2162 callers,
+    /// so the change is invisible to peers that don't care.
+    #[test]
+    fn empty_coordination_is_omitted_from_json() {
+        let beat = sample_alive();
+        assert!(beat.coordination.is_empty());
+        let json = serde_json::to_string(&beat).expect("encode");
+        assert!(
+            !json.contains("\"coordination\""),
+            "empty CoordinationSignal must not be serialised; got {json}"
+        );
+    }
+
+    /// Decoding a pre-aacf2162 beat (no `coordination` key at all)
+    /// must succeed and yield an empty signal. This is the back-compat
+    /// half: a fresh client must not refuse heartbeats from older
+    /// peers still on the wire.
+    ///
+    /// The "legacy" fixture is synthesized from a real `AgentHeartbeat`
+    /// with an empty coordination signal — the same JSON a pre-aacf2162
+    /// emitter would have produced, and the same JSON a current
+    /// emitter produces when the coordination signal is empty (the
+    /// `empty_coordination_is_omitted_from_json` test pins that
+    /// invariant). Using `PeerId::new()` (v4) for the fixture avoids
+    /// hand-rolled UUID strings, which can be malformed or accidentally
+    /// collide with real identities in p2p.
+    #[test]
+    fn pre_aacf2162_beats_decode_with_empty_coordination() {
+        let beat = sample_alive();
+        assert!(beat.coordination.is_empty());
+        let legacy_wire = serde_json::to_string(&beat).expect("encode legacy-shaped beat");
+        assert!(
+            !legacy_wire.contains("\"coordination\""),
+            "fixture must lack a coordination key to exercise the back-compat path; \
+             got {legacy_wire}"
+        );
+        let decoded: AgentHeartbeat =
+            serde_json::from_str(&legacy_wire).expect("legacy-shape decode");
+        assert_eq!(decoded.kind, HeartbeatKind::Alive);
+        assert_eq!(decoded.runtime, beat.runtime);
+        assert_eq!(decoded.peer, beat.peer);
+        assert!(
+            decoded.coordination.is_empty(),
+            "missing coordination key must deserialize to the empty signal, \
+             not produce an error"
+        );
+    }
+
+    /// Each sub-field is independently optional: an emitter that
+    /// only knows its own availability (but not active claims or
+    /// doctrine) must still round-trip cleanly.
+    #[test]
+    fn partial_coordination_signals_round_trip_independently() {
+        let only_availability = CoordinationSignal {
+            availability: Some(AgentAvailabilityState::Away),
+            ..Default::default()
+        };
+        let only_claims = CoordinationSignal {
+            active_claims: vec![WorkCardId::from_u128(1)],
+            ..Default::default()
+        };
+        let only_doctrine = CoordinationSignal {
+            doctrine_version: Some("v1".to_string()),
+            ..Default::default()
+        };
+        for signal in [only_availability, only_claims, only_doctrine] {
+            let mut beat = sample_alive();
+            beat.coordination = signal.clone();
+            let json = serde_json::to_string(&beat).expect("encode");
+            let decoded: AgentHeartbeat = serde_json::from_str(&json).expect("decode");
+            assert_eq!(decoded.coordination, signal);
+        }
+    }
+
+    /// `is_empty` is the predicate `skip_serializing_if` and observer
+    /// "this agent reported nothing" logic both rely on. Pin it.
+    #[test]
+    fn is_empty_only_true_when_every_field_unset() {
+        assert!(CoordinationSignal::default().is_empty());
+        assert!(!CoordinationSignal {
+            active_claims: vec![WorkCardId::from_u128(1)],
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!CoordinationSignal {
+            availability: Some(AgentAvailabilityState::Ready),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!CoordinationSignal {
+            doctrine_version: Some("x".into()),
+            ..Default::default()
+        }
+        .is_empty());
     }
 }
