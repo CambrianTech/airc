@@ -612,10 +612,23 @@ async fn open_pr_and_link(
     // Card a4fe899f: `gh` does NOT accept `-C` (that's git's flag).
     // The cwd has to be set via `Command::current_dir(...)` so gh's
     // own repo-resolution (which scans `git remote get-url origin`
-    // from cwd) picks the worktree's branch. Without this, gh
-    // silently ran against whatever the shell's cwd was at invoke
-    // time — usually the wrong repo — and the whole Review-state →
-    // PR-link pipeline failed (best-effort warning was swallowed).
+    // from cwd) picks the worktree's branch.
+    //
+    // Card 28f1440c: `--base` is set explicitly to the workflow's
+    // integration branch (`rust-rewrite`) rather than letting gh
+    // fall back to the repo's GitHub default (`main` here). Main is
+    // the legacy snapshot; every PR landing there bypasses the
+    // substrate work. Hardcoded for the MVP; a follow-up card
+    // surfaces it as configurable for consumers whose integration
+    // branch differs.
+    //
+    // Card 13131f1c: `--title` + `--body` are passed explicitly from
+    // the HEAD commit instead of relying on `--fill`. `--fill`'s
+    // heuristic sometimes substitutes a slugified branch name as the
+    // title (observed on #1032 and #1033 — `docs(agents):`/`fix(ci):`
+    // prefixes stripped, breaking the canary-gate bypass). Reading
+    // the commit subject directly is deterministic.
+    let base_branch = pr_create_base_branch();
     let subject = git_show_format(&worktree_str, "%s")?;
     let body = git_show_format(&worktree_str, "%b")?;
     let create_out = std::process::Command::new("gh")
@@ -627,6 +640,8 @@ async fn open_pr_and_link(
             subject.trim(),
             "--body",
             body.trim(),
+            "--base",
+            base_branch,
         ])
         .output()?;
     if !create_out.status.success() {
@@ -641,15 +656,18 @@ async fn open_pr_and_link(
     let pr_number = extract_pr_number(pr_url)
         .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
 
-    // Resolve head/base from the worktree's git state.
+    // Resolve head from the worktree's git state. Base is the same
+    // value we passed to `gh pr create` above (card 28f1440c) — must
+    // not drift between the substrate's PullRequestRef and the
+    // actual PR target, or downstream consumers (review-spawn,
+    // close-guard) reason about the wrong branch.
     let head_branch = git_rev_parse_branch(&worktree_str)?;
-    let base_branch = gh_default_branch(&worktree_str).unwrap_or_else(|_| "main".to_string());
 
     let pull_request = PullRequestRef {
         repo: card.repo.clone(),
         number: pr_number,
         head: BranchName::new(head_branch)?,
-        base: BranchName::new(base_branch)?,
+        base: BranchName::new(base_branch.to_string())?,
     };
     airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
         card_id,
@@ -786,6 +804,22 @@ fn git_show_format(worktree: &str, format: &str) -> Result<String, Box<dyn std::
     Ok(String::from_utf8(out.stdout)?)
 }
 
+/// Card 28f1440c — the integration branch every per-card PR opens
+/// against. Hardcoded to the airc substrate's working branch for
+/// MVP; a follow-up surfaces this as configurable (e.g. via
+/// `.airc/work.toml`) for consumers whose integration branch is
+/// different.
+///
+/// MUST NOT change to a runtime read of `gh repo view --json defaultBranchRef` —
+/// that returns the repo's GitHub `default_branch` (`main` on this
+/// repo today), and every PR landing on `main` bypasses
+/// `rust-rewrite`'s substrate work. The whole point of this card
+/// is to refuse that fallback.
+pub(crate) fn pr_create_base_branch() -> &'static str {
+    "rust-rewrite"
+}
+
+#[allow(dead_code)]
 fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
     // `Command::current_dir(...)` so `gh repo view` resolves the
@@ -1819,5 +1853,28 @@ mod tests {
         // The id must appear so the agent can copy-paste it into
         // the corrective command.
         assert!(msg.contains(&card_id.to_string()), "carries the card UUID");
+    }
+
+    /// Card 28f1440c — the PR target branch is hardcoded to the
+    /// substrate's working branch (`rust-rewrite`), NOT the repo's
+    /// GitHub default (`main`). Pinning this catches a regression
+    /// where someone "fixes" the constant by routing through
+    /// `gh_default_branch` (which surfaces `main` for this repo and
+    /// would silently bypass the substrate work the doctrine
+    /// requires per AGENTS.md §8). If a config-driven base ever
+    /// ships (the documented follow-up), this test extends —
+    /// it does not get deleted.
+    #[test]
+    fn pr_create_base_branch_targets_rust_rewrite() {
+        assert_eq!(
+            pr_create_base_branch(),
+            "rust-rewrite",
+            "card 28f1440c: PR target must be the substrate working \
+             branch, never the repo's GitHub default ('main' on this \
+             repo today)"
+        );
+        // Specifically: it must NOT be 'main'. The doctrine treats
+        // main as the legacy snapshot.
+        assert_ne!(pr_create_base_branch(), "main");
     }
 }
