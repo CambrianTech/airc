@@ -345,6 +345,49 @@ impl Airc {
         self.inner.identity.client_id
     }
 
+    /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
+    ///
+    /// Scans recent transcript events in the current room for the
+    /// latest `TranscriptKind::IdentityPublished` emitted by `peer_id`
+    /// and returns the published display name when known. Returns
+    /// `Ok(None)` when the peer has never published an identity card
+    /// in this room's recent window, or when the published `name`
+    /// field is empty (an honest "unknown" rather than rendering an
+    /// empty string).
+    ///
+    /// On-demand query — no in-memory cache. The scan window (200
+    /// events) is conservative for a substrate where `IdentityPublished`
+    /// fires once per join, not per chat message. If profiling shows
+    /// hot-path callers, the follow-up is an in-memory roster fed by
+    /// the existing subscribe loop; `peer_alias` keeps its shape.
+    ///
+    /// Consumers: `airc work board format_peer` (card c397567a),
+    /// `airc whois <peer>` (card 20066c49).
+    pub async fn peer_alias(&self, peer_id: PeerId) -> Result<Option<String>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::IdentityPublished {
+                continue;
+            }
+            if event.peer_id != peer_id {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
+            else {
+                continue;
+            };
+            if card.identity.name.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(card.identity.name));
+        }
+        Ok(None)
+    }
+
     /// Sign a domain-separated identity assertion — the airc analogue
     /// of a WebAuthn assertion. The signature covers a versioned domain
     /// tag + `context` (the relying-party / "type" binding) + the
