@@ -13,9 +13,11 @@ use std::collections::BTreeMap;
 pub type Headers = BTreeMap<String, String>;
 
 /// Match predicate for subscription fan-out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeaderFilter {
+    /// Matches every envelope — the default (no header scoping).
+    #[default]
     Any,
     Exact { key: String, value: String },
     Prefix { key: String, value_prefix: String },

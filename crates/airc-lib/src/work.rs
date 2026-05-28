@@ -26,6 +26,37 @@ pub struct CreateWorkCard {
     pub body: Option<String>,
     pub priority: Priority,
     pub lane_id: Option<LaneId>,
+    /// If this card is a review of another card, the reviewed
+    /// card's id. Card ad7e100b (peer-agent review loop) Sub-A:
+    /// makes the relationship a typed link rather than a
+    /// body-string convention. Defaults to `None` for non-review
+    /// cards.
+    #[doc(hidden)]
+    pub reviews: Option<WorkCardId>,
+}
+
+impl CreateWorkCard {
+    /// Default to `None` for the optional fields so the common
+    /// path (a non-review card) doesn't need to spell out every
+    /// new optional field as the request struct grows.
+    pub fn new(repo: RepoId, title: impl Into<String>, priority: Priority) -> Self {
+        Self {
+            repo,
+            title: title.into(),
+            body: None,
+            priority,
+            lane_id: None,
+            reviews: None,
+        }
+    }
+
+    /// Builder-style setter for the typed reviews link.
+    /// Convention: `airc work review <PARENT>` will populate
+    /// this; manual callers can chain `.reviewing(parent)`.
+    pub fn reviewing(mut self, parent: WorkCardId) -> Self {
+        self.reviews = Some(parent);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +76,66 @@ pub struct ReleaseWorkClaim {
 pub struct ChangeWorkCardState {
     pub card_id: WorkCardId,
     pub state: CardState,
+}
+
+/// Amend a card's editable fields after creation. Card 5ac0a359 —
+/// addresses the recurring friction of needing to update a card's
+/// title/body/priority post-creation without losing its id (which
+/// would break `reviews` links, observer subscriptions, and the
+/// projection's continuity guarantee).
+///
+/// Each field is `Option`; `None` means "leave alone." To clear a
+/// body, pass `Some("".into())` — empty string is the markdown
+/// "no body" idiom.
+///
+/// Construct via [`UpdateWorkCard::amend`] for convenience.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWorkCard {
+    pub card_id: WorkCardId,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub priority: Option<Priority>,
+}
+
+impl UpdateWorkCard {
+    /// Builder constructor: start with `card_id` and chain
+    /// `.with_title(...) / .with_body(...) / .with_priority(...)`.
+    pub fn amend(card_id: WorkCardId) -> Self {
+        Self {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+        }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the body. Pass `""` to clear (markdown "no body" idiom).
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+}
+
+/// Link a pull request to a work card (card 820629e9). The projection
+/// (`apply_pull_request_linked`) atomically transitions the card into
+/// `CardState::Review` and populates `WorkCard.pull_request` so any
+/// downstream consumer — auto-spawn review card on Review state
+/// (ad7e100b Sub-C), board renderers, gh check-suite observers —
+/// reads from one source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCardPullRequest {
+    pub card_id: WorkCardId,
+    pub pull_request: airc_work::model::PullRequestRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +357,7 @@ impl Airc {
             lane_id: request.lane_id,
             created_by: self.peer_id(),
             created_at_ms: now_ms()?,
+            reviews: request.reviews,
         });
         self.publish_work_event(&event).await?;
         Ok(card_id)
@@ -304,6 +396,38 @@ impl Airc {
         Ok(())
     }
 
+    /// Amend a work card's editable fields (title, body, priority)
+    /// post-creation. Card 5ac0a359 — `None` on a field means "leave
+    /// alone"; `body` is double-`Option` so the caller can
+    /// distinguish "don't change body" from "clear the body".
+    ///
+    /// An all-`None` request still emits an event (with the latest
+    /// `updated_at_ms`), which is useful as a liveness marker — a
+    /// peer can "touch" a card to advertise that they're tracking it
+    /// without changing semantics. The projection treats this as a
+    /// pure `updated_at_ms` bump.
+    ///
+    /// Refuses on `WorkCardNotInCurrentRoom` so an amendment can't
+    /// silently target a card from a different room — same guard
+    /// `change_work_card_state` uses.
+    pub async fn update_work_card(
+        &self,
+        request: UpdateWorkCard,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
+            card_id: request.card_id,
+            title: request.title,
+            body: request.body,
+            priority: request.priority,
+            updated_by: self.peer_id(),
+            updated_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
     /// Change a work card's lifecycle state through the work event
     /// stream. This is the queue hygiene path agents use to stop
     /// completed work from remaining claimable.
@@ -318,6 +442,29 @@ impl Airc {
             state: request.state,
             changed_by: self.peer_id(),
             changed_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(())
+    }
+
+    /// Link a pull request to a work card (card 820629e9). Emits
+    /// `WorkEvent::PullRequestLinked` whose projection atomically sets
+    /// `card.pull_request = Some(pr)` and transitions
+    /// `card.state = Review`. Used by `airc work state ... review`
+    /// after `gh pr create` returns a PR number; future card-state
+    /// observers don't need to ask "did the agent forget to fill the
+    /// pr field" — the link IS the state transition.
+    pub async fn link_card_pull_request(
+        &self,
+        request: LinkCardPullRequest,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(request.card_id)
+            .await?;
+        let event = WorkEvent::PullRequestLinked(airc_work::event::PullRequestLinked {
+            card_id: request.card_id,
+            pull_request: request.pull_request,
+            linked_by: self.peer_id(),
+            linked_at_ms: now_ms()?,
         });
         self.publish_work_event(&event).await?;
         Ok(())
@@ -542,21 +689,44 @@ impl Airc {
     /// [`Airc::work_board_complete`] instead.
     pub async fn work_board(&self, limit: usize) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
+        // Recent-window view (not the complete board): daemon reads the
+        // most-recent `limit`; direct reads the recent store page.
+        if self.is_daemon_attached() {
+            let transcripts = self.daemon_page_recent(&room, limit).await?;
+            return Ok(airc_work_store::project_transcripts(transcripts)?);
+        }
         let store = WorkEventStore::new(self.event_store());
         Ok(store.project_recent(Some(room.channel), limit).await?)
     }
 
-    /// Rebuild the current room's complete work board in bounded store
-    /// pages. Scheduling and mutation paths use this so old active
-    /// cards do not disappear just because chat/status traffic pushed
-    /// their creation event outside a recent transcript window.
+    /// Rebuild the current room's complete work board. Scheduling and
+    /// mutation paths use this so old active cards do not disappear just
+    /// because chat/status traffic pushed their creation event outside a
+    /// recent transcript window.
     pub async fn work_board_complete(
         &self,
         page_size: usize,
     ) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
+        self.project_room_work_board(&room, page_size).await
+    }
+
+    /// Project `room`'s work board, reading work events from the daemon
+    /// when attached (the one same-machine path) or the local store
+    /// otherwise. Centralises the read so the whole work subsystem is
+    /// daemon-aware — work is event-sourced, so its reads must follow the
+    /// same path as its writes (`send_frame` → daemon when attached).
+    async fn project_room_work_board(
+        &self,
+        room: &crate::Room,
+        page_size: usize,
+    ) -> Result<WorkBoardProjection, AircError> {
+        if self.is_daemon_attached() {
+            let transcripts = self
+                .daemon_room_transcripts(room.channel, page_size)
+                .await?;
+            return Ok(airc_work_store::project_transcripts(transcripts)?);
+        }
         let store = WorkEventStore::new(self.event_store());
         Ok(store
             .project_complete(Some(room.channel), page_size)
@@ -681,10 +851,8 @@ impl Airc {
 
     async fn ensure_work_card_in_current_room(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
-        self.ensure_room_subscriber(&room).await?;
-        let store = WorkEventStore::new(self.event_store());
-        let board = store
-            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         if board.card(card_id).is_some() {
             return Ok(());
@@ -699,9 +867,8 @@ impl Airc {
 
     async fn ensure_work_card_unclaimed(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
-        let store = WorkEventStore::new(self.event_store());
-        let board = store
-            .project_complete(Some(room.channel), WORK_MUTATION_PAGE_SIZE)
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         let Some(card) = board.card(card_id) else {
             return Err(AircError::WorkCardNotInCurrentRoom {

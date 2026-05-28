@@ -278,37 +278,38 @@ pub(crate) fn cwd() -> String {
         .unwrap_or_default()
 }
 
-fn state_prefix() -> String {
-    #[cfg(unix)]
-    {
-        // SAFETY: `getuid` has no preconditions, does not dereference pointers,
-        // and returns the numeric user id for the current process.
-        unsafe { libc::getuid().to_string() }
-    }
-    #[cfg(not(unix))]
-    {
-        env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
-    }
+/// Per-account GitHub guard state lives under the machine-account home
+/// (`~/.airc/gh/`), not a temp dir — same "all state under `.airc`"
+/// discipline as the daemon socket. `.airc` is already per-user, so no
+/// uid prefix is needed. The directory is created on demand.
+fn gh_state_dir() -> PathBuf {
+    let account_home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".airc"))
+        // No home env at all (headless/broken env): fall back to a temp
+        // `.airc` so the guard still functions rather than panicking.
+        .unwrap_or_else(|| env::temp_dir().join(".airc"));
+    let dir = account_home.join("gh");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 pub(crate) fn backoff_path() -> PathBuf {
-    env::temp_dir().join(format!("airc-gh-backoff-until-{}", state_prefix()))
+    gh_state_dir().join("backoff-until")
 }
 
 pub(crate) fn budget_path() -> PathBuf {
-    env::temp_dir().join(format!("airc-gh-budget-{}.jsonl", state_prefix()))
+    gh_state_dir().join("budget.jsonl")
 }
 
 pub(crate) fn audit_path() -> PathBuf {
     env::var_os("AIRC_GH_AUDIT_LOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::temp_dir().join(format!("airc-gh-requests-{}.jsonl", state_prefix()))
-        })
+        .unwrap_or_else(|| gh_state_dir().join("requests.jsonl"))
 }
 
 fn lock_path() -> PathBuf {
-    env::temp_dir().join(format!("airc-gh-guard-{}.lock", state_prefix()))
+    gh_state_dir().join("guard.lock")
 }
 
 #[cfg(test)]

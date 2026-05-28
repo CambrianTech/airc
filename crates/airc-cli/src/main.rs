@@ -20,9 +20,9 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
-mod daemon_scope;
 mod doctor;
 mod envelope_cli;
+mod event_render;
 mod events_cli;
 mod events_commands;
 mod gh_cli;
@@ -362,7 +362,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit, json).await,
 
-        Command::Room { name, wire } => commands::run_room(&home, name, wire).await,
+        Command::Room { name } => commands::run_room(&home, name).await,
+
+        Command::DoctrinePublish { from_file } => {
+            commands::run_doctrine_publish(&home, from_file).await
+        }
 
         Command::Part { room } => commands::run_part(&home, room).await,
 
@@ -611,11 +615,25 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 claim_id,
                 reason,
             } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            WorkAction::Update {
+                card_id,
+                title,
+                body,
+                priority,
+            } => work_commands::run_update(&home, card_id, title, body, priority).await,
             WorkAction::State { card_id, state } => {
                 work_commands::run_state(&home, card_id, state).await
             }
             WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
-            WorkAction::Board { limit } => work_commands::run_board(&home, limit).await,
+            WorkAction::Board {
+                limit,
+                available,
+                mine,
+                others,
+            } => {
+                let filter = work_commands::BoardFilter::from_flags(available, mine, others);
+                work_commands::run_board(&home, limit, filter).await
+            }
             WorkAction::Next {
                 repo,
                 max_priority,
@@ -657,6 +675,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             }
+            WorkAction::Review {
+                parent_id,
+                pr,
+                priority,
+                body,
+            } => work_commands::run_review(&home, parent_id, pr, priority, body).await,
             WorkAction::Availability {
                 repo,
                 state,
@@ -946,12 +970,6 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::IsoToEpoch { timestamp } => {
             println!("{}", airc_core::iso_to_epoch(&timestamp)?);
-            Ok(())
-        }
-
-        Command::DaemonScopeId { scope } => {
-            let scope = scope.unwrap_or_else(daemon_scope::default_scope);
-            println!("{}", daemon_scope::scope_id(&scope));
             Ok(())
         }
     }

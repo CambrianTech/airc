@@ -20,5 +20,14 @@ futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
+# Same-machine delivery is the owner-core daemon's job, so the
+# integration tests stand up an in-process daemon and the consumer
+# `Airc::attach`es to it — exactly what the airc install provides in
+# production. These deps are TEST HARNESS only; the runtime embedding
+# surface (`src/agent.rs`) still depends solely on `airc-lib`.
+airc-daemon = { path = "../../airc-daemon" }
+airc-core = { path = "../../airc-core" }
+airc-protocol = { path = "../../airc-protocol" }
+airc-store = { path = "../../airc-store" }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }

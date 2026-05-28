@@ -23,10 +23,8 @@ use futures::stream::StreamExt;
 
 use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
 use airc_identity::LocalIdentity;
-use airc_ipc::{
-    AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response, SubscribeRequest,
-};
-use airc_lib::{Airc, Body, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
+use airc_ipc::{AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response};
+use airc_lib::{Airc, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_trust as peers_store;
 
@@ -52,20 +50,15 @@ pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `room` — print current room. `room <name>` — switch to a
-/// deterministic room derived from `<name>`. `--wire` overrides the
-/// per-home default wire dir (test-only shared-wire setup).
+/// deterministic room derived from `<name>`.
 pub async fn run_room(
     home: &Path,
     name: Option<String>,
-    wire: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
-            let next = match wire {
-                Some(wire) => airc.join_with_wire(&name, wire).await?,
-                None => airc.join(&name).await?,
-            };
+            let next = airc.join(&name).await?;
             println!("switched room: {}", next.name);
             println!("  wire:    {}", next.wire.display());
             println!("  channel: {}", next.channel);
@@ -78,6 +71,71 @@ pub async fn run_room(
         }
     }
     Ok(())
+}
+
+/// `doctrine-publish` — read a markdown file (default: AGENTS.md at
+/// the git repo root) and publish it as the room's operating
+/// doctrine via `Airc::publish_room_doctrine`. Card 2903a8ef slice
+/// 2/4 of the engine keystone — gets the "how we work here" contract
+/// onto the substrate so attaching agents in any scope load it.
+///
+/// Version: short SHA-256 prefix of the body bytes. Future tooling
+/// can compare versions to detect "doctrine on my scope is stale."
+pub async fn run_doctrine_publish(
+    home: &Path,
+    from_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve the source path. Default: `<git-repo-root>/AGENTS.md`.
+    let path = match from_file {
+        Some(p) => p,
+        None => {
+            let repo_root = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .output()?;
+            if !repo_root.status.success() {
+                return Err(format!(
+                    "no --from-file passed and git rev-parse --show-toplevel \
+                     failed (not in a git repo?): {}",
+                    String::from_utf8_lossy(&repo_root.stderr).trim()
+                )
+                .into());
+            }
+            let root = String::from_utf8(repo_root.stdout)?.trim().to_string();
+            PathBuf::from(root).join("AGENTS.md")
+        }
+    };
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        format!("cannot read doctrine file {}: {e}", path.display())
+    })?;
+
+    let version = short_content_hash(body.as_bytes());
+
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let airc = Airc::attach(home, socket).await?;
+    airc.publish_room_doctrine(body.clone(), version.clone()).await?;
+    println!(
+        "doctrine_published: file={file} version={version} bytes={bytes}",
+        file = path.display(),
+        bytes = body.len(),
+    );
+    Ok(())
+}
+
+/// Short content discriminator — first 12 chars of SHA-256 hex of
+/// `body`. Twelve chars are enough to distinguish unrelated revisions
+/// of a kilobyte-scale doctrine file (the AGENTS.md target) without
+/// pulling in a heavier hash; collisions at this scale are
+/// astronomically unlikely and the substrate stores every event so a
+/// "version" collision degrades to "two latest with the same tag,"
+/// not data loss.
+fn short_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hex.chars().take(12).collect()
 }
 
 /// `part` — leave a subscribed room without deleting identity, trust,
@@ -94,7 +152,11 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
 pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    // Start the machine-singular daemon and attach: join, heartbeat, and
+    // the live feed all route through the daemon's router (one path).
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    let airc = Airc::attach(home, socket.clone()).await?;
     let runtime_context = crate::runtime_context::RuntimeContext::current();
     match room {
         Some(room) => {
@@ -117,10 +179,21 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             print_scope_context(home, &current.wire);
         }
     }
-    let socket = crate::cli::default_socket_path_in(home);
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    subscribe_daemon_to_current_rooms(home, socket).await?;
+    sync_daemon_peers_for_current_rooms(home, socket).await?;
     ensure_runtime_integrations();
+
+    // Card 745e93f0 (slice 4/4 of engine-keystone 2903a8ef): surface
+    // the room's operating doctrine to the attaching agent. Agent
+    // runner harnesses scrape this region from join stdout and
+    // inject it into the agent's system context — the "user is not
+    // the engine" fix lands here. Marked with stable BEGIN/END
+    // markers so the scrape is unambiguous; silent when the room
+    // has no published doctrine.
+    if let Ok(Some(doctrine)) = airc.room_doctrine().await {
+        println!("--- BEGIN ROOM DOCTRINE (version={}) ---", doctrine.version);
+        println!("{}", doctrine.body);
+        println!("--- END ROOM DOCTRINE ---");
+    }
 
     let _heartbeat = if runtime_context.should_stream_join() {
         Some(start_join_heartbeat(&airc, home, &runtime_context).await?)
@@ -143,13 +216,27 @@ async fn start_join_heartbeat(
     let runtime = runtime_context.runtime_label().to_string();
     let client_id = runtime_context.client_id().map(ToString::to_string);
     let build = (!crate::build_info::is_unknown()).then(|| crate::build_info::COMMIT_SHORT.into());
+
+    // Card 0bf262eb: populate the coordination signal added in
+    // aacf2162. This is the minimum-viable slice — the build SHA
+    // stands in for `doctrine_version` (the build tree includes
+    // AGENTS.md, so observers can still detect peers on stale
+    // doctrine), and the other two fields stay default. A follow-up
+    // card refreshes `active_claims` from the board projection on
+    // every tick.
+    let coordination = airc_lib::CoordinationSignal {
+        doctrine_version: build.clone(),
+        ..Default::default()
+    };
+
     Ok(airc
-        .start_agent_heartbeat_with_metadata(
+        .start_agent_heartbeat_with_coordination(
             runtime,
             client_id,
             Some(scope),
             build,
             DEFAULT_HEARTBEAT_INTERVAL,
+            coordination,
         )
         .await?)
 }
@@ -296,7 +383,12 @@ fn detach_daemon(command: &mut Command) {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
-async fn subscribe_daemon_to_current_rooms(
+/// Push the current scope's peer trust into the running daemon's
+/// in-memory registry. In the owner-core there is no per-wire subscribe:
+/// the one machine daemon already routes every channel through its
+/// `EventRouter`, so a scope just needs the daemon to know its peers
+/// (for cross-machine verify), nothing more.
+async fn sync_daemon_peers_for_current_rooms(
     home: &Path,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -304,13 +396,6 @@ async fn subscribe_daemon_to_current_rooms(
     let client = DaemonClient::new(socket);
     let set = airc.subscription_set().await?;
     sync_daemon_peers(&client, home, &set).await?;
-    for subscription in set.all() {
-        client
-            .subscribe(SubscribeRequest {
-                wire: subscription.as_room().wire,
-            })
-            .await?;
-    }
     Ok(())
 }
 
@@ -417,12 +502,21 @@ fn canonical_machine_account_home() -> Option<PathBuf> {
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
+/// Open an `Airc` attached to this machine's singular daemon, starting
+/// it if needed. Same-machine send/read/subscribe route through the
+/// daemon's router — the only same-machine path (no more `frames.jsonl`).
+pub(crate) async fn attached_airc(home: &Path) -> Result<Airc, Box<dyn std::error::Error>> {
+    let socket = crate::cli::default_socket_path_in(home);
+    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
+    Ok(Airc::attach(home, socket).await?)
+}
+
 pub async fn run_send(
     home: &Path,
     peers: Vec<PeerSpec>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
@@ -468,7 +562,7 @@ pub async fn run_listen(
     peers: Vec<PeerSpec>,
     _replay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
@@ -553,21 +647,29 @@ pub async fn run_daemon(
         }
     }
 
-    // The durable event store lives under `<home>/events.sqlite`.
-    // Migrations are applied on open; consumers that subscribed
-    // before the daemon was last restarted can resume from the
-    // same `(lamport, event_id)` cursor on next boot.
-    let store_path = home.join("events.sqlite");
-    let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
-    let state = Arc::new(DaemonState::new_with_runtime(
-        identity.peer_id,
-        identity.keypair,
-        registry,
-        VerificationPolicy::Strict,
-        home.to_path_buf(),
-        store,
-        current_daemon_runtime_info(),
-    ));
+    // ONE ORM per machine account (§3.3). The daemon is the single
+    // owner: every scope under this user's `$HOME` resolves the same
+    // machine-account home, so they share one `events.sqlite` — the
+    // router's durable transcript + persisted epoch, and the coordinator
+    // store's subscriptions / beacons / identity. No per-scope store.
+    let machine_home = airc_lib::machine_account_home(home);
+    std::fs::create_dir_all(&machine_home)?;
+    let db_path = machine_home.join("events.sqlite");
+    let coordinator_store: Arc<dyn EventStore> =
+        Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let state = Arc::new(
+        DaemonState::build(
+            identity.peer_id,
+            identity.keypair,
+            registry,
+            VerificationPolicy::Strict,
+            machine_home,
+            &db_path,
+            coordinator_store,
+            current_daemon_runtime_info(),
+        )
+        .await?,
+    );
     println!(
         "airc daemon: peer_id={} listening on {}",
         identity.peer_id,
@@ -632,7 +734,7 @@ pub async fn run_msg(
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    subscribe_daemon_to_current_rooms(home, socket.clone()).await?;
+    sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
     let current = airc.current_room().await?;
     airc.say_with_headers(text, runtime_headers()?).await?;
@@ -662,8 +764,8 @@ pub async fn run_inbox(
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
-        Some(socket) => Airc::attach(home, socket).await?,
-        None => Airc::open(home).await?,
+        Some(socket) => { ensure_daemon_running(home, socket.clone(), Vec::new()).await?; Airc::attach(home, socket).await? }
+        None => attached_airc(home).await?,
     };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
@@ -784,17 +886,11 @@ where
 }
 
 fn print_event(event: &airc_core::TranscriptEvent) {
-    let text = event
-        .body
-        .as_ref()
-        .and_then(Body::as_text)
-        .unwrap_or("<non-text body>");
-    println!(
-        "[{kind:?}] {sender} → {channel}: {text}",
-        kind = event.kind,
-        sender = event.peer_id,
-        channel = event.room_id,
-    );
+    // Structured events render by kind; `alive` heartbeats are suppressed
+    // (None) so they don't drown the feed. See `event_render`.
+    if let Some(line) = crate::event_render::render_feed_line(event) {
+        println!("{line}");
+    }
 }
 
 /// Build the runtime `PeerKeyRegistry` from persistent peers
@@ -938,7 +1034,42 @@ pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std
         [peer] => {
             println!("  peer_id:   {}", peer.peer_id);
             println!("  pubkey:    {}", peer.pubkey_b64);
-            println!("  identity:  not published yet");
+            // Card 20066c49: read the identity card the peer published
+            // via the substrate (IdentityPublished events emitted on
+            // join — cards 088af06 / cd638b8) when known. Falls back
+            // to the honest "not published yet" line so the user can
+            // tell unknown from blank-but-known.
+            match airc.peer_identity_card(peer.peer_id).await {
+                Ok(Some(card)) => {
+                    let id = &card.identity;
+                    let name = if id.name.is_empty() { "(unset)" } else { id.name.as_str() };
+                    let pronouns = if id.pronouns.is_empty() { "(unset)" } else { id.pronouns.as_str() };
+                    let role = if id.role.is_empty() { "(unset)" } else { id.role.as_str() };
+                    let bio = if id.bio.is_empty() { "(unset)" } else { id.bio.as_str() };
+                    let status = if id.status.is_empty() { "(none)" } else { id.status.as_str() };
+                    let fingerprint = if id.fingerprint.is_empty() {
+                        "(unset)"
+                    } else {
+                        id.fingerprint.as_str()
+                    };
+                    println!("  identity:  published");
+                    println!("    name:        {name}");
+                    println!("    pronouns:    {pronouns}");
+                    println!("    role:        {role}");
+                    println!("    bio:         {bio}");
+                    println!("    status:      {status}");
+                    println!("    fingerprint: {fingerprint}");
+                    if !id.integrations.is_empty() {
+                        println!("    integrations:");
+                        for (k, v) in &id.integrations {
+                            println!("      {k}: {v}");
+                        }
+                    }
+                    println!("    emitted_at:  {} ms", card.emitted_at_ms);
+                }
+                Ok(None) => println!("  identity:  not published yet"),
+                Err(error) => println!("  identity:  lookup failed: {error}"),
+            }
             println!("  source:    peer trust store");
             Ok(())
         }

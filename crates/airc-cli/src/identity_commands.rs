@@ -260,9 +260,15 @@ async fn load_identity_card(home: &Path) -> Result<Identity, Box<dyn Error>> {
 }
 
 async fn save_identity_card(home: &Path, identity: Identity) -> Result<(), Box<dyn Error>> {
+    // Route through the daemon-attached Airc handle so the save +
+    // PeerIdentityCard broadcast to every subscribed room are atomic
+    // from the caller's view (card da586598 — last identity-roster
+    // slice). The previous direct-store save persisted locally but
+    // never published, so attached peers had no way to learn about
+    // nick/profile updates without the author rejoining.
     let _ = LocalIdentity::load_or_generate(home).await?;
-    let store = identity_store(home).await?;
-    store.save_local_identity_card(identity).await?;
+    let airc = crate::commands::attached_airc(home).await?;
+    airc.set_local_identity_card(identity).await?;
     Ok(())
 }
 

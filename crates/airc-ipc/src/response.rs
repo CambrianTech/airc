@@ -1,11 +1,17 @@
 //! Daemon → client responses. Symmetric to `request.rs` — typed
 //! enum, wire-tagged by `kind`.
-
-use std::path::PathBuf;
+//!
+//! Owner-core model: live events and inbox pages cross the IPC boundary
+//! as **opaque airc-wire bytes** (`airc_wire::encode(&Envelope)`) — the
+//! daemon encodes once, the client decodes once. The IPC layer stays
+//! ignorant of the envelope's shape (no `airc-bus` dependency leaks
+//! here, no per-hop re-serialize).
 
 use serde::{Deserialize, Serialize};
 
 use airc_core::{EventId, PeerId, RoomId};
+
+use crate::request::IpcCursor;
 
 /// One response to a `Request`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -15,25 +21,21 @@ pub enum Response {
     Pong,
     /// Response to `Status`.
     Status(StatusResponse),
-    /// Response to `Inbox` — buffered frames + a "newest cursor" the
-    /// caller threads back on the next call to keep the stream
-    /// consume-once.
+    /// Response to `Inbox` — durable envelopes (airc-wire bytes) + a
+    /// "newest cursor" the caller threads back on the next call to keep
+    /// the stream consume-once.
     Inbox(InboxResponse),
-    /// One live event emitted by an `Attach` stream.
-    Event {
-        event: Box<airc_core::TranscriptEvent>,
-    },
-    /// Response to `Publish`.
+    /// One live event emitted by an `Attach` stream — the airc-wire
+    /// encoding of the bus `Envelope`. The client decodes via
+    /// `airc_wire::decode`.
+    Event { envelope: Vec<u8> },
+    /// Response to `Publish` / `Send` — the owner-assigned receipt.
     Publish(PublishResponse),
-    /// Response to `ResolveWire`. `wire` is `None` when the
-    /// channel UUID isn't subscribed in this daemon's scope —
-    /// caller must join the channel first.
-    ResolveWire(ResolveWireResponse),
     /// Response to `ListPeers` — the daemon's currently-enrolled
     /// peers (peer_id + URL-safe-no-padding base64 pubkey).
     Peers(PeersResponse),
-    /// Generic success for ops that don't return data (`Send`,
-    /// `Subscribe`, `AddPeer`, `Stop`).
+    /// Generic success for ops that don't return data (`AddPeer`,
+    /// `RemovePeer`, `Stop`, and the initial `Attach` ack).
     Ok,
     /// Failure — typed message so the client can render it.
     Error { message: String },
@@ -79,41 +81,35 @@ pub struct PeersResponse {
     pub peers: Vec<PeerEntry>,
 }
 
-/// Result of an `Inbox` pull: events + the cursor to feed back as
-/// `since` on the next call. Returned events are oldest → newest
-/// within the page.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Result of an `Inbox` pull: durable envelopes (airc-wire bytes) + the
+/// cursor to feed back as `since` on the next call. Envelopes are in
+/// total order `(epoch, counter, event_id)`, oldest → newest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InboxResponse {
-    /// Up to `limit` events matching the request, in transcript
-    /// order `(lamport asc, event_id asc)`.
-    pub events: Vec<airc_core::TranscriptEvent>,
-    /// Cursor of the newest event in `events`. `None` when the page
-    /// was empty — in that case the caller's `since` is still the
-    /// authoritative position to feed back on the next poll.
+    /// Up to `limit` envelopes matching the request, each an
+    /// `airc_wire::encode(&Envelope)` buffer.
+    pub envelopes: Vec<Vec<u8>>,
+    /// Cursor of the newest envelope in `envelopes`. `None` when the
+    /// page was empty — the caller's `since` stays authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newest: Option<airc_core::TranscriptCursor>,
+    pub newest: Option<IpcCursor>,
 }
 
-/// Event metadata returned by daemon-backed structured publish.
+/// Owner-assigned receipt returned by `Send` / `Publish`. The
+/// `(epoch, counter)` seq IS the authoritative total order; wall-clock
+/// `occurred_at` lives on the envelope itself (decode from inbox/attach
+/// bytes if a client needs it), so it isn't duplicated here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublishResponse {
     pub event_id: EventId,
-    pub lamport: u64,
+    /// Generational epoch of the assigned `(epoch, counter)` seq.
+    pub epoch: u64,
+    /// Monotonic counter within the epoch.
+    pub counter: u64,
+    /// Owner-stamped wall-clock at publish (informational; the
+    /// authoritative order is `(epoch, counter)`).
     pub occurred_at_ms: u64,
     pub channel_id: RoomId,
-}
-
-/// Result of a `ResolveWire` request.
-///
-/// `wire` is `Some(path)` when the daemon's subscription store
-/// has a subscription on the requested channel UUID; `None`
-/// when the daemon has never seen that channel (caller must
-/// join it first — `ResolveWire` does not auto-subscribe, same
-/// non-auto-join discipline as `Airc::publish`'s
-/// `PublishTarget::RoomByName`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolveWireResponse {
-    pub wire: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -174,11 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn publish_response_roundtrips() {
+    fn publish_response_roundtrips_with_epoch_counter() {
         let original = Response::Publish(PublishResponse {
             event_id: EventId::from_u128(1),
-            lamport: 2,
-            occurred_at_ms: 3,
+            epoch: 2,
+            counter: 9,
+            occurred_at_ms: 1_700_000_000_000,
             channel_id: RoomId::from_u128(4),
         });
         let encoded = serde_json::to_string(&original).unwrap();
@@ -187,9 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_wire_roundtrips_with_path() {
-        let original = Response::ResolveWire(ResolveWireResponse {
-            wire: Some(PathBuf::from("/var/lib/airc/wires/project-x")),
+    fn inbox_response_roundtrips_with_wire_bytes() {
+        let original = Response::Inbox(InboxResponse {
+            envelopes: vec![vec![1, 2, 3], vec![4, 5, 6, 7]],
+            newest: Some(IpcCursor {
+                epoch: 1,
+                counter: 2,
+                event_id: EventId::from_u128(3),
+            }),
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
@@ -197,38 +199,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_wire_roundtrips_with_none() {
-        let original = Response::ResolveWire(ResolveWireResponse { wire: None });
-        let encoded = serde_json::to_string(&original).unwrap();
-        let decoded: Response = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn event_response_wraps_transcript_without_tag_collision() {
-        use airc_core::{
-            Body, ClientId, EventId, Headers, MentionTarget, RoomId, TranscriptEvent,
-            TranscriptKind,
-        };
-
+    fn event_response_carries_opaque_wire_bytes() {
         let response = Response::Event {
-            event: Box::new(TranscriptEvent {
-                event_id: EventId::new(),
-                room_id: RoomId::new(),
-                peer_id: PeerId::new(),
-                client_id: ClientId::new(),
-                kind: TranscriptKind::Message,
-                occurred_at_ms: 1,
-                lamport: 1,
-                target: MentionTarget::All,
-                headers: Headers::new(),
-                body: Some(Body::text("hello")),
-                attachment: None,
-                receipt: None,
-                metadata: serde_json::Value::Null,
-            }),
+            envelope: vec![0xa, 0xb, 0xc],
         };
-
         let encoded = serde_json::to_string(&response).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, response);

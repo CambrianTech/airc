@@ -2,9 +2,9 @@ use std::error::Error;
 use std::io::Write;
 use std::path::Path;
 
-use airc_core::{Body, MentionTarget, TranscriptEvent, TranscriptKind};
-use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, Response, SubscribeRequest};
-use airc_lib::Airc;
+use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
+use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, Response};
+use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
@@ -15,43 +15,59 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
     let socket = crate::cli::default_socket_path_in(home);
-    let client = DaemonClient::new(socket);
     let set = airc.subscription_set().await?;
-    for subscription in set.all() {
-        client
-            .subscribe(SubscribeRequest {
-                wire: subscription.as_room().wire,
-            })
-            .await?;
-    }
-    let mut stream = client.attach(AttachRequest::default()).await?;
-    let mut sandbox = Sandbox::new();
+    let channels: Vec<RoomId> = set.all().map(|sub| sub.as_room().channel).collect();
 
-    println!("airc: attached to Rust event stream for subscribed channels");
-    std::io::stdout().flush()?;
-    loop {
-        let Some(response) = read_frame::<_, Response>(&mut stream).await? else {
-            return Ok(());
-        };
-        match response {
-            Response::Ok => {}
-            Response::Event { event } => {
-                if let Some(text) = render_claimable_work_for_event(&airc, event.as_ref()).await? {
-                    sandbox.emit_contract_once();
-                    render_text_event(event.as_ref(), client_id.as_deref(), &text, &mut sandbox);
-                } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
-                    render_event(event.as_ref(), client_id.as_deref(), &mut sandbox);
+    // The owner-core router subscribes per channel; the monitor opens one
+    // attach stream per subscribed room and merges them into a single
+    // feed. Each daemon `Event` carries airc-wire bytes — decoded once
+    // here via the shared projection.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TranscriptEvent>(1024);
+    for channel in channels {
+        let socket = socket.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let client = DaemonClient::new(socket);
+            let mut stream = match client
+                .attach(AttachRequest {
+                    channel: Some(channel),
+                    from: None,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(stream) => stream,
+                Err(_) => return,
+            };
+            while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
+                if let Response::Event { envelope } = response {
+                    match decode_wire_event(envelope) {
+                        Ok(event) => {
+                            if tx.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
                 }
             }
-            Response::Error { message } => return Err(message.into()),
-            Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_) => {}
+        });
+    }
+    drop(tx);
+
+    let mut sandbox = Sandbox::new();
+    println!("airc: attached to Rust event stream for subscribed channels");
+    std::io::stdout().flush()?;
+
+    while let Some(event) = rx.recv().await {
+        if let Some(text) = render_claimable_work_for_event(&airc, &event).await? {
+            sandbox.emit_contract_once();
+            render_text_event(&event, client_id.as_deref(), &text, &mut sandbox);
+        } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
+            render_event(&event, client_id.as_deref(), &mut sandbox);
         }
     }
+    Ok(())
 }
 
 fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut Sandbox) {

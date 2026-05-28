@@ -21,7 +21,6 @@ use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::Value as JsonValue;
 
 use airc_core::{
@@ -39,7 +38,6 @@ use crate::entities::{
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
-use crate::migration::Migrator;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer};
 use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::store::EventStore;
@@ -64,7 +62,10 @@ impl SqliteEventStore {
             .acquire_timeout(std::time::Duration::from_secs(5))
             .max_connections(1);
         let db = Database::connect(opts).await?;
-        Migrator::up(&db, None)
+        // Forward-compatible BOTH directions: apply our pending
+        // migrations, but tolerate a DB already migrated AHEAD of this
+        // binary (version skew must not brick the store).
+        crate::migration::apply_migrations(&db)
             .await
             .map_err(|err| StoreError::Migration(err.to_string()))?;
         Ok(Self { db })
@@ -965,21 +966,13 @@ impl SqliteEventStore {
 }
 
 fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreError> {
-    let kind = match ev.kind {
-        TranscriptKind::Message => "message",
-        TranscriptKind::Attachment => "attachment",
-        TranscriptKind::Receipt => "receipt",
-        TranscriptKind::Presence => "presence",
-        TranscriptKind::SessionControl => "session_control",
-        TranscriptKind::System => "system",
-        TranscriptKind::PeerArrived => "peer_arrived",
-        TranscriptKind::PeerDeparted => "peer_departed",
-        TranscriptKind::WireEstablished => "wire_established",
-        TranscriptKind::WireLost => "wire_lost",
-        TranscriptKind::RoomJoined => "room_joined",
-        TranscriptKind::RoomParted => "room_parted",
-        TranscriptKind::SubscriptionAdvanced => "subscription_advanced",
-    };
+    // The kind ↔ str mapping lives on `TranscriptKind` itself
+    // (single source of truth, kink 0cfcc8db). Adding a variant
+    // here used to require a parallel edit; now the compiler
+    // enforces it inside airc-core's own `as_wire_str` match, and
+    // airc-core's `wire_str_round_trip_covers_every_variant` test
+    // catches any drift before this codec is even invoked.
+    let kind = ev.kind.as_wire_str();
     Ok(event::ActiveModel {
         event_id: ActiveValue::Set(ev.event_id.as_uuid()),
         room_id: ActiveValue::Set(ev.room_id.as_uuid()),
@@ -1007,22 +1000,11 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
 }
 
 fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
-    let kind = match m.kind.as_str() {
-        "message" => TranscriptKind::Message,
-        "attachment" => TranscriptKind::Attachment,
-        "receipt" => TranscriptKind::Receipt,
-        "presence" => TranscriptKind::Presence,
-        "session_control" => TranscriptKind::SessionControl,
-        "system" => TranscriptKind::System,
-        "peer_arrived" => TranscriptKind::PeerArrived,
-        "peer_departed" => TranscriptKind::PeerDeparted,
-        "wire_established" => TranscriptKind::WireEstablished,
-        "wire_lost" => TranscriptKind::WireLost,
-        "room_joined" => TranscriptKind::RoomJoined,
-        "room_parted" => TranscriptKind::RoomParted,
-        "subscription_advanced" => TranscriptKind::SubscriptionAdvanced,
-        other => return Err(StoreError::UnknownTranscriptKind(other.to_string())),
-    };
+    // Reverse of `to_active_model`'s `as_wire_str`. Unknown rows
+    // surface as `UnknownTranscriptKind` so callers can distinguish
+    // "store corruption / schema drift" from a normal decode.
+    let kind = TranscriptKind::from_wire_str(&m.kind)
+        .ok_or_else(|| StoreError::UnknownTranscriptKind(m.kind.clone()))?;
     let target: MentionTarget = serde_json::from_value(m.target)?;
     let headers: Headers = serde_json::from_value(m.headers)?;
     let body: Option<Body> = match m.body {

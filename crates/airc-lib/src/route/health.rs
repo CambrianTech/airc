@@ -61,12 +61,11 @@ pub struct TransportHealthTable {
 }
 
 impl TransportHealthTable {
+    /// An empty health table. The local same-machine transport is the
+    /// daemon's in-memory router (no health to seed); cross-machine
+    /// transports register themselves as they come up.
     pub fn local_default() -> Self {
-        let table = Self::default();
-        table.upsert(TransportHealthSample::healthy_direct(
-            TransportKind::LocalFs,
-        ));
-        table
+        Self::default()
     }
 
     pub fn replace(&self, samples: impl IntoIterator<Item = TransportHealthSample>) {
@@ -106,7 +105,6 @@ impl Default for TransportHealthTable {
 
 fn transport_kind_order(kind: TransportKind) -> u8 {
     match kind {
-        TransportKind::LocalFs => 0,
         TransportKind::LanTcp => 1,
         TransportKind::Tailscale => 2,
         TransportKind::Udp => 3,
@@ -172,7 +170,9 @@ mod tests {
         ));
 
         let samples = table.samples();
-        assert_eq!(samples.len(), 2);
+        // `local_default()` is empty now (same-machine is the daemon), so
+        // the two LanTcp upserts collapse to one replaced sample.
+        assert_eq!(samples.len(), 1);
         assert_eq!(
             samples
                 .iter()

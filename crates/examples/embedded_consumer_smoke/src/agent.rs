@@ -2,10 +2,10 @@
 //!
 //! This is deliberately tiny product-adjacent code: it models what an
 //! agent runtime needs from AIRC without importing substrate crates or
-//! shelling out to the CLI.
+//! shelling out to the CLI. It wraps an `Airc` handle the embedder has
+//! attached to the machine's owner-core daemon (`Airc::attach`).
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use airc_lib::{
@@ -43,11 +43,11 @@ pub struct AgentConsumer {
 }
 
 impl AgentConsumer {
-    pub async fn open(home: impl Into<PathBuf>, profile: AgentProfile) -> Result<Self, AircError> {
-        Ok(Self {
-            airc: Airc::open(home).await?,
-            profile,
-        })
+    /// Wrap an `Airc` the embedder has already attached to the machine
+    /// daemon (`Airc::attach(home, socket)`). The consumer holds no
+    /// substrate handles — just this airc-lib API.
+    pub fn new(airc: Airc, profile: AgentProfile) -> Self {
+        Self { airc, profile }
     }
 
     pub fn airc(&self) -> &Airc {
@@ -63,14 +63,8 @@ impl AgentConsumer {
         self.airc.add_peer(peer).await
     }
 
-    pub async fn join_shared_wire(
-        &self,
-        room: &str,
-        wire: impl AsRef<Path>,
-    ) -> Result<(), AircError> {
-        self.airc
-            .join_with_wire(room, wire.as_ref().to_path_buf())
-            .await?;
+    pub async fn join(&self, room: &str) -> Result<(), AircError> {
+        self.airc.join(room).await?;
         Ok(())
     }
 

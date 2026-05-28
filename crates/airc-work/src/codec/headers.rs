@@ -41,6 +41,12 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
                 insert_display_header(headers, HEADER_FORGE_WORK_LANE_ID, lane_id);
             }
         }
+        WorkEvent::CardUpdated(e) => {
+            // Just the card id — subscribers watching a single card
+            // get notified; subscribers watching the whole work
+            // domain see it via the body-hint header.
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+        }
         WorkEvent::CardClaimed(e) => project_claim(headers, e.card_id, e.claim_id),
         WorkEvent::ClaimHeartbeat(e) => project_claim(headers, e.card_id, e.claim_id),
         WorkEvent::ClaimReleased(e) => project_claim(headers, e.card_id, e.claim_id),

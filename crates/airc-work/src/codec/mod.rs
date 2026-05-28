@@ -84,6 +84,7 @@ fn require_work_event_hint(headers: &Headers) -> Result<(), WorkEventCodecError>
 pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
     match event {
         WorkEvent::CardCreated(_) => "card_created",
+        WorkEvent::CardUpdated(_) => "card_updated",
         WorkEvent::CardClaimed(_) => "card_claimed",
         WorkEvent::ClaimHeartbeat(_) => "claim_heartbeat",
         WorkEvent::ClaimReleased(_) => "claim_released",

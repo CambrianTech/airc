@@ -211,6 +211,7 @@ impl Airc {
                     body: candidate.body.clone(),
                     priority: candidate.priority,
                     lane_id: candidate.lane_id,
+                    reviews: None,
                 })
                 .await?;
             items.push(SeededWorkCard {
@@ -459,6 +460,7 @@ mod tests {
                 runtime: "agent".to_string(),
                 scope: Some("/tmp/agent".to_string()),
                 last_seen_ms: now_ms().unwrap_or(1),
+                coordination: Default::default(),
             }),
             availability,
             active_claims,
@@ -497,6 +499,7 @@ mod tests {
             created_by: PeerId::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            reviews: None,
         }
     }
 }

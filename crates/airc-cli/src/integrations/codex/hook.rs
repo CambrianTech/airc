@@ -25,7 +25,7 @@ pub async fn run_user_prompt_submit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     drain_stdin()?;
 
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let filter = hook_filter();
     let runtime_client = current_client_id()?;
     let consumer_id = consumer_id(runtime_client.as_deref());
@@ -56,7 +56,7 @@ pub async fn run_poll(
     include_self: bool,
     wait_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let runtime_client = current_client_id()?;
     let consumer_id = consumer_id(runtime_client.as_deref());
     let filter = hook_filter();

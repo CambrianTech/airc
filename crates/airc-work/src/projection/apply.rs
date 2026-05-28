@@ -1,5 +1,5 @@
 use crate::event::{
-    AgentAvailabilityReported, CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimReleased,
     GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
     LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
     PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,
@@ -24,6 +24,7 @@ impl WorkBoardProjection {
     pub fn apply(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
         match event {
             WorkEvent::CardCreated(e) => self.apply_card_created(e),
+            WorkEvent::CardUpdated(e) => self.apply_card_updated(e),
             WorkEvent::CardClaimed(e) => self.apply_card_claimed(e),
             WorkEvent::ClaimHeartbeat(e) => self.apply_claim_heartbeat(e),
             WorkEvent::ClaimReleased(e) => self.apply_claim_released(e),
@@ -110,6 +111,26 @@ impl WorkBoardProjection {
         self.workspaces.get(&workspace_id)
     }
 
+    /// Cards whose `reviews` link points at `parent_id` — i.e. the
+    /// review cards that exist for the given card. Card ad7e100b
+    /// (peer-agent review loop) Sub-A: lets schedulers and CLI
+    /// renderers ask "what reviews exist for this PR's card?"
+    /// without scanning bodies.
+    ///
+    /// Returns an iterator over `&WorkCard` so callers can filter
+    /// further (e.g. by state, to find unclaimed reviews) without
+    /// the projection imposing a policy. Iteration order is
+    /// unspecified; callers that need it deterministic should sort
+    /// on `created_at_ms` or `card_id`.
+    pub fn review_cards_for(
+        &self,
+        parent_id: WorkCardId,
+    ) -> impl Iterator<Item = &WorkCard> + '_ {
+        self.cards
+            .values()
+            .filter(move |card| card.reviews == Some(parent_id))
+    }
+
     pub fn stale_claims(&self, now_ms: u64) -> Vec<StaleClaim> {
         self.cards
             .values()
@@ -147,6 +168,7 @@ impl WorkBoardProjection {
             created_by: e.created_by,
             created_at_ms: e.created_at_ms,
             updated_at_ms: e.created_at_ms,
+            reviews: e.reviews,
         };
         self.cards.insert(e.card_id, card);
         if let Some(lane_id) = e.lane_id {
@@ -226,6 +248,36 @@ impl WorkBoardProjection {
         card.claim_id = None;
         card.claim_expires_at_ms = None;
         card.updated_at_ms = e.released_at_ms;
+        Ok(())
+    }
+
+    /// Card 5ac0a359 — apply an amendment to a card's editable fields.
+    /// Each `Some(...)` field writes; each `None` leaves the existing
+    /// projection value alone. Per-event `updated_at_ms` always moves
+    /// (even for an all-`None` no-op amendment), giving observers a
+    /// liveness signal.
+    ///
+    /// Replay determinism: this is a pure event apply. Out-of-order
+    /// updates (a later `updated_at_ms` arriving before an earlier
+    /// one due to lamport churn) project deterministically — the
+    /// projection writes whatever the latest applied event says.
+    /// Callers depending on causality between two updates should
+    /// sequence them via lamport, the same way other event chains
+    /// already do.
+    fn apply_card_updated(&mut self, e: &CardUpdated) -> Result<(), ProjectionError> {
+        let card = self.card_mut(e.card_id)?;
+        if let Some(ref title) = e.title {
+            card.title = title.clone();
+        }
+        if let Some(body) = &e.body {
+            // Set the body to whatever the amendment carries.
+            // Empty string is the "clear" idiom.
+            card.body = Some(body.clone());
+        }
+        if let Some(priority) = e.priority {
+            card.priority = priority;
+        }
+        card.updated_at_ms = e.updated_at_ms;
         Ok(())
     }
 

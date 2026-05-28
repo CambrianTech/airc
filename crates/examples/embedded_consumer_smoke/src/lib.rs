@@ -13,15 +13,19 @@
 //! > headers; subscribe by header/channel/kind; fetch replay; use
 //! > blobs; never shell out.
 //!
-//! The integration test in `tests/two_agents_via_sdk.rs` exercises
-//! the embedding pattern end-to-end. Future PR-I slices will add
-//! consumer-shape examples (Continuum personas, OpenClaw chat/thread
-//! identity bridge, Hermes agent contracts, etc.) — this crate is the
-//! foundation those build on.
+//! The integration tests exercise the embedding pattern end-to-end.
+//! Future PR-I slices will add consumer-shape examples (Continuum
+//! personas, OpenClaw chat/thread identity bridge, Hermes agent
+//! contracts, etc.) — this crate is the foundation those build on.
 //!
-//! Constraint: this crate's only AIRC dependency is `airc-lib`. If a
-//! future change forces a substrate-internal AIRC import in here,
-//! that's a signal `airc-lib` is missing a re-export, not a sign this
-//! crate should grow more substrate imports.
+//! Constraint: the RUNTIME embedding surface (`src/agent.rs`) depends
+//! only on `airc-lib` and reaches the substrate solely via
+//! `Airc::attach`. In the owner-core model same-machine delivery is the
+//! one machine daemon's job, so the integration tests stand up an
+//! in-process daemon (the airc install ships it in production) — the
+//! substrate deps for that live in `[dev-dependencies]` + the test
+//! harness only, never in the embedding surface. If a future change
+//! forces a substrate-internal import into `src/`, that's a signal
+//! `airc-lib` is missing a re-export.
 
 pub mod agent;

@@ -50,9 +50,8 @@ fn health_samples(args: RouteStatusArgs) -> Vec<TransportHealthSample> {
         && args.invite.is_empty()
         && args.down.is_empty()
     {
-        samples.push(TransportHealthSample::healthy_direct(
-            TransportKind::LocalFs,
-        ));
+        // No transports specified → empty. Same-machine delivery is the
+        // daemon's in-memory router, not a registered transport.
         return samples;
     }
 
@@ -108,7 +107,6 @@ fn format_class(class: RouteClass) -> &'static str {
 
 fn format_kind(kind: TransportKind) -> &'static str {
     match kind {
-        TransportKind::LocalFs => "local-fs",
         TransportKind::LanTcp => "lan-tcp",
         TransportKind::Tailscale => "tailscale",
         TransportKind::Udp => "udp",
@@ -141,7 +139,6 @@ fn format_state(state: TransportHealthState) -> &'static str {
 impl From<RouteTransport> for TransportKind {
     fn from(value: RouteTransport) -> Self {
         match value {
-            RouteTransport::LocalFs => Self::LocalFs,
             RouteTransport::LanTcp => Self::LanTcp,
             RouteTransport::Tailscale => Self::Tailscale,
             RouteTransport::Udp => Self::Udp,

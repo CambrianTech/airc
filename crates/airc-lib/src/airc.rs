@@ -27,7 +27,7 @@ use std::sync::Arc;
 use airc_core::{ClientId, PeerId, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
-use airc_protocol::{PeerKeyRegistry, VerificationPolicy};
+use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::{udp::UdpAdapter, LanTcpAdapter, RelayAdapter};
 use airc_trust as peers_store;
@@ -41,8 +41,8 @@ use crate::room::Room;
 use crate::route::health::TransportHealthTable;
 use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
-use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
-use crate::transport::{FrameSubscriber, WireSubscriber};
+use crate::subscriptions::{self, ChannelName, MeshIdentity};
+use crate::transport::FrameSubscriber;
 use crate::webrtc_media::{IncomingTrack, IncomingTrackHandler, IncomingTrackRegistry};
 use crate::{coordinator, time};
 
@@ -55,7 +55,11 @@ const EVENTS_DB_FILENAME: &str = "events.sqlite";
 /// that need durable replay use `Airc::resume_from` against the store.
 const LIVE_BROADCAST_CAPACITY: usize = 1024;
 
-fn machine_account_home(scope_home: &Path) -> PathBuf {
+/// The machine-account home (`$HOME/.airc`) that owns the singular
+/// daemon + the one ORM for every scope under this user's home. Scopes
+/// outside `$HOME` (CI temp dirs, isolated test roots) get their own
+/// `scope_home` back — they are their own account boundary.
+pub fn machine_account_home(scope_home: &Path) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         let normalized_home = home.canonicalize().unwrap_or(home);
@@ -148,10 +152,6 @@ pub(crate) struct AircInner {
     pub(crate) webrtc_incoming_track_handler: Mutex<Option<IncomingTrackHandler>>,
     /// Runtime registry of inbound WebRTC media tracks by peer.
     pub(crate) webrtc_incoming_tracks: IncomingTrackRegistry,
-    /// Per-wire background subscriber tasks. Spawned lazily on first
-    /// `say`/`send`/`subscribe`/`page_recent` referencing the wire.
-    /// Held in a Mutex so concurrent calls can't double-spawn.
-    pub(crate) subscribers: Mutex<HashMap<PathBuf, WireSubscriber>>,
     /// Live event fan-out. Every event the subscribers append to the
     /// store is also forwarded here so consumers tailing via
     /// [`Airc::subscribe`] see it immediately.
@@ -198,6 +198,22 @@ impl Airc {
         socket: impl Into<PathBuf>,
     ) -> Result<Self, AircError> {
         let airc = Self::open(home).await?;
+        Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
+    }
+
+    /// Test-only [`attach`] that pins the machine-account wire root
+    /// explicitly instead of deriving it from `HOME`/`USERPROFILE`.
+    /// Two scopes sharing one `wire_root` resolve the same mesh
+    /// identity (hence the same `RoomId`) and converge through the
+    /// daemon — without mutating process-global env, which would race
+    /// parallel tests. Strict verification, matching [`attach`].
+    #[doc(hidden)]
+    pub async fn attach_with_wire_root_for_test(
+        home: impl Into<PathBuf>,
+        wire_root: impl Into<PathBuf>,
+        socket: impl Into<PathBuf>,
+    ) -> Result<Self, AircError> {
+        let airc = Self::open_with_wire_root_for_test(home, wire_root).await?;
         Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
     }
 
@@ -295,7 +311,6 @@ impl Airc {
                 webrtc_peer_connections: Mutex::new(HashMap::new()),
                 webrtc_incoming_track_handler: Mutex::new(None),
                 webrtc_incoming_tracks: IncomingTrackRegistry::default(),
-                subscribers: Mutex::new(HashMap::new()),
                 live_tx,
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                     RECENTLY_BROADCAST_CAPACITY,
@@ -328,6 +343,191 @@ impl Airc {
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id
+    }
+
+    /// Persist a new local-identity card and broadcast the update to
+    /// every currently-subscribed room so attached peers see the
+    /// updated profile without rejoining (card da586598 — last
+    /// identity-roster slice).
+    ///
+    /// Replaces the old direct-store save in the CLI's nick / identity
+    /// edit path: storage + emission are now atomic from the caller's
+    /// view (one fails, neither effect is visible to peers). Per-room
+    /// emission iterates the SubscriptionSet's `subscribed` map.
+    pub async fn set_local_identity_card(
+        &self,
+        identity: airc_core::identity::Identity,
+    ) -> Result<(), AircError> {
+        self.event_store()
+            .save_local_identity_card(identity)
+            .await
+            .map_err(AircError::from)?;
+        let set = subscriptions::load_or_init(self.event_store()).await?;
+        for subscription in set.subscribed.values() {
+            self.emit_peer_identity_card(subscription.room_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Richer roster lookup — return the full `PeerIdentityCard` if
+    /// `peer_id` has published one in the current room's recent
+    /// window. Powers `airc whois <peer>` (card 20066c49) and any
+    /// future caller that needs more than just the display name.
+    /// Same scan window + on-demand model as [`Self::peer_alias`].
+    pub async fn peer_identity_card(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::IdentityPublished {
+                continue;
+            }
+            if event.peer_id != peer_id {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
+            else {
+                continue;
+            };
+            return Ok(Some(card));
+        }
+        Ok(None)
+    }
+
+    /// Look up the latest doctrine published for the current room
+    /// (card b898f713 — slice 3/4 of 2903a8ef). Same MVP shape as
+    /// `Airc::peer_identity_card`: scan recent transcript events for
+    /// the latest `TranscriptKind::DoctrinePublished`, decode the
+    /// JSON body into `DoctrineEvent::RoomDoctrinePublished`, return
+    /// it. Returns `Ok(None)` when the room has no published
+    /// doctrine in the recent window (an honest "unknown" rather
+    /// than rendering empty body).
+    ///
+    /// Consumer: slice 4/4 (card 745e93f0) — auto-load on attach so
+    /// every newly-attaching agent has the operating contract in
+    /// context without external onboarding.
+    pub async fn room_doctrine(
+        &self,
+    ) -> Result<Option<airc_core::doctrine::RoomDoctrinePublished>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::DoctrinePublished {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished(card)) =
+                serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value)
+            else {
+                continue;
+            };
+            return Ok(Some(card));
+        }
+        Ok(None)
+    }
+
+    /// Publish the room operating doctrine — card a9767579 (slice 2/4
+    /// of engine-keystone 2903a8ef). Emits a
+    /// `TranscriptKind::DoctrinePublished` lifecycle event on the
+    /// CURRENT room carrying a serialized
+    /// `DoctrineEvent::RoomDoctrinePublished` with the body and
+    /// version. Every attaching agent's subscribe stream surfaces it;
+    /// future slice 4/4 auto-loads it into agent context on join.
+    ///
+    /// `version` is a short content discriminator (e.g. first 12 chars
+    /// of SHA-256 of `body`); caller chooses the function so older
+    /// CLIs don't need a `sha2` dep to render `airc room doctrine
+    /// publish --from-file AGENTS.md`. Idempotency is the publisher's
+    /// responsibility — the substrate stores every event;
+    /// projections take latest by `published_at_ms`.
+    pub async fn publish_room_doctrine(
+        &self,
+        body: String,
+        version: String,
+    ) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        let event = airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished(
+            airc_core::doctrine::RoomDoctrinePublished {
+                room_id: room.channel,
+                body,
+                version,
+                published_by: self.inner.identity.peer_id,
+                published_at_ms: time::now_ms()?,
+            },
+        );
+        let body_json = serde_json::to_value(&event)
+            .map_err(|e| AircError::Crypto(format!("doctrine event serialize: {e}")))?;
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::DoctrinePublished,
+            room.channel,
+            airc_core::Body::Json(body_json),
+        )
+        .await
+    }
+
+    /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
+    ///
+    /// Scans recent transcript events in the current room for the
+    /// latest `TranscriptKind::IdentityPublished` emitted by `peer_id`
+    /// and returns the published display name when known. Returns
+    /// `Ok(None)` when the peer has never published an identity card
+    /// in this room's recent window, or when the published `name`
+    /// field is empty (an honest "unknown" rather than rendering an
+    /// empty string).
+    ///
+    /// On-demand query — no in-memory cache. The scan window (200
+    /// events) is conservative for a substrate where `IdentityPublished`
+    /// fires once per join, not per chat message. If profiling shows
+    /// hot-path callers, the follow-up is an in-memory roster fed by
+    /// the existing subscribe loop; `peer_alias` keeps its shape.
+    ///
+    /// Consumers: `airc work board format_peer` (card c397567a),
+    /// `airc whois <peer>` (card 20066c49).
+    pub async fn peer_alias(&self, peer_id: PeerId) -> Result<Option<String>, AircError> {
+        let events = self.page_recent(200).await?;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::IdentityPublished {
+                continue;
+            }
+            if event.peer_id != peer_id {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
+            else {
+                continue;
+            };
+            if card.identity.name.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(card.identity.name));
+        }
+        Ok(None)
+    }
+
+    /// Sign a domain-separated identity assertion — the airc analogue
+    /// of a WebAuthn assertion. The signature covers a versioned domain
+    /// tag + `context` (the relying-party / "type" binding) + the
+    /// `challenge` bytes (a server nonce, a session descriptor, or a
+    /// Forge-alloy Merkle-context root), in a space disjoint from frame
+    /// signatures. Consumers (Continuum / jtag / browser / server)
+    /// build session tokens + credential bindings on top; the raw key
+    /// is never exposed, so a later device-bound / Secure-Enclave
+    /// signer (for hardware attestation) is a drop-in.
+    pub fn sign_assertion(&self, context: &str, challenge: &[u8]) -> IdentityAssertion {
+        self.inner
+            .identity
+            .keypair
+            .sign_assertion(self.inner.identity.peer_id, 0, context, challenge)
     }
 
     pub fn is_daemon_attached(&self) -> bool {
@@ -399,7 +599,6 @@ impl Airc {
             webrtc_peer_connections: Mutex::new(HashMap::new()),
             webrtc_incoming_track_handler: Mutex::new(None),
             webrtc_incoming_tracks: IncomingTrackRegistry::default(),
-            subscribers: Mutex::new(HashMap::new()),
             live_tx: self.inner.live_tx.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
@@ -520,7 +719,6 @@ impl Airc {
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
-        self.ensure_wire_subscriber(&room.wire).await?;
 
         // Emit the lifecycle event after the subscription is durable
         // and the wire is up. Lifecycle is part of the substrate
@@ -538,7 +736,48 @@ impl Airc {
         self.emit_lifecycle(airc_core::TranscriptKind::RoomJoined, room.channel, body)
             .await?;
 
+        // Publish this peer's identity card to the new room so peers
+        // already attached populate their roster on the next event
+        // they receive (card 2f74b8a1 — identity-roster substrate
+        // slice, parent af40f46d). Re-loaded from the store on each
+        // join so any local-identity edits since startup propagate.
+        self.emit_peer_identity_card(room.channel).await?;
+
         Ok(room)
+    }
+
+    /// Build + emit a `PeerIdentityCard` for this scope on the given
+    /// room as an `IdentityPublished` lifecycle event. Used on join
+    /// (so the room's roster sees this peer arrive identifiable, not
+    /// just by uuid); will also be used on nick / profile change in a
+    /// follow-up slice. No-op when no local identity is persisted
+    /// yet (e.g. fresh scope mid-bootstrap).
+    async fn emit_peer_identity_card(
+        &self,
+        room_id: airc_core::RoomId,
+    ) -> Result<(), AircError> {
+        let local = self
+            .event_store()
+            .load_local_identity()
+            .await
+            .map_err(AircError::from)?;
+        let Some(stored) = local else { return Ok(()) };
+        let card = airc_core::identity::PeerIdentityCard {
+            peer_id: self.inner.identity.peer_id,
+            identity: stored.identity,
+            emitted_at_ms: time::now_ms()?,
+        };
+        let event = airc_core::identity::IdentityEvent::PeerIdentityCard(card);
+        let body_json = serde_json::to_value(&event).map_err(|e| {
+            AircError::Crypto(format!("identity event serialize: {e}"))
+        })?;
+        let body = airc_core::Body::Json(body_json);
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::IdentityPublished,
+            room_id,
+            body,
+        )
+        .await
     }
 
     /// Subscribe this scope to the default account context:
@@ -585,30 +824,16 @@ impl Airc {
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
 
+        // Card a6d0df25: publish this peer's identity card to every
+        // room subscribed in this attach so peers already attached
+        // populate their roster — same lifecycle as Airc::join(name)
+        // (commit 088af06), now extended to the routine `airc join`
+        // (no args) path. No-op when no local identity exists.
         for room in &rooms {
-            self.ensure_wire_subscriber(&room.wire).await?;
+            self.emit_peer_identity_card(room.channel).await?;
         }
 
         Ok(rooms)
-    }
-
-    /// Variant of [`join`] that overrides the per-home default wire
-    /// dir. Used for shared-wire setups (local-fs tests where two
-    /// processes on one machine tail the same `frames.jsonl`).
-    /// Production users want [`join`].
-    pub async fn join_with_wire(&self, name: &str, wire: PathBuf) -> Result<Room, AircError> {
-        let channel = ChannelName::new(name)?;
-        let identity = self.mesh_identity().await?;
-        let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        let subscription = Subscription::with_wire(&identity, channel.clone(), wire)?;
-        set.parted.remove(&channel);
-        set.subscribed.insert(channel.clone(), subscription.clone());
-        set.set_default(channel)?;
-        subscriptions::save(self.event_store(), &set).await?;
-        self.publish_presence(&identity, &set).await?;
-        let room = subscription.as_room();
-        self.ensure_wire_subscriber(&room.wire).await?;
-        Ok(room)
     }
 
     /// Leave a subscribed channel without deleting identity or trust.
@@ -662,7 +887,13 @@ impl Airc {
         set.set_default(channel)?;
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
-        Ok(subscription.as_room())
+        // Same publish-on-subscribe semantics as Airc::join /
+        // ensure_join_context (card a6d0df25): the lazy default-room
+        // subscribe is a real attach point, so emit the identity
+        // card to the new room.
+        let room = subscription.as_room();
+        self.emit_peer_identity_card(room.channel).await?;
+        Ok(room)
     }
 
     pub(crate) fn event_store(&self) -> &dyn EventStore {

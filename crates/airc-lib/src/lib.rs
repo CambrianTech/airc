@@ -65,7 +65,6 @@ mod udp;
 mod webrtc;
 pub mod webrtc_media;
 pub mod webrtc_signaling;
-mod wire_replay;
 pub mod work;
 pub mod work_manager;
 pub mod work_roster;
@@ -76,10 +75,10 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
 };
 pub use agent_heartbeat::{
-    AgentHeartbeat, AgentLiveness, HeartbeatKind, HeartbeatTask, DEFAULT_HEARTBEAT_INTERVAL,
-    HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
+    AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask,
+    DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
-pub use airc::Airc;
+pub use airc::{machine_account_home, Airc};
 pub use command_bus::PendingCommand;
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
@@ -92,6 +91,7 @@ pub use coordinator::{
     DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
 };
+pub use daemon::decode_wire_event;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
@@ -111,6 +111,7 @@ pub use mesh_identity::{
     resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
+pub use airc_protocol::{AssertionError, IdentityAssertion};
 pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
@@ -132,9 +133,10 @@ pub use webrtc_media::{
 pub use work::{
     AllocateWorkspace, ChangeWorkCardState, ChangeWorkLaneState, ClaimManagerHat, ClaimWorkCard,
     ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
-    HeartbeatWorkspace, ObserveLocalGitWorkspace, ObservePullRequests, ObservedLocalGitWorkspace,
-    ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim, ReleaseWorkspace,
-    ReportAgentAvailability, RequestWorkspace, WorkQueueStatus, WorkQueueStatusQuery,
+    HeartbeatWorkspace, LinkCardPullRequest, ObserveLocalGitWorkspace, ObservePullRequests,
+    ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat, ReleaseWorkClaim,
+    ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace, UpdateWorkCard,
+    WorkQueueStatus, WorkQueueStatusQuery,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,
@@ -156,8 +158,8 @@ pub use airc_core::{
 };
 pub use airc_work::{
     AgentAvailabilityRecord, AgentAvailabilityReported, AgentAvailabilityState, BoardSnapshot,
-    BranchName, CardState, ClaimId, DirtyState, GitObjectId, LaneId, LaneState, LocalGitSnapshot,
-    ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection, WorkCard, WorkCardId,
-    WorkEvent, WorkspaceId, WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT,
-    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
+    BranchName, CardState, CardUpdated, ClaimId, DirtyState, GitObjectId, LaneId, LaneState,
+    LocalGitSnapshot, ManagerHat, Priority, ProjectionError, RepoId, WorkBoardProjection,
+    WorkCard, WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus,
+    BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
 };

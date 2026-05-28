@@ -15,6 +15,7 @@ use crate::model::{
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkEvent {
     CardCreated(CardCreated),
+    CardUpdated(CardUpdated),
     CardClaimed(WorkCardClaimed),
     ClaimHeartbeat(ClaimHeartbeat),
     ClaimReleased(ClaimReleased),
@@ -46,6 +47,7 @@ impl WorkEvent {
     pub fn occurred_at_ms(&self) -> u64 {
         match self {
             WorkEvent::CardCreated(e) => e.created_at_ms,
+            WorkEvent::CardUpdated(e) => e.updated_at_ms,
             WorkEvent::CardClaimed(e) => e.claimed_at_ms,
             WorkEvent::ClaimHeartbeat(e) => e.heartbeat_at_ms,
             WorkEvent::ClaimReleased(e) => e.released_at_ms,
@@ -85,6 +87,74 @@ pub struct CardCreated {
     pub lane_id: Option<LaneId>,
     pub created_by: PeerId,
     pub created_at_ms: u64,
+    /// If this card is a sibling review of another card, the
+    /// reviewed card's id. Card ad7e100b (peer-agent review loop)
+    /// Sub-A: makes "this card is a review of X" a typed link
+    /// rather than a body-string convention, so observers /
+    /// scheduling logic can ask the projection
+    /// (`WorkBoardProjection::review_cards_for(parent_id)`) which
+    /// reviews exist for a card.
+    ///
+    /// Optional: regular cards omit it. Serde-back-compat: legacy
+    /// `CardCreated` events on the wire decode with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews: Option<WorkCardId>,
+}
+
+/// Amend a card's editable fields after creation. Card 5ac0a359 —
+/// recurring friction during the autonomous flywheel: cards are
+/// often filed with provisional bodies that need updating once
+/// decomposition or scope refinement happens, and the substrate
+/// previously had no typed way to do that without close+re-create
+/// (which loses the card id, breaks `reviews` links pointing at the
+/// old id, and forces every observer to re-project).
+///
+/// Each updatable field is `Option`; `None` means "leave the
+/// projection's current value alone." An event with every field
+/// `None` is legal and projects as a no-op (updating only
+/// `updated_at_ms`) — convenient for liveness markers / "I touched
+/// this card" without changing semantics.
+///
+/// Body semantics: setting an empty string is the canonical "clear
+/// the body" path — the projection records exactly what the
+/// amendment specifies. A true tri-state ("leave" vs "clear to
+/// None" vs "set to s") would require a custom serde shape and
+/// gives back only the ability to distinguish `Some("")` from
+/// `None` on the projection's body field, which no observer
+/// actually depends on (board renderers treat both as "no body").
+/// If that distinction ever matters, swap this field for a tagged
+/// enum (`BodyAmendment::Leave | Clear | Set(String)`) — the wire
+/// shape can change behind serde's `untagged` discipline.
+///
+/// Fields that are deliberately NOT updatable post-creation:
+///   * `card_id` — identity (would defeat the whole point of cards
+///     being stable references).
+///   * `repo` — cards live where the work lives; cross-repo
+///     migration is its own card type.
+///   * `created_by`, `created_at_ms` — attribution / temporal
+///     anchors, append-only.
+///   * `reviews` — typed sibling link set at creation; rebinding
+///     a review to a different parent is structurally a different
+///     review card.
+///   * `lane_id` — lane membership is a separate event (lane
+///     reassignment is its own concern).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardUpdated {
+    pub card_id: WorkCardId,
+    /// New title, if changing. `None` leaves the existing title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// New body, if changing. `None` leaves the existing body
+    /// alone; `Some(s)` sets it (empty string clears in practice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// New priority, if changing. `None` leaves the existing
+    /// priority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    /// Peer that emitted the amendment. Audit / attribution.
+    pub updated_by: PeerId,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +416,7 @@ mod tests {
             lane_id: None,
             created_by: PeerId::from_u128(2),
             created_at_ms: 10,
+            reviews: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "card_created");

@@ -5,7 +5,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    Airc, AllocateWorkspace, BranchName, ClaimId, HeartbeatWorkspace, ReleaseWorkspace, RepoId,
+    AllocateWorkspace, BranchName, ClaimId, HeartbeatWorkspace, ReleaseWorkspace, RepoId,
     RequestWorkspace, WorkBoardProjection, WorkCardId, WorkspaceId,
 };
 
@@ -17,7 +17,7 @@ pub async fn run_request(
     branch: String,
     base: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let workspace_id = airc
         .request_workspace(RequestWorkspace {
             card_id: parse_work_card_id(&card_id)?,
@@ -36,7 +36,7 @@ pub async fn run_allocate(
     workspace_id: String,
     path: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     airc.allocate_workspace(AllocateWorkspace {
         workspace_id: parse_workspace_id(&workspace_id)?,
         path,
@@ -51,7 +51,7 @@ pub async fn run_heartbeat(
     workspace_id: String,
     disk_bytes: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     airc.heartbeat_workspace(HeartbeatWorkspace {
         workspace_id: parse_workspace_id(&workspace_id)?,
         disk_bytes,
@@ -65,7 +65,7 @@ pub async fn run_release(
     home: &Path,
     workspace_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     airc.release_workspace(ReleaseWorkspace {
         workspace_id: parse_workspace_id(&workspace_id)?,
     })
@@ -75,7 +75,7 @@ pub async fn run_release(
 }
 
 pub async fn run_list(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
     print_workspaces(&board);
     Ok(())

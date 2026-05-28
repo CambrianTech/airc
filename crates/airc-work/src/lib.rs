@@ -27,7 +27,7 @@ pub use drain_policy::{
     PolicyInputs, PrStatus, PrTerminalState, ReportOnlyReason, DEFAULT_HEARTBEAT_STALE_MS,
 };
 pub use event::{
-    AgentAvailabilityReported, CardCreated, CardStateChanged, ClaimHeartbeat, ClaimReleased,
+    AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimReleased,
     GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated,
     LaneStateChanged, ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged,
     PullRequestLinked, PullRequestMergeStateChanged, PullRequestMerged, PullRequestReviewSubmitted,

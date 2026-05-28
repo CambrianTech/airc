@@ -76,6 +76,24 @@ pub enum TranscriptKind {
     ///    "event_id": <uuid> }`. Useful for "I've caught up to
     /// here" signals between cooperating consumers.
     SubscriptionAdvanced,
+    /// A peer published their identity card to a room — emitted on
+    /// join (so other peers populate their roster on attach) and
+    /// on nick / profile change. Body: serialized
+    /// `airc_core::identity::IdentityEvent::PeerIdentityCard`,
+    /// kind="peer_identity_card", carrying { peer_id, identity,
+    /// emitted_at_ms }. Roster projections take the highest
+    /// emitted_at_ms per peer_id. Part of card a63ad10a/2f74b8a1
+    /// (identity-roster substrate, parent af40f46d).
+    IdentityPublished,
+    /// A peer published the room's operating doctrine — the
+    /// "how we work here" markdown every attaching agent loads on
+    /// join. Body: serialized
+    /// `airc_core::doctrine::DoctrineEvent::RoomDoctrinePublished`,
+    /// kind="room_doctrine_published", carrying { room_id, body,
+    /// version, published_by, published_at_ms }. Projections take
+    /// the latest per room_id (LWW on published_at_ms). Part of
+    /// card 2903a8ef — engine keystone "the user is not the engine."
+    DoctrinePublished,
 }
 
 impl TranscriptKind {
@@ -92,8 +110,94 @@ impl TranscriptKind {
                 | TranscriptKind::RoomJoined
                 | TranscriptKind::RoomParted
                 | TranscriptKind::SubscriptionAdvanced
+                | TranscriptKind::IdentityPublished
+                | TranscriptKind::DoctrinePublished
         )
     }
+
+    /// Stable wire / storage discriminator string. This is the single
+    /// source of truth for the `TranscriptKind ↔ &str` mapping that
+    /// downstream codecs (airc-store SQLite, future JSON envelopes,
+    /// debug rendering) consume.
+    ///
+    /// **NEVER rename an existing string after it ships** — these are
+    /// persisted to SQLite and replayed on store open. Renaming a
+    /// shipped variant is a schema migration, not a code change.
+    ///
+    /// Adding a variant: extend the match below AND
+    /// [`Self::from_wire_str`] AND
+    /// [`Self::ALL_VARIANTS`]. The compiler enforces the first via
+    /// match exhaustiveness; the round-trip unit test
+    /// (`wire_str_round_trip_covers_every_variant`) enforces the
+    /// other two. Catching it here means no downstream consumer can
+    /// silently drift, the way airc-store did when
+    /// `IdentityPublished` landed (kink 0cfcc8db).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TranscriptKind::Message => "message",
+            TranscriptKind::Attachment => "attachment",
+            TranscriptKind::Receipt => "receipt",
+            TranscriptKind::Presence => "presence",
+            TranscriptKind::SessionControl => "session_control",
+            TranscriptKind::System => "system",
+            TranscriptKind::PeerArrived => "peer_arrived",
+            TranscriptKind::PeerDeparted => "peer_departed",
+            TranscriptKind::WireEstablished => "wire_established",
+            TranscriptKind::WireLost => "wire_lost",
+            TranscriptKind::RoomJoined => "room_joined",
+            TranscriptKind::RoomParted => "room_parted",
+            TranscriptKind::SubscriptionAdvanced => "subscription_advanced",
+            TranscriptKind::IdentityPublished => "identity_published",
+            TranscriptKind::DoctrinePublished => "doctrine_published",
+        }
+    }
+
+    /// Inverse of [`Self::as_wire_str`]. Returns `None` for unknown
+    /// strings so callers can decide how to surface the error
+    /// (`airc-store` wraps it in `StoreError::UnknownTranscriptKind`).
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "message" => TranscriptKind::Message,
+            "attachment" => TranscriptKind::Attachment,
+            "receipt" => TranscriptKind::Receipt,
+            "presence" => TranscriptKind::Presence,
+            "session_control" => TranscriptKind::SessionControl,
+            "system" => TranscriptKind::System,
+            "peer_arrived" => TranscriptKind::PeerArrived,
+            "peer_departed" => TranscriptKind::PeerDeparted,
+            "wire_established" => TranscriptKind::WireEstablished,
+            "wire_lost" => TranscriptKind::WireLost,
+            "room_joined" => TranscriptKind::RoomJoined,
+            "room_parted" => TranscriptKind::RoomParted,
+            "subscription_advanced" => TranscriptKind::SubscriptionAdvanced,
+            "identity_published" => TranscriptKind::IdentityPublished,
+            "doctrine_published" => TranscriptKind::DoctrinePublished,
+            _ => return None,
+        })
+    }
+
+    /// Every variant of [`TranscriptKind`], in declaration order. The
+    /// round-trip test iterates this slice; adding a variant without
+    /// extending this constant fails the test, which keeps
+    /// `as_wire_str` / `from_wire_str` honest. This is the consumer-
+    /// sync guard for the fan-out problem captured in card 0cfcc8db.
+    pub const ALL_VARIANTS: &'static [TranscriptKind] = &[
+        TranscriptKind::Message,
+        TranscriptKind::Attachment,
+        TranscriptKind::Receipt,
+        TranscriptKind::Presence,
+        TranscriptKind::SessionControl,
+        TranscriptKind::System,
+        TranscriptKind::PeerArrived,
+        TranscriptKind::PeerDeparted,
+        TranscriptKind::WireEstablished,
+        TranscriptKind::WireLost,
+        TranscriptKind::RoomJoined,
+        TranscriptKind::RoomParted,
+        TranscriptKind::SubscriptionAdvanced,
+        TranscriptKind::IdentityPublished,
+        TranscriptKind::DoctrinePublished,
+    ];
 }
 
 /// Who a transcript event is addressed to.
@@ -153,5 +257,60 @@ impl TranscriptEvent {
             SelfFilter::ExcludeSameClient => &self.client_id == client_id,
             SelfFilter::ExcludeSamePeer => &self.peer_id == peer_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Card 0cfcc8db. Every variant of `TranscriptKind` must
+    /// appear in `ALL_VARIANTS`, and its `as_wire_str` discriminator
+    /// must round-trip through `from_wire_str`. If a future variant
+    /// extends the enum without extending the codec methods, this
+    /// test fails inside `airc-core` — before any downstream
+    /// consumer (airc-store SQLite codec, JSON envelopes, etc.) can
+    /// silently drift the way airc-store did when `IdentityPublished`
+    /// landed.
+    ///
+    /// Pairs with match-exhaustiveness on `as_wire_str`: the compiler
+    /// catches a missing arm there, and this test catches a missing
+    /// arm in `from_wire_str` or `ALL_VARIANTS`.
+    #[test]
+    fn wire_str_round_trip_covers_every_variant() {
+        assert!(
+            !TranscriptKind::ALL_VARIANTS.is_empty(),
+            "ALL_VARIANTS must list every TranscriptKind"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for &kind in TranscriptKind::ALL_VARIANTS {
+            let s = kind.as_wire_str();
+            assert!(
+                seen.insert(s),
+                "wire-str discriminator {s:?} is duplicated across variants — \
+                 each TranscriptKind needs a unique stable string"
+            );
+            assert!(
+                !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "wire-str {s:?} must be snake_case ascii (persisted to SQLite)"
+            );
+            let decoded = TranscriptKind::from_wire_str(s).unwrap_or_else(|| {
+                panic!(
+                    "from_wire_str({s:?}) returned None — add an arm to from_wire_str \
+                     when you add a TranscriptKind variant"
+                )
+            });
+            assert_eq!(
+                decoded, kind,
+                "{kind:?}.as_wire_str() = {s:?}, but from_wire_str({s:?}) = {decoded:?}"
+            );
+        }
+
+        assert_eq!(
+            TranscriptKind::from_wire_str("not_a_real_kind"),
+            None,
+            "unknown discriminators must return None (so callers can wrap as an error)"
+        );
     }
 }

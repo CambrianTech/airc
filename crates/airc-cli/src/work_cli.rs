@@ -77,14 +77,53 @@ pub enum WorkAction {
         ttl_ms: u64,
     },
     /// Release this peer's claim on a work card.
+    ///
+    /// `CLAIM_ID` is optional — when omitted, defaults to THIS peer's
+    /// active claim on the card (looked up via the board projection).
+    /// Pass an explicit `CLAIM_ID` only to release a specific claim
+    /// when you have multiple, or to release someone else's claim
+    /// (which the daemon will reject if you don't own it).
+    ///
+    /// Unlike `claim`, `release` does not enforce a `~/.airc/worktrees/`
+    /// lease check — an agent must always be able to release a claim it
+    /// holds, regardless of cwd. So there is no `--no-lease-required`
+    /// flag here; release is unconditionally permitted.
     Release {
         /// Work card UUID.
         card_id: String,
-        /// Claim UUID returned by `work claim`.
-        claim_id: String,
+        /// Claim UUID returned by `work claim`. Optional — see command help.
+        claim_id: Option<String>,
         /// Optional release reason.
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Amend a card's editable fields (title / body / priority) post-creation.
+    ///
+    /// Card 5ac0a359 — the substrate had no typed way to update a
+    /// card after creation, so refining a card's body during
+    /// decomposition meant closing + recreating, which broke
+    /// references (the new card had a new UUID) and forced every
+    /// observer to re-project. `airc work update` emits a typed
+    /// `CardUpdated` event whose projection writes only the supplied
+    /// fields, leaving everything else (including the card id,
+    /// `reviews` link, owner, claim) alone.
+    ///
+    /// Passing no field flags is legal — it acts as a liveness
+    /// marker (bumps `updated_at_ms` without changing semantics).
+    /// To clear a body, pass `--body ""` (empty string is the
+    /// canonical "no body" idiom for markdown).
+    Update {
+        /// Work card UUID.
+        card_id: String,
+        /// New title (omit to leave unchanged).
+        #[arg(long)]
+        title: Option<String>,
+        /// New body (omit to leave unchanged). Pass `""` to clear.
+        #[arg(long)]
+        body: Option<String>,
+        /// New priority (omit to leave unchanged).
+        #[arg(long, value_enum)]
+        priority: Option<CliPriority>,
     },
     /// Change a work card's lifecycle state.
     State {
@@ -100,10 +139,25 @@ pub enum WorkAction {
         card_id: String,
     },
     /// Print the current room's projected work board.
+    ///
+    /// `--available`, `--mine`, `--others` are mutually exclusive filters
+    /// over the projection so peers can see their slice fast (kink
+    /// b408698c). When none are passed, the full board is shown.
     Board {
         /// Recent transcript events to replay into the projection.
         #[arg(long, default_value_t = 128)]
         limit: usize,
+        /// Show only cards available to claim now: no active claim, or
+        /// claim's lease has expired (reclaim-eligible per the
+        /// flywheel-continuity doctrine). Closed / Merged are hidden.
+        #[arg(long, group = "board_filter")]
+        available: bool,
+        /// Show only cards currently claimed by this peer.
+        #[arg(long, group = "board_filter")]
+        mine: bool,
+        /// Show only cards currently claimed by another peer.
+        #[arg(long, group = "board_filter")]
+        others: bool,
     },
     /// Suggest claimable work for this agent.
     Next {
@@ -155,6 +209,39 @@ pub enum WorkAction {
         /// Heartbeat age to consider live.
         #[arg(long, default_value_t = 180_000)]
         active_within_ms: u64,
+    },
+    /// Spawn a sibling review card for an existing work card.
+    ///
+    /// The created card carries a typed `reviews` link to the parent
+    /// (card ad7e100b Sub-A: `WorkCard.reviews`), so observers and
+    /// schedulers can find every review for a card via
+    /// `WorkBoardProjection::review_cards_for(parent_id)` without
+    /// parsing body prose.
+    ///
+    /// Per AGENTS.md §6 every peer has equal authority to review; the
+    /// CLI imposes no self-review restriction beyond the agent's own
+    /// judgment. If two peers race to spawn a review for the same
+    /// parent, both cards land — the projection surfaces them both
+    /// (atomic claim arbitrates *who works each*, not whether reviews
+    /// exist).
+    Review {
+        /// Parent card UUID being reviewed.
+        parent_id: String,
+        /// Optional pull-request URL the reviewer should consult. The
+        /// body includes it explicitly so reviewers can find it
+        /// without re-projecting the board.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Scheduling priority for the review card. Defaults to
+        /// inheriting the parent's priority (the review of a P0 is
+        /// itself P0-eligible work).
+        #[arg(long, value_enum)]
+        priority: Option<CliPriority>,
+        /// Optional free-form body — e.g. focus areas or known
+        /// gotchas. The parent card id + PR URL are prepended
+        /// automatically; this is additive.
+        #[arg(long)]
+        body: Option<String>,
     },
     /// Publish this agent's availability for a repo.
     Availability {

@@ -18,14 +18,11 @@ use crate::transport::IpcStream;
 
 use crate::request::{
     AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
-    ResolveWireRequest, SendRequest, SubscribeRequest,
+    SendRequest,
 };
-use crate::response::{
-    InboxResponse, PeersResponse, PublishResponse, ResolveWireResponse, Response, StatusResponse,
-};
+use crate::response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const SUBSCRIBE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
@@ -130,14 +127,7 @@ impl DaemonClient {
 
         match response {
             Response::Error { message } => Err(ClientError::Daemon(message)),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Ok) => Ok(other),
+            other => Ok(other),
         }
     }
 
@@ -148,14 +138,7 @@ impl DaemonClient {
     pub async fn ping_with_timeout(&self, deadline: Duration) -> Result<(), ClientError> {
         match self.call_with_timeout(Request::Ping, deadline).await? {
             Response::Pong => Ok(()),
-            other @ (Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::Ok
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
@@ -169,145 +152,51 @@ impl DaemonClient {
     ) -> Result<StatusResponse, ClientError> {
         match self.call_with_timeout(Request::Status, deadline).await? {
             Response::Status(status) => Ok(status),
-            other @ (Response::Pong
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::Ok
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
-    pub async fn send(&self, request: SendRequest) -> Result<(), ClientError> {
+    /// Send a text message on a channel. Returns the owner-assigned
+    /// receipt — the daemon publishes it through its `EventRouter`.
+    pub async fn send(&self, request: SendRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Send(request)).await? {
-            Response::Ok => Ok(()),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            Response::Publish(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn publish(&self, request: PublishRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Publish(request)).await? {
             Response::Publish(response) => Ok(response),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Peers(_)
-            | Response::Ok
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
-        }
-    }
-
-    /// Look up the wire path the daemon uses for a given channel
-    /// UUID. Returns `None` inside [`ResolveWireResponse`] when the
-    /// daemon has not subscribed that channel yet — same non-auto-
-    /// join discipline as [`Airc::publish`](airc-lib's publish API).
-    pub async fn resolve_wire(
-        &self,
-        request: ResolveWireRequest,
-    ) -> Result<ResolveWireResponse, ClientError> {
-        match self.call(Request::ResolveWire(request)).await? {
-            Response::ResolveWire(response) => Ok(response),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::Ok
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
-        }
-    }
-
-    pub async fn subscribe(&self, request: SubscribeRequest) -> Result<(), ClientError> {
-        self.subscribe_with_timeout(request, SUBSCRIBE_RPC_TIMEOUT)
-            .await
-    }
-
-    pub async fn subscribe_with_timeout(
-        &self,
-        request: SubscribeRequest,
-        deadline: Duration,
-    ) -> Result<(), ClientError> {
-        match self
-            .call_with_timeout(Request::Subscribe(request), deadline)
-            .await?
-        {
-            Response::Ok => Ok(()),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::Ok
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
         match self.call(Request::AddPeer(request)).await? {
             Response::Ok => Ok(()),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
     pub async fn remove_peer(&self, request: RemovePeerRequest) -> Result<(), ClientError> {
         match self.call(Request::RemovePeer(request)).await? {
             Response::Ok => Ok(()),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Peers(_)
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 
@@ -317,14 +206,7 @@ impl DaemonClient {
     pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
         match self.call(Request::ListPeers).await? {
             Response::Peers(response) => Ok(response),
-            other @ (Response::Pong
-            | Response::Status(_)
-            | Response::Inbox(_)
-            | Response::Event { .. }
-            | Response::Publish(_)
-            | Response::Ok
-            | Response::ResolveWire(_)
-            | Response::Error { .. }) => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
 

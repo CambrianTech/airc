@@ -6,7 +6,7 @@
 //! `airc-store` so each attach starts at "new since last seen" instead
 //! of replaying the full transcript.
 
-use airc_core::{Body, TranscriptEvent};
+use airc_core::TranscriptEvent;
 use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::stream::StreamExt;
 use std::sync::Arc;
@@ -104,17 +104,11 @@ fn consumer_id() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn print_event(event: &TranscriptEvent) {
-    let text = event
-        .body
-        .as_ref()
-        .and_then(Body::as_text)
-        .unwrap_or("<non-text body>");
-    println!(
-        "[{kind:?}] {sender} → {channel}: {text}",
-        kind = event.kind,
-        sender = event.peer_id,
-        channel = event.room_id,
-    );
+    // Structured events render by kind; `alive` heartbeats are suppressed
+    // (None) so they don't drown the feed. See `event_render`.
+    if let Some(line) = crate::event_render::render_feed_line(event) {
+        println!("{line}");
+    }
 }
 
 #[cfg(test)]

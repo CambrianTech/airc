@@ -6,11 +6,65 @@ use std::task::{Context, Poll};
 use airc_core::transcript::TranscriptKind;
 use airc_core::{HeaderFilter, RoomId, TranscriptEvent};
 use futures::stream::Stream;
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream};
 
 /// Live transcript-event stream returned by `Airc::subscribe`.
+///
+/// Two sources, one interface: the in-process **broadcast** fan-out
+/// (embedded SDK + cross-machine transports) and the **daemon** path
+/// (one IPC attach per subscribed channel, merged into a single
+/// receiver). The owner-core router subscribes per channel, so the
+/// daemon variant fans N attach streams into one ordered-per-channel
+/// feed — the same merge the CLI monitor does, lifted into the SDK.
 pub struct EventStream {
-    pub(crate) inner: BroadcastStream<Arc<TranscriptEvent>>,
+    inner: EventStreamInner,
+}
+
+enum EventStreamInner {
+    Broadcast(BroadcastStream<Arc<TranscriptEvent>>),
+    Daemon {
+        rx: ReceiverStream<Arc<TranscriptEvent>>,
+        /// Aborts the per-channel attach tasks when the stream drops, so
+        /// closing a subscription tears down its IPC connections.
+        _guard: DaemonAttachGuard,
+    },
+}
+
+impl EventStream {
+    pub(crate) fn from_broadcast(rx: broadcast::Receiver<Arc<TranscriptEvent>>) -> Self {
+        Self {
+            inner: EventStreamInner::Broadcast(BroadcastStream::new(rx)),
+        }
+    }
+
+    pub(crate) fn daemon(
+        rx: mpsc::Receiver<Arc<TranscriptEvent>>,
+        handles: Vec<JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            inner: EventStreamInner::Daemon {
+                rx: ReceiverStream::new(rx),
+                _guard: DaemonAttachGuard { handles },
+            },
+        }
+    }
+}
+
+/// Owns the spawned per-channel attach tasks; aborting on drop keeps the
+/// IPC connections tied to the `EventStream`'s lifetime (no detached
+/// background work).
+struct DaemonAttachGuard {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl Drop for DaemonAttachGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }
 
 impl Stream for EventStream {
@@ -18,14 +72,23 @@ impl Stream for EventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let inner = Pin::new(&mut this.inner);
-        match inner.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                Poll::Ready(Some(Err(LiveLag { skipped: n })))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
+        match &mut this.inner {
+            EventStreamInner::Broadcast(stream) => match Pin::new(stream).poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    Poll::Ready(Some(Err(LiveLag { skipped: n })))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+            },
+            // The daemon attach loop handles lag internally (resume-from-
+            // cursor on the IPC side), so the SDK consumer only ever sees
+            // delivered events here.
+            EventStreamInner::Daemon { rx, .. } => match Pin::new(rx).poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(event)) => Poll::Ready(Some(Ok(event))),
+                Poll::Ready(None) => Poll::Ready(None),
+            },
         }
     }
 }

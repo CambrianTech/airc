@@ -26,7 +26,6 @@ pub enum RouteClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
-    LocalFs,
     LanTcp,
     Tailscale,
     Udp,
@@ -85,7 +84,7 @@ fn allows(class: RouteClass, candidate: TransportCandidate) -> bool {
             (RouteClass::InviteAdvertise, TransportRole::InviteBeacon)
                 | (RouteClass::PeerRendezvous, TransportRole::Rendezvous)
         ),
-        TransportKind::LocalFs | TransportKind::LanTcp | TransportKind::Tailscale => {
+        TransportKind::LanTcp | TransportKind::Tailscale => {
             candidate.role == TransportRole::Direct
                 && (is_live_class(class) || class == RouteClass::PeerRendezvous)
         }
@@ -133,7 +132,6 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
     match class {
         RouteClass::ControlInteractive | RouteClass::PresenceEphemeral => match kind {
             TransportKind::LanTcp => 0,
-            TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Udp => 3,
             TransportKind::WebRtcDataChannel => 4,
@@ -143,7 +141,6 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         },
         RouteClass::DataInteractive => match kind {
             TransportKind::LanTcp => 0,
-            TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Reticulum => 3,
             TransportKind::Relay => 4,
@@ -153,7 +150,6 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
             | TransportKind::GhGist => 255,
         },
         RouteClass::MediaSignaling => match kind {
-            TransportKind::LocalFs => 0,
             TransportKind::Udp => 1,
             TransportKind::WebRtcDataChannel => 2,
             TransportKind::LanTcp => 3,
@@ -164,7 +160,6 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         },
         RouteClass::DataBulk => match kind {
             TransportKind::LanTcp => 0,
-            TransportKind::LocalFs => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Reticulum => 3,
             TransportKind::Relay => 4,
@@ -175,7 +170,6 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         },
         RouteClass::PeerRendezvous => match (kind, role) {
             (TransportKind::LanTcp, TransportRole::Direct) => 0,
-            (TransportKind::LocalFs, TransportRole::Direct) => 1,
             (TransportKind::Tailscale, TransportRole::Direct) => 2,
             (TransportKind::Reticulum, TransportRole::Direct) => 3,
             (TransportKind::Reticulum, TransportRole::Rendezvous) => 4,
@@ -266,20 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn live_peer_delivery_prefers_lan_over_local_storage_when_both_are_healthy() {
-        let policy = RoutePolicy;
-        let decision = policy.choose(
-            RouteClass::DataInteractive,
-            [
-                candidate(TransportKind::LocalFs, TransportRole::Direct),
-                candidate(TransportKind::LanTcp, TransportRole::Direct),
-            ],
-        );
-
-        assert_eq!(decision, RouteDecision::Selected(TransportKind::LanTcp));
-    }
-
-    #[test]
     fn relay_beacon_beats_github_invite() {
         let policy = RoutePolicy;
         let decision = policy.choose(
@@ -300,7 +280,7 @@ mod tests {
             RouteClass::DataInteractive,
             [
                 TransportCandidate {
-                    kind: TransportKind::LocalFs,
+                    kind: TransportKind::Reticulum,
                     role: TransportRole::Direct,
                     healthy: false,
                 },

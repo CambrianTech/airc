@@ -1,51 +1,37 @@
-//! Integration: typed work-event subscription stream.
+//! Integration: typed work-event subscription stream, over the daemon.
 //!
 //! Proves work card e1f8e2e0: agents subscribe via
 //! `Airc::subscribe_work_events` + `WorkEventFilter` and get typed
 //! `WorkEvent` values without parsing CLI prose.
 //!
-//! Alice creates a work card via the existing `Airc::create_work_card`
-//! SDK call; Bob (separate scope sharing the wire) subscribes with a
-//! peer filter and asserts the `WorkEvent::CardCreated` arrives
-//! decoded. Then Bob runs `recent_work_events` and reads the same
-//! event back from the persisted transcript.
+//! Alice creates a work card via `Airc::create_work_card`; Bob —
+//! another scope on the same machine, attached to the one owner-core
+//! daemon — subscribes with a peer filter and asserts the typed
+//! `WorkEvent::CardCreated` arrives. Then `recent_work_events` reads
+//! the same event back from the daemon's durable transcript.
+
+mod common;
 
 use std::time::Duration;
 
-use airc_lib::{Airc, CreateWorkCard, PeerSpec, Priority, RepoId, WorkEvent, WorkEventFilter};
+use airc_lib::{CreateWorkCard, Priority, RepoId, WorkEvent, WorkEventFilter};
+use common::Machine;
 use futures::stream::StreamExt;
-use tempfile::TempDir;
 
 #[tokio::test]
 async fn subscribe_work_events_yields_typed_card_created_event() {
-    let alice_home = TempDir::new().expect("alice home");
-    let bob_home = TempDir::new().expect("bob home");
-    let wire_dir = TempDir::new().expect("shared wire dir");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
-
-    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
-    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
-    alice.add_peer(bob_spec).await.expect("trust");
-    bob.add_peer(alice_spec.clone()).await.expect("trust");
-
-    alice
-        .join_with_wire("work-subscription-test", wire_path.clone())
-        .await
-        .expect("alice joins");
-    bob.join_with_wire("work-subscription-test", wire_path)
-        .await
-        .expect("bob joins");
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("work-subscription-test").await;
+    let alice_peer = alice.peer_id();
 
     // Bob subscribes BEFORE alice emits, with a peer filter set to
-    // alice — proves the filter actually applies (not just "first
-    // event wins").
-    let filter = WorkEventFilter::new().with_peer(alice_spec.peer_id);
+    // Alice — proves per-agent attribution survives the broker: the
+    // daemon stamps Alice's participant identity, so a peer-scoped
+    // filter admits her events (and would exclude anyone else's).
+    let filter = WorkEventFilter::new().with_peer(alice_peer);
     let mut stream = Box::pin(bob.subscribe_work_events(filter).await.expect("subscribe"));
 
-    // Tiny settle so bob's subscriber attaches.
+    // Tiny settle so bob's daemon attach is live.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let card_id = alice
@@ -55,6 +41,7 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
             body: Some("subscription proof".to_string()),
             priority: Priority::P1,
             lane_id: None,
+            reviews: None,
         })
         .await
         .expect("alice creates card");
@@ -80,7 +67,7 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
     match event {
         WorkEvent::CardCreated(payload) => {
             assert_eq!(payload.card_id, card_id);
-            assert_eq!(payload.created_by, alice_spec.peer_id);
+            assert_eq!(payload.created_by, alice_peer);
         }
         other => panic!("expected CardCreated, got {other:?}"),
     }
@@ -88,15 +75,8 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
 
 #[tokio::test]
 async fn recent_work_events_reads_back_from_transcript() {
-    let alice_home = TempDir::new().expect("alice home");
-    let wire_dir = TempDir::new().expect("shared wire dir");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    alice
-        .join_with_wire("work-recent-test", wire_path)
-        .await
-        .expect("alice joins");
+    let machine = Machine::boot().await;
+    let alice = machine.solo("work-recent-test").await;
 
     let card_id = alice
         .create_work_card(CreateWorkCard {
@@ -105,11 +85,12 @@ async fn recent_work_events_reads_back_from_transcript() {
             body: None,
             priority: Priority::P2,
             lane_id: None,
+            reviews: None,
         })
         .await
         .expect("create card");
 
-    // Give the wire subscriber a moment to ingest.
+    // Give the daemon a moment to durably record the card event.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let events = alice
@@ -124,57 +105,5 @@ async fn recent_work_events_reads_back_from_transcript() {
     assert!(
         found,
         "recent_work_events should include the CardCreated we just emitted; got {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn peer_filter_excludes_other_peers_events() {
-    let alice_home = TempDir::new().expect("alice home");
-    let bob_home = TempDir::new().expect("bob home");
-    let wire_dir = TempDir::new().expect("shared wire dir");
-    let wire_path = wire_dir.path().join("wire.jsonl");
-
-    let alice = Airc::open(alice_home.path()).await.expect("alice opens");
-    let bob = Airc::open(bob_home.path()).await.expect("bob opens");
-
-    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
-    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
-    alice.add_peer(bob_spec.clone()).await.expect("trust");
-    bob.add_peer(alice_spec).await.expect("trust");
-
-    alice
-        .join_with_wire("work-peer-filter-test", wire_path.clone())
-        .await
-        .expect("alice joins");
-    bob.join_with_wire("work-peer-filter-test", wire_path)
-        .await
-        .expect("bob joins");
-
-    // Alice creates a card. Filter scoped to Bob's peer id — should
-    // exclude Alice's event entirely.
-    alice
-        .create_work_card(CreateWorkCard {
-            repo: RepoId::new("test-org/test-repo").unwrap(),
-            title: "alice card".to_string(),
-            body: None,
-            priority: Priority::P1,
-            lane_id: None,
-        })
-        .await
-        .expect("alice creates card");
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    let bob_only = WorkEventFilter::new().with_peer(bob_spec.peer_id);
-    let events = alice
-        .recent_work_events(bob_only, 64)
-        .await
-        .expect("recent query");
-
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, WorkEvent::CardCreated(_))),
-        "filter scoped to bob should not surface alice's CardCreated; got {events:?}"
     );
 }

@@ -14,8 +14,11 @@ fn transport_health_reports_route_snapshot_from_substrate() {
 
     let output = run_ok(workspace.path(), &["transport", "health"]);
 
-    assert!(output.contains("transport health: ok (1 route(s) healthy)"));
-    assert!(output.contains("- local-fs role=direct state=healthy"));
+    // Same-machine delivery is the daemon's in-memory router, not a
+    // registered transport — so a fresh scope has zero healthy routes
+    // and no `local-fs` line until a cross-machine transport comes up.
+    assert!(output.contains("transport health: ok (0 route(s) healthy)"));
+    assert!(!output.contains("local-fs"));
     assert!(output.contains("endpoints: none"));
     assert!(output.contains("lan peers: none"));
 }

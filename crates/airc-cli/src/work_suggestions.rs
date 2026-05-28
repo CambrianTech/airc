@@ -197,6 +197,7 @@ mod tests {
             created_by: PeerId::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            reviews: None,
         }
     }
 

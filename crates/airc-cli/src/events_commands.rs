@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use airc_lib::{Airc, Body, EventFilter, HeaderFilter, TranscriptEvent, TranscriptKind};
+use airc_lib::{Body, EventFilter, HeaderFilter, TranscriptEvent, TranscriptKind};
 use serde::Serialize;
 
 use crate::events_cli::CliTranscriptKind;
@@ -21,7 +21,7 @@ pub async fn run_list(
     limit: usize,
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+    let airc = crate::commands::attached_airc(home).await?;
     let filter = EventFilter {
         kinds: kinds.into_iter().map(TranscriptKind::from).collect(),
         headers_filter: parse_header_filters(exact_headers, prefix_headers)?,

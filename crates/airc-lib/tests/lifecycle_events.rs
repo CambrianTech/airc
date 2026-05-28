@@ -225,64 +225,6 @@ async fn remove_peer_emits_peer_departed_lifecycle_event() {
 }
 
 #[tokio::test]
-async fn join_emits_wire_established_after_subscriber_attaches() {
-    use airc_lib::lifecycle::WireEstablishedBody;
-
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-
-    // join() drives ensure_wire_subscriber which emits the event.
-    let _room = airc.join("wire-established-test").await.expect("join");
-
-    // Page recent events; both RoomJoined and WireEstablished
-    // should land. The order between them is implementation
-    // detail (current order: RoomJoined fires inside join() after
-    // ensure_wire_subscriber returns, so WireEstablished is first
-    // in the lamport sequence — but the test asserts presence,
-    // not order).
-    let page = airc.page_recent(64).await.expect("page");
-    let wire_event = page
-        .iter()
-        .find(|e| e.kind == TranscriptKind::WireEstablished)
-        .expect("WireEstablished should be emitted when the wire subscriber attaches");
-    let body = wire_event.body.as_ref().expect("event has body");
-    let body_json = match body {
-        Body::Json(value) => value.clone(),
-        _ => panic!("WireEstablished body should be JSON"),
-    };
-    let parsed: WireEstablishedBody =
-        serde_json::from_value(body_json).expect("body parses as WireEstablishedBody");
-    assert_eq!(parsed.channel_name, "wire-established-test");
-    assert!(!parsed.wire.is_empty(), "wire path should be set");
-}
-
-#[tokio::test]
-async fn wire_established_fires_once_per_wire_idempotent() {
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-
-    let _room = airc.join("idempotent-wire").await.expect("first join");
-    // Second join() to the same channel — should hit the
-    // contains_key short-circuit in ensure_wire_subscriber. No
-    // duplicate WireEstablished.
-    let _room2 = airc.join("idempotent-wire").await.expect("second join");
-
-    let page = airc.page_recent(64).await.expect("page");
-    let count = page
-        .iter()
-        .filter(|e| e.kind == TranscriptKind::WireEstablished)
-        .count();
-    assert_eq!(
-        count, 1,
-        "ensure_wire_subscriber must short-circuit on the second call; only one WireEstablished expected"
-    );
-}
-
-#[tokio::test]
 async fn save_runtime_cursor_emits_subscription_advanced() {
     use airc_lib::lifecycle::SubscriptionAdvancedBody;
 
@@ -292,14 +234,16 @@ async fn save_runtime_cursor_emits_subscription_advanced() {
     let airc = Airc::open(&home).await.expect("open");
     let _room = airc.join("subscription-advanced-test").await.expect("join");
 
-    airc.say("cursor source").await.expect("say");
+    // Runtime cursors are local consumer state; bookmark the join's
+    // own RoomJoined lifecycle event as the source — a local transcript
+    // event, no network route needed.
     let source = airc
         .page_recent(32)
         .await
         .expect("page")
         .into_iter()
-        .find(|event| event.kind == TranscriptKind::Message)
-        .expect("message event exists");
+        .find(|event| event.kind == TranscriptKind::RoomJoined)
+        .expect("RoomJoined event exists");
     let source_cursor = source.cursor();
 
     airc.save_runtime_cursor_for_event("test-consumer", &source)
@@ -391,14 +335,13 @@ async fn saving_subscription_advanced_cursor_does_not_emit_recursive_event() {
         .await
         .expect("join");
 
-    airc.say("cursor source").await.expect("say");
     let source = airc
         .page_recent(32)
         .await
         .expect("page")
         .into_iter()
-        .find(|event| event.kind == TranscriptKind::Message)
-        .expect("message event exists");
+        .find(|event| event.kind == TranscriptKind::RoomJoined)
+        .expect("RoomJoined event exists");
     airc.save_runtime_cursor_for_event("test-consumer", &source)
         .await
         .expect("save source cursor");
@@ -422,87 +365,6 @@ async fn saving_subscription_advanced_cursor_does_not_emit_recursive_event() {
     assert_eq!(
         count, 1,
         "saving a SubscriptionAdvanced cursor must not emit another SubscriptionAdvanced event"
-    );
-}
-
-#[tokio::test]
-async fn teardown_wire_emits_wire_lost_with_teardown_reason() {
-    use airc_lib::lifecycle::WireLostBody;
-
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-
-    // Join puts a wire subscriber in the map.
-    let room = airc.join("wire-lost-test").await.expect("join");
-
-    // Resolve the wire path the same way the subscriber map keys
-    // are formed — via the room subscription.
-    let subs = airc.subscriptions().await.expect("subscriptions");
-    let sub = subs
-        .iter()
-        .find(|s| s.room_id == room.channel)
-        .expect("subscription row for joined channel");
-    let wire_path = sub.wire.clone();
-
-    airc.teardown_wire_for_test(&wire_path)
-        .await
-        .expect("teardown_wire");
-
-    // Allow the task a moment to flush its emit even though
-    // teardown_wire awaits the JoinHandle.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut wire_lost_event = None;
-    while std::time::Instant::now() < deadline {
-        let page = airc.page_recent(64).await.expect("page");
-        if let Some(event) = page
-            .into_iter()
-            .find(|e| e.kind == TranscriptKind::WireLost)
-        {
-            wire_lost_event = Some(event);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let event = wire_lost_event.expect("WireLost should be emitted by teardown_wire");
-    let body = event.body.as_ref().expect("event has body");
-    let body_json = match body {
-        Body::Json(value) => value.clone(),
-        _ => panic!("WireLost body should be JSON"),
-    };
-    let parsed: WireLostBody =
-        serde_json::from_value(body_json).expect("body parses as WireLostBody");
-    assert_eq!(
-        parsed.reason, "teardown",
-        "explicit teardown path tags reason=teardown"
-    );
-    assert!(!parsed.wire.is_empty(), "wire path should be set");
-}
-
-#[tokio::test]
-async fn teardown_wire_is_idempotent_no_subscriber_noop() {
-    let dir = TempDir::new().expect("tempdir");
-    let home = dir.path().join(".airc");
-    std::fs::create_dir_all(&home).unwrap();
-    let airc = Airc::open(&home).await.expect("open");
-
-    // Tearing down a wire that was never subscribed must not panic
-    // and must not emit a WireLost event (no room to attach it to).
-    let bogus = home.join("does-not-exist");
-    airc.teardown_wire_for_test(&bogus)
-        .await
-        .expect("teardown_wire on unknown wire is a no-op");
-
-    let page = airc.page_recent(64).await.expect("page");
-    let count = page
-        .iter()
-        .filter(|e| e.kind == TranscriptKind::WireLost)
-        .count();
-    assert_eq!(
-        count, 0,
-        "tearing down an unknown wire must not emit WireLost"
     );
 }
 

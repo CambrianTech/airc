@@ -31,6 +31,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -80,6 +81,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: merged_card,
@@ -103,6 +105,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: closed_card,
@@ -139,6 +142,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -185,6 +189,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -234,6 +239,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             lane_id: None,
             created_by: first_owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -282,6 +288,7 @@ fn expired_claim_can_be_superseded_by_new_claim() {
             lane_id: None,
             created_by: expired_owner,
             created_at_ms: 100,
+            reviews: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -383,6 +390,7 @@ fn lane_card_and_pr_merge_projection_is_deterministic() {
             lane_id: Some(lane_id),
             created_by: owner,
             created_at_ms: 2,
+            reviews: None,
         }),
         WorkEvent::PullRequestLinked(PullRequestLinked {
             card_id,
@@ -424,6 +432,7 @@ fn workspace_lease_lifecycle_projects_status_and_disk() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -692,6 +701,7 @@ fn heartbeat_for_non_active_claim_is_dropped_silently() {
             lane_id: None,
             created_by: owner,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -734,6 +744,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             lane_id: None,
             created_by: owner_a,
             created_at_ms: 1,
+            reviews: None,
         }))
         .unwrap();
     projection
@@ -776,4 +787,600 @@ fn release_for_superseded_claim_does_not_poison_projection() {
     );
     assert_eq!(card.owner, Some(owner_a));
     assert_eq!(card.state, CardState::Claimed);
+}
+
+// Invariant (d) of card 5d65aec2 — peer self-organizing contract:
+// two peers creating cards concurrently must not collide. The
+// store-as-arbiter contract for *creation* reduces to "fresh UUID per
+// card" + projection's id-keyed insertion; distinct ids round-trip
+// both writers, and a true id collision SURFACES (no silent clobber).
+
+#[test]
+fn concurrent_card_creates_with_distinct_ids_project_independently() {
+    let card_a = WorkCardId::from_u128(101);
+    let card_b = WorkCardId::from_u128(102);
+    let alice = peer(10);
+    let bob = peer(20);
+
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: card_a,
+            repo: repo(),
+            title: "alice's card".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: alice,
+            created_at_ms: 100,
+            reviews: None,
+        }))
+        .expect("alice's create projects");
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: card_b,
+            repo: repo(),
+            title: "bob's card".into(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            created_by: bob,
+            created_at_ms: 101,
+            reviews: None,
+        }))
+        .expect("bob's create projects independently");
+
+    let a = projection.card(card_a).expect("card_a present");
+    let b = projection.card(card_b).expect("card_b present");
+    assert_eq!(a.title, "alice's card");
+    assert_eq!(a.created_by, alice);
+    assert_eq!(a.priority, Priority::P1);
+    assert_eq!(b.title, "bob's card");
+    assert_eq!(b.created_by, bob);
+    assert_eq!(b.priority, Priority::P2);
+}
+
+#[test]
+fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
+    // A true id collision is structurally unreachable with fresh
+    // UUIDs, but the arbitration contract must still be explicit:
+    // silent overwrite would let a bug — or a malicious peer —
+    // replace a card. Test pins "surfaces as DuplicateCard, original
+    // unchanged".
+    let card_id = WorkCardId::from_u128(42);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "original".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 100,
+            reviews: None,
+        }))
+        .expect("first create projects");
+    let err = projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "clobber attempt".into(),
+            body: None,
+            priority: Priority::P3,
+            lane_id: None,
+            created_by: peer(2),
+            created_at_ms: 200,
+            reviews: None,
+        }))
+        .expect_err("duplicate card_id must surface as an error");
+    assert!(
+        matches!(err, super::ProjectionError::DuplicateCard(id) if id == card_id),
+        "wrong error variant: {err:?}",
+    );
+    // Original card unchanged — silent overwrite would be a bug.
+    let card = projection.card(card_id).expect("original card still present");
+    assert_eq!(card.title, "original");
+    assert_eq!(card.priority, Priority::P1);
+    assert_eq!(card.created_by, peer(1));
+}
+
+// -------------------------------------------------------------------------
+// Card ad7e100b Sub-A — typed `reviews` link on `WorkCard`.
+//
+// Reviews are a sibling-card relationship: a "review" card carries a
+// `reviews = Some(parent_id)` link so observers can ask the projection
+// (`review_cards_for(parent_id)`) which reviews exist for a parent
+// without scanning bodies. The link must:
+//   * project onto `WorkCard.reviews` when the event carries it;
+//   * default to `None` when the event omits it (back-compat — legacy
+//     events on the wire decode without a `reviews` field);
+//   * surface on `review_cards_for(parent_id)`, including the case
+//     where multiple sibling reviewers race (every review surfaces,
+//     not just the first).
+// -------------------------------------------------------------------------
+
+#[test]
+fn cards_omitting_reviews_link_project_with_none() {
+    let card_id = WorkCardId::from_u128(0xAD7E_100B);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "ordinary card".into(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 1,
+            reviews: None,
+        }))
+        .expect("ordinary create projects");
+
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(card.reviews, None);
+    assert_eq!(
+        projection.review_cards_for(card_id).count(),
+        0,
+        "no review cards exist for an unreviewed parent"
+    );
+}
+
+#[test]
+fn review_card_links_to_parent_and_surfaces_on_query() {
+    let parent_id = WorkCardId::from_u128(0xAD7E_100B);
+    let review_id = WorkCardId::from_u128(0xAD7E_F001);
+    let mut projection = WorkBoardProjection::new();
+
+    // Parent card: a normal piece of work.
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: parent_id,
+            repo: repo(),
+            title: "parent: peer-agent review loop".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 1,
+            reviews: None,
+        }))
+        .expect("parent create projects");
+
+    // Review card: same repo, sibling, typed link back at the parent.
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: review_id,
+            repo: repo(),
+            title: "review: peer-agent review loop".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(2),
+            created_at_ms: 2,
+            reviews: Some(parent_id),
+        }))
+        .expect("review create projects");
+
+    let review = projection.card(review_id).expect("review present");
+    assert_eq!(review.reviews, Some(parent_id));
+
+    let reviews: Vec<_> = projection.review_cards_for(parent_id).collect();
+    assert_eq!(reviews.len(), 1, "exactly one review for the parent");
+    assert_eq!(reviews[0].card_id, review_id);
+    assert_eq!(
+        reviews[0].created_by,
+        peer(2),
+        "review card created_by attribution preserved (reviewer ≠ author)"
+    );
+}
+
+#[test]
+fn multiple_reviewers_each_surface_for_the_same_parent() {
+    // Two agents racing to review the same PR each spawn their own
+    // review card. The projection MUST surface both: review work is
+    // peer-parallel by AGENTS.md §8 (no "lead reviewer" gate).
+    let parent_id = WorkCardId::from_u128(0xAD7E_100B);
+    let alice_review = WorkCardId::from_u128(0xAD7E_A11C_AAAA);
+    let bob_review = WorkCardId::from_u128(0xAD7E_B0B0_BBBB);
+    let unrelated = WorkCardId::from_u128(0xCAFE_BABE);
+
+    let mut projection = WorkBoardProjection::new();
+    for (id, by, ts, title, reviews) in [
+        (
+            parent_id,
+            peer(1),
+            1u64,
+            "parent",
+            None,
+        ),
+        (
+            alice_review,
+            peer(2),
+            2,
+            "alice's review",
+            Some(parent_id),
+        ),
+        (
+            bob_review,
+            peer(3),
+            3,
+            "bob's review",
+            Some(parent_id),
+        ),
+        (
+            unrelated,
+            peer(4),
+            4,
+            "unrelated card — wrong parent",
+            Some(WorkCardId::from_u128(0xDEAD_BEEF)),
+        ),
+    ] {
+        projection
+            .apply(&WorkEvent::CardCreated(CardCreated {
+                card_id: id,
+                repo: repo(),
+                title: title.into(),
+                body: None,
+                priority: Priority::P2,
+                lane_id: None,
+                created_by: by,
+                created_at_ms: ts,
+                reviews,
+            }))
+            .expect("create projects");
+    }
+
+    let mut review_ids: Vec<_> = projection
+        .review_cards_for(parent_id)
+        .map(|card| card.card_id)
+        .collect();
+    review_ids.sort_by_key(|id| id.as_uuid());
+    let mut expected = vec![alice_review, bob_review];
+    expected.sort_by_key(|id| id.as_uuid());
+    assert_eq!(
+        review_ids, expected,
+        "review_cards_for must surface every reviewer, not just the first"
+    );
+
+    assert_eq!(
+        projection
+            .review_cards_for(WorkCardId::from_u128(0xDEAD_BEEF))
+            .count(),
+        1,
+        "review_cards_for filters by parent_id exactly — the 'unrelated' \
+         card is only a review of 0xDEAD_BEEF, not of the parent"
+    );
+}
+
+#[test]
+fn reviews_field_round_trips_through_serde_with_back_compat() {
+    // Forward direction: an event WITH a reviews link round-trips
+    // every field byte-identically, and the typed field is what's
+    // recorded on the wire (not stuffed into the body).
+    let parent = WorkCardId::new();
+    let review_event = CardCreated {
+        card_id: WorkCardId::new(),
+        repo: repo(),
+        title: "review card".into(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        created_by: PeerId::new(),
+        created_at_ms: 200,
+        reviews: Some(parent),
+    };
+    let json = serde_json::to_value(&review_event).expect("encode");
+    assert_eq!(
+        json["reviews"],
+        serde_json::json!(parent.as_uuid().to_string())
+    );
+    let decoded: CardCreated = serde_json::from_value(json).expect("decode");
+    assert_eq!(decoded, review_event);
+
+    // Back-compat: a legacy event (encoded by a peer on pre-ad7e100b
+    // code, or a non-review card) carries no `reviews` key on the
+    // wire. We synthesize one from a real `CardCreated` with
+    // `reviews: None` so the fixture uses typed UUID newtypes
+    // throughout (PeerId / WorkCardId / RepoId) — never hand-rolled
+    // UUID strings, which can be malformed or collide in p2p.
+    let plain = CardCreated {
+        reviews: None,
+        ..review_event
+    };
+    let plain_json = serde_json::to_value(&plain).expect("encode plain");
+    assert!(
+        plain_json.get("reviews").is_none(),
+        "None reviews must not appear in JSON (skip_serializing_if); got {plain_json}"
+    );
+    let decoded_plain: CardCreated =
+        serde_json::from_value(plain_json).expect("legacy-shape decode");
+    assert_eq!(
+        decoded_plain.reviews, None,
+        "missing `reviews` key must deserialize as None, not error"
+    );
+    assert_eq!(decoded_plain, plain);
+}
+
+// -------------------------------------------------------------------------
+// Card 5ac0a359 — `CardUpdated` amendment event + projection.
+//
+// Each editable field is `Option`; `None` = leave alone. `body` is
+// double-`Option` so the outer `None` distinguishes "don't touch
+// body" from `Some(None)` (clear) and `Some(Some(s))` (set). The
+// projection always bumps `updated_at_ms` — even a no-op all-`None`
+// amendment moves it (liveness marker without a semantic change).
+// Unknown card_id surfaces as `UnknownCard` so an out-of-room
+// amendment doesn't silently succeed.
+// -------------------------------------------------------------------------
+
+fn project_card_with(
+    projection: &mut WorkBoardProjection,
+    card_id: WorkCardId,
+    title: &str,
+    body: Option<&str>,
+    priority: Priority,
+    created_at_ms: u64,
+) {
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: title.into(),
+            body: body.map(Into::into),
+            priority,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms,
+            reviews: None,
+        }))
+        .expect("create projects");
+}
+
+#[test]
+fn card_updated_title_only_preserves_body_and_priority() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(
+        &mut projection,
+        card_id,
+        "original",
+        Some("original body"),
+        Priority::P2,
+        100,
+    );
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: Some("amended title".into()),
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 200,
+        }))
+        .expect("title amend projects");
+
+    let card = projection.card(card_id).expect("card present");
+    assert_eq!(card.title, "amended title");
+    assert_eq!(
+        card.body.as_deref(),
+        Some("original body"),
+        "body untouched when amendment field is None"
+    );
+    assert_eq!(
+        card.priority,
+        Priority::P2,
+        "priority untouched when amendment field is None"
+    );
+    assert_eq!(
+        card.updated_at_ms, 200,
+        "updated_at_ms moves to the amendment's timestamp"
+    );
+    assert_eq!(
+        card.created_at_ms, 100,
+        "created_at_ms is append-only (attribution / temporal anchor)"
+    );
+    assert_eq!(
+        card.created_by,
+        peer(1),
+        "created_by attribution preserved (not the amender)"
+    );
+}
+
+#[test]
+fn card_updated_body_leave_alone_vs_set_vs_empty_string_clear() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(
+        &mut projection,
+        card_id,
+        "title",
+        Some("original body"),
+        Priority::P2,
+        100,
+    );
+
+    // `body: None` — leave alone. Body stays.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 110,
+        }))
+        .expect("no-op amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some("original body"),
+        "None body must NOT touch the existing body"
+    );
+
+    // `body: Some("new")` — set to the new value.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: Some("amended body".into()),
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 120,
+        }))
+        .expect("set-body amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some("amended body"),
+    );
+
+    // `body: Some("")` — the canonical clear path. The projection
+    // records exactly what's supplied; renderers treat empty string
+    // and None as "no body" identically.
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: Some(String::new()),
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 130,
+        }))
+        .expect("clear-body amend projects");
+    assert_eq!(
+        projection.card(card_id).unwrap().body.as_deref(),
+        Some(""),
+        "Some(\"\") body sets the body to empty (markdown 'no body' idiom)"
+    );
+}
+
+#[test]
+fn card_updated_priority_only_rewrites_priority() {
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(&mut projection, card_id, "p2 card", None, Priority::P2, 100);
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: Some(Priority::P0),
+            updated_by: peer(2),
+            updated_at_ms: 200,
+        }))
+        .expect("priority amend projects");
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(card.priority, Priority::P0);
+    assert_eq!(card.title, "p2 card", "title untouched");
+}
+
+#[test]
+fn card_updated_all_none_bumps_updated_at_only() {
+    // The no-op amendment doubles as a liveness marker: an agent
+    // "touches" a card without changing semantics. The projection
+    // must accept it and bump updated_at_ms.
+    let card_id = WorkCardId::new();
+    let mut projection = WorkBoardProjection::new();
+    project_card_with(&mut projection, card_id, "untouched", None, Priority::P1, 100);
+    let snapshot_before = projection.card(card_id).cloned().unwrap();
+
+    projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id,
+            title: None,
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 500,
+        }))
+        .expect("no-op amend projects");
+
+    let after = projection.card(card_id).unwrap();
+    assert_eq!(after.title, snapshot_before.title);
+    assert_eq!(after.body, snapshot_before.body);
+    assert_eq!(after.priority, snapshot_before.priority);
+    assert_eq!(after.state, snapshot_before.state);
+    assert_eq!(after.owner, snapshot_before.owner);
+    assert_eq!(after.claim_id, snapshot_before.claim_id);
+    assert_eq!(after.reviews, snapshot_before.reviews);
+    assert_eq!(after.updated_at_ms, 500, "updated_at_ms moves even on no-op");
+}
+
+#[test]
+fn card_updated_for_unknown_card_surfaces_error() {
+    // An out-of-room amendment would silently succeed if the
+    // projection treated missing cards as a no-op — `airc-lib`'s
+    // ensure_work_card_in_current_room guard depends on the
+    // projection surfacing the error so the typed AircError can be
+    // returned.
+    let mut projection = WorkBoardProjection::new();
+    let err = projection
+        .apply(&WorkEvent::CardUpdated(CardUpdated {
+            card_id: WorkCardId::new(),
+            title: Some("would silently fail".into()),
+            body: None,
+            priority: None,
+            updated_by: peer(2),
+            updated_at_ms: 100,
+        }))
+        .expect_err("amend on missing card must surface");
+    assert!(
+        matches!(err, super::ProjectionError::UnknownCard(_)),
+        "wrong error variant: {err:?}",
+    );
+}
+
+#[test]
+fn card_updated_round_trips_through_serde_with_skip_on_none() {
+    // Wire shape contract: every `None` field is omitted via
+    // skip_serializing_if so partial amendments stay small on the
+    // wire. UUID-typed identity fields are constructed via
+    // PeerId::new() / WorkCardId::new() (uuid v4) — no hand-rolled
+    // UUID strings in tests.
+    let amend = CardUpdated {
+        card_id: WorkCardId::new(),
+        title: Some("only title".into()),
+        body: None,
+        priority: None,
+        updated_by: PeerId::new(),
+        updated_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&amend).expect("encode");
+    assert!(json.get("title").is_some());
+    assert!(
+        json.get("body").is_none(),
+        "None body must be omitted; got {json}"
+    );
+    assert!(
+        json.get("priority").is_none(),
+        "None priority must be omitted; got {json}"
+    );
+    let decoded: CardUpdated = serde_json::from_value(json).expect("decode");
+    assert_eq!(decoded, amend);
+
+    // Clear-body shape: Some("") — empty string round-trips
+    // cleanly (unlike Option<Option<String>>'s Some(None), which
+    // collapses to None on serde's default decode path). This is
+    // the canonical "clear" idiom — observers that render the body
+    // treat empty string and None identically (no body).
+    let clear = CardUpdated {
+        card_id: WorkCardId::new(),
+        title: None,
+        body: Some(String::new()),
+        priority: None,
+        updated_by: PeerId::new(),
+        updated_at_ms: 1_700_000_000_001,
+    };
+    let json = serde_json::to_value(&clear).expect("encode clear");
+    assert_eq!(
+        json.get("body"),
+        Some(&serde_json::Value::String(String::new())),
+        "Some(\"\") body must appear as the empty string on the wire; got {json}"
+    );
+    let decoded: CardUpdated = serde_json::from_value(json).expect("decode clear");
+    assert_eq!(decoded, clear);
 }

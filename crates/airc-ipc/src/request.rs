@@ -1,14 +1,88 @@
 //! Client → daemon requests. Add new operations by extending the
 //! `Request` enum; the daemon's dispatcher is exhaustiveness-checked
 //! so the compiler nags you to handle every variant.
-
-use std::path::PathBuf;
+//!
+//! Owner-core model: there is **no wire**. Same-machine delivery is the
+//! daemon's in-memory router fan-out, not a `frames.jsonl` file. A room
+//! is addressed by its `channel` UUID; the daemon keys its `EventRouter`
+//! on it. There is no `Subscribe` (room drain) and no `ResolveWire`
+//! (channel→file lookup) — both were artifacts of the file-wire path.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use airc_core::{Body, Headers, MentionTarget, PeerId};
-use airc_protocol::FrameKind;
+use airc_core::{HeaderFilter, Headers, PeerId};
+
+/// How an envelope is delivered + retained — mirrors
+/// `airc_bus::DeliveryClass` without leaking the bus type across the
+/// IPC boundary. **Only `Durable` reaches the ORM.** Presence/typing
+/// (`EphemeralLatest`) and media/game-state chunks (`StreamChunk`) route
+/// live, in-memory, zero-copy — never persisted — which is what keeps
+/// the high-throughput / low-latency streaming path (games, WebRTC
+/// signalling/media) off the durable tier. The daemon maps this to the
+/// bus class at publish.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcDelivery {
+    /// Persisted to the ORM via write-behind; the chat/transcript class.
+    #[default]
+    Durable,
+    /// Latest-wins coalesced in-memory, TTL'd. Presence, pose, typing.
+    /// Never an ORM row.
+    EphemeralLatest,
+    /// Bounded recent-N window, in-memory only.
+    EphemeralWindow,
+    /// Request leg of a request/response correlation; routed live.
+    RequestResponse,
+    /// A chunk of a longer stream (media, game-state diffs, progress).
+    /// Routed live, not persisted — the zero-copy high-rate path.
+    StreamChunk,
+}
+
+/// Addressing for a publish — mirrors `airc_bus::envelope::Target`
+/// without leaking the bus type. The full vocabulary so every consumer
+/// fits: broadcast, direct peer, a named endpoint, a correlation reply
+/// leg (RPC), or a capability set the grid-router fans out to (remote
+/// inference / foundry, §3.9).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcTarget {
+    #[default]
+    All,
+    Peer(PeerId),
+    Endpoint(String),
+    Reply(Uuid),
+    Capability(String),
+}
+
+/// Envelope category — mirrors `airc_bus::envelope::Kind` for attach-time
+/// filtering, so a consumer can subscribe to just the kinds it handles
+/// (e.g. Hermes filters to Command/CommandResult) without the router
+/// fanning out everything else.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcKind {
+    Message,
+    Event,
+    Command,
+    CommandResult,
+    Signal,
+    StreamChunk,
+    Control,
+}
+
+/// A cursor into a channel's total order: the owner-assigned
+/// `(epoch, counter)` plus the `event_id` tiebreaker. Mirrors
+/// `airc_bus::Cursor` without leaking the bus type across the IPC
+/// boundary — the daemon maps between them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcCursor {
+    pub epoch: u64,
+    pub counter: u64,
+    /// The deterministic tiebreaker at one seq. Maps 1:1 to the bus
+    /// cursor's `event_id`; serializes as a UUID string.
+    pub event_id: airc_core::EventId,
+}
 
 /// A single client-issued operation. Wire-tagged by `op`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,55 +102,26 @@ pub enum Request {
     /// Snapshot of currently-enrolled peers (peer_id + pubkey).
     /// Returned via `Response::Peers`.
     ListPeers,
-    /// Send a text Message frame. Daemon signs + dispatches via its
-    /// owned `SignedTransport`.
+    /// Send a text Message on a channel. The daemon publishes it to its
+    /// `EventRouter` as a `Durable` envelope and returns a receipt.
     Send(SendRequest),
-    /// Publish a structured frame. Daemon signs + dispatches via its
-    /// owned transport and returns event metadata in `Response::Publish`.
+    /// Publish a structured frame on a channel. The daemon publishes to
+    /// its router and returns the `(epoch, counter)` receipt in
+    /// `Response::Publish`.
     Publish(PublishRequest),
-    /// Start a subscription on `wire` if one isn't already running.
-    /// Daemon buffers received frames into an in-memory inbox per
-    /// wire. Idempotent — repeated calls return Ok without
-    /// duplicating subscriptions.
-    Subscribe(SubscribeRequest),
-    /// Look up the wire path for a channel UUID. Daemon answers
-    /// from its subscription store so consumer-side code (e.g.
-    /// continuum's `DaemonAircRealtimeStore`) can fill
-    /// `PublishRequest.wire` without knowing the daemon's
-    /// filesystem layout. Closes work card 6e525958.
-    ResolveWire(ResolveWireRequest),
-    /// Read events from the daemon's durable event store, strictly
-    /// after `since` (a `(lamport, event_id)` cursor) and optionally
-    /// filtered to a single channel. Pass back the response's
-    /// `newest` cursor on the next call for consume-once streaming.
+    /// Read durable events on a channel strictly after `since`, in total
+    /// order. Replay comes from the router's hot ring + SQLite durable
+    /// tier (no gap at the ring/sink seam). Pass back the response's
+    /// `newest` cursor for consume-once paging.
     Inbox(InboxRequest),
-    /// Attach to the daemon's live event stream. This is a long-lived
-    /// request: after an initial `Response::Ok`, the daemon writes
-    /// `Response::Event` frames until the client disconnects.
+    /// Attach to the daemon's live event stream. Long-lived: after an
+    /// initial `Response::Ok`, the daemon streams `Response::Event`
+    /// frames (airc-wire bytes) until the client disconnects. Optionally
+    /// resumes from `from` so replay→live has no gap and no dup.
     Attach(AttachRequest),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.
     Stop,
-}
-
-/// Parameters for `Subscribe`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SubscribeRequest {
-    /// Wire directory to subscribe on (creates the local-fs adapter
-    /// + replay-anchored subscription if not already running).
-    pub wire: std::path::PathBuf,
-}
-
-/// Parameters for `ResolveWire`. The daemon answers from its
-/// own subscription store; consumer-side callers (continuum's
-/// `DaemonAircRealtimeStore`, OpenClaw/Hermes bridges) get the
-/// wire path without ever needing to construct it themselves.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolveWireRequest {
-    /// Channel UUID to resolve. Same value the consumer holds
-    /// from prior `Subscribe`, `Publish`, or `airc room`
-    /// interactions.
-    pub channel: Uuid,
 }
 
 /// Parameters for `Inbox`.
@@ -84,14 +129,10 @@ pub struct ResolveWireRequest {
 pub struct InboxRequest {
     /// Return only events strictly after this cursor. `None` means
     /// "give me the most recent events available."
-    ///
-    /// Cursor is `(lamport, event_id)` per grievance §7 — lamport is
-    /// the primary order, event_id is the deterministic tiebreaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since: Option<airc_core::TranscriptCursor>,
+    pub since: Option<IpcCursor>,
     /// Restrict to events on this channel (room). `None` means "any
-    /// channel" — used when the caller wants global tail rather than
-    /// per-room paging.
+    /// channel" — a global tail rather than per-room paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<airc_core::RoomId>,
     /// Max events to return in this batch. `None` defaults to a
@@ -100,13 +141,33 @@ pub struct InboxRequest {
     pub limit: Option<usize>,
 }
 
-/// Parameters for `Attach`.
+/// Parameters for `Attach`. Filters are applied **router-side** so the
+/// daemon never fans out events the consumer would discard — the
+/// adaptable/performant subscription: Hermes attaches to
+/// Command/CommandResult, Continuum scopes by `forge.continuum.*`
+/// headers, a game attaches to one room's StreamChunk only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AttachRequest {
-    /// Restrict live events to this channel. `None` streams all
-    /// subscribed daemon events.
+    /// The channel (room) to attach to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<airc_core::RoomId>,
+    /// Resume strictly after this cursor before going live — replay the
+    /// gap the client missed while detached, then continue live with no
+    /// duplicate at the seam. `None` starts from the live edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<IpcCursor>,
+    /// If set, only these kinds are delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<IpcKind>>,
+    /// If set, only these delivery classes are delivered (e.g. just
+    /// `StreamChunk` for a media tap, or just `Durable` for a transcript
+    /// tail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Vec<IpcDelivery>>,
+    /// Header predicate evaluated router-side. `Any` (default) matches
+    /// all; consumers scope by their `forge.*` projection headers.
+    #[serde(default)]
+    pub headers: HeaderFilter,
 }
 
 /// Parameters for `AddPeer`. `pubkey_b64` is the URL-safe-no-padding
@@ -127,10 +188,17 @@ pub struct RemovePeerRequest {
 /// Parameters for `Send`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendRequest {
-    /// Wire directory the daemon should write to.
-    pub wire: PathBuf,
-    /// Channel UUID. Use a stable value across peers in the same room.
+    /// Channel UUID. Stable across peers in the same room.
     pub channel: Uuid,
+    /// Originating participant identity — the agent/tab that authored
+    /// this, established once by the attached client. The daemon is a
+    /// broker, not the author: it stamps the envelope `from` with this
+    /// so attribution survives (Continuum avatars, chat author,
+    /// self-echo). NOT the machine account peer.
+    pub from_peer: Uuid,
+    /// Stable per-session client id distinguishing tabs that share one
+    /// `from_peer`.
+    pub from_client: Uuid,
     /// Body text.
     pub text: String,
     /// Optional envelope headers supplied by the caller. Used for
@@ -142,24 +210,49 @@ pub struct SendRequest {
 /// Parameters for `Publish`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PublishRequest {
-    /// Wire directory the daemon should write to.
-    pub wire: PathBuf,
-    /// Channel UUID. Use a stable value across peers in the same room.
+    /// Channel UUID. Stable across peers in the same room.
     pub channel: Uuid,
-    /// Frame kind to publish.
-    pub kind: FrameKind,
-    /// Target for the envelope. Most consumer publishes use `All`.
-    #[serde(default = "mention_all")]
-    pub target: MentionTarget,
-    /// Opaque body carried by the substrate.
-    pub body: Body,
+    /// Originating participant identity — the agent/tab that authored
+    /// this. The daemon stamps the envelope `from` with it so per-agent
+    /// attribution survives the broker (see `SendRequest::from_peer`).
+    pub from_peer: Uuid,
+    /// Stable per-session client id distinguishing tabs that share one
+    /// `from_peer`.
+    pub from_client: Uuid,
+    /// Envelope kind — full vocabulary so RPC/grid consumers can publish
+    /// `Command`/`CommandResult`/`Signal`/`StreamChunk`, not just chat.
+    pub kind: IpcKind,
+    /// Delivery + retention class. Defaults to `Durable` (chat). Set
+    /// `StreamChunk`/`EphemeralLatest`/… for media, game-state, presence
+    /// so they route live and never hit the ORM.
+    #[serde(default)]
+    pub delivery: IpcDelivery,
+    /// Addressing. Defaults to `All` (broadcast). `Peer`/`Reply` for
+    /// unicast + RPC replies; `Capability` for grid scatter-gather.
+    #[serde(default)]
+    pub target: IpcTarget,
+    /// Correlation id pairing a request to its reply (RPC: Hermes agent
+    /// command ↔ tool result; grid capability query ↔ inference result).
+    /// `None` for fire-and-forget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<Uuid>,
+    /// Coalescing key for `EphemeralLatest` — latest-wins is computed per
+    /// `(channel, coalesce_key)`. Continuum keys avatar-state/presence by
+    /// persona (`"avatar:<persona>"`, `"presence:<peer>"`) so 30 fps of
+    /// pose updates collapse to one current value, never persisted.
+    /// Ignored for non-`EphemeralLatest` classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesce_key: Option<String>,
+    /// **Opaque** payload bytes — the daemon routes them, never parses
+    /// them. The consumer owns the codec: airc chat encodes a small JSON
+    /// `Body`; a WebRTC/game/inference consumer passes raw bytes with
+    /// zero serialization. Rides the IPC frame as a CBOR byte-string and
+    /// the airc-wire envelope as a raw byte vector — no per-element
+    /// serialization on the hot path.
+    pub payload: Vec<u8>,
     /// Optional envelope headers supplied by the caller.
     #[serde(default)]
     pub headers: Headers,
-}
-
-fn mention_all() -> MentionTarget {
-    MentionTarget::All
 }
 
 #[cfg(test)]
@@ -168,8 +261,6 @@ mod tests {
 
     #[test]
     fn ping_serializes_compactly() {
-        // The simplest variant — wire-tag only. Pinned so we catch
-        // accidental unwrapping (e.g. adding fields by mistake).
         let encoded = serde_json::to_string(&Request::Ping).unwrap();
         assert_eq!(encoded, r#"{"op":"ping"}"#);
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
@@ -188,8 +279,9 @@ mod tests {
     #[test]
     fn send_roundtrips_with_typed_fields() {
         let original = Request::Send(SendRequest {
-            wire: PathBuf::from("/tmp/wire"),
             channel: Uuid::nil(),
+            from_peer: Uuid::from_u128(0x1),
+            from_client: Uuid::from_u128(0x2),
             text: "hello".to_string(),
             headers: Headers::new(),
         });
@@ -201,12 +293,49 @@ mod tests {
     #[test]
     fn publish_roundtrips_with_typed_body_and_kind() {
         let original = Request::Publish(PublishRequest {
-            wire: PathBuf::from("/tmp/wire"),
             channel: Uuid::nil(),
-            kind: FrameKind::Event,
-            target: MentionTarget::All,
-            body: Body::text("hello"),
+            from_peer: Uuid::from_u128(0x1),
+            from_client: Uuid::from_u128(0x2),
+            kind: IpcKind::Command,
+            delivery: IpcDelivery::RequestResponse,
+            target: IpcTarget::Capability("inference:gpu".to_string()),
+            correlation_id: Some(Uuid::from_u128(0xc0ffee)),
+            coalesce_key: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
             headers: Headers::new(),
+        });
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn publish_delivery_defaults_to_durable_when_absent() {
+        // A client that omits `delivery` (simple chat publish) must
+        // decode as Durable — the streaming classes are opt-in.
+        let decoded: Request = serde_json::from_str(
+            r#"{"op":"publish","channel":"00000000-0000-0000-0000-000000000000","from_peer":"00000000-0000-0000-0000-000000000001","from_client":"00000000-0000-0000-0000-000000000002","kind":"message","payload":[104,105]}"#,
+        )
+        .unwrap();
+        match decoded {
+            Request::Publish(p) => {
+                assert_eq!(p.delivery, IpcDelivery::Durable);
+                assert_eq!(p.payload, b"hi");
+            }
+            other => panic!("expected publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbox_roundtrips_with_epoch_counter_cursor() {
+        let original = Request::Inbox(InboxRequest {
+            since: Some(IpcCursor {
+                epoch: 3,
+                counter: 17,
+                event_id: airc_core::EventId::from_u128(0xdead_beef),
+            }),
+            channel: Some(airc_core::RoomId::from_u128(0x42)),
+            limit: Some(64),
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
@@ -219,15 +348,5 @@ mod tests {
             serde_json::to_string(&Request::Stop).unwrap(),
             r#"{"op":"stop"}"#
         );
-    }
-
-    #[test]
-    fn resolve_wire_roundtrips_with_typed_channel() {
-        let original = Request::ResolveWire(ResolveWireRequest {
-            channel: Uuid::from_u128(0xabcd_1234),
-        });
-        let encoded = serde_json::to_string(&original).unwrap();
-        let decoded: Request = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, original);
     }
 }

@@ -30,10 +30,6 @@ impl Airc {
     /// - LAN-TCP: healthy when there is a bound LAN endpoint or an
     ///   active LAN peer connection
     pub async fn refresh_route_discovery(&self) -> Result<RouteDiscoverySnapshot, AircError> {
-        self.upsert_transport_health(TransportHealthSample::healthy_direct(
-            TransportKind::LocalFs,
-        ))?;
-
         let endpoints = self.route_endpoints()?;
         let lan_has_endpoint = endpoints
             .iter()
