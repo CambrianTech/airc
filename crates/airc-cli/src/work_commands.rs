@@ -574,14 +574,17 @@ async fn open_pr_and_link(
     // gh pr create — --fill takes title/body from commits, so a clean
     // workflow (claim → commit → state review) produces a PR titled
     // from the last commit. Head is the worktree's current branch.
+    //
+    // Card a4fe899f: `gh` does NOT accept `-C` (that's git's flag).
+    // The cwd has to be set via `Command::current_dir(...)` so gh's
+    // own repo-resolution (which scans `git remote get-url origin`
+    // from cwd) picks the worktree's branch. Without this, gh
+    // silently ran against whatever the shell's cwd was at invoke
+    // time — usually the wrong repo — and the whole Review-state →
+    // PR-link pipeline failed (best-effort warning was swallowed).
     let create_out = std::process::Command::new("gh")
-        .args([
-            "-C",
-            &worktree_str,
-            "pr",
-            "create",
-            "--fill",
-        ])
+        .current_dir(&worktree_str)
+        .args(["pr", "create", "--fill"])
         .output()?;
     if !create_out.status.success() {
         return Err(format!(
@@ -714,10 +717,12 @@ fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std::error::Er
 }
 
 fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
+    // `Command::current_dir(...)` so `gh repo view` resolves the
+    // worktree's origin remote, not the shell cwd's.
     let out = std::process::Command::new("gh")
+        .current_dir(worktree)
         .args([
-            "-C",
-            worktree,
             "repo",
             "view",
             "--json",
