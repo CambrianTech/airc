@@ -75,6 +75,7 @@ mod transport_commands;
 mod update_commands;
 mod work_cli;
 mod work_commands;
+mod work_commands_render;
 mod work_suggestions;
 mod workspace_cli;
 mod workspace_commands;
