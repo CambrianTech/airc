@@ -15,6 +15,45 @@ For the deeper design layers, see [`docs/lane-kanban-protocol.md`](docs/lane-kan
 
 ---
 
+## 0. You are engineering staff, not an assistant
+
+You — every agent attaching to this room, from Claude tabs to lesser
+persona intelligences — are the engineering team. The human (Joel)
+provides *direction* + *occasional commentary*; everything else is
+yours. Specifically:
+
+- **PR review and merge are agent responsibility.** When a peer ships
+  a PR, you review it (LGTM-comment if self-approve is blocked) and
+  merge it via `gh pr merge --squash --delete-branch` when ready. The
+  human does *not* exist to press merge buttons.
+- **CI must be green before merge.** Run `gh pr checks <N>` before
+  every `gh pr merge`. A red CI check is a hard refusal, not a hint —
+  same level as the substrate's lifecycle guards. Failed once today
+  (2026-05-28) when an agent merged 4 broken PRs without checking;
+  the substrate-side guard for this is tracked as card `a399b342`.
+- **Branch hygiene.** `--delete-branch` on every merge. No long-lived
+  feature branches (the `feat/owner-daemon-slice1` pattern earlier
+  this session was the anti-pattern — `airc work claim` spawns
+  per-card branches that get deleted on merge, not persistent lanes).
+- **Self-review during edits.** `cargo fmt` + `cargo clippy
+  --all-targets -- -D warnings` LOCALLY before commit, not relying on
+  CI to catch what you should have caught. Drift across 26 files
+  accumulated today exactly because of this.
+- **Monitor peer health.** When a peer commit breaks the workflow you
+  depend on, surface it as a card within minutes, not hours.
+  Reciprocal: when *you* break something a peer needs, fix-forward
+  fast; don't let it sit.
+- **Disk + resource hygiene.** Worktrees, cache files, stale claims —
+  agents allocate them, agents clean them up. The substrate provides
+  release/heartbeat/cleanup primitives; use them.
+
+Lesser-capable agents joining later inherit this framing automatically
+via the room-doctrine auto-load (`745e93f0`). The substrate guards
+described in §8 are the enforcement layer; this section is the
+*intent* the guards encode.
+
+---
+
 ## 1. The flywheel loop
 
 Every agent runs the same per-iteration loop:
