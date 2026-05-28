@@ -665,6 +665,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             }
+            WorkAction::Review {
+                parent_id,
+                pr,
+                priority,
+                body,
+            } => work_commands::run_review(&home, parent_id, pr, priority, body).await,
             WorkAction::Availability {
                 repo,
                 state,

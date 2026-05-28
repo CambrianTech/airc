@@ -81,6 +81,100 @@ pub async fn run_seed(
     Ok(())
 }
 
+/// `airc work review <PARENT> [--pr URL] [--priority P] [--body B]` —
+/// spawn a sibling review card with a typed `reviews` link back to
+/// the parent. Card ad7e100b Sub-B (the CLI half of the peer-agent
+/// review loop); Sub-A shipped the typed substrate.
+///
+/// Lookup rules:
+///   * Parent must exist in the current room's board projection. The
+///     review card is created in the SAME repo as the parent (cross-
+///     repo reviews aren't a thing — reviews live where the work
+///     lives).
+///   * Priority defaults to the parent's priority. The review of a
+///     P0 is P0-eligible work; the default keeps that visible
+///     without the caller having to spell it out.
+///   * Title is generated as `review: <parent.title>` (truncated at
+///     a reasonable bound to stay board-renderable).
+///   * Body prepends the parent card id and any `--pr` URL so a
+///     reviewer who pulls just this card has the navigation anchors;
+///     `--body` content (if any) follows.
+pub async fn run_review(
+    home: &Path,
+    parent_id: String,
+    pr: Option<String>,
+    priority: Option<CliPriority>,
+    body: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent_card_id = parse_work_card_id(&parent_id)?;
+    let airc = crate::commands::attached_airc(home).await?;
+
+    // Resolve the parent off the current room's board. Refusing on
+    // "no parent" is more useful than spawning an orphan review.
+    let board = airc.work_board(usize::MAX).await?;
+    let parent = board.card(parent_card_id).ok_or_else(|| {
+        format!(
+            "parent card {parent_card_id} not found in the current room's board; \
+             switch to the room that owns it, or pass the correct id"
+        )
+    })?;
+
+    // Title — same convention an auto-spawn (Sub-C) would use, so
+    // manual and auto-created review cards render identically.
+    let title = format_review_title(&parent.title);
+
+    // Body — the navigation anchors a reviewer needs, then the
+    // caller's prose. The parent id is a UUID so reviewers can
+    // `airc work board` and find the parent fast; `--pr` URL gives
+    // them the diff directly.
+    let mut body_buf = String::new();
+    body_buf.push_str(&format!("review of card {parent_card_id}"));
+    if let Some(ref url) = pr {
+        body_buf.push_str("\nPR: ");
+        body_buf.push_str(url);
+    }
+    if let Some(extra) = body {
+        body_buf.push_str("\n\n");
+        body_buf.push_str(&extra);
+    }
+
+    // Priority — inherits the parent's unless overridden. Reviews
+    // of high-priority work are themselves high-priority.
+    let final_priority = priority
+        .map(Into::into)
+        .unwrap_or(parent.priority);
+
+    // Construct via the airc-lib request type with the typed link
+    // populated. Sub-A added `.reviewing(parent)` precisely so this
+    // call doesn't have to spell out `reviews: Some(parent)` inline.
+    let request = CreateWorkCard::new(parent.repo.clone(), title, final_priority)
+        .reviewing(parent_card_id);
+    let request = CreateWorkCard {
+        body: Some(body_buf),
+        ..request
+    };
+
+    let review_card_id = airc.create_work_card(request).await?;
+    println!("review_card_id: {review_card_id} parent_card_id: {parent_card_id}");
+    Ok(())
+}
+
+/// Generate the review card's title from the parent's. Format is
+/// stable so Sub-C (auto-spawn) and Sub-B (CLI) produce identical
+/// titles — observers that filter on `title.starts_with("review:")`
+/// pick up both paths.
+fn format_review_title(parent_title: &str) -> String {
+    // 80-char body keeps board rendering tidy without aggressively
+    // truncating informative parent titles.
+    const MAX_PARENT_LEN: usize = 80;
+    let parent_short: String = parent_title.chars().take(MAX_PARENT_LEN).collect();
+    if parent_short.chars().count() < parent_title.chars().count() {
+        format!("review: {parent_short}…")
+    } else {
+        format!("review: {parent_short}")
+    }
+}
+
 pub async fn run_claim(
     home: &Path,
     card_id: String,
@@ -922,5 +1016,61 @@ mod tests {
         for card in &cases {
             assert!(BoardFilter::All.matches(card, me, 1_000));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Card ad7e100b Sub-B — review-card title formatting.
+    //
+    // Sub-C (auto-spawn on Review state) and Sub-B (this CLI) MUST
+    // produce identical titles so observers filtering on
+    // `title.starts_with("review:")` pick up both paths. Pin the
+    // shared formatter here so a future tweak to either path can't
+    // diverge them silently.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn review_title_preserves_short_parent_title_verbatim() {
+        let title = format_review_title("typed reviews link on WorkCard");
+        assert_eq!(title, "review: typed reviews link on WorkCard");
+        assert!(
+            title.starts_with("review: "),
+            "starts_with(\"review:\") observer filter must hold"
+        );
+    }
+
+    #[test]
+    fn review_title_truncates_long_parent_with_ellipsis_marker() {
+        // Eighty Xs is exactly at the limit and must NOT truncate;
+        // adding the 81st character must add the ellipsis.
+        let parent_at_limit: String = std::iter::repeat('x').take(80).collect();
+        let title_at_limit = format_review_title(&parent_at_limit);
+        assert_eq!(title_at_limit, format!("review: {parent_at_limit}"));
+        assert!(!title_at_limit.ends_with('…'));
+
+        let parent_too_long: String = std::iter::repeat('x').take(120).collect();
+        let title_too_long = format_review_title(&parent_too_long);
+        assert!(title_too_long.ends_with('…'));
+        // The visible portion + the "review: " prefix should sum to
+        // the 80-char limit + the ellipsis suffix, so reviewers see
+        // a recognizable parent title without the board renderer
+        // wrapping.
+        let expected_prefix: String = std::iter::repeat('x').take(80).collect();
+        assert_eq!(title_too_long, format!("review: {expected_prefix}…"));
+    }
+
+    #[test]
+    fn review_title_counts_chars_not_bytes_for_unicode_parents() {
+        // Multi-byte chars are 1 char but >1 byte. The truncation
+        // bound MUST be character-based; otherwise we'd slice in the
+        // middle of a UTF-8 sequence and panic. Use a 3-byte glyph
+        // ('日') 90 times — well past the 80-char limit but under
+        // any byte-based slice.
+        let parent: String = std::iter::repeat('日').take(90).collect();
+        let title = format_review_title(&parent);
+        // No panic = the truncation respects char boundaries. The
+        // truncated portion must be exactly 80 chars of '日' + the
+        // ellipsis.
+        let expected_visible: String = std::iter::repeat('日').take(80).collect();
+        assert_eq!(title, format!("review: {expected_visible}…"));
     }
 }

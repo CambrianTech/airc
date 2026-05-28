@@ -182,6 +182,39 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 180_000)]
         active_within_ms: u64,
     },
+    /// Spawn a sibling review card for an existing work card.
+    ///
+    /// The created card carries a typed `reviews` link to the parent
+    /// (card ad7e100b Sub-A: `WorkCard.reviews`), so observers and
+    /// schedulers can find every review for a card via
+    /// `WorkBoardProjection::review_cards_for(parent_id)` without
+    /// parsing body prose.
+    ///
+    /// Per AGENTS.md §6 every peer has equal authority to review; the
+    /// CLI imposes no self-review restriction beyond the agent's own
+    /// judgment. If two peers race to spawn a review for the same
+    /// parent, both cards land — the projection surfaces them both
+    /// (atomic claim arbitrates *who works each*, not whether reviews
+    /// exist).
+    Review {
+        /// Parent card UUID being reviewed.
+        parent_id: String,
+        /// Optional pull-request URL the reviewer should consult. The
+        /// body includes it explicitly so reviewers can find it
+        /// without re-projecting the board.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Scheduling priority for the review card. Defaults to
+        /// inheriting the parent's priority (the review of a P0 is
+        /// itself P0-eligible work).
+        #[arg(long, value_enum)]
+        priority: Option<CliPriority>,
+        /// Optional free-form body — e.g. focus areas or known
+        /// gotchas. The parent card id + PR URL are prepended
+        /// automatically; this is additive.
+        #[arg(long)]
+        body: Option<String>,
+    },
     /// Publish this agent's availability for a repo.
     Availability {
         /// Repository key, e.g. `CambrianTech/airc`.
