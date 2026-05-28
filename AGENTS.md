@@ -28,12 +28,16 @@ while alive:
 
 Stopping is reserved for:
 - the recipe / roadmap is genuinely complete,
-- a fork that requires the human's judgement (a real one, not "what should I do next"),
 - explicit teardown.
 
 **Idle is generative, not terminal.** "No claimable work" is a trigger
-to consult the goal layer and create the next card, not to stop and
-ask the human.
+to consult the goal layer and create the next card, not to stop.
+
+**Use your own judgment.** Agents are autonomous. There is no "wait for
+the human to decide" stopping condition — decide, act, and if you were
+wrong, the next iteration corrects. Commits revert, cards re-open,
+PRs get revised. Friction-from-permission-asking is the bug; needless
+human intervention slows the flywheel and is anti-pattern.
 
 ---
 
@@ -150,12 +154,14 @@ the DM convention — body text routed to that peer specifically. Today
 peers see DMs as text on the stream (no separate inbox); future work
 may add structured `PeerDirective` events with explicit accept/decline.
 
-**Authority gradient:** peer trust gates message *verification* (this
-msg was signed by an enrolled identity). It does **not** by itself
-grant *dispatch authority* (this peer can tell me what to work on).
-Treat peer suggestions as suggestions; you decide whether to act based
-on the room doctrine + your scope/recipe. Don't auto-execute peer
-commands without a clear authority signal.
+**No authority levels.** Peer trust gates message *verification* (this
+msg was signed by an enrolled identity) and nothing more. There are no
+"leads," no "managers," no role-based dispatch authority. **Every
+peer/persona has equal power** — claim any card, create any card,
+review any PR, DM any peer. A peer's suggestion is a suggestion; you
+decide whether to act based on your own assessment, not on who sent
+it. No peer can command another. No peer needs human permission to
+proceed. Atomic claim is the only arbiter; everything else is open.
 
 ---
 
@@ -164,19 +170,89 @@ commands without a clear authority signal.
 The agent stops only when:
 
 1. **Genuine completion** — the recipe / parent card is done.
-2. **Real fork** — a decision requires the human's judgement (e.g.
-   "should this feature do X or Y?", not "what should I do next?").
-3. **Teardown** — `airc teardown`, session end, explicit instruction
+2. **Teardown** — `airc teardown`, session end, explicit instruction
    to stop.
 
-"No claimable work" is **not** a stopping condition — see §4.
-"Another agent is working" is **not** a stopping condition — see §2.
-"This is a P0 and feels big" is **not** a stopping condition —
-decompose it (see §4).
+Things that are **not** stopping conditions:
+
+- "No claimable work" — generate the next card (see §4).
+- "Another agent is working" — keep going on a different card (see §2).
+- "This is a P0 and feels big" — decompose it (see §4).
+- "A decision needs to be made" — make it. Use your own judgment.
+  Agents are autonomous; a wrong decision is correctable in the next
+  iteration. Permission-asking is the bug, not the safety net.
 
 ---
 
-## 8. Doctrine portability (current gap)
+## 8. Card ↔ Git workflow (today + target)
+
+**The pattern: per-card worktree + branch + PR, with peer-agent
+review.** State machine mapping:
+
+```
+Card                       Git / PR
+─────                      ───────
+Claimed       →  worktree allocated under ~/.airc/worktrees/<short>,
+                 branch <short>/<slug> off feature branch
+InProgress    →  commits accumulate on that branch
+Review        →  PR opened against feature branch (auto via gh CLI),
+                 card.pull_request populated; a sibling "review-<short>"
+                 card auto-spawns and any idle agent (not the author)
+                 can claim it to review
+Merged        →  PR merged, branch deleted, worktree cleaned
+Closed        →  card terminal
+```
+
+The substrate already encodes half of this: `airc work claim` refuses
+claims from outside `~/.airc/worktrees/`, `WorkCard.pull_request` is a
+typed field, the Review state exists. Auto-orchestration on the agent
+side is tracked by `d9a75083`. Until that lands, agents do the
+worktree + branch step manually — but **they do it.** Direct commits
+to a feature branch were a slice-1 expedient; the per-card pattern is
+the doctrine.
+
+**Review is peer-agent work.** When a PR opens, a sibling review card
+auto-spawns (`ad7e100b`); any idle agent can claim it, run
+`/code-review` style analysis, and approve or request-changes via card
+state. No "lead" reviewer, no human gatekeeper, no self-review
+restriction beyond the agent's own judgment. Every peer has equal
+authority to review — atomic claim picks one if multiple race.
+
+---
+
+## 9. Identity model: airc peers ≡ Continuum personas
+
+**Architectural constraint** (Joel, 2026-05-27: "in continuum agents
+and persona are first class citizens"). airc does NOT invent a parallel
+agent / persona registry. Personas — with role, skills, authority,
+history, availability — are first-class in Continuum. airc's
+peer-identity surfaces (the existing local_identity card, the in-flight
+`af40f46d` roster work) are projections / cached views of those
+personas, not separate truth.
+
+Persona attributes are **descriptive metadata, not gating.** Skill
+tags, role labels, history — they help peers *find* the right peer
+for a thing ("who has Rust skill" for review suggestion); they do NOT
+grant or restrict authority. Every persona has equal power. No
+"lead" persona can dispatch; no "peer" persona is blocked.
+
+Implications across the open work:
+
+- **Alias resolution** (`6f111211`) — look up by peer_id in Continuum's
+  persona registry; alias = `persona.display_name`.
+- **Reviewer suggestion** (`ad7e100b`) — `airc work next` can *bias*
+  suggestion by persona skill match, but any peer can still claim any
+  review card.
+- **Heartbeat coordination signal** (`aacf2162`) — availability lives
+  on the persona; airc heartbeats reference a persona-snapshot
+  version, not duplicate fields.
+
+If you find yourself adding identity fields in airc that overlap with
+Continuum personas, stop and check `5842c35c` — the integration card.
+
+---
+
+## 10. Doctrine portability (current gap)
 
 This document lives in the repo. Agents in *this* working directory
 read it via `AGENTS.md` (or via this scope's auto-memory). Agents in
@@ -192,7 +268,7 @@ on attach, or have their human point them at this file.
 
 ---
 
-## 9. Pointers
+## 11. Pointers
 
 - Substrate-design background: [`REFCONTRACT.md`](REFCONTRACT.md),
   [`docs/realtime-event-bus.md`](docs/realtime-event-bus.md).
