@@ -728,6 +728,15 @@ impl Airc {
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
 
+        // Card a6d0df25: publish this peer's identity card to every
+        // room subscribed in this attach so peers already attached
+        // populate their roster — same lifecycle as Airc::join(name)
+        // (commit 088af06), now extended to the routine `airc join`
+        // (no args) path. No-op when no local identity exists.
+        for room in &rooms {
+            self.emit_peer_identity_card(room.channel).await?;
+        }
+
         Ok(rooms)
     }
 
@@ -782,7 +791,13 @@ impl Airc {
         set.set_default(channel)?;
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
-        Ok(subscription.as_room())
+        // Same publish-on-subscribe semantics as Airc::join /
+        // ensure_join_context (card a6d0df25): the lazy default-room
+        // subscribe is a real attach point, so emit the identity
+        // card to the new room.
+        let room = subscription.as_room();
+        self.emit_peer_identity_card(room.channel).await?;
+        Ok(room)
     }
 
     pub(crate) fn event_store(&self) -> &dyn EventStore {
