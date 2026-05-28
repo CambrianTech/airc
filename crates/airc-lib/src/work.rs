@@ -19,6 +19,29 @@ use crate::{Airc, AircError};
 
 const WORK_MUTATION_PAGE_SIZE: usize = 512;
 
+/// Card 79953b4d: how many raw transcript events to fetch from the
+/// daemon per requested work board page entry. Heartbeats with their
+/// d4e3e350 coordination payload share the recent-event window with
+/// work events; with N active peers heart-beating every 60s a flat
+/// `limit`-event scan can be ~90% heartbeats. 4x over-fetch trades a
+/// bit of IPC bandwidth for the property "user's requested `limit`
+/// number of work events actually lands in the projection." Server-
+/// side filtering at the daemon's page rpc would be cleaner; this is
+/// the minimum-viable fix until that follow-up.
+const WORK_BOARD_FETCH_MULTIPLIER: usize = 4;
+
+/// Card 79953b4d (pure helper for unit-testability): true when a
+/// transcript event is a work-domain event. Distinguishes work events
+/// from heartbeats / chat / other lifecycle by header presence rather
+/// than body shape — every work event carries
+/// `HEADER_FORGE_WORK_EVENT_KIND`; heartbeats and chat do not.
+fn is_work_event_transcript(event: &airc_core::TranscriptEvent) -> bool {
+    event
+        .headers
+        .iter()
+        .any(|(key, _)| key == airc_work::HEADER_FORGE_WORK_EVENT_KIND)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkCard {
     pub repo: RepoId,
@@ -692,7 +715,24 @@ impl Airc {
         // Recent-window view (not the complete board): daemon reads the
         // most-recent `limit`; direct reads the recent store page.
         if self.is_daemon_attached() {
-            let transcripts = self.daemon_page_recent(&room, limit).await?;
+            // Card 79953b4d: heartbeats with the d4e3e350 coordination
+            // payload (active_claims + doctrine_version) dominate the
+            // recent-event window at scale. With three+ peers heart-
+            // beating every 60s, a flat `limit`-event page fills with
+            // heartbeats and squeezes card lifecycle events out — the
+            // projection then misses recent cards even when they're
+            // durably in the transcript. Filter to events carrying
+            // HEADER_FORGE_WORK_EVENT_KIND (work-domain events only)
+            // and over-fetch by WORK_BOARD_FETCH_MULTIPLIER so the
+            // projection sees `limit` work events worth of history.
+            let fetch_limit = limit.saturating_mul(WORK_BOARD_FETCH_MULTIPLIER);
+            let transcripts: Vec<_> = self
+                .daemon_page_recent(&room, fetch_limit)
+                .await?
+                .into_iter()
+                .filter(is_work_event_transcript)
+                .take(limit)
+                .collect();
             return Ok(airc_work_store::project_transcripts(transcripts)?);
         }
         let store = WorkEventStore::new(self.event_store());
@@ -899,5 +939,66 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
         AgentAvailabilityState::Ready => 0,
         AgentAvailabilityState::Busy => 1,
         AgentAvailabilityState::Away => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use airc_core::headers::Headers;
+    use airc_core::{ClientId, EventId, MentionTarget, RoomId, TranscriptKind};
+
+    fn event_with_headers(headers: Headers) -> airc_core::TranscriptEvent {
+        airc_core::TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: airc_core::PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::System,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers,
+            body: None,
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn work_event_transcript_filter_pins_header_presence_not_body_shape() {
+        // Card 79953b4d: at scale, heartbeats with the d4e3e350
+        // coordination payload share the recent-event window. The
+        // distinguishing signal is HEADER_FORGE_WORK_EVENT_KIND —
+        // every work event carries it, heartbeats / chat / generic
+        // lifecycle do not.
+
+        // Work event: header present → keep.
+        let mut work_headers = Headers::new();
+        work_headers.insert(
+            airc_work::HEADER_FORGE_WORK_EVENT_KIND.to_owned(),
+            "card_created".to_owned(),
+        );
+        assert!(is_work_event_transcript(&event_with_headers(work_headers)));
+
+        // Empty headers (e.g. raw heartbeat alive) → drop.
+        assert!(!is_work_event_transcript(&event_with_headers(Headers::new())));
+
+        // Unrelated header only (e.g. a chat msg with bridge headers) → drop.
+        let mut other_headers = Headers::new();
+        other_headers.insert("airc.bridge.source".to_owned(), "slack".to_owned());
+        assert!(!is_work_event_transcript(&event_with_headers(other_headers)));
+
+        // Mixed headers including the work-kind header → keep
+        // (work events often carry several headers like
+        // forge.work.card_id alongside forge.work.kind).
+        let mut mixed_headers = Headers::new();
+        mixed_headers.insert(
+            airc_work::HEADER_FORGE_WORK_EVENT_KIND.to_owned(),
+            "card_claimed".to_owned(),
+        );
+        mixed_headers.insert("forge.work.card_id".to_owned(), "abc".to_owned());
+        assert!(is_work_event_transcript(&event_with_headers(mixed_headers)));
     }
 }
