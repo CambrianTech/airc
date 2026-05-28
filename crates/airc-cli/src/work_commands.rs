@@ -9,77 +9,16 @@
 
 use std::path::Path;
 
-use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
 use uuid::Uuid;
 
 use airc_lib::{
-    AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard, CreateWorkCard,
-    LaneId, Priority, ReleaseWorkClaim, RepoId, UpdateWorkCard, WorkBacklogSeedCandidate,
-    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
-    WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
+    AgentAvailabilityState, CardState, ClaimId, CreateWorkCard, LaneId, Priority, RepoId,
+    WorkBoardProjection, WorkCardId, WorkManagerRecommendation, WorkManagerRecommendationKind,
+    WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
 use crate::lease;
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
-
-pub async fn run_create(
-    home: &Path,
-    repo: String,
-    title: String,
-    body: Option<String>,
-    lane_id: Option<String>,
-    priority: CliPriority,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
-    let card_id = airc
-        .create_work_card(CreateWorkCard {
-            repo: RepoId::new(repo)?,
-            title,
-            body,
-            priority: priority.into(),
-            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
-            reviews: None,
-        })
-        .await?;
-    println!("card_id: {card_id}");
-    Ok(())
-}
-
-pub async fn run_seed(
-    home: &Path,
-    repo: String,
-    title: String,
-    body: Option<String>,
-    lane_id: Option<String>,
-    priority: CliPriority,
-    evidence_key: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
-    let result = airc
-        .seed_work_backlog(vec![WorkBacklogSeedCandidate {
-            repo: RepoId::new(repo)?,
-            title,
-            body,
-            priority: priority.into(),
-            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
-            evidence_key,
-        }])
-        .await?;
-    for item in result.items {
-        let outcome = match item.outcome {
-            WorkBacklogSeedOutcome::Created => "created",
-            WorkBacklogSeedOutcome::AlreadyRepresented => "already_represented",
-            WorkBacklogSeedOutcome::AlreadyCompleted => "already_completed",
-        };
-        println!(
-            "seeded: outcome={outcome} card_id={card_id} repo={repo} title={title}",
-            card_id = item.card_id,
-            repo = item.candidate.repo,
-            title = item.candidate.title,
-        );
-    }
-    Ok(())
-}
 
 /// `airc work review <PARENT> [--pr URL] [--priority P] [--body B]` —
 /// spawn a sibling review card with a typed `reviews` link back to
@@ -173,47 +112,6 @@ fn format_review_title(parent_title: &str) -> String {
     }
 }
 
-pub async fn run_claim(
-    home: &Path,
-    card_id: String,
-    ttl_ms: u64,
-    no_lease_required: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !no_lease_required {
-        let check = lease::check_current_dir()?;
-        if !check.under_lease {
-            return Err(format!(
-                "refusing to claim work card from {cwd}: not under lease zone {root}.\n\
-                 Allocate a worktree under ~/.airc/worktrees/ first, or pass \
-                 --no-lease-required to override.",
-                cwd = check.path.display(),
-                root = check.lease_root.display(),
-            )
-            .into());
-        }
-    }
-    let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let claim_id = airc
-        .claim_work_card(ClaimWorkCard {
-            card_id: card_uuid,
-            ttl_ms,
-        })
-        .await?;
-    println!("claim_id: {claim_id}");
-
-    // Card d1b2798d: auto-spawn a worktree + branch on successful
-    // claim. Eliminates the shared-checkout friction two agents on
-    // the same machine hit (`--no-lease-required` everywhere is the
-    // tell). Best-effort: a git failure does NOT undo the claim or
-    // the lease — the claim is the authoritative record, the
-    // worktree is convenience around it.
-    if let Err(error) = spawn_claim_worktree(&airc, card_uuid).await {
-        eprintln!("airc: worktree spawn skipped — {error}");
-    }
-    Ok(())
-}
-
 /// Best-effort: allocate `~/.airc/worktrees/<card_short>/` and a
 /// branch `<card_short>/<slug>` off the current feature branch HEAD
 /// so the agent who just claimed the card can `cd` into a clean,
@@ -223,7 +121,7 @@ pub async fn run_claim(
 /// git command failure) so run_claim can surface it as a warning
 /// without aborting. Skips silently (Ok) when the worktree already
 /// exists, which lets re-claim after release work without surprise.
-async fn spawn_claim_worktree(
+pub(crate) async fn spawn_claim_worktree(
     airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -368,208 +266,11 @@ fn slugify(title: &str, max_len: usize) -> String {
     out
 }
 
-pub async fn run_release(
-    home: &Path,
-    card_id: String,
-    claim_id: Option<String>,
-    reason: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    // Default: resolve THIS peer's active claim from the board so
-    // callers don't have to track claim_ids the system already knows
-    // (kink card acb8bfcd: release ergonomics).
-    let claim_uuid = match claim_id {
-        Some(raw) => parse_claim_id(&raw)?,
-        None => resolve_my_active_claim(&airc, card_uuid).await?,
-    };
-    airc.release_work_claim(ReleaseWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        reason,
-    })
-    .await?;
-    println!("released: card_id={card_id} claim_id={claim_uuid}");
-    Ok(())
-}
-
-/// Look up the active claim on `card_id` held by this peer via the
-/// board projection. Surfaces clear errors when there is no claim, or
-/// the claim is held by another peer — so the default never silently
-/// releases someone else's work.
-async fn resolve_my_active_claim(
-    airc: &airc_lib::Airc,
-    card_id: airc_lib::WorkCardId,
-) -> Result<airc_lib::ClaimId, Box<dyn std::error::Error>> {
-    let board = airc.work_board(usize::MAX).await?;
-    let card = board
-        .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not present in the board projection"))?;
-    let me = airc.peer_id();
-    match (card.owner, card.claim_id) {
-        (Some(owner), Some(claim_id)) if owner == me => Ok(claim_id),
-        (Some(owner), _) => Err(format!(
-            "card {card_id} is currently claimed by {owner}, not this peer ({me}); \
-             pass CLAIM_ID explicitly to release a claim you don't own"
-        )
-        .into()),
-        (None, _) => Err(format!("card {card_id} has no active claim to release").into()),
-    }
-}
-
-pub async fn run_heartbeat(
-    home: &Path,
-    card_id: String,
-    claim_id: String,
-    ttl_ms: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let claim_uuid = parse_claim_id(&claim_id)?;
-    airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        ttl_ms,
-    })
-    .await?;
-    println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
-
-    // Heartbeat doesn't refuse on lease drift — the claim was
-    // already granted, and refusing here would just orphan it. But
-    // we DO record the drift as a typed diagnostic so a substrate
-    // observer can see when an agent has wandered out of its lease.
-    if let Ok(check) = lease::check_current_dir() {
-        if !check.under_lease {
-            let diag = DiagnosticEvent::warn(
-                DiagnosticComponent::Work,
-                DiagnosticCode::WorkspaceLeaseViolation,
-                "work heartbeat fired from a path outside the lease zone",
-            )
-            .with_field("card_id", &card_id)
-            .with_field("claim_id", &claim_id)
-            .with_field("cwd", check.path.display())
-            .with_field("lease_root", check.lease_root.display());
-            // Best-effort: a publish failure shouldn't break the
-            // heartbeat from the user's perspective. Surface to
-            // stderr so it isn't silently swallowed.
-            if let Err(error) = airc.publish_diagnostic_event(&diag).await {
-                eprintln!("airc: failed to publish lease-violation diagnostic: {error}");
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Card 5ac0a359 — `airc work update <CARD_ID> [--title T] [--body B]
-/// [--priority P]`. Amend a card's editable fields post-creation.
-/// Omitted flags leave the projection's existing values alone;
-/// `--body ""` clears (empty string is the markdown "no body"
-/// idiom).
-pub async fn run_update(
-    home: &Path,
-    card_id: String,
-    title: Option<String>,
-    body: Option<String>,
-    priority: Option<CliPriority>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let airc = crate::commands::attached_airc(home).await?;
-
-    let mut request = UpdateWorkCard::amend(card_uuid);
-    if let Some(title) = title {
-        request = request.with_title(title);
-    }
-    if let Some(body) = body {
-        request = request.with_body(body);
-    }
-    if let Some(priority) = priority {
-        request = request.with_priority(priority.into());
-    }
-
-    airc.update_work_card(request).await?;
-    println!("card_updated: card_id={card_uuid}");
-    Ok(())
-}
-
-pub async fn run_state(
-    home: &Path,
-    card_id: String,
-    state: CliCardState,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let card_state = CardState::from(state);
-
-    // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
-    // to states that should only come from substrate observers (e.g.
-    // Merged must come from PullRequestMerged, not `airc work state X
-    // merged` by an agent). Architectural boundary: agent input goes
-    // through this CLI guard; substrate mechanisms write events
-    // directly via Airc::change_work_card_state.
-    if !cli_can_set_state_directly(card_state) {
-        return Err(refusal_message(card_uuid, card_state).into());
-    }
-
-    // Card 9656a836 (close-lifecycle gate): Closed must come from
-    // Merged (PR merged) or {Open, Claimed, Blocked} (cancellation
-    // before any real work landed). Refuses Closed from InProgress
-    // or Review — there's claimed work in flight; the agent should
-    // either ship via state review → merge, or release the claim.
-    // Complementary to a1bc62b3 above: that one refuses agents from
-    // self-attesting Merged; this one refuses agents from
-    // self-attesting Closed without a Merged predecessor.
-    if card_state == CardState::Closed {
-        let board = airc.work_board(usize::MAX).await?;
-        let card = board.card(card_uuid).ok_or_else(|| {
-            format!("card {card_uuid} not visible in current room's board projection")
-        })?;
-        if !close_transition_allowed_from(card.state) {
-            return Err(format!(
-                "refusing to close card {card_uuid}: current state is {actual:?}, but \
-                 Closed requires Merged (PR merged) or {{Open, Claimed, Blocked}} \
-                 (cancellation before work landed).\n\n\
-                 If work is in flight ({actual:?}), the next step is:\n  \
-                 - state Review: open a PR via `airc work state {card_uuid} review`\n  \
-                 - wait for the PR to merge (state → Merged via gh observer)\n  \
-                 - THEN `airc work close {card_uuid}` succeeds.\n\n\
-                 If you want to abandon the work, `airc work release {card_uuid}` \
-                 drops the claim and returns the card to its prior state — close \
-                 from there.",
-                actual = card.state,
-            )
-            .into());
-        }
-    }
-
-    airc.change_work_card_state(ChangeWorkCardState {
-        card_id: card_uuid,
-        state: card_state,
-    })
-    .await?;
-    println!("card_state_changed: card_id={card_uuid} state={card_state:?}");
-
-    // Card 820629e9: on transition to Review, open a PR via `gh` from
-    // the card's worktree and link it to the card. Best-effort — a gh
-    // failure (no commits, no remote, gh not installed) prints a
-    // warning but does not undo the state transition. The link is
-    // recorded as a separate WorkEvent::PullRequestLinked, whose
-    // projection re-sets state=Review idempotently and populates
-    // card.pull_request — so downstream consumers (ad7e100b Sub-C
-    // auto-spawn review card, board renderers) read one source of
-    // truth.
-    if card_state == CardState::Review {
-        if let Err(error) = open_pr_and_link(&airc, card_uuid).await {
-            eprintln!("airc: gh pr create skipped — {error}");
-        }
-    }
-    Ok(())
-}
-
 /// Best-effort: open a GitHub PR for the work card's worktree branch
 /// and link it via `WorkEvent::PullRequestLinked`. Returns Err so
 /// run_state can surface as a warning without aborting the state
 /// transition.
-async fn open_pr_and_link(
+pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -696,7 +397,7 @@ async fn open_pr_and_link(
 /// out of the CLI for consumers that bypass it (Continuum, OpenClaw),
 /// but the wire shape is stable — that move doesn't break this
 /// emit.
-async fn auto_spawn_review_card(
+pub(crate) async fn auto_spawn_review_card(
     airc: &airc_lib::Airc,
     parent_id: airc_lib::WorkCardId,
     pr_url: &str,
@@ -811,88 +512,6 @@ fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// Card a1bc62b3 — gate on direct CLI state writes.
-///
-/// Returns `true` when the CLI's `airc work state <id> <target>` is
-/// allowed to drive a card into `target` by direct event emission.
-///
-/// `false` for substrate-owned target states:
-///   * [`CardState::Merged`] — only the gh observer's
-///     `WorkEvent::PullRequestMerged` should set Merged; an agent
-///     self-attesting Merged from the CLI defeats 9656a836's
-///     close-guard.
-///
-/// `true` for everything else the workflow currently surfaces
-/// (Open / Claimed / InProgress / Blocked / Review / Closed). 9656a836's
-/// `close_transition_allowed_from` already gates Closed by FROM-state.
-/// This gate is its sibling on the TO-state axis.
-///
-/// "Workflow is workflow" — for non-coding recipes, swap PR-merged
-/// for the recipe-specific verified-done signal; the substrate gate
-/// is the same shape.
-pub(crate) fn cli_can_set_state_directly(target: CardState) -> bool {
-    !matches!(target, CardState::Merged)
-}
-
-/// Per-state actionable refusal message for the gate above. Lesser-
-/// capable agents read this verbatim, so the corrective steps for
-/// each refused state are explicit.
-fn refusal_message(card_uuid: airc_lib::WorkCardId, target: CardState) -> String {
-    match target {
-        CardState::Merged => format!(
-            "refusing to set card {card_uuid} to Merged from the CLI: Merged is \
-             reserved for the PullRequestMerged event from the gh observer, \
-             which fires automatically when the linked PR merges on github.\n\n\
-             What you almost certainly want instead:\n  \
-             - If the PR has been merged on github: wait for the gh observer \
-             event to land (or check the card's pull_request field on the \
-             board — if it shows merged_at populated, the observer event is \
-             in flight).\n  \
-             - If you want to mark the card done without going through \
-             github (e.g. cancellation): `airc work close {card_uuid}` from \
-             a pre-work state (Open / Claimed / Blocked) succeeds directly \
-             per card 9656a836's close-guard.\n  \
-             - If you want to override for testing / recovery: this CLI \
-             surface is deliberately disabled (card a1bc62b3); patch the \
-             substrate or use a substrate-internal recovery tool."
-        ),
-        // Future substrate-owned states extend this match. The
-        // compiler enforces exhaustiveness on the gate function;
-        // the refusal message follows it.
-        other => format!(
-            "refusing to set card {card_uuid} to {other:?} from the CLI \
-             (no actionable next step encoded yet — this is a bug in \
-             airc-cli's refusal_message)"
-        ),
-    }
-}
-
-pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    run_state(home, card_id, CliCardState::Closed).await
-}
-
-/// Card 9656a836: gate the close transition. Returns `true` when a
-/// card in `state` is allowed to transition to Closed.
-///
-/// Closed has substrate meaning: this card was shipped (PR merged)
-/// OR cancelled before any real work landed. An agent who calls
-/// `airc work close` from InProgress/Review/Closed is doing the
-/// thing we caught today — self-reporting work as done without it
-/// actually going through review + merge. Per Joel's "lesser persona
-/// intelligences" framing, this MUST refuse strictly — the persona
-/// can't be trusted to "know better," the substrate refuses.
-///
-/// "Workflow is workflow" — for non-coding recipes, swap PR-merged
-/// for the recipe-specific "verified done" signal; this rule's
-/// shape (Closed requires verified-done OR pre-work cancellation)
-/// generalizes.
-pub(crate) fn close_transition_allowed_from(state: CardState) -> bool {
-    matches!(
-        state,
-        CardState::Merged | CardState::Open | CardState::Claimed | CardState::Blocked
-    )
-}
-
 /// First 8 chars of a UUID-style id — enough to disambiguate at the
 /// board's typical scale, much easier on the eye than 36-char UUIDs.
 /// We deliberately do NOT shorten card_id in the board output because
@@ -928,13 +547,8 @@ fn format_peer(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoardFilter {
     All,
-    /// No active claim, or claim's lease has expired (eligible for
-    /// reclaim per the flywheel-continuity doctrine). Closed/Merged
-    /// terminal cards are excluded.
     Available,
-    /// Owned by this peer right now.
     Mine,
-    /// Owned by another peer (active claim).
     Others,
 }
 
@@ -1390,32 +1004,32 @@ fn print_manager_recommendation(recommendation: &WorkManagerRecommendation) {
     );
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 
-fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
+pub(crate) fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
     let uuid = Uuid::parse_str(input)
         .map_err(|error| format!("work card id {input:?} is not a valid UUID: {error}"))?;
     Ok(WorkCardId::from_uuid(uuid))
 }
 
-fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
+pub(crate) fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
     let uuid = Uuid::parse_str(input)
         .map_err(|error| format!("claim id {input:?} is not a valid UUID: {error}"))?;
     Ok(ClaimId::from_uuid(uuid))
 }
 
-fn parse_optional_lane_id(
+pub(crate) fn parse_optional_lane_id(
     input: Option<&str>,
 ) -> Result<Option<LaneId>, Box<dyn std::error::Error>> {
     input.map(parse_lane_id).transpose()
 }
 
-fn parse_lane_id(input: &str) -> Result<LaneId, Box<dyn std::error::Error>> {
+pub(crate) fn parse_lane_id(input: &str) -> Result<LaneId, Box<dyn std::error::Error>> {
     let uuid = Uuid::parse_str(input)
         .map_err(|error| format!("lane id {input:?} is not a valid UUID: {error}"))?;
     Ok(LaneId::from_uuid(uuid))
@@ -1459,6 +1073,9 @@ impl From<CliCardState> for CardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_commands_lifecycle::{
+        cli_can_set_state_directly, close_transition_allowed_from, refusal_message,
+    };
 
     #[test]
     fn lease_renders_dash_when_no_claim() {
@@ -1821,3 +1438,12 @@ mod tests {
         assert!(msg.contains(&card_id.to_string()), "carries the card UUID");
     }
 }
+
+// Phase 2 (card 5aa9e780): lifecycle handlers + their state
+// guards extracted to a sibling module. Re-exported here so
+// callers (main.rs dispatchers, tests) still address them as
+// `work_commands::run_create` etc. — no churn on the public
+// surface.
+pub use crate::work_commands_lifecycle::{
+    run_claim, run_close, run_create, run_heartbeat, run_release, run_seed, run_state, run_update,
+};
