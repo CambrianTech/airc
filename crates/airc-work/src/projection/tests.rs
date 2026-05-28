@@ -777,3 +777,96 @@ fn release_for_superseded_claim_does_not_poison_projection() {
     assert_eq!(card.owner, Some(owner_a));
     assert_eq!(card.state, CardState::Claimed);
 }
+
+// Invariant (d) of card 5d65aec2 — peer self-organizing contract:
+// two peers creating cards concurrently must not collide. The
+// store-as-arbiter contract for *creation* reduces to "fresh UUID per
+// card" + projection's id-keyed insertion; distinct ids round-trip
+// both writers, and a true id collision SURFACES (no silent clobber).
+
+#[test]
+fn concurrent_card_creates_with_distinct_ids_project_independently() {
+    let card_a = WorkCardId::from_u128(101);
+    let card_b = WorkCardId::from_u128(102);
+    let alice = peer(10);
+    let bob = peer(20);
+
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: card_a,
+            repo: repo(),
+            title: "alice's card".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: alice,
+            created_at_ms: 100,
+        }))
+        .expect("alice's create projects");
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id: card_b,
+            repo: repo(),
+            title: "bob's card".into(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            created_by: bob,
+            created_at_ms: 101,
+        }))
+        .expect("bob's create projects independently");
+
+    let a = projection.card(card_a).expect("card_a present");
+    let b = projection.card(card_b).expect("card_b present");
+    assert_eq!(a.title, "alice's card");
+    assert_eq!(a.created_by, alice);
+    assert_eq!(a.priority, Priority::P1);
+    assert_eq!(b.title, "bob's card");
+    assert_eq!(b.created_by, bob);
+    assert_eq!(b.priority, Priority::P2);
+}
+
+#[test]
+fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
+    // A true id collision is structurally unreachable with fresh
+    // UUIDs, but the arbitration contract must still be explicit:
+    // silent overwrite would let a bug — or a malicious peer —
+    // replace a card. Test pins "surfaces as DuplicateCard, original
+    // unchanged".
+    let card_id = WorkCardId::from_u128(42);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "original".into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(1),
+            created_at_ms: 100,
+        }))
+        .expect("first create projects");
+    let err = projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "clobber attempt".into(),
+            body: None,
+            priority: Priority::P3,
+            lane_id: None,
+            created_by: peer(2),
+            created_at_ms: 200,
+        }))
+        .expect_err("duplicate card_id must surface as an error");
+    assert!(
+        matches!(err, super::ProjectionError::DuplicateCard(id) if id == card_id),
+        "wrong error variant: {err:?}",
+    );
+    // Original card unchanged — silent overwrite would be a bug.
+    let card = projection.card(card_id).expect("original card still present");
+    assert_eq!(card.title, "original");
+    assert_eq!(card.priority, Priority::P1);
+    assert_eq!(card.created_by, peer(1));
+}
