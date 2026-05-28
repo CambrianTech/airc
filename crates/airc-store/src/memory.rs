@@ -364,6 +364,7 @@ mod tests {
                 version: 1,
                 created_at_ms: 42,
                 identity,
+                agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
             })
             .await
             .unwrap();

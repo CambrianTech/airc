@@ -239,6 +239,7 @@ impl LocalIdentity {
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms,
                 identity: Identity::default(),
+            agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
             })
             .await?;
 
@@ -280,6 +281,7 @@ async fn migrate_legacy_identity_json(
         version: parsed.version,
         created_at_ms: parsed.created_at_ms,
         identity: Identity::default(),
+            agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
     };
     store.insert_local_identity(stored.clone()).await?;
     let _ = std::fs::remove_file(path);
@@ -433,6 +435,7 @@ mod tests {
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms: 1,
                 identity: Identity::default(),
+            agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
             })
             .await
             .unwrap();

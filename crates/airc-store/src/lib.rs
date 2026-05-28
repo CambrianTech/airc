@@ -57,7 +57,7 @@ pub use beacon::StoredBeacon;
 pub use bus_epoch_store::SqliteEpochStore;
 pub use bus_sink::SqliteDurableSink;
 pub use error::StoreError;
-pub use local_identity::StoredLocalIdentity;
+pub use local_identity::{StoredLocalIdentity, DEFAULT_AGENT_NAME};
 pub use memory::InMemoryEventStore;
 pub use mesh_identity::StoredMeshIdentity;
 pub use peer_trust::{RotationAuditEntry, StoredPeer};
