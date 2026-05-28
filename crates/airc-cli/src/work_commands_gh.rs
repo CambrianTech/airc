@@ -128,7 +128,9 @@ pub(crate) async fn open_pr_and_link(
     // here must not undo the state transition or the PR link, and
     // re-running `state review` on a card whose review card already
     // exists is a no-op.
-    if let Err(error) = crate::work_commands::auto_spawn_review_card(airc, card_id, pr_url).await {
+    if let Err(error) =
+        crate::work_commands_review::auto_spawn_review_card(airc, card_id, pr_url).await
+    {
         eprintln!("airc: review card auto-spawn skipped — {error}");
     }
 
