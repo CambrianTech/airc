@@ -174,10 +174,10 @@ enum GateResult {
     NotReady(String),
 }
 
-/// Query `gh pr view --json statusCheckRollup` and apply the merge
-/// gate. First-cut policy: no FAILURE or CANCELLED in the rollup, and
-/// no checks still IN_PROGRESS/PENDING. Pre-existing-red bypass is
-/// deferred to a follow-up card.
+/// Query `gh pr view --json statusCheckRollup,mergeable,state` and
+/// apply [`evaluate_gh_view`] to the response. The IO half is here;
+/// the decision half is the pure function so it can be unit-tested
+/// without shelling out.
 async fn check_pr_gate(
     pr: &airc_work::model::PullRequestRef,
 ) -> Result<GateResult, Box<dyn std::error::Error>> {
@@ -203,23 +203,30 @@ async fn check_pr_gate(
     }
 
     let parsed: GhPrView = serde_json::from_slice(&output.stdout)?;
+    Ok(evaluate_gh_view(&parsed))
+}
 
-    if parsed.state != "OPEN" {
-        return Ok(GateResult::NotReady(format!(
-            "PR state is {} (not OPEN)",
-            parsed.state
-        )));
+/// Decide whether a PR is ready to merge, given the parsed `gh pr
+/// view` payload. Pure — no IO, no async. First-cut policy:
+///
+/// - state must be `OPEN` (not already MERGED/CLOSED)
+/// - mergeable must not be `CONFLICTING` (no rebase needed)
+/// - no `FAILURE` / `CANCELLED` / `TIMED_OUT` conclusions
+/// - no still-running checks (status != COMPLETED with no conclusion)
+///
+/// The strictly-less-red-than-base doctrine refinement (#1033) is a
+/// separate, more lenient gate carded as a follow-up.
+fn evaluate_gh_view(view: &GhPrView) -> GateResult {
+    if view.state != "OPEN" {
+        return GateResult::NotReady(format!("PR state is {} (not OPEN)", view.state));
     }
-    if parsed.mergeable == "CONFLICTING" {
-        return Ok(GateResult::NotReady(
-            "PR has merge conflicts; needs rebase".to_string(),
-        ));
+    if view.mergeable == "CONFLICTING" {
+        return GateResult::NotReady("PR has merge conflicts; needs rebase".to_string());
     }
-
-    let rollup = parsed.status_check_rollup.unwrap_or_default();
+    let rollup = view.status_check_rollup.as_deref().unwrap_or(&[]);
     let mut failures = 0usize;
     let mut pending = 0usize;
-    for c in &rollup {
+    for c in rollup {
         match c.conclusion.as_deref() {
             Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
             Some("FAILURE") | Some("CANCELLED") | Some("TIMED_OUT") => failures += 1,
@@ -232,14 +239,12 @@ async fn check_pr_gate(
         }
     }
     if failures > 0 {
-        return Ok(GateResult::NotReady(format!("{failures} failing check(s)")));
+        return GateResult::NotReady(format!("{failures} failing check(s)"));
     }
     if pending > 0 {
-        return Ok(GateResult::NotReady(format!(
-            "{pending} check(s) still running"
-        )));
+        return GateResult::NotReady(format!("{pending} check(s) still running"));
     }
-    Ok(GateResult::Green)
+    GateResult::Green
 }
 
 /// Actually merge. `gh pr merge --squash --delete-branch` matches the
@@ -324,4 +329,178 @@ fn acquire_singleton_lock(home: &Path) -> Result<std::fs::File, Box<dyn std::err
         )
     })?;
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-function tests for the merge gate. The IO and orchestration
+    //! halves (gh shelling, work_board fetch, the loop) are integration
+    //! territory — exercised end-to-end when the merger runs against
+    //! real PRs. The decision matrix is what changes most often (every
+    //! follow-up to f16650cd: LGTM gate, less-red bypass, catchup); it
+    //! is the right surface to lock down with unit tests.
+    use super::*;
+    use serde_json::json;
+
+    fn parse(payload: serde_json::Value) -> GhPrView {
+        serde_json::from_value(payload).expect("test fixture must parse")
+    }
+
+    #[test]
+    fn merges_when_state_open_no_conflicts_all_checks_green() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": "NEUTRAL", "status": "COMPLETED"},
+                {"conclusion": "SKIPPED", "status": "COMPLETED"},
+            ]
+        }));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+    }
+
+    #[test]
+    fn refuses_when_pr_is_closed() {
+        let view = parse(json!({"state": "CLOSED", "mergeable": "MERGEABLE"}));
+        let result = evaluate_gh_view(&view);
+        let GateResult::NotReady(reason) = result else {
+            panic!("expected NotReady, got Green");
+        };
+        assert!(reason.contains("CLOSED"), "reason should name the state");
+    }
+
+    #[test]
+    fn refuses_when_pr_is_already_merged() {
+        let view = parse(json!({"state": "MERGED", "mergeable": "MERGEABLE"}));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+    }
+
+    #[test]
+    fn refuses_when_conflicting() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "CONFLICTING",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        }));
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("conflict") || reason.contains("rebase"),
+            "reason should name conflicts"
+        );
+    }
+
+    #[test]
+    fn refuses_when_any_check_failed() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": "FAILURE", "status": "COMPLETED"},
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+            ]
+        }));
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+            panic!("expected NotReady");
+        };
+        assert!(reason.contains("failing"), "reason should mention failures");
+    }
+
+    #[test]
+    fn refuses_when_a_check_was_cancelled() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "CANCELLED", "status": "COMPLETED"},
+            ]
+        }));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+    }
+
+    #[test]
+    fn refuses_when_a_check_timed_out() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "TIMED_OUT", "status": "COMPLETED"},
+            ]
+        }));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+    }
+
+    #[test]
+    fn refuses_when_a_check_is_still_running() {
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": null, "status": "IN_PROGRESS"},
+            ]
+        }));
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("still running"),
+            "reason should indicate pending checks"
+        );
+    }
+
+    #[test]
+    fn merges_when_rollup_is_empty() {
+        // No checks configured at all → mergeable. (Repo with no CI is
+        // a valid state, e.g. docs-only repos.) The gate is "no
+        // failure OR pending"; zero checks satisfies both vacuously.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [],
+        }));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+    }
+
+    #[test]
+    fn merges_when_rollup_field_absent() {
+        // Missing field → default empty Vec → vacuously green, same
+        // as the explicit-empty case above. The serde default keeps
+        // the gate robust to gh CLI version drift.
+        let view = parse(json!({"state": "OPEN", "mergeable": "MERGEABLE"}));
+        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+    }
+
+    #[test]
+    fn singleton_lock_refuses_second_holder() {
+        // Acquire on a fresh tmpdir, then try a second acquire — must
+        // fail with the "already running" error rather than blocking
+        // or succeeding (which would race two mergers).
+        let tmp = std::env::temp_dir().join(format!(
+            "airc-merger-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let _first = acquire_singleton_lock(&tmp).expect("first acquire");
+        let second = acquire_singleton_lock(&tmp);
+        assert!(second.is_err(), "second acquire must fail");
+        let err = second.unwrap_err().to_string();
+        assert!(
+            err.contains("already running"),
+            "error should name the conflict: {err}"
+        );
+
+        drop(_first);
+        let _third = acquire_singleton_lock(&tmp).expect("after drop, third acquire succeeds");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
