@@ -153,6 +153,7 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
 /// repo today), and every PR landing on `main` bypasses
 /// `rust-rewrite`'s substrate work. The whole point of this card
 /// is to refuse that fallback.
+// Wired into open_pr_and_link by card 812b5a1b / PR #1058 (pending merge).
 pub(crate) fn pr_create_base_branch() -> &'static str {
     "rust-rewrite"
 }
