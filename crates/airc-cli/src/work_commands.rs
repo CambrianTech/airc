@@ -218,10 +218,32 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
+/// First 8 chars of a UUID-style id — enough to disambiguate at the
+/// board's typical scale, much easier on the eye than 36-char UUIDs.
+/// We deliberately do NOT shorten card_id in the board output because
+/// callers copy-paste it into `claim` / `state` / `close`; it's the
+/// API key, not a display field.
+fn short_id<T: std::fmt::Display>(id: T) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+/// Render a peer-id for the board: 'me' when it matches this peer's
+/// identity, short-uuid otherwise. Full alias resolution for OTHER
+/// peers needs the rich-peer-identity-card substrate (blocker card
+/// af40f46d); until then 'me + short uuid' substantially improves the
+/// at-a-glance readability complaint from kink 6f111211.
+fn format_peer(peer: airc_lib::PeerId, me: airc_lib::PeerId) -> String {
+    if peer == me {
+        "me".to_string()
+    } else {
+        short_id(peer)
+    }
+}
+
 pub async fn run_board(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let board = airc.work_board(limit).await?;
-    print_board(&board);
+    print_board(&board, airc.peer_id());
     Ok(())
 }
 
@@ -344,7 +366,7 @@ pub async fn run_availability(
     Ok(())
 }
 
-fn print_board(board: &WorkBoardProjection) {
+fn print_board(board: &WorkBoardProjection, me: airc_lib::PeerId) {
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");
@@ -358,11 +380,11 @@ fn print_board(board: &WorkBoardProjection) {
     for card in &snapshot.cards {
         let owner = card
             .owner
-            .map(|peer| peer.to_string())
+            .map(|peer| format_peer(peer, me))
             .unwrap_or_else(|| "-".to_string());
         let claim = card
             .claim_id
-            .map(|claim| claim.to_string())
+            .map(short_id)
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{card_id}  {priority:?}  {state:?}  owner={owner}  claim={claim}  repo={repo}  title={title}",
@@ -380,8 +402,8 @@ fn print_board(board: &WorkBoardProjection) {
             println!(
                 "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
                 card_id = claim.card_id,
-                owner = claim.owner,
-                claim_id = claim.claim_id,
+                owner = format_peer(claim.owner, me),
+                claim_id = short_id(claim.claim_id),
                 expired_at_ms = claim.expired_at_ms,
             );
         }
