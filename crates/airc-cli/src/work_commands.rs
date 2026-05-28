@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use airc_lib::{
     AgentAvailabilityState, CardState, ChangeWorkCardState, ClaimId, ClaimWorkCard,
-    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, WorkBacklogSeedCandidate,
-    WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId, WorkManagerRecommendation,
-    WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
+    CreateWorkCard, LaneId, Priority, ReleaseWorkClaim, RepoId, UpdateWorkCard,
+    WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBoardProjection, WorkCardId,
+    WorkManagerRecommendation, WorkManagerRecommendationKind, WorkManagerStatus,
+    WorkQueueStatus, WorkRosterStatus,
 };
 
 use crate::lease;
@@ -261,6 +262,31 @@ async fn spawn_claim_worktree(
     }
     let repo_root = String::from_utf8(repo_root_out.stdout)?.trim().to_string();
 
+    // Card 59243bee: refuse worktree creation when cwd's repo doesn't
+    // match card.repo — otherwise we'd create a worktree of the wrong
+    // codebase. Honest error beats wrong worktree. The proper
+    // cross-repo resolver (~/.airc config mapping RepoId → local
+    // clone path) is a richer follow-up; this check at minimum
+    // prevents silent damage.
+    let cwd_repo_id = cwd_github_repo_id(&repo_root)
+        .ok_or_else(|| {
+            format!(
+                "cannot determine github repo from cwd ({repo_root}); \
+                 ensure `git remote get-url origin` points at a github.com URL, \
+                 or pass --no-lease-required to skip worktree spawn"
+            )
+        })?;
+    if cwd_repo_id != card.repo.to_string() {
+        return Err(format!(
+            "card belongs to repo {card_repo}, but cwd is in {cwd_repo}; \
+             cd into the {card_repo} checkout and re-claim, or pass \
+             --no-lease-required to claim without a worktree spawn",
+            card_repo = card.repo,
+            cwd_repo = cwd_repo_id,
+        )
+        .into());
+    }
+
     let branch = format!("{short}/{slug}");
     let add_out = std::process::Command::new("git")
         .args([
@@ -285,6 +311,48 @@ async fn spawn_claim_worktree(
     println!("branch:    {branch}");
     println!("hint:      cd {}", worktree_path.display());
     Ok(())
+}
+
+/// Resolve cwd's github "owner/repo" identity by reading the origin
+/// remote URL. Card 59243bee — the check the original d1b2798d
+/// shipped without. Returns None when the remote isn't a github URL
+/// (or doesn't exist) so callers can decide whether to refuse or
+/// degrade. Parses both `https://github.com/owner/repo[.git]` and
+/// `git@github.com:owner/repo[.git]` shapes.
+fn cwd_github_repo_id(repo_root: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", repo_root, "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    parse_github_repo_id(&url)
+}
+
+/// Pure-function half of [`cwd_github_repo_id`] — accepts a remote
+/// URL and returns `Some("owner/repo")` for github URLs it
+/// recognises, `None` otherwise. Kept pure so tests don't need a
+/// real git repo.
+fn parse_github_repo_id(url: &str) -> Option<String> {
+    // SSH: git@github.com:owner/repo[.git]
+    let owner_repo = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return None;
+    };
+    let owner_repo = owner_repo.trim().trim_end_matches('/');
+    let owner_repo = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    // Expect exactly one '/' separating owner and repo.
+    if owner_repo.matches('/').count() != 1 {
+        return None;
+    }
+    Some(owner_repo.to_string())
 }
 
 /// Sanitize a card title into a git-safe branch slug. Lowercase,
@@ -403,6 +471,37 @@ pub async fn run_heartbeat(
             }
         }
     }
+    Ok(())
+}
+
+/// Card 5ac0a359 — `airc work update <CARD_ID> [--title T] [--body B]
+/// [--priority P]`. Amend a card's editable fields post-creation.
+/// Omitted flags leave the projection's existing values alone;
+/// `--body ""` clears (empty string is the markdown "no body"
+/// idiom).
+pub async fn run_update(
+    home: &Path,
+    card_id: String,
+    title: Option<String>,
+    body: Option<String>,
+    priority: Option<CliPriority>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let card_uuid = parse_work_card_id(&card_id)?;
+    let airc = crate::commands::attached_airc(home).await?;
+
+    let mut request = UpdateWorkCard::amend(card_uuid);
+    if let Some(title) = title {
+        request = request.with_title(title);
+    }
+    if let Some(body) = body {
+        request = request.with_body(body);
+    }
+    if let Some(priority) = priority {
+        request = request.with_priority(priority.into());
+    }
+
+    airc.update_work_card(request).await?;
+    println!("card_updated: card_id={card_uuid}");
     Ok(())
 }
 
@@ -1327,6 +1426,41 @@ mod tests {
         // Non-numeric tail → None (degrade gracefully).
         assert_eq!(extract_pr_number("https://example.com/no-pr-here"), None);
         assert_eq!(extract_pr_number(""), None);
+    }
+
+    #[test]
+    fn parse_github_repo_id_handles_https_ssh_and_trailing_git() {
+        // HTTPS — both with and without .git suffix.
+        assert_eq!(
+            parse_github_repo_id("https://github.com/CambrianTech/airc.git"),
+            Some("CambrianTech/airc".into()),
+        );
+        assert_eq!(
+            parse_github_repo_id("https://github.com/CambrianTech/airc"),
+            Some("CambrianTech/airc".into()),
+        );
+        // SSH (git@github.com:owner/repo).
+        assert_eq!(
+            parse_github_repo_id("git@github.com:CambrianTech/continuum.git"),
+            Some("CambrianTech/continuum".into()),
+        );
+        // Trailing slash gets normalized.
+        assert_eq!(
+            parse_github_repo_id("https://github.com/CambrianTech/airc/"),
+            Some("CambrianTech/airc".into()),
+        );
+        // Non-github remotes return None so the caller can refuse
+        // worktree creation with a clear error.
+        assert_eq!(
+            parse_github_repo_id("https://gitlab.com/owner/repo.git"),
+            None,
+        );
+        assert_eq!(parse_github_repo_id(""), None);
+        // Github URL but with extra path segments isn't owner/repo.
+        assert_eq!(
+            parse_github_repo_id("https://github.com/owner/repo/pull/123"),
+            None,
+        );
     }
 
     #[test]
