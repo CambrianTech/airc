@@ -195,12 +195,123 @@ pub async fn run_claim(
         }
     }
     let airc = crate::commands::attached_airc(home).await?;
-    let card_id = parse_work_card_id(&card_id)?;
+    let card_uuid = parse_work_card_id(&card_id)?;
     let claim_id = airc
-        .claim_work_card(ClaimWorkCard { card_id, ttl_ms })
+        .claim_work_card(ClaimWorkCard {
+            card_id: card_uuid,
+            ttl_ms,
+        })
         .await?;
     println!("claim_id: {claim_id}");
+
+    // Card d1b2798d: auto-spawn a worktree + branch on successful
+    // claim. Eliminates the shared-checkout friction two agents on
+    // the same machine hit (`--no-lease-required` everywhere is the
+    // tell). Best-effort: a git failure does NOT undo the claim or
+    // the lease — the claim is the authoritative record, the
+    // worktree is convenience around it.
+    if let Err(error) = spawn_claim_worktree(&airc, card_uuid).await {
+        eprintln!("airc: worktree spawn skipped — {error}");
+    }
     Ok(())
+}
+
+/// Best-effort: allocate `~/.airc/worktrees/<card_short>/` and a
+/// branch `<card_short>/<slug>` off the current feature branch HEAD
+/// so the agent who just claimed the card can `cd` into a clean,
+/// isolated workspace.
+///
+/// Returns Err on any genuine failure (no git repo, no lease zone,
+/// git command failure) so run_claim can surface it as a warning
+/// without aborting. Skips silently (Ok) when the worktree already
+/// exists, which lets re-claim after release work without surprise.
+async fn spawn_claim_worktree(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Need the card's title for the branch slug — board projection
+    // is the source of truth.
+    let board = airc.work_board(usize::MAX).await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    let short: String = card.card_id.to_string().chars().take(8).collect();
+    let slug = slugify(&card.title, 40);
+
+    let lease_root = lease::lease_root()
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    let worktree_path = lease_root.join(&short);
+    if worktree_path.exists() {
+        println!("worktree:  {} (existing — reused)", worktree_path.display());
+        return Ok(());
+    }
+    std::fs::create_dir_all(&lease_root)?;
+
+    // Resolve repo root from cwd (the user's checkout). git itself
+    // handles the worktree-add — we don't reimplement.
+    let repo_root_out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !repo_root_out.status.success() {
+        return Err(format!(
+            "git rev-parse --show-toplevel failed: {}",
+            String::from_utf8_lossy(&repo_root_out.stderr).trim()
+        )
+        .into());
+    }
+    let repo_root = String::from_utf8(repo_root_out.stdout)?.trim().to_string();
+
+    let branch = format!("{short}/{slug}");
+    let add_out = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_root,
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+        ])
+        .arg(&worktree_path)
+        .output()?;
+    if !add_out.status.success() {
+        return Err(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr).trim()
+        )
+        .into());
+    }
+
+    println!("worktree:  {}", worktree_path.display());
+    println!("branch:    {branch}");
+    println!("hint:      cd {}", worktree_path.display());
+    Ok(())
+}
+
+/// Sanitize a card title into a git-safe branch slug. Lowercase,
+/// alphanumeric + '-' only; collapses runs of non-alphanumerics
+/// into single dashes; trims leading/trailing dashes; bounds length.
+fn slugify(title: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(title.len().min(max_len));
+    let mut last_was_dash = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !out.is_empty() {
+            out.push('-');
+            last_was_dash = true;
+        }
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("work");
+    }
+    out
 }
 
 pub async fn run_release(
@@ -984,6 +1095,24 @@ mod tests {
         assert!(BoardFilter::Others.matches(&theirs, me, 1_000));
         assert!(!BoardFilter::Others.matches(&mine, me, 1_000));
         assert!(!BoardFilter::Others.matches(&unclaimed, me, 1_000));
+    }
+
+    #[test]
+    fn slugify_lowercases_alphanumeric_collapses_separators_and_bounds_length() {
+        assert_eq!(
+            slugify("airc work claim: auto-spawn worktree + branch", 40),
+            "airc-work-claim-auto-spawn-worktree-bran",
+        );
+        assert_eq!(slugify("simple", 40), "simple");
+        // Trailing dashes from cut runs of non-alphanum are trimmed.
+        assert_eq!(slugify("a !! b", 40), "a-b");
+        // Empty / fully non-alphanum -> sensible fallback so branch
+        // creation never produces "<short>/" with empty suffix.
+        assert_eq!(slugify("!!!", 40), "work");
+        assert_eq!(slugify("", 40), "work");
+        // Length bound respected.
+        let bounded = slugify(&"x".repeat(200), 10);
+        assert!(bounded.len() <= 10, "got: {bounded}");
     }
 
     #[test]
