@@ -72,6 +72,12 @@ pub(crate) async fn open_pr_and_link(
     // PR-link pipeline failed (best-effort warning was swallowed).
     let subject = crate::work_commands::git_show_format(&worktree_str, "%s")?;
     let body = crate::work_commands::git_show_format(&worktree_str, "%b")?;
+    // Card 812b5a1b: pin --base to pr_create_base_branch() (rust-rewrite),
+    // not gh's default. Without --base, `gh pr create` picks the repo's
+    // GitHub default branch (`main` on this repo), and every auto-spawned
+    // PR lands against main — bypassing rust-rewrite's substrate work
+    // and producing the duplicate-PR pattern seen on #1044 and #1054.
+    let base_branch = pr_create_base_branch();
     let create_out = std::process::Command::new("gh")
         .current_dir(&worktree_str)
         .args([
@@ -81,6 +87,8 @@ pub(crate) async fn open_pr_and_link(
             subject.trim(),
             "--body",
             body.trim(),
+            "--base",
+            base_branch,
         ])
         .output()?;
     if !create_out.status.success() {
@@ -95,15 +103,16 @@ pub(crate) async fn open_pr_and_link(
     let pr_number = extract_pr_number(pr_url)
         .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
 
-    // Resolve head/base from the worktree's git state.
+    // Resolve head from the worktree's git state. Base is the same
+    // pinned value we passed to gh — the projection must record what
+    // we actually opened the PR against, not gh's repo default.
     let head_branch = crate::work_commands::git_rev_parse_branch(&worktree_str)?;
-    let base_branch = gh_default_branch(&worktree_str).unwrap_or_else(|_| "main".to_string());
 
     let pull_request = PullRequestRef {
         repo: card.repo.clone(),
         number: pr_number,
         head: BranchName::new(head_branch)?,
-        base: BranchName::new(base_branch)?,
+        base: BranchName::new(base_branch.to_string())?,
     };
     airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
         card_id,
