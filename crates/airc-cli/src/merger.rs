@@ -120,8 +120,21 @@ async fn tick_once(
     let board = airc.work_board(256).await?;
     let snapshot = board.snapshot();
 
+    // Card d5b7b07d: fetch the baseline (rust-rewrite HEAD's failing
+    // check names) ONCE per tick — every per-card gate consults the
+    // same snapshot. The set is small (handful of check names) and
+    // the query is one REST call; cheap relative to per-PR pr_view.
+    let baseline_failures = fetch_baseline_failures(gh).await;
+    if !baseline_failures.is_empty() {
+        eprintln!(
+            "airc-merger: baseline has {} failing check(s) on rust-rewrite — \
+             those won't block per-PR gates this tick",
+            baseline_failures.len()
+        );
+    }
+
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(gh, card).await? else {
+        let Some(decision) = evaluate(gh, card, &baseline_failures).await? else {
             continue;
         };
         match decision {
@@ -164,6 +177,7 @@ enum MergeDecision {
 async fn evaluate(
     gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
+    baseline_failures: &std::collections::HashSet<String>,
 ) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
     if card.state != CardState::Review {
@@ -173,7 +187,7 @@ async fn evaluate(
         return Ok(None);
     };
 
-    match check_pr_gate(gh, &pr).await {
+    match check_pr_gate(gh, &pr, baseline_failures).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
         Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
@@ -199,6 +213,7 @@ enum GateResult {
 async fn check_pr_gate(
     gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
+    baseline_failures: &std::collections::HashSet<String>,
 ) -> Result<GateResult, crate::gh_client::GhError> {
     let view = gh
         .pr_view(crate::gh_client::PrViewArgs {
@@ -207,7 +222,58 @@ async fn check_pr_gate(
             cwd: None,
         })
         .await?;
-    Ok(evaluate_gh_view(&view))
+    Ok(evaluate_gh_view(&view, baseline_failures))
+}
+
+/// Fetch the rust-rewrite HEAD's check-run rollup and return the SET
+/// of names that are currently FAILURE on base. The merger calls this
+/// once per tick; each per-card gate consults the same snapshot. On
+/// error (rate-limit, network), returns empty set — the gate
+/// degrades to "no allowance" rather than over-trusting.
+async fn fetch_baseline_failures(
+    gh: &dyn crate::gh_client::GhClient,
+) -> std::collections::HashSet<String> {
+    let base_branch = crate::work_commands_gh::pr_create_base_branch();
+    let runs = match gh
+        .branch_check_rollup(crate::gh_client::BranchCheckRollupArgs {
+            repo: "CambrianTech/airc".to_string(),
+            branch: base_branch.to_string(),
+        })
+        .await
+    {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!(
+                "airc-merger: baseline-failures lookup failed for {base_branch}: {error} \
+                 (degrading to no-allowance gate)"
+            );
+            return std::collections::HashSet::new();
+        }
+    };
+    baseline_failing_names(&runs)
+}
+
+/// Pure projection: rollup → set of check NAMES whose conclusion is
+/// failure-shaped (case-insensitive). Kept separate from the IO half
+/// so the strictly-less-red logic is unit-testable without a live
+/// `gh`.
+pub(crate) fn baseline_failing_names(
+    runs: &[crate::gh_client::GhCheck],
+) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for c in runs {
+        let conc_upper = c
+            .conclusion
+            .as_deref()
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default();
+        if matches!(conc_upper.as_str(), "FAILURE" | "CANCELLED" | "TIMED_OUT") {
+            if let Some(name) = c.name.as_deref() {
+                set.insert(name.to_string());
+            }
+        }
+    }
+    set
 }
 
 /// Decide whether a PR is ready to merge, given the parsed `gh pr
@@ -218,9 +284,14 @@ async fn check_pr_gate(
 /// - no `FAILURE` / `CANCELLED` / `TIMED_OUT` conclusions
 /// - no still-running checks (status != COMPLETED with no conclusion)
 ///
-/// The strictly-less-red-than-base doctrine refinement (#1033) is a
-/// separate, more lenient gate carded as a follow-up.
-fn evaluate_gh_view(view: &crate::gh_client::PrView) -> GateResult {
+/// Card d5b7b07d adds the strictly-less-red-than-base refinement:
+/// a FAILURE whose check name is ALSO failing on base is treated as
+/// effectively neutral (the PR didn't cause it). Pass an empty set
+/// to disable the bypass — that's the f16650cd-original strict gate.
+fn evaluate_gh_view(
+    view: &crate::gh_client::PrView,
+    baseline_failures: &std::collections::HashSet<String>,
+) -> GateResult {
     if view.state != "OPEN" {
         return GateResult::NotReady(format!("PR state is {} (not OPEN)", view.state));
     }
@@ -228,12 +299,28 @@ fn evaluate_gh_view(view: &crate::gh_client::PrView) -> GateResult {
         return GateResult::NotReady("PR has merge conflicts; needs rebase".to_string());
     }
     let rollup = view.status_check_rollup.as_deref().unwrap_or(&[]);
-    let mut failures = 0usize;
+    let mut new_failures = 0usize;
+    let mut inherited_failures = 0usize;
     let mut pending = 0usize;
     for c in rollup {
         match c.conclusion.as_deref() {
             Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
-            Some("FAILURE") | Some("CANCELLED") | Some("TIMED_OUT") => failures += 1,
+            Some("FAILURE") | Some("CANCELLED") | Some("TIMED_OUT") => {
+                // Strictly-less-red: if the PR-side check name is
+                // also failing on base, the PR isn't responsible.
+                // Counts as inherited (doesn't block) so the log line
+                // can surface that we noticed.
+                let is_inherited = c
+                    .name
+                    .as_deref()
+                    .map(|n| baseline_failures.contains(n))
+                    .unwrap_or(false);
+                if is_inherited {
+                    inherited_failures += 1;
+                } else {
+                    new_failures += 1;
+                }
+            }
             _ => {
                 // No conclusion → in flight (IN_PROGRESS / QUEUED / PENDING).
                 if c.status.as_deref() != Some("COMPLETED") {
@@ -242,8 +329,13 @@ fn evaluate_gh_view(view: &crate::gh_client::PrView) -> GateResult {
             }
         }
     }
-    if failures > 0 {
-        return GateResult::NotReady(format!("{failures} failing check(s)"));
+    if new_failures > 0 {
+        let inherited_note = if inherited_failures > 0 {
+            format!(" ({inherited_failures} inherited from base, ignored)")
+        } else {
+            String::new()
+        };
+        return GateResult::NotReady(format!("{new_failures} failing check(s){inherited_note}"));
     }
     if pending > 0 {
         return GateResult::NotReady(format!("{pending} check(s) still running"));
@@ -325,6 +417,13 @@ mod tests {
         serde_json::from_value(payload).expect("test fixture must parse")
     }
 
+    /// Empty baseline = no inherited failures known. Old strict-gate
+    /// behavior. Used by all the pre-d5b7b07d tests which pre-date
+    /// the strictly-less-red bypass.
+    fn empty_baseline() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn merges_when_state_open_no_conflicts_all_checks_green() {
         let view = parse(json!({
@@ -336,13 +435,16 @@ mod tests {
                 {"conclusion": "SKIPPED", "status": "COMPLETED"},
             ]
         }));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::Green
+        ));
     }
 
     #[test]
     fn refuses_when_pr_is_closed() {
         let view = parse(json!({"state": "CLOSED", "mergeable": "MERGEABLE"}));
-        let result = evaluate_gh_view(&view);
+        let result = evaluate_gh_view(&view, &empty_baseline());
         let GateResult::NotReady(reason) = result else {
             panic!("expected NotReady, got Green");
         };
@@ -352,7 +454,10 @@ mod tests {
     #[test]
     fn refuses_when_pr_is_already_merged() {
         let view = parse(json!({"state": "MERGED", "mergeable": "MERGEABLE"}));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::NotReady(_)
+        ));
     }
 
     #[test]
@@ -362,7 +467,7 @@ mod tests {
             "mergeable": "CONFLICTING",
             "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
             panic!("expected NotReady");
         };
         assert!(
@@ -382,7 +487,7 @@ mod tests {
                 {"conclusion": "SUCCESS", "status": "COMPLETED"},
             ]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
             panic!("expected NotReady");
         };
         assert!(reason.contains("failing"), "reason should mention failures");
@@ -397,7 +502,10 @@ mod tests {
                 {"conclusion": "CANCELLED", "status": "COMPLETED"},
             ]
         }));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::NotReady(_)
+        ));
     }
 
     #[test]
@@ -409,7 +517,10 @@ mod tests {
                 {"conclusion": "TIMED_OUT", "status": "COMPLETED"},
             ]
         }));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::NotReady(_)));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::NotReady(_)
+        ));
     }
 
     #[test]
@@ -422,7 +533,7 @@ mod tests {
                 {"conclusion": null, "status": "IN_PROGRESS"},
             ]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view) else {
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
             panic!("expected NotReady");
         };
         assert!(
@@ -441,7 +552,10 @@ mod tests {
             "mergeable": "MERGEABLE",
             "statusCheckRollup": [],
         }));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::Green
+        ));
     }
 
     #[test]
@@ -450,7 +564,10 @@ mod tests {
         // as the explicit-empty case above. The serde default keeps
         // the gate robust to gh CLI version drift.
         let view = parse(json!({"state": "OPEN", "mergeable": "MERGEABLE"}));
-        assert!(matches!(evaluate_gh_view(&view), GateResult::Green));
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline()),
+            GateResult::Green
+        ));
     }
 
     #[test]
@@ -481,5 +598,157 @@ mod tests {
         let _third = acquire_singleton_lock(&tmp).expect("after drop, third acquire succeeds");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ------------------------------------------------------------------
+    // Card d5b7b07d — strictly-less-red-than-base
+    // ------------------------------------------------------------------
+
+    fn baseline_with(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn evaluate_ignores_failure_whose_name_is_in_baseline() {
+        // Card d5b7b07d: the PR has one FAILURE, but that check name
+        // is already failing on base. PR didn't cause it; gate must
+        // pass.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED", "name": "cargo test (macos-latest)"},
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
+            ]
+        }));
+        let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
+        assert!(matches!(
+            evaluate_gh_view(&view, &baseline),
+            GateResult::Green
+        ));
+    }
+
+    #[test]
+    fn evaluate_still_refuses_when_pr_introduces_new_failure() {
+        // Card d5b7b07d: even with one inherited failure, a NEW
+        // PR-side failure (different name) blocks. The bypass is
+        // narrow — it only forgives names that also fail on base.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "cargo test (ubuntu-latest)"},
+            ]
+        }));
+        let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline) else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("1 failing") && reason.contains("inherited"),
+            "reason should distinguish new from inherited: {reason}"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_empty_baseline_matches_old_strict_behavior() {
+        // Regression: when no baseline known (lookup failed) the gate
+        // falls back to the f16650cd-original strict behavior — no
+        // free passes.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
+            ]
+        }));
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("1 failing"),
+            "reason should be unchanged: {reason}"
+        );
+    }
+
+    #[test]
+    fn baseline_failing_names_picks_up_failure_shaped_conclusions() {
+        // Card d5b7b07d: the REST endpoint uses lowercase ("failure")
+        // while gh pr view uses uppercase. baseline_failing_names
+        // must accept both — a case mismatch would silently drop the
+        // base failure and re-block every PR. Also: CANCELLED /
+        // TIMED_OUT count as failure-shaped because they're
+        // failure-shaped from the merger's perspective (something
+        // went wrong, not "the PR passed").
+        let runs = vec![
+            crate::gh_client::GhCheck {
+                conclusion: Some("failure".to_string()),
+                status: Some("completed".to_string()),
+                name: Some("shell syntax + rust cutover guards".to_string()),
+            },
+            crate::gh_client::GhCheck {
+                conclusion: Some("FAILURE".to_string()),
+                status: Some("COMPLETED".to_string()),
+                name: Some("clean-install-linux".to_string()),
+            },
+            crate::gh_client::GhCheck {
+                conclusion: Some("cancelled".to_string()),
+                status: Some("completed".to_string()),
+                name: Some("clean-install-macos".to_string()),
+            },
+            crate::gh_client::GhCheck {
+                conclusion: Some("success".to_string()),
+                status: Some("completed".to_string()),
+                name: Some("cargo fmt --check".to_string()),
+            },
+        ];
+        let set = baseline_failing_names(&runs);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("shell syntax + rust cutover guards"));
+        assert!(set.contains("clean-install-linux"));
+        assert!(set.contains("clean-install-macos"));
+        assert!(!set.contains("cargo fmt --check"));
+    }
+
+    #[test]
+    fn baseline_failing_names_returns_empty_when_base_is_green() {
+        // Regression: when base is all-green, the set is empty and
+        // the merger gates as old-strict — exactly what we want.
+        let runs = vec![
+            crate::gh_client::GhCheck {
+                conclusion: Some("success".to_string()),
+                status: Some("completed".to_string()),
+                name: Some("cargo fmt --check".to_string()),
+            },
+            crate::gh_client::GhCheck {
+                conclusion: Some("success".to_string()),
+                status: Some("completed".to_string()),
+                name: Some("cargo test (ubuntu-latest)".to_string()),
+            },
+        ];
+        assert!(baseline_failing_names(&runs).is_empty());
+    }
+
+    #[test]
+    fn parse_check_runs_handles_rest_envelope() {
+        // The REST `/check-runs` endpoint wraps results in a
+        // {total_count, check_runs: [...]} envelope. Pin that we
+        // project to just the run list — anything else (like
+        // returning the whole envelope) and the merger can't
+        // typecheck against GhCheck.
+        let json = serde_json::json!({
+            "total_count": 2,
+            "check_runs": [
+                {"name": "cargo fmt --check", "status": "completed", "conclusion": "success"},
+                {"name": "cargo test (windows-latest)", "status": "in_progress", "conclusion": null},
+            ]
+        });
+        let runs = airc_lib::gh_client::parse_check_runs(json.to_string().as_bytes())
+            .expect("envelope parses");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].name.as_deref(), Some("cargo fmt --check"));
+        assert_eq!(runs[1].conclusion.as_deref(), None);
+        assert_eq!(runs[1].status.as_deref(), Some("in_progress"));
     }
 }

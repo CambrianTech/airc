@@ -29,9 +29,12 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 pub use airc_lib::gh_client::{
-    parse_pr_url, parse_pr_view, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
-    PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+    parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt,
+    PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
 };
+// parse_check_runs is only used inside merger's #[cfg(test)] block — accessed
+// via the airc_lib path there to avoid a "unused re-export" lint in non-test
+// builds. The shell impl above uses the same path directly.
 
 /// Default [`GhClient`] backed by spawning `gh` as a subprocess.
 ///
@@ -127,6 +130,27 @@ impl GhClient for ShellGhClient {
             return Err(classify_gh_failure(&output));
         }
         Ok(())
+    }
+
+    async fn branch_check_rollup(
+        &self,
+        args: BranchCheckRollupArgs,
+    ) -> Result<Vec<GhCheck>, GhError> {
+        // Card d5b7b07d: REST `/check-runs` for the integration branch's
+        // HEAD. `--paginate` so a workflow with >30 checks doesn't
+        // silently lose the failing ones to pagination. The REST shape
+        // is {total_count, check_runs:[...]}; parse_check_runs in
+        // airc-lib projects to just the run list.
+        let path = format!("repos/{}/commits/{}/check-runs", args.repo, args.branch);
+        let output = Command::new("gh")
+            .args(["api", "--paginate", &path])
+            .output()
+            .await
+            .map_err(map_spawn_error)?;
+        if !output.status.success() {
+            return Err(classify_gh_failure(&output));
+        }
+        airc_lib::gh_client::parse_check_runs(&output.stdout)
     }
 }
 

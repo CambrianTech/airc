@@ -128,6 +128,16 @@ pub trait GhClient: Send + Sync {
     /// supplied `base` ref. Workaround for the Projects-classic
     /// deprecation that breaks `gh pr edit --base` (card 3bf62fbb).
     async fn pr_edit_base(&self, args: PrEditBaseArgs) -> Result<(), GhError>;
+
+    /// `gh api repos/{owner}/{repo}/commits/{branch}/check-runs`.
+    /// Card d5b7b07d — fetches the check-run rollup for an arbitrary
+    /// branch's HEAD so the merger can implement the
+    /// strictly-less-red-than-base doctrine (failures inherited from
+    /// the integration branch don't block per-PR gates).
+    async fn branch_check_rollup(
+        &self,
+        args: BranchCheckRollupArgs,
+    ) -> Result<Vec<GhCheck>, GhError>;
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +170,14 @@ pub struct PrEditBaseArgs {
     pub repo: String,
     pub number: u64,
     pub base: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchCheckRollupArgs {
+    pub repo: String,
+    /// Branch name (e.g. `"rust-rewrite"`). Resolved by gh against
+    /// `repos/{owner}/{repo}/commits/{branch}/check-runs`. Card d5b7b07d.
+    pub branch: String,
 }
 
 /// `gh pr view --json state,mergeable,statusCheckRollup` shape.
@@ -203,6 +221,22 @@ pub struct MergeReceipt {
 /// schema round-trip is pinned in tests.
 pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
     Ok(serde_json::from_slice(json)?)
+}
+
+/// Decode `gh api /repos/.../check-runs` (REST shape) into the same
+/// [`GhCheck`] type the merger uses for PR rollups. Pure — synthetic
+/// JSON in, typed values out. The REST endpoint wraps results in
+/// `{total_count, check_runs: [...]}`; we project to just the run
+/// list since the merger doesn't care about pagination metadata.
+/// Card d5b7b07d.
+pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        check_runs: Vec<GhCheck>,
+    }
+    let env: Envelope = serde_json::from_slice(json)?;
+    Ok(env.check_runs)
 }
 
 /// Extract the PR URL + number from `gh pr create`'s plain-text
