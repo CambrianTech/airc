@@ -1253,13 +1253,14 @@ mod tests {
         );
     }
 
-    /// Card 8384cc18 Sub-B — the final schema no longer enforces the
-    /// singleton `CHECK (id = 1)`. Store APIs still load the default row
-    /// until Sub-C/Sub-D add agent-name lookup and init surfaces, but
-    /// the database must now accept a second agent row so those slices
-    /// have a schema to target.
+    /// Card 8384cc18 Sub-D — the API write path
+    /// (`insert_local_identity`) accepts a second agent row, not just
+    /// raw ActiveModel inserts. Sister of
+    /// `local_identity_schema_accepts_a_second_agent_row` below
+    /// (Sub-B), which proves the SCHEMA accepts via raw insert; this
+    /// proves the API path round-trips end-to-end.
     #[tokio::test]
-    async fn local_identity_schema_accepts_a_second_agent_row() {
+    async fn local_identity_api_inserts_a_second_agent_row() {
         let store = SqliteEventStore::in_memory().await.unwrap();
         let store_api: &dyn EventStore = &store;
         store_api
