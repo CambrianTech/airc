@@ -723,6 +723,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 }
             },
+            WorkAction::Merge { card_id, dry_run } => {
+                work_commands::run_merge(&home, card_id, dry_run).await
+            }
         },
 
         Command::Lane(args) => match args.action {
