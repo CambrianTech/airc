@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod account_registry;
+pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
 mod broadcast_deduper;
