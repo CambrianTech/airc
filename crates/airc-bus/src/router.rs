@@ -307,6 +307,26 @@ impl EventRouter {
         }
     }
 
+    /// **Card 7d5b6a65.** Return the cursor of the most-recent envelope
+    /// in the channel's ring snapshot, or `None` if the channel has not
+    /// yet received any envelope.
+    ///
+    /// Callers use this to implement "subscribe from the live edge":
+    /// pass the returned cursor as `from_cursor` to [`Self::subscribe`]
+    /// and the deep-replay + ring-snapshot legs return empty (their
+    /// `is_after` predicate filters them out), so the subscriber gets
+    /// only events published strictly after the call. This is the
+    /// agent-Monitor live-tail shape — the `AttachRequest::from_now`
+    /// flag.
+    pub fn head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        let n = self.inner.shards.len();
+        let idx = (channel.0.as_u128() % n as u128) as usize;
+        let shard = &self.inner.shards[idx];
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .and_then(|state| state.ring.newest_cursor())
+    }
+
     /// Subscribe (§4 subscribe, §3.5 cursor contract).
     ///
     /// Returns a stream that yields **every** envelope on the filter strictly

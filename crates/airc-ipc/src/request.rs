@@ -153,9 +153,44 @@ pub struct AttachRequest {
     pub channel: Option<airc_core::RoomId>,
     /// Resume strictly after this cursor before going live — replay the
     /// gap the client missed while detached, then continue live with no
-    /// duplicate at the seam. `None` starts from the live edge.
+    /// duplicate at the seam.
+    ///
+    /// `None` historically meant "give me everything from the beginning
+    /// of the transcript" (despite the prior docstring claiming "live
+    /// edge"). Card 7d5b6a65 splits intent: pair `from: None` with
+    /// `from_now: true` for "skip backlog, just go live," and pair it
+    /// with `from_now: false` for the legacy full-backlog behavior.
+    /// Existing callers that omit `from_now` keep the prior shape (no
+    /// behavior change on the wire for pre-card-7d5b6a65 clients).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<IpcCursor>,
+    /// **Card 7d5b6a65.** When `true`, the daemon overrides any `from`
+    /// value with the current head cursor at attach time — the client
+    /// gets no backlog at all, only events published strictly after
+    /// the attach call returns. This is the agent-Monitor live-tail
+    /// shape (the existing `from: None` behaviour replayed days of
+    /// transcript and fired one notification per historical event).
+    ///
+    /// Default `false` preserves the prior `from: None` = full-replay
+    /// behaviour for tools that depend on it (audit, replay,
+    /// codex-hook poll's first-attach catch-up).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_now: bool,
+    /// **Card 7d5b6a65.** When `true`, the daemon emits ONE
+    /// [`Response::AttachCursorAdvanced`] summary frame at the end of
+    /// the backlog catch-up phase instead of streaming each historical
+    /// event individually, then transitions to live tail. Live events
+    /// still arrive one-at-a-time as before.
+    ///
+    /// Has no effect when there is no backlog to coalesce
+    /// (`from_now: true` or `from` already at head). Has no effect on
+    /// live events — only on the catch-up phase.
+    ///
+    /// Default `false` preserves the prior event-by-event replay so
+    /// audit/replay tools that need to see every historical envelope
+    /// keep working unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub coalesce_backlog: bool,
     /// If set, only these kinds are delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<IpcKind>>,
@@ -168,6 +203,11 @@ pub struct AttachRequest {
     /// all; consumers scope by their `forge.*` projection headers.
     #[serde(default)]
     pub headers: HeaderFilter,
+}
+
+#[inline]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Parameters for `AddPeer`. `pubkey_b64` is the URL-safe-no-padding
