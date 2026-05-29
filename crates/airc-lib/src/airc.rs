@@ -35,6 +35,7 @@ use airc_trust as peers_store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::adapter::{AdapterRegistry, ConsumerAdapter, RegistryError};
 use crate::broadcast_deduper::BroadcastDeduper;
 use crate::error::AircError;
 use crate::join_context::JoinContext;
@@ -194,6 +195,13 @@ pub(crate) struct AircInner {
     /// store is also forwarded here so consumers tailing via
     /// [`Airc::subscribe`] see it immediately.
     pub(crate) live_tx: broadcast::Sender<Arc<TranscriptEvent>>,
+    /// Card df92581a Sub-2 — consumer adapter registry. The
+    /// dispatch task spawned at `Airc::open` consumes from
+    /// [`Self::live_tx`] and routes envelopes whose `airc.body_hint`
+    /// matches a registered adapter into that adapter's
+    /// `on_envelope`. Registrations land via
+    /// [`Airc::register_adapter`].
+    pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Event IDs this Airc instance has already broadcast via
     /// [`live_tx`]. Consulted by the wire subscriber to avoid
     /// double-delivering a send that was already broadcast in-process
@@ -392,8 +400,9 @@ impl Airc {
                 .map_err(|e| AircError::Crypto(e.to_string()))?;
         }
         let (live_tx, _) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
+        let adapter_registry = Arc::new(AdapterRegistry::new());
 
-        Ok(Self {
+        let this = Self {
             inner: Arc::new(AircInner {
                 wire_root,
                 home,
@@ -419,11 +428,64 @@ impl Airc {
                 webrtc_incoming_track_handler: Mutex::new(None),
                 webrtc_incoming_tracks: IncomingTrackRegistry::default(),
                 live_tx,
+                adapter_registry: adapter_registry.clone(),
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                     RECENTLY_BROADCAST_CAPACITY,
                 )),
             }),
-        })
+        };
+        // Card df92581a Sub-2: spawn the dispatch loop. Subscribes to
+        // live_tx and routes every envelope into the registry. When
+        // the Airc instance is dropped, live_tx is dropped, the
+        // receiver returns Closed, the task exits — no leaked
+        // background work, no abort handle to manage.
+        let mut rx = this.inner.live_tx.subscribe();
+        let registry_for_task = adapter_registry;
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(envelope) => {
+                        // The registry returns Ok(false) when no
+                        // adapter claims the body_hint — silent
+                        // drop is correct (consumer isn't enrolled
+                        // yet). An adapter's on_envelope Err is
+                        // logged but doesn't kill the loop — one
+                        // bad consumer mustn't take down the
+                        // substrate (V4 in the integration test).
+                        match registry_for_task.dispatch((*envelope).clone()).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!(
+                                    "airc: adapter dispatch failed for envelope \
+                                     {event_id} (lamport={lamport}): {error}",
+                                    event_id = envelope.event_id,
+                                    lamport = envelope.lamport,
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Slow dispatch can fall behind a busy
+                        // live_tx. The substrate's contract is
+                        // at-least-once-from-store; a lag here
+                        // means the adapter missed a window of
+                        // events that will be re-delivered on the
+                        // next subscribe-from-store path. Log so
+                        // the operator can see it.
+                        eprintln!(
+                            "airc: adapter dispatch lagged by {skipped} events — \
+                             consumer is slow; events will be re-delivered via the \
+                             store-replay path"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Airc dropped — sender gone. Exit cleanly.
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(this)
     }
 
     /// Record `event_id` as broadcast in-process so the wire
@@ -847,6 +909,10 @@ impl Airc {
             webrtc_incoming_track_handler: Mutex::new(None),
             webrtc_incoming_tracks: IncomingTrackRegistry::default(),
             live_tx: self.inner.live_tx.clone(),
+            // Card df92581a Sub-2: share the same registry — the
+            // attach-daemon variant of Airc routes envelopes
+            // through the same dispatch task spawned at open().
+            adapter_registry: self.inner.adapter_registry.clone(),
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
             )),
@@ -1221,6 +1287,52 @@ impl Airc {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    /// Card df92581a Sub-2 — register a consumer adapter. After this
+    /// returns Ok, the dispatch task spawned at `Airc::open` routes
+    /// every inbound envelope whose `airc.body_hint` matches the
+    /// adapter's `body_hint()` into the adapter's `on_envelope`.
+    ///
+    /// Errors mirror [`AdapterRegistry::register`]: duplicate names
+    /// and duplicate body_hints are refused, never silently overwritten.
+    /// Consumers that need to swap an adapter call
+    /// [`Self::deregister_adapter`] first.
+    pub fn register_adapter(&self, adapter: Arc<dyn ConsumerAdapter>) -> Result<(), RegistryError> {
+        self.inner.adapter_registry.register(adapter)
+    }
+
+    /// Card df92581a Sub-2 — remove an adapter by name. Used by
+    /// consumers swapping a long-running adapter for a new instance
+    /// without restarting the substrate. Returns `Ok(None)` for an
+    /// unregistered name (idempotent).
+    pub fn deregister_adapter(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<Arc<dyn ConsumerAdapter>>, RegistryError> {
+        self.inner.adapter_registry.deregister(name)
+    }
+
+    /// Snapshot read of the adapter registry. Returned `Arc` shares
+    /// state with the live registry; the dispatch task reads through
+    /// it on every inbound envelope.
+    pub fn adapter_registry(&self) -> Arc<AdapterRegistry> {
+        self.inner.adapter_registry.clone()
+    }
+
+    /// Test-only helper that emits an envelope directly into the
+    /// live stream the dispatch task subscribes to. Production paths
+    /// (transport.rs, lifecycle.rs, messaging.rs) feed live_tx via
+    /// the existing append/broadcast flow; this helper short-
+    /// circuits to that same stream so the dispatch wire's
+    /// integration tests can run without spinning up a real
+    /// transport.
+    #[doc(hidden)]
+    pub async fn emit_for_dispatch_test(
+        &self,
+        envelope: Arc<TranscriptEvent>,
+    ) -> Result<(), broadcast::error::SendError<Arc<TranscriptEvent>>> {
+        self.inner.live_tx.send(envelope).map(|_| ())
     }
 }
 
