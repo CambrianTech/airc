@@ -350,6 +350,60 @@ fn codex_hook_installer_replaces_existing_managed_hook_command() {
 }
 
 #[test]
+fn codex_hook_installer_adds_turn_contract_when_unset() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(codex_home.join("config.toml"), "[features]\n").expect("write config");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "install-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    assert!(config.contains("AIRC-CODEX-INSTRUCTIONS-START"));
+    assert!(config.contains("developer_instructions"));
+    assert!(config.contains("airc codex-hook poll --wait-ms 1000"));
+    assert!(config.contains("hooks = true"));
+}
+
+#[test]
+fn codex_hook_installer_preserves_custom_developer_instructions() {
+    let workspace = TempDir::new().expect("tempdir");
+    let home = workspace.path().join("airc");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "developer_instructions = \"custom contract\"\n",
+    )
+    .expect("write config");
+
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "install-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    assert!(config.contains("developer_instructions = \"custom contract\""));
+    assert!(!config.contains("AIRC-CODEX-INSTRUCTIONS-START"));
+    assert!(!config.contains("airc codex-hook poll --wait-ms 1000"));
+    assert!(config.contains("hooks = true"));
+}
+
+#[test]
 fn codex_hook_installer_removes_managed_filesystem_profile() {
     let workspace = TempDir::new().expect("tempdir");
     let home = workspace.path().join("airc");

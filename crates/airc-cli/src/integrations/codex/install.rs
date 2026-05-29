@@ -52,9 +52,9 @@ pub fn install_hooks_at(
             hooks_json.display()
         ));
     }
-    if config::remove_managed_developer_instructions(&config)? {
+    if config::upsert_managed_developer_instructions(&config)? {
         report.push(format!(
-            "removed legacy AIRC Codex polling instructions from {}",
+            "installed AIRC Codex turn contract in {}",
             config.display()
         ));
     }
@@ -88,6 +88,9 @@ pub async fn run_uninstall_hooks(
             "removed AIRC UserPromptSubmit hook from {}",
             hooks_json.display()
         );
+    }
+    if config::remove_managed_developer_instructions(&config)? {
+        println!("removed AIRC Codex turn contract from {}", config.display());
     }
     Ok(())
 }
