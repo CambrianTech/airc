@@ -268,4 +268,90 @@ mod tests {
         let err = classify_gh_failure(&output_with_stderr("something went sideways"));
         assert!(matches!(err, GhError::GhExited { .. }));
     }
+
+    // ------------------------------------------------------------------
+    // Card 00e3aa39 — measurement establishing the gh-CLI-spawn perf gap.
+    //
+    // The boundary perf audit (#1077 / #1078 / #1079) found that the
+    // substrate's pure-data paths are already fast. The real
+    // user-visible latency lives at the gh boundary: every merger
+    // tick spawns gh 1+N times (N = Review-state cards with PRs),
+    // each ~500-600ms wall-clock.
+    //
+    // This benchmark MEASURES the gap end-to-end so a future
+    // ReqwestGhClient impl has a concrete baseline to beat. Marked
+    // `#[ignore]` because it hits the live GitHub API and depends on
+    // `gh auth status` succeeding on the runner — not appropriate
+    // for CI, but exactly what a perf reviewer wants to run by hand
+    // (`cargo test ... --release --ignored -- --nocapture`).
+    //
+    // The expected delta:
+    //   ShellGhClient::branch_check_rollup → ~500-600ms
+    //   Direct REST GET via HTTP/2 keep-alive → ~80-120ms (4-7×)
+    //
+    // The implementation card (00e3aa39 main scope) adds the
+    // ReqwestGhClient impl; this bench is its acceptance criterion.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "card 00e3aa39: hits live GitHub API; run manually with --ignored to measure the gh-CLI-spawn perf gap"]
+    async fn bench_branch_check_rollup_against_live_github() {
+        // Establishes the baseline for the ReqwestGhClient
+        // follow-up. Runs branch_check_rollup against
+        // CambrianTech/airc's rust-rewrite branch a small number of
+        // times so the operator can read the per-call cost off the
+        // printed timing.
+        let client = ShellGhClient::new();
+        let args = BranchCheckRollupArgs {
+            repo: "CambrianTech/airc".to_string(),
+            branch: "rust-rewrite".to_string(),
+        };
+
+        // Warmup so the first-call DNS / TLS handshake doesn't skew
+        // the measured cost. The gh binary has its own auth cache,
+        // so this also primes that.
+        let _ = client.branch_check_rollup(args.clone()).await;
+
+        const ITERS: u32 = 5;
+        let mut total = std::time::Duration::ZERO;
+        let mut sample_count = 0usize;
+        for i in 0..ITERS {
+            let start = std::time::Instant::now();
+            let result = client.branch_check_rollup(args.clone()).await;
+            let elapsed = start.elapsed();
+            total += elapsed;
+            match result {
+                Ok(runs) => {
+                    sample_count = runs.len();
+                    eprintln!(
+                        "card 00e3aa39: ShellGhClient.branch_check_rollup #{i} → \
+                         {elapsed:?} ({} check runs)",
+                        runs.len()
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "card 00e3aa39: ShellGhClient.branch_check_rollup #{i} \
+                         FAILED in {elapsed:?}: {error}"
+                    );
+                }
+            }
+        }
+        let avg = total / ITERS;
+        eprintln!(
+            "card 00e3aa39: ShellGhClient AVERAGE over {ITERS} calls: {avg:?} \
+             ({sample_count} runs/call). \
+             Goal for the ReqwestGhClient follow-up: < {} ms/call.",
+            avg.as_millis() / 4
+        );
+
+        // Coarse floor: if a single call somehow climbs above 5s
+        // we want to know (catastrophic regression — likely network
+        // hung). The honest baseline is ~500ms; the floor is loose
+        // enough to survive slow runners.
+        assert!(
+            avg.as_secs() < 5,
+            "ShellGhClient regressed to {avg:?} per call — investigate"
+        );
+    }
 }
