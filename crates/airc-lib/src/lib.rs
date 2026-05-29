@@ -60,6 +60,7 @@ pub mod room;
 pub mod route;
 mod stream;
 pub mod subscriptions;
+pub mod task_negotiation;
 mod time;
 mod transport;
 mod udp;
@@ -130,6 +131,9 @@ pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,
+};
+pub use task_negotiation::{
+    HEADER_AIRC_TASK_ACCEPTED, HEADER_AIRC_TASK_OFFER, HEADER_AIRC_TASK_REQUEST,
 };
 pub use webrtc_media::{
     IncomingTrack, IncomingTrackHandler, OpenedWebRtcConnection, OutgoingAudioTrack,
