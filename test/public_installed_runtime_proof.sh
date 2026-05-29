@@ -290,19 +290,13 @@ MONITOR_MESSAGE="monitor public proof $(date +%s)"
 start_monitor_for_scope "$OPENCLAW_REPO" "$OPENCLAW_SCOPE" "$ROOT/monitor.out" "$ROOT/monitor.err"
 send_general_from_continuum "$MONITOR_MESSAGE" "$ROOT/monitor-msg.out" "$ROOT/monitor-msg.err"
 
-# KNOWN GAP — card e51ab14e (arch(daemon): machine-singular daemon —
-# consolidate per-project sockets). `default_socket_path_in`
-# (crates/airc-cli/src/cli.rs:183) gives every project scope its own
-# daemon socket; openclaw's daemon never sees continuum's published
-# msg as a live event. Point-in-time delivery via the shared
-# coordinator store works (proven above by `events list`); live
-# cross-daemon fan-out does not. Two paths to fix: machine-singular
-# daemon socket, OR a shared-store tail in the daemon's wire-tail
-# loop. Card e51ab14e takes the former.
-#
-# Until that card lands, this assertion is documented-skipped — NOT
-# silently dropped. Remove the `if false` once e51ab14e closes.
-if false && ! wait_for_file_text "$ROOT/monitor.out" "$MONITOR_MESSAGE"; then
+# Cross-daemon live delivery — re-enabled when card e51ab14e closed
+# the per-project daemon socket gap. `default_socket_path_in`
+# (crates/airc-cli/src/cli.rs:183) now consolidates every project
+# scope under $HOME onto the same machine-singular daemon socket,
+# so openclaw's monitor and continuum's msg-sender share the same
+# daemon → live events propagate without a shared-store tail.
+if ! wait_for_file_text "$ROOT/monitor.out" "$MONITOR_MESSAGE"; then
   echo "--- monitor stdout ---" >&2
   cat "$ROOT/monitor.out" >&2 || true
   echo "--- monitor stderr ---" >&2

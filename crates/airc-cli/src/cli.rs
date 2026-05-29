@@ -160,10 +160,28 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 /// file needed.
 ///
 /// Resolution:
-///   - Project-scoped home (parent is a git working tree):
-///     `<runtime-dir>/airc-<project-hash>-v<N>.sock`
-///   - Machine-account home (`~/.airc/` directly):
-///     `<runtime-dir>/airc-machine-v<N>.sock` (one per user)
+///   - Machine-account scope (machine_account_home resolves under
+///     `$HOME` — i.e., this scope shares a daemon with every other
+///     project scope on the same OS account):
+///     `<runtime-dir>/airc-machine-v<N>.sock` (ONE per user, per the
+///     `state.rs:36` doctrine "one daemon per machine account").
+///   - Isolated scope (CI temp dir, test root — machine_account_home
+///     equals the scope itself because the scope is outside `$HOME`):
+///     `<runtime-dir>/airc-<project-hash>-v<N>.sock` so parallel
+///     isolated runs do not collide on the same daemon socket.
+///
+/// **Card e51ab14e**: this is the consolidation of the per-project
+/// socket from card 7e88c34d / PR #1040. PR #1040 solved
+/// agents-in-one-project-find-the-same-socket via project hashing,
+/// but applied the same hashing to project scopes on the SAME OS
+/// account, which gave each project its own daemon and broke
+/// cross-scope live event delivery (see card e51ab14e body, and
+/// `crates/airc-daemon/src/state.rs:36-37`). The fix keeps PR #1040's
+/// runtime-dir resolution unchanged, but consolidates project scopes
+/// under `$HOME` onto the machine-singular socket name. Isolated
+/// scopes outside `$HOME` (the case the project-hash was originally
+/// solving for) keep the per-project name so parallel test runs
+/// don't collide.
 ///
 /// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]:
 ///   `$AIRC_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/airc` → `$TMPDIR/airc`
@@ -182,26 +200,132 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 /// compatible for old binaries.
 pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
     let machine_home = airc_lib::machine_account_home(home);
-    let socket_name = if home == machine_home {
-        // Machine-account home — one daemon per user.
-        format!("airc-machine-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION)
-    } else {
-        // Project-scoped home — its parent is the git working tree.
-        let project_root = home.parent().unwrap_or(home);
-        match crate::runtime_dir::project_socket_path(project_root) {
-            Ok(path) => return path,
-            Err(_) => {
-                // Runtime dir unreachable; fall through to legacy
-                // home-private path so daemon still binds.
-                return machine_home
-                    .join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
-            }
-        }
-    };
-    match crate::runtime_dir::runtime_dir() {
-        Ok(dir) => dir.join(socket_name),
-        Err(_) => machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION)),
+    let user_home = read_user_home_from_env();
+    let runtime_dir = crate::runtime_dir::runtime_dir().ok();
+    let project_socket = home
+        .parent()
+        .map(|root| crate::runtime_dir::project_socket_path(root).ok())
+        .unwrap_or(None);
+    resolve_socket_path(
+        home,
+        &machine_home,
+        user_home.as_deref(),
+        runtime_dir.as_deref(),
+        project_socket,
+    )
+}
+
+/// Pure-function variant of [`default_socket_path_in`] for tests +
+/// callers that need to inject the env directly. Production code goes
+/// through [`default_socket_path_in`] which reads env once and
+/// delegates here; tests bypass env entirely so they don't race with
+/// `cargo test`'s parallel pool (env mutation is unsound under
+/// concurrent reads — Rust 1.80+ marks `set_var` `unsafe` for this
+/// reason).
+///
+/// - `home`: the scope's home directory (the caller's `--home` /
+///   `AIRC_HOME` / resolved default).
+/// - `machine_home`: result of [`airc_lib::machine_account_home`]
+///   for `home` (equals `home` when scope is outside the user account,
+///   `$HOME/.airc` when scope is under it).
+/// - `user_home`: the OS user-home directory (`$HOME` /
+///   `$USERPROFILE`). `None` ⇒ treat every scope as isolated.
+/// - `runtime_dir`: result of [`crate::runtime_dir::runtime_dir`].
+///   `None` ⇒ the legacy home-private fallback.
+/// - `project_socket`: result of
+///   [`crate::runtime_dir::project_socket_path`] for the scope's
+///   project root. Only consulted when the scope is isolated.
+fn resolve_socket_path(
+    home: &std::path::Path,
+    machine_home: &std::path::Path,
+    user_home: Option<&std::path::Path>,
+    runtime_dir: Option<&std::path::Path>,
+    project_socket: Option<PathBuf>,
+) -> PathBuf {
+    // `machine_account_home(scope_home)` returns `$HOME/.airc` when
+    // scope_home is under `$HOME`, otherwise returns scope_home
+    // unchanged. So if `machine_home != home` here, the scope IS
+    // a project scope under `$HOME` — share the machine-singular
+    // socket with every other such scope on this OS account. If
+    // `machine_home == home`, two distinct cases:
+    //   (a) `home` IS literally `$HOME/.airc` — already
+    //       machine-singular; share.
+    //   (b) `home` is outside `$HOME` (CI temp dir, test root) —
+    //       isolated; use the per-project socket so parallel
+    //       isolated scopes don't collide.
+    let is_machine_account_scope =
+        machine_home != home || path_starts_with(machine_home, user_home);
+    let legacy_fallback =
+        machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
+    if is_machine_account_scope {
+        // Hash the user-home into the socket NAME so distinct OS user
+        // accounts (different `$HOME` values) get distinct sockets in a
+        // shared `runtime_dir`. Real users on the same machine see
+        // different home dirs → different sockets → independent daemons,
+        // which is what "one daemon per machine account" means. As a
+        // side benefit, tests that override `HOME=<tempdir>` for state
+        // isolation get unique sockets too, with no test-side changes
+        // required — implicit isolation becomes explicit.
+        let account_key = user_home
+            .map(machine_account_key)
+            .unwrap_or_else(|| machine_account_key(machine_home));
+        let socket_name = format!(
+            "airc-machine-{}-v{}.sock",
+            account_key,
+            airc_ipc::IPC_PROTOCOL_VERSION
+        );
+        return runtime_dir
+            .map(|dir| dir.join(&socket_name))
+            .unwrap_or(legacy_fallback);
     }
+    // Isolated scope (CI temp, test root outside `$HOME`): per-project
+    // socket so multiple isolated tests can run in parallel without
+    // colliding on the same daemon.
+    project_socket.unwrap_or(legacy_fallback)
+}
+
+fn read_user_home_from_env() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+            } else {
+                None
+            }
+        })
+        .map(PathBuf::from)
+}
+
+/// 16-char hex prefix of SHA-256(canonical(path)). Used to namespace
+/// the machine-singular socket by the OS user account so distinct
+/// users on the same machine + tempdir-isolated tests + parallel CI
+/// scopes all get distinct sockets in a shared `runtime_dir`. Same
+/// hashing scheme as [`crate::runtime_dir::project_socket_path`] /
+/// `discovery::project_key` for consistency.
+fn machine_account_key(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let digest = Sha256::digest(canon.as_os_str().as_encoded_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(16);
+    for b in &digest[..8] {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// `Path::starts_with` with canonicalization on both sides + a tolerant
+/// fallback when one side fails to canonicalize (test paths that don't
+/// exist yet). Used by [`resolve_socket_path`] to test "this scope is
+/// inside the OS user account."
+fn path_starts_with(path: &std::path::Path, base: Option<&std::path::Path>) -> bool {
+    let Some(base) = base else {
+        return false;
+    };
+    let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let normalized_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    normalized_path.starts_with(&normalized_base)
 }
 
 /// AIRC substrate CLI.
@@ -656,6 +780,130 @@ mod tests {
             rendered.contains(&format!("v{}", airc_ipc::IPC_PROTOCOL_VERSION)),
             "socket endpoint must include IPC protocol version to avoid stale daemon protocol reuse: {rendered}"
         );
+    }
+
+    /// Card e51ab14e: every project scope under the same OS user
+    /// account resolves to the SAME daemon socket. This is the doctrine
+    /// "one daemon per machine account" from `airc-daemon/src/state.rs:36`,
+    /// the missing-piece consolidation of PR #1040's per-project
+    /// hashing.
+    ///
+    /// Without this guarantee the cross-scope live-event delivery
+    /// proven in `test/public_installed_runtime_proof.sh` fails:
+    /// openclaw's daemon never sees continuum's published msg as a
+    /// live event because they were two different daemons.
+    ///
+    /// Test injects synthetic env via [`resolve_socket_path`] rather
+    /// than mutating `$HOME` — env mutation under `cargo test`'s
+    /// parallel pool races with sibling tests that read it.
+    #[test]
+    fn project_scopes_under_user_home_share_one_daemon_socket() {
+        use super::resolve_socket_path;
+        let user_home = std::path::PathBuf::from("/synthetic/user-home");
+        let runtime_dir = std::path::PathBuf::from("/synthetic/runtime");
+        let machine_home = user_home.join(".airc");
+        let project_a = user_home.join("continuum").join(".airc");
+        let project_b = user_home.join("openclaw").join(".airc");
+
+        let socket_a = resolve_socket_path(
+            &project_a,
+            &machine_home,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            // project_socket is irrelevant for machine-account scopes;
+            // pass a distinct value per call to assert we don't accidentally
+            // fall through to it.
+            Some(runtime_dir.join("airc-project-a-v0.sock")),
+        );
+        let socket_b = resolve_socket_path(
+            &project_b,
+            &machine_home,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            Some(runtime_dir.join("airc-project-b-v0.sock")),
+        );
+
+        assert_eq!(
+            socket_a, socket_b,
+            "project scopes under the same OS user account must \
+             share one daemon socket per state.rs:36 doctrine; \
+             socket_a={socket_a:?} socket_b={socket_b:?}"
+        );
+        let rendered = socket_a.to_string_lossy();
+        assert!(
+            rendered.contains("airc-machine-"),
+            "machine-account scopes must use the machine-singular \
+             socket name 'airc-machine-<account-hash>-v<N>.sock', got: {rendered}"
+        );
+    }
+
+    /// Card e51ab14e: scopes OUTSIDE the OS user account (CI temp
+    /// roots, isolated test trees) keep their per-project socket so
+    /// parallel test runs do not collide on the same daemon. This
+    /// preserves PR #1040's original guarantee for the case it was
+    /// solving for.
+    #[test]
+    fn isolated_scopes_outside_user_home_keep_per_project_sockets() {
+        use super::resolve_socket_path;
+        let user_home = std::path::PathBuf::from("/synthetic/user-home");
+        let runtime_dir = std::path::PathBuf::from("/synthetic/runtime");
+        // Two isolated scopes that are NOT under user_home. For each,
+        // `machine_account_home` would return the scope itself
+        // (production behaviour). Pass the same here.
+        let scope_a = std::path::PathBuf::from("/synthetic/isolated/a/.airc");
+        let scope_b = std::path::PathBuf::from("/synthetic/isolated/b/.airc");
+        let project_socket_a = runtime_dir.join("airc-isolated-a-v0.sock");
+        let project_socket_b = runtime_dir.join("airc-isolated-b-v0.sock");
+
+        let socket_a = resolve_socket_path(
+            &scope_a,
+            &scope_a,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            Some(project_socket_a.clone()),
+        );
+        let socket_b = resolve_socket_path(
+            &scope_b,
+            &scope_b,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            Some(project_socket_b.clone()),
+        );
+
+        assert_ne!(
+            socket_a, socket_b,
+            "isolated scopes outside the OS user account must keep \
+             per-project sockets so parallel test runs don't collide; \
+             got the same socket for two unrelated isolated roots: \
+             {socket_a:?}"
+        );
+        assert_eq!(socket_a, project_socket_a);
+        assert_eq!(socket_b, project_socket_b);
+    }
+
+    /// Card e51ab14e: when `runtime_dir` resolution fails (`$HOME`
+    /// unset, no `$XDG_RUNTIME_DIR`, no usable `$TMPDIR`), the
+    /// machine-account path falls through to the legacy home-private
+    /// `<machine_home>/daemon-v<N>.sock` so the substrate stays
+    /// functional even in degraded environments.
+    #[test]
+    fn machine_account_scope_falls_back_to_home_private_when_runtime_dir_unavailable() {
+        use super::resolve_socket_path;
+        let user_home = std::path::PathBuf::from("/synthetic/user-home");
+        let machine_home = user_home.join(".airc");
+        let project = user_home.join("continuum").join(".airc");
+
+        let socket = resolve_socket_path(
+            &project,
+            &machine_home,
+            Some(user_home.as_path()),
+            None,
+            None,
+        );
+
+        let expected =
+            machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
+        assert_eq!(socket, expected);
     }
 }
 
