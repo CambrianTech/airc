@@ -35,6 +35,10 @@ use airc_trust as peers_store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
+
 use crate::adapter::{AdapterRegistry, ConsumerAdapter, RegistryError};
 use crate::broadcast_deduper::BroadcastDeduper;
 use crate::error::AircError;
@@ -455,11 +459,15 @@ impl Airc {
                         match registry_for_task.dispatch((*envelope).clone()).await {
                             Ok(_) => {}
                             Err(error) => {
-                                eprintln!(
-                                    "airc: adapter dispatch failed for envelope \
-                                     {event_id} (lamport={lamport}): {error}",
-                                    event_id = envelope.event_id,
-                                    lamport = envelope.lamport,
+                                StderrJsonDiagnosticSink.emit(
+                                    DiagnosticEvent::warn(
+                                        DiagnosticComponent::Adapter,
+                                        DiagnosticCode::AdapterDispatchFailed,
+                                        "adapter dispatch failed",
+                                    )
+                                    .with_field("event_id", envelope.event_id)
+                                    .with_field("lamport", envelope.lamport)
+                                    .with_field("error", error),
                                 );
                             }
                         }
@@ -472,10 +480,14 @@ impl Airc {
                         // events that will be re-delivered on the
                         // next subscribe-from-store path. Log so
                         // the operator can see it.
-                        eprintln!(
-                            "airc: adapter dispatch lagged by {skipped} events — \
-                             consumer is slow; events will be re-delivered via the \
-                             store-replay path"
+                        StderrJsonDiagnosticSink.emit(
+                            DiagnosticEvent::warn(
+                                DiagnosticComponent::Adapter,
+                                DiagnosticCode::AdapterDispatchLagged,
+                                "adapter dispatch lagged behind live_tx",
+                            )
+                            .with_field("skipped_events", skipped)
+                            .with_field("recovery", "store-replay path will re-deliver"),
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {

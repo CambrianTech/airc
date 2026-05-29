@@ -167,6 +167,7 @@ fn severity_header_value(severity: DiagnosticSeverity) -> &'static str {
 
 fn component_header_value(component: DiagnosticComponent) -> &'static str {
     match component {
+        DiagnosticComponent::Adapter => "adapter",
         DiagnosticComponent::Daemon => "daemon",
         DiagnosticComponent::Monitor => "monitor",
         DiagnosticComponent::Replay => "replay",
@@ -179,6 +180,8 @@ fn component_header_value(component: DiagnosticComponent) -> &'static str {
 
 fn code_header_value(code: DiagnosticCode) -> &'static str {
     match code {
+        DiagnosticCode::AdapterDispatchFailed => "adapter_dispatch_failed",
+        DiagnosticCode::AdapterDispatchLagged => "adapter_dispatch_lagged",
         DiagnosticCode::ConnectionError => "connection_error",
         DiagnosticCode::FrameVerificationFailed => "frame_verification_failed",
         DiagnosticCode::StoreAppendFailed => "store_append_failed",

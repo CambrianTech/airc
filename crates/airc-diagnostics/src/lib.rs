@@ -23,6 +23,12 @@ pub enum DiagnosticSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticComponent {
+    /// Card df92581a Sub-2: the consumer-adapter dispatch task that
+    /// routes inbound envelopes to registered `ConsumerAdapter`
+    /// instances. Emits when an adapter's `on_envelope` returns an
+    /// error or when the dispatch task itself lags behind a busy
+    /// `live_tx`.
+    Adapter,
     Daemon,
     Monitor,
     Replay,
@@ -35,6 +41,15 @@ pub enum DiagnosticComponent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCode {
+    /// Card df92581a Sub-2: a registered `ConsumerAdapter`'s
+    /// `on_envelope` returned an error. Non-fatal at the substrate
+    /// layer; logged so operators see consumer-side regressions.
+    AdapterDispatchFailed,
+    /// Card df92581a Sub-2: the adapter-dispatch task fell behind a
+    /// busy `live_tx` (broadcast channel lag). The skipped events
+    /// will be re-delivered via the store-replay path
+    /// (at-least-once-from-store contract).
+    AdapterDispatchLagged,
     ConnectionError,
     FrameVerificationFailed,
     StoreAppendFailed,
