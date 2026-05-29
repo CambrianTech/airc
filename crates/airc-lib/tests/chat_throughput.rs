@@ -89,10 +89,7 @@ use tempfile::TempDir;
 /// Returns `(alice, bob, _bob_home, _alice_home)` — the `TempDir`s
 /// are kept alive for the lifetime of the test by binding them in
 /// the caller's scope.
-async fn paired_airc(
-    alice_home: std::path::PathBuf,
-    bob_home: std::path::PathBuf,
-) -> (Airc, Airc) {
+async fn paired_airc(alice_home: std::path::PathBuf, bob_home: std::path::PathBuf) -> (Airc, Airc) {
     let alice = Airc::open(alice_home).await.expect("alice open");
     let bob = Airc::open(bob_home).await.expect("bob open");
 
@@ -101,7 +98,10 @@ async fn paired_airc(
     alice.add_peer(bob_spec).await.expect("alice trusts bob");
     bob.add_peer(alice_spec).await.expect("bob trusts alice");
 
-    alice.join("chat-throughput-bench").await.expect("alice join");
+    alice
+        .join("chat-throughput-bench")
+        .await
+        .expect("alice join");
     bob.join("chat-throughput-bench").await.expect("bob join");
 
     let bob_addr: SocketAddr = bob
@@ -187,18 +187,17 @@ async fn bench_chat_burst_replay_attach() {
         "forge.body_hint".to_string(),
         "forge.persona.turn.v1".to_string(),
     );
-    headers.insert(
-        "continuum.widget".to_string(),
-        "video-room".to_string(),
-    );
+    headers.insert("continuum.widget".to_string(), "video-room".to_string());
 
     let start = std::time::Instant::now();
     for i in 0..BURST {
         airc.say_with_headers(
-            &format!("burst {i}: 280-char body simulating a typical persona turn \
+            &format!(
+                "burst {i}: 280-char body simulating a typical persona turn \
                      so the realistic payload size is in the measurement; the \
                      mid-length prose mirrors what continuum's chat-widget \
-                     actually carries when a persona finishes a turn."),
+                     actually carries when a persona finishes a turn."
+            ),
             headers.clone(),
         )
         .await
