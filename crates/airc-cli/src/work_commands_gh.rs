@@ -153,6 +153,13 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
 /// repo today), and every PR landing on `main` bypasses
 /// `rust-rewrite`'s substrate work. The whole point of this card
 /// is to refuse that fallback.
+// Dead-code today because `open_pr_and_link` above does not pass
+// `--base` to `gh pr create` — substrate kink that opens every
+// auto-spawned PR against the github default branch (main) instead
+// of rust-rewrite. Wiring this in is carded as a follow-up
+// (812b5a1b) so that fix can land independently of fae3c28e's
+// review-only close-flow work.
+#[allow(dead_code)]
 pub(crate) fn pr_create_base_branch() -> &'static str {
     "rust-rewrite"
 }
