@@ -176,6 +176,29 @@ pub enum WorkAction {
         /// Recent transcript events to replay into the projection.
         #[arg(long, default_value_t = 512)]
         event_limit: usize,
+        /// Card e4cad280: idle-signal exit code. With `--check-idle`,
+        /// `airc work next` suppresses the human-readable output and
+        /// exits with status 0 when there IS claimable work for this
+        /// peer, status 1 when the board is idle for this peer.
+        /// Useful in agent-loop scripts:
+        ///
+        ///   while true; do
+        ///     if ! airc work next --check-idle; then
+        ///       # board is empty — read wall recipes + generate cards
+        ///       airc work board --json | jq '...' | generate_recipe_cards
+        ///     fi
+        ///     airc work next --limit 1 | ...
+        ///     sleep 30
+        ///   done
+        ///
+        /// The substrate provides the signal; consumers (Claude tabs,
+        /// Codex, hermes/openclaw/continuum agents, personas) decide
+        /// what to generate based on wall posts in category="recipe"
+        /// or their own goal/state. Card f4227579 / 50a2f7dd /
+        /// ea8086e5 (continuum/hermes/openclaw integration) build
+        /// the consumer-side generation loops on top of this signal.
+        #[arg(long)]
+        check_idle: bool,
     },
     /// Show agent liveness, availability, and active work claims.
     Roster {
