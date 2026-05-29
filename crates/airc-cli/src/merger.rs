@@ -133,8 +133,17 @@ async fn tick_once(
         );
     }
 
+    // Card 7ed1ac4f: snapshot `now_ms` ONCE per tick so every per-card
+    // gate sees the same wall clock. Otherwise a long-running tick
+    // (rare but possible under heavy gh latency) could promote a
+    // pending check across the timeout mid-iteration, which would be
+    // observable as "first-pass refused, second-pass accepted" on
+    // the same data — confusing, and breaks the determinism the
+    // dry-run mode promises.
+    let policy = GatePolicy::default_for_merger(now_ms());
+
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(gh, card, &baseline_failures).await? else {
+        let Some(decision) = evaluate(gh, card, &baseline_failures, policy).await? else {
             continue;
         };
         match decision {
@@ -178,6 +187,7 @@ async fn evaluate(
     gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
     baseline_failures: &std::collections::HashSet<String>,
+    policy: GatePolicy,
 ) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
     if card.state != CardState::Review {
@@ -187,7 +197,7 @@ async fn evaluate(
         return Ok(None);
     };
 
-    match check_pr_gate(gh, &pr, baseline_failures).await {
+    match check_pr_gate(gh, &pr, baseline_failures, policy).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
         Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
@@ -204,6 +214,45 @@ pub(crate) enum GateResult {
     NotReady(String),
 }
 
+/// Card 7ed1ac4f — tunable policy parameters carried into
+/// [`evaluate_gh_view`]. Kept as a plain Copy struct so the pure
+/// function stays trivially testable. The defaults
+/// ([`Self::default_for_merger`]) preserve the f16650cd / d5b7b07d
+/// behavior — pending_timeout_ms > 0 only when the CLI explicitly
+/// opts in.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GatePolicy {
+    /// Pending check age (ms) past which the gate treats the check
+    /// as "inherited from base" (CI hung, not test red). `0` =
+    /// disabled (strict pre-7ed1ac4f behavior).
+    pub(crate) pending_timeout_ms: u64,
+    /// Current time in ms-since-epoch. Injected for testability; the
+    /// IO path fills this with `SystemTime::now()`.
+    pub(crate) now_ms: u64,
+}
+
+impl GatePolicy {
+    /// Default for the continuous merger / `airc work merge` CLI:
+    /// 30-minute pending timeout. Matches the observation window
+    /// for the Windows-runner hang failure mode (3-8 min normal,
+    /// 30+ min hung). Callers override via the CLI flag.
+    pub(crate) fn default_for_merger(now_ms: u64) -> Self {
+        Self {
+            pending_timeout_ms: 30 * 60 * 1000,
+            now_ms,
+        }
+    }
+}
+
+/// Snapshot wall-clock ms — once per tick, plumbed through the gate
+/// for testable determinism.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Query `gh pr view --json statusCheckRollup,mergeable,state` and
 /// apply [`evaluate_gh_view`] to the response.
 ///
@@ -217,6 +266,7 @@ pub(crate) async fn check_pr_gate(
     gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
     baseline_failures: &std::collections::HashSet<String>,
+    policy: GatePolicy,
 ) -> Result<GateResult, crate::gh_client::GhError> {
     let view = gh
         .pr_view(crate::gh_client::PrViewArgs {
@@ -225,7 +275,7 @@ pub(crate) async fn check_pr_gate(
             cwd: None,
         })
         .await?;
-    Ok(evaluate_gh_view(&view, baseline_failures))
+    Ok(evaluate_gh_view(&view, baseline_failures, policy))
 }
 
 /// Fetch the rust-rewrite HEAD's check-run rollup and return the SET
@@ -291,9 +341,17 @@ pub(crate) fn baseline_failing_names(
 /// a FAILURE whose check name is ALSO failing on base is treated as
 /// effectively neutral (the PR didn't cause it). Pass an empty set
 /// to disable the bypass — that's the f16650cd-original strict gate.
-fn evaluate_gh_view(
+///
+/// Card 7ed1ac4f adds the pending-too-long timeout: a check still
+/// `IN_PROGRESS` / `QUEUED` after [`GatePolicy::pending_timeout_ms`]
+/// counts as inherited (CI infrastructure hang, not test red). This
+/// closes the dogfood-blocking failure mode observed in #1067+#1070
+/// where Windows runners hung for hours, refusing every PR merge
+/// indefinitely.
+pub(crate) fn evaluate_gh_view(
     view: &crate::gh_client::PrView,
     baseline_failures: &std::collections::HashSet<String>,
+    policy: GatePolicy,
 ) -> GateResult {
     if view.state != "OPEN" {
         return GateResult::NotReady(format!("PR state is {} (not OPEN)", view.state));
@@ -304,7 +362,8 @@ fn evaluate_gh_view(
     let rollup = view.status_check_rollup.as_deref().unwrap_or(&[]);
     let mut new_failures = 0usize;
     let mut inherited_failures = 0usize;
-    let mut pending = 0usize;
+    let mut active_pending = 0usize;
+    let mut timed_out_pending = 0usize;
     for c in rollup {
         match c.conclusion.as_deref() {
             Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
@@ -327,21 +386,59 @@ fn evaluate_gh_view(
             _ => {
                 // No conclusion → in flight (IN_PROGRESS / QUEUED / PENDING).
                 if c.status.as_deref() != Some("COMPLETED") {
-                    pending += 1;
+                    // Card 7ed1ac4f: a check pending longer than the
+                    // configured timeout is treated as inherited
+                    // (CI hung, not test red). 0 disables the
+                    // bypass — strict-gate behaviour for callers
+                    // that want it. Missing started_at falls into
+                    // the active-pending bucket — the fail-closed
+                    // bias: if we can't compute age, we don't bypass.
+                    let timed_out = policy.pending_timeout_ms > 0
+                        && c.started_at
+                            .as_deref()
+                            .and_then(airc_lib::gh_client::parse_iso_timestamp_ms)
+                            .map(|started| {
+                                policy.now_ms.saturating_sub(started) > policy.pending_timeout_ms
+                            })
+                            .unwrap_or(false);
+                    if timed_out {
+                        timed_out_pending += 1;
+                    } else {
+                        active_pending += 1;
+                    }
                 }
             }
         }
     }
     if new_failures > 0 {
-        let inherited_note = if inherited_failures > 0 {
-            format!(" ({inherited_failures} inherited from base, ignored)")
+        let mut notes = Vec::new();
+        if inherited_failures > 0 {
+            notes.push(format!("{inherited_failures} inherited from base, ignored"));
+        }
+        if timed_out_pending > 0 {
+            notes.push(format!(
+                "{timed_out_pending} timed-out pending, ignored (CI hung)"
+            ));
+        }
+        let note = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join("; "))
+        };
+        return GateResult::NotReady(format!("{new_failures} failing check(s){note}"));
+    }
+    if active_pending > 0 {
+        let timeout_note = if timed_out_pending > 0 {
+            format!(
+                " ({timed_out_pending} other check(s) timed-out pending, ignored \
+                 — only these {active_pending} still actively running)"
+            )
         } else {
             String::new()
         };
-        return GateResult::NotReady(format!("{new_failures} failing check(s){inherited_note}"));
-    }
-    if pending > 0 {
-        return GateResult::NotReady(format!("{pending} check(s) still running"));
+        return GateResult::NotReady(format!(
+            "{active_pending} check(s) still running{timeout_note}"
+        ));
     }
     GateResult::Green
 }
@@ -427,6 +524,17 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    /// Pending-timeout disabled + fixed clock — strict pre-7ed1ac4f
+    /// behavior. Used by all pre-7ed1ac4f tests so they keep
+    /// asserting the same shape; the new pending-timeout tests
+    /// build their own GatePolicy with a known clock.
+    fn empty_policy() -> GatePolicy {
+        GatePolicy {
+            pending_timeout_ms: 0,
+            now_ms: 0,
+        }
+    }
+
     #[test]
     fn merges_when_state_open_no_conflicts_all_checks_green() {
         let view = parse(json!({
@@ -439,7 +547,7 @@ mod tests {
             ]
         }));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::Green
         ));
     }
@@ -447,7 +555,7 @@ mod tests {
     #[test]
     fn refuses_when_pr_is_closed() {
         let view = parse(json!({"state": "CLOSED", "mergeable": "MERGEABLE"}));
-        let result = evaluate_gh_view(&view, &empty_baseline());
+        let result = evaluate_gh_view(&view, &empty_baseline(), empty_policy());
         let GateResult::NotReady(reason) = result else {
             panic!("expected NotReady, got Green");
         };
@@ -458,7 +566,7 @@ mod tests {
     fn refuses_when_pr_is_already_merged() {
         let view = parse(json!({"state": "MERGED", "mergeable": "MERGEABLE"}));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::NotReady(_)
         ));
     }
@@ -470,7 +578,9 @@ mod tests {
             "mergeable": "CONFLICTING",
             "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
+        let GateResult::NotReady(reason) =
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(
@@ -490,7 +600,9 @@ mod tests {
                 {"conclusion": "SUCCESS", "status": "COMPLETED"},
             ]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
+        let GateResult::NotReady(reason) =
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(reason.contains("failing"), "reason should mention failures");
@@ -506,7 +618,7 @@ mod tests {
             ]
         }));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::NotReady(_)
         ));
     }
@@ -521,7 +633,7 @@ mod tests {
             ]
         }));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::NotReady(_)
         ));
     }
@@ -536,7 +648,9 @@ mod tests {
                 {"conclusion": null, "status": "IN_PROGRESS"},
             ]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
+        let GateResult::NotReady(reason) =
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(
@@ -556,7 +670,7 @@ mod tests {
             "statusCheckRollup": [],
         }));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::Green
         ));
     }
@@ -568,7 +682,7 @@ mod tests {
         // the gate robust to gh CLI version drift.
         let view = parse(json!({"state": "OPEN", "mergeable": "MERGEABLE"}));
         assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline()),
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
             GateResult::Green
         ));
     }
@@ -626,7 +740,7 @@ mod tests {
         }));
         let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
         assert!(matches!(
-            evaluate_gh_view(&view, &baseline),
+            evaluate_gh_view(&view, &baseline, empty_policy()),
             GateResult::Green
         ));
     }
@@ -645,7 +759,8 @@ mod tests {
             ]
         }));
         let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline) else {
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(
@@ -666,7 +781,9 @@ mod tests {
                 {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
             ]
         }));
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline()) else {
+        let GateResult::NotReady(reason) =
+            evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(
@@ -689,21 +806,25 @@ mod tests {
                 conclusion: Some("failure".to_string()),
                 status: Some("completed".to_string()),
                 name: Some("shell syntax + rust cutover guards".to_string()),
+                started_at: None,
             },
             crate::gh_client::GhCheck {
                 conclusion: Some("FAILURE".to_string()),
                 status: Some("COMPLETED".to_string()),
                 name: Some("clean-install-linux".to_string()),
+                started_at: None,
             },
             crate::gh_client::GhCheck {
                 conclusion: Some("cancelled".to_string()),
                 status: Some("completed".to_string()),
                 name: Some("clean-install-macos".to_string()),
+                started_at: None,
             },
             crate::gh_client::GhCheck {
                 conclusion: Some("success".to_string()),
                 status: Some("completed".to_string()),
                 name: Some("cargo fmt --check".to_string()),
+                started_at: None,
             },
         ];
         let set = baseline_failing_names(&runs);
@@ -723,11 +844,13 @@ mod tests {
                 conclusion: Some("success".to_string()),
                 status: Some("completed".to_string()),
                 name: Some("cargo fmt --check".to_string()),
+                started_at: None,
             },
             crate::gh_client::GhCheck {
                 conclusion: Some("success".to_string()),
                 status: Some("completed".to_string()),
                 name: Some("cargo test (ubuntu-latest)".to_string()),
+                started_at: None,
             },
         ];
         assert!(baseline_failing_names(&runs).is_empty());
@@ -803,12 +926,174 @@ mod tests {
             ]
         }));
         let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
-        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline) else {
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy())
+        else {
             panic!("expected NotReady");
         };
         assert!(
             reason.contains("inherited from base, ignored"),
             "phrase must stay stable — `airc work merge` refusal references it: {reason}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Card 7ed1ac4f — pending-too-long timeout
+    // ------------------------------------------------------------------
+
+    /// 2026-05-29T03:29:46Z anchored in ms-since-epoch via the same
+    /// path airc_lib::gh_client::parse_iso_timestamp_ms uses.
+    /// Hand-resolving rather than calling the parser keeps the test
+    /// honest about what the policy actually compares.
+    const FIXED_STARTED_AT: &str = "2026-05-29T03:29:46Z";
+    const FIXED_STARTED_AT_MS: u64 = 1_780_025_386_000;
+
+    #[test]
+    fn pending_check_older_than_timeout_counts_as_inherited() {
+        // Card 7ed1ac4f core case: a check still IN_PROGRESS for
+        // longer than pending_timeout_ms is treated as CI-infra-
+        // hung. With everything else green, the PR merges. Mirrors
+        // the failure mode observed in #1067+#1070 where Windows
+        // runners hung for hours, refusing every PR indefinitely.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED", "name": "cargo test (ubuntu-latest)"},
+                {"conclusion": null, "status": "IN_PROGRESS",
+                 "name": "cargo test (windows-latest)",
+                 "startedAt": FIXED_STARTED_AT},
+            ]
+        }));
+        // now = started + 60min, timeout = 30min → check is 60min old, timed-out.
+        let policy = GatePolicy {
+            pending_timeout_ms: 30 * 60 * 1000,
+            now_ms: FIXED_STARTED_AT_MS + 60 * 60 * 1000,
+        };
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline(), policy),
+            GateResult::Green
+        ));
+    }
+
+    #[test]
+    fn pending_check_younger_than_timeout_still_blocks() {
+        // Within the timeout window — still pending, still blocks.
+        // The bypass is narrow: only checks past the configured
+        // wall-clock age count as "CI hung." A 5-minute pending
+        // check is still actively running.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED", "name": "cargo test (ubuntu-latest)"},
+                {"conclusion": null, "status": "IN_PROGRESS",
+                 "name": "cargo test (windows-latest)",
+                 "startedAt": FIXED_STARTED_AT},
+            ]
+        }));
+        let policy = GatePolicy {
+            pending_timeout_ms: 30 * 60 * 1000,
+            // 5 minutes in — well under the 30-min timeout.
+            now_ms: FIXED_STARTED_AT_MS + 5 * 60 * 1000,
+        };
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
+        else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("1 check(s) still running"),
+            "young pending should still block with the unchanged phrase: {reason}"
+        );
+    }
+
+    #[test]
+    fn pending_timeout_zero_keeps_strict_behavior() {
+        // Regression: setting the timeout to 0 must NOT silently
+        // bypass everything. The default-off mode is "strict gate,
+        // no infra-hang bypass" — same as the f16650cd /
+        // d5b7b07d era.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": null, "status": "IN_PROGRESS",
+                 "name": "cargo test (windows-latest)",
+                 "startedAt": FIXED_STARTED_AT},
+            ]
+        }));
+        // Even with `now` an hour past `started`, timeout=0 means
+        // no bypass — gate refuses.
+        let policy = GatePolicy {
+            pending_timeout_ms: 0,
+            now_ms: FIXED_STARTED_AT_MS + 60 * 60 * 1000,
+        };
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
+        else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("still running"),
+            "timeout=0 must refuse pending checks regardless of age: {reason}"
+        );
+    }
+
+    #[test]
+    fn new_failure_still_blocks_even_with_inherited_timeouts() {
+        // The strictness invariant: a NEW failure (not inherited
+        // from base, not a timeout) still blocks even when
+        // some other checks are inherited-from-base or timed-out
+        // pending. The bypass is per-check, not a free pass.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "cargo test (ubuntu-latest)"},
+                {"conclusion": null, "status": "IN_PROGRESS",
+                 "name": "cargo test (windows-latest)",
+                 "startedAt": FIXED_STARTED_AT},
+            ]
+        }));
+        let policy = GatePolicy {
+            pending_timeout_ms: 30 * 60 * 1000,
+            now_ms: FIXED_STARTED_AT_MS + 60 * 60 * 1000,
+        };
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
+        else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("1 failing"),
+            "real failure still surfaces even when other checks timed-out: {reason}"
+        );
+        assert!(
+            reason.contains("timed-out pending"),
+            "refusal should name the timed-out check separately so the user can see what was bypassed: {reason}"
+        );
+    }
+
+    #[test]
+    fn pending_check_without_started_at_falls_into_active_pending() {
+        // Fail-closed bias: if gh somehow returned a pending check
+        // with no `startedAt` (older check types, schema drift), we
+        // can't compute its age — therefore we MUST treat it as
+        // active-pending rather than timing it out. A permissive
+        // alternative ("no timestamp = assume old = bypass") would
+        // silently merge through any gh schema regression.
+        let view = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": null, "status": "IN_PROGRESS",
+                 "name": "cargo test (windows-latest)"},
+            ]
+        }));
+        let policy = GatePolicy {
+            pending_timeout_ms: 30 * 60 * 1000,
+            now_ms: FIXED_STARTED_AT_MS + 24 * 60 * 60 * 1000,
+        };
+        assert!(matches!(
+            evaluate_gh_view(&view, &empty_baseline(), policy),
+            GateResult::NotReady(_)
+        ));
     }
 }

@@ -807,6 +807,7 @@ pub async fn run_merge(
     home: &Path,
     card_id: String,
     dry_run: bool,
+    pending_timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::gh_client::GhClient as _;
     use airc_lib::MarkPullRequestMerged;
@@ -851,7 +852,15 @@ pub async fn run_merge(
         );
     }
 
-    match crate::merger::check_pr_gate(&gh, &pr, &baseline).await {
+    // Card 7ed1ac4f: pending-too-long timeout. Default 30 min from
+    // GatePolicy::default_for_merger; CLI flag override comes
+    // through `pending_timeout_secs` arg (0 = strict-mode bypass).
+    let policy = crate::merger::GatePolicy {
+        pending_timeout_ms: pending_timeout_secs.saturating_mul(1000),
+        now_ms: crate::merger::now_ms(),
+    };
+
+    match crate::merger::check_pr_gate(&gh, &pr, &baseline, policy).await {
         Ok(crate::merger::GateResult::Green) => {
             if dry_run {
                 println!(
