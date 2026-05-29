@@ -12,6 +12,12 @@ pub struct Model {
     pub peer_id: Uuid,
     pub pubkey_b64: String,
     pub added_at_ms: i64,
+    /// Card 34942ec1 Sub-A: trust gradient column.
+    /// Wire-string of [`crate::peer_trust::TrustTier`]. Default
+    /// "untrusted" applied at migration time so pre-Sub-A rows
+    /// keep working without a backfill pass.
+    #[sea_orm(default_value = "untrusted")]
+    pub tier: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
