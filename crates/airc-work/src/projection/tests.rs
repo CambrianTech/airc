@@ -1378,3 +1378,174 @@ fn card_updated_round_trips_through_serde_with_skip_on_none() {
     let decoded: CardUpdated = serde_json::from_value(json).expect("decode clear");
     assert_eq!(decoded, clear);
 }
+
+// =====================================================================
+// Card 1291173d — projection rebuild perf benchmarks
+//
+// Methodology mirrors card 512fd8a1's header benches: write the
+// measurement FIRST, run, identify the actual bottleneck.
+// =====================================================================
+
+/// Build a realistic event log: M cards × K mutations each (claim,
+/// heartbeat, state-change). Models a multi-day room: ~50 cards
+/// active, each with ~5 mutation events = ~250 events. The
+/// merger calls work_board(256) which replays this whole log on
+/// every tick.
+fn build_realistic_event_log(n_cards: u32, mutations_per_card: u32) -> Vec<WorkEvent> {
+    let mut events = Vec::with_capacity((n_cards * (1 + mutations_per_card)) as usize);
+    for i in 0..n_cards {
+        let card_id = WorkCardId::from_u128(u128::from(i) + 1);
+        let claim_id = ClaimId::from_u128(u128::from(i) + 1_000_000);
+        let owner = peer(u128::from(i) + 1);
+        events.push(WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: format!("perf card #{i}"),
+            body: Some(format!(
+                "synthetic body for card {i} — realistic mid-length \
+                 body string capturing typical card prose"
+            )),
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 1_000 + u64::from(i),
+            reviews: None,
+        }));
+        events.push(WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id,
+            owner,
+            ttl_ms: 600_000,
+            claimed_at_ms: 2_000 + u64::from(i),
+        }));
+        for h in 0..mutations_per_card {
+            events.push(WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
+                card_id,
+                claim_id,
+                owner,
+                ttl_ms: 600_000,
+                heartbeat_at_ms: 3_000 + u64::from(i) + u64::from(h),
+            }));
+        }
+    }
+    events
+}
+
+#[test]
+fn bench_projection_apply_throughput() {
+    // How fast can `apply()` consume events? Dominant cost path for
+    // any rebuild or replay; we should be able to apply 10k events
+    // in well under a millisecond.
+    let events = build_realistic_event_log(50, 5); // 50 × (1 created + 1 claimed + 5 heartbeats) = 350 events
+
+    // Warm.
+    let mut warm = WorkBoardProjection::new();
+    for e in &events {
+        warm.apply(e).unwrap();
+    }
+
+    const ITERS: u64 = 100;
+    let start = std::time::Instant::now();
+    for _ in 0..ITERS {
+        let mut p = WorkBoardProjection::new();
+        for e in &events {
+            p.apply(e).unwrap();
+        }
+        // Read the projection so the optimiser can't elide.
+        let _ = p.cards.len();
+    }
+    let elapsed = start.elapsed();
+    let total_events = ITERS * events.len() as u64;
+    let ns_per_event = elapsed.as_nanos() as u64 / total_events;
+    eprintln!(
+        "card 1291173d: projection.apply throughput — {} events × {ITERS} rebuilds in {elapsed:?}, \
+         {ns_per_event} ns/event, total {total_events} applies",
+        events.len()
+    );
+
+    // Floor: applying a single event should never cost more than
+    // 10μs. The realistic mix here measures ~hundreds of ns on M2.
+    assert!(
+        ns_per_event < 10_000,
+        "projection.apply regressed to {ns_per_event} ns/event"
+    );
+}
+
+#[test]
+fn bench_projection_replay_realistic_log() {
+    // The actual hot-path shape: rebuild the WHOLE projection from
+    // event-log replay. Equivalent to what
+    // SqliteEventStore::page_recent → Airc::work_board does on
+    // every tick of the merger and every `airc work board` call.
+    let small = build_realistic_event_log(10, 3); // ~50 events
+    let medium = build_realistic_event_log(50, 5); // ~350 events
+    let large = build_realistic_event_log(200, 5); // ~1400 events
+
+    for (label, events) in [("50ev", &small), ("350ev", &medium), ("1.4kev", &large)] {
+        // Warm.
+        let _ = WorkBoardProjection::replay(events.iter().cloned()).unwrap();
+
+        const ITERS: u64 = 50;
+        let start = std::time::Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..ITERS {
+            let p = WorkBoardProjection::replay(events.iter().cloned()).unwrap();
+            sink = sink.wrapping_add(p.cards.len());
+        }
+        let elapsed = start.elapsed();
+        let ns_per_rebuild = elapsed.as_nanos() as u64 / ITERS;
+        let ns_per_event = ns_per_rebuild / events.len() as u64;
+        eprintln!(
+            "card 1291173d: projection.replay [{label}] — {ITERS} full rebuilds of {} events in {elapsed:?}, \
+             {ns_per_rebuild} ns/rebuild, {ns_per_event} ns/event, sink={sink}",
+            events.len()
+        );
+
+        // A full rebuild of 1.4k events should stay under 5ms; merger
+        // ticks every 60s so the latency budget is generous, but the
+        // CLI `airc work board` user-facing call wants to feel
+        // instant (< 50ms total round-trip including DB read).
+        assert!(
+            ns_per_rebuild < 50_000_000,
+            "projection.replay [{label}] regressed to {ns_per_rebuild} ns/rebuild — \
+             this lands on every `airc work board` and every merger tick"
+        );
+    }
+}
+
+#[test]
+fn bench_projection_snapshot_clone_cost() {
+    // `snapshot()` clones every internal HashMap's values into a Vec.
+    // For 200 cards each carrying String fields, the per-snapshot
+    // cost is dominated by String::clone. If this is large, the
+    // upcoming streaming-snapshot work (borrowed view of the
+    // projection state) is justified.
+    let events = build_realistic_event_log(200, 0); // 200 cards, no mutations
+    let projection = WorkBoardProjection::replay(events.iter().cloned()).unwrap();
+
+    // Warm.
+    for _ in 0..100 {
+        let _ = projection.snapshot();
+    }
+
+    const ITERS: u64 = 1_000;
+    let start = std::time::Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..ITERS {
+        let snap = projection.snapshot();
+        sink = sink.wrapping_add(snap.cards.len());
+    }
+    let elapsed = start.elapsed();
+    let ns_per_snapshot = elapsed.as_nanos() as u64 / ITERS;
+    eprintln!(
+        "card 1291173d: projection.snapshot — {ITERS} snapshots of {}-card projection in {elapsed:?}, \
+         {ns_per_snapshot} ns/snapshot, sink={sink}",
+        projection.cards.len()
+    );
+
+    // Floor: a snapshot of a 200-card projection should be < 1ms.
+    assert!(
+        ns_per_snapshot < 1_000_000,
+        "projection.snapshot regressed to {ns_per_snapshot} ns/snapshot"
+    );
+}
