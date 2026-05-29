@@ -199,6 +199,13 @@ pub struct GhCheck {
     pub status: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// ISO-8601 timestamp gh returns for when the check started.
+    /// Used by the merger's pending-too-long timeout (card
+    /// 7ed1ac4f) to distinguish "genuinely slow CI" from "CI runner
+    /// hung." `None` when gh doesn't supply it (older check types,
+    /// future schema drift).
+    #[serde(default, rename = "startedAt")]
+    pub started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,14 +236,97 @@ pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
 /// `{total_count, check_runs: [...]}`; we project to just the run
 /// list since the merger doesn't care about pagination metadata.
 /// Card d5b7b07d.
+///
+/// REST `started_at` uses the snake_case field name (the REST API
+/// differs from the GraphQL `startedAt` here); we accept both via a
+/// custom Deserialize because [`GhCheck`] is the one struct shared
+/// across both code paths.
 pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
+    #[derive(Deserialize)]
+    struct RestRun {
+        #[serde(default)]
+        conclusion: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        started_at: Option<String>,
+    }
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
-        check_runs: Vec<GhCheck>,
+        check_runs: Vec<RestRun>,
     }
     let env: Envelope = serde_json::from_slice(json)?;
-    Ok(env.check_runs)
+    Ok(env
+        .check_runs
+        .into_iter()
+        .map(|r| GhCheck {
+            conclusion: r.conclusion,
+            status: r.status,
+            name: r.name,
+            started_at: r.started_at,
+        })
+        .collect())
+}
+
+/// Card 7ed1ac4f — parse an ISO-8601 timestamp gh returns (e.g.
+/// `"2026-05-29T03:29:44Z"`) into ms-since-epoch. Pure parser so the
+/// merger's pending-too-long policy can be unit-tested without a
+/// real clock. Returns `None` for any shape we don't recognise —
+/// callers MUST treat that as "don't know the age, can't time out"
+/// rather than "old enough to bypass," matching the fail-closed
+/// bias of the rest of the gate.
+///
+/// Hand-rolled rather than pulling in chrono just for this one
+/// parse — the gh shape is fixed (`YYYY-MM-DDTHH:MM:SSZ`, UTC only,
+/// 'Z' literal). Anything else is a schema drift we'd want to see
+/// rather than silently coerce.
+pub fn parse_iso_timestamp_ms(ts: &str) -> Option<u64> {
+    // Expected exact length: 20 chars including the trailing Z.
+    if ts.len() != 20 || !ts.ends_with('Z') {
+        return None;
+    }
+    let date = &ts[..10];
+    let sep = ts.as_bytes()[10];
+    let time = &ts[11..19];
+    if sep != b'T' {
+        return None;
+    }
+    let mut dparts = date.split('-');
+    let y = dparts.next()?.parse::<i64>().ok()?;
+    let mo = dparts.next()?.parse::<u32>().ok()?;
+    let d = dparts.next()?.parse::<u32>().ok()?;
+    if dparts.next().is_some() {
+        return None;
+    }
+    let mut tparts = time.split(':');
+    let h = tparts.next()?.parse::<u32>().ok()?;
+    let mi = tparts.next()?.parse::<u32>().ok()?;
+    let s = tparts.next()?.parse::<u32>().ok()?;
+    if tparts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    // Days-from-epoch via the standard zeller-style civil calendar
+    // ("howard hinnant date algorithms"). Validates against
+    // 1970-01-01..=9999-12-31 implicitly via the bounds above.
+    let yi = y - i64::from(mo <= 2);
+    let era = if yi >= 0 { yi / 400 } else { (yi - 399) / 400 };
+    let yoe = (yi - era * 400) as u64;
+    let doy =
+        (153 * (u64::from(mo) + (if mo > 2 { 0 } else { 12 }) - 3) + 2) / 5 + u64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe as i64 - 719468;
+    if days_since_epoch < 0 {
+        return None;
+    }
+    let secs =
+        (days_since_epoch as u64) * 86400 + u64::from(h) * 3600 + u64::from(mi) * 60 + u64::from(s);
+    Some(secs * 1000)
 }
 
 /// Extract the PR URL + number from `gh pr create`'s plain-text
@@ -327,6 +417,92 @@ mod tests {
             parse_pr_url("\n\n  \n"),
             Err(GhError::OutputParse(_))
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Card 7ed1ac4f — ISO timestamp parser for the pending-too-long gate
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_iso_timestamp_ms_matches_known_anchors() {
+        // 1970-01-01T00:00:00Z is by definition 0 ms since epoch.
+        assert_eq!(parse_iso_timestamp_ms("1970-01-01T00:00:00Z"), Some(0));
+        // 1970-01-01T00:00:01Z is 1 second later.
+        assert_eq!(parse_iso_timestamp_ms("1970-01-01T00:00:01Z"), Some(1_000));
+        // 2000-01-01T00:00:00Z is the well-known 946_684_800 epoch
+        // seconds — Y2K anchor every date library agrees on. Pin
+        // that the hand-rolled civil-calendar math lines up.
+        assert_eq!(
+            parse_iso_timestamp_ms("2000-01-01T00:00:00Z"),
+            Some(946_684_800_000)
+        );
+        // 2026-05-29T03:29:44Z — from a real gh statusCheckRollup
+        // sample observed this session. 1_780_025_384 seconds.
+        assert_eq!(
+            parse_iso_timestamp_ms("2026-05-29T03:29:44Z"),
+            Some(1_780_025_384_000)
+        );
+    }
+
+    #[test]
+    fn parse_iso_timestamp_ms_rejects_malformed() {
+        // Missing trailing Z — gh always emits UTC; refusing a
+        // local-time variant is intentional (don't guess the offset).
+        assert_eq!(parse_iso_timestamp_ms("2026-05-29T03:29:44"), None);
+        // Wrong length.
+        assert_eq!(parse_iso_timestamp_ms(""), None);
+        assert_eq!(parse_iso_timestamp_ms("2026-05-29"), None);
+        // Wrong separator.
+        assert_eq!(parse_iso_timestamp_ms("2026-05-29 03:29:44Z"), None);
+        // Out-of-range month / day / hour. These would silently
+        // round in a permissive parser, which would corrupt the
+        // pending-too-long check.
+        assert_eq!(parse_iso_timestamp_ms("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso_timestamp_ms("2026-01-32T00:00:00Z"), None);
+        assert_eq!(parse_iso_timestamp_ms("2026-01-01T24:00:00Z"), None);
+        // Non-numeric.
+        assert_eq!(parse_iso_timestamp_ms("XXXX-XX-XXTXX:XX:XXZ"), None);
+    }
+
+    #[test]
+    fn gh_check_deserializes_started_at_from_pr_view_shape() {
+        // gh pr view --json statusCheckRollup uses camelCase. Pin
+        // that the serde rename catches it — a regression would
+        // silently leave started_at = None on every PR-side check
+        // and the pending-too-long policy would degenerate to "no
+        // timestamps known, never time out anything."
+        let json = serde_json::json!({
+            "conclusion": null,
+            "status": "IN_PROGRESS",
+            "name": "cargo test (windows-latest)",
+            "startedAt": "2026-05-29T03:29:46Z",
+        });
+        let parsed: GhCheck = serde_json::from_value(json).expect("PR-shape decodes");
+        assert_eq!(parsed.started_at.as_deref(), Some("2026-05-29T03:29:46Z"));
+        assert_eq!(parsed.status.as_deref(), Some("IN_PROGRESS"));
+    }
+
+    #[test]
+    fn parse_check_runs_extracts_rest_started_at() {
+        // The REST endpoint uses snake_case `started_at` (different
+        // from the GraphQL `startedAt`). parse_check_runs bridges
+        // both into the same GhCheck so the merger doesn't care
+        // which path supplied the rollup. A regression here would
+        // make baseline-side timeouts invisible.
+        let json = serde_json::json!({
+            "total_count": 1,
+            "check_runs": [
+                {
+                    "name": "cargo test (windows-latest)",
+                    "status": "in_progress",
+                    "conclusion": null,
+                    "started_at": "2026-05-29T03:29:46Z",
+                }
+            ]
+        });
+        let runs = parse_check_runs(json.to_string().as_bytes()).expect("REST envelope decodes");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].started_at.as_deref(), Some("2026-05-29T03:29:46Z"));
     }
 }
 
@@ -613,6 +789,7 @@ pub mod mock {
                 conclusion: Some("FAILURE".to_string()),
                 status: Some("COMPLETED".to_string()),
                 name: Some("flaky-base-check".to_string()),
+                started_at: None,
             }]));
 
             mock.pr_view(args_for_pr(1)).await.unwrap();

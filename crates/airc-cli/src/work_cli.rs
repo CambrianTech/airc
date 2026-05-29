@@ -310,6 +310,12 @@ pub enum WorkAction {
         /// calling `gh pr merge`. Useful before committing.
         #[arg(long)]
         dry_run: bool,
+        /// Card 7ed1ac4f: a check pending longer than this is
+        /// treated as inherited-from-base ("CI hung, not test
+        /// red"). Default 1800s (30 min). Set to 0 to disable the
+        /// bypass and require fully-completed CI before merging.
+        #[arg(long, default_value_t = 1800)]
+        pending_timeout_secs: u64,
     },
 }
 
