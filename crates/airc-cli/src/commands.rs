@@ -32,12 +32,19 @@ use airc_trust as peers_store;
 /// generates the identity, opens the event store, applies any
 /// pending migrations, and primes the peer registry. The CLI then
 /// prints the local peer's spec so the user can share it.
-pub async fn run_init(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
+pub async fn run_init(
+    home: &Path,
+    agent_name: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = match agent_name {
+        Some(agent_name) => Airc::open_as(home, agent_name).await?,
+        None => Airc::open(home).await?,
+    };
     let current = airc.current_room().await?;
     println!("home:        {}", airc.home().display());
     println!("peer_id:     {}", airc.peer_id());
     println!("client_id:   {}", airc.client_id());
+    println!("agent_name:  {}", airc.agent_name());
     println!("room:        {} ({})", current.name, current.channel);
     println!("peer_spec:   {}", airc.peer_spec());
     println!();

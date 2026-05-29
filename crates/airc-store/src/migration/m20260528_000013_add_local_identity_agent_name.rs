@@ -16,7 +16,7 @@
 //!
 //! After Sub-B drops the CHECK, multiple rows become possible and
 //! `agent_name` becomes the natural read-key for "which agent am
-//! I?" — Sub-C ships the API, Sub-D wires `AIRC_AGENT_ID` /
+//! I?" — Sub-C ships the API, Sub-D wires `AIRC_AGENT_NAME` /
 //! `airc init --as <name>`.
 
 use sea_orm_migration::prelude::*;

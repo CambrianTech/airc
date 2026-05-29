@@ -15,7 +15,7 @@
 //! Sub-B table-recreated this schema to drop the former
 //! `CHECK (id = 1)` singleton constraint. Multiple rows are now
 //! legal at the schema layer; Sub-C surfaces the agent-name read API
-//! and Sub-D wires `AIRC_AGENT_ID` / `airc init --as <name>`.
+//! and Sub-D wires `AIRC_AGENT_NAME` / `airc init --as <name>`.
 //!
 //! [`SINGLETON_ID`] remains the documented primary-key value for the
 //! legacy/default agent row until the higher-level APIs stop using a

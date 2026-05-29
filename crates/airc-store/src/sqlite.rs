@@ -365,17 +365,27 @@ impl SqliteEventStore {
         .transpose()
     }
 
-    /// Persist the singleton local-identity row. Insert-only by
-    /// design — there is no `replace_local_identity` because a
-    /// peer_id / client_id change IS a new identity, not an update.
-    /// Calling this with a row already present returns an error
-    /// from the singleton CHECK + PK collision.
+    /// Return whether any local-identity row exists.
+    ///
+    /// Used by `airc-identity` to distinguish key-only partial state
+    /// from an already-initialized scope adding a second agent row.
+    pub async fn has_local_identity_rows(&self) -> Result<bool, StoreError> {
+        Ok(local_identity::Entity::find()
+            .one(&self.db)
+            .await?
+            .is_some())
+    }
+
+    /// Persist a local-identity row. Insert-only by design — there
+    /// is no `replace_local_identity` because a peer_id / client_id
+    /// change IS a new identity, not an update. Calling this with an
+    /// existing `agent_name` returns an error from the unique index.
     pub async fn insert_local_identity(
         &self,
         identity: StoredLocalIdentity,
     ) -> Result<(), StoreError> {
         let active = local_identity::ActiveModel {
-            id: Set(local_identity::SINGLETON_ID),
+            id: ActiveValue::NotSet,
             peer_id: Set(identity.peer_id.as_uuid()),
             client_id: Set(identity.client_id.as_uuid()),
             version: Set(i32::try_from(identity.version).map_err(|_| {
@@ -1264,24 +1274,17 @@ mod tests {
             .await
             .unwrap();
 
-        local_identity::Entity::insert(local_identity::ActiveModel {
-            id: Set(2),
-            peer_id: Set(PeerId::from_u128(0xa4).as_uuid()),
-            client_id: Set(ClientId::from_u128(0xc4).as_uuid()),
-            version: Set(1),
-            created_at_ms: Set(101),
-            name: Set("codex".to_string()),
-            pronouns: Set("".to_string()),
-            role: Set("agent".to_string()),
-            bio: Set("".to_string()),
-            status: Set("active".to_string()),
-            fingerprint: Set("".to_string()),
-            integrations_json: Set(json!({})),
-            agent_name: Set("codex".to_string()),
-        })
-        .exec(&store.db)
-        .await
-        .expect("Sub-B schema accepts a non-singleton local_identity row");
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xa4),
+                client_id: ClientId::from_u128(0xc4),
+                version: 1,
+                created_at_ms: 101,
+                identity: Identity::new("codex"),
+                agent_name: "codex".to_string(),
+            })
+            .await
+            .expect("Sub-D write path inserts a non-singleton local_identity row");
 
         let rows = local_identity::Entity::find()
             .order_by_asc(local_identity::Column::Id)
@@ -1321,27 +1324,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Second agent inserted directly (Sub-D will wire the
-        // multi-row write surface; for Sub-C's read-side test, the
-        // direct insert is enough to populate the schema).
-        local_identity::Entity::insert(local_identity::ActiveModel {
-            id: Set(2),
-            peer_id: Set(PeerId::from_u128(0xb2).as_uuid()),
-            client_id: Set(ClientId::from_u128(0xd2).as_uuid()),
-            version: Set(1),
-            created_at_ms: Set(201),
-            name: Set("codex".to_string()),
-            pronouns: Set("".to_string()),
-            role: Set("agent".to_string()),
-            bio: Set("".to_string()),
-            status: Set("active".to_string()),
-            fingerprint: Set("".to_string()),
-            integrations_json: Set(json!({})),
-            agent_name: Set("codex".to_string()),
-        })
-        .exec(&store.db)
-        .await
-        .unwrap();
+        store_api
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::from_u128(0xb2),
+                client_id: ClientId::from_u128(0xd2),
+                version: 1,
+                created_at_ms: 201,
+                identity: Identity::new("codex"),
+                agent_name: "codex".to_string(),
+            })
+            .await
+            .unwrap();
 
         // By-name lookup: default vs codex resolves to distinct rows.
         let default_row = store_api
