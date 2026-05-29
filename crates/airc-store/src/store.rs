@@ -23,13 +23,41 @@ use crate::subscriptions::StoredSubscription;
 /// is the deterministic tiebreaker.
 #[async_trait]
 pub trait EventStore: Send + Sync {
-    /// Load this install's singleton local identity row, if present.
+    /// Load the default-agent local identity row, if present.
+    ///
+    /// Equivalent to [`Self::load_local_identity_by_agent_name`] with
+    /// `"default"`. Kept for backwards compatibility with every
+    /// pre-card-8384cc18 callsite that resolves identity without
+    /// being multi-agent-aware. New code that knows its agent
+    /// discriminator should call the by-name variant directly so
+    /// `AIRC_AGENT_NAME` / `airc init --as <name>` (Sub-D, card
+    /// 0f749d4c) can override it.
     async fn load_local_identity(&self) -> Result<Option<StoredLocalIdentity>, StoreError>;
 
-    /// Insert this install's singleton local identity row.
+    /// Load the local identity row whose `agent_name` matches.
     ///
-    /// Implementations must fail if a row already exists; changing
-    /// peer/client identity is a new identity, not an update.
+    /// Card 8384cc18 Sub-C — the multi-agent read surface that
+    /// Sub-B's schema (unique index on `agent_name`) enables. Returns
+    /// `Ok(None)` when no row is named `agent_name` so callers can
+    /// distinguish "fresh database for this agent" from a real I/O
+    /// error and decide whether to generate vs. surface a partial
+    /// state.
+    ///
+    /// Sub-D wires this through `AIRC_AGENT_NAME` and
+    /// `airc init --as <name>`; until that ships, the default-agent
+    /// path via [`Self::load_local_identity`] remains the entrypoint
+    /// for every existing caller.
+    async fn load_local_identity_by_agent_name(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<StoredLocalIdentity>, StoreError>;
+
+    /// Insert a local identity row.
+    ///
+    /// Implementations must fail if a row with the same
+    /// `agent_name` already exists; changing peer/client identity
+    /// is a new identity, not an update. Multiple rows with
+    /// distinct `agent_name`s are legal post-Sub-B (8384cc18).
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError>;
 
     /// Replace only the user-facing identity card fields on the
