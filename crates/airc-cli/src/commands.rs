@@ -1013,6 +1013,7 @@ pub async fn run_peer_add(
     home: &Path,
     spec: PeerSpec,
     socket: PathBuf,
+    tier: Option<airc_store::TrustTier>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     let pubkey_b64 = base64::Engine::encode(
@@ -1021,7 +1022,27 @@ pub async fn run_peer_add(
     );
     let peer_id = spec.peer_id;
     airc.add_peer(spec).await?;
-    println!("enroled peer_id={peer_id} (pubkey 32 bytes)");
+    // Card 34942ec1 Sub-C: --tier override. If unset, the substrate
+    // default (Untrusted) from Sub-A applies — no surface change for
+    // existing callers. If set, promote the freshly-added row to the
+    // requested tier in a separate set_peer_trust_tier call. The
+    // two-step write isn't atomic at the SQL level but the
+    // substrate's invariant is "tier is orthogonal to key material"
+    // — a peer briefly visible at Untrusted before the promotion
+    // commits is the same state any honest peer starts at.
+    if let Some(tier) = tier {
+        airc_trust::set_tier(home, peer_id, tier)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "internal: just-added peer {peer_id} missing during tier-set — \
+                     report this as a substrate bug"
+                )
+            })?;
+        println!("enroled peer_id={peer_id} (pubkey 32 bytes) tier={tier}");
+    } else {
+        println!("enroled peer_id={peer_id} (pubkey 32 bytes) tier=untrusted (default)");
+    }
 
     // Best-effort daemon sync. If the daemon isn't running, that's
     // fine — it'll pick up the trust store on next start.
@@ -1077,18 +1098,95 @@ pub async fn run_peer_remove(
     Ok(())
 }
 
+/// Card 34942ec1 Sub-C: update an enrolled peer's tier without
+/// touching key material. Refuses for unknown peers (no implicit
+/// add — the operator should `peer add <spec> --tier=…` instead).
+/// Idempotent for no-op transitions.
+pub async fn run_peer_set_tier(
+    home: &Path,
+    peer_id: airc_core::PeerId,
+    tier: airc_store::TrustTier,
+    socket: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Look up the prior tier so the output can name both old + new
+    // (operator audit trail) AND so the idempotent no-op path can
+    // honestly say "no change."
+    let prior = airc_trust::load(home)
+        .await?
+        .into_iter()
+        .find(|p| p.peer_id == peer_id);
+    let Some(prior) = prior else {
+        return Err(format!(
+            "peer {peer_id} is not enrolled in this scope's trust store. \
+             Use `airc peer add <spec> --tier={tier}` to enrol fresh, \
+             or check `airc peer list` for the right peer_id."
+        )
+        .into());
+    };
+    if prior.tier == tier {
+        println!("no change: peer_id={peer_id} already at tier={tier} (idempotent)");
+        return Ok(());
+    }
+    let prior_tier = prior.tier;
+    let updated = airc_trust::set_tier(home, peer_id, tier)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "internal: peer {peer_id} disappeared between load and set_tier — \
+             likely a concurrent `peer remove`; retry or check the trust store"
+            )
+        })?;
+    println!(
+        "tier_changed: peer_id={peer_id} {prior_tier} → {new}",
+        new = updated.tier
+    );
+
+    // Best-effort daemon sync — same shape as run_peer_add /
+    // run_peer_remove. The daemon currently has no SetTier RPC; on
+    // a follow-up Sub-D it should subscribe to a TrustTierChanged
+    // event and re-evaluate its in-memory verifier policy. For now
+    // the trust store is the source of truth; the daemon will pick
+    // up the new tier on its next read.
+    let _ = socket; // placeholder until SetTier RPC ships (Sub-D)
+    Ok(())
+}
+
 /// `peer list` — print enroled peers via `Airc::peers`. The daemon
-/// writes the same trust store, so this view stays
-/// consistent whether the daemon is running or not.
-pub async fn run_peer_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = Airc::open(home).await?;
-    let peers = airc.peers().await?;
+/// writes the same trust store, so this view stays consistent
+/// whether the daemon is running or not. `--json` produces the
+/// machine-readable shape consumers (bridge, router) read off of.
+pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let peers = airc_trust::load(home).await?;
+    if json {
+        // Card 34942ec1 Sub-C V4: JSON shape is the contract
+        // consumers read. Pin the field names + the tier wire
+        // string so a future schema drift breaks the test in
+        // peer_commands.rs, not the consumer at runtime.
+        let rows: Vec<serde_json::Value> = peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "peer_id": p.peer_id.to_string(),
+                    "pubkey_b64": p.pubkey_b64,
+                    "added_at_ms": p.added_at_ms,
+                    "tier": p.tier.as_wire_str(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if peers.is_empty() {
         println!("(no enroled peers — use `airc peer add <spec>` to enrol)");
         return Ok(());
     }
     for peer in &peers {
-        println!("{}  {}", peer.peer_id, peer.pubkey_b64);
+        println!(
+            "{}  {}  tier={}",
+            peer.peer_id,
+            peer.pubkey_b64,
+            peer.tier.as_wire_str()
+        );
     }
     println!();
     println!("{} peer(s) enroled at {}", peers.len(), home.display());

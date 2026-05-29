@@ -677,6 +677,13 @@ pub enum PeerAction {
         /// Override the default daemon IPC endpoint.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Card 34942ec1 Sub-C: enrol at this trust tier instead of
+        /// the substrate-default Untrusted. Used to manually pin
+        /// Friend / OwnAccount / OwnMachine when the operator knows
+        /// the relationship out-of-band (Joel pinning Friend on
+        /// Toby's airc, OwnAccount on his other machine, etc.).
+        #[arg(long, value_enum)]
+        tier: Option<CliTrustTier>,
     },
     /// Remove a peer from local trust.
     Remove {
@@ -686,8 +693,55 @@ pub enum PeerAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Card 34942ec1 Sub-C: update the trust tier of an
+    /// already-enrolled peer without rotating the key. Pubkey-
+    /// rotation has its own path (`peer add` with a re-pair flow);
+    /// this is the orthogonal tier-update.
+    ///
+    /// Refuses for unknown peers (no implicit add). Idempotent for
+    /// no-op transitions.
+    SetTier {
+        /// Peer UUID to re-tier.
+        peer_id: String,
+        /// New trust tier.
+        #[arg(value_enum)]
+        tier: CliTrustTier,
+        /// Override the default daemon IPC endpoint.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// List enrolled peers from the peer trust store.
-    List,
+    List {
+        /// Print as JSON ({peer_id, pubkey_b64, tier, added_at_ms}
+        /// per row). Consumers (continuum bridge, hermes router)
+        /// read this to build their grid routing tables — see card
+        /// 34942ec1 Sub-C V4.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// CLI mirror of `airc_store::TrustTier`. Kept distinct so clap's
+/// value_enum machinery can derive the snake-case rename without
+/// pulling clap into the storage layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum CliTrustTier {
+    OwnMachine,
+    OwnAccount,
+    Friend,
+    Untrusted,
+}
+
+impl From<CliTrustTier> for airc_store::TrustTier {
+    fn from(value: CliTrustTier) -> Self {
+        match value {
+            CliTrustTier::OwnMachine => airc_store::TrustTier::OwnMachine,
+            CliTrustTier::OwnAccount => airc_store::TrustTier::OwnAccount,
+            CliTrustTier::Friend => airc_store::TrustTier::Friend,
+            CliTrustTier::Untrusted => airc_store::TrustTier::Untrusted,
+        }
+    }
 }
 
 /// Frame kind selector for `airc publish`. Maps 1:1 onto

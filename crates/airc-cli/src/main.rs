@@ -392,17 +392,27 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Part { room } => commands::run_part(&home, room).await,
 
         Command::Peer(args) => match args.action {
-            PeerAction::Add { spec, socket } => {
-                commands::run_peer_add(&home, spec, default_or(socket, &home)).await
+            PeerAction::Add { spec, socket, tier } => {
+                commands::run_peer_add(&home, spec, default_or(socket, &home), tier.map(Into::into))
+                    .await
             }
             PeerAction::Remove { peer_id, socket } => {
                 let peer_id = parse_peer_id(&peer_id)?;
                 commands::run_peer_remove(&home, peer_id, default_or(socket, &home)).await
             }
-            PeerAction::List => commands::run_peer_list(&home).await,
+            PeerAction::SetTier {
+                peer_id,
+                tier,
+                socket,
+            } => {
+                let peer_id = parse_peer_id(&peer_id)?;
+                commands::run_peer_set_tier(&home, peer_id, tier.into(), default_or(socket, &home))
+                    .await
+            }
+            PeerAction::List { json } => commands::run_peer_list(&home, json).await,
         },
 
-        Command::Peers => commands::run_peer_list(&home).await,
+        Command::Peers => commands::run_peer_list(&home, false).await,
 
         Command::Whois { peer } => match peer {
             Some(peer) => commands::run_whois_peer(&home, &peer).await,
