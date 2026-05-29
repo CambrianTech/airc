@@ -38,7 +38,7 @@ use crate::entities::{
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
-use crate::peer_trust::{RotationAuditEntry, StoredPeer};
+use crate::peer_trust::{RotationAuditEntry, StoredPeer, TrustTier};
 use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
@@ -164,10 +164,24 @@ impl SqliteEventStore {
             .await?;
         rows.into_iter()
             .map(|row| {
+                // Card 34942ec1 Sub-A: parse the stored tier wire
+                // string into TrustTier. An unknown string surfaces
+                // honestly via InvalidStoredValue so a forwards-
+                // version-skew bug doesn't silently downgrade trust
+                // (a newer binary writing "own_account" being read
+                // by an older binary that doesn't know that variant
+                // is a real condition we'd want to see).
+                let tier = TrustTier::from_wire_str(&row.tier).ok_or_else(|| {
+                    StoreError::InvalidStoredEnumString {
+                        column: "peer_trust.tier",
+                        value: row.tier.clone(),
+                    }
+                })?;
                 Ok(StoredPeer {
                     peer_id: PeerId::from_uuid(row.peer_id),
                     pubkey_b64: row.pubkey_b64,
                     added_at_ms: i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?,
+                    tier,
                 })
             })
             .collect()
@@ -179,10 +193,38 @@ impl SqliteEventStore {
         pubkey_b64: String,
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
+        // Card 34942ec1 Sub-A: defaults to the safe-conservative
+        // tier (Untrusted). Sub-B detection and explicit-enrolment
+        // CLI paths land via [`set_peer_trust_tier`] in a follow-up
+        // PR; this one keeps the existing add() contract identical
+        // (no API churn for current callers).
+        self.add_peer_trust_with_tier(
+            peer_id,
+            pubkey_b64,
+            added_at_ms,
+            TrustTier::default_for_new_peer(),
+        )
+        .await
+    }
+
+    /// Card 34942ec1 Sub-A — variant of [`Self::add_peer_trust`] that
+    /// lets the caller set an explicit tier at insert time. For new
+    /// rows only; doesn't change an existing row's tier (an existing
+    /// row keeps its stored tier — promoting/demoting goes through
+    /// the separate tier-update path Sub-B introduces). Same
+    /// pubkey-conflict semantics as add().
+    pub async fn add_peer_trust_with_tier(
+        &self,
+        peer_id: PeerId,
+        pubkey_b64: String,
+        added_at_ms: u64,
+        tier: TrustTier,
+    ) -> Result<StoredPeer, StoreError> {
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
+            tier: Set(tier.as_wire_str().to_string()),
         };
         let insert = peer_trust::Entity::insert(active)
             .on_conflict(
@@ -212,10 +254,17 @@ impl SqliteEventStore {
                 attempted_pubkey_b64: pubkey_b64,
             });
         }
+        let stored_tier = TrustTier::from_wire_str(&stored.tier).ok_or_else(|| {
+            StoreError::InvalidStoredEnumString {
+                column: "peer_trust.tier",
+                value: stored.tier.clone(),
+            }
+        })?;
         Ok(StoredPeer {
             peer_id,
             pubkey_b64: stored.pubkey_b64,
             added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+            tier: stored_tier,
         })
     }
 
@@ -225,10 +274,21 @@ impl SqliteEventStore {
         pubkey_b64: String,
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
+        // Card 34942ec1 Sub-A: replace preserves the existing tier
+        // (a rotation is a key-material event; trust gradient is
+        // orthogonal — losing it on rotate would silently demote a
+        // Friend back to Untrusted, which would be a security
+        // regression). For a fresh insert, default to Untrusted.
+        let existing_tier = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&self.db)
+            .await?
+            .and_then(|row| TrustTier::from_wire_str(&row.tier))
+            .unwrap_or_else(TrustTier::default_for_new_peer);
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
+            tier: Set(existing_tier.as_wire_str().to_string()),
         };
         peer_trust::Entity::insert(active)
             .on_conflict(
@@ -242,6 +302,7 @@ impl SqliteEventStore {
             peer_id,
             pubkey_b64,
             added_at_ms,
+            tier: existing_tier,
         })
     }
 
@@ -261,10 +322,17 @@ impl SqliteEventStore {
             .exec(&txn)
             .await?;
         txn.commit().await?;
+        let removed_tier = TrustTier::from_wire_str(&stored.tier).ok_or_else(|| {
+            StoreError::InvalidStoredEnumString {
+                column: "peer_trust.tier",
+                value: stored.tier.clone(),
+            }
+        })?;
         Ok(Some(StoredPeer {
             peer_id,
             pubkey_b64: stored.pubkey_b64,
             added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+            tier: removed_tier,
         }))
     }
 
@@ -1816,5 +1884,119 @@ mod tests {
             sqlite_file_url(path),
             "sqlite:///tmp/airc/events.sqlite?mode=rwc"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Card 34942ec1 Sub-A — peer_trust tier round-trip
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_peer_trust_defaults_to_untrusted_tier() {
+        // Sub-A migration sets the column default = 'untrusted'.
+        // The existing add_peer_trust() contract stays identical
+        // (peer_id, pubkey, timestamp) — callers don't have to pick
+        // a tier just to enrol. Pinning that the stored tier is
+        // Untrusted, not whatever the enum's Default::default()
+        // happens to be (we don't impl Default on TrustTier on
+        // purpose: every insert site must decide explicitly).
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x1234_abcd);
+        let stored = store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 100)
+            .await
+            .unwrap();
+        assert_eq!(stored.tier, TrustTier::Untrusted);
+
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tier, TrustTier::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn add_peer_trust_with_tier_round_trips_explicit_tier() {
+        // The with_tier variant lets Sub-B detection (UDS sibling →
+        // OwnMachine) or explicit-enrolment CLI (`airc peer add
+        // --tier=friend`) pin the tier at insert. Pin that every
+        // declared variant round-trips end-to-end through write +
+        // reload — a forgotten match arm in load_peers (post-
+        // migration drift) would only surface in CI when an actual
+        // OwnMachine peer was enrolled, but this test catches it at
+        // PR review time.
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        for (i, tier) in TrustTier::ALL_VARIANTS.iter().copied().enumerate() {
+            let peer_id = PeerId::from_u128(0x4000 + i as u128);
+            let stored = store
+                .add_peer_trust_with_tier(
+                    peer_id,
+                    format!("PUB{i}").repeat(11),
+                    100 + i as u64,
+                    tier,
+                )
+                .await
+                .unwrap();
+            assert_eq!(stored.tier, tier, "round-trip: insert tier survives");
+        }
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded.len(), TrustTier::ALL_VARIANTS.len());
+        let observed: std::collections::HashSet<_> = loaded.iter().map(|p| p.tier).collect();
+        let expected: std::collections::HashSet<_> =
+            TrustTier::ALL_VARIANTS.iter().copied().collect();
+        assert_eq!(observed, expected, "every variant survives the round-trip");
+    }
+
+    #[tokio::test]
+    async fn replace_peer_trust_preserves_existing_tier() {
+        // Card 34942ec1 Sub-A explicit invariant: a key-material
+        // rotation (replace_peer_trust) must NOT silently demote a
+        // Friend back to Untrusted. The tier is orthogonal to the
+        // pubkey; losing it on rotate would be a security
+        // regression that this test catches.
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0xfeed_face);
+
+        // Enrol as Friend explicitly.
+        let initial = store
+            .add_peer_trust_with_tier(peer_id, "A".repeat(43), 100, TrustTier::Friend)
+            .await
+            .unwrap();
+        assert_eq!(initial.tier, TrustTier::Friend);
+
+        // Rotate to a new pubkey via replace_peer_trust.
+        let rotated = store
+            .replace_peer_trust(peer_id, "B".repeat(43), 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated.tier,
+            TrustTier::Friend,
+            "rotate must preserve the existing tier"
+        );
+
+        // Confirm the durable row, not just the return value.
+        let reloaded = store.load_peers().await.unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].tier, TrustTier::Friend);
+    }
+
+    #[test]
+    fn trust_tier_wire_str_round_trips_every_variant() {
+        // The consumer-sync guard (same pattern as
+        // TranscriptKind::wire_str_round_trip_covers_every_variant).
+        // Forgetting to extend as_wire_str / from_wire_str /
+        // ALL_VARIANTS when adding a variant is exactly the kink
+        // 0cfcc8db pattern that motivated the convention.
+        for &tier in TrustTier::ALL_VARIANTS {
+            let s = tier.as_wire_str();
+            let back = TrustTier::from_wire_str(s);
+            assert_eq!(
+                back,
+                Some(tier),
+                "{tier:?} must round-trip through wire string"
+            );
+        }
+        // Unknown strings honestly fail.
+        assert_eq!(TrustTier::from_wire_str(""), None);
+        assert_eq!(TrustTier::from_wire_str("verified"), None);
+        assert_eq!(TrustTier::from_wire_str("OwnMachine"), None);
     }
 }

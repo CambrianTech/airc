@@ -10,6 +10,7 @@ use base64::Engine;
 
 use airc_core::PeerId;
 use airc_protocol::trust_rotation::{verify_rotation, RotationVerificationError, TrustRotation};
+pub use airc_store::peer_trust::TrustTier;
 pub use airc_store::{RotationAuditEntry, StoredPeer};
 use airc_store::{SqliteEventStore, StoreError};
 
@@ -168,6 +169,7 @@ impl From<StoreError> for PeersStoreError {
             | StoreError::DuplicateEventId(_)
             | StoreError::UnknownTranscriptKind(_)
             | StoreError::InvalidStoredValue { .. }
+            | StoreError::InvalidStoredEnumString { .. }
             | StoreError::NotFound(_)
             | StoreError::Codec(_) => PeersStoreError::Store(error),
         }

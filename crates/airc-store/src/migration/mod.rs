@@ -24,6 +24,7 @@ mod m20260526_000011_create_bus_events;
 mod m20260527_000012_create_bus_epoch;
 mod m20260528_000013_add_local_identity_agent_name;
 mod m20260528_000014_drop_local_identity_singleton_check;
+mod m20260529_000015_add_peer_trust_tier;
 
 pub struct Migrator;
 
@@ -45,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260527_000012_create_bus_epoch::Migration),
             Box::new(m20260528_000013_add_local_identity_agent_name::Migration),
             Box::new(m20260528_000014_drop_local_identity_singleton_check::Migration),
+            Box::new(m20260529_000015_add_peer_trust_tier::Migration),
         ]
     }
 }

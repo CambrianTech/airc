@@ -38,6 +38,15 @@ pub enum StoreError {
     #[error("invalid stored value for {field}: {value}")]
     InvalidStoredValue { field: &'static str, value: i128 },
 
+    /// Stored string value doesn't round-trip through the Rust enum
+    /// it was supposed to come from. Card 34942ec1 Sub-A: trust tier
+    /// is stored as a wire string; an unknown variant means version
+    /// skew (a newer binary wrote a tier this binary doesn't know),
+    /// which must surface honestly rather than silently downgrading
+    /// to a default.
+    #[error("invalid stored enum string for {column}: {value:?}")]
+    InvalidStoredEnumString { column: &'static str, value: String },
+
     /// Expected row is absent.
     #[error("store row not found: {0}")]
     NotFound(&'static str),
