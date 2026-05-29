@@ -556,6 +556,124 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
+/// Card a399b342: `airc work merge <CARD_ID>` — manual one-shot merge
+/// behind the same gate the auto-merger uses. Refuses unless the card
+/// is in Review state with a PR linked AND the PR's CI is green per
+/// the strictly-less-red-than-base policy (card d5b7b07d).
+///
+/// Failure modes that get an explicit refusal (not a swallowed error):
+///   - card not visible / not in Review
+///   - no PR linked
+///   - PR state ≠ OPEN
+///   - merge conflicts
+///   - failing checks NOT already failing on base
+///   - checks still running
+///
+/// On success: `gh pr merge --squash --delete-branch`, then emit
+/// `MarkPullRequestMerged` so the projection transitions consistently
+/// with the merger path. `--dry-run` prints the gate decision and
+/// stops.
+pub async fn run_merge(
+    home: &Path,
+    card_id: String,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::gh_client::GhClient as _;
+    use airc_lib::MarkPullRequestMerged;
+    use airc_work::model::CardState;
+
+    let airc = crate::commands::attached_airc(home).await?;
+    let card_uuid = parse_work_card_id(&card_id)?;
+
+    let board = airc.work_board(usize::MAX).await?;
+    let card = board.card(card_uuid).ok_or_else(|| {
+        format!("card {card_uuid} not visible in current room's board projection")
+    })?;
+
+    if card.state != CardState::Review {
+        return Err(format!(
+            "refusing to merge card {card_uuid}: state is {actual:?}, but `airc work merge` \
+             requires Review (the card has been finished + PR opened + announced).\n\n\
+             Next step: `airc work state {card_uuid} review` to open + link the PR, then \
+             `airc work merge {card_uuid}` once CI is green.",
+            actual = card.state,
+        )
+        .into());
+    }
+
+    let Some(pr) = card.pull_request.clone() else {
+        return Err(format!(
+            "refusing to merge card {card_uuid}: Review state but no PR linked. \
+             The `state review` transition runs `gh pr create` and emits \
+             `LinkCardPullRequest`; re-run it from the card's worktree so the \
+             projection has a PR to merge."
+        )
+        .into());
+    };
+
+    let gh = crate::gh_client::ShellGhClient::new();
+    let baseline = crate::merger::fetch_baseline_failures(&gh).await;
+    if !baseline.is_empty() {
+        eprintln!(
+            "airc: baseline has {} failing check(s) on rust-rewrite — inherited \
+             failures with those names are ignored (strictly-less-red, card d5b7b07d)",
+            baseline.len()
+        );
+    }
+
+    match crate::merger::check_pr_gate(&gh, &pr, &baseline).await {
+        Ok(crate::merger::GateResult::Green) => {
+            if dry_run {
+                println!(
+                    "merge_gate: GREEN — card={card_uuid} pr=#{n} repo={r} (would merge)",
+                    n = pr.number,
+                    r = pr.repo,
+                );
+                return Ok(());
+            }
+            gh.pr_merge(crate::gh_client::PrMergeArgs {
+                repo: pr.repo.as_str().to_string(),
+                number: pr.number,
+            })
+            .await?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            airc.mark_pull_request_merged(MarkPullRequestMerged {
+                card_id: card_uuid,
+                pull_request: pr.clone(),
+                merged_at_ms: now_ms,
+            })
+            .await?;
+            println!(
+                "merged: card={card_uuid} pr=#{n} repo={r}",
+                n = pr.number,
+                r = pr.repo,
+            );
+            Ok(())
+        }
+        Ok(crate::merger::GateResult::NotReady(reason)) => Err(format!(
+            "refusing to merge card {card_uuid} pr=#{n}: {reason}.\n\n\
+             The strictly-less-red doctrine (card d5b7b07d) already lets you through \
+             when only base-inherited failures remain. If you BELIEVE this gate is \
+             wrong for your case, fix the upstream root cause or rebase rather than \
+             reaching for `gh pr merge` directly — that bypass is exactly what this \
+             gate exists to refuse (Joel's 'engineering staff' merge discipline).",
+            n = pr.number,
+        )
+        .into()),
+        Err(error) => Err(format!(
+            "merge gate query failed for card {card_uuid} pr=#{n}: {error}.\n\n\
+             Network / rate-limit / auth issue with gh — retry or check `gh auth status`. \
+             The substrate refuses to merge when it cannot verify the gate; that's the \
+             intended fail-closed behavior.",
+            n = pr.number,
+        )
+        .into()),
+    }
+}
+
 /// Card 9656a836 + fae3c28e: gate the close transition.
 /// Returns `true` when `card` is allowed to transition to Closed.
 ///

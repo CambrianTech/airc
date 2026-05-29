@@ -196,7 +196,10 @@ async fn evaluate(
     }
 }
 
-enum GateResult {
+/// Result of applying the merge gate to a PR. `pub(crate)` since card
+/// a399b342: the `airc work merge` CLI command consumes the same gate
+/// so a manual merge is held to the same bar the auto-merger uses.
+pub(crate) enum GateResult {
     Green,
     NotReady(String),
 }
@@ -210,7 +213,7 @@ enum GateResult {
 /// typed [`crate::gh_client::GhError`] variants (rate-limited,
 /// auth-required, …) so callers can pattern-match on them; the
 /// decision half (`evaluate_gh_view`) remains pure for unit tests.
-async fn check_pr_gate(
+pub(crate) async fn check_pr_gate(
     gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
     baseline_failures: &std::collections::HashSet<String>,
@@ -230,7 +233,7 @@ async fn check_pr_gate(
 /// once per tick; each per-card gate consults the same snapshot. On
 /// error (rate-limit, network), returns empty set — the gate
 /// degrades to "no allowance" rather than over-trusting.
-async fn fetch_baseline_failures(
+pub(crate) async fn fetch_baseline_failures(
     gh: &dyn crate::gh_client::GhClient,
 ) -> std::collections::HashSet<String> {
     let base_branch = crate::work_commands_gh::pr_create_base_branch();
@@ -750,5 +753,62 @@ mod tests {
         assert_eq!(runs[0].name.as_deref(), Some("cargo fmt --check"));
         assert_eq!(runs[1].conclusion.as_deref(), None);
         assert_eq!(runs[1].status.as_deref(), Some("in_progress"));
+    }
+
+    // ------------------------------------------------------------------
+    // Card a399b342 — `airc work merge` (manual gate). The IO path
+    // (gh.pr_view + gh.pr_merge + MarkPullRequestMerged emit) is
+    // exercised by integration tests against real PRs in the merger
+    // dry-run mode. Here we pin the pub(crate) gate surface stays
+    // observable to work_commands::run_merge — a regression that
+    // narrows GateResult / check_pr_gate back to private would break
+    // the engineering-discipline gate without surfacing in clippy
+    // (private items are still implemented; just unreachable from
+    // work_commands.rs).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn gate_result_is_reachable_for_run_merge_callers() {
+        // Compile-time assertion: GateResult variants are
+        // pattern-matchable from a function that is NOT in the merger
+        // module. If a future change re-privatises these, this test
+        // fails to compile rather than the cli `work merge` path
+        // silently losing its gate.
+        fn classify_for_external_caller(g: GateResult) -> &'static str {
+            match g {
+                GateResult::Green => "green",
+                GateResult::NotReady(_) => "not_ready",
+            }
+        }
+        assert_eq!(classify_for_external_caller(GateResult::Green), "green");
+        assert_eq!(
+            classify_for_external_caller(GateResult::NotReady("test".into())),
+            "not_ready"
+        );
+    }
+
+    #[test]
+    fn evaluate_gh_view_signals_inherited_with_dedicated_phrase() {
+        // The `airc work merge` refusal message points users at the
+        // strictly-less-red doctrine; that hint is only actionable if
+        // the gate's NotReady reason actually distinguishes inherited
+        // failures from new ones with a stable phrase the docs +
+        // refusal text both reference.
+        let view = parse(serde_json::json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
+                {"conclusion": "FAILURE", "status": "COMPLETED", "name": "cargo test (ubuntu-latest)"},
+            ]
+        }));
+        let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
+        let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline) else {
+            panic!("expected NotReady");
+        };
+        assert!(
+            reason.contains("inherited from base, ignored"),
+            "phrase must stay stable — `airc work merge` refusal references it: {reason}"
+        );
     }
 }

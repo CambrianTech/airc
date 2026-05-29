@@ -290,6 +290,27 @@ pub enum WorkAction {
         #[command(subcommand)]
         action: MergerAction,
     },
+    /// Card a399b342: merge a Review-state card's PR if CI is green.
+    ///
+    /// The same gate the auto-merger (`airc work merger run`) uses —
+    /// strictly-less-red-than-base (card d5b7b07d) — applied to a
+    /// one-shot manual merge. Refuses when CI is failing/pending or
+    /// the card isn't in Review state with a PR linked.
+    ///
+    /// Substrate enforcement of "engineering staff" merge discipline:
+    /// a less-careful persona reaching for `gh pr merge` directly is
+    /// holding the discipline-shaped tool, but `airc work merge`
+    /// holds the discipline AND publishes the
+    /// `MarkPullRequestMerged` event so the projection transitions
+    /// the card consistently with the auto-merger path.
+    Merge {
+        /// Work card UUID.
+        card_id: String,
+        /// Print the gate decision (Green / NotReady reason) without
+        /// calling `gh pr merge`. Useful before committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
