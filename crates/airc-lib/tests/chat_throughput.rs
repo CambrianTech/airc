@@ -27,7 +27,7 @@
 //! bench (#1077). This one isolates the substrate's per-message
 //! work — the layer card 127816bd targets.
 //!
-//! ## Measured Phase 1.A baseline (2026-05-29, M2 paired loopback LAN)
+//! ## Phase 1.A baseline (2026-05-29, M2 paired loopback LAN)
 //!
 //! - Sustained `say()` (~280-char body, no headers): **~3.56 ms/op,
 //!   281 msg/sec** (300 calls in 1.07s)
@@ -36,20 +36,27 @@
 //! - Minimal `say("x")` (1-char body, no headers): **~3.71 ms/op**
 //!   (500 calls in 1.86s)
 //!
-//! Continuum's stated goal is 100μs/op; baseline is **~36× above**
-//! that target. The minimal-headers variant being indistinguishable
-//! from the sustained/burst variants implies the per-message cost
-//! is dominated by something **invariant to payload size** — the
-//! ORM dual-write + fsync the card targets, NOT envelope-build or
-//! header-encoding.
+//! ## Phase 1.C result (WAL + sync=NORMAL + drop post-insert SELECT)
+//!
+//! - Sustained: **~2.01 ms/op, 498 msg/sec** (1.77× over baseline)
+//! - Burst:     **~1.94 ms/op** (1.86× over baseline)
+//! - Minimal:   **~1.87 ms/op** (1.98× over baseline)
+//!
+//! Goal continuum cited: 100 μs/op. Still ~20× above that; Phase 2+
+//! attacks the residual cost (LAN-TCP TLS write + envelope sign).
+//!
+//! The minimal-headers variant moves with the realistic-payload
+//! variant ⇒ per-msg cost is dominated by something **invariant to
+//! payload size** — the SQLite fsync + INSERT-SELECT round trip
+//! (now both eliminated). Body size cost did not surface as a
+//! bottleneck at this scale.
 //!
 //! ## Acceptance floors
 //!
-//! Bench is a *regression catcher* at baseline; assertions are 3×
-//! above measured ns/op so the bench passes the current truth and
-//! catches catastrophic regressions. Phase 1.D's job: tighten these
-//! to match the post-optimization measurement (the assertion change
-//! is the proof the optimization moved the floor).
+//! Bench is a *regression catcher* at the Phase 1.C floor; 5ms/op
+//! ceiling = ~2.5× Phase 1.C measured (passes typical fsync-jitter
+//! variance, catches a 2.5× regression). Tighten further when the
+//! next phase ships and the new floor is durable.
 //!
 //! Actual ns/op numbers printed via `eprintln!` so a perf reviewer
 //! reads the truth off the test output, not the assertion.
@@ -110,6 +117,7 @@ async fn paired_airc(
 }
 
 #[tokio::test]
+#[ignore = "perf bench: contends for fsync + TCP loopback; opt-in via `--ignored --test-threads=1`"]
 async fn bench_chat_throughput_sustained_load() {
     // 15 personas × 5 msg/s sustained = 75 msg/s. Simulate one
     // persona's cost; the substrate's per-message hot path is
@@ -151,13 +159,14 @@ async fn bench_chat_throughput_sustained_load() {
     // survive CI noise. Phase 1.D tightens to whatever the optimized
     // value lands at.
     assert!(
-        ns_per_op < 10_000_000,
+        ns_per_op < 5_000_000,
         "chat sustained throughput regressed to {ns_per_op} ns/op — \
          was the per-message hot path hit with new ORM round-trips?"
     );
 }
 
 #[tokio::test]
+#[ignore = "perf bench: contends for fsync + TCP loopback; opt-in via `--ignored --test-threads=1`"]
 async fn bench_chat_burst_replay_attach() {
     // The "burst" shape: a chat widget mounts, pulls last 200
     // messages off the store, renders. We measure the cost of
@@ -208,13 +217,14 @@ async fn bench_chat_burst_replay_attach() {
     // user-visible long before this; Phase 1.D's optimization is what
     // tightens this floor to "no longer user-visible."
     assert!(
-        elapsed.as_millis() < 2200,
+        elapsed.as_millis() < 1100,
         "chat burst replay regressed to {elapsed:?} total ({BURST} messages); \
          continuum's chat-widget mount becomes user-visible at this scale"
     );
 }
 
 #[tokio::test]
+#[ignore = "perf bench: contends for fsync + TCP loopback; opt-in via `--ignored --test-threads=1`"]
 async fn bench_chat_throughput_minimal_headers() {
     // Sanity bench: same shape as `bench_chat_throughput_sustained_load`
     // but with NO headers, NO body customization, so it isolates the
@@ -243,7 +253,7 @@ async fn bench_chat_throughput_minimal_headers() {
     );
 
     assert!(
-        ns_per_op < 10_000_000,
+        ns_per_op < 5_000_000,
         "minimal say() regressed to {ns_per_op} ns/op — substrate per-msg overhead has grown"
     );
 }

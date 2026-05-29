@@ -61,6 +61,31 @@ impl SqliteEventStore {
         opts.connect_timeout(std::time::Duration::from_secs(5))
             .acquire_timeout(std::time::Duration::from_secs(5))
             .max_connections(1);
+        // Card 127816bd Phase 1.C — chat throughput.
+        //
+        // Default SQLite mode is journal=DELETE + synchronous=FULL,
+        // which forces a rollback-journal fsync on EVERY append. On
+        // macOS APFS that's ~3-15ms per insert; for chat publish (one
+        // append per `.say()`) that single fsync IS the per-message
+        // hot path — measured at 3.5 ms/op against the empty-WAL
+        // baseline in `airc-lib/tests/chat_throughput.rs`.
+        //
+        // WAL + `synchronous=NORMAL` trades that per-commit fsync
+        // for an fsync at WAL checkpoint (every ~1000 pages). Crash
+        // semantics: only the un-checkpointed tail can be lost. For
+        // airc this is correct: events are content-addressed
+        // (event_id is the digest), the wire path replays gaps from
+        // peers on reconnect, and the daemon's recover-from-cursor
+        // protocol already handles short tails. Same trade `bus_sink`
+        // makes for the same reasons.
+        //
+        // Typed builder, not literal SQL — `SqliteConnectOptions`
+        // is sea-orm's ORM-level connection-config surface.
+        opts.sqlx_logging(false).map_sqlx_sqlite_opts(|so| {
+            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
+            so.journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+        });
         let db = Database::connect(opts).await?;
         // Forward-compatible BOTH directions: apply our pending
         // migrations, but tolerate a DB already migrated AHEAD of this
@@ -695,31 +720,32 @@ impl EventStore for SqliteEventStore {
 
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
         let active = to_active_model(&ev)?;
-        // Insert with explicit "do nothing on conflict" so a replay
-        // surfaces as DuplicateEventId rather than a generic DbErr.
-        let res = event::Entity::insert(active)
+        // Card 127816bd Phase 1.C — eliminate the post-insert SELECT.
+        //
+        // Sea-ORM's `ON CONFLICT DO NOTHING` returns `Ok(_)` on a
+        // true insert and `Err(DbErr::RecordNotInserted)` on a
+        // do-nothing — the duplicate signal is in the error path,
+        // no second query needed. The previous re-query by event_id
+        // was over-cautious; event_id is a UUIDv4 + content-derived
+        // and the (event_id, lamport) pair is invariant for a given
+        // event, so a lamport-mismatch on the existing row can never
+        // legitimately occur — only a race between two concurrent
+        // appenders writing the same event_id, which the do-nothing
+        // path is exactly designed to handle.
+        //
+        // Removes one full SELECT (planner + index hit) per `.say()`
+        // — a measurable share of the 3.5ms/op baseline measured
+        // in `airc-lib/tests/chat_throughput.rs`.
+        match event::Entity::insert(active)
             .on_conflict(
                 OnConflict::column(event::Column::EventId)
                     .do_nothing()
                     .to_owned(),
             )
             .exec(&self.db)
-            .await;
-        match res {
-            Ok(_) => {
-                // Distinguish a true insert from a no-op DO-NOTHING:
-                // re-query by event_id and compare.
-                let existing = event::Entity::find_by_id(ev.event_id.as_uuid())
-                    .one(&self.db)
-                    .await?;
-                match existing {
-                    Some(row) if row.lamport == ev.lamport as i64 => Ok(()),
-                    Some(_) => Err(StoreError::DuplicateEventId(ev.event_id.as_uuid())),
-                    None => Err(StoreError::Database(sea_orm::DbErr::Custom(
-                        "post-insert lookup returned no row".to_string(),
-                    ))),
-                }
-            }
+            .await
+        {
+            Ok(_) => Ok(()),
             Err(sea_orm::DbErr::RecordNotInserted) => {
                 Err(StoreError::DuplicateEventId(ev.event_id.as_uuid()))
             }
