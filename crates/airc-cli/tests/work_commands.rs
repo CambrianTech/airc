@@ -610,7 +610,12 @@ fn work_board_empty_state_is_explicit() {
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let machine_home = home.parent().unwrap_or(home);
+    // Card 303f2384: --no-lease-required is gated on cwd being a
+    // scope-owner / lease-zone / project-root. Set cwd to the test's
+    // machine_home (which becomes a scope owner once `init` runs)
+    // so the gate accepts the tests' `--no-lease-required` claims.
     let output = Command::new(airc_core())
+        .current_dir(machine_home)
         .env("HOME", machine_home)
         .env("USERPROFILE", machine_home)
         .arg("--home")
@@ -631,6 +636,7 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
 fn run_expect_failure(home: &Path, args: &[&str]) -> String {
     let machine_home = home.parent().unwrap_or(home);
     let output = Command::new(airc_core())
+        .current_dir(machine_home)
         .env("HOME", machine_home)
         .env("USERPROFILE", machine_home)
         .arg("--home")

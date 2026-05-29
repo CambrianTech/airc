@@ -179,17 +179,72 @@ pub async fn run_claim(
     ttl_ms: u64,
     no_lease_required: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let lease_check = lease::check_current_dir()?;
     if !no_lease_required {
-        let check = lease::check_current_dir()?;
-        if !check.under_lease {
+        if !lease_check.under_lease {
             return Err(format!(
                 "refusing to claim work card from {cwd}: not under lease zone {root}.\n\
                  Allocate a worktree under ~/.airc/worktrees/ first, or pass \
                  --no-lease-required to override.",
-                cwd = check.path.display(),
-                root = check.lease_root.display(),
+                cwd = lease_check.path.display(),
+                root = lease_check.lease_root.display(),
             )
             .into());
+        }
+    } else {
+        // Card 303f2384: restrict the `--no-lease-required` bypass.
+        // The flag was intended as an escape hatch for legitimate
+        // non-worktree contexts (claiming a review card from the
+        // project's main checkout, recovering from an orphaned claim
+        // in a fresh tree). It started getting used everywhere
+        // (`--no-lease-required` "is the tell" per card d1b2798d's
+        // doc) — agents bypass the whole worktree workflow because
+        // they don't want to deal with it, then we get shared-
+        // checkout collisions and identity leaks.
+        //
+        // Restriction: even with the flag set, the cwd MUST be one
+        // of:
+        //   (a) under the lease zone (`~/.airc/worktrees/<short>/`,
+        //       in which case the flag was redundant — silently OK)
+        //   (b) at the project's git working-tree ROOT (e.g.
+        //       `/Users/joel/Development/airc`). Joel-from-the-main-
+        //       checkout case + the "primary tab" scenario both look
+        //       like this; random subdirs do not.
+        //   (c) an airc-scope owner — cwd contains a `.airc/` dir.
+        //       Integration test workspaces (tempdir + `airc init`)
+        //       satisfy this without being a git repo, and any
+        //       "primary tab" cwd already covered by (b) also has
+        //       `.airc/`; this widens the bypass without weakening
+        //       the no-random-subdir intent.
+        //
+        // Any other cwd is refused: tmpdirs without state, accidental
+        // sibling-worktree paths, unrelated projects. The agent gets an
+        // explicit error with the corrective action.
+        let cwd_is_scope_owner = lease_check.path.join(".airc").is_dir();
+        if !lease_check.under_lease
+            && !cwd_is_scope_owner
+            && !cwd_is_project_root(&lease_check.path)?
+        {
+            return Err(format!(
+                "refusing --no-lease-required claim from {cwd}: cwd is neither under \
+                 the lease zone ({root}), at the project's git working-tree root, \
+                 NOR an airc-scope owner (no .airc/ subdir). The flag is for review \
+                 cards / main-checkout claims; for normal worktree-spawned cards, \
+                 cd to a worktree first or omit the flag.",
+                cwd = lease_check.path.display(),
+                root = lease_check.lease_root.display(),
+            )
+            .into());
+        }
+        // Soft warning even on the legitimate path — the flag's overuse
+        // is the slippery slope.
+        if !lease_check.under_lease {
+            eprintln!(
+                "warn: --no-lease-required claim from project root \
+                 ({cwd}). Acceptable for review cards / direct primary \
+                 claims; for normal cards use the worktree workflow.",
+                cwd = lease_check.path.display()
+            );
         }
     }
     let airc = crate::commands::attached_airc(home).await?;
@@ -212,6 +267,38 @@ pub async fn run_claim(
         eprintln!("airc: worktree spawn skipped — {error}");
     }
     Ok(())
+}
+
+/// Card 303f2384: true when `cwd` IS the git project's main working
+/// tree root (e.g. `/Users/joel/Development/airc`). Used by the
+/// `--no-lease-required` gate so legitimate direct-claim contexts
+/// (Joel claiming a review card from his main checkout, the
+/// "primary tab" pattern) still work, while random subdirs /
+/// tmpdirs / unrelated-project cwds get refused.
+///
+/// Returns Err only when git itself fails in a way the caller cares
+/// about (we'd otherwise refuse legitimate claims because of a
+/// transient git error); the gate above defaults to NOT-root when
+/// this returns Err, so the agent gets the explicit refusal rather
+/// than a silent success.
+fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        // Not a git repo OR git unavailable. Conservative: NOT root.
+        return Ok(false);
+    }
+    let toplevel = String::from_utf8(output.stdout)?.trim().to_string();
+    if toplevel.is_empty() {
+        return Ok(false);
+    }
+    let toplevel_canon = std::path::PathBuf::from(&toplevel)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&toplevel));
+    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    Ok(cwd_canon == toplevel_canon)
 }
 
 pub async fn run_release(
@@ -1820,5 +1907,88 @@ mod tests {
         // own test pinning the 8-char take. This test is the
         // architectural cross-reference.)
         assert_eq!(short_id(card_id.to_string()), expected_short);
+    }
+
+    // ---------------------------------------------------------------------
+    // Card 303f2384 — --no-lease-required cwd gate
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn cwd_is_project_root_returns_false_for_nonexistent_path() {
+        // A path with no git repo (and that doesn't exist) returns
+        // Ok(false), not an error — that's the conservative default
+        // the gate relies on so a transient git failure doesn't
+        // permit a refused claim.
+        let unique = std::env::temp_dir().join(format!(
+            "airc-303f2384-noent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Don't even create it — confirms the no-git-here path
+        let result = super::cwd_is_project_root(&unique);
+        match result {
+            Ok(false) => {}
+            Ok(true) => panic!("nonexistent path is NOT project root"),
+            Err(_) => {} // Acceptable — git can't enter a missing dir
+        }
+    }
+
+    #[test]
+    fn cwd_is_project_root_true_at_repo_top_level() {
+        // From the repo root (cargo runs tests from the package
+        // dir), git rev-parse --show-toplevel returns the workspace
+        // root. The cwd at test time IS that, so cwd_is_project_root
+        // must return true. Pins the substrate gate's "primary tab"
+        // semantic.
+        let cwd = std::env::current_dir().expect("cwd available");
+        // Find the actual workspace root via git
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .output();
+        let Ok(out) = output else {
+            return; // No git, can't verify the property
+        };
+        if !out.status.success() {
+            return;
+        }
+        let toplevel = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        // cd to the workspace root and check
+        let root = std::path::PathBuf::from(toplevel);
+        let result = super::cwd_is_project_root(&root).expect("git available");
+        assert!(
+            result,
+            "running with cwd = git toplevel must be detected as project root"
+        );
+    }
+
+    #[test]
+    fn cwd_is_project_root_false_in_subdir_of_repo() {
+        // A subdir of the repo (e.g. crates/airc-cli) is NOT the
+        // project root — gate must refuse `--no-lease-required`
+        // claims from random sub-paths.
+        let cwd = std::env::current_dir().expect("cwd available");
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .output();
+        let Ok(out) = output else { return };
+        if !out.status.success() {
+            return;
+        }
+        let toplevel = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let root = std::path::PathBuf::from(toplevel);
+        let subdir = root.join("crates");
+        if !subdir.exists() {
+            return; // Sanity guard; in this repo it exists
+        }
+        let result = super::cwd_is_project_root(&subdir).expect("git available");
+        assert!(
+            !result,
+            "subdir of the workspace must NOT be detected as project root"
+        );
     }
 }
