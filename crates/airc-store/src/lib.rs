@@ -60,7 +60,7 @@ pub use error::StoreError;
 pub use local_identity::{StoredLocalIdentity, DEFAULT_AGENT_NAME};
 pub use memory::InMemoryEventStore;
 pub use mesh_identity::StoredMeshIdentity;
-pub use peer_trust::{RotationAuditEntry, StoredPeer};
+pub use peer_trust::{RotationAuditEntry, StoredPeer, TrustTier};
 pub use refresh_lock::{StoredRefreshLock, StoredRefreshLockOutcome};
 pub use sqlite::SqliteEventStore;
 pub use store::EventStore;

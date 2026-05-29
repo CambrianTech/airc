@@ -336,6 +336,44 @@ impl SqliteEventStore {
         }))
     }
 
+    /// Card 34942ec1 Sub-B — update the trust tier on an existing
+    /// peer row. Lets the substrate elevate a peer to OwnMachine /
+    /// OwnAccount after detection runs (Sub-B), or lets the operator
+    /// set Friend via the Sub-C CLI surface, without touching the
+    /// peer's pubkey or added_at_ms.
+    ///
+    /// Returns `Ok(None)` if the peer isn't enrolled — the caller
+    /// decides whether that's a structural bug (substrate calling
+    /// set_tier on an unknown peer) or a benign race (peer was
+    /// removed concurrent with the tier write). No row is inserted.
+    ///
+    /// Idempotent: setting the same tier the row already has returns
+    /// the row unchanged.
+    pub async fn set_peer_trust_tier(
+        &self,
+        peer_id: PeerId,
+        tier: TrustTier,
+    ) -> Result<Option<StoredPeer>, StoreError> {
+        let txn = self.db.begin().await?;
+        let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+        let mut active: peer_trust::ActiveModel = existing.clone().into();
+        active.tier = Set(tier.as_wire_str().to_string());
+        peer_trust::Entity::update(active).exec(&txn).await?;
+        txn.commit().await?;
+        Ok(Some(StoredPeer {
+            peer_id,
+            pubkey_b64: existing.pubkey_b64,
+            added_at_ms: i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?,
+            tier,
+        }))
+    }
+
     pub async fn append_peer_rotation_audit(
         &self,
         entry: RotationAuditEntry,
