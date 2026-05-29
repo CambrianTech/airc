@@ -298,11 +298,19 @@ impl Airc {
         //    EMPTY for this event_id in our process — so we DO fan
         //    out. That's how Claude and Codex talking on the same
         //    HOME actually deliver to each other's subscribers.
+        //
+        // Card 127816bd Phase 1.C: ring-check first so case 1 (self
+        // echo) skips the redundant `store.append`. Saves one full
+        // SQLite append + fsync per locally-sent message OFF the
+        // wire-tail task — not on the `.say()` critical path (the
+        // wire tail is async) but still wasted work that contends
+        // for the DB connection with subsequent sends.
+        if !self.mark_broadcast(event_id) {
+            return;
+        }
         match self.inner.store.append(event.clone()).await {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
-                if self.mark_broadcast(event_id) {
-                    let _ = self.inner.live_tx.send(Arc::new(event));
-                }
+                let _ = self.inner.live_tx.send(Arc::new(event));
             }
             Err(err) => {
                 StderrJsonDiagnosticSink.emit(
