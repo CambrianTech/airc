@@ -8,26 +8,24 @@
 //! **metadata that callers need to pair with the on-disk key**:
 //! `peer_id`, `client_id`, schema version, the originally recorded
 //! creation timestamp, the user-facing identity-card fields, and
-//! (since card 8384cc18 Sub-A) an `agent_name` discriminator.
+//! an `agent_name` discriminator.
 //!
-//! Singleton today, multi-agent target: the migration still uses an
-//! integer primary key fixed at `1` (CHECK constraint enforced),
-//! so a fresh DB has exactly zero or one row. Card 8384cc18 Sub-A
-//! adds `agent_name TEXT NOT NULL DEFAULT 'default'` purely
-//! additively — every existing row gets named `"default"`. Sub-B
-//! drops the CHECK + table-recreates so multiple rows become legal;
-//! Sub-C surfaces the agent-name read API; Sub-D wires
-//! `AIRC_AGENT_ID` / `airc init --as <name>`.
+//! Multi-agent target: card 8384cc18 Sub-A added
+//! `agent_name TEXT NOT NULL DEFAULT 'default'` additively, and
+//! Sub-B table-recreated this schema to drop the former
+//! `CHECK (id = 1)` singleton constraint. Multiple rows are now
+//! legal at the schema layer; Sub-C surfaces the agent-name read API
+//! and Sub-D wires `AIRC_AGENT_ID` / `airc init --as <name>`.
 //!
-//! [`SINGLETON_ID`] stays the documented primary-key value until
-//! Sub-B lands.
+//! [`SINGLETON_ID`] remains the documented primary-key value for the
+//! legacy/default agent row until the higher-level APIs stop using a
+//! singleton fallback.
 
 use sea_orm::entity::prelude::*;
 
-/// The only legal primary-key value while the singleton CHECK is in
-/// place (card 8384cc18 Sub-A → Sub-B will drop it). Encoded as `i32`
-/// so SQLite stores it as INTEGER (cheap) rather than a TEXT
-/// singleton key.
+/// The legacy/default primary-key value. Sub-B removed the database
+/// CHECK that made this the only legal id, but existing callers still
+/// use it until Sub-C/Sub-D route identity lookup by agent name.
 pub const SINGLETON_ID: i32 = 1;
 
 /// The default agent name used for every pre-card-8384cc18 row and
@@ -39,10 +37,9 @@ pub const DEFAULT_AGENT_NAME: &str = "default";
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "local_identity")]
 pub struct Model {
-    /// Currently always [`SINGLETON_ID`] (migration enforces it via
-    /// CHECK). Card 8384cc18 Sub-B drops the CHECK to allow multiple
-    /// rows; at that point `agent_name` becomes the natural read-key
-    /// and `id` becomes a non-meaningful row sequence number.
+    /// Existing/default identities use [`SINGLETON_ID`]. Sub-B removed
+    /// the singleton CHECK so additional rows can use other ids;
+    /// `agent_name` is the natural read key for multi-agent callers.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: i32,
     pub peer_id: Uuid,
