@@ -217,6 +217,107 @@ pub async fn add(
         .map_err(Into::into)
 }
 
+/// Card 34942ec1 Sub-B — update the trust tier on an existing peer.
+///
+/// Returns `Ok(None)` if the peer isn't enrolled — the caller
+/// decides whether that's a structural bug (detection ran on an
+/// unknown peer) or a benign race. Substrate-only API; consumer
+/// policy (continuum's tensor routing, hermes' goal visibility)
+/// reads the tier through the store load API and applies their
+/// domain rules.
+pub async fn set_tier(
+    home: &Path,
+    peer_id: PeerId,
+    tier: airc_store::TrustTier,
+) -> Result<Option<StoredPeer>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .set_peer_trust_tier(peer_id, tier)
+        .await
+        .map_err(Into::into)
+}
+
+/// Card 34942ec1 Sub-B — pure detection helper.
+///
+/// Returns the trust tier that should apply when we observe a peer
+/// whose `peer_id`, mesh-identity (`peer_mesh`), and local-machine
+/// reachability (`peer_is_on_this_machine`) we already know. The
+/// caller resolves those signals; this function is the policy from
+/// signals → tier.
+///
+/// Rules, in order:
+///   1. `peer_id == self_peer_id` → [`TrustTier::OwnMachine`].
+///      Literal self-enrollment (`Airc::open` adds my own peer to
+///      my own trust store as the first row); that row is
+///      definitionally OwnMachine.
+///   2. `peer_is_on_this_machine` (caller has confirmed the peer
+///      reaches us via the local UDS socket / same machine_account_home
+///      filesystem) → [`TrustTier::OwnMachine`].
+///   3. `peer_mesh == self_mesh` (peer authenticates as the same
+///      mesh-identity as us, e.g. another physical machine signed
+///      into the same GitHub account) → [`TrustTier::OwnAccount`].
+///   4. Otherwise → [`TrustTier::Untrusted`]. [`TrustTier::Friend`]
+///      is never inferred from signals; it requires an explicit
+///      out-of-band operator decision (Sub-C `airc peer set-tier`).
+///
+/// Idempotent: returning the same tier on repeated calls with the
+/// same inputs. Pure — no IO, no async — so it's easy to unit-test
+/// the policy matrix without standing up sockets.
+pub fn detect_tier(
+    self_peer_id: PeerId,
+    self_mesh: Option<&str>,
+    peer_id: PeerId,
+    peer_mesh: Option<&str>,
+    peer_is_on_this_machine: bool,
+) -> airc_store::TrustTier {
+    if peer_id == self_peer_id {
+        return airc_store::TrustTier::OwnMachine;
+    }
+    if peer_is_on_this_machine {
+        return airc_store::TrustTier::OwnMachine;
+    }
+    if let (Some(self_mesh), Some(peer_mesh)) = (self_mesh, peer_mesh) {
+        if !self_mesh.is_empty() && self_mesh == peer_mesh {
+            return airc_store::TrustTier::OwnAccount;
+        }
+    }
+    airc_store::TrustTier::Untrusted
+}
+
+/// Card 34942ec1 Sub-B — substrate-level convenience: probe whether
+/// `peer_home` is reachable from `self_home` on the local filesystem.
+/// Two filesystem paths are "on the same machine" when they
+/// canonicalize to the same directory OR one is a descendant of the
+/// other (e.g. self at `~/.airc/` and a sub-scope peer at
+/// `~/.airc/joel-codex/`).
+///
+/// Deliberately conservative — does NOT treat two arbitrary
+/// siblings under a common parent as same-machine, because every
+/// system tempdir would then collapse to OwnMachine. Substrates
+/// that have stronger evidence (e.g. shared `machine_account_home`
+/// resolved by `airc-lib::machine_account_home`) should pass
+/// `peer_is_on_this_machine = true` to [`detect_tier`] directly
+/// rather than relying on this loose heuristic.
+///
+/// Note: this is the *file-layout* signal only. A peer could be on
+/// the same machine but reach us via a network transport instead of
+/// UDS; that case isn't covered here.
+pub fn is_local_machine_home(self_home: &Path, peer_home: &Path) -> bool {
+    let Ok(self_canon) = self_home.canonicalize() else {
+        return false;
+    };
+    let Ok(peer_canon) = peer_home.canonicalize() else {
+        return false;
+    };
+    if self_canon == peer_canon {
+        return true;
+    }
+    if peer_canon.starts_with(&self_canon) || self_canon.starts_with(&peer_canon) {
+        return true;
+    }
+    false
+}
+
 /// Remove an enrolled peer from the local trust store. Idempotent:
 /// returns `Ok(None)` when the peer is already absent.
 pub async fn remove(home: &Path, peer_id: PeerId) -> Result<Option<StoredPeer>, PeersStoreError> {
@@ -604,5 +705,179 @@ mod tests {
         assert!(ids.contains(&a.0));
         assert!(ids.contains(&b.0));
         assert!(ids.contains(&c.0));
+    }
+
+    // ---- Card 34942ec1 Sub-B (detection + set_tier) ----
+
+    fn sub_b_sample(seed: u8) -> (PeerId, [u8; 32]) {
+        (PeerId::new(), fake_pubkey(seed))
+    }
+
+    #[tokio::test]
+    async fn set_tier_updates_existing_peer_and_returns_some() {
+        let home = TempDir::new().unwrap();
+        let (peer, pubkey) = sub_b_sample(1);
+        add(home.path(), peer, pubkey).await.unwrap();
+
+        // Newly-added rows default to Untrusted per Sub-A.
+        let before = load(home.path()).await.unwrap();
+        assert_eq!(
+            before[0].tier,
+            airc_store::TrustTier::Untrusted,
+            "freshly enrolled peers start Untrusted",
+        );
+
+        let updated = set_tier(home.path(), peer, airc_store::TrustTier::Friend)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().tier, airc_store::TrustTier::Friend);
+
+        // Persisted: reload reads the new tier.
+        let after = load(home.path()).await.unwrap();
+        assert_eq!(after[0].tier, airc_store::TrustTier::Friend);
+    }
+
+    #[tokio::test]
+    async fn set_tier_on_unknown_peer_returns_none_no_row_inserted() {
+        let home = TempDir::new().unwrap();
+        let (ghost, _) = sub_b_sample(99);
+        let result = set_tier(home.path(), ghost, airc_store::TrustTier::OwnMachine)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "unknown peer must not be silently inserted"
+        );
+        assert!(load(home.path()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_tier_is_idempotent_when_tier_matches_existing() {
+        let home = TempDir::new().unwrap();
+        let (peer, pubkey) = sub_b_sample(2);
+        add(home.path(), peer, pubkey).await.unwrap();
+        set_tier(home.path(), peer, airc_store::TrustTier::Friend)
+            .await
+            .unwrap();
+        // Set to the same tier again — same row, same tier, no error.
+        let again = set_tier(home.path(), peer, airc_store::TrustTier::Friend)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.tier, airc_store::TrustTier::Friend);
+    }
+
+    #[test]
+    fn detect_tier_rule_1_self_peer_id_is_own_machine() {
+        let me = PeerId::from_u128(42);
+        let tier = detect_tier(me, Some("alice@github"), me, Some("alice@github"), false);
+        assert_eq!(tier, airc_store::TrustTier::OwnMachine);
+    }
+
+    #[test]
+    fn detect_tier_rule_2_same_machine_is_own_machine() {
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        let tier = detect_tier(
+            me,
+            Some("alice@github"),
+            other,
+            Some("bob@github"),
+            true, // caller has confirmed same-machine reachability
+        );
+        assert_eq!(tier, airc_store::TrustTier::OwnMachine);
+    }
+
+    #[test]
+    fn detect_tier_rule_3_matching_mesh_identity_is_own_account() {
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        let tier = detect_tier(me, Some("alice@github"), other, Some("alice@github"), false);
+        assert_eq!(tier, airc_store::TrustTier::OwnAccount);
+    }
+
+    #[test]
+    fn detect_tier_default_is_untrusted_when_no_signal_matches() {
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        let tier = detect_tier(me, Some("alice@github"), other, Some("bob@github"), false);
+        assert_eq!(tier, airc_store::TrustTier::Untrusted);
+    }
+
+    #[test]
+    fn detect_tier_friend_is_never_inferred_from_signals() {
+        // Friend requires explicit out-of-band operator decision —
+        // detect_tier MUST NOT return Friend for any signal
+        // combination. Pins the substrate contract that automated
+        // detection can't fabricate an out-of-band trust claim.
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        let mut combos = Vec::new();
+        for self_mesh in [None, Some("alice"), Some("")] {
+            for peer_mesh in [None, Some("alice"), Some("")] {
+                for same_machine in [true, false] {
+                    combos.push(detect_tier(me, self_mesh, other, peer_mesh, same_machine));
+                }
+            }
+        }
+        for tier in &combos {
+            assert_ne!(
+                *tier,
+                airc_store::TrustTier::Friend,
+                "Friend must not be inferred",
+            );
+        }
+    }
+
+    #[test]
+    fn detect_tier_empty_mesh_strings_dont_match() {
+        // Empty mesh-identity on both sides isn't a real match — it
+        // means "we don't have a mesh-identity yet." Guards against a
+        // bug where two un-initialized peers would falsely collapse
+        // to OwnAccount.
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        let tier = detect_tier(me, Some(""), other, Some(""), false);
+        assert_eq!(tier, airc_store::TrustTier::Untrusted);
+    }
+
+    #[test]
+    fn is_local_machine_home_detects_same_directory() {
+        let tmp = TempDir::new().unwrap();
+        assert!(is_local_machine_home(tmp.path(), tmp.path()));
+    }
+
+    #[test]
+    fn is_local_machine_home_does_not_treat_arbitrary_siblings_as_local() {
+        // Deliberately strict: two siblings under a common parent are
+        // NOT considered same-machine. Otherwise every system tempdir
+        // would collapse to OwnMachine, which is what the original
+        // version of this test (under common /var/folders parent)
+        // surfaced. Substrates with stronger evidence pass
+        // `peer_is_on_this_machine = true` directly to detect_tier.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("agent-a");
+        let b = tmp.path().join("agent-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert!(!is_local_machine_home(&a, &b));
+    }
+
+    #[test]
+    fn is_local_machine_home_detects_nested_homes() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().to_path_buf();
+        let child = parent.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(is_local_machine_home(&parent, &child));
+        assert!(is_local_machine_home(&child, &parent));
+    }
+
+    #[test]
+    fn is_local_machine_home_returns_false_for_unrelated_paths() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        assert!(!is_local_machine_home(tmp_a.path(), tmp_b.path()));
     }
 }
