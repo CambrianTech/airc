@@ -94,6 +94,15 @@ pub enum TranscriptKind {
     /// the latest per room_id (LWW on published_at_ms). Part of
     /// card 2903a8ef — engine keystone "the user is not the engine."
     DoctrinePublished,
+    /// A peer pinned (or revised) a wall post — the room's living-
+    /// document mechanism (card b4742d9c). Body: serialized
+    /// `DoctrineEvent::WallPostPublished` carrying { room_id, post_id,
+    /// category, body, supersedes, published_by, published_at_ms }.
+    /// `category` is consumer-defined ("doctrine" / "rules" /
+    /// "agenda" / "rag" / anything). Doctrine becomes the special
+    /// case `category="doctrine"`; the legacy `DoctrinePublished`
+    /// remains for back-compat replay.
+    WallPostPublished,
 }
 
 impl TranscriptKind {
@@ -112,6 +121,7 @@ impl TranscriptKind {
                 | TranscriptKind::SubscriptionAdvanced
                 | TranscriptKind::IdentityPublished
                 | TranscriptKind::DoctrinePublished
+                | TranscriptKind::WallPostPublished
         )
     }
 
@@ -149,6 +159,7 @@ impl TranscriptKind {
             TranscriptKind::SubscriptionAdvanced => "subscription_advanced",
             TranscriptKind::IdentityPublished => "identity_published",
             TranscriptKind::DoctrinePublished => "doctrine_published",
+            TranscriptKind::WallPostPublished => "wall_post_published",
         }
     }
 
@@ -172,6 +183,7 @@ impl TranscriptKind {
             "subscription_advanced" => TranscriptKind::SubscriptionAdvanced,
             "identity_published" => TranscriptKind::IdentityPublished,
             "doctrine_published" => TranscriptKind::DoctrinePublished,
+            "wall_post_published" => TranscriptKind::WallPostPublished,
             _ => return None,
         })
     }
@@ -197,6 +209,7 @@ impl TranscriptKind {
         TranscriptKind::SubscriptionAdvanced,
         TranscriptKind::IdentityPublished,
         TranscriptKind::DoctrinePublished,
+        TranscriptKind::WallPostPublished,
     ];
 }
 
