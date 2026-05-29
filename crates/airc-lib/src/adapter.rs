@@ -193,7 +193,10 @@ impl AdapterRegistry {
     pub fn register(&self, adapter: Arc<dyn ConsumerAdapter>) -> Result<(), RegistryError> {
         let name = adapter.name();
         let body_hint = adapter.body_hint();
-        let mut by_name = self.by_name.write().expect("adapter registry not poisoned");
+        let mut by_name = self
+            .by_name
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if by_name.contains_key(name) {
             return Err(RegistryError::DuplicateName(name));
@@ -217,14 +220,20 @@ impl AdapterRegistry {
         &self,
         name: &'static str,
     ) -> Result<Option<Arc<dyn ConsumerAdapter>>, RegistryError> {
-        let mut by_name = self.by_name.write().expect("adapter registry not poisoned");
+        let mut by_name = self
+            .by_name
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(by_name.remove(name))
     }
 
     /// Snapshot of registered adapter names. Stable order
     /// (alphabetical) so log lines and tests are deterministic.
     pub fn registered_names(&self) -> Vec<&'static str> {
-        let by_name = self.by_name.read().expect("adapter registry not poisoned");
+        let by_name = self
+            .by_name
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut names: Vec<&'static str> = by_name.keys().copied().collect();
         names.sort_unstable();
         names
@@ -235,7 +244,10 @@ impl AdapterRegistry {
     /// loop should log + drop (or buffer for later, if its policy
     /// says so) when this returns None.
     pub fn adapter_for_body_hint(&self, body_hint: &str) -> Option<Arc<dyn ConsumerAdapter>> {
-        let by_name = self.by_name.read().expect("adapter registry not poisoned");
+        let by_name = self
+            .by_name
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         by_name
             .values()
             .find(|a| a.body_hint() == body_hint)
