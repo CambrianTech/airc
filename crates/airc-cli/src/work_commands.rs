@@ -557,7 +557,14 @@ pub async fn run_state(
 ///     `git branch -D` if the branch has no other reachable refs.
 ///   * All operations run from the MAIN working tree (the cwd's
 ///     repo root), not from the worktree being removed.
-async fn cleanup_card_worktree(
+///
+/// Called from TWO terminal paths so a card's worktree is reclaimed
+/// regardless of who closes it: (1) the CLI `airc work close` path
+/// below, and (2) the merger's `perform_merge` after a successful
+/// `MarkPullRequestMerged` (card cdb477a2). The merger closes the
+/// majority of cards; without path (2) every merger-merged card
+/// leaked its worktree — the 84-orphan accumulation this fix targets.
+pub(crate) async fn cleanup_card_worktree(
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let short: String = card_id.to_string().chars().take(8).collect();
