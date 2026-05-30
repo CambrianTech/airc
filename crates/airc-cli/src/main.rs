@@ -792,14 +792,25 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             MonitorAction::Format { peers_dir, my_name } => {
                 monitor::run_format(&peers_dir, &my_name)
             }
-            MonitorAction::Attach { my_name } => {
+            MonitorAction::Attach {
+                my_name,
+                from_now,
+                include_backlog,
+                coalesce_backlog,
+            } => {
                 let socket = default_or(None, &home);
                 // Return-value ignored: this call site only uses the
                 // daemon-side state (monitor::run_attach reads the
                 // store, not the socket). If discovery routes to a
                 // different socket, the home is what matters here.
                 let _socket = commands::ensure_daemon_running(&home, socket, parsed.peers).await?;
-                monitor::run_attach(&home, &my_name).await
+                // Card 7d5b6a65: clap resolves --include-backlog as
+                // the inverse of --from-now (they're conflicting
+                // flags). Defaults: from_now=true. coalesce_backlog
+                // defaults to true; flipped to false by user only
+                // when they want event-by-event replay (audit case).
+                let live_only = from_now && !include_backlog;
+                monitor::run_attach(&home, &my_name, live_only, coalesce_backlog).await
             }
         },
 

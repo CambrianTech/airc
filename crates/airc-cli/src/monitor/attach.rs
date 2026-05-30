@@ -11,7 +11,31 @@ use super::render::{normalize_channel, xml_escape, Sandbox};
 use crate::client_id::current_client_id;
 use crate::work_suggestions::render_claimable_work_for_event;
 
-pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error>> {
+/// One frame to surface on stdout — either a decoded transcript event
+/// or a one-shot summary line (the card-7d5b6a65 catch-up coalesce).
+///
+/// `Event` is boxed because `TranscriptEvent` is ~400 bytes (headers,
+/// body, signature, etc.) while `CatchUpSummary` is ~24 bytes; without
+/// the box every enum slot is sized for the largest variant and the
+/// channel buffer balloons. Box-on-the-heavy-variant is the standard
+/// fix and matches clippy's `large_enum_variant` lint guidance.
+enum MonitorFrame {
+    Event(Box<TranscriptEvent>),
+    /// Card 7d5b6a65 summary frame. Carries the daemon's catch-up
+    /// summary so the merger that joins multiple per-channel streams
+    /// can render it on the main thread without extra plumbing.
+    CatchUpSummary {
+        channel: RoomId,
+        skipped: u64,
+    },
+}
+
+pub(crate) async fn run(
+    home: &Path,
+    _my_name: &str,
+    from_now: bool,
+    coalesce_backlog: bool,
+) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
     let socket = crate::cli::default_socket_path_in(home);
@@ -22,7 +46,14 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
     // attach stream per subscribed room and merges them into a single
     // feed. Each daemon `Event` carries airc-wire bytes — decoded once
     // here via the shared projection.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<TranscriptEvent>(1024);
+    //
+    // Card 7d5b6a65: `from_now=true` (the default) asks the daemon to
+    // skip transcript replay and start at the live edge — no backlog
+    // flood. `coalesce_backlog=true` (only meaningful when `from_now`
+    // is false) asks the daemon to collapse the catch-up phase into a
+    // single `AttachCursorAdvanced` summary frame which the renderer
+    // surfaces as ONE stdout line instead of N historical events.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<MonitorFrame>(1024);
     for channel in channels {
         let socket = socket.clone();
         let tx = tx.clone();
@@ -32,6 +63,8 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
                 .attach(AttachRequest {
                     channel: Some(channel),
                     from: None,
+                    from_now,
+                    coalesce_backlog,
                     ..Default::default()
                 })
                 .await
@@ -40,15 +73,24 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
                 Err(_) => return,
             };
             while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
-                if let Response::Event { envelope } = response {
-                    match decode_wire_event(envelope) {
+                match response {
+                    Response::Event { envelope } => match decode_wire_event(envelope) {
                         Ok(event) => {
-                            if tx.send(event).await.is_err() {
+                            if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err() {
                                 return;
                             }
                         }
                         Err(_) => return,
+                    },
+                    Response::AttachCursorAdvanced { skipped, .. }
+                        if tx
+                            .send(MonitorFrame::CatchUpSummary { channel, skipped })
+                            .await
+                            .is_err() =>
+                    {
+                        return;
                     }
+                    _ => {}
                 }
             }
         });
@@ -59,12 +101,30 @@ pub(crate) async fn run(home: &Path, _my_name: &str) -> Result<(), Box<dyn Error
     println!("airc: attached to Rust event stream for subscribed channels");
     std::io::stdout().flush()?;
 
-    while let Some(event) = rx.recv().await {
-        if let Some(text) = render_claimable_work_for_event(&airc, &event).await? {
-            sandbox.emit_contract_once();
-            render_text_event(&event, client_id.as_deref(), &text, &mut sandbox);
-        } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
-            render_event(&event, client_id.as_deref(), &mut sandbox);
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            MonitorFrame::Event(event) => {
+                let event = *event;
+                if let Some(text) = render_claimable_work_for_event(&airc, &event).await? {
+                    sandbox.emit_contract_once();
+                    render_text_event(&event, client_id.as_deref(), &text, &mut sandbox);
+                } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
+                    render_event(&event, client_id.as_deref(), &mut sandbox);
+                }
+            }
+            MonitorFrame::CatchUpSummary { channel, skipped } => {
+                // ONE stdout line per channel that had backlog to
+                // catch up on. Card 7d5b6a65: the substrate
+                // contribution to keeping live-tail notification
+                // cost bounded regardless of backlog depth.
+                println!(
+                    "airc: caught up — skipped {} event{} on channel {} during backlog catch-up",
+                    skipped,
+                    if skipped == 1 { "" } else { "s" },
+                    channel.0
+                );
+                std::io::stdout().flush()?;
+            }
         }
     }
     Ok(())

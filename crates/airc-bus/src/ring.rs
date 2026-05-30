@@ -102,6 +102,16 @@ impl HotRing {
             .collect()
     }
 
+    /// **Card 7d5b6a65.** The cursor of the most-recent entry currently
+    /// retained, if any. Used by [`EventRouter::head_cursor`] to
+    /// implement the "subscribe from the live edge" attach shape — pass
+    /// this cursor as `from_cursor` and the replay-after predicate
+    /// returns nothing, so the subscriber sees only events strictly
+    /// after the call (the agent-Monitor live-tail).
+    pub fn newest_cursor(&self) -> Option<Cursor> {
+        self.slots.back().map(|slot| slot.env.cursor())
+    }
+
     /// The cursor of the oldest entry currently retained, if any. A
     /// `from_cursor` older than this means the ring cannot serve the full
     /// replay and the deep (sink) leg must cover `(from, oldest_in_ring)`.

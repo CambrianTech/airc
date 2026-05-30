@@ -307,6 +307,45 @@ impl EventRouter {
         }
     }
 
+    /// **Card 7d5b6a65.** Return the cursor of the most-recent envelope
+    /// in the channel's ring snapshot, or `None` if the channel has not
+    /// yet received any envelope.
+    ///
+    /// Callers use this to implement "subscribe from the live edge":
+    /// pass the returned cursor as `from_cursor` to [`Self::subscribe`]
+    /// and the deep-replay + ring-snapshot legs return empty (their
+    /// `is_after` predicate filters them out), so the subscriber gets
+    /// only events published strictly after the call. This is the
+    /// agent-Monitor live-tail shape — the `AttachRequest::from_now`
+    /// flag.
+    pub fn head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        let n = self.inner.shards.len();
+        let idx = (channel.0.as_u128() % n as u128) as usize;
+        let shard = &self.inner.shards[idx];
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .and_then(|state| state.ring.newest_cursor())
+    }
+
+    /// **Card 7d5b6a65.** Async fallback for [`Self::head_cursor`] that
+    /// queries the durable sink. Callers use this when the in-memory
+    /// ring is empty (fresh daemon start with backlog in the sink):
+    ///
+    /// ```ignore
+    /// let from = match router.head_cursor(channel) {
+    ///     Some(c) => Some(c),
+    ///     None => router.sink_head_cursor(channel).await,
+    /// };
+    /// ```
+    ///
+    /// Without this fallback, an `AttachRequest::from_now: true`
+    /// against a freshly-started daemon would fall through to
+    /// `from: None` and replay the whole sink — the exact bug card
+    /// 7d5b6a65 closes.
+    pub async fn sink_head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        self.inner.sink.head_cursor(channel).await.ok().flatten()
+    }
+
     /// Subscribe (§4 subscribe, §3.5 cursor contract).
     ///
     /// Returns a stream that yields **every** envelope on the filter strictly

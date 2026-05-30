@@ -29,6 +29,24 @@ pub enum Response {
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
     Event { envelope: Vec<u8> },
+    /// **Card 7d5b6a65.** Emitted by an `Attach` stream when the
+    /// client requested `coalesce_backlog: true` and the daemon had
+    /// backlog to catch up on. ONE summary frame per attach catch-up,
+    /// then the stream transitions to live tail; each subsequent live
+    /// event arrives as its own `Event` frame.
+    ///
+    /// `skipped` is the count of historical events the daemon
+    /// suppressed during catch-up. `advanced_to` is the cursor the
+    /// daemon resumed from — the client may persist this and pass it
+    /// as `from` on a future reconnect to skip the same backlog
+    /// without `from_now`. When `skipped: 0`, the catch-up phase was
+    /// empty (no backlog at attach time) and the frame is suppressed
+    /// — the daemon emits this variant only when it actually omitted
+    /// at least one event.
+    AttachCursorAdvanced {
+        skipped: u64,
+        advanced_to: IpcCursor,
+    },
     /// Response to `Publish` / `Send` — the owner-assigned receipt.
     Publish(PublishResponse),
     /// Response to `ListPeers` — the daemon's currently-enrolled

@@ -287,9 +287,38 @@ where
     // while detached), then go live with no dup at the seam. `from` is
     // advanced as we send, so a re-subscribe after a lag drop resumes
     // exactly where we left off.
-    let mut from = attach
-        .from
-        .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+    //
+    // Card 7d5b6a65: `from_now` overrides any cursor the client passed
+    // with the channel's current head — the agent-Monitor live-tail
+    // shape. The router's `subscribe_with_lag` interprets a
+    // forward-pointing cursor as "nothing newer than this yet," so the
+    // ring snapshot + deep replay legs return empty and we go straight
+    // to live.
+    //
+    // Critical: when the in-memory ring is empty (fresh daemon, no
+    // events yet this process-lifetime), `router.head_cursor` returns
+    // None — but the SINK still has the durable transcript. Without
+    // the sink fallback below, `from: None` would fall through to a
+    // full sink replay (the very bug card 7d5b6a65 closes). Query the
+    // sink for its head when the ring is empty.
+    let mut from = if attach.from_now {
+        match state.router.head_cursor(channel) {
+            Some(c) => Some(c),
+            None => state.router.sink_head_cursor(channel).await,
+        }
+    } else {
+        attach
+            .from
+            .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id))
+    };
+
+    // Card 7d5b6a65: `coalesce_backlog` lets the daemon collapse all
+    // historical catch-up into ONE `AttachCursorAdvanced` summary
+    // frame instead of streaming each event individually. We track the
+    // ring-snapshot's high-water cursor; everything at or before it is
+    // backlog (collapsed), everything after it is live (streamed
+    // event-by-event as before).
+    let coalesce_backlog = attach.coalesce_backlog && !attach.from_now;
 
     // Compile the consumer's kind/delivery/header filters into the router
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
@@ -318,6 +347,25 @@ where
     let shutdown = state.shutdown.notified();
     tokio::pin!(shutdown);
 
+    // Card 7d5b6a65 catch-up tracking. When `coalesce_backlog` is set,
+    // we count events until the ring's live-edge cursor (captured at
+    // subscribe time) is reached, then emit ONE summary frame and
+    // switch to per-event live streaming.
+    let mut catchup = if coalesce_backlog {
+        // Same ring-then-sink fallback as the `from_now` path above so
+        // a freshly-started daemon catching up on a real durable
+        // backlog actually has a `live_edge` to compare against (an
+        // empty ring with non-empty sink would otherwise treat every
+        // historical event as live and emit no summary).
+        let edge = match state.router.head_cursor(channel) {
+            Some(c) => Some(c),
+            None => state.router.sink_head_cursor(channel).await,
+        };
+        Some(BacklogCatchup::new(edge))
+    } else {
+        None
+    };
+
     loop {
         let (stream, lag) = pending
             .take()
@@ -330,13 +378,33 @@ where
                 next = stream.next() => match next {
                     Some(env) => {
                         from = Some(env.cursor());
-                        write_response(
-                            &mut writer,
-                            &Response::Event {
-                                envelope: airc_wire::encode(&env).to_vec(),
-                            },
-                        )
-                        .await?;
+                        let suppressed = match catchup.as_mut() {
+                            Some(c) => c.observe(env.cursor()),
+                            None => false,
+                        };
+                        if suppressed {
+                            // Inside catch-up window — count and skip,
+                            // a single AttachCursorAdvanced will flush
+                            // when we cross the live edge.
+                        } else {
+                            // Flush a pending summary BEFORE the first
+                            // live event so the client sees the seam.
+                            if let Some(summary) =
+                                catchup.as_mut().and_then(BacklogCatchup::take_summary)
+                            {
+                                if summary.skipped > 0 {
+                                    write_response(&mut writer, &summary.into_response())
+                                        .await?;
+                                }
+                            }
+                            write_response(
+                                &mut writer,
+                                &Response::Event {
+                                    envelope: airc_wire::encode(&env).to_vec(),
+                                },
+                            )
+                            .await?;
+                        }
                         if lag.is_lagged() {
                             // Dropped a live push — break to re-resume
                             // from the last cursor we sent (no gap).
@@ -346,6 +414,98 @@ where
                     None => return Ok(()),
                 },
             }
+        }
+    }
+}
+
+/// Card 7d5b6a65: tracks the catch-up phase of an `attach` with
+/// `coalesce_backlog: true`. Counts envelopes at or before the
+/// snapshot live edge (captured at subscribe time) so the daemon can
+/// emit ONE `Response::AttachCursorAdvanced` summary at the live seam
+/// instead of forwarding each historical envelope.
+struct BacklogCatchup {
+    /// Cursor of the most recent envelope in the ring at subscribe
+    /// time. Anything at or before is backlog; anything after is live.
+    /// `None` means the channel was empty at subscribe — there is no
+    /// backlog phase to coalesce; the first event is live.
+    live_edge: Option<Cursor>,
+    /// Number of envelopes suppressed during catch-up so far.
+    skipped: u64,
+    /// Cursor of the most recent suppressed envelope; advances as we
+    /// observe more backlog. Reported in the summary so the client
+    /// can persist it for future reconnects.
+    last_skipped_cursor: Option<Cursor>,
+    /// Set once when we cross the live edge so subsequent events skip
+    /// the per-cursor comparison and stream as live.
+    crossed: bool,
+}
+
+impl BacklogCatchup {
+    fn new(live_edge: Option<Cursor>) -> Self {
+        Self {
+            live_edge,
+            skipped: 0,
+            last_skipped_cursor: None,
+            crossed: live_edge.is_some(),
+        }
+    }
+
+    /// Observe one envelope's cursor. Returns `true` when the envelope
+    /// is inside the catch-up window (caller should suppress it) and
+    /// `false` once we've crossed the live edge.
+    fn observe(&mut self, cursor: Cursor) -> bool {
+        if !self.crossed {
+            // No live_edge means the channel was empty at subscribe,
+            // so EVERYTHING that arrives is by definition live (no
+            // backlog phase).
+            return false;
+        }
+        if let Some(edge) = self.live_edge {
+            if cursor.is_after(&edge) {
+                self.crossed = false; // we've moved past catchup
+                return false;
+            }
+            self.skipped = self.skipped.saturating_add(1);
+            self.last_skipped_cursor = Some(cursor);
+            return true;
+        }
+        false
+    }
+
+    /// Pull the catch-up summary once we've crossed the live edge.
+    /// Returns `None` if there's nothing pending (already taken or
+    /// catch-up never had backlog).
+    fn take_summary(&mut self) -> Option<BacklogSummary> {
+        if self.crossed {
+            return None;
+        }
+        // crossed=false at this point means either (a) we observed
+        // something past the edge — pull the summary OR (b) we never
+        // had a live_edge to begin with. Mark crossed so we don't
+        // re-emit.
+        let skipped = self.skipped;
+        let advanced_to = self.last_skipped_cursor;
+        self.skipped = 0;
+        self.last_skipped_cursor = None;
+        self.crossed = true;
+        advanced_to.map(|cursor| BacklogSummary { skipped, cursor })
+    }
+}
+
+struct BacklogSummary {
+    skipped: u64,
+    cursor: Cursor,
+}
+
+impl BacklogSummary {
+    fn into_response(self) -> Response {
+        Response::AttachCursorAdvanced {
+            skipped: self.skipped,
+            advanced_to: airc_ipc::request::IpcCursor {
+                epoch: self.cursor.seq.epoch,
+                counter: self.cursor.seq.counter,
+                event_id: self.cursor.event_id,
+            },
         }
     }
 }
