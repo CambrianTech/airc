@@ -786,6 +786,20 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
+/// Card 70e87d33: retroactively link an already-open PR to a card so
+/// the merger can pick it up. Thin orchestration over
+/// `work_commands_gh::link_existing_pr` — attach, parse the card id,
+/// delegate.
+pub async fn run_link(
+    home: &Path,
+    card_id: String,
+    pr: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = crate::commands::attached_airc(home).await?;
+    let card_uuid = parse_work_card_id(&card_id)?;
+    crate::work_commands_gh::link_existing_pr(&airc, card_uuid, pr).await
+}
+
 /// Card a399b342: `airc work merge <CARD_ID>` — manual one-shot merge
 /// behind the same gate the auto-merger uses. Refuses unless the card
 /// is in Review state with a PR linked AND the PR's CI is green per
@@ -1978,27 +1992,28 @@ mod tests {
         assert!(msg.contains(&card_id.to_string()), "carries the card UUID");
     }
 
-    /// Card 28f1440c — the PR target branch is hardcoded to the
+    /// Card 28f1440c — the airc PR target branch must be the
     /// substrate's working branch (`rust-rewrite`), NOT the repo's
-    /// GitHub default (`main`). Pinning this catches a regression
-    /// where someone "fixes" the constant by routing through
-    /// `gh_default_branch` (which surfaces `main` for this repo and
-    /// would silently bypass the substrate work the doctrine
-    /// requires per AGENTS.md §8). If a config-driven base ever
-    /// ships (the documented follow-up), this test extends —
-    /// it does not get deleted.
+    /// GitHub default (`main`). Card 70e87d33 made the base per-repo
+    /// (so continuum can target `canary`), but the airc invariant is
+    /// unchanged and pinned here: a regression that routes airc
+    /// through the GitHub default would surface `main` and silently
+    /// bypass the substrate work the doctrine requires (AGENTS.md §8).
+    /// This is the per-repo-aware successor to the old constant test —
+    /// extended per its own instruction, not deleted.
     #[test]
-    fn pr_create_base_branch_targets_rust_rewrite() {
+    fn airc_pr_base_targets_rust_rewrite_never_main() {
+        std::env::remove_var("AIRC_PR_BASE");
+        let airc_repo = airc_work::RepoId::new("CambrianTech/airc").expect("valid repo key");
+        let base = crate::work_commands_gh::configured_base_branch(&airc_repo);
         assert_eq!(
-            crate::work_commands_gh::pr_create_base_branch(),
-            "rust-rewrite",
-            "card 28f1440c: PR target must be the substrate working \
+            base.as_deref(),
+            Some("rust-rewrite"),
+            "card 28f1440c: airc PR target must be the substrate working \
              branch, never the repo's GitHub default ('main' on this \
              repo today)"
         );
-        // Specifically: it must NOT be 'main'. The doctrine treats
-        // main as the legacy snapshot.
-        assert_ne!(crate::work_commands_gh::pr_create_base_branch(), "main");
+        assert_ne!(base.as_deref(), Some("main"));
     }
 
     // ---------------------------------------------------------------------

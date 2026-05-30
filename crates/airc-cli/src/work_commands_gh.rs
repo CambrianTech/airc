@@ -72,12 +72,20 @@ pub(crate) async fn open_pr_and_link(
     // PR-link pipeline failed (best-effort warning was swallowed).
     let subject = crate::work_commands_git::git_show_format(&worktree_str, "%s")?;
     let body = crate::work_commands_git::git_show_format(&worktree_str, "%b")?;
-    // Card 812b5a1b: pin --base to pr_create_base_branch() (rust-rewrite),
-    // not gh's default. Without --base, `gh pr create` picks the repo's
-    // GitHub default branch (`main` on this repo), and every auto-spawned
-    // PR lands against main — bypassing rust-rewrite's substrate work
-    // and producing the duplicate-PR pattern seen on #1044 and #1054.
-    let base_branch = pr_create_base_branch();
+    // Card 70e87d33: resolve --base PER REPO. Card 812b5a1b pinned a
+    // single global base (rust-rewrite) — correct for airc, but it
+    // BROKE every other repo: continuum has no rust-rewrite branch, so
+    // `gh pr create --base rust-rewrite` failed, no PullRequestLinked
+    // fired, and the merger never saw the PR (flywheel stall on
+    // #1469/#1470/#1471). configured_base_branch() returns the repo's
+    // pinned integration branch (airc→rust-rewrite, continuum→canary);
+    // repos with no override fall back to their actual GitHub default
+    // branch. This is deliberately NOT a blanket default-branch switch
+    // — that would re-break airc by landing PRs on main.
+    let base_branch = match configured_base_branch(&card.repo) {
+        Some(base) => base,
+        None => gh_default_branch(&worktree_str)?,
+    };
     let create_out = std::process::Command::new("gh")
         .current_dir(&worktree_str)
         .args([
@@ -88,7 +96,7 @@ pub(crate) async fn open_pr_and_link(
             "--body",
             body.trim(),
             "--base",
-            base_branch,
+            base_branch.as_str(),
         ])
         .output()?;
     if !create_out.status.success() {
@@ -112,7 +120,7 @@ pub(crate) async fn open_pr_and_link(
         repo: card.repo.clone(),
         number: pr_number,
         head: BranchName::new(head_branch)?,
-        base: BranchName::new(base_branch.to_string())?,
+        base: BranchName::new(base_branch)?,
     };
     airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
         card_id,
@@ -142,29 +150,126 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
     let tail = trimmed.rsplit('/').next()?;
     tail.parse::<u64>().ok()
 }
-/// Card 28f1440c — the integration branch every per-card PR opens
-/// against. Hardcoded to the airc substrate's working branch for
-/// MVP; a follow-up surfaces this as configurable (e.g. via
-/// `.airc/work.toml`) for consumers whose integration branch is
-/// different.
+/// Card 70e87d33 — resolve the integration branch a card's PR opens
+/// against, PER REPO. Returns `Some(branch)` for repos whose
+/// integration branch is pinned (and is NOT their GitHub default), or
+/// `None` to signal "use the repo's GitHub default branch".
 ///
-/// MUST NOT change to a runtime read of `gh repo view --json defaultBranchRef` —
-/// that returns the repo's GitHub `default_branch` (`main` on this
-/// repo today), and every PR landing on `main` bypasses
-/// `rust-rewrite`'s substrate work. The whole point of this card
-/// is to refuse that fallback.
-// Dead-code today because `open_pr_and_link` above does not pass
-// `--base` to `gh pr create` — substrate kink that opens every
-// auto-spawned PR against the github default branch (main) instead
-// of rust-rewrite. Wiring this in is carded as a follow-up
-// (812b5a1b) so that fix can land independently of fae3c28e's
-// review-only close-flow work.
-#[allow(dead_code)]
-pub(crate) fn pr_create_base_branch() -> &'static str {
-    "rust-rewrite"
+/// History: card 28f1440c hardcoded a single global `rust-rewrite`
+/// base because airc's substrate work lives on rust-rewrite, not its
+/// GitHub default (`main`). Correct for airc, wrong for every other
+/// repo — continuum has no `rust-rewrite` branch, so `gh pr create
+/// --base rust-rewrite` failed, `PullRequestLinked` never fired, and
+/// the merger never saw the PR. The fix is per-repo, NOT a blanket
+/// default-branch switch (which would re-break airc by landing PRs on
+/// main — the exact fallback 28f1440c set out to refuse).
+///
+/// `AIRC_PR_BASE` overrides everything (tests / one-offs). The carded
+/// end state surfaces this as `.airc/work.toml` per-repo config; for
+/// now the two known consumer repos are pinned inline.
+pub(crate) fn configured_base_branch(repo: &airc_work::RepoId) -> Option<String> {
+    if let Ok(base) = std::env::var("AIRC_PR_BASE") {
+        let base = base.trim();
+        if !base.is_empty() {
+            return Some(base.to_string());
+        }
+    }
+    match repo.as_str() {
+        "CambrianTech/airc" => Some("rust-rewrite".to_string()),
+        "CambrianTech/continuum" => Some("canary".to_string()),
+        _ => None,
+    }
 }
 
-#[allow(dead_code)]
+/// Card 70e87d33 (part b) — retroactively link an ALREADY-OPEN PR to a
+/// card by emitting `PullRequestLinked`. The auto-link in
+/// `open_pr_and_link` only fires when `airc work state review` itself
+/// creates the PR; a PR opened manually (e.g. while the base-default
+/// bug blocked the auto path, as on #1471/#1472) has no link, so the
+/// merger never picks it up. This closes that gap: `airc work link
+/// <card> --pr <n>` reads the PR's real head/base from `gh` and links
+/// it, after which the merger's gate sees a linked PR and can merge.
+///
+/// Idempotent: re-linking a card that already has a PR is a no-op.
+pub(crate) async fn link_existing_pr(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+    pr_number: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use airc_work::model::{BranchName, PullRequestRef};
+
+    let board = airc.work_board(usize::MAX).await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    if let Some(existing) = &card.pull_request {
+        println!(
+            "pull_request already linked: card={card_id} pr=#{} ({})",
+            existing.number,
+            existing.repo.as_str()
+        );
+        return Ok(());
+    }
+    let repo = card.repo.clone();
+
+    // Read the PR's actual head/base/state from GitHub. `--repo` is
+    // explicit (not cwd-derived) so this works from anywhere, including
+    // a card whose worktree was already cleaned up.
+    let out = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo.as_str(),
+            "--json",
+            "state,headRefName,baseRefName",
+            "--jq",
+            ".state + \"\\t\" + .headRefName + \"\\t\" + .baseRefName",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr view #{pr_number} ({}) failed: {}",
+            repo.as_str(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    let line = String::from_utf8(out.stdout)?;
+    let mut fields = line.trim().split('\t');
+    let state = fields.next().unwrap_or("").trim().to_string();
+    let head = fields.next().unwrap_or("").trim().to_string();
+    let base = fields.next().unwrap_or("").trim().to_string();
+    if head.is_empty() || base.is_empty() {
+        return Err(format!(
+            "could not parse head/base for PR #{pr_number} ({}) — got state={state:?}",
+            repo.as_str()
+        )
+        .into());
+    }
+    if state != "OPEN" {
+        // Linking a closed/merged PR is allowed (records history) but
+        // the merger won't act on it — flag so the caller isn't
+        // surprised the flywheel stays put.
+        eprintln!("airc: warning — PR #{pr_number} state is {state}, not OPEN");
+    }
+
+    let pull_request = PullRequestRef {
+        repo,
+        number: pr_number,
+        head: BranchName::new(head)?,
+        base: BranchName::new(base)?,
+    };
+    airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
+        card_id,
+        pull_request,
+    })
+    .await?;
+    println!("pull_request_linked: card={card_id} pr=#{pr_number}");
+    Ok(())
+}
+
 pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
     // `Command::current_dir(...)` so `gh repo view` resolves the
@@ -188,4 +293,63 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
         .into());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use airc_work::RepoId;
+
+    fn repo(key: &str) -> RepoId {
+        RepoId::new(key).expect("test repo key valid")
+    }
+
+    /// Card 70e87d33: the per-repo base resolver. Kept in ONE test so
+    /// the process-global `AIRC_PR_BASE` env var can't race a sibling
+    /// test running in parallel in the same binary.
+    #[test]
+    fn configured_base_branch_is_per_repo_with_env_override_and_default_fallback() {
+        // No override env: pinned repos resolve to their integration
+        // branch (NOT their GitHub default of `main`).
+        std::env::remove_var("AIRC_PR_BASE");
+        assert_eq!(
+            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
+            Some("rust-rewrite"),
+            "airc must pin rust-rewrite, never fall through to main"
+        );
+        assert_eq!(
+            configured_base_branch(&repo("CambrianTech/continuum")).as_deref(),
+            Some("canary"),
+            "continuum must pin canary — the bug this card fixes"
+        );
+
+        // Unknown repo: None signals the caller to use the repo's real
+        // GitHub default branch (the safe, correct generic fallback).
+        assert_eq!(
+            configured_base_branch(&repo("SomeOrg/unknown-repo")),
+            None,
+            "unknown repos defer to their GitHub default, not a hardcoded base"
+        );
+
+        // Env override wins for every repo (tests / one-off retarget).
+        std::env::set_var("AIRC_PR_BASE", "release/x");
+        assert_eq!(
+            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
+            Some("release/x"),
+            "AIRC_PR_BASE must override even a pinned repo"
+        );
+        assert_eq!(
+            configured_base_branch(&repo("SomeOrg/unknown-repo")).as_deref(),
+            Some("release/x"),
+            "AIRC_PR_BASE must override the default-branch fallback too"
+        );
+        // Blank/whitespace env is ignored (not treated as a real base).
+        std::env::set_var("AIRC_PR_BASE", "   ");
+        assert_eq!(
+            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
+            Some("rust-rewrite"),
+            "blank AIRC_PR_BASE must not shadow the pinned base"
+        );
+        std::env::remove_var("AIRC_PR_BASE");
+    }
 }
