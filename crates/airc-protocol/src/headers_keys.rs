@@ -55,3 +55,79 @@ pub const HEADER_AIRC_CORRELATION_ID: &str = "airc.correlation_id";
 /// opaque routing metadata. Useful for receivers to dispatch
 /// matching handlers without parsing the body.
 pub const HEADER_AIRC_COMMAND_KIND: &str = "airc.command_kind";
+
+// ---------------------------------------------------------------------------
+// Body-encryption convention — card 1224aac2 slice 2
+// ---------------------------------------------------------------------------
+//
+// The substrate's wire crypto (frame signing, TLS-pinned transport) authenticates
+// + opaque-wraps the on-the-wire frame. Consumers that need their bodies to be
+// opaque ALSO to the substrate (defense-in-depth, content-key escrow, "even my
+// own daemon can't read this") wrap the body with their crypto of choice (JWE,
+// age, noise-box, whatever) BEFORE handing it to `publish`. The three headers
+// below are the canonical labeling convention so:
+//
+//   - UI / renderer surfaces show `[encrypted: <scheme>]` instead of rendering
+//     ciphertext as garbled text
+//   - key-rotation jobs can find every event using a given key by `key_id`
+//   - audit logs surface the scheme without decrypting
+//
+// Substrate ships the convention; consumers ship the crypto. Substrate does NOT
+// validate any of these — set them or don't, the daemon routes opaque either way.
+
+/// Body-encryption scheme identifier. Opaque consumer-defined string —
+/// `"jwe.A256GCM"`, `"age.v1"`, `"continuum.aead.v1"`, etc. Absence of the
+/// header is the substrate-visible signal that the body is plaintext.
+///
+/// Consumers MUST choose a scheme id that round-trips through their decode
+/// path — the substrate compares it only for equality across events (key
+/// rotation, audit grouping); never parses it.
+pub const HEADER_AIRC_BODY_ENC_SCHEME: &str = "airc.body.enc.scheme";
+
+/// Identifier of the key that encrypted this body. Free-form consumer string —
+/// could be a UUID, a key thumbprint, a label like `"continuum.user.<uid>.v3"`.
+/// Used by key-rotation jobs to enumerate events still encrypted under a
+/// rotated key; the substrate does no key management itself.
+pub const HEADER_AIRC_BODY_ENC_KEY_ID: &str = "airc.body.enc.key_id";
+
+/// Additional authenticated data (AAD) the encryptor bound the ciphertext
+/// to. Present when the consumer's scheme uses an AEAD that binds context
+/// (room id, sender peer, intended audience, etc.) into the ciphertext. The
+/// substrate stores + delivers it opaque; the decryptor must supply the same
+/// AAD on decrypt or authentication will fail closed.
+pub const HEADER_AIRC_BODY_ENC_AAD: &str = "airc.body.enc.aad";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Card 1224aac2 slice 2: the substrate's body-encryption convention
+    /// must STAY in the `airc.body.enc.*` namespace — adapters + audit
+    /// surfaces look up by exact string, so a rename here would silently
+    /// break renderer / rotation tooling without a compile error.
+    #[test]
+    fn body_encryption_header_names_are_stable() {
+        assert_eq!(HEADER_AIRC_BODY_ENC_SCHEME, "airc.body.enc.scheme");
+        assert_eq!(HEADER_AIRC_BODY_ENC_KEY_ID, "airc.body.enc.key_id");
+        assert_eq!(HEADER_AIRC_BODY_ENC_AAD, "airc.body.enc.aad");
+    }
+
+    /// Card 1224aac2 slice 2: every encryption header lives under the
+    /// substrate's `airc.*` namespace and never collides with the
+    /// consumer-owned `forge.*` / `continuum.*` / `openclaw.*` /
+    /// `hermes.*` / `opencode.*` / `x-*` spaces (see substrate design
+    /// doc, "Header namespaces" section).
+    #[test]
+    fn body_encryption_headers_in_substrate_namespace() {
+        for header in [
+            HEADER_AIRC_BODY_ENC_SCHEME,
+            HEADER_AIRC_BODY_ENC_KEY_ID,
+            HEADER_AIRC_BODY_ENC_AAD,
+        ] {
+            assert!(
+                header.starts_with("airc."),
+                "{header:?} must be in the substrate-owned `airc.*` namespace"
+            );
+        }
+    }
+}
