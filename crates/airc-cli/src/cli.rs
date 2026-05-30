@@ -183,11 +183,12 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 /// solving for) keep the per-project name so parallel test runs
 /// don't collide.
 ///
-/// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]:
-///   `$AIRC_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/airc` → `$TMPDIR/airc`
-///   (macOS only) → `~/.airc/runtime`. All four are namespaced under
-///   the user (no shared-machine collisions) and reachable across
-///   sandbox boundaries in the common case.
+/// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]: the
+///   explicit `$AIRC_RUNTIME_DIR` override (test isolation only),
+///   else always `~/.airc/runtime`. Card 50d1728b: it deliberately
+///   does NOT consult `$TMPDIR`/`$XDG_RUNTIME_DIR` — those are
+///   per-session and fragmented the machine-singular daemon into one
+///   instance per shell.
 ///
 /// The filename includes `airc_ipc::IPC_PROTOCOL_VERSION`: if the
 /// local daemon wire protocol changes, a new client must not talk
@@ -882,10 +883,10 @@ mod tests {
     }
 
     /// Card e51ab14e: when `runtime_dir` resolution fails (`$HOME`
-    /// unset, no `$XDG_RUNTIME_DIR`, no usable `$TMPDIR`), the
-    /// machine-account path falls through to the legacy home-private
-    /// `<machine_home>/daemon-v<N>.sock` so the substrate stays
-    /// functional even in degraded environments.
+    /// unset and no `$AIRC_RUNTIME_DIR` override, so `~/.airc/runtime`
+    /// can't be built), the machine-account path falls through to the
+    /// legacy home-private `<machine_home>/daemon-v<N>.sock` so the
+    /// substrate stays functional even in degraded environments.
     #[test]
     fn machine_account_scope_falls_back_to_home_private_when_runtime_dir_unavailable() {
         use super::resolve_socket_path;
