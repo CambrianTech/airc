@@ -2,9 +2,11 @@ use std::error::Error;
 use std::io::Write;
 use std::path::Path;
 
+use std::time::Duration;
+
 use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
-use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, Response};
-use airc_lib::{decode_wire_event, Airc};
+use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, IpcCursor, Response};
+use airc_lib::{decode_wire_event_with_cursor, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
@@ -27,6 +29,24 @@ enum MonitorFrame {
     CatchUpSummary {
         channel: RoomId,
         skipped: u64,
+    },
+    /// Card 16bd4d71 slice 1: emitted by the per-channel attach loop
+    /// when it detects the IPC stream went away (daemon stop, socket
+    /// gone, EOF). The main rendering loop surfaces it as ONE
+    /// "airc: daemon disconnected — reconnecting..." stdout line. The
+    /// per-channel task then enters exponential backoff (1s → 2s →
+    /// 5s → 10s → 30s cap) and re-attaches with `from=last-seen-cursor`
+    /// AND `coalesce_backlog=true` so the gap replays as a single
+    /// summary frame, not a flood of historical events.
+    Disconnected {
+        channel: RoomId,
+    },
+    /// Card 16bd4d71 slice 1: emitted after a successful re-attach
+    /// when the per-channel task has just resumed from a saved
+    /// cursor. The main rendering loop surfaces it as ONE
+    /// "airc: reconnected (resumed from cursor X)" stdout line.
+    Reconnected {
+        channel: RoomId,
     },
 }
 
@@ -58,41 +78,7 @@ pub(crate) async fn run(
         let socket = socket.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let client = DaemonClient::new(socket);
-            let mut stream = match client
-                .attach(AttachRequest {
-                    channel: Some(channel),
-                    from: None,
-                    from_now,
-                    coalesce_backlog,
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(stream) => stream,
-                Err(_) => return,
-            };
-            while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
-                match response {
-                    Response::Event { envelope } => match decode_wire_event(envelope) {
-                        Ok(event) => {
-                            if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
-                    },
-                    Response::AttachCursorAdvanced { skipped, .. }
-                        if tx
-                            .send(MonitorFrame::CatchUpSummary { channel, skipped })
-                            .await
-                            .is_err() =>
-                    {
-                        return;
-                    }
-                    _ => {}
-                }
-            }
+            run_channel_attach_loop(socket, channel, tx, from_now, coalesce_backlog).await;
         });
     }
     drop(tx);
@@ -125,9 +111,230 @@ pub(crate) async fn run(
                 );
                 std::io::stdout().flush()?;
             }
+            MonitorFrame::Disconnected { channel } => {
+                // Card 16bd4d71 slice 1: ONE stdout line per channel
+                // when the daemon stream EOFs. The per-channel task
+                // is already in exponential backoff trying to reconnect.
+                println!(
+                    "airc: daemon disconnected — reconnecting (channel {})",
+                    channel.0
+                );
+                std::io::stdout().flush()?;
+            }
+            MonitorFrame::Reconnected { channel } => {
+                // Card 16bd4d71 slice 1: ONE stdout line per channel
+                // after the auto-reconnect re-attaches. The cursor-resume
+                // means the gap that arrived during the disconnect
+                // surfaces as a single `CatchUpSummary` frame
+                // immediately after — operators see "disconnected →
+                // reconnected → caught up N events" in three lines
+                // regardless of how many events accumulated in the gap.
+                println!("airc: reconnected (channel {})", channel.0);
+                std::io::stdout().flush()?;
+            }
         }
     }
     Ok(())
+}
+
+/// Card 16bd4d71 slice 1: the per-channel attach loop with auto-reconnect
+/// on daemon EOF + cursor-resume so the gap during disconnect replays
+/// without loss or duplicate.
+///
+/// First connect uses the caller's `from_now` / `coalesce_backlog`
+/// flags. On EOF, the loop tracks `last_cursor` from each delivered
+/// event + each `AttachCursorAdvanced` summary, then re-attaches with
+/// `from=last_cursor` + `coalesce_backlog=true` so the daemon's
+/// `subscribe_with_lag` resumes strictly after the last-seen event
+/// and the gap surfaces as ONE summary frame (not a per-event flood).
+///
+/// Backoff schedule: 1s → 2s → 5s → 10s → 30s cap. Reset to 0 on
+/// successful attach. The `Disconnected` + `Reconnected` MonitorFrames
+/// surface as one stdout line each so the operator sees the lifecycle
+/// without ambiguity.
+async fn run_channel_attach_loop(
+    socket: std::path::PathBuf,
+    channel: RoomId,
+    tx: tokio::sync::mpsc::Sender<MonitorFrame>,
+    initial_from_now: bool,
+    initial_coalesce_backlog: bool,
+) {
+    let client = DaemonClient::new(socket);
+    let mut last_cursor: Option<IpcCursor> = None;
+    let mut backoff = Backoff::new();
+    let mut is_first_connect = true;
+
+    loop {
+        if !is_first_connect {
+            // Tell the main render loop we lost the daemon — emit
+            // BEFORE the backoff sleep so the operator sees the
+            // disconnect immediately, not after the sleep.
+            if tx
+                .send(MonitorFrame::Disconnected { channel })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(backoff.current()).await;
+        }
+
+        // Build the attach request — first connect honors caller
+        // flags; reconnects always use cursor-resume + coalesce so
+        // the gap doesn't flood.
+        let request = if let Some(cursor) = last_cursor {
+            AttachRequest {
+                channel: Some(channel),
+                from: Some(cursor),
+                from_now: false, // we have a cursor; resume from it
+                coalesce_backlog: true,
+                ..Default::default()
+            }
+        } else {
+            AttachRequest {
+                channel: Some(channel),
+                from: None,
+                from_now: initial_from_now,
+                coalesce_backlog: initial_coalesce_backlog,
+                ..Default::default()
+            }
+        };
+
+        let mut stream = match client.attach(request).await {
+            Ok(s) => s,
+            Err(_) => {
+                backoff.advance();
+                continue;
+            }
+        };
+
+        // Successful attach — emit Reconnected if this isn't the
+        // first connect, then reset backoff.
+        if !is_first_connect
+            && tx
+                .send(MonitorFrame::Reconnected { channel })
+                .await
+                .is_err()
+        {
+            return;
+        }
+        is_first_connect = false;
+        backoff.reset();
+
+        // Stream loop — read frames until EOF or send-fail.
+        while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
+            match response {
+                Response::Event { envelope } => match decode_wire_event_with_cursor(envelope) {
+                    Ok((event, cursor)) => {
+                        last_cursor = Some(cursor);
+                        if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                },
+                Response::AttachCursorAdvanced {
+                    skipped,
+                    advanced_to,
+                } => {
+                    last_cursor = Some(advanced_to);
+                    if tx
+                        .send(MonitorFrame::CatchUpSummary { channel, skipped })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Stream ended — fall through to the top of the loop, which
+        // will emit Disconnected and back off before re-attaching.
+        backoff.advance();
+    }
+}
+
+/// Card 16bd4d71 slice 1: exponential backoff for the per-channel
+/// attach loop. Sequence: 1s → 2s → 5s → 10s → 30s cap, reset to 0
+/// (immediate retry on first connect) on successful attach.
+struct Backoff {
+    current_ms: u64,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { current_ms: 0 }
+    }
+
+    fn current(&self) -> Duration {
+        Duration::from_millis(self.current_ms)
+    }
+
+    fn advance(&mut self) {
+        self.current_ms = match self.current_ms {
+            0 => 1_000,
+            1_000 => 2_000,
+            2_000 => 5_000,
+            5_000 => 10_000,
+            _ => 30_000,
+        };
+    }
+
+    fn reset(&mut self) {
+        self.current_ms = 0;
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::Backoff;
+    use std::time::Duration;
+
+    /// Card 16bd4d71 slice 1: the exponential-backoff schedule MUST
+    /// stay stable — operators reading the disconnect log expect
+    /// 1s → 2s → 5s → 10s → 30s and assume retry happens within
+    /// 30s once the daemon comes back. Drift here changes the
+    /// recovery story without a test catching it.
+    #[test]
+    fn backoff_schedule_is_stable() {
+        let mut b = Backoff::new();
+        assert_eq!(b.current(), Duration::ZERO, "first connect = no wait");
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(1));
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(2));
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(5));
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(10));
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(30));
+        // Capped: subsequent advances stay at 30s, don't keep growing.
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(30));
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(30));
+    }
+
+    /// Card 16bd4d71 slice 1: reset MUST clear back to 0 so the next
+    /// disconnect after a successful reconnect starts the schedule
+    /// over (a transient daemon hiccup shouldn't penalize the next
+    /// unrelated bounce minutes later).
+    #[test]
+    fn backoff_reset_returns_to_zero() {
+        let mut b = Backoff::new();
+        b.advance();
+        b.advance();
+        b.advance();
+        assert_ne!(b.current(), Duration::ZERO);
+        b.reset();
+        assert_eq!(b.current(), Duration::ZERO);
+        // Post-reset, advance restarts the schedule from 1s.
+        b.advance();
+        assert_eq!(b.current(), Duration::from_secs(1));
+    }
 }
 
 fn render_event(event: &TranscriptEvent, client_id: Option<&str>, sandbox: &mut Sandbox) {

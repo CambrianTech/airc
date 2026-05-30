@@ -95,7 +95,7 @@ pub use coordinator::{
     DEFAULT_HEARTBEAT_TTL_MS as COORDINATOR_HEARTBEAT_TTL_MS,
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
 };
-pub use daemon::decode_wire_event;
+pub use daemon::{decode_wire_event, decode_wire_event_with_cursor};
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };

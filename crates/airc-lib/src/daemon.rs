@@ -138,6 +138,32 @@ pub fn decode_wire_event(bytes: Vec<u8>) -> Result<TranscriptEvent, AircError> {
     Ok(project(&env))
 }
 
+/// Card 16bd4d71 slice 1: same as [`decode_wire_event`] but also returns
+/// the wire envelope's cursor so callers tracking resume state (the
+/// monitor's auto-reconnect loop) don't have to re-decode the envelope.
+///
+/// The cursor is what the daemon's `subscribe_with_lag` interprets as
+/// "events strictly after this" — pass the last-seen cursor as
+/// `AttachRequest::from` on reconnect to resume the gap without loss
+/// or duplicate. Used together with `AttachRequest::coalesce_backlog`
+/// so the gap-replay surfaces as ONE `AttachCursorAdvanced` summary
+/// frame instead of N event frames (the flood pattern PR #1086 fixed
+/// for the initial-attach case; this card extends it across daemon
+/// restarts).
+pub fn decode_wire_event_with_cursor(
+    bytes: Vec<u8>,
+) -> Result<(TranscriptEvent, airc_ipc::IpcCursor), AircError> {
+    let env = airc_wire::decode(bytes.into())
+        .map_err(|e| AircError::Route(format!("daemon event decode: {e}")))?;
+    let event = project(&env);
+    let cursor = airc_ipc::IpcCursor {
+        epoch: env.seq.epoch,
+        counter: env.seq.counter,
+        event_id: env.event_id,
+    };
+    Ok((event, cursor))
+}
+
 impl Airc {
     pub(crate) fn daemon_client(&self) -> Option<&airc_ipc::DaemonClient> {
         self.inner.daemon_client.as_deref()
