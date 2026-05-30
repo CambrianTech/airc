@@ -1,80 +1,80 @@
-//! Platform-correct runtime directory for the daemon's IPC socket and
-//! other ephemeral runtime artifacts.
+//! Runtime directory for the daemon's IPC socket.
 //!
-//! Card 7e88c34d. Replaces the `/tmp/airc-discovery-<uid>/` indirection
-//! from card 282850c2 / PR #1036. Joel pushback 2026-05-28:
-//! "still using tmp ugh" + "we have our own DIR man, does claude code
-//! use tmp?". `/tmp` is the lowest-common-denominator but the wrong
-//! answer:
+//! Card 50d1728b. The socket is the rendezvous point for a
+//! MACHINE-SINGULAR daemon, so its path MUST be machine-stable — the
+//! same value for every process, tab, and shell on this user's
+//! machine. It is `~/.airc/runtime`, full stop. That is where all
+//! other airc state already lives (`~/.airc/wires`, `~/.airc/worktrees`,
+//! identity/trust), so the socket belongs there too.
 //!
-//!   - Linux has `$XDG_RUNTIME_DIR` (`/run/user/<uid>/`) — the standard
-//!     location for runtime sockets, tmpfs-backed, per-user, cleaned
-//!     on logout.
-//!   - macOS has `$TMPDIR` per-user under `/var/folders/.../T/` —
-//!     sandbox-passthrough in the common case, not `/tmp`.
-//!   - Windows has `%LOCALAPPDATA%\airc\runtime\`.
+//! History — why this used to be more complicated (and wrong): card
+//! 7e88c34d (replacing the `/tmp/airc-discovery-<uid>/` layer from
+//! #1036) tried to be platform-clever — prefer `$XDG_RUNTIME_DIR` on
+//! Linux, `$TMPDIR/airc` on macOS, `~/.airc/runtime` only as a
+//! fallback. That DEFEATED machine-singularity: `$TMPDIR` is
+//! per-SESSION on macOS and is freely overridden by harnesses (the
+//! Claude Code harness sets `TMPDIR=/tmp/claude-<id>`; terminals carry
+//! `/var/folders/.../T`; a daemon spawned with no `$TMPDIR` fell to
+//! `~/.airc/runtime`). So the same binary, with the same machine-hash
+//! in the socket NAME, resolved a DIFFERENT directory per process —
+//! and each one started its own daemon. Observed 2026-05-29: 4 live
+//! daemons + 18 client connections fragmented across them. The hash
+//! made the socket name machine-stable; the env-derived directory
+//! un-did it.
 //!
-//! All three are reachable across sandbox boundaries in the common
-//! case AND they're namespaced. The daemon socket lives here as
-//! `airc-<project-hash>.sock`; agents in the same project compute the
-//! same hash → find the same socket → no discovery file needed.
-//!
-//! The discovery module (`crates/airc-cli/src/discovery.rs` from
-//! #1036) becomes vestigial once every caller uses this resolution.
-//! It stays during the transition and is removed in a follow-up.
+//! The fix is to stop deriving the directory from per-session env at
+//! all. `$AIRC_RUNTIME_DIR` remains as the ONE explicit override — its
+//! only real consumer is the integration suite, which points ephemeral
+//! test daemons at throwaway dirs so they don't collide with the real
+//! machine daemon. Normal operation never sets it.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// The platform's runtime directory for `airc`. Created if absent.
-/// Returns the path where `airc-<hash>.sock` files belong.
+/// The runtime directory for `airc` — where `airc-<hash>-v<N>.sock`
+/// files live. Created if absent.
 ///
-/// Resolution order:
-///   1. `$AIRC_RUNTIME_DIR` (explicit override; honored anywhere)
-///   2. `$XDG_RUNTIME_DIR/airc` (Linux convention)
-///   3. `$TMPDIR/airc` (macOS — user-private under /var/folders)
-///   4. `~/.airc/runtime` (fallback, home-private)
+/// Resolution:
+///   1. `$AIRC_RUNTIME_DIR` if set — explicit override, honored
+///      verbatim. Exists for TEST ISOLATION (ephemeral daemons in
+///      throwaway dirs); normal operation never sets it.
+///   2. `~/.airc/runtime` — the machine-stable default. Always this.
 ///
-/// Returns `Err` only if the chosen path can't be created — every
-/// platform should reach at least case 4.
+/// Deliberately does NOT consult `$TMPDIR`/`$XDG_RUNTIME_DIR`: those
+/// are per-session and would fragment the machine-singular daemon (see
+/// module docs / card 50d1728b).
+///
+/// Returns `Err` only if `$HOME`/`$USERPROFILE` is unset (so the
+/// default can't be built) or the directory can't be created.
 pub fn runtime_dir() -> std::io::Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os("AIRC_RUNTIME_DIR") {
-        let dir = PathBuf::from(explicit);
-        std::fs::create_dir_all(&dir)?;
-        return Ok(dir);
-    }
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let dir = PathBuf::from(xdg).join("airc");
-        std::fs::create_dir_all(&dir)?;
-        return Ok(dir);
-    }
-    // On macOS, std::env::temp_dir() returns $TMPDIR which IS
-    // per-user under /var/folders. On Linux without XDG_RUNTIME_DIR
-    // it returns /tmp — we'd rather fall through to ~/.airc/runtime
-    // in that case, but distinguishing is hard. Use $TMPDIR ONLY
-    // when it's not /tmp.
-    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-        let path = PathBuf::from(&tmpdir);
-        if path.as_os_str() != "/tmp" && path.starts_with("/var/") {
-            let dir = path.join("airc");
-            std::fs::create_dir_all(&dir)?;
-            return Ok(dir);
-        }
-    }
-    // Last resort: ~/.airc/runtime/. Home-private (sandboxed agents
-    // without $HOME pass-through can't reach it), but it's namespaced
-    // and persistent.
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no $HOME or $USERPROFILE — cannot resolve any runtime dir",
-            )
-        })?;
-    let dir = PathBuf::from(home).join(".airc").join("runtime");
+    let dir = resolve_runtime_dir(
+        std::env::var_os("AIRC_RUNTIME_DIR"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Pure path resolution — no env reads, no filesystem. `override_dir`
+/// is `$AIRC_RUNTIME_DIR`; `home` is `$HOME`/`$USERPROFILE`. Extracted
+/// so the machine-stable invariant is testable WITHOUT mutating
+/// process-global env (which races across parallel tests), and so the
+/// type signature itself proves no per-session var (`$TMPDIR`,
+/// `$XDG_RUNTIME_DIR`) can influence the path.
+fn resolve_runtime_dir(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::io::Result<PathBuf> {
+    if let Some(explicit) = override_dir {
+        return Ok(PathBuf::from(explicit));
+    }
+    let home = home.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no $HOME or $USERPROFILE — cannot resolve ~/.airc/runtime",
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".airc").join("runtime"))
 }
 
 /// Project-derived socket path. The hash of the canonicalized project
@@ -117,6 +117,36 @@ fn project_key(project_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card 50d1728b — the machine-singular invariant. With no
+    /// override, the runtime dir is ALWAYS `$HOME/.airc/runtime`,
+    /// regardless of any per-session env. Because `resolve_runtime_dir`
+    /// takes only the override and home, no `$TMPDIR`/`$XDG_RUNTIME_DIR`
+    /// can reach it — this test plus the signature is the guard against
+    /// the regression that fragmented the mesh into 4 daemons.
+    #[test]
+    fn resolve_defaults_to_home_dot_airc_runtime() {
+        let resolved = resolve_runtime_dir(None, Some(std::ffi::OsString::from("/home/jane")))
+            .expect("home is set");
+        assert_eq!(resolved, PathBuf::from("/home/jane/.airc/runtime"));
+    }
+
+    #[test]
+    fn resolve_honors_explicit_override_verbatim() {
+        let resolved = resolve_runtime_dir(
+            Some(std::ffi::OsString::from("/tmp/test-iso/airc")),
+            Some(std::ffi::OsString::from("/home/jane")),
+        )
+        .expect("override wins");
+        // Override is honored verbatim AND ignores home entirely.
+        assert_eq!(resolved, PathBuf::from("/tmp/test-iso/airc"));
+    }
+
+    #[test]
+    fn resolve_errors_without_home_and_no_override() {
+        let err = resolve_runtime_dir(None, None).expect_err("no home, no override → error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn project_key_is_stable_across_calls() {

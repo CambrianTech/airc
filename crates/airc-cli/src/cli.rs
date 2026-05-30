@@ -183,11 +183,12 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 /// solving for) keep the per-project name so parallel test runs
 /// don't collide.
 ///
-/// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]:
-///   `$AIRC_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/airc` → `$TMPDIR/airc`
-///   (macOS only) → `~/.airc/runtime`. All four are namespaced under
-///   the user (no shared-machine collisions) and reachable across
-///   sandbox boundaries in the common case.
+/// `runtime-dir` resolves via [`runtime_dir::runtime_dir`]: the
+///   explicit `$AIRC_RUNTIME_DIR` override (test isolation only),
+///   else always `~/.airc/runtime`. Card 50d1728b: it deliberately
+///   does NOT consult `$TMPDIR`/`$XDG_RUNTIME_DIR` — those are
+///   per-session and fragmented the machine-singular daemon into one
+///   instance per shell.
 ///
 /// The filename includes `airc_ipc::IPC_PROTOCOL_VERSION`: if the
 /// local daemon wire protocol changes, a new client must not talk
@@ -202,17 +203,28 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
     let machine_home = airc_lib::machine_account_home(home);
     let user_home = read_user_home_from_env();
     let runtime_dir = crate::runtime_dir::runtime_dir().ok();
+    // SUN_LEN fallback root for deep-home cases (see machine_socket_path).
+    // The OS per-user temp dir is short; never used for normal homes.
+    let short_fallback = std::env::temp_dir();
     let project_socket = home
         .parent()
         .map(|root| crate::runtime_dir::project_socket_path(root).ok())
         .unwrap_or(None);
-    resolve_socket_path(
+    let socket = resolve_socket_path(
         home,
         &machine_home,
         user_home.as_deref(),
         runtime_dir.as_deref(),
+        Some(short_fallback.as_path()),
         project_socket,
-    )
+    );
+    // runtime_dir() created ~/.airc/runtime, but the SUN_LEN fallback dir
+    // (<temp>/airc) may not exist yet — ensure the chosen socket's parent
+    // exists so bind() doesn't fail on a missing directory. Best-effort.
+    if let Some(parent) = socket.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    socket
 }
 
 /// Pure-function variant of [`default_socket_path_in`] for tests +
@@ -240,6 +252,7 @@ fn resolve_socket_path(
     machine_home: &std::path::Path,
     user_home: Option<&std::path::Path>,
     runtime_dir: Option<&std::path::Path>,
+    short_fallback_dir: Option<&std::path::Path>,
     project_socket: Option<PathBuf>,
 ) -> PathBuf {
     // `machine_account_home(scope_home)` returns `$HOME/.airc` when
@@ -274,14 +287,61 @@ fn resolve_socket_path(
             account_key,
             airc_ipc::IPC_PROTOCOL_VERSION
         );
-        return runtime_dir
-            .map(|dir| dir.join(&socket_name))
-            .unwrap_or(legacy_fallback);
+        return machine_socket_path(
+            runtime_dir,
+            short_fallback_dir,
+            &socket_name,
+            legacy_fallback,
+        );
     }
     // Isolated scope (CI temp, test root outside `$HOME`): per-project
     // socket so multiple isolated tests can run in parallel without
     // colliding on the same daemon.
     project_socket.unwrap_or(legacy_fallback)
+}
+
+/// `sockaddr_un.sun_path` is 104 bytes on macOS (incl. NUL) and 108 on
+/// Linux. Use the conservative macOS bound so a socket path that fits
+/// here binds on both. Card 50d1728b: the machine socket normally lives
+/// at `~/.airc/runtime/airc-machine-<hash>.sock`, which is well under
+/// this for any real home — but a pathologically deep `$HOME` (the
+/// integration suite's `/var/folders/.../T/.tmpXXX` tempdir homes, or a
+/// rare deep real home) can overflow it.
+const MAX_SOCKET_PATH_LEN: usize = 100;
+
+fn fits_socket_limit(path: &std::path::Path) -> bool {
+    path.as_os_str().len() < MAX_SOCKET_PATH_LEN
+}
+
+/// Join `socket_name` under `runtime_dir` (the stable `~/.airc/runtime`),
+/// but if that overflows `MAX_SOCKET_PATH_LEN`, fall back to the OS
+/// per-user temp dir, which is short. The socket NAME already hashes the
+/// account, so isolation holds even though the short fallback dir is
+/// shared across accounts. This is a SUN_LEN safety net ONLY: every real
+/// home stays at `~/.airc/runtime`, so the machine-singular guarantee is
+/// unaffected — the fallback exists so deep tempdir homes (tests,
+/// containers) bind a working socket instead of failing.
+fn machine_socket_path(
+    runtime_dir: Option<&std::path::Path>,
+    short_fallback_dir: Option<&std::path::Path>,
+    socket_name: &str,
+    legacy_fallback: PathBuf,
+) -> PathBuf {
+    let Some(primary) = runtime_dir.map(|dir| dir.join(socket_name)) else {
+        return legacy_fallback;
+    };
+    if fits_socket_limit(&primary) {
+        return primary;
+    }
+    if let Some(short) = short_fallback_dir {
+        let candidate = short.join("airc").join(socket_name);
+        if fits_socket_limit(&candidate) {
+            return candidate;
+        }
+    }
+    // Nothing shorter available — return the primary and let the bind
+    // surface a clear SUN_LEN error rather than silently misbehaving.
+    primary
 }
 
 fn read_user_home_from_env() -> Option<PathBuf> {
@@ -810,6 +870,7 @@ mod tests {
             &machine_home,
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
+            None,
             // project_socket is irrelevant for machine-account scopes;
             // pass a distinct value per call to assert we don't accidentally
             // fall through to it.
@@ -820,6 +881,7 @@ mod tests {
             &machine_home,
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
+            None,
             Some(runtime_dir.join("airc-project-b-v0.sock")),
         );
 
@@ -860,6 +922,7 @@ mod tests {
             &scope_a,
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
+            None,
             Some(project_socket_a.clone()),
         );
         let socket_b = resolve_socket_path(
@@ -867,6 +930,7 @@ mod tests {
             &scope_b,
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
+            None,
             Some(project_socket_b.clone()),
         );
 
@@ -882,10 +946,10 @@ mod tests {
     }
 
     /// Card e51ab14e: when `runtime_dir` resolution fails (`$HOME`
-    /// unset, no `$XDG_RUNTIME_DIR`, no usable `$TMPDIR`), the
-    /// machine-account path falls through to the legacy home-private
-    /// `<machine_home>/daemon-v<N>.sock` so the substrate stays
-    /// functional even in degraded environments.
+    /// unset and no `$AIRC_RUNTIME_DIR` override, so `~/.airc/runtime`
+    /// can't be built), the machine-account path falls through to the
+    /// legacy home-private `<machine_home>/daemon-v<N>.sock` so the
+    /// substrate stays functional even in degraded environments.
     #[test]
     fn machine_account_scope_falls_back_to_home_private_when_runtime_dir_unavailable() {
         use super::resolve_socket_path;
@@ -899,11 +963,62 @@ mod tests {
             Some(user_home.as_path()),
             None,
             None,
+            None,
         );
 
         let expected =
             machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
         assert_eq!(socket, expected);
+    }
+
+    /// Card 50d1728b SUN_LEN guard: a deep `$HOME` (the integration
+    /// suite's `/var/folders/.../T/.tmpXXX` tempdir homes) would push
+    /// `~/.airc/runtime/airc-machine-<hash>.sock` past sockaddr_un's
+    /// 104-byte limit. The machine socket must then fall back to the
+    /// short OS temp dir — NOT fail to bind, NOT silently use the
+    /// over-long path. Normal homes are unaffected (covered by the live
+    /// daemon_lifecycle integration test, which binds at ~/.airc/runtime).
+    #[test]
+    fn machine_socket_falls_back_to_short_dir_when_runtime_path_too_long() {
+        use super::resolve_socket_path;
+        // A realistically deep macOS tempdir home — what `HOME=<TempDir>`
+        // resolves to under `cargo test`.
+        let user_home =
+            std::path::PathBuf::from("/var/folders/8d/778wjbv96mq1760tv6gk374m0000gn/T/.tmpXY12ab");
+        let machine_home = user_home.join(".airc");
+        let scope = user_home.join("scope").join(".airc");
+        let deep_runtime = user_home.join(".airc").join("runtime");
+        let short_fallback = std::path::PathBuf::from("/tmp");
+
+        let socket = resolve_socket_path(
+            &scope,
+            &machine_home,
+            Some(user_home.as_path()),
+            Some(deep_runtime.as_path()),
+            Some(short_fallback.as_path()),
+            None,
+        );
+
+        assert!(
+            socket.as_os_str().len() < super::MAX_SOCKET_PATH_LEN,
+            "resolved socket must fit sockaddr_un: {} ({} bytes)",
+            socket.display(),
+            socket.as_os_str().len()
+        );
+        assert!(
+            socket.starts_with("/tmp/airc"),
+            "deep home must fall back to the short dir, got {}",
+            socket.display()
+        );
+        // Isolation preserved: the account-hashed name still rides along.
+        assert!(
+            socket
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("airc-machine-")),
+            "socket name keeps the account hash: {}",
+            socket.display()
+        );
     }
 }
 
