@@ -41,6 +41,28 @@ pub trait DurableSink: Send + Sync {
         from_cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>>;
+
+    /// **Card 7d5b6a65.** Return the cursor of the most-recent persisted
+    /// event on `channel`, or `None` if the sink has no event for it.
+    ///
+    /// Used by [`crate::EventRouter::head_cursor`] to compute the
+    /// live edge when the in-memory ring is empty (fresh daemon
+    /// start with backlog in the sink — without this, an
+    /// `AttachRequest::from_now: true` would fall through to a full
+    /// transcript replay because `ring.newest_cursor()` returned None
+    /// and the deep-replay leg pages from `None` (= beginning).
+    ///
+    /// Default impl walks the full sink page to find the last cursor;
+    /// concrete impls should override with an efficient query
+    /// (`SELECT max((epoch, counter, event_id))` on SQLite, back-of-vec
+    /// on in-memory).
+    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>> {
+        Ok(self
+            .page(channel, None, usize::MAX)
+            .await?
+            .last()
+            .map(|env| env.cursor()))
+    }
 }
 
 /// In-memory durable tier for tests. Records append count so the
@@ -117,6 +139,15 @@ impl DurableSink for InMemoryDurableSink {
         });
         guard.append_count += 1;
         Ok(())
+    }
+
+    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(guard
+            .events
+            .get(&channel.0.as_u128())
+            .and_then(|bucket| bucket.last())
+            .map(|env| env.cursor()))
     }
 
     async fn page(

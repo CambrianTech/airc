@@ -179,6 +179,28 @@ impl DurableSink for SqliteDurableSink {
 
         rows.into_iter().map(from_model).collect()
     }
+
+    /// Card 7d5b6a65: efficient head-cursor query for the
+    /// `AttachRequest::from_now` path. The trait's default impl pages
+    /// the entire channel to find the last cursor; the SQLite override
+    /// picks the single row at the top of total order via the existing
+    /// composite index — bounded cost regardless of channel depth.
+    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>, BusError> {
+        let row = bus_event::Entity::find()
+            .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
+            .order_by_desc(bus_event::Column::Epoch)
+            .order_by_desc(bus_event::Column::Counter)
+            .order_by_desc(bus_event::Column::EventId)
+            .one(&self.db)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+        Ok(row.map(|r| {
+            Cursor::new(
+                airc_bus::Seq::new(r.epoch as u64, r.counter as u64),
+                airc_core::EventId(r.event_id),
+            )
+        }))
+    }
 }
 
 /// Put the connection in WAL journal mode (§3.3). WAL lets the

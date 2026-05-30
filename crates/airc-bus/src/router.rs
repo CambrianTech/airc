@@ -327,6 +327,25 @@ impl EventRouter {
             .and_then(|state| state.ring.newest_cursor())
     }
 
+    /// **Card 7d5b6a65.** Async fallback for [`Self::head_cursor`] that
+    /// queries the durable sink. Callers use this when the in-memory
+    /// ring is empty (fresh daemon start with backlog in the sink):
+    ///
+    /// ```ignore
+    /// let from = match router.head_cursor(channel) {
+    ///     Some(c) => Some(c),
+    ///     None => router.sink_head_cursor(channel).await,
+    /// };
+    /// ```
+    ///
+    /// Without this fallback, an `AttachRequest::from_now: true`
+    /// against a freshly-started daemon would fall through to
+    /// `from: None` and replay the whole sink — the exact bug card
+    /// 7d5b6a65 closes.
+    pub async fn sink_head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        self.inner.sink.head_cursor(channel).await.ok().flatten()
+    }
+
     /// Subscribe (§4 subscribe, §3.5 cursor contract).
     ///
     /// Returns a stream that yields **every** envelope on the filter strictly

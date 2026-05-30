@@ -294,8 +294,18 @@ where
     // forward-pointing cursor as "nothing newer than this yet," so the
     // ring snapshot + deep replay legs return empty and we go straight
     // to live.
+    //
+    // Critical: when the in-memory ring is empty (fresh daemon, no
+    // events yet this process-lifetime), `router.head_cursor` returns
+    // None — but the SINK still has the durable transcript. Without
+    // the sink fallback below, `from: None` would fall through to a
+    // full sink replay (the very bug card 7d5b6a65 closes). Query the
+    // sink for its head when the ring is empty.
     let mut from = if attach.from_now {
-        state.router.head_cursor(channel)
+        match state.router.head_cursor(channel) {
+            Some(c) => Some(c),
+            None => state.router.sink_head_cursor(channel).await,
+        }
     } else {
         attach
             .from
@@ -342,7 +352,16 @@ where
     // subscribe time) is reached, then emit ONE summary frame and
     // switch to per-event live streaming.
     let mut catchup = if coalesce_backlog {
-        Some(BacklogCatchup::new(state.router.head_cursor(channel)))
+        // Same ring-then-sink fallback as the `from_now` path above so
+        // a freshly-started daemon catching up on a real durable
+        // backlog actually has a `live_edge` to compare against (an
+        // empty ring with non-empty sink would otherwise treat every
+        // historical event as live and emit no summary).
+        let edge = match state.router.head_cursor(channel) {
+            Some(c) => Some(c),
+            None => state.router.sink_head_cursor(channel).await,
+        };
+        Some(BacklogCatchup::new(edge))
     } else {
         None
     };
