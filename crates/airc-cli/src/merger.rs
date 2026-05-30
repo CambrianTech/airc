@@ -33,7 +33,6 @@
 //!   should require a non-author LGTM. For now, ANY Review card
 //!   auto-merges if green — appropriate for single-author scopes; for
 //!   multi-author, the doctrine says "review before Review state."
-//! - Worktree cleanup on merge (card abe9fe4c).
 //! - Card-close on merged (currently relies on projection state and an
 //!   agent's explicit close; an observer would automate it).
 //!
@@ -477,6 +476,20 @@ async fn perform_merge(
         merged_at_ms: now_ms,
     })
     .await?;
+
+    // Card cdb477a2: reclaim the card's worktree now that its PR is
+    // merged. The CLI `airc work close` path already does this, but the
+    // merger closes the majority of cards and previously left every
+    // worktree behind (~/.airc/worktrees/<short> accumulated to 84).
+    // Best-effort: a cleanup refusal (uncommitted/unpushed work) logs a
+    // warning but must NOT fail the merge — the PR is already merged and
+    // the projection has transitioned.
+    if let Err(error) = crate::work_commands::cleanup_card_worktree(card.card_id).await {
+        eprintln!(
+            "airc-merger: worktree cleanup skipped for {} — {error}",
+            card.card_id
+        );
+    }
     Ok(())
 }
 
