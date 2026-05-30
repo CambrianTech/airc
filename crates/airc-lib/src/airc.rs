@@ -28,9 +28,11 @@ use airc_core::{ClientId, PeerId, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
+use airc_store::peer_trust::TrustTier;
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::{udp::UdpAdapter, LanTcpAdapter, RelayAdapter};
 use airc_trust as peers_store;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::broadcast_deduper::BroadcastDeduper;
@@ -594,6 +596,45 @@ impl Airc {
         Ok(project_wall_posts(posts, category_filter))
     }
 
+    /// **Card 1224aac2 slice 1.** Reserved wall-post category name for
+    /// the room trust policy. Substrate consumes it (route gate);
+    /// consumers publish under it.
+    pub const WALL_CATEGORY_TRUST_POLICY: &'static str = "trust-policy";
+
+    /// **Card 1224aac2 slice 1.** Return the active room trust policy
+    /// declared via the current room's wall, or `None` when no
+    /// `category="trust-policy"` post is present.
+    ///
+    /// A continuum recipe instantiates a room (settings room, private
+    /// notes, team review, etc.) and declares its trust requirement by
+    /// publishing a wall post:
+    ///
+    /// ```ignore
+    /// airc.publish_wall_post("trust-policy",
+    ///     serde_json::to_string(&RoomTrustPolicy {
+    ///         min_tier: TrustTier::OwnAccount,
+    ///     })?)?;
+    /// ```
+    ///
+    /// The substrate then enforces it at the route policy: peers below
+    /// `min_tier` (resolved per the existing trust gradient in
+    /// `airc-trust`) are not delivered frames on this room — covering
+    /// chat, widget commands, events, and presence equally.
+    ///
+    /// Latest-wins on the wall's supersede chain — a fresh trust-policy
+    /// post supersedes the previous one. Missing or empty policy =
+    /// no gate (back-compat with rooms predating this primitive).
+    pub async fn wall_trust_policy_for_room(&self) -> Result<Option<RoomTrustPolicy>, AircError> {
+        let posts = self
+            .wall_posts(Some(Self::WALL_CATEGORY_TRUST_POLICY))
+            .await?;
+        // The wall projection returns surviving posts in
+        // published-time order; the LATEST is the active policy.
+        Ok(posts
+            .last()
+            .and_then(|post| serde_json::from_str(&post.body).ok()))
+    }
+
     /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
     ///
     /// Scans recent transcript events in the current room for the
@@ -1108,6 +1149,61 @@ impl Airc {
 /// astronomically unlikely, but the semantics MUST be category-
 /// scoped regardless).
 ///
+/// **Card 1224aac2 slice 1.** A room's trust policy, published as
+/// the body of a `WallPostPublished` event in
+/// `category=Airc::WALL_CATEGORY_TRUST_POLICY`.
+///
+/// `min_tier` is the minimum trust tier a peer must hold (resolved
+/// per `airc_trust::resolve_tier`) to receive frames on the room.
+/// The substrate enforces it at the route boundary — chat, widget
+/// commands, events, and presence are gated equally so a single
+/// post governs the whole UX surface for the room.
+///
+/// Adding fields to this struct is backward-compatible as long as
+/// they are `#[serde(default)]` — older posts written without them
+/// decode with the default, and renderers that don't know about a
+/// new field continue to work.
+///
+/// `TrustTier` itself doesn't ship serde derives (the canonical wire
+/// form is the `as_wire_str` / `from_wire_str` schema-bound pair).
+/// We round-trip via those so a string change there is caught by the
+/// existing variant round-trip test rather than silently shifting
+/// our JSON shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomTrustPolicy {
+    /// Minimum trust tier required to receive frames on this room.
+    /// Resolved against each peer's `airc_trust::resolve_tier` outcome
+    /// at delivery time; peers below this tier are dropped at the
+    /// router boundary (chat, widget commands, events, presence —
+    /// every frame the room would have delivered).
+    #[serde(with = "trust_tier_wire_str")]
+    pub min_tier: TrustTier,
+}
+
+/// Serde adapter that round-trips [`TrustTier`] via its stable
+/// `as_wire_str` / `from_wire_str` schema-bound representation.
+/// Avoids deriving serde directly on `TrustTier` (which would create
+/// two competing wire forms — the snake_case enum-discriminant default
+/// and the existing stable schema).
+mod trust_tier_wire_str {
+    use super::TrustTier;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &TrustTier, s: S) -> Result<S::Ok, S::Error> {
+        value.as_wire_str().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<TrustTier, D::Error> {
+        let raw = String::deserialize(d)?;
+        TrustTier::from_wire_str(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown trust tier wire-string {raw:?} — \
+                 valid values are own_machine, own_account, friend, untrusted"
+            ))
+        })
+    }
+}
+
 /// Pure, sync, no IO — the IO half is `Airc::wall_posts`, which
 /// reads the transcript and hands the result here.
 fn project_wall_posts(
@@ -1317,5 +1413,65 @@ mod wall_projection_tests {
         let events = vec![post(1, "rules", "supersedes a phantom", Some(999_999), 100)];
         let result = project_wall_posts(events, None);
         assert_eq!(result.len(), 1, "post survives despite unknown parent");
+    }
+}
+
+#[cfg(test)]
+mod room_trust_policy_tests {
+    use super::{RoomTrustPolicy, TrustTier};
+
+    /// Card 1224aac2 slice 1: the wire shape MUST use the stable
+    /// `as_wire_str` schema from `airc_store::peer_trust`, not the
+    /// debug / variant-discriminant default that serde would pick on
+    /// its own. A schema drift here would silently change every
+    /// existing room's policy interpretation, so pin the wire form
+    /// against representative variants.
+    #[test]
+    fn round_trips_via_stable_trust_tier_wire_strings() {
+        for tier in TrustTier::ALL_VARIANTS {
+            let policy = RoomTrustPolicy { min_tier: *tier };
+            let json = serde_json::to_string(&policy).expect("serialize");
+            let decoded: RoomTrustPolicy = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(policy, decoded, "round-trip for tier {tier:?}");
+            // Pin the on-wire field name + value so an accidental
+            // rename (`min_tier` → `minTier`, or a field projection
+            // change) is caught at the wire layer not at integration
+            // time.
+            assert!(
+                json.contains("\"min_tier\""),
+                "JSON must carry field name `min_tier`: {json}"
+            );
+            assert!(
+                json.contains(&format!("\"{}\"", tier.as_wire_str())),
+                "JSON must carry stable wire-str {:?}: {json}",
+                tier.as_wire_str()
+            );
+        }
+    }
+
+    /// Card 1224aac2 slice 1: a body string with an unknown trust
+    /// tier value MUST fail to decode with a useful error — not
+    /// silently fall back to a default. Substrate is fail-loud on
+    /// schema drift; route enforcement upstream relies on this.
+    #[test]
+    fn unknown_tier_string_surfaces_decode_error() {
+        let body = r#"{"min_tier":"ultra_secret"}"#;
+        let result: Result<RoomTrustPolicy, _> = serde_json::from_str(body);
+        let err = result.expect_err("unknown tier must error");
+        let message = err.to_string();
+        assert!(
+            message.contains("ultra_secret"),
+            "error must surface the bad value: {message}"
+        );
+    }
+
+    /// Card 1224aac2 slice 1: the reserved wall-category constant
+    /// stays stable as the contract between recipe consumers
+    /// publishing policies and the substrate enforcing them. A
+    /// silent rename here would leave every existing policy post
+    /// unrecognized by the next binary upgrade.
+    #[test]
+    fn wall_category_constant_is_stable() {
+        assert_eq!(super::Airc::WALL_CATEGORY_TRUST_POLICY, "trust-policy");
     }
 }
