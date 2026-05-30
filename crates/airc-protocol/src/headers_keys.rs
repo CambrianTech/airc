@@ -97,6 +97,105 @@ pub const HEADER_AIRC_BODY_ENC_KEY_ID: &str = "airc.body.enc.key_id";
 /// AAD on decrypt or authentication will fail closed.
 pub const HEADER_AIRC_BODY_ENC_AAD: &str = "airc.body.enc.aad";
 
+// ---------------------------------------------------------------------------
+// Canonical attribution + role + target convention — card d26cb46c
+// ---------------------------------------------------------------------------
+//
+// The substrate already threads `from_peer` + `from_client` through IPC (per
+// the owner-core attribution work; memory: owner-core-agent-attribution-gap).
+// What outbound surfaces (GitHub plugin, web UI, audit log, work-board
+// projection, persona renderer) need is a UNIFORM HEADER VOCABULARY so the
+// originator's identity, role, target, and trust tier survive the outbound
+// translation. Without this, every PR/comment/review on GitHub renders as
+// "joelteply" (the account owning the API tokens) instead of as the actual
+// persona/agent — Joel 2026-05-30 "the 'joelteply leak'".
+//
+// Substrate ships the vocabulary; consumers populate + render it. Where a
+// structured equivalent exists on `Envelope` (e.g. `from_peer`), the header
+// is a projection of the authoritative field — mismatch fails frame verify,
+// same pattern as `HEADER_AIRC_REPLY_TO`.
+
+// --- Identity attribution ----------------------------------------------------
+
+/// Substrate peer_id (UUID string) of the originating peer. Always set on
+/// outbound events; survives every outbound translation. Renderers use this
+/// as the primary identity key for avatar / display-name lookup.
+///
+/// Projection of `SendRequest::from_peer` / `Envelope::from_peer`. Mismatch
+/// between structured + header values causes verify to reject.
+pub const HEADER_AIRC_FROM_PEER: &str = "airc.from.peer";
+
+/// Per-session client_id (UUID string) — distinguishes tabs / sessions /
+/// agent processes that share one `airc.from.peer`. Mirrors the existing
+/// `airc.client` header (which stays for hook compatibility); this constant
+/// lives in the canonical `airc.from.*` namespace so consumers don't have
+/// to special-case the older spelling when projecting identity.
+pub const HEADER_AIRC_FROM_CLIENT: &str = "airc.from.client";
+
+/// Persona id (UUID string) when the originator is a continuum persona
+/// acting as a first-class airc peer. Absence = not-a-persona (a human
+/// user, an agent, a system actor). Substrate doesn't validate the id —
+/// continuum owns the persona registry — but rendering / audit logic keys
+/// off this header to dispatch to the persona-card layer instead of the
+/// default user-card layer.
+pub const HEADER_AIRC_FROM_PERSONA: &str = "airc.from.persona";
+
+/// Cached display name for renderer convenience. The authoritative source
+/// is the identity card on the wall (`TranscriptKind::IdentityPublished`);
+/// this header is the projection consumers use without an extra lookup so
+/// every event self-contains enough to render. Drift between cached value
+/// and wall card is acceptable (renderer can re-read the wall on demand);
+/// the substrate does NOT enforce equality.
+pub const HEADER_AIRC_FROM_DISPLAY_NAME: &str = "airc.from.display_name";
+
+/// Optional runtime hint: `"claude"`, `"continuum-claude"`, `"codex"`,
+/// `"web"`, `"gh-bot"`, etc. Renderers use it to pick the right avatar /
+/// icon family without inferring from `airc.from.client` substrings.
+/// Substrate doesn't validate; consumers extend the vocabulary as they
+/// add runtimes.
+pub const HEADER_AIRC_FROM_RUNTIME: &str = "airc.from.runtime";
+
+// --- Role + target -----------------------------------------------------------
+
+/// The originator's role for THIS event: `"author"` / `"reviewer"` /
+/// `"watcher"` / `"mentioned"` / `"merger"` / `"reactor"` / consumer-
+/// extended. Substrate doesn't enumerate the vocabulary; renderers
+/// dispatch to the right UI element (review badge, mention chip, etc.)
+/// by string match and fall back to verbatim rendering for unknowns.
+pub const HEADER_AIRC_ROLE: &str = "airc.role";
+
+/// Target type the event is acting on: `"pr"` / `"card"` / `"room"` /
+/// `"peer"` / `"recipe"` / `"blob"` / `"setting"`. Consumer-extensible.
+/// Renderers use this to route the event to the right surface (a PR
+/// review goes to the PR thread, a card update goes to the work board).
+pub const HEADER_AIRC_TARGET_KIND: &str = "airc.target.kind";
+
+/// Target identifier — semantics depend on `airc.target.kind`. For
+/// `kind=pr` it's the PR number; for `kind=card` it's the card UUID;
+/// for `kind=room` it's the room id; for `kind=blob` it's the blob
+/// hash; for `kind=setting` it's the setting key. Substrate carries it
+/// opaque.
+pub const HEADER_AIRC_TARGET_ID: &str = "airc.target.id";
+
+/// Optional GitHub-style repo identifier when the target lives in a
+/// versioned repo context — e.g. `"CambrianTech/airc"` for PRs, cards
+/// scoped to a repo. Absent for targets that don't have a repo (a
+/// per-user setting, a free-floating room).
+pub const HEADER_AIRC_TARGET_REPO: &str = "airc.target.repo";
+
+// --- Trust + provenance ------------------------------------------------------
+
+/// Resolved trust tier of the originator at event-emit time. Stable
+/// wire-string form matching
+/// `airc_store::peer_trust::TrustTier::as_wire_str` —
+/// `"own_machine"` / `"own_account"` / `"friend"` / `"untrusted"`.
+///
+/// Snapshot at emit-time so the audit log preserves the as-believed
+/// tier even if the originator's tier changes later. Renderers use it
+/// to choose a confidence indicator (color / badge); review aggregates
+/// use it for tier-min policy enforcement (card ae3e1a47).
+pub const HEADER_AIRC_TRUST_TIER: &str = "airc.trust.tier";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,8 +214,7 @@ mod tests {
     /// Card 1224aac2 slice 2: every encryption header lives under the
     /// substrate's `airc.*` namespace and never collides with the
     /// consumer-owned `forge.*` / `continuum.*` / `openclaw.*` /
-    /// `hermes.*` / `opencode.*` / `x-*` spaces (see substrate design
-    /// doc, "Header namespaces" section).
+    /// `hermes.*` / `opencode.*` / `x-*` spaces.
     #[test]
     fn body_encryption_headers_in_substrate_namespace() {
         for header in [
@@ -127,6 +225,96 @@ mod tests {
             assert!(
                 header.starts_with("airc."),
                 "{header:?} must be in the substrate-owned `airc.*` namespace"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod attribution_header_tests {
+    use super::*;
+
+    /// Card d26cb46c: the attribution + role + target + trust header
+    /// names MUST stay stable. Renderers (GitHub plugin, web UI, audit
+    /// log) match by exact string; a silent rename here flips every
+    /// existing event's identity into "unknown" at every consumer
+    /// surface without a compile error.
+    #[test]
+    fn attribution_header_names_are_stable() {
+        // Identity attribution
+        assert_eq!(HEADER_AIRC_FROM_PEER, "airc.from.peer");
+        assert_eq!(HEADER_AIRC_FROM_CLIENT, "airc.from.client");
+        assert_eq!(HEADER_AIRC_FROM_PERSONA, "airc.from.persona");
+        assert_eq!(HEADER_AIRC_FROM_DISPLAY_NAME, "airc.from.display_name");
+        assert_eq!(HEADER_AIRC_FROM_RUNTIME, "airc.from.runtime");
+        // Role + target
+        assert_eq!(HEADER_AIRC_ROLE, "airc.role");
+        assert_eq!(HEADER_AIRC_TARGET_KIND, "airc.target.kind");
+        assert_eq!(HEADER_AIRC_TARGET_ID, "airc.target.id");
+        assert_eq!(HEADER_AIRC_TARGET_REPO, "airc.target.repo");
+        // Trust + provenance
+        assert_eq!(HEADER_AIRC_TRUST_TIER, "airc.trust.tier");
+    }
+
+    /// Card d26cb46c: every attribution header lives under the
+    /// substrate's `airc.*` namespace and never collides with
+    /// consumer-owned `forge.*` / `continuum.*` / `openclaw.*` /
+    /// `hermes.*` / `opencode.*` / `x-*` spaces.
+    #[test]
+    fn attribution_headers_in_substrate_namespace() {
+        for header in [
+            HEADER_AIRC_FROM_PEER,
+            HEADER_AIRC_FROM_CLIENT,
+            HEADER_AIRC_FROM_PERSONA,
+            HEADER_AIRC_FROM_DISPLAY_NAME,
+            HEADER_AIRC_FROM_RUNTIME,
+            HEADER_AIRC_ROLE,
+            HEADER_AIRC_TARGET_KIND,
+            HEADER_AIRC_TARGET_ID,
+            HEADER_AIRC_TARGET_REPO,
+            HEADER_AIRC_TRUST_TIER,
+        ] {
+            assert!(
+                header.starts_with("airc."),
+                "{header:?} must be in the substrate-owned `airc.*` namespace"
+            );
+        }
+    }
+
+    /// Card d26cb46c: the identity-attribution headers MUST stay in
+    /// the `airc.from.*` sub-namespace so consumers can iterate
+    /// projection by prefix (e.g. "give me all from-data on this
+    /// event"). Drift into a different sub-namespace would break
+    /// prefix iteration silently.
+    #[test]
+    fn identity_attribution_headers_share_from_sub_namespace() {
+        for header in [
+            HEADER_AIRC_FROM_PEER,
+            HEADER_AIRC_FROM_CLIENT,
+            HEADER_AIRC_FROM_PERSONA,
+            HEADER_AIRC_FROM_DISPLAY_NAME,
+            HEADER_AIRC_FROM_RUNTIME,
+        ] {
+            assert!(
+                header.starts_with("airc.from."),
+                "{header:?} must share the `airc.from.*` identity sub-namespace"
+            );
+        }
+    }
+
+    /// Card d26cb46c: target headers MUST stay in `airc.target.*` so
+    /// consumers can group by target dimension symmetrically with
+    /// identity grouping.
+    #[test]
+    fn target_headers_share_target_sub_namespace() {
+        for header in [
+            HEADER_AIRC_TARGET_KIND,
+            HEADER_AIRC_TARGET_ID,
+            HEADER_AIRC_TARGET_REPO,
+        ] {
+            assert!(
+                header.starts_with("airc.target."),
+                "{header:?} must share the `airc.target.*` sub-namespace"
             );
         }
     }
