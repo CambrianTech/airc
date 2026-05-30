@@ -286,7 +286,10 @@ pub(crate) async fn check_pr_gate(
 pub(crate) async fn fetch_baseline_failures(
     gh: &dyn crate::gh_client::GhClient,
 ) -> std::collections::HashSet<String> {
-    let base_branch = crate::work_commands_gh::pr_create_base_branch();
+    // Card 70e87d33 made the PR base per-repo. This baseline lookup is
+    // airc-specific (the repo is hardcoded to CambrianTech/airc below),
+    // so it resolves to airc's integration branch, rust-rewrite.
+    let base_branch = "rust-rewrite";
     let runs = match gh
         .branch_check_rollup(crate::gh_client::BranchCheckRollupArgs {
             repo: "CambrianTech/airc".to_string(),

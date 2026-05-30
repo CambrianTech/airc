@@ -317,6 +317,19 @@ pub enum WorkAction {
         #[arg(long, default_value_t = 1800)]
         pending_timeout_secs: u64,
     },
+    /// Card 70e87d33: retroactively link an already-open PR to a card.
+    /// `airc work state review` auto-links PRs it creates, but a PR
+    /// opened manually (or before the per-repo base-default fix landed)
+    /// has no link, so the merger never sees it. This reads the PR's
+    /// head/base from `gh` and emits `PullRequestLinked` so the merger
+    /// gate picks it up. Idempotent on an already-linked card.
+    Link {
+        /// Work card UUID to link the PR to.
+        card_id: String,
+        /// GitHub PR number to link (e.g. 1471).
+        #[arg(long)]
+        pr: u64,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
