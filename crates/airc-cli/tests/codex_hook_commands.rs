@@ -485,12 +485,27 @@ fn codex_hook_uninstaller_removes_managed_hooks_only() {
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {
+    // Diagnostic checkpoint for tracking down the airc#1097 Windows
+    // hang. Visible in CI with `--nocapture`; gated by env var so
+    // local runs aren't noisy.
+    if std::env::var_os("AIRC_TEST_TRACE").is_some() {
+        eprintln!(
+            "[airc-test-trace] run_ok: spawning airc {args:?} home={}",
+            home.display()
+        );
+    }
     let output = command_for_home(home)
         .args(["--home"])
         .arg(home)
         .args(args)
         .output()
         .expect("airc-core command must spawn");
+    if std::env::var_os("AIRC_TEST_TRACE").is_some() {
+        eprintln!(
+            "[airc-test-trace] run_ok: exited airc {args:?} status={}",
+            output.status
+        );
+    }
     assert!(
         output.status.success(),
         "airc-core {:?} failed: stdout={} stderr={}",
@@ -520,6 +535,13 @@ fn run_ok_with_client(home: &Path, client_id: &str, args: &[&str]) -> String {
 }
 
 fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
+    let trace = std::env::var_os("AIRC_TEST_TRACE").is_some();
+    if trace {
+        eprintln!(
+            "[airc-test-trace] run_hook: spawning airc {args:?} home={}",
+            home.display()
+        );
+    }
     let mut child = command_for_home(home)
         .args(["--home"])
         .arg(home)
@@ -529,13 +551,29 @@ fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("airc-core hook must spawn");
+    if trace {
+        eprintln!(
+            "[airc-test-trace] run_hook: spawned pid={}, writing {} bytes to stdin",
+            child.id(),
+            stdin.len()
+        );
+    }
     child
         .stdin
         .as_mut()
         .expect("stdin pipe")
         .write_all(stdin.as_bytes())
         .expect("write hook stdin");
+    if trace {
+        eprintln!("[airc-test-trace] run_hook: stdin written, calling wait_with_output (this is where airc#1097 deadlocks on Windows)");
+    }
     let output = child.wait_with_output().expect("wait for hook");
+    if trace {
+        eprintln!(
+            "[airc-test-trace] run_hook: wait_with_output returned status={}",
+            output.status
+        );
+    }
     assert!(
         output.status.success(),
         "airc-core {:?} failed: stdout={} stderr={}",

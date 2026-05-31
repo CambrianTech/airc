@@ -119,4 +119,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - name: cargo test --workspace --all-features
-        run: cargo test --workspace --all-features
+        env:
+          # Surface diagnostic checkpoints from test helpers so we can
+          # see where Windows hangs (airc#1097). Single-threaded test
+          # execution + --nocapture so the eprintln output appears in
+          # CI logs even on success; both are cheap on success runs.
+          AIRC_TEST_TRACE: "1"
+          RUST_BACKTRACE: "full"
+        run: cargo test --workspace --all-features -- --nocapture --test-threads=1
+        # Job-level deadline: if Windows hangs in airc#1097 territory,
+        # cap the runner kill at 25 minutes so we get partial logs
+        # (and don't burn CI minutes on a known-hung pattern).
+        timeout-minutes: 25
