@@ -362,6 +362,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
         Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
+        Command::IpcEndpoint { socket } => {
+            // Resolve via the same path airc itself would use to bind/
+            // connect. No probe — see command doc on cli.rs. Print and
+            // exit zero so callers can capture via `$(airc ipc-endpoint)`.
+            let path = default_or(socket, &home);
+            println!("{}", path.display());
+            Ok(())
+        }
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
         Command::Msg { socket, text } => {

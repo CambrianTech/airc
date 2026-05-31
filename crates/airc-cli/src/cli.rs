@@ -497,6 +497,29 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
+    /// Print the resolved daemon IPC socket path to stdout and exit.
+    ///
+    /// Designed for external callers (Continuum, OpenClaw, bridge
+    /// processes, future workers) that need to attach to the running
+    /// airc daemon without re-implementing airc's socket-path
+    /// resolution rules. Output is the path on a single line, no
+    /// trailing whitespace, no formatting — safe to capture with
+    /// `$(airc ipc-endpoint)` and pass straight to `connect()`.
+    ///
+    /// Does NOT probe liveness: the path is what the daemon would
+    /// (or does) bind under the current `--home` / `AIRC_HOME` /
+    /// `--socket` resolution. Combine with `airc ping --socket
+    /// "$(airc ipc-endpoint)"` if a liveness gate is needed.
+    ///
+    /// The point of this command is decoupling: airc remains free
+    /// to evolve its socket-path scheme (machine-account hashing,
+    /// SUN_LEN fallbacks, `$AIRC_RUNTIME_DIR` override) without
+    /// breaking downstream consumers — they ask, they don't derive.
+    IpcEndpoint {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
     /// Daemon health snapshot.
     Status {
         #[arg(long)]
