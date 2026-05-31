@@ -26,6 +26,23 @@ yours. Specifically:
   a PR, you review it (LGTM-comment if self-approve is blocked) and
   merge it via `gh pr merge --squash --delete-branch` when ready. The
   human does *not* exist to press merge buttons.
+- **Agent / sentinel sign-off is valid approval.** `gh` refuses
+  `--approve` on a PR you authored under the same identity, so the
+  author can't approve their own PR through the GitHub button. The
+  substrate-correct fix is **spawn an adversarial reviewer agent**
+  (a fresh subagent via your runtime's Agent tool, or a peer agent
+  in the room) with a "default to BLOCK MERGE, justify any APPROVE"
+  prompt. A clean APPROVE verdict from that reviewer is the sign-off
+  — `gh pr merge` after a green CI is then doctrinally legitimate,
+  not a workaround. The reviewer role ("sentinel") is equally open
+  to every peer; in the continuum substrate sentinels ARE agents and
+  the verdict pathway is identical. Document the reviewer's verdict
+  in the PR body or a follow-up comment so the audit trail is
+  inspectable; that comment serves the same purpose the GitHub
+  approval checkbox would, and downstream tools (e.g. `airc work
+  merge`, future merger daemons) should accept it as the human-shape
+  equivalent. Joel, 2026-05-31: *"agents or sentinels can be allowed
+  the role and this is ok process."*
 - **CI must be green before merge.** Run `gh pr checks <N>` before
   every `gh pr merge`. A red CI check is a hard refusal, not a hint —
   same level as the substrate's lifecycle guards. Failed once today
