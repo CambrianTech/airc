@@ -26,6 +26,7 @@ pub mod client;
 pub mod codec;
 pub mod request;
 pub mod response;
+pub mod sdk_conversions;
 pub mod transport;
 
 /// Local daemon IPC ABI version.
@@ -45,5 +46,6 @@ pub use request::{
     PublishRequest, RemovePeerRequest, Request, SendRequest,
 };
 pub use response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
+pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};
 // IpcListener / IpcStream stay under `transport` because only the
 // daemon host and low-level tests need the raw byte transport.

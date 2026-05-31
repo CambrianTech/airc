@@ -19,8 +19,8 @@ use airc_bus::envelope::{Envelope, Kind, Target};
 use airc_core::{Body, MentionTarget, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind};
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    Response, SendRequest,
+    AttachRequest, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest, Response,
+    SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -34,8 +34,11 @@ use crate::Airc;
 /// Low bits of the packed `lamport` that hold the per-epoch counter; the
 /// remaining high bits hold the epoch. 40 bits ⇒ ~1.1e12 events per
 /// epoch and ~16.7M epochs (restarts) — neither realistically reachable.
-const COUNTER_BITS: u32 = 40;
-const COUNTER_MASK: u64 = (1 << COUNTER_BITS) - 1;
+//
+// Re-exported from airc-ipc so the wire vocabulary and the SDK
+// projection can never disagree on layout. Anyone reading
+// `COUNTER_BITS` here gets the same value as the IPC From impls.
+use airc_ipc::{COUNTER_BITS, COUNTER_MASK};
 
 /// Reconnect backoff for a daemon attach stream that drops (daemon
 /// restart / transient loss): start small, double, cap — so a long
@@ -58,17 +61,6 @@ fn unpack_seq(lamport: u64) -> (u64, u64) {
     (lamport >> COUNTER_BITS, lamport & COUNTER_MASK)
 }
 
-/// Map the consumer-facing `FrameKind` (chat vocabulary) to the bus's
-/// `IpcKind`. RPC/grid consumers that need `Command`/`CommandResult`
-/// publish via the typed IPC client directly with `IpcKind`.
-fn framekind_to_ipc(kind: FrameKind) -> IpcKind {
-    match kind {
-        FrameKind::Message => IpcKind::Message,
-        FrameKind::Event => IpcKind::Event,
-        FrameKind::Control => IpcKind::Control,
-    }
-}
-
 fn kind_to_transcript(kind: Kind) -> TranscriptKind {
     match kind {
         Kind::Message => TranscriptKind::Message,
@@ -80,16 +72,6 @@ fn kind_to_transcript(kind: Kind) -> TranscriptKind {
         | Kind::Signal
         | Kind::StreamChunk
         | Kind::Control => TranscriptKind::System,
-    }
-}
-
-/// Inverse of [`target_to_mention`] — map the SDK send target to the IPC
-/// addressing vocabulary. A room mention round-trips as a named endpoint.
-fn mention_to_ipc_target(target: MentionTarget) -> IpcTarget {
-    match target {
-        MentionTarget::All => IpcTarget::All,
-        MentionTarget::Peer(peer) => IpcTarget::Peer(peer),
-        MentionTarget::Room(room) => IpcTarget::Endpoint(format!("room:{}", room.as_uuid())),
     }
 }
 
@@ -186,9 +168,9 @@ impl Airc {
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: framekind_to_ipc(kind),
+                kind: kind.into(),
                 delivery: IpcDelivery::Durable,
-                target: mention_to_ipc_target(target),
+                target: target.into(),
                 correlation_id: None,
                 coalesce_key: None,
                 payload: body.to_payload(),
@@ -215,7 +197,7 @@ impl Airc {
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: framekind_to_ipc(kind),
+                kind: kind.into(),
                 // SDK chat/structured publishes are durable; the live
                 // streaming classes are reached via the typed IPC client
                 // directly (media/game-state), not this chat helper.
