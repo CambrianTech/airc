@@ -191,9 +191,60 @@ fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&s
     event.client_id == airc.client_id()
 }
 
+/// Read Codex's hook JSON from stdin, with a hard deadline so a
+/// hung pipe never deadlocks the process.
+///
+/// **Why the deadline exists** (airc#1097). On the Windows CI
+/// runner, the codex_hook_commands tests hung for 5+ hours because
+/// `std::io::stdin().read_to_string` waited forever for an EOF that
+/// never arrived — most likely a Windows handle-inheritance leak
+/// from `Stdio::piped()` parent → grandchild daemon, where the
+/// daemon's inherited duplicate of the pipe-read handle kept the
+/// pipe alive after the parent closed its write end. Mac/Linux
+/// don't manifest the issue (~1s tests there).
+///
+/// The robust fix isn't a platform-specific handle-inheritance
+/// patch (untestable without a Windows machine, fragile across
+/// future cargo / std / Windows changes). It's to **stop relying
+/// on stdin-EOF as a liveness signal**: read with a deadline,
+/// proceed with empty payload if EOF doesn't arrive in time.
+/// Codex sends the JSON in microseconds in the happy path; 5s
+/// is far past any legitimate latency.
+///
+/// On Mac/Linux this changes nothing observable (EOF arrives
+/// well within the deadline). On Windows the deadlock becomes a
+/// fast-fail-and-proceed — the hook produces no AdditionalContext
+/// for that call, which is the same outcome as receiving empty
+/// stdin, and the next hook invocation behaves correctly.
 fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
-    let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw)?;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const STDIN_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut raw = String::new();
+        let result = std::io::stdin().read_to_string(&mut raw).map(|_| raw);
+        let _ = tx.send(result);
+    });
+
+    let raw = match rx.recv_timeout(STDIN_READ_DEADLINE) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_timeout) => {
+            // Best-effort diagnostic; the orphan reader thread keeps
+            // its handle and will exit when the OS reclaims it after
+            // process exit.
+            eprintln!(
+                "airc codex-hook: stdin EOF not received within {STDIN_READ_DEADLINE:?}, \
+                 proceeding with empty payload (see airc#1097)"
+            );
+            return Ok(());
+        }
+    };
+
     if raw.trim().is_empty() {
         return Ok(());
     }
