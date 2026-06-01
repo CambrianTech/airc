@@ -22,7 +22,9 @@ pub(crate) async fn spawn_claim_worktree(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Need the card's title for the branch slug — board projection
     // is the source of truth.
-    let board = airc.work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;

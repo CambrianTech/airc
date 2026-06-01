@@ -518,7 +518,9 @@ async fn refresh_coordination(
     airc: &crate::Airc,
     baseline: &CoordinationSignal,
 ) -> Result<CoordinationSignal, AircError> {
-    let board = airc.work_board_complete(crate::WORK_BOARD_PROJECTION_PAGE_SIZE).await?;
+    let board = airc
+        .work_board_complete(crate::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let me = airc.peer_id();
     let active_claims: Vec<WorkCardId> = board
         .snapshot()

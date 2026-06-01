@@ -723,6 +723,7 @@ pub mod mock {
                 state: state.to_string(),
                 mergeable: "MERGEABLE".to_string(),
                 status_check_rollup: Some(Vec::new()),
+                merged_at: None,
             }
         }
 

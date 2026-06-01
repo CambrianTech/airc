@@ -276,7 +276,9 @@ pub(crate) enum GateResult {
     /// The card needs `PullRequestMerged` to reach the Merged state,
     /// but `gh pr merge` would 422. `merged_at_ms` is parsed from
     /// gh's `mergedAt`; falls back to wall-clock-now if absent.
-    AlreadyMerged { merged_at_ms: u64 },
+    AlreadyMerged {
+        merged_at_ms: u64,
+    },
 }
 
 /// Card 7ed1ac4f — tunable policy parameters carried into
@@ -679,7 +681,9 @@ mod tests {
         // sync with GitHub. The acd72c81 follow-up routes MERGED
         // into AlreadyMerged so the merger emits
         // `PullRequestMerged` and transitions the card.
-        let view = parse(json!({"state": "MERGED", "mergeable": "MERGEABLE", "mergedAt": "2026-06-01T07:04:07Z"}));
+        let view = parse(
+            json!({"state": "MERGED", "mergeable": "MERGEABLE", "mergedAt": "2026-06-01T07:04:07Z"}),
+        );
         match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
             GateResult::AlreadyMerged { merged_at_ms } => {
                 assert_eq!(merged_at_ms, 1780297447000);
@@ -1057,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_gh_view_falls_back_to_wallclock_when_mergedAt_absent() {
+    fn evaluate_gh_view_falls_back_to_wallclock_when_merged_at_absent() {
         // gh shouldn't return MERGED without mergedAt, but we don't
         // crash if it does — the wall-clock-now fallback yields a
         // reasonable timestamp. Asserts nonzero rather than a
