@@ -423,9 +423,10 @@ impl Airc {
                                         // subscription (wire schema drift,
                                         // encoding bug, anything that breaks
                                         // decode).
-                                        eprintln!(
-                                            "airc subscribe: dropping subscription on channel {channel} \
-                                             — decode_wire_event failed: {error}"
+                                        tracing::warn!(
+                                            channel = %channel,
+                                            error = %error,
+                                            "airc subscribe: dropping subscription — decode_wire_event failed"
                                         );
                                         return;
                                     }
@@ -437,17 +438,19 @@ impl Airc {
                                 // recurring stream of these indicates the
                                 // daemon is sending shapes the SDK doesn't
                                 // recognise.
-                                eprintln!(
-                                    "airc subscribe: ignoring non-Event frame on channel {channel} \
-                                     — {other:?}"
+                                tracing::warn!(
+                                    channel = %channel,
+                                    frame = ?other,
+                                    "airc subscribe: ignoring non-Event frame"
                                 );
                             }
                             Ok(None) | Err(_) => {
                                 // Card 807193ab: surface stream drops so a
                                 // session of "no events" can be told apart
                                 // from "connection died, reconnecting."
-                                eprintln!(
-                                    "airc subscribe: stream closed on channel {channel} — reconnecting"
+                                tracing::warn!(
+                                    channel = %channel,
+                                    "airc subscribe: stream closed — reconnecting"
                                 );
                                 break;
                             }
@@ -474,9 +477,11 @@ impl Airc {
                                 // operators watching a dead connection with
                                 // no signal. Show the reattach failure +
                                 // current backoff.
-                                eprintln!(
-                                    "airc subscribe: reattach failed on channel {channel} \
-                                     (backoff={backoff_ms}ms): {error}"
+                                tracing::warn!(
+                                    channel = %channel,
+                                    backoff_ms,
+                                    error = %error,
+                                    "airc subscribe: reattach failed"
                                 );
                                 continue;
                             }
@@ -488,15 +493,17 @@ impl Airc {
                                 break; // reconnected; resume draining
                             }
                             Ok(Some(other)) => {
-                                eprintln!(
-                                    "airc subscribe: reattach ack mismatch on channel {channel} \
-                                     — expected Ok, got: {other:?}"
+                                tracing::warn!(
+                                    channel = %channel,
+                                    frame = ?other,
+                                    "airc subscribe: reattach ack mismatch — expected Ok"
                                 );
                             }
                             Ok(None) | Err(_) => {
-                                eprintln!(
-                                    "airc subscribe: reattach ack read failed on channel {channel} \
-                                     (backoff={backoff_ms}ms)"
+                                tracing::warn!(
+                                    channel = %channel,
+                                    backoff_ms,
+                                    "airc subscribe: reattach ack read failed"
                                 );
                             }
                         }
