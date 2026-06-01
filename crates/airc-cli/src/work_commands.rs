@@ -111,7 +111,9 @@ pub async fn run_review(
 
     // Resolve the parent off the current room's board. Refusing on
     // "no parent" is more useful than spawning an orphan review.
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
             "parent card {parent_card_id} not found in the current room's board; \
@@ -334,7 +336,9 @@ async fn resolve_my_active_claim(
     airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
 ) -> Result<airc_lib::ClaimId, Box<dyn std::error::Error>> {
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not present in the board projection"))?;
@@ -452,7 +456,9 @@ pub async fn run_state(
     // self-attesting Merged; this one refuses agents from
     // self-attesting Closed without a Merged predecessor.
     if card_state == CardState::Closed {
-        let board = airc.work_board(usize::MAX).await?;
+        let board = airc
+            .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+            .await?;
         let card = board.card(card_uuid).ok_or_else(|| {
             format!("card {card_uuid} not visible in current room's board projection")
         })?;
@@ -698,7 +704,9 @@ pub(crate) async fn auto_spawn_review_card(
     parent_id: airc_lib::WorkCardId,
     pr_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let parent = board
         .card(parent_id)
         .ok_or_else(|| format!("parent card {parent_id} no longer in board projection"))?;
@@ -837,7 +845,9 @@ pub async fn run_merge(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
 
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let card = board.card(card_uuid).ok_or_else(|| {
         format!("card {card_uuid} not visible in current room's board projection")
     })?;
@@ -908,6 +918,33 @@ pub async fn run_merge(
             .await?;
             println!(
                 "merged: card={card_uuid} pr=#{n} repo={r}",
+                n = pr.number,
+                r = pr.repo,
+            );
+            Ok(())
+        }
+        Ok(crate::merger::GateResult::AlreadyMerged { merged_at_ms }) => {
+            // Card acd72c81 follow-up: PR is already merged on
+            // GitHub. The manual `airc work merge` path reconciles
+            // by emitting `PullRequestMerged` — no `gh pr merge`
+            // call needed.
+            if dry_run {
+                println!(
+                    "merge_gate: ALREADY_MERGED — card={card_uuid} pr=#{n} repo={r} \
+                     (would reconcile)",
+                    n = pr.number,
+                    r = pr.repo,
+                );
+                return Ok(());
+            }
+            airc.mark_pull_request_merged(MarkPullRequestMerged {
+                card_id: card_uuid,
+                pull_request: pr.clone(),
+                merged_at_ms,
+            })
+            .await?;
+            println!(
+                "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
                 n = pr.number,
                 r = pr.repo,
             );

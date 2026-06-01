@@ -165,6 +165,25 @@ async fn tick_once(
                     ),
                 }
             }
+            MergeDecision::Reconcile(pr, merged_at_ms) => {
+                if dry_run {
+                    eprintln!(
+                        "airc-merger: [DRY-RUN] would reconcile already-merged card={} pr=#{} ({})",
+                        card.card_id, pr.number, pr.repo
+                    );
+                    continue;
+                }
+                match perform_reconcile(card, &pr, merged_at_ms, airc).await {
+                    Ok(()) => eprintln!(
+                        "airc-merger: reconciled already-merged card={} pr=#{} ({})",
+                        card.card_id, pr.number, pr.repo
+                    ),
+                    Err(error) => eprintln!(
+                        "airc-merger: reconcile failed card={} pr=#{}: {error}",
+                        card.card_id, pr.number
+                    ),
+                }
+            }
             MergeDecision::Skip(reason) => {
                 eprintln!("airc-merger: skip card={} reason={reason}", card.card_id);
             }
@@ -173,8 +192,43 @@ async fn tick_once(
     Ok(())
 }
 
+/// Card acd72c81 follow-up: emit `PullRequestMerged` for a card whose
+/// PR is ALREADY merged on GitHub. Skips `gh pr merge` (the GH merge
+/// already happened), runs the same kanban-event + worktree-cleanup
+/// shape as `perform_merge` so reconciled cards reach the exact same
+/// terminal state as freshly-merged ones.
+async fn perform_reconcile(
+    card: &WorkCard,
+    pr: &airc_work::model::PullRequestRef,
+    merged_at_ms: u64,
+    airc: &Airc,
+) -> Result<(), Box<dyn std::error::Error>> {
+    airc.mark_pull_request_merged(MarkPullRequestMerged {
+        card_id: card.card_id,
+        pull_request: pr.clone(),
+        merged_at_ms,
+    })
+    .await?;
+
+    if let Err(error) = crate::work_commands::cleanup_card_worktree(card.card_id).await {
+        eprintln!(
+            "airc-merger: worktree cleanup skipped for {} — {error}",
+            card.card_id
+        );
+    }
+    Ok(())
+}
+
 enum MergeDecision {
     Merge(airc_work::model::PullRequestRef),
+    /// Card acd72c81 follow-up: PR is ALREADY merged on GitHub but the
+    /// kanban projection hasn't observed it (no `PullRequestMerged`
+    /// event for this card). The merger reconciles by emitting one
+    /// — no `gh pr merge` call needed; the merge already happened.
+    /// `merged_at_ms` comes from gh's `mergedAt` ISO-8601 timestamp
+    /// when available, falls back to wall-clock-now if gh didn't
+    /// supply it (older gh schema or transient).
+    Reconcile(airc_work::model::PullRequestRef, u64),
     Skip(String),
 }
 
@@ -198,6 +252,9 @@ async fn evaluate(
 
     match check_pr_gate(gh, &pr, baseline_failures, policy).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
+        Ok(GateResult::AlreadyMerged { merged_at_ms }) => {
+            Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms)))
+        }
         Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
             "gh status query failed: {error}"
@@ -208,9 +265,20 @@ async fn evaluate(
 /// Result of applying the merge gate to a PR. `pub(crate)` since card
 /// a399b342: the `airc work merge` CLI command consumes the same gate
 /// so a manual merge is held to the same bar the auto-merger uses.
+#[derive(Debug)]
 pub(crate) enum GateResult {
     Green,
     NotReady(String),
+    /// Card acd72c81 follow-up: PR's GitHub state is already MERGED
+    /// (someone merged it out-of-band, or the merger crashed after
+    /// `gh pr merge` but before `mark_pull_request_merged`, or this
+    /// card was created post-hoc to track an already-shipped PR).
+    /// The card needs `PullRequestMerged` to reach the Merged state,
+    /// but `gh pr merge` would 422. `merged_at_ms` is parsed from
+    /// gh's `mergedAt`; falls back to wall-clock-now if absent.
+    AlreadyMerged {
+        merged_at_ms: u64,
+    },
 }
 
 /// Card 7ed1ac4f — tunable policy parameters carried into
@@ -250,6 +318,17 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Parse gh's `mergedAt` (ISO-8601, e.g. "2026-06-01T07:04:07Z") to
+/// epoch milliseconds. Returns `None` on parse failure so the caller
+/// can fall back to wall-clock-now. Card acd72c81 follow-up: the
+/// reconcile path's canonical timestamp is GitHub's recorded merge
+/// time, not the reconcile tick's wall clock.
+pub(crate) fn parse_iso8601_to_ms(s: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis().max(0) as u64)
 }
 
 /// Query `gh pr view --json statusCheckRollup,mergeable,state` and
@@ -355,6 +434,22 @@ pub(crate) fn evaluate_gh_view(
     baseline_failures: &std::collections::HashSet<String>,
     policy: GatePolicy,
 ) -> GateResult {
+    if view.state == "MERGED" {
+        // Card acd72c81 follow-up: reconcile, don't skip. The kanban
+        // projection needs `PullRequestMerged` to transition; the GH
+        // merge already happened, so the merger just emits the event.
+        let merged_at_ms = view
+            .merged_at
+            .as_deref()
+            .and_then(parse_iso8601_to_ms)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
+        return GateResult::AlreadyMerged { merged_at_ms };
+    }
     if view.state != "OPEN" {
         return GateResult::NotReady(format!("PR state is {} (not OPEN)", view.state));
     }
@@ -579,12 +674,22 @@ mod tests {
     }
 
     #[test]
-    fn refuses_when_pr_is_already_merged() {
-        let view = parse(json!({"state": "MERGED", "mergeable": "MERGEABLE"}));
-        assert!(matches!(
-            evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
-            GateResult::NotReady(_)
-        ));
+    fn reconciles_when_pr_is_already_merged() {
+        // Pre-acd72c81 behavior: MERGED → NotReady("PR state is
+        // MERGED (not OPEN)"). That caused the merger to skip
+        // already-merged PRs forever, leaving the kanban out of
+        // sync with GitHub. The acd72c81 follow-up routes MERGED
+        // into AlreadyMerged so the merger emits
+        // `PullRequestMerged` and transitions the card.
+        let view = parse(
+            json!({"state": "MERGED", "mergeable": "MERGEABLE", "mergedAt": "2026-06-01T07:04:07Z"}),
+        );
+        match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
+            GateResult::AlreadyMerged { merged_at_ms } => {
+                assert_eq!(merged_at_ms, 1780297447000);
+            }
+            other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
     }
 
     #[test]
@@ -917,6 +1022,7 @@ mod tests {
             match g {
                 GateResult::Green => "green",
                 GateResult::NotReady(_) => "not_ready",
+                GateResult::AlreadyMerged { .. } => "already_merged",
             }
         }
         assert_eq!(classify_for_external_caller(GateResult::Green), "green");
@@ -924,6 +1030,89 @@ mod tests {
             classify_for_external_caller(GateResult::NotReady("test".into())),
             "not_ready"
         );
+        assert_eq!(
+            classify_for_external_caller(GateResult::AlreadyMerged { merged_at_ms: 0 }),
+            "already_merged"
+        );
+    }
+
+    #[test]
+    fn evaluate_gh_view_routes_merged_state_to_already_merged() {
+        // Card acd72c81 follow-up: a PR whose state is MERGED
+        // returns AlreadyMerged so the merger reconciles instead of
+        // skipping. The parsed mergedAt becomes the canonical
+        // merged_at_ms; absent mergedAt falls back to wall-clock-now
+        // (not asserted here because that path uses SystemTime).
+        let view = crate::gh_client::PrView {
+            state: "MERGED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: Some("2026-06-01T07:04:07Z".to_string()),
+        };
+        let baseline = std::collections::HashSet::new();
+        let policy = GatePolicy::default_for_merger(0);
+        match evaluate_gh_view(&view, &baseline, policy) {
+            GateResult::AlreadyMerged { merged_at_ms } => {
+                // 2026-06-01T07:04:07Z = 1780297447000 ms
+                assert_eq!(merged_at_ms, 1780297447000);
+            }
+            other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_gh_view_falls_back_to_wallclock_when_merged_at_absent() {
+        // gh shouldn't return MERGED without mergedAt, but we don't
+        // crash if it does — the wall-clock-now fallback yields a
+        // reasonable timestamp. Asserts nonzero rather than a
+        // specific value (SystemTime is non-deterministic in tests).
+        let view = crate::gh_client::PrView {
+            state: "MERGED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: None,
+        };
+        let baseline = std::collections::HashSet::new();
+        let policy = GatePolicy::default_for_merger(0);
+        match evaluate_gh_view(&view, &baseline, policy) {
+            GateResult::AlreadyMerged { merged_at_ms } => assert!(merged_at_ms > 0),
+            other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_gh_view_routes_closed_state_to_not_ready() {
+        // Closed (without merge) is still NotReady — the merger
+        // shouldn't try to reconcile a closed-without-merging PR
+        // into Merged state. Only MERGED → AlreadyMerged.
+        let view = crate::gh_client::PrView {
+            state: "CLOSED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: None,
+        };
+        let baseline = std::collections::HashSet::new();
+        let policy = GatePolicy::default_for_merger(0);
+        match evaluate_gh_view(&view, &baseline, policy) {
+            GateResult::NotReady(reason) => {
+                assert!(reason.contains("CLOSED"), "got: {reason}");
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_iso8601_to_ms_handles_standard_gh_format() {
+        assert_eq!(
+            parse_iso8601_to_ms("2026-06-01T07:04:07Z"),
+            Some(1780297447000)
+        );
+        assert_eq!(
+            parse_iso8601_to_ms("2026-06-01T07:04:07.500Z"),
+            Some(1780297447500)
+        );
+        assert_eq!(parse_iso8601_to_ms("garbage"), None);
+        assert_eq!(parse_iso8601_to_ms(""), None);
     }
 
     #[test]

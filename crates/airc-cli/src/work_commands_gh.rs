@@ -29,7 +29,9 @@ pub(crate) async fn open_pr_and_link(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
@@ -198,7 +200,9 @@ pub(crate) async fn link_existing_pr(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
-    let board = airc.work_board(usize::MAX).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
