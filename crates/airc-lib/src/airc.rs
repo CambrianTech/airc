@@ -912,6 +912,18 @@ impl Airc {
     /// Subscribe to `name` and make it the default channel for
     /// short-shape commands.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
+        // Card c409eaf5: refuse uuid-shaped names. `ChannelName::new`
+        // hashes the name into a derived UUID; a uuid-shaped string
+        // re-hashes into a DIFFERENT channel UUID, silently. The
+        // resulting subscription registers on the wrong channel and
+        // the fan-out misses every publish. Better to fail loudly at
+        // the API boundary than to let the trap close on the next
+        // consumer like it closed on the continuum demo 2026-06-01.
+        if uuid::Uuid::parse_str(name.trim()).is_ok() {
+            return Err(AircError::JoinUuidString {
+                string: name.to_string(),
+            });
+        }
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
