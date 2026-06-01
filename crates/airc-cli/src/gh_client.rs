@@ -69,7 +69,7 @@ impl GhClient for ShellGhClient {
                 "--repo",
                 args.repo.as_str(),
                 "--json",
-                "state,mergeable,statusCheckRollup",
+                "state,mergeable,statusCheckRollup,mergedAt",
             ])
             .output()
             .await

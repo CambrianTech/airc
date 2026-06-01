@@ -180,7 +180,7 @@ pub struct BranchCheckRollupArgs {
     pub branch: String,
 }
 
-/// `gh pr view --json state,mergeable,statusCheckRollup` shape.
+/// `gh pr view --json state,mergeable,statusCheckRollup,mergedAt` shape.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PrView {
     #[serde(default)]
@@ -189,6 +189,14 @@ pub struct PrView {
     pub mergeable: String,
     #[serde(default, rename = "statusCheckRollup")]
     pub status_check_rollup: Option<Vec<GhCheck>>,
+    /// ISO-8601 timestamp of the merge, populated by gh when
+    /// `state == "MERGED"`. `None` for OPEN PRs. The merger's
+    /// reconcile path (card acd72c81 follow-up) parses this to emit
+    /// `PullRequestMerged` with the canonical GitHub timestamp
+    /// instead of wall-clock-now when transitioning the kanban for
+    /// an already-merged PR.
+    #[serde(default, rename = "mergedAt")]
+    pub merged_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

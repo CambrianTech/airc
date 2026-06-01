@@ -913,6 +913,33 @@ pub async fn run_merge(
             );
             Ok(())
         }
+        Ok(crate::merger::GateResult::AlreadyMerged { merged_at_ms }) => {
+            // Card acd72c81 follow-up: PR is already merged on
+            // GitHub. The manual `airc work merge` path reconciles
+            // by emitting `PullRequestMerged` — no `gh pr merge`
+            // call needed.
+            if dry_run {
+                println!(
+                    "merge_gate: ALREADY_MERGED — card={card_uuid} pr=#{n} repo={r} \
+                     (would reconcile)",
+                    n = pr.number,
+                    r = pr.repo,
+                );
+                return Ok(());
+            }
+            airc.mark_pull_request_merged(MarkPullRequestMerged {
+                card_id: card_uuid,
+                pull_request: pr.clone(),
+                merged_at_ms,
+            })
+            .await?;
+            println!(
+                "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
+                n = pr.number,
+                r = pr.repo,
+            );
+            Ok(())
+        }
         Ok(crate::merger::GateResult::NotReady(reason)) => Err(format!(
             "refusing to merge card {card_uuid} pr=#{n}: {reason}.\n\n\
              The strictly-less-red doctrine (card d5b7b07d) already lets you through \
