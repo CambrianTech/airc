@@ -138,6 +138,25 @@ pub enum WorkAction {
         /// Work card UUID.
         card_id: String,
     },
+    /// Prune worktrees whose work card has reached a terminal state
+    /// (Closed or Merged). Card c9b28925: the substrate accumulates a
+    /// worktree per claimed card; once the card ships, the worktree
+    /// is L1 cache, not durable state ([[local-worktree-is-temp-dir]]).
+    /// Default is dry-run (prints what WOULD be removed); pass
+    /// `--force` to actually remove. Worktrees with uncommitted /
+    /// unpushed changes are NEVER removed silently — the operator's
+    /// WIP outranks hygiene.
+    Cleanup {
+        /// Explicit dry-run flag. Default behaviour even without it,
+        /// but useful in scripts so the intent is loud.
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually `git worktree remove` everything classified as
+        /// Removable. Dirty / unknown / locked worktrees are still
+        /// reported but NEVER touched.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the current room's projected work board.
     ///
     /// `--available`, `--mine`, `--others` are mutually exclusive filters

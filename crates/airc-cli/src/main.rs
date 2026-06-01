@@ -656,6 +656,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 work_commands::run_state(&home, card_id, state).await
             }
             WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
+            WorkAction::Cleanup { dry_run, force } => {
+                work_commands::run_cleanup(&home, dry_run, force).await
+            }
             WorkAction::Board {
                 limit,
                 available,

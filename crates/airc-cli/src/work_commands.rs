@@ -801,6 +801,334 @@ pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::
     run_state(home, card_id, CliCardState::Closed).await
 }
 
+/// Card c9b28925: prune worktrees whose card has reached a terminal
+/// state. Doctrinally the always-on side of two principles from the
+/// substrate handbook: `local-worktree-is-temp-dir` (worktrees are L1
+/// cache, not durable state) and `substrate-is-a-good-citizen-on-the-host`
+/// (no disk filling). This slice is the manual command so operators
+/// can audit before automating.
+///
+/// Default behaviour is dry-run. `--force` actually runs `git worktree
+/// remove`. Dirty / locked / orphan worktrees are NEVER touched: the
+/// operator's WIP outranks hygiene.
+pub async fn run_cleanup(
+    home: &Path,
+    dry_run: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = crate::commands::attached_airc(home).await?;
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
+
+    let lease_root = lease::lease_root()
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    if !lease_root.exists() {
+        println!(
+            "no worktrees to inspect: {} does not exist",
+            lease_root.display()
+        );
+        return Ok(());
+    }
+
+    // Collect classifications. Pure-function classifier lives below so
+    // every disposition gets a unit test.
+    let mut classifications: Vec<WorktreeClassification> = Vec::new();
+    for entry in std::fs::read_dir(&lease_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let basename = entry.file_name().to_string_lossy().to_string();
+        let Some(short) = parse_worktree_short_id(&basename) else {
+            continue;
+        };
+        let card = board
+            .snapshot()
+            .cards
+            .iter()
+            .find(|c| {
+                let card_short: String = c.card_id.to_string().chars().take(8).collect();
+                card_short == short
+            })
+            .cloned();
+        let card_state = card.as_ref().map(|c| c.state);
+        let pr_number = card
+            .as_ref()
+            .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
+        let repo = card.as_ref().map(|c| c.repo.to_string());
+
+        // Check git status (`--porcelain` => empty stdout means clean).
+        let dirty_status = git_status_porcelain(&path);
+
+        let disposition = classify_worktree(card_state.as_ref(), &dirty_status);
+
+        classifications.push(WorktreeClassification {
+            short,
+            path: path.clone(),
+            card_state,
+            pr_number,
+            repo,
+            dirty_status: dirty_status.clone(),
+            disposition,
+        });
+    }
+
+    // Sort: Removable first (most actionable), then KeepActive, then
+    // SkipX (least urgent, but still surface). Inside each bucket sort
+    // by short id for determinism.
+    classifications.sort_by(|a, b| {
+        a.disposition
+            .display_priority()
+            .cmp(&b.disposition.display_priority())
+            .then_with(|| a.short.cmp(&b.short))
+    });
+
+    // Always print the table — that's the diagnostic the operator
+    // wants. `--force` then takes destructive action; `--dry-run` is
+    // the explicit-intent alias of the default.
+    println!("worktrees scanned: {}", classifications.len());
+    if classifications.is_empty() {
+        return Ok(());
+    }
+
+    let mut last_bucket = "";
+    for c in &classifications {
+        let bucket = c.disposition.bucket_label();
+        if bucket != last_bucket {
+            println!("  {bucket}:");
+            last_bucket = bucket;
+        }
+        let pr_label = c
+            .pr_number
+            .map(|n| format!("PR #{n}"))
+            .unwrap_or_else(|| "no PR".to_string());
+        let state_label = c
+            .card_state
+            .map(|s| format!("{s:?}"))
+            .unwrap_or_else(|| "unknown card".to_string());
+        let suffix = c.disposition.suffix();
+        println!(
+            "    {short}  {pr_label}  {state_label}{suffix}",
+            short = c.short
+        );
+    }
+    println!();
+
+    let removable: Vec<&WorktreeClassification> = classifications
+        .iter()
+        .filter(|c| matches!(c.disposition, Disposition::Removable))
+        .collect();
+
+    if removable.is_empty() {
+        println!("Nothing to remove.");
+        return Ok(());
+    }
+
+    if !force {
+        let suffix = if dry_run { " (--dry-run)" } else { "" };
+        println!(
+            "Would remove {n} worktree(s) on --force{suffix}.",
+            n = removable.len()
+        );
+        return Ok(());
+    }
+
+    // --force: actually remove. Per-worktree error doesn't kill the
+    // batch — surface the diagnostic, keep going. The operator
+    // re-runs after fixing the specific issue.
+    let mut removed = 0usize;
+    for c in removable {
+        match git_worktree_remove(&c.path) {
+            Ok(()) => {
+                println!("✓ removed {}", c.path.display());
+                removed += 1;
+            }
+            Err(error) => {
+                eprintln!("✗ {} — {error}", c.path.display());
+            }
+        }
+    }
+    println!("{removed} worktree(s) removed.");
+    Ok(())
+}
+
+/// One scan result for `run_cleanup`'s table + the force loop.
+struct WorktreeClassification {
+    short: String,
+    path: std::path::PathBuf,
+    card_state: Option<airc_work::CardState>,
+    pr_number: Option<u64>,
+    #[allow(dead_code)]
+    repo: Option<String>,
+    #[allow(dead_code)]
+    dirty_status: DirtyStatus,
+    disposition: Disposition,
+}
+
+/// What the operator should do with this worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Card is Closed or Merged; worktree is clean. Safe to remove.
+    Removable,
+    /// Card is still active (Open / Claimed / InProgress / Review /
+    /// Blocked / Merged-but-projection-not-caught-up). Keep.
+    KeepActive,
+    /// Worktree has uncommitted / unpushed changes. Operator's WIP
+    /// outranks hygiene; print, never remove.
+    SkipDirty,
+    /// Couldn't run `git status` (not a git dir, permissions, etc).
+    SkipNotGit,
+    /// No card matches the worktree's short id. Orphan — surface but
+    /// don't touch; could be from a deleted card or a different scope.
+    SkipUnknownCard,
+}
+
+impl Disposition {
+    /// Sort key: lower → earlier in the printed table.
+    fn display_priority(self) -> u8 {
+        match self {
+            Disposition::Removable => 0,
+            Disposition::KeepActive => 1,
+            Disposition::SkipDirty => 2,
+            Disposition::SkipNotGit => 3,
+            Disposition::SkipUnknownCard => 4,
+        }
+    }
+
+    fn bucket_label(self) -> &'static str {
+        match self {
+            Disposition::Removable => "Removable",
+            Disposition::KeepActive => "KeepActive",
+            Disposition::SkipDirty => "SkipDirty",
+            Disposition::SkipNotGit => "SkipNotGit",
+            Disposition::SkipUnknownCard => "SkipUnknownCard",
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Disposition::Removable => "  (would remove on --force)",
+            Disposition::KeepActive => "",
+            Disposition::SkipDirty => "  uncommitted changes",
+            Disposition::SkipNotGit => "  not a git worktree",
+            Disposition::SkipUnknownCard => "  no matching card on board",
+        }
+    }
+}
+
+/// Whether the worktree has uncommitted / unpushed changes. Outcome
+/// of `git status --porcelain` (empty == clean) or a probe failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirtyStatus {
+    Clean,
+    Dirty,
+    /// Probe failed — `git status` errored, not a git dir, etc.
+    Unknown,
+}
+
+/// Pure classifier. Card c9b28925 — table-driven so every disposition
+/// gets exercised in tests without spinning up a real worktree.
+pub(crate) fn classify_worktree(
+    card_state: Option<&airc_work::CardState>,
+    dirty: &DirtyStatus,
+) -> Disposition {
+    use airc_work::CardState;
+    let Some(state) = card_state else {
+        return Disposition::SkipUnknownCard;
+    };
+    if matches!(dirty, DirtyStatus::Unknown) {
+        return Disposition::SkipNotGit;
+    }
+    if matches!(dirty, DirtyStatus::Dirty) {
+        return Disposition::SkipDirty;
+    }
+    match state {
+        CardState::Closed | CardState::Merged => Disposition::Removable,
+        CardState::Open
+        | CardState::Claimed
+        | CardState::InProgress
+        | CardState::Review
+        | CardState::Blocked => Disposition::KeepActive,
+    }
+}
+
+/// Extract a worktree's short card id from its directory name. The
+/// convention from `airc work claim` is the first 8 hex chars of the
+/// card UUID; allow trailing extras (slash, branch slug) for
+/// robustness against future naming changes.
+pub(crate) fn parse_worktree_short_id(basename: &str) -> Option<String> {
+    let trimmed = basename.trim().trim_end_matches('/');
+    let prefix: String = trimmed.chars().take(8).collect();
+    if prefix.len() != 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// Probe `git status --porcelain` in `path`. Empty stdout ⇒ clean.
+/// Non-empty ⇒ Dirty. Probe failure ⇒ Unknown (caller treats as
+/// SkipNotGit per the safety doctrine: refuse to remove anything we
+/// can't confidently classify).
+fn git_status_porcelain(path: &std::path::Path) -> DirtyStatus {
+    let path_str = path.to_string_lossy().to_string();
+    match std::process::Command::new("git")
+        .args(["-C", &path_str, "status", "--porcelain"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                DirtyStatus::Clean
+            } else {
+                DirtyStatus::Dirty
+            }
+        }
+        _ => DirtyStatus::Unknown,
+    }
+}
+
+/// Run `git worktree remove <path>` against the worktree's repo root.
+/// Failure surfaces as a stringified error so the batch loop can
+/// log + continue.
+fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
+    let path_str = path.to_string_lossy().to_string();
+    // First find the repo's git-common-dir so `git worktree remove` runs
+    // from the right place. Without `-C path`, git would refuse from the
+    // worktree itself ("cannot remove main working tree").
+    let common_out = std::process::Command::new("git")
+        .args(["-C", &path_str, "rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|e| format!("spawn git rev-parse: {e}"))?;
+    if !common_out.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&common_out.stderr).trim()
+        ));
+    }
+    let common_dir = String::from_utf8(common_out.stdout)
+        .map_err(|e| format!("git common-dir utf8: {e}"))?
+        .trim()
+        .to_string();
+    // `git-common-dir` is the .git directory; the main worktree's repo
+    // root is its parent.
+    let repo_root = std::path::Path::new(&common_dir)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| common_dir.clone());
+    let rm_out = std::process::Command::new("git")
+        .args(["-C", &repo_root, "worktree", "remove", &path_str])
+        .output()
+        .map_err(|e| format!("spawn git worktree remove: {e}"))?;
+    if !rm_out.status.success() {
+        return Err(format!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&rm_out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Card 70e87d33: retroactively link an already-open PR to a card so
 /// the merger can pick it up. Thin orchestration over
 /// `work_commands_gh::link_existing_pr` — attach, parse the card id,
@@ -1614,6 +1942,109 @@ mod tests {
     fn short_id_truncates_to_8_chars() {
         assert_eq!(short_id("cdff6a9d-e995-4b4a-a119-10bc1faf1747"), "cdff6a9d");
         assert_eq!(short_id("short"), "short");
+    }
+
+    // Card c9b28925 — `airc work cleanup` classifier tests. Pure
+    // functions, no real filesystem or daemon — every Disposition
+    // gets exercised at least once.
+
+    #[test]
+    fn parse_worktree_short_id_accepts_canonical_shape() {
+        assert_eq!(
+            parse_worktree_short_id("acd72c81"),
+            Some("acd72c81".to_string())
+        );
+        assert_eq!(
+            parse_worktree_short_id("c9b28925/extra"),
+            Some("c9b28925".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_worktree_short_id_rejects_non_hex_basenames() {
+        // Could be unrelated dirs in the lease zone — e.g. a README.
+        assert_eq!(parse_worktree_short_id("README"), None);
+        assert_eq!(parse_worktree_short_id("notes-here"), None);
+        // Too short to be a card prefix.
+        assert_eq!(parse_worktree_short_id("ab"), None);
+    }
+
+    #[test]
+    fn classifier_closed_clean_removes() {
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Clean);
+        assert_eq!(d, Disposition::Removable);
+    }
+
+    #[test]
+    fn classifier_merged_clean_removes() {
+        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Clean);
+        assert_eq!(d, Disposition::Removable);
+    }
+
+    #[test]
+    fn classifier_active_states_keep() {
+        for state in [
+            CardState::Open,
+            CardState::Claimed,
+            CardState::InProgress,
+            CardState::Review,
+            CardState::Blocked,
+        ] {
+            let d = classify_worktree(Some(&state), &DirtyStatus::Clean);
+            assert_eq!(d, Disposition::KeepActive, "state={state:?}");
+        }
+    }
+
+    #[test]
+    fn classifier_dirty_never_removes_even_when_card_closed() {
+        // Operator's WIP outranks hygiene. Closed card + dirty
+        // worktree still classifies as SkipDirty — print, never
+        // remove silently.
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Dirty);
+        assert_eq!(d, Disposition::SkipDirty);
+        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Dirty);
+        assert_eq!(d, Disposition::SkipDirty);
+    }
+
+    #[test]
+    fn classifier_no_card_returns_skip_unknown_card() {
+        // Orphan worktree — basename matches the short-id pattern but
+        // no card is on the current board. Could be from a deleted
+        // card, a different scope, or scope drift. Surface but don't
+        // touch.
+        let d = classify_worktree(None, &DirtyStatus::Clean);
+        assert_eq!(d, Disposition::SkipUnknownCard);
+    }
+
+    #[test]
+    fn classifier_not_git_returns_skip_not_git() {
+        // git status probe failure (not a git dir, permissions) ⇒
+        // refuse to classify as either Clean or Dirty. SkipNotGit
+        // surfaces the diagnostic and the operator decides.
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Unknown);
+        assert_eq!(d, Disposition::SkipNotGit);
+    }
+
+    #[test]
+    fn disposition_display_priority_orders_removable_first() {
+        let mut order = [
+            Disposition::SkipUnknownCard,
+            Disposition::Removable,
+            Disposition::KeepActive,
+            Disposition::SkipDirty,
+            Disposition::SkipNotGit,
+        ];
+        order.sort_by_key(|d| d.display_priority());
+        assert_eq!(
+            order,
+            [
+                Disposition::Removable,
+                Disposition::KeepActive,
+                Disposition::SkipDirty,
+                Disposition::SkipNotGit,
+                Disposition::SkipUnknownCard,
+            ]
+        );
     }
 
     use airc_core::PeerId;
