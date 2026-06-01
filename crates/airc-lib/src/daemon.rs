@@ -413,11 +413,44 @@ impl Airc {
                                         }
                                         backoff_ms = RECONNECT_BACKOFF_START_MS;
                                     }
-                                    Err(_) => return,
+                                    Err(error) => {
+                                        // Card 807193ab: a silent return here
+                                        // killed the subscription with no
+                                        // diagnostic — the consumer's mpsc
+                                        // would close and `next().await` just
+                                        // yielded None. Now operators see
+                                        // WHY the substrate dropped the
+                                        // subscription (wire schema drift,
+                                        // encoding bug, anything that breaks
+                                        // decode).
+                                        eprintln!(
+                                            "airc subscribe: dropping subscription on channel {channel} \
+                                             — decode_wire_event failed: {error}"
+                                        );
+                                        return;
+                                    }
                                 }
                             }
-                            Ok(Some(_)) => {}
-                            Ok(None) | Err(_) => break, // stream died → reconnect
+                            Ok(Some(other)) => {
+                                // Non-Event frames on a live subscription
+                                // are unexpected (ack already consumed); a
+                                // recurring stream of these indicates the
+                                // daemon is sending shapes the SDK doesn't
+                                // recognise.
+                                eprintln!(
+                                    "airc subscribe: ignoring non-Event frame on channel {channel} \
+                                     — {other:?}"
+                                );
+                            }
+                            Ok(None) | Err(_) => {
+                                // Card 807193ab: surface stream drops so a
+                                // session of "no events" can be told apart
+                                // from "connection died, reconnecting."
+                                eprintln!(
+                                    "airc subscribe: stream closed on channel {channel} — reconnecting"
+                                );
+                                break;
+                            }
                         }
                     }
                     // Reconnect with resume + capped backoff.
@@ -427,20 +460,45 @@ impl Airc {
                         if tx.is_closed() {
                             return; // consumer dropped while we were down
                         }
-                        let Ok(mut s) = client
+                        let mut s = match client
                             .attach(AttachRequest {
                                 channel: Some(channel),
                                 from,
                                 ..Default::default()
                             })
                             .await
-                        else {
-                            continue;
+                        {
+                            Ok(s) => s,
+                            Err(error) => {
+                                // Card 807193ab: silent `continue` left
+                                // operators watching a dead connection with
+                                // no signal. Show the reattach failure +
+                                // current backoff.
+                                eprintln!(
+                                    "airc subscribe: reattach failed on channel {channel} \
+                                     (backoff={backoff_ms}ms): {error}"
+                                );
+                                continue;
+                            }
                         };
-                        if let Ok(Some(Response::Ok)) = read_frame::<_, Response>(&mut s).await {
-                            stream = s;
-                            backoff_ms = RECONNECT_BACKOFF_START_MS;
-                            break; // reconnected; resume draining
+                        match read_frame::<_, Response>(&mut s).await {
+                            Ok(Some(Response::Ok)) => {
+                                stream = s;
+                                backoff_ms = RECONNECT_BACKOFF_START_MS;
+                                break; // reconnected; resume draining
+                            }
+                            Ok(Some(other)) => {
+                                eprintln!(
+                                    "airc subscribe: reattach ack mismatch on channel {channel} \
+                                     — expected Ok, got: {other:?}"
+                                );
+                            }
+                            Ok(None) | Err(_) => {
+                                eprintln!(
+                                    "airc subscribe: reattach ack read failed on channel {channel} \
+                                     (backoff={backoff_ms}ms)"
+                                );
+                            }
                         }
                     }
                 }
