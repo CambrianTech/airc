@@ -1321,6 +1321,17 @@ pub async fn run_merge(
                 n = pr.number,
                 r = pr.repo,
             );
+            // Card edf3670c: reclaim the worktree the same way the
+            // merger daemon does (see `merger::perform_merge`). Without
+            // this, every operator-driven `airc work merge` left a
+            // 12-19GB cargo `target/` worktree behind — the recurring
+            // disk-full crash that took out Joel's Intel Mac sessions.
+            // Best-effort: refusing to cleanup MUST NOT fail the merge
+            // (the PR is already merged + projection transitioned);
+            // surface the reason so the operator can recover manually.
+            if let Err(error) = cleanup_card_worktree(card_uuid).await {
+                eprintln!("airc: worktree cleanup skipped for {card_uuid} — {error}");
+            }
             Ok(())
         }
         Ok(crate::merger::GateResult::AlreadyMerged { merged_at_ms }) => {
@@ -1348,6 +1359,13 @@ pub async fn run_merge(
                 n = pr.number,
                 r = pr.repo,
             );
+            // Card edf3670c: same cleanup wire as the GREEN path. The
+            // AlreadyMerged branch fires when GH merged the PR but the
+            // projection lost the event — reconciling MUST also reclaim
+            // the worktree, else recovery paths still leak.
+            if let Err(error) = cleanup_card_worktree(card_uuid).await {
+                eprintln!("airc: worktree cleanup skipped for {card_uuid} — {error}");
+            }
             Ok(())
         }
         Ok(crate::merger::GateResult::NotReady(reason)) => Err(format!(
