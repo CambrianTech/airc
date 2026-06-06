@@ -2885,12 +2885,13 @@ mod tests {
         // `airc.mark_pull_request_merged(` and any chained
         // access. Doc-comments use backticks around the bare
         // name (`mark_pull_request_merged`) so they don't match.
-        let total = work_commands_prod.matches(".mark_pull_request_merged(").count()
+        let total = work_commands_prod
+            .matches(".mark_pull_request_merged(")
+            .count()
             + merger_prod.matches(".mark_pull_request_merged(").count();
 
         assert_eq!(
-            total,
-            1,
+            total, 1,
             "Found {total} direct callers of `.mark_pull_request_merged(` in \
              production code across work_commands.rs + merger.rs. Card edf3670c \
              contract: the helper `mark_merged_and_reclaim` is the ONLY allowed \

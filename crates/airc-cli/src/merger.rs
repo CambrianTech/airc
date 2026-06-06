@@ -207,13 +207,8 @@ async fn perform_reconcile(
     // through `mark_merged_and_reclaim`. Eliminates the hand-paired
     // `mark_pull_request_merged + cleanup_card_worktree` duplication
     // and pins both wires at one site.
-    crate::work_commands::mark_merged_and_reclaim(
-        airc,
-        card.card_id,
-        pr.clone(),
-        merged_at_ms,
-    )
-    .await
+    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), merged_at_ms)
+        .await
 }
 
 enum MergeDecision {
@@ -567,13 +562,7 @@ async fn perform_merge(
     // CLI's two terminal paths all agree. Before extraction, four
     // sites duplicated this pair and the CLI half forgot the cleanup
     // wire — recurring disk-full crash.
-    crate::work_commands::mark_merged_and_reclaim(
-        airc,
-        card.card_id,
-        pr.clone(),
-        now_ms,
-    )
-    .await
+    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), now_ms).await
 }
 
 /// Acquire a non-blocking exclusive lock at `<home>/merger.lock`.
