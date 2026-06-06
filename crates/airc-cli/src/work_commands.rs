@@ -553,16 +553,14 @@ pub async fn run_state(
 ///   * Resolves `~/.airc/worktrees/<card_short>/` from `lease_root`.
 ///   * Skips silently (Ok) if the worktree doesn't exist — re-close
 ///     on an already-cleaned card is a no-op.
-///   * REFUSES via `probe_dirty_status` if EITHER of:
-///       - `git status --porcelain` non-empty (uncommitted /
-///         untracked work) — that's WIP on disk
-///       - `git rev-list --count @{u}..HEAD > 0` (committed but
-///         unpushed work) — that's WIP only-on-this-machine
-///       - probe is ambiguous (no upstream, detached HEAD, broken
-///         git) — refuse to classify per `[[no-fallbacks-ever]]`
-///     The agent recovers manually; we never silently nuke
-///     pending work. This is the "operator's WIP outranks hygiene"
-///     contract.
+///   * REFUSES via `probe_dirty_status` if any of: (a) `git status
+///     --porcelain` non-empty (uncommitted / untracked work — WIP
+///     on disk), (b) `git rev-list --count @{u}..HEAD > 0`
+///     (committed but unpushed work — WIP only-on-this-machine),
+///     or (c) the probe is ambiguous (no upstream, detached HEAD,
+///     broken git — refuse to classify per [[no-fallbacks-ever]]).
+///     The agent recovers manually; we never silently nuke pending
+///     work. This is the "operator's WIP outranks hygiene" contract.
 ///   * On the happy path: `git worktree remove --force` then
 ///     `git branch -d` (lowercase — refuses unmerged) as a
 ///     second line of defense if probe somehow missed unpushed
@@ -1127,7 +1125,10 @@ fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
     if !porcelain_out.status.success() {
         return DirtyStatus::Unknown;
     }
-    if !String::from_utf8_lossy(&porcelain_out.stdout).trim().is_empty() {
+    if !String::from_utf8_lossy(&porcelain_out.stdout)
+        .trim()
+        .is_empty()
+    {
         return DirtyStatus::Dirty;
     }
 
@@ -2120,28 +2121,69 @@ mod tests {
                 cmd.current_dir(d);
             }
             let out = cmd.output().expect("git spawn");
-            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
 
         run(&["init", "--bare", origin.to_str().unwrap()], None);
-        run(&["clone", origin.to_str().unwrap(), clone.to_str().unwrap()], None);
+        run(
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+            None,
+        );
         // Configure identity so commits don't fail in CI containers.
-        run(&["-C", clone.to_str().unwrap(), "config", "user.email", "test@example.invalid"], None);
-        run(&["-C", clone.to_str().unwrap(), "config", "user.name", "Test"], None);
+        run(
+            &[
+                "-C",
+                clone.to_str().unwrap(),
+                "config",
+                "user.email",
+                "test@example.invalid",
+            ],
+            None,
+        );
+        run(
+            &["-C", clone.to_str().unwrap(), "config", "user.name", "Test"],
+            None,
+        );
 
         if seed_commit {
             // Empty bare origin has no HEAD; create an initial commit
             // on clone + push so the upstream branch exists.
             std::fs::write(clone.join("README"), "seed\n").expect("write seed");
             run(&["-C", clone.to_str().unwrap(), "add", "README"], None);
-            run(&["-C", clone.to_str().unwrap(), "commit", "-m", "seed"], None);
+            run(
+                &["-C", clone.to_str().unwrap(), "commit", "-m", "seed"],
+                None,
+            );
             // Detect default branch (master vs main depending on git config)
             let branch_out = std::process::Command::new("git")
-                .args(["-C", clone.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+                .args([
+                    "-C",
+                    clone.to_str().unwrap(),
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "HEAD",
+                ])
                 .output()
                 .expect("rev-parse");
-            let branch = String::from_utf8(branch_out.stdout).unwrap().trim().to_string();
-            run(&["-C", clone.to_str().unwrap(), "push", "-u", "origin", &branch], None);
+            let branch = String::from_utf8(branch_out.stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            run(
+                &[
+                    "-C",
+                    clone.to_str().unwrap(),
+                    "push",
+                    "-u",
+                    "origin",
+                    &branch,
+                ],
+                None,
+            );
         }
 
         (clone, tmp)
@@ -2186,7 +2228,11 @@ mod tests {
                 .current_dir(&clone)
                 .output()
                 .expect("git spawn");
-            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["add", "local-only"]);
         run(&["commit", "-m", "local-only WIP"]);
@@ -2214,7 +2260,11 @@ mod tests {
                 .current_dir(&clone)
                 .output()
                 .expect("git spawn");
-            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["checkout", "-b", "local-only-branch"]);
 
