@@ -641,10 +641,16 @@ pub(crate) async fn cleanup_card_worktree(
     let short: String = card_id.to_string().chars().take(8).collect();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    let worktree_path = lease_root.join(&short);
-    if !worktree_path.exists() {
+    let parent = lease_root.join(&short);
+    if !parent.exists() {
         return Ok(());
     }
+    // Card 83a5624e: support both the canonical `<short>/` layout
+    // and the `<short>/src/` nested layout (used by repos like
+    // continuum where `src/` is the workspace root). Without this,
+    // the merger's cleanup hook stranded nested worktrees on every
+    // merge — observed 2026-06-05 with continuum PRs #1530/#1531.
+    let worktree_path = resolve_worktree_path(&parent);
     let worktree_str = worktree_path.to_string_lossy().to_string();
 
     // WIP guard: refuse if either uncommitted/untracked OR
@@ -930,9 +936,15 @@ pub async fn run_cleanup(
             .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
         let repo = card.as_ref().map(|c| c.repo.to_string());
 
+        // Card 83a5624e: resolve <short>/ vs <short>/src/ BEFORE
+        // probing so the operator sees the actual git worktree path
+        // in the disposition table AND the force-remove loop targets
+        // the right directory.
+        let effective = resolve_worktree_path(&path);
+
         // Probe for both uncommitted AND unpushed work — see
         // `probe_dirty_status` for the WIP-outranks-hygiene contract.
-        let dirty_status = probe_dirty_status(&path);
+        let dirty_status = probe_dirty_status_at(&effective);
 
         // Probe whether the worktree's branch still exists on origin.
         // `gh pr merge --delete-branch` (the default merger path AND
@@ -949,7 +961,7 @@ pub async fn run_cleanup(
 
         classifications.push(WorktreeClassification {
             short,
-            path: path.clone(),
+            path: effective,
             card_state,
             pr_number,
             repo,
@@ -1263,6 +1275,66 @@ pub(crate) fn parse_worktree_short_id(basename: &str) -> Option<String> {
 /// unpushed WIP would have been destroyed by `--force`. This is
 /// the WIP-outranks-hygiene contract the PR claims to enforce.
 fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
+    let effective = resolve_worktree_path(path);
+    probe_dirty_status_at(&effective)
+}
+
+/// Resolve `<short>/` to the actual git worktree path. Some repos
+/// (continuum is the canonical case) live at `<short>/src/` because
+/// `src/` is the workspace root the operator clones into. The
+/// `airc work claim` canonical convention is `<short>/`, but
+/// `git worktree add <short>/src` is a common manual pattern that
+/// leaves the parent `<short>/` as a non-git directory containing
+/// a single `src/` worktree.
+///
+/// This helper:
+///
+///   1. If `path` IS a git worktree (a `.git` file/dir exists OR
+///      `git rev-parse --git-dir` succeeds), return `path`.
+///   2. Else if `path/src/` IS a git worktree, return `path/src/`.
+///   3. Else return `path` unchanged — downstream probes will
+///      classify it as `Unknown`/`SkipNotGit` and the operator
+///      sees the diagnostic.
+///
+/// One-level nested fallback ONLY. Arbitrary deep nesting is
+/// out-of-scope (no observed wild case); per `[[no-fallbacks-ever]]`
+/// the helper documents exactly the two layouts it accepts.
+///
+/// Card 83a5624e follow-up to c9b28925: the merger's
+/// `cleanup_card_worktree` hook (and the manual `airc work cleanup`)
+/// both probe `~/.airc/worktrees/<short>/` directly. Worktrees
+/// allocated at `<short>/src/` were stranded across merges
+/// (observed 2026-06-05 with continuum PRs #1530 / #1531). This
+/// helper closes that gap.
+fn resolve_worktree_path(path: &std::path::Path) -> std::path::PathBuf {
+    if is_git_worktree(path) {
+        return path.to_path_buf();
+    }
+    let nested = path.join("src");
+    if is_git_worktree(&nested) {
+        return nested;
+    }
+    path.to_path_buf()
+}
+
+/// Cheap heuristic: `.git` (file or dir) at the path's top level
+/// is a strong signal of a git worktree. Avoids spawning `git`
+/// just to ask. Both regular worktrees (`.git/` dir) and linked
+/// worktrees (`.git` file pointing at the main repo's
+/// `worktrees/<name>` metadata dir) qualify.
+fn is_git_worktree(path: &std::path::Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let dot_git = path.join(".git");
+    dot_git.exists()
+}
+
+/// The inner probe — runs against the ALREADY-resolved git
+/// worktree path. Tests that exercise the porcelain + upstream
+/// branches directly call this; production callers go through
+/// `probe_dirty_status` which resolves the nested-layout first.
+fn probe_dirty_status_at(path: &std::path::Path) -> DirtyStatus {
     let path_str = path.to_string_lossy().to_string();
 
     // Step 1: porcelain probe.
@@ -2614,6 +2686,110 @@ mod tests {
             probe_dirty_status(tmp.path()),
             DirtyStatus::Unknown,
             "non-git dir must be Unknown"
+        );
+    }
+
+    // ─── Card 83a5624e: nested <short>/src/ layout ────────────────────
+    //
+    // Tests cover the substrate gap that stranded continuum PRs
+    // #1530 and #1531's worktrees across merge: the cleanup probe
+    // ran against the parent `<short>/` (not a git worktree) and
+    // returned Unknown → SkipNotGit → no reclaim.
+
+    #[test]
+    fn resolve_worktree_path_returns_path_when_it_is_a_git_worktree() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+        let resolved = resolve_worktree_path(&clone);
+        assert_eq!(resolved, clone, "git worktree at top level → return as-is");
+    }
+
+    #[test]
+    fn resolve_worktree_path_falls_back_to_nested_src() {
+        // Build a layout like ~/.airc/worktrees/<short>/src where
+        // <short>/ is just a container and <short>/src/ is the real
+        // worktree. This is the continuum repo case observed in
+        // the wild.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("aabbccdd");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        let nested = parent.join("src");
+
+        // Init the nested path as a git worktree.
+        let init_out = std::process::Command::new("git")
+            .args(["init", nested.to_str().unwrap()])
+            .output()
+            .expect("git init");
+        assert!(init_out.status.success(), "git init nested: {:?}", init_out);
+
+        let resolved = resolve_worktree_path(&parent);
+        assert_eq!(
+            resolved, nested,
+            "parent isn't git → fall back to <parent>/src/ which is"
+        );
+    }
+
+    #[test]
+    fn resolve_worktree_path_returns_input_when_neither_is_git() {
+        // Both <parent>/ and <parent>/src/ are non-git → return
+        // <parent>/ unchanged. Downstream probe classifies as
+        // Unknown → SkipNotGit (operator sees the diagnostic).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("aabbccdd");
+        std::fs::create_dir_all(parent.join("src")).expect("mkdir src");
+        let resolved = resolve_worktree_path(&parent);
+        assert_eq!(
+            resolved, parent,
+            "neither layout is git → return input unchanged for downstream diagnostic"
+        );
+    }
+
+    #[test]
+    fn probe_dirty_status_handles_nested_src_layout() {
+        // End-to-end: probe a `<parent>/` where the actual git
+        // worktree lives at `<parent>/src/`. Should return Clean
+        // (not Unknown) because the nested fallback finds the real
+        // git dir.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("aabbccdd");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        let nested = parent.join("src");
+
+        // Set up the nested clone with upstream tracking so the
+        // probe's two-pass check returns Clean.
+        let (real_clone, _real_tmp) = git_fixture_with_upstream(true);
+        // Move the real clone's contents under <parent>/src/
+        std::fs::rename(&real_clone, &nested).expect("rename real clone to nested");
+
+        assert_eq!(
+            probe_dirty_status(&parent),
+            DirtyStatus::Clean,
+            "probe must resolve <parent>/ → <parent>/src/ + return its real Clean state"
+        );
+    }
+
+    #[test]
+    fn classifier_handles_nested_src_layout_via_probe() {
+        // End-to-end: nested worktree with a Closed card should
+        // classify as Removable, not SkipNotGit. Pins the substrate
+        // contract that fired the disk-full incident.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("aabbccdd");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        let nested = parent.join("src");
+
+        let (real_clone, _real_tmp) = git_fixture_with_upstream(true);
+        std::fs::rename(&real_clone, &nested).expect("rename");
+
+        let dirty = probe_dirty_status(&parent);
+        assert_eq!(dirty, DirtyStatus::Clean);
+
+        let disp = classify_worktree(Some(&CardState::Closed), &dirty, false);
+        assert_eq!(
+            disp,
+            Disposition::Removable,
+            "nested-layout + Closed card → Removable. Was SkipNotGit before \
+             card 83a5624e — the bug the merger's cleanup hook stranded \
+             continuum #1530/#1531 worktrees on."
         );
     }
 
