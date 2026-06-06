@@ -80,6 +80,25 @@ pub enum AircError {
     #[error("not subscribed to channel: {0}")]
     NotSubscribed(String),
 
+    /// Caller passed a uuid-shaped string to [`crate::Airc::join`].
+    /// `join(name)` takes a channel NAME and hashes it into the
+    /// channel UUID; a uuid-shaped string gets re-hashed and
+    /// produces a brand-new channel whose UUID does NOT match the
+    /// caller's intent. Card c409eaf5 makes that class of silent
+    /// failure loud. Either pass the channel NAME (like "continuum"
+    /// or "general"), or — if you already hold a channel UUID and
+    /// want to attach to the existing channel — look it up via the
+    /// subscription set and pass its actual name. UUIDs do not
+    /// round-trip through `ChannelName::new`.
+    #[error(
+        "join refused: {string:?} looks like a UUID. \
+         `Airc::join(name)` takes a channel NAME and derives the channel UUID by hashing — \
+         passing a UUID string re-hashes it into a different channel. \
+         If you want to attach to an existing channel by its UUID, look it up via the \
+         subscription set and pass its name to join."
+    )]
+    JoinUuidString { string: String },
+
     /// Caller attempted to mutate a work card from a room whose work
     /// projection does not contain that card. Work cards are
     /// room-scoped coordination state; transitions from another room
@@ -120,4 +139,59 @@ pub enum AircError {
     /// correlation id rather than reusing the timed-out one.
     #[error("command deadline elapsed (correlation_id={correlation_id})")]
     CommandDeadline { correlation_id: uuid::Uuid },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_uuid_string_error_names_the_input() {
+        let err = AircError::JoinUuidString {
+            string: "11c1a7ac-cb85-5ca0-a5b4-2847280ea3fa".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("11c1a7ac-cb85-5ca0-a5b4-2847280ea3fa"),
+            "{msg}"
+        );
+        assert!(msg.contains("looks like a UUID"), "{msg}");
+        assert!(msg.contains("channel NAME"), "{msg}");
+    }
+
+    /// Card c409eaf5 — pin the canonical detection: every uuid shape
+    /// the standard parser accepts MUST trip the guard, otherwise the
+    /// trap re-opens for the next consumer that picks an alternate
+    /// uuid format. Bare hex (no hyphens) and braced are both valid
+    /// per uuid::Uuid::parse_str.
+    #[test]
+    fn uuid_detection_canonical_shapes_all_trip() {
+        let shapes = [
+            "11c1a7ac-cb85-5ca0-a5b4-2847280ea3fa",     // hyphenated
+            "11c1a7accb855ca0a5b42847280ea3fa",         // bare hex
+            "{11c1a7ac-cb85-5ca0-a5b4-2847280ea3fa}",   // braced
+            "  11c1a7ac-cb85-5ca0-a5b4-2847280ea3fa  ", // padded
+        ];
+        for s in shapes {
+            assert!(
+                uuid::Uuid::parse_str(s.trim()).is_ok(),
+                "uuid::parse_str must accept {s:?} — if this fails, \
+                 either the guard needs to broaden or the test case is wrong"
+            );
+        }
+    }
+
+    /// Card c409eaf5 — false-positive guard. Real channel names must
+    /// pass through; the predicate is uuid-specific, not "anything
+    /// hex-looking."
+    #[test]
+    fn uuid_detection_rejects_real_channel_names() {
+        let names = ["continuum", "general", "cambriantech", "ai-dev", "room-1"];
+        for s in names {
+            assert!(
+                uuid::Uuid::parse_str(s.trim()).is_err(),
+                "uuid::parse_str must REJECT real channel name {s:?}"
+            );
+        }
+    }
 }
