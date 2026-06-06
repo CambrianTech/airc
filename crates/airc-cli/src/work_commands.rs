@@ -548,19 +548,26 @@ pub async fn run_state(
 /// Disk-pressure substrate fix; the 2026-05-28 session sat on
 /// ~25 GB of orphan target/ before a manual sweep.
 ///
-/// Contract:
+/// Contract (PR #1105 reviewer round 1 fix — describes ACTUAL
+/// behavior, not the previous version's mis-stated guarantees):
 ///   * Resolves `~/.airc/worktrees/<card_short>/` from `lease_root`.
 ///   * Skips silently (Ok) if the worktree doesn't exist — re-close
 ///     on an already-cleaned card is a no-op.
-///   * REFUSES with an error if the worktree has uncommitted
-///     changes (`git status --porcelain` non-empty). The agent
-///     recovers manually; we never silently nuke pending work.
-///   * REFUSES if the worktree has unpushed commits AND its branch
-///     is the worktree's current HEAD — those commits would be
-///     unreachable after pruning. Pushed commits are fine because
-///     origin still has them.
+///   * REFUSES via `probe_dirty_status` if EITHER of:
+///       - `git status --porcelain` non-empty (uncommitted /
+///         untracked work) — that's WIP on disk
+///       - `git rev-list --count @{u}..HEAD > 0` (committed but
+///         unpushed work) — that's WIP only-on-this-machine
+///       - probe is ambiguous (no upstream, detached HEAD, broken
+///         git) — refuse to classify per `[[no-fallbacks-ever]]`
+///     The agent recovers manually; we never silently nuke
+///     pending work. This is the "operator's WIP outranks hygiene"
+///     contract.
 ///   * On the happy path: `git worktree remove --force` then
-///     `git branch -D` if the branch has no other reachable refs.
+///     `git branch -d` (lowercase — refuses unmerged) as a
+///     second line of defense if probe somehow missed unpushed
+///     work, or if the branch was used by a different worktree
+///     too.
 ///   * All operations run from the MAIN working tree (the cwd's
 ///     repo root), not from the worktree being removed.
 ///
@@ -582,25 +589,31 @@ pub(crate) async fn cleanup_card_worktree(
     }
     let worktree_str = worktree_path.to_string_lossy().to_string();
 
-    // Uncommitted-change guard.
-    let status_out = std::process::Command::new("git")
-        .args(["-C", &worktree_str, "status", "--porcelain"])
-        .output()?;
-    if !status_out.status.success() {
-        return Err(format!(
-            "git status --porcelain failed on worktree {worktree_str}: {}",
-            String::from_utf8_lossy(&status_out.stderr).trim()
-        )
-        .into());
-    }
-    let porcelain = String::from_utf8(status_out.stdout)?;
-    if !porcelain.trim().is_empty() {
-        return Err(format!(
-            "worktree at {worktree_str} has uncommitted changes — refusing \
-             to remove. commit + push or discard manually, then re-close \
-             the card to retry cleanup."
-        )
-        .into());
+    // WIP guard: refuse if either uncommitted/untracked OR
+    // committed-but-unpushed work exists, OR the probe is ambiguous.
+    // Same `probe_dirty_status` the run_cleanup classifier uses so
+    // both terminal paths apply identical safety.
+    match probe_dirty_status(&worktree_path) {
+        DirtyStatus::Clean => {}
+        DirtyStatus::Dirty => {
+            return Err(format!(
+                "worktree at {worktree_str} has uncommitted or unpushed work — \
+                 refusing to remove. commit + push or discard manually, then \
+                 re-close the card to retry cleanup."
+            )
+            .into());
+        }
+        DirtyStatus::Unknown => {
+            return Err(format!(
+                "worktree at {worktree_str} could not be classified \
+                 (not a git dir / no upstream tracking / detached HEAD / \
+                 broken repo) — refusing to remove. Per [[no-fallbacks-ever]] \
+                 the substrate refuses to nuke worktrees it can't \
+                 confidently call clean. Inspect with `git -C {worktree_str} \
+                 status` and resolve manually."
+            )
+            .into());
+        }
     }
 
     // Identify the worktree's branch so we can prune it after removal.
@@ -859,8 +872,9 @@ pub async fn run_cleanup(
             .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
         let repo = card.as_ref().map(|c| c.repo.to_string());
 
-        // Check git status (`--porcelain` => empty stdout means clean).
-        let dirty_status = git_status_porcelain(&path);
+        // Probe for both uncommitted AND unpushed work — see
+        // `probe_dirty_status` for the WIP-outranks-hygiene contract.
+        let dirty_status = probe_dirty_status(&path);
 
         let disposition = classify_worktree(card_state.as_ref(), &dirty_status);
 
@@ -975,8 +989,9 @@ pub(crate) enum Disposition {
     /// Card is still active (Open / Claimed / InProgress / Review /
     /// Blocked / Merged-but-projection-not-caught-up). Keep.
     KeepActive,
-    /// Worktree has uncommitted / unpushed changes. Operator's WIP
-    /// outranks hygiene; print, never remove.
+    /// Worktree has uncommitted or unpushed work (detected by
+    /// `probe_dirty_status`). Operator's WIP outranks hygiene;
+    /// print, never remove.
     SkipDirty,
     /// Couldn't run `git status` (not a git dir, permissions, etc).
     SkipNotGit,
@@ -1011,20 +1026,28 @@ impl Disposition {
         match self {
             Disposition::Removable => "  (would remove on --force)",
             Disposition::KeepActive => "",
-            Disposition::SkipDirty => "  uncommitted changes",
+            Disposition::SkipDirty => "  uncommitted or unpushed work",
             Disposition::SkipNotGit => "  not a git worktree",
             Disposition::SkipUnknownCard => "  no matching card on board",
         }
     }
 }
 
-/// Whether the worktree has uncommitted / unpushed changes. Outcome
-/// of `git status --porcelain` (empty == clean) or a probe failure.
+/// Whether the worktree carries work the operator has not yet
+/// captured upstream. Outcome of `probe_dirty_status` — see that
+/// function for the two-pass check (porcelain + `@{u}..HEAD`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirtyStatus {
+    /// Working tree matches HEAD AND HEAD is fully pushed upstream.
     Clean,
+    /// Either uncommitted/untracked files OR committed-but-unpushed
+    /// commits exist. Either way the worktree's files are WIP that
+    /// may not be captured anywhere else; refuse to remove.
     Dirty,
-    /// Probe failed — `git status` errored, not a git dir, etc.
+    /// Probe failed — `git status` errored, no upstream tracking,
+    /// detached HEAD, or not a git dir. Per `[[no-fallbacks-ever]]`
+    /// the classifier treats Unknown as SkipNotGit and refuses
+    /// rather than guessing Clean.
     Unknown,
 }
 
@@ -1067,25 +1090,73 @@ pub(crate) fn parse_worktree_short_id(basename: &str) -> Option<String> {
     Some(prefix)
 }
 
-/// Probe `git status --porcelain` in `path`. Empty stdout ⇒ clean.
-/// Non-empty ⇒ Dirty. Probe failure ⇒ Unknown (caller treats as
-/// SkipNotGit per the safety doctrine: refuse to remove anything we
-/// can't confidently classify).
-fn git_status_porcelain(path: &std::path::Path) -> DirtyStatus {
+/// Probe `path` for any state that means "this worktree carries
+/// work the operator has not yet captured upstream." Two passes:
+///
+///   1. `git status --porcelain` — catches uncommitted-in-working-tree
+///      AND untracked files. Non-empty ⇒ Dirty.
+///   2. `git rev-list --count @{u}..HEAD` — catches committed-but-
+///      not-pushed work. Non-zero ⇒ Dirty. The branch survives
+///      the per-card cleanup (because `git branch -d` refuses
+///      unmerged), but per `[[local-worktree-is-temp-dir]]` the
+///      worktree's *files on disk* are the WIP an operator may
+///      still be editing; we don't remove them silently.
+///
+/// Probe failures (git not on PATH, broken repo, branch with no
+/// upstream tracking, detached HEAD) ⇒ Unknown. The classifier
+/// treats Unknown as SkipNotGit — refuse to remove anything we
+/// can't confidently classify. Per `[[no-fallbacks-ever]]` we
+/// surface the ambiguity rather than assume Clean.
+///
+/// PR #1105 reviewer round 1: the prior version only ran the
+/// porcelain probe and silently let committed-but-unpushed work
+/// classify as Clean → Removable. A closed-card worktree with
+/// unpushed WIP would have been destroyed by `--force`. This is
+/// the WIP-outranks-hygiene contract the PR claims to enforce.
+fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
     let path_str = path.to_string_lossy().to_string();
-    match std::process::Command::new("git")
+
+    // Step 1: porcelain probe.
+    let porcelain_out = match std::process::Command::new("git")
         .args(["-C", &path_str, "status", "--porcelain"])
         .output()
     {
-        Ok(out) if out.status.success() => {
-            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                DirtyStatus::Clean
-            } else {
-                DirtyStatus::Dirty
-            }
-        }
-        _ => DirtyStatus::Unknown,
+        Ok(out) => out,
+        Err(_) => return DirtyStatus::Unknown,
+    };
+    if !porcelain_out.status.success() {
+        return DirtyStatus::Unknown;
     }
+    if !String::from_utf8_lossy(&porcelain_out.stdout).trim().is_empty() {
+        return DirtyStatus::Dirty;
+    }
+
+    // Step 2: unpushed-commits probe. `git rev-list --count @{u}..HEAD`
+    // counts commits reachable from HEAD but not from the upstream
+    // tracking branch. If `@{u}` errors (no upstream / detached HEAD),
+    // we can't classify safely — return Unknown rather than guess.
+    let unpushed_out = match std::process::Command::new("git")
+        .args(["-C", &path_str, "rev-list", "--count", "@{u}..HEAD"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return DirtyStatus::Unknown,
+    };
+    if !unpushed_out.status.success() {
+        // Likely "no upstream configured for branch X" or detached
+        // HEAD. Per `[[no-fallbacks-ever]]` refuse to classify
+        // rather than assume the operator pushed.
+        return DirtyStatus::Unknown;
+    }
+    let count_text = String::from_utf8_lossy(&unpushed_out.stdout)
+        .trim()
+        .to_string();
+    let count: u64 = count_text.parse().unwrap_or(0);
+    if count > 0 {
+        return DirtyStatus::Dirty;
+    }
+
+    DirtyStatus::Clean
 }
 
 /// Run `git worktree remove <path>` against the worktree's repo root.
@@ -2023,6 +2094,146 @@ mod tests {
         // surfaces the diagnostic and the operator decides.
         let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Unknown);
         assert_eq!(d, Disposition::SkipNotGit);
+    }
+
+    // ─── probe_dirty_status: PR #1105 reviewer round 1 fix ───────────
+    //
+    // Tests that exercise the actual `probe_dirty_status` function
+    // against real git fixtures, not just the classifier's reaction
+    // to the enum. The reviewer's BLOCK 2 was specifically that the
+    // probe didn't check unpushed commits — these tests pin the
+    // contract on the function itself, where the bug lived.
+
+    /// Build a tempdir, init a bare "origin" repo + a working clone
+    /// that tracks it. Returns the working clone's path (which we
+    /// pass to `probe_dirty_status`) and the tempdir handle (which
+    /// owns both, kept alive by the caller).
+    fn git_fixture_with_upstream(seed_commit: bool) -> (std::path::PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("clone");
+
+        let run = |args: &[&str], cwd: Option<&std::path::Path>| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args);
+            if let Some(d) = cwd {
+                cmd.current_dir(d);
+            }
+            let out = cmd.output().expect("git spawn");
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+
+        run(&["init", "--bare", origin.to_str().unwrap()], None);
+        run(&["clone", origin.to_str().unwrap(), clone.to_str().unwrap()], None);
+        // Configure identity so commits don't fail in CI containers.
+        run(&["-C", clone.to_str().unwrap(), "config", "user.email", "test@example.invalid"], None);
+        run(&["-C", clone.to_str().unwrap(), "config", "user.name", "Test"], None);
+
+        if seed_commit {
+            // Empty bare origin has no HEAD; create an initial commit
+            // on clone + push so the upstream branch exists.
+            std::fs::write(clone.join("README"), "seed\n").expect("write seed");
+            run(&["-C", clone.to_str().unwrap(), "add", "README"], None);
+            run(&["-C", clone.to_str().unwrap(), "commit", "-m", "seed"], None);
+            // Detect default branch (master vs main depending on git config)
+            let branch_out = std::process::Command::new("git")
+                .args(["-C", clone.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .expect("rev-parse");
+            let branch = String::from_utf8(branch_out.stdout).unwrap().trim().to_string();
+            run(&["-C", clone.to_str().unwrap(), "push", "-u", "origin", &branch], None);
+        }
+
+        (clone, tmp)
+    }
+
+    #[test]
+    fn probe_dirty_status_clean_when_committed_and_pushed() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+        assert_eq!(
+            probe_dirty_status(&clone),
+            DirtyStatus::Clean,
+            "freshly-cloned + pushed state must be Clean"
+        );
+    }
+
+    #[test]
+    fn probe_dirty_status_dirty_on_uncommitted_change() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+        std::fs::write(clone.join("scratch"), "untracked\n").expect("write scratch");
+        assert_eq!(
+            probe_dirty_status(&clone),
+            DirtyStatus::Dirty,
+            "untracked file must classify as Dirty (porcelain stage)"
+        );
+    }
+
+    /// PR #1105 reviewer round 1 BLOCK 2: the prior probe only ran
+    /// `git status --porcelain` and silently classified
+    /// committed-but-unpushed work as Clean. A closed-card worktree
+    /// with this state would have been silently destroyed by
+    /// `airc work cleanup --force`. This test pins the new
+    /// behavior: unpushed commits ⇒ Dirty.
+    #[test]
+    fn probe_dirty_status_dirty_on_unpushed_commit() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+
+        // Make a clean commit but DON'T push it.
+        std::fs::write(clone.join("local-only"), "committed but not pushed\n").expect("write");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&clone)
+                .output()
+                .expect("git spawn");
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "local-only"]);
+        run(&["commit", "-m", "local-only WIP"]);
+
+        assert_eq!(
+            probe_dirty_status(&clone),
+            DirtyStatus::Dirty,
+            "committed-but-unpushed work must classify as Dirty — \
+             this is the [[local-worktree-is-temp-dir]] safety contract \
+             reviewer round 1 BLOCK 2 caught"
+        );
+    }
+
+    /// A branch with NO upstream tracking is ambiguous — could be
+    /// pure local WIP, could be already-pushed-by-someone-else.
+    /// Per `[[no-fallbacks-ever]]` refuse to classify.
+    #[test]
+    fn probe_dirty_status_unknown_when_no_upstream_tracking() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+
+        // Switch to a fresh branch that has no upstream configured.
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&clone)
+                .output()
+                .expect("git spawn");
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["checkout", "-b", "local-only-branch"]);
+
+        assert_eq!(
+            probe_dirty_status(&clone),
+            DirtyStatus::Unknown,
+            "branch with no upstream tracking must be Unknown — \
+             ambiguous state, classifier refuses rather than assuming"
+        );
+    }
+
+    #[test]
+    fn probe_dirty_status_unknown_when_not_a_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            probe_dirty_status(tmp.path()),
+            DirtyStatus::Unknown,
+            "non-git dir must be Unknown"
+        );
     }
 
     #[test]
