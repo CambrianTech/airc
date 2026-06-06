@@ -213,6 +213,42 @@ impl Airc {
         Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
     }
 
+    /// Attach to an already-running daemon AND open the local identity
+    /// under a specific `agent_name`. This is the constructor a multi-
+    /// citizen host (Continuum personas, future external-agent hosts)
+    /// reaches for when each hosted citizen needs:
+    ///
+    /// 1. Its OWN identity, distinguishable from other citizens'
+    ///    (the [`open_as`] half), so `airc peers` from another scope
+    ///    shows each one as a separate enrolled participant.
+    /// 2. The daemon's live publish/subscribe (the [`attach`] half),
+    ///    so the citizen can `say()` and `subscribe()` over the
+    ///    router instead of only inspecting local state.
+    ///
+    /// Today, [`attach`] only offers (2) (under the host's default
+    /// agent_name) and [`open_as`] only offers (1) (owner-mode, no
+    /// daemon). Hosting multiple citizens in one process with the
+    /// pre-existing pair therefore needs an unergonomic dance with
+    /// the (intentionally private) `with_daemon_client` builder.
+    /// This constructor closes the gap as a single call.
+    ///
+    /// Equivalent to:
+    /// ```ignore
+    /// let airc = Airc::open_as(home, agent_name).await?
+    ///     .with_daemon_client(DaemonClient::new(socket));
+    /// ```
+    ///
+    /// — but spelled as one method so consumers don't reach for the
+    /// private builder.
+    pub async fn attach_as(
+        home: impl Into<PathBuf>,
+        agent_name: impl Into<String>,
+        socket: impl Into<PathBuf>,
+    ) -> Result<Self, AircError> {
+        let airc = Self::open_as(home, agent_name).await?;
+        Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
+    }
+
     /// Test-only [`attach`] that pins the machine-account wire root
     /// explicitly instead of deriving it from `HOME`/`USERPROFILE`.
     /// Two scopes sharing one `wire_root` resolve the same mesh

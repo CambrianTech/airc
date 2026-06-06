@@ -30,6 +30,26 @@ const WORK_MUTATION_PAGE_SIZE: usize = 512;
 /// the minimum-viable fix until that follow-up.
 const WORK_BOARD_FETCH_MULTIPLIER: usize = 4;
 
+/// Canonical pagination size for complete work-board projections.
+///
+/// Card acd72c81: every prior caller that needed the complete board
+/// was passing `usize::MAX` to `work_board(limit)`. That issues ONE
+/// Inbox RPC asking for `usize::MAX * WORK_BOARD_FETCH_MULTIPLIER`
+/// events; the daemon serializes every transcript event in the room
+/// into a single CBOR frame, which trips
+/// `airc_ipc::codec::MAX_FRAME_BYTES` (16 MiB) once the room
+/// accumulates ~9000+ events. Empirically caught on Joel's box
+/// 2026-06-01: `airc work state X closed` failed with
+/// `daemon I/O: ipc frame too large: 16973574 bytes exceeds 16777216`.
+///
+/// `work_board_complete(page_size)` paginates: each IPC frame stays
+/// well under the cap while the projection is still complete.
+/// 1024 events per page is a comfortable middle: each frame fits
+/// (events are typed, not blob payloads — kilobytes each, not MB),
+/// and the round-trip count stays low for the 9000+ event case
+/// (~9 RPCs instead of one giant one).
+pub const WORK_BOARD_PROJECTION_PAGE_SIZE: usize = 1024;
+
 /// Card 79953b4d (pure helper for unit-testability): true when a
 /// transcript event is a work-domain event. Distinguishes work events
 /// from heartbeats / chat / other lifecycle by header presence rather
@@ -740,6 +760,14 @@ impl Airc {
     /// events. `limit` is the transcript page size for interactive
     /// board views; scheduling code should use
     /// [`Airc::work_board_complete`] instead.
+    ///
+    /// **DO NOT pass `usize::MAX`** — it issues a single Inbox RPC
+    /// asking for every event in the room, which trips
+    /// `airc_ipc::codec::MAX_FRAME_BYTES` (16 MiB) once the room
+    /// has accumulated ~9000+ events. If you need the complete
+    /// board, call [`Airc::work_board_complete`] with
+    /// [`WORK_BOARD_PROJECTION_PAGE_SIZE`] (paginated, never hits
+    /// the cap). Card acd72c81.
     pub async fn work_board(&self, limit: usize) -> Result<WorkBoardProjection, AircError> {
         let room = self.current_room().await?;
         // Recent-window view (not the complete board): daemon reads the

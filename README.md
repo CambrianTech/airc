@@ -129,6 +129,8 @@ Continuum uses airc-style channels as the transport substrate for live rooms whe
 
 The same channel model can back other consumers. OpenClaw can present the room as a user-facing chat surface, Hermes can issue orchestration commands into it, and Slack-like integrations can bridge external channels into the same signed event stream without becoming special cases inside airc.
 
+Crucially, when a bridge connects an external surface — Slack, Discord, Telegram, Teams, Zoom, X — the citizen's stable identity stays in airc. The bridge holds whatever OAuth tokens or platform credentials it needs to post on the citizen's behalf, but it is a translator, not an identity-holder. Unplug the bridge and the citizen persists. Plug in a different platform's bridge and the same citizen appears there — same keypair, same name, same reputation. This is what "same personas, everywhere" means at the substrate level.
+
 ## Embedded Consumers
 
 airc is a command-line chat tool and an embeddable Rust substrate. Applications should use `airc-lib` instead of shelling out when they need event streams, cursor replay, or typed filtering.
