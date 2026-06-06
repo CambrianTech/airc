@@ -716,6 +716,23 @@ pub async fn run_daemon(
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Card 800ce5bd: install a tracing subscriber so the existing
+    // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
+    // airc-relay, etc. actually emit. Before this, every tracing call
+    // in the workspace was a no-op (no subscriber registered) — load-
+    // bearing diagnostics had nowhere to land. `RUST_LOG=info` turns on
+    // the fan-out + subscribe instrumentation; default `warn` filter
+    // keeps the daemon quiet at steady state. `set_global_default`
+    // failures are ignored (a re-run inside the same process shouldn't
+    // crash — e.g. in-process tests sharing the daemon entry).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
     let registry = build_combined_registry(home, &identity, &peers).await?;
 
     if let Some(parent) = socket.parent() {

@@ -238,24 +238,56 @@ impl EventRouter {
             // Fan out live to matching subscribers. try_send only — a slow
             // subscriber is marked lagged, never blocks the shard (§3.5). Each
             // send is an `Arc::clone` (refcount bump), NOT a deep copy.
+            //
+            // Card 800ce5bd: per-publish observability. The fan-out is the
+            // load-bearing path that carries chat from `airc msg` to attached
+            // subscribers, and it has been opaque — when chat doesn't arrive,
+            // we couldn't tell whether the publish reached this loop, how
+            // many subscribers were considered, which were filtered out,
+            // which were closed. INFO so `RUST_LOG=airc_bus=info` turns it
+            // on for diagnosis without flooding the operator at default level.
+            let subscribers_before = state.subscribers.len();
+            let mut matched = 0usize;
+            let mut sent_ok = 0usize;
+            let mut sent_lagged = 0usize;
+            let mut sent_closed = 0usize;
             state.subscribers.retain(|sub| {
                 if !sub.filter.matches(&env) {
                     return true; // not for this subscriber, keep it
                 }
+                matched += 1;
                 match sub.tx.try_send(Arc::clone(&env)) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        sent_ok += 1;
+                        true
+                    }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Lagged: drop the live push, flag it; the subscriber
                         // resumes from the sink via its cursor.
                         sub.lagged.store(true, Ordering::SeqCst);
+                        sent_lagged += 1;
                         true
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         // Receiver gone -> drop the handle.
+                        sent_closed += 1;
                         false
                     }
                 }
             });
+            tracing::info!(
+                channel = %env.channel,
+                epoch = env.seq.epoch,
+                counter = env.seq.counter,
+                kind = ?env.kind,
+                delivery = ?env.delivery,
+                subscribers_before,
+                matched,
+                sent_ok,
+                sent_lagged,
+                sent_closed,
+                "airc-bus publish: fan-out summary"
+            );
         } // shard lock released here, before any await
 
         // --- write-behind (durable only), off the hot lock ---
@@ -385,8 +417,9 @@ impl EventRouter {
 
         // --- step 1: register live + snapshot ring under one lock ---
         let lagged = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = mpsc::channel::<Arc<Envelope>>(inner.config.subscriber_buffer.max(1));
-        let (ring_snapshot, ring_oldest) = {
+        let buffer_capacity = inner.config.subscriber_buffer.max(1);
+        let (tx, mut rx) = mpsc::channel::<Arc<Envelope>>(buffer_capacity);
+        let (ring_snapshot, ring_oldest, shard_idx, subscribers_after) = {
             let n = inner.shards.len();
             let idx = (channel.0.as_u128() % n as u128) as usize;
             let shard = &inner.shards[idx];
@@ -409,8 +442,25 @@ impl EventRouter {
             (
                 state.ring.replay_after(from_cursor),
                 state.ring.oldest_cursor(),
+                idx,
+                state.subscribers.len(),
             )
         }; // lock released; now we may await
+
+        // Card 800ce5bd: per-registration observability. Pairs with the
+        // per-publish summary so an operator can correlate "I subscribed at
+        // T=X on shard=Y for channel=Z" with "at T=X+ε a publish landed on
+        // shard=Y for channel=Z and saw N subscribers." A subscribe that
+        // doesn't appear in a subsequent publish's `subscribers_before` is
+        // the smoking gun for "wrong shard / wrong channel / wrong state."
+        tracing::info!(
+            channel = %channel,
+            shard_idx,
+            subscribers_after,
+            buffer_capacity,
+            filter_summary = ?filter,
+            "airc-bus subscribe_with_lag: registered"
+        );
 
         let lag_flag = LagFlag(Arc::clone(&lagged));
         let stream = async_stream::stream! {

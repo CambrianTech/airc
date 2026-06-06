@@ -38,6 +38,7 @@ airc-work-store = { path = "../airc-work-store" }
 
 async-trait = "0.1"
 base64 = "0.22"
+tracing = "0.1"
 dashmap = "6"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
