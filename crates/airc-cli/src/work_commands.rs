@@ -1314,6 +1314,18 @@ fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
 /// Run `git worktree remove <path>` against the worktree's repo root.
 /// Failure surfaces as a stringified error so the batch loop can
 /// log + continue.
+///
+/// **Submodules.** `git worktree remove` refuses worktrees that contain
+/// submodules ("working trees containing submodules cannot be moved or
+/// removed"). Continuum is the canonical example — it has llama.cpp +
+/// whisper.cpp vendored as submodules. Verified live on Joel's machine
+/// 2026-06-07: classifier correctly says Removable, git refuses the
+/// remove, worktree leaks anyway. The fix: on that specific error,
+/// fall back to `rm -rf` + `git worktree prune` on the repo root. The
+/// pre-cleanup classifier already proved the worktree is `Clean` (no
+/// uncommitted/unpushed work in either the outer repo OR the submodules
+/// reachable via `git status --porcelain`), so `rm -rf` doesn't risk
+/// the operator's WIP.
 fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
     let path_str = path.to_string_lossy().to_string();
     // First find the repo's git-common-dir so `git worktree remove` runs
@@ -1343,13 +1355,38 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
         .args(["-C", &repo_root, "worktree", "remove", &path_str])
         .output()
         .map_err(|e| format!("spawn git worktree remove: {e}"))?;
-    if !rm_out.status.success() {
-        return Err(format!(
-            "git worktree remove failed: {}",
-            String::from_utf8_lossy(&rm_out.stderr).trim()
-        ));
+    if rm_out.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    let stderr = String::from_utf8_lossy(&rm_out.stderr).to_string();
+
+    // Submodule fallback. The classifier already proved the worktree
+    // is Clean — uncommitted/unpushed WIP would have surfaced as
+    // SkipDirty. Safe to nuke the directory and let git's metadata
+    // catch up via `worktree prune`.
+    if stderr.contains("contains submodules") || stderr.contains("containing submodules") {
+        std::fs::remove_dir_all(path).map_err(|e| {
+            format!(
+                "git refused worktree remove (submodules) and rm -rf {} failed: {e}",
+                path.display()
+            )
+        })?;
+        let prune_out = std::process::Command::new("git")
+            .args(["-C", &repo_root, "worktree", "prune"])
+            .output()
+            .map_err(|e| format!("spawn git worktree prune: {e}"))?;
+        if !prune_out.status.success() {
+            return Err(format!(
+                "rm -rf {} succeeded but git worktree prune failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&prune_out.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!("git worktree remove failed: {}", stderr.trim()))
 }
 
 /// Card 70e87d33: retroactively link an already-open PR to a card so
