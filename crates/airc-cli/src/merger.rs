@@ -47,7 +47,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use airc_lib::{Airc, MarkPullRequestMerged, WorkCard};
+use airc_lib::{Airc, WorkCard};
 
 /// Run the continuous-merge loop until shutdown (Ctrl-C / SIGTERM).
 /// Default interval at the CLI layer is 30 seconds — CI pipelines on
@@ -203,20 +203,12 @@ async fn perform_reconcile(
     merged_at_ms: u64,
     airc: &Airc,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    airc.mark_pull_request_merged(MarkPullRequestMerged {
-        card_id: card.card_id,
-        pull_request: pr.clone(),
-        merged_at_ms,
-    })
-    .await?;
-
-    if let Err(error) = crate::work_commands::cleanup_card_worktree(card.card_id).await {
-        eprintln!(
-            "airc-merger: worktree cleanup skipped for {} — {error}",
-            card.card_id
-        );
-    }
-    Ok(())
+    // Card edf3670c: every "PR merged" terminal path routes
+    // through `mark_merged_and_reclaim`. Eliminates the hand-paired
+    // `mark_pull_request_merged + cleanup_card_worktree` duplication
+    // and pins both wires at one site.
+    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), merged_at_ms)
+        .await
 }
 
 enum MergeDecision {
@@ -565,27 +557,12 @@ async fn perform_merge(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    airc.mark_pull_request_merged(MarkPullRequestMerged {
-        card_id: card.card_id,
-        pull_request: pr.clone(),
-        merged_at_ms: now_ms,
-    })
-    .await?;
-
-    // Card cdb477a2: reclaim the card's worktree now that its PR is
-    // merged. The CLI `airc work close` path already does this, but the
-    // merger closes the majority of cards and previously left every
-    // worktree behind (~/.airc/worktrees/<short> accumulated to 84).
-    // Best-effort: a cleanup refusal (uncommitted/unpushed work) logs a
-    // warning but must NOT fail the merge — the PR is already merged and
-    // the projection has transitioned.
-    if let Err(error) = crate::work_commands::cleanup_card_worktree(card.card_id).await {
-        eprintln!(
-            "airc-merger: worktree cleanup skipped for {} — {error}",
-            card.card_id
-        );
-    }
-    Ok(())
+    // Card edf3670c (was card cdb477a2): same helper as
+    // `perform_reconcile` so the daemon's two terminal paths and the
+    // CLI's two terminal paths all agree. Before extraction, four
+    // sites duplicated this pair and the CLI half forgot the cleanup
+    // wire — recurring disk-full crash.
+    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), now_ms).await
 }
 
 /// Acquire a non-blocking exclusive lock at `<home>/merger.lock`.

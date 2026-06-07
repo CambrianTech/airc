@@ -543,6 +543,56 @@ pub async fn run_state(
     Ok(())
 }
 
+/// Card edf3670c — emit `MarkPullRequestMerged` AND reclaim the
+/// card's worktree as one atomic merge-completion step.
+///
+/// Every "PR merged" terminal path MUST route through this helper.
+/// Before extraction, four call sites (merger daemon × 2 +
+/// `run_merge` × 2) each hand-paired the two operations; the CLI
+/// merge sites forgot the cleanup wire, leaving 12-19 GB per
+/// orphaned worktree on Joel's Intel Mac — the recurring disk-full
+/// crash this card targets.
+///
+/// Contract:
+/// 1. Emits `MarkPullRequestMerged` so the projection transitions
+///    the card to `Merged` consistently with the daemon path.
+/// 2. Best-effort reclaim of the worktree at
+///    `~/.airc/worktrees/<short>/`. A cleanup refusal
+///    (uncommitted / unpushed work) logs a warning but does NOT
+///    fail the merge — the PR is already merged + the projection
+///    has transitioned. Same shape as `merger::perform_merge`.
+/// 3. Emits a `tracing::info!` breadcrumb at
+///    `airc::work::merge::reclaim` so sentinels / operators can
+///    subscribe to merge-completion without parsing stderr.
+///
+/// The source-text regression test `every_merge_site_routes_through_helper`
+/// pins the call-site count so a future maintainer who reintroduces
+/// the bug (hand-paired `mark_pull_request_merged` + missing
+/// cleanup) breaks at compile-time, not at "disk full mid-session."
+pub(crate) async fn mark_merged_and_reclaim(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+    pull_request: airc_work::model::PullRequestRef,
+    merged_at_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use airc_lib::MarkPullRequestMerged;
+    airc.mark_pull_request_merged(MarkPullRequestMerged {
+        card_id,
+        pull_request,
+        merged_at_ms,
+    })
+    .await?;
+    tracing::info!(
+        target: "airc::work::merge::reclaim",
+        %card_id,
+        "worktree reclaim attempted after MarkPullRequestMerged",
+    );
+    if let Err(error) = cleanup_card_worktree(card_id).await {
+        eprintln!("airc: worktree cleanup skipped for {card_id} — {error}");
+    }
+    Ok(())
+}
+
 /// Card abe9fe4c — remove the per-card worktree (and prune its
 /// branch if no unmerged commits remain) once a card terminalizes.
 /// Disk-pressure substrate fix; the 2026-05-28 session sat on
@@ -569,12 +619,22 @@ pub async fn run_state(
 ///   * All operations run from the MAIN working tree (the cwd's
 ///     repo root), not from the worktree being removed.
 ///
-/// Called from TWO terminal paths so a card's worktree is reclaimed
-/// regardless of who closes it: (1) the CLI `airc work close` path
-/// below, and (2) the merger's `perform_merge` after a successful
-/// `MarkPullRequestMerged` (card cdb477a2). The merger closes the
-/// majority of cards; without path (2) every merger-merged card
-/// leaked its worktree — the 84-orphan accumulation this fix targets.
+/// Called from every terminal path that ends a card's life — grep
+/// for callers (do NOT maintain a list here; card edf3670c's bug
+/// shipped because the prior caller-enumeration was stale and the
+/// `run_merge` site was forgotten). Today's wires:
+///
+/// - `airc work close` for review-only + cancellation
+/// - `merger::perform_merge` (CI-green daemon path)
+/// - `merger::perform_reconcile` (already-merged daemon path)
+/// - `mark_merged_and_reclaim` (CLI `airc work merge` — both
+///   GREEN + AlreadyMerged branches go through the helper)
+///
+/// **Future terminal paths MUST route through
+/// [`mark_merged_and_reclaim`] (when the path emits
+/// `MarkPullRequestMerged`) or call this directly (close-shape
+/// path).** A regression test pins the call-site count; if you
+/// add a 5th terminal path, the test fails until you wire cleanup.
 pub(crate) async fn cleanup_card_worktree(
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1239,7 +1299,6 @@ pub async fn run_merge(
     pending_timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::gh_client::GhClient as _;
-    use airc_lib::MarkPullRequestMerged;
     use airc_work::model::CardState;
 
     let airc = crate::commands::attached_airc(home).await?;
@@ -1310,12 +1369,7 @@ pub async fn run_merge(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            airc.mark_pull_request_merged(MarkPullRequestMerged {
-                card_id: card_uuid,
-                pull_request: pr.clone(),
-                merged_at_ms: now_ms,
-            })
-            .await?;
+            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), now_ms).await?;
             println!(
                 "merged: card={card_uuid} pr=#{n} repo={r}",
                 n = pr.number,
@@ -1337,12 +1391,7 @@ pub async fn run_merge(
                 );
                 return Ok(());
             }
-            airc.mark_pull_request_merged(MarkPullRequestMerged {
-                card_id: card_uuid,
-                pull_request: pr.clone(),
-                merged_at_ms,
-            })
-            .await?;
+            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), merged_at_ms).await?;
             println!(
                 "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
                 n = pr.number,
@@ -2785,6 +2834,105 @@ mod tests {
         // own test pinning the 8-char take. This test is the
         // architectural cross-reference.)
         assert_eq!(short_id(card_id.to_string()), expected_short);
+    }
+
+    // ---------------------------------------------------------------------
+    // Card edf3670c — every "PR merged" terminal path MUST route
+    // through `mark_merged_and_reclaim`. The original bug shipped
+    // because `run_merge` hand-paired `mark_pull_request_merged` +
+    // missing-cleanup; the helper extraction + this source-text
+    // contract test together pin the invariant going forward.
+    //
+    // Why a source-text test, not a unit test with a mock Airc:
+    // `Airc` is a concrete struct (not a trait) and the cleanup
+    // function shells out to `git`. Faking either is heavier than
+    // the bug class warrants. The source-text scan catches the
+    // exact regression pattern — a maintainer who reintroduces
+    // raw `airc.mark_pull_request_merged(...)` calls at a NEW
+    // terminal path will break this test until they route the new
+    // path through the helper.
+    // ---------------------------------------------------------------------
+
+    /// Every direct caller of `airc.mark_pull_request_merged` in
+    /// the substrate is a candidate for re-introducing the
+    /// disk-full bug. Only the helper itself is allowed to make
+    /// that call. Every other site MUST go through
+    /// `mark_merged_and_reclaim`.
+    ///
+    /// This test scans `work_commands.rs` + `merger.rs` source
+    /// (the two files that historically owned merge-terminal
+    /// paths) and asserts that `mark_pull_request_merged(` appears
+    /// at EXACTLY ONE call site (inside the helper). A maintainer
+    /// who adds a new merge-terminal path with a raw
+    /// `mark_pull_request_merged` call drops this count to >1 and
+    /// breaks the test until they route through the helper —
+    /// which automatically wires cleanup.
+    #[test]
+    fn every_merge_site_routes_through_helper() {
+        // Scan production code only — strip the `#[cfg(test)]`
+        // module before counting so this test's own references to
+        // the method name don't inflate the total.
+        fn production_only(src: &str) -> &str {
+            src.split_once("#[cfg(test)]")
+                .map(|(prod, _)| prod)
+                .unwrap_or(src)
+        }
+        let work_commands_prod = production_only(include_str!("work_commands.rs"));
+        let merger_prod = production_only(include_str!("merger.rs"));
+
+        // Count direct method-call invocations — the
+        // `.mark_pull_request_merged(` form catches both
+        // `airc.mark_pull_request_merged(` and any chained
+        // access. Doc-comments use backticks around the bare
+        // name (`mark_pull_request_merged`) so they don't match.
+        let total = work_commands_prod
+            .matches(".mark_pull_request_merged(")
+            .count()
+            + merger_prod.matches(".mark_pull_request_merged(").count();
+
+        assert_eq!(
+            total, 1,
+            "Found {total} direct callers of `.mark_pull_request_merged(` in \
+             production code across work_commands.rs + merger.rs. Card edf3670c \
+             contract: the helper `mark_merged_and_reclaim` is the ONLY allowed \
+             caller, so every other terminal path inherits worktree cleanup \
+             automatically. \n\n\
+             If you added a new merge-terminal path: route it through \
+             `mark_merged_and_reclaim(&airc, card_id, pr, merged_at_ms)` instead \
+             of calling `mark_pull_request_merged` directly. The bug this test \
+             prevents shipped to production once already; the recurring disk-full \
+             crash on Joel's Intel Mac took out 60 GB per session before this fix."
+        );
+    }
+
+    /// Companion to `every_merge_site_routes_through_helper`: the
+    /// helper itself MUST contain a `cleanup_card_worktree` call.
+    /// Without this, a maintainer could "simplify" the helper down
+    /// to just `mark_pull_request_merged` and re-ship the bug at
+    /// ALL four call sites at once. The function-body scan pins
+    /// the cleanup wire inside the helper.
+    #[test]
+    fn helper_body_contains_cleanup_call() {
+        let work_commands = include_str!("work_commands.rs");
+        // Extract the body of mark_merged_and_reclaim by finding
+        // the function signature + reading until the closing
+        // brace at column 0. Substrate convention is one-fn per
+        // top-level item with `pub`/`pub(crate)` declarations.
+        let needle = "pub(crate) async fn mark_merged_and_reclaim(";
+        let start = work_commands
+            .find(needle)
+            .expect("mark_merged_and_reclaim function must exist (card edf3670c)");
+        // Read 4000 chars after the signature — generous bound
+        // that covers the full body but bails out at the next
+        // top-level item. Cheap fence; not a parser.
+        let body_window = &work_commands[start..start.saturating_add(4000)];
+        assert!(
+            body_window.contains("cleanup_card_worktree("),
+            "mark_merged_and_reclaim must call cleanup_card_worktree — that's \
+             the entire point of the helper. Removing this call re-ships the \
+             disk-full bug at all four merge-terminal paths simultaneously \
+             (card edf3670c)."
+        );
     }
 
     // ---------------------------------------------------------------------
