@@ -934,7 +934,18 @@ pub async fn run_cleanup(
         // `probe_dirty_status` for the WIP-outranks-hygiene contract.
         let dirty_status = probe_dirty_status(&path);
 
-        let disposition = classify_worktree(card_state.as_ref(), &dirty_status);
+        // Probe whether the worktree's branch still exists on origin.
+        // `gh pr merge --delete-branch` (the default merger path AND
+        // every manual merge that uses --delete-branch) removes the
+        // branch on origin AFTER merging the PR. That's the universal
+        // signal a worktree is dead: branch upstream is gone ⇒ either
+        // merged-and-deleted or abandoned. Combined with `Clean` dirty
+        // status, that's enough to remove regardless of the kanban
+        // projection's state — which often lags reality when a
+        // `gh pr merge` bypasses `airc work merge`.
+        let upstream_gone = probe_upstream_gone(&path);
+
+        let disposition = classify_worktree(card_state.as_ref(), &dirty_status, upstream_gone);
 
         classifications.push(WorktreeClassification {
             short,
@@ -1111,20 +1122,36 @@ pub(crate) enum DirtyStatus {
 
 /// Pure classifier. Card c9b28925 — table-driven so every disposition
 /// gets exercised in tests without spinning up a real worktree.
+///
+/// `upstream_gone`: the worktree's tracking branch is missing on
+/// origin. Universal signal for "PR was merged + branch deleted"
+/// (the `gh pr merge --delete-branch` flow that the auto-merger
+/// AND every manual merge uses). When clean + upstream_gone we
+/// override an out-of-sync kanban state and remove — fixes the
+/// recurring disk-full crash where worktrees for already-merged
+/// PRs lingered because the projection hadn't observed the merge.
 pub(crate) fn classify_worktree(
     card_state: Option<&airc_work::CardState>,
     dirty: &DirtyStatus,
+    upstream_gone: bool,
 ) -> Disposition {
     use airc_work::CardState;
-    let Some(state) = card_state else {
-        return Disposition::SkipUnknownCard;
-    };
     if matches!(dirty, DirtyStatus::Unknown) {
         return Disposition::SkipNotGit;
     }
     if matches!(dirty, DirtyStatus::Dirty) {
         return Disposition::SkipDirty;
     }
+    // `upstream_gone` is the trump card for cleanups: branch deleted
+    // on origin = PR merged (or branch abandoned). Either way the
+    // worktree's HEAD is dead weight on disk. Doesn't depend on the
+    // card projection being up-to-date — that's the entire point.
+    if upstream_gone {
+        return Disposition::Removable;
+    }
+    let Some(state) = card_state else {
+        return Disposition::SkipUnknownCard;
+    };
     match state {
         CardState::Closed | CardState::Merged => Disposition::Removable,
         CardState::Open
@@ -1133,6 +1160,70 @@ pub(crate) fn classify_worktree(
         | CardState::Review
         | CardState::Blocked => Disposition::KeepActive,
     }
+}
+
+/// Returns `true` when the worktree's current branch tracks an
+/// upstream that no longer exists on `origin`. The dominant cause is
+/// `gh pr merge --delete-branch` (and the auto-merger's equivalent)
+/// removing the branch on the remote after the merge commit lands.
+///
+/// Implementation: `git -C path rev-parse --abbrev-ref @{u}` gives
+/// the tracking ref name (e.g. `origin/feat/foo`); split off the
+/// remote name, then `git -C path ls-remote --exit-code --heads
+/// <remote> <branch>` — exit 2 means the ref is absent on the
+/// remote, exit 0 means it's present. Probe failures (no upstream
+/// tracking, detached HEAD, network errors) return `false` — the
+/// safe default keeps the worktree under the existing classifier
+/// rules so a transient remote-list error never deletes work.
+fn probe_upstream_gone(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy().to_string();
+
+    // Step 1: resolve the upstream tracking ref. No upstream = no
+    // signal; return false and let the card-state classifier
+    // handle it.
+    let upstream_out = match std::process::Command::new("git")
+        .args(["-C", &path_str, "rev-parse", "--abbrev-ref", "@{u}"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    if !upstream_out.status.success() {
+        return false;
+    }
+    let upstream_full = String::from_utf8_lossy(&upstream_out.stdout)
+        .trim()
+        .to_string();
+    let Some((remote, branch)) = upstream_full.split_once('/') else {
+        return false;
+    };
+    if remote.is_empty() || branch.is_empty() {
+        return false;
+    }
+
+    // Step 2: ask the remote whether the branch ref still exists.
+    // `--exit-code` makes ls-remote return 2 when the ref is absent,
+    // 0 when present, non-zero-non-2 on transport errors. We treat
+    // "absent" as "gone" and anything else (present, transport
+    // error) as "not gone" — keeping the safe default.
+    let ls_out = match std::process::Command::new("git")
+        .args([
+            "-C",
+            &path_str,
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            remote,
+            branch,
+        ])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    // Exit code 2 = ref absent. Everything else (0 = present, 128 =
+    // transport error, etc.) = don't claim "gone".
+    matches!(ls_out.status.code(), Some(2))
 }
 
 /// Extract a worktree's short card id from its directory name. The
@@ -2092,13 +2183,13 @@ mod tests {
 
     #[test]
     fn classifier_closed_clean_removes() {
-        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Clean);
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Clean, false);
         assert_eq!(d, Disposition::Removable);
     }
 
     #[test]
     fn classifier_merged_clean_removes() {
-        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Clean);
+        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Clean, false);
         assert_eq!(d, Disposition::Removable);
     }
 
@@ -2111,7 +2202,7 @@ mod tests {
             CardState::Review,
             CardState::Blocked,
         ] {
-            let d = classify_worktree(Some(&state), &DirtyStatus::Clean);
+            let d = classify_worktree(Some(&state), &DirtyStatus::Clean, false);
             assert_eq!(d, Disposition::KeepActive, "state={state:?}");
         }
     }
@@ -2121,9 +2212,9 @@ mod tests {
         // Operator's WIP outranks hygiene. Closed card + dirty
         // worktree still classifies as SkipDirty — print, never
         // remove silently.
-        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Dirty);
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Dirty, false);
         assert_eq!(d, Disposition::SkipDirty);
-        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Dirty);
+        let d = classify_worktree(Some(&CardState::Merged), &DirtyStatus::Dirty, false);
         assert_eq!(d, Disposition::SkipDirty);
     }
 
@@ -2133,7 +2224,7 @@ mod tests {
         // no card is on the current board. Could be from a deleted
         // card, a different scope, or scope drift. Surface but don't
         // touch.
-        let d = classify_worktree(None, &DirtyStatus::Clean);
+        let d = classify_worktree(None, &DirtyStatus::Clean, false);
         assert_eq!(d, Disposition::SkipUnknownCard);
     }
 
@@ -2142,8 +2233,71 @@ mod tests {
         // git status probe failure (not a git dir, permissions) ⇒
         // refuse to classify as either Clean or Dirty. SkipNotGit
         // surfaces the diagnostic and the operator decides.
-        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Unknown);
+        let d = classify_worktree(Some(&CardState::Closed), &DirtyStatus::Unknown, false);
         assert_eq!(d, Disposition::SkipNotGit);
+    }
+
+    // ─── upstream_gone: the fix for the recurring disk-full crash ────
+
+    /// THE bug this slice fixes. PR merged via `gh pr merge --delete-
+    /// branch`; airc projection hasn't caught up (no `airc work merge`
+    /// path was used); card stays Review forever. Before this slice
+    /// classifier returned KeepActive → worktree leaked → disk full.
+    /// Now upstream_gone=true overrides card_state and returns
+    /// Removable.
+    #[test]
+    fn classifier_upstream_gone_removes_even_when_card_review() {
+        let d = classify_worktree(Some(&CardState::Review), &DirtyStatus::Clean, true);
+        assert_eq!(d, Disposition::Removable);
+    }
+
+    /// Apply the same trump-card behavior to every non-dirty active
+    /// state. Any worktree whose branch has been deleted on origin is
+    /// dead weight regardless of where the kanban thinks the card is.
+    #[test]
+    fn classifier_upstream_gone_removes_for_every_active_state_when_clean() {
+        for state in [
+            CardState::Open,
+            CardState::Claimed,
+            CardState::InProgress,
+            CardState::Review,
+            CardState::Blocked,
+        ] {
+            let d = classify_worktree(Some(&state), &DirtyStatus::Clean, true);
+            assert_eq!(
+                d,
+                Disposition::Removable,
+                "upstream gone + clean must remove (state={state:?})"
+            );
+        }
+    }
+
+    /// WIP still outranks hygiene. Even with the upstream branch
+    /// deleted, an uncommitted-or-unpushed local change must NOT be
+    /// silently destroyed — surface as SkipDirty.
+    #[test]
+    fn classifier_upstream_gone_still_respects_dirty() {
+        let d = classify_worktree(Some(&CardState::Review), &DirtyStatus::Dirty, true);
+        assert_eq!(d, Disposition::SkipDirty);
+    }
+
+    /// Probe failures still surface as SkipNotGit even with the
+    /// upstream-gone signal, because we can't trust we read the
+    /// working tree state correctly.
+    #[test]
+    fn classifier_upstream_gone_still_respects_unknown_git() {
+        let d = classify_worktree(Some(&CardState::Review), &DirtyStatus::Unknown, true);
+        assert_eq!(d, Disposition::SkipNotGit);
+    }
+
+    /// Orphan worktree (no card) + upstream gone = Removable. This is
+    /// the "card got pruned out of projection retention but the
+    /// worktree is still on disk" path — same disk-full cause, different
+    /// projection failure mode.
+    #[test]
+    fn classifier_upstream_gone_removes_orphan() {
+        let d = classify_worktree(None, &DirtyStatus::Clean, true);
+        assert_eq!(d, Disposition::Removable);
     }
 
     // ─── probe_dirty_status: PR #1105 reviewer round 1 fix ───────────
