@@ -1285,8 +1285,7 @@ fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
 
     // Step 2: unpushed-commits probe. `git rev-list --count @{u}..HEAD`
     // counts commits reachable from HEAD but not from the upstream
-    // tracking branch. If `@{u}` errors (no upstream / detached HEAD),
-    // we can't classify safely — return Unknown rather than guess.
+    // tracking branch.
     let unpushed_out = match std::process::Command::new("git")
         .args(["-C", &path_str, "rev-list", "--count", "@{u}..HEAD"])
         .output()
@@ -1294,21 +1293,151 @@ fn probe_dirty_status(path: &std::path::Path) -> DirtyStatus {
         Ok(out) => out,
         Err(_) => return DirtyStatus::Unknown,
     };
-    if !unpushed_out.status.success() {
-        // Likely "no upstream configured for branch X" or detached
-        // HEAD. Per `[[no-fallbacks-ever]]` refuse to classify
-        // rather than assume the operator pushed.
-        return DirtyStatus::Unknown;
-    }
-    let count_text = String::from_utf8_lossy(&unpushed_out.stdout)
-        .trim()
-        .to_string();
-    let count: u64 = count_text.parse().unwrap_or(0);
-    if count > 0 {
-        return DirtyStatus::Dirty;
+    if unpushed_out.status.success() {
+        let count_text = String::from_utf8_lossy(&unpushed_out.stdout)
+            .trim()
+            .to_string();
+        let count: u64 = count_text.parse().unwrap_or(0);
+        if count > 0 {
+            return DirtyStatus::Dirty;
+        }
+        return DirtyStatus::Clean;
     }
 
-    DirtyStatus::Clean
+    // Card 8a3082c4: the @{u} probe failed — likely "no upstream
+    // configured" (every worktree spawned by `airc work claim` is
+    // born on a fresh `<short>/<slug>` branch that's never been
+    // pushed) or a detached HEAD. Rather than blanket-Unknown the
+    // worktree, fall through to a SECOND positive-proof check: are
+    // every commit on HEAD already present in `origin/<default>`,
+    // either by SHA equality or by patch-id equality (squash merge)?
+    //
+    // This is NOT a [[no-fallbacks-ever]] violation — it's a
+    // *stricter* check than "ahead==0 of upstream." The original
+    // upstream probe trusted the operator's per-branch tracking
+    // config; this trusts only what's verifiably already in the
+    // remote default branch. The branch will be deleted; the test
+    // for "is anything lost?" is "is any commit unique to this
+    // branch vs origin/<default>?" — `git cherry` answers exactly
+    // that, by patch-id, so squash-merged commits count as already-
+    // applied.
+    //
+    // Concrete case this fixes: today's continuum #1547 → card
+    // 8a3082c4. The auto-spawn created
+    // `~/.airc/worktrees/8a3082c4/` on branch
+    // `8a3082c4/fix-probes-rolling-log-fmt-layer-default` with no
+    // upstream. The actual work landed on a DIFFERENT branch which
+    // was squash-merged. `airc work merge` then ran cleanup and the
+    // classifier refused to remove the worktree, leaving an orphan
+    // that needs manual `git -C ... status` inspection. With this
+    // fallback the cleanup correctly recognizes "every commit here
+    // is already in origin/canary by patch-id."
+    is_clean_via_cherry_against_origin_head(&path_str)
+}
+
+/// Returns [`DirtyStatus::Clean`] iff there exists at least one
+/// well-known integration ref `origin/<name>` where every commit
+/// reachable from HEAD is also reachable (by SHA OR patch-id) from
+/// that ref. "Captured in at least one integration branch" is the
+/// safety property: if `origin/canary` has all the patches and the
+/// PR was merged there, work isn't lost when we delete the local
+/// branch — even if `origin/main` hasn't been promoted yet.
+///
+/// Returns [`DirtyStatus::Dirty`] when every candidate ref we try
+/// shows at least one `+` line (a commit not yet captured). The
+/// branch carries genuinely unique work; refuse to remove.
+///
+/// Returns [`DirtyStatus::Unknown`] when no candidate ref exists on
+/// the remote (we can't form an opinion). Safety posture: refuse
+/// to claim Clean without positive proof.
+///
+/// ## Why a list of candidates
+///
+/// Per-card branches auto-spawned by `airc work claim` start with no
+/// upstream tracking, so the standard `@{u}..HEAD` probe errors out.
+/// The cleanup path needs a fallback that proves "work is captured
+/// in the integration branch tree" even when the local branch's
+/// upstream config is missing.
+///
+/// `git symbolic-ref refs/remotes/origin/HEAD` returns the repo's
+/// default branch (usually `main` or `master`), but the PR may have
+/// merged to a different integration ref like `canary` or
+/// `rust-rewrite`. Trying the full known list catches every
+/// real-world layout we ship (continuum: main + canary; airc:
+/// rust-rewrite; generic OSS: main/master) without threading the
+/// card's PR base through every call site.
+///
+/// The risk of a false positive (patch-ids accidentally matching on
+/// an unrelated branch) is negligible — patch-ids are SHA1-based and
+/// don't collide by accident across two commits with different
+/// content.
+fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
+    // Candidate integration refs in priority order. `origin/HEAD`
+    // first because it's the operator-configured default; the named
+    // refs cover repos whose PRs typically land somewhere other than
+    // origin/HEAD (continuum: PRs land on canary; airc: rust-rewrite).
+    const CANDIDATES: &[&str] = &[
+        "origin/HEAD",
+        "origin/main",
+        "origin/master",
+        "origin/canary",
+        "origin/rust-rewrite",
+        "origin/develop",
+    ];
+
+    let mut any_existed = false;
+    for candidate in CANDIDATES {
+        // Skip non-existent refs so the loop only considers refs the
+        // local repo actually knows about. `rev-parse --verify` is
+        // the cheap existence check — succeeds when the ref
+        // resolves, fails (non-zero exit) when it doesn't.
+        let exists = std::process::Command::new("git")
+            .args(["-C", path_str, "rev-parse", "--verify", candidate])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        any_existed = true;
+
+        // `git cherry <upstream> HEAD` lists each commit reachable
+        // from HEAD but not from <upstream>. `+ <sha>` = patch-id
+        // NOT present upstream (unique work). `- <sha>` = patch-id
+        // IS present upstream (squash-merged or cherry-picked).
+        // Empty output ⇒ HEAD equals upstream ⇒ trivially Clean.
+        let cherry_out = match std::process::Command::new("git")
+            .args(["-C", path_str, "cherry", candidate])
+            .output()
+        {
+            Ok(out) => out,
+            Err(_) => continue,
+        };
+        if !cherry_out.status.success() {
+            continue;
+        }
+        let cherry_text = String::from_utf8_lossy(&cherry_out.stdout).to_string();
+        let has_unique = cherry_text
+            .lines()
+            .any(|line| line.trim_start().starts_with('+'));
+        if !has_unique {
+            // This candidate already contains every patch on HEAD.
+            // The branch's work is captured upstream; safe to delete.
+            return DirtyStatus::Clean;
+        }
+    }
+
+    if any_existed {
+        // We checked at least one candidate and ALL of them showed
+        // unique commits on HEAD. The branch genuinely has work not
+        // captured anywhere — refuse to remove.
+        DirtyStatus::Dirty
+    } else {
+        // No candidate ref existed in the local repo. We can't form
+        // a positive-proof opinion. Refuse to classify per
+        // `[[no-fallbacks-ever]]` rather than guess.
+        DirtyStatus::Unknown
+    }
 }
 
 /// Run `git worktree remove <path>` against the worktree's repo root.
@@ -2486,14 +2615,18 @@ mod tests {
         );
     }
 
-    /// A branch with NO upstream tracking is ambiguous — could be
-    /// pure local WIP, could be already-pushed-by-someone-else.
-    /// Per `[[no-fallbacks-ever]]` refuse to classify.
+    /// Card 8a3082c4: a branch with no upstream BUT whose HEAD is
+    /// already captured upstream (the branch is just a no-op off
+    /// origin's HEAD, the "auto-spawned worktree never used" case)
+    /// must classify as Clean, not Unknown. Without this the cleanup
+    /// classifier leaves orphan worktrees indefinitely whenever the
+    /// auto-spawn never received commits.
     #[test]
-    fn probe_dirty_status_unknown_when_no_upstream_tracking() {
+    fn probe_dirty_status_clean_when_no_upstream_but_head_already_captured() {
         let (clone, _tmp) = git_fixture_with_upstream(true);
 
-        // Switch to a fresh branch that has no upstream configured.
+        // Switch to a fresh branch that has no upstream configured
+        // but starts from origin/HEAD — no unique content.
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -2510,9 +2643,45 @@ mod tests {
 
         assert_eq!(
             probe_dirty_status(&clone),
-            DirtyStatus::Unknown,
-            "branch with no upstream tracking must be Unknown — \
-             ambiguous state, classifier refuses rather than assuming"
+            DirtyStatus::Clean,
+            "branch with no upstream but HEAD = origin/HEAD must be \
+             Clean — `git cherry origin/HEAD HEAD` shows no `+` lines, \
+             so deleting the branch loses nothing"
+        );
+    }
+
+    /// Card 8a3082c4 mirror: a branch with no upstream AND a unique
+    /// commit not yet captured upstream must classify as Dirty. The
+    /// no-upstream-tracking case must NOT silently let real WIP slip
+    /// through; positive-proof check is "every commit upstream by
+    /// patch-id."
+    #[test]
+    fn probe_dirty_status_dirty_when_no_upstream_and_unique_commit() {
+        let (clone, _tmp) = git_fixture_with_upstream(true);
+
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&clone)
+                .output()
+                .expect("git spawn");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Branch off, add a unique commit, leave no upstream config.
+        run(&["checkout", "-b", "local-only-branch"]);
+        std::fs::write(clone.join("unique"), "wip\n").expect("write");
+        run(&["add", "unique"]);
+        run(&["commit", "-m", "local WIP not on origin"]);
+
+        assert_eq!(
+            probe_dirty_status(&clone),
+            DirtyStatus::Dirty,
+            "branch with no upstream AND a commit not in any origin \
+             ref must be Dirty — refusing to silently destroy WIP"
         );
     }
 
