@@ -29,6 +29,16 @@ pub(crate) async fn spawn_claim_worktree(
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
     let short: String = card.card_id.to_string().chars().take(8).collect();
+
+    // Card 8a3082c4: skip worktree spawn entirely when the card is
+    // already linked to a PR — the work is by definition happening
+    // on the linked head branch elsewhere. See `worktree_skip_reason`
+    // for the rule + rationale.
+    if let Some(reason) = worktree_skip_reason(&card) {
+        println!("worktree:  skipped — {reason}");
+        return Ok(());
+    }
+
     let slug = slugify(&card.title, 40);
 
     let lease_root = lease::lease_root()
@@ -200,4 +210,103 @@ pub(crate) fn git_show_format(
         .into());
     }
     Ok(String::from_utf8(out.stdout)?)
+}
+
+/// Decide whether [`spawn_claim_worktree`] should skip creating a new
+/// worktree for `card`. Returns `Some(reason)` with a human-readable
+/// explanation suitable for direct printing, or `None` when the
+/// allocator should proceed normally.
+///
+/// Per Joel `[[every-error-is-an-opportunity-to-battle-harden]]`:
+/// fixing the immediate friction (continuum PR #1547 → card 8a3082c4,
+/// auto-spawned stray worktree on an already-PR'd card) AND making
+/// the rule testable on its own without an IPC daemon round-trip.
+///
+/// Current rule: skip when `card.pull_request.is_some()`. The
+/// reasoning is that linking a PR is a positive statement that work
+/// is already underway on `pr.head` in some existing checkout — the
+/// auto-spawn would either create a different branch (wrong) or
+/// collide with the existing checkout (wrong). Future rules can
+/// extend this match without touching the call site.
+pub(crate) fn worktree_skip_reason(card: &airc_work::model::WorkCard) -> Option<String> {
+    if let Some(ref pr) = card.pull_request {
+        return Some(format!(
+            "card already linked to PR #{number} on branch {head} ({repo}); \
+             continue work in your existing checkout/worktree",
+            number = pr.number,
+            head = pr.head,
+            repo = pr.repo,
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use airc_core::PeerId;
+    use airc_work::ids::{RepoId, WorkCardId};
+    use airc_work::model::{BranchName, CardState, Priority, PullRequestRef, WorkCard};
+
+    /// Build a minimal `WorkCard` with the optional `pr` already
+    /// linked or not. Pure constructor — no clock, no IDs from the
+    /// daemon, so the result is reproducible across runs.
+    fn card_with_pr(pr: Option<PullRequestRef>) -> WorkCard {
+        WorkCard {
+            card_id: WorkCardId::new(),
+            repo: RepoId::new("acme/widgets").expect("test repo id"),
+            title: "fix(scheduler): bound retry backoff".to_string(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            state: CardState::Open,
+            owner: None,
+            claim_id: None,
+            claim_expires_at_ms: None,
+            last_heartbeat_at_ms: None,
+            pull_request: pr,
+            created_by: PeerId::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            reviews: None,
+        }
+    }
+
+    /// Card 8a3082c4: the load-bearing case for this fix. A PR-linked
+    /// card has its work in flight on `pr.head` somewhere else;
+    /// allocating a fresh `<short>/<slug>` worktree would be wasted
+    /// disk + a misleading hint. The skip reason must be informative
+    /// enough that the operator knows where to go instead.
+    #[test]
+    fn skips_when_pull_request_is_linked() {
+        let card = card_with_pr(Some(PullRequestRef {
+            repo: RepoId::new("acme/widgets").expect("test repo"),
+            number: 1547,
+            head: BranchName::new("fix/rolling-log").expect("test head"),
+            base: BranchName::new("canary").expect("test base"),
+        }));
+        let reason = worktree_skip_reason(&card).expect("PR-linked card must skip");
+        assert!(reason.contains("#1547"), "reason must cite PR number: {reason}");
+        assert!(
+            reason.contains("fix/rolling-log"),
+            "reason must cite head branch: {reason}"
+        );
+        assert!(
+            reason.contains("acme/widgets"),
+            "reason must cite repo so the operator knows which checkout: {reason}"
+        );
+    }
+
+    /// The normal-claim path. With no PR linked the substrate has no
+    /// existing-checkout evidence; the worktree allocator should
+    /// proceed (the function returns None so the caller falls
+    /// through to its existing logic).
+    #[test]
+    fn proceeds_when_no_pull_request_linked() {
+        let card = card_with_pr(None);
+        assert!(
+            worktree_skip_reason(&card).is_none(),
+            "unlinked card must NOT short-circuit worktree spawn",
+        );
+    }
 }
