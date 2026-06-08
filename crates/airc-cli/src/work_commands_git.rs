@@ -34,7 +34,7 @@ pub(crate) async fn spawn_claim_worktree(
     // already linked to a PR — the work is by definition happening
     // on the linked head branch elsewhere. See `worktree_skip_reason`
     // for the rule + rationale.
-    if let Some(reason) = worktree_skip_reason(&card) {
+    if let Some(reason) = worktree_skip_reason(card) {
         println!("worktree:  skipped — {reason}");
         return Ok(());
     }
@@ -286,7 +286,10 @@ mod tests {
             base: BranchName::new("canary").expect("test base"),
         }));
         let reason = worktree_skip_reason(&card).expect("PR-linked card must skip");
-        assert!(reason.contains("#1547"), "reason must cite PR number: {reason}");
+        assert!(
+            reason.contains("#1547"),
+            "reason must cite PR number: {reason}"
+        );
         assert!(
             reason.contains("fix/rolling-log"),
             "reason must cite head branch: {reason}"
