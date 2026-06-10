@@ -104,7 +104,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows runs on the self-hosted bigmama runner (5090 grid
+        # node) — GitHub-hosted windows-latest has been queue-starved
+        # for days and was blocking merges (#1114). The install-smoke
+        # jobs in ci.yml deliberately STAY on windows-latest: they do
+        # real machine-wide winget installs and need a virgin box,
+        # which a persistent self-hosted runner is not.
+        # Security: repo fork-PR approval policy is set to
+        # all_external_contributors, so no fork code reaches the
+        # self-hosted runner without a maintainer's explicit approval.
+        os: [ubuntu-latest, macos-latest, [self-hosted, windows]]
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
