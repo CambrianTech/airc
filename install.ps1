@@ -172,17 +172,71 @@ Test-WingetAvailable
 # removes a 30+ second prereq install (and the visible UAC prompt).
 
 Install-IfMissing -Name 'Git for Windows'    -WingetId 'Git.Git'             -TestCmd { Get-Command git -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -TestCmd {
-    # Probe both the launcher (`py -3`) and direct `python`. Either is fine
-    # for airc.ps1's Python invocations. Skip the App Execution Alias stub
-    # at $env:LOCALAPPDATA\Microsoft\WindowsApps\python.exe which prints
-    # "Python was not found; run without arguments to install ..." on call.
-    $py = Get-Command python -ErrorAction SilentlyContinue
-    if ($py -and $py.Source -notlike '*\WindowsApps\*') { return $true }
-    return [bool](Get-Command py -ErrorAction SilentlyContinue)
-}
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'jq'                 -WingetId 'jqlang.jq'           -TestCmd { Get-Command jq -ErrorAction SilentlyContinue }
+# Python + jq dropped as prereqs (parity with install.sh, issue #341):
+# identity, signing, hooks, config, and JSON handling are Rust-owned.
+
+# -- Rust toolchain ------------------------------------------------------
+# airc IS a Rust binary; cargo is a hard prereq. install.sh auto-installs
+# Rustlang.Rustup on the winget path -- mirror that here instead of the
+# old hard-exit "go install Rust yourself". winget's Rustup package runs
+# rustup-init, which installs the stable-msvc toolchain and adds
+# %USERPROFILE%\.cargo\bin to the User PATH; Update-SessionPath inside
+# Install-IfMissing makes it visible to THIS session.
+Install-IfMissing -Name 'Rust (rustup)'      -WingetId 'Rustlang.Rustup'     -TestCmd { Get-Command cargo -ErrorAction SilentlyContinue }
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    # rustup installed but cargo not resolving: a fresh rustup-init may
+    # not have set a default toolchain (non-interactive install). Fix it
+    # directly rather than telling the user to open a new shell and guess.
+    $rustupExe = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
+    if (Test-Path $rustupExe) {
+        & $rustupExe default stable
+        Update-SessionPath
+    }
+}
+
+# -- MSVC C++ build tools ------------------------------------------------
+# Validated live on a fresh Windows 11 box (2026-06-10): rustup's default
+# x86_64-pc-windows-msvc target CANNOT LINK without the Visual Studio C++
+# build tools -- `cargo build` dies with a wall of per-crate
+# `error: linking with link.exe failed: exit code: 1` and no guidance.
+# The windows-gnu toolchain is NOT a viable fallback for airc: windows-sys
+# raw-dylib import libs trip the upstream bundled-dlltool bug
+# (rust-lang/rust#103939) and `ring` needs a real C compiler regardless.
+# So: probe for the VC.Tools component via vswhere and auto-install the
+# (license-free) VS 2022 Build Tools with the C++ workload when absent.
+function Test-MsvcToolchain {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { return $false }
+    $vsPath = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    return [bool]$vsPath
+}
+
+if (Test-MsvcToolchain) {
+    Write-Ok 'MSVC C++ build tools already installed'
+} else {
+    Write-Step 'Installing Visual Studio 2022 Build Tools + C++ workload (required to link Rust on Windows; ~2 GB, several minutes) ...'
+    $btArgs = @(
+        'install', '--id', 'Microsoft.VisualStudio.2022.BuildTools',
+        '--exact', '--silent',
+        '--accept-package-agreements', '--accept-source-agreements',
+        '--disable-interactivity',
+        '--override', '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+    )
+    & winget @btArgs
+    if (Test-MsvcToolchain) {
+        Write-Ok 'MSVC C++ build tools installed'
+    } else {
+        # Most likely: VS/BuildTools product exists but lacks the C++
+        # workload, and winget won't modify an existing install. Send the
+        # user to the one place that fixes it instead of letting cargo
+        # produce the inscrutable link.exe wall.
+        Write-Fail 'MSVC C++ build tools still missing after install attempt.'
+        Write-Host '  Open "Visual Studio Installer" -> Modify -> check "Desktop development with C++" -> Install.'
+        Write-Host '  Then re-run this script. (Without it, cargo cannot link on Windows.)'
+        exit 1
+    }
+}
 
 
 Write-Host ''

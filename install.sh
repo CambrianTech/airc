@@ -162,6 +162,69 @@ install_with_pkgmgr() {
 
 
 
+# Windows (Git Bash / MSYS / Cygwin): rustup's default target is
+# x86_64-pc-windows-msvc, which CANNOT LINK without the Visual Studio C++
+# build tools — `cargo build` dies with a per-crate wall of
+# `error: linking with link.exe failed: exit code: 1` and no guidance.
+# Validated live on a fresh Windows 11 box (2026-06-10). The windows-gnu
+# toolchain is NOT a viable fallback for airc: windows-sys raw-dylib
+# import libs hit the upstream bundled-dlltool bug (rust-lang/rust#103939)
+# and `ring` needs a real C compiler regardless. So when we're on Windows
+# with winget available, probe for the VC.Tools component via vswhere and
+# auto-install the (license-free) VS 2022 Build Tools C++ workload.
+_ensure_windows_msvc_toolchain() {
+  local mgr="$1"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) return 0 ;;
+  esac
+
+  # %ProgramFiles(x86)% can't be read as a bash variable (parens are
+  # invalid in names) — ask cmd for it, fall back to the standard path.
+  local pf86
+  pf86=$(cmd //c 'echo %ProgramFiles(x86)%' 2>/dev/null | tr -d '\r')
+  [ -z "$pf86" ] || [ "$pf86" = '%ProgramFiles(x86)%' ] && pf86='C:\Program Files (x86)'
+  local vswhere
+  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
+  [ -x "$vswhere" ] || vswhere=""
+
+  if [ -n "$vswhere" ]; then
+    local vs_path
+    vs_path=$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null || true)
+    if [ -n "$vs_path" ]; then
+      ok "MSVC C++ build tools already installed"
+      return 0
+    fi
+  fi
+
+  if [ "$mgr" != "winget" ]; then
+    warn "MSVC C++ build tools not found and winget unavailable — cargo cannot link on Windows without them."
+    warn "  Install 'Visual Studio 2022 Build Tools' with the 'Desktop development with C++' workload, then re-run."
+    return 0
+  fi
+
+  info "Installing Visual Studio 2022 Build Tools + C++ workload (required to link Rust on Windows; ~2 GB, several minutes)..."
+  local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+  [ -z "$wbin" ] && return 0
+  "$wbin" install --id Microsoft.VisualStudio.2022.BuildTools --exact --silent \
+    --accept-source-agreements --accept-package-agreements --disable-interactivity \
+    --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" \
+    || warn "winget BuildTools install returned non-zero; probing anyway"
+
+  # Re-probe: vswhere ships with Build Tools, so it exists now if the
+  # install worked even when it didn't exist before.
+  vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [ -x "$vswhere" ] && [ -n "$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null)" ]; then
+    ok "MSVC C++ build tools installed"
+  else
+    # Most likely: a VS/BuildTools product exists but lacks the C++
+    # workload, and winget won't modify an existing install.
+    fail "MSVC C++ build tools still missing after install attempt.
+       Open 'Visual Studio Installer' -> Modify -> check 'Desktop development with C++' -> Install.
+       Then re-run install.sh. (Without it, cargo cannot link on Windows.)"
+  fi
+}
+
 ensure_prereqs() {
   [ "${AIRC_SKIP_PREREQS:-0}" = "1" ] && { info "AIRC_SKIP_PREREQS=1 -- skipping prereq install"; return 0; }
 
@@ -265,6 +328,22 @@ ensure_prereqs() {
   else
     ok "All required prereqs present"
   fi
+
+  # Session PATH refresh after a winget rustup install. rustup-init puts
+  # %USERPROFILE%\.cargo\bin on the *registry* User PATH, but this Git
+  # Bash session inherited its PATH at launch — without this export the
+  # script auto-installs Rust and then immediately dies at
+  # _install_airc_binary's "cargo is required" probe. Caught live on a
+  # fresh Windows 11 box, 2026-06-10.
+  if ! command -v cargo >/dev/null 2>&1; then
+    if [ -x "$HOME/.cargo/bin/cargo" ] || [ -x "$HOME/.cargo/bin/cargo.exe" ]; then
+      export PATH="$HOME/.cargo/bin:$PATH"
+      ok "Added ~/.cargo/bin to this session's PATH (rustup install is brand-new)"
+    fi
+  fi
+
+  _ensure_windows_msvc_toolchain "$mgr"
+
   # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
   # Identity gen + signing live in Rust, so system OpenSSL and Python
   # package state are irrelevant to airc install correctness.
