@@ -49,6 +49,17 @@ tries channels in order; the user is involved only when a rung requires it:
    account, or a continuum account created once). Each machine publishes its signed
    peer record there; all machines subscribed to the store auto-enrol each other and
    gossip endpoint updates. **Zero interaction. This is what the gists were for.**
+
+   **The anti-cheat rule (no a-priori knowledge):** the store's location must be
+   DERIVED from the credential alone — discovered by convention (well-known marker on
+   the account's own artifacts), created if absent by whichever machine arrives first.
+   Nothing is ever exchanged out-of-band: no URLs, no codes, no hand-carried specs.
+   The 2026-06-10 bootstrap gist (manually created, URL relayed by the operator) is
+   the canonical EXAMPLE OF FAILURE — it proved agents can compensate for a missing
+   mechanism, not that the mechanism exists. The acceptance test that cannot be
+   cheated: two fresh machines, same credential, zero prior state, zero shared bytes —
+   install + `airc join` on each → enrolled, routed (LAN-first; tailnet only when a
+   node leaves the LAN), message delivered. Any human carrying anything = FAIL.
 2. **Same LAN + shared identity anchor** — mDNS finds the candidate; the anchor (from
    rung 1's store, cached) proves same-owner; auto-pair. Zero interaction, works when
    the store is unreachable (offline LAN).
