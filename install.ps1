@@ -4,13 +4,23 @@
 # same channel persistence -- but bootstraps the Windows-native PS port
 # (airc.ps1) with auto-install of every prereq via winget.
 #
-# Designed for FIRST-TIME Windows users with NOTHING pre-installed.
+# DEV PATH ONLY (zero-friction doctrine, docs/ZERO-FRICTION-PATH.md):
+# users get prebuilt signed binaries and never see this script or a
+# compiler. This source-build path serves contributors, grid-node
+# operators on unreleased branches, and CI; it moves behind --dev once
+# the release pipeline lands.
+#
+# Designed for a FIRST-TIME dev box with NOTHING pre-installed.
 # Runs on the default Windows PowerShell 5.1 (ships with Windows 10+).
 # Installs:
 #   - Git              (clone + update)
-#   - Python 3         (envelope crypto, formatter, helpers)
 #   - GitHub CLI (gh)  (gist transport -- the room IS a private gist)
-#   - jq               (JSON wrangling for the bash scripts)
+#   - Rust (rustup)    (airc IS a Rust binary)
+#   - VS 2022 Build Tools C++ workload (MSVC linker; machine-scope, so
+#     an interactive non-admin session may see ONE OS UAC consent --
+#     winget flags suppress winget's own prompts, not UAC. Run elevated
+#     or be ready to click consent; non-interactive non-admin fails
+#     loudly with recovery guidance.)
 #
 # Post-Phase-3c: no OpenSSH server, no Tailscale, no sshd, no pwsh.
 # The substrate is gh + envelope encryption (X25519 + ChaCha20-Poly1305).
@@ -165,8 +175,8 @@ Write-Host ''
 Test-WingetAvailable
 
 # -- Install prereqs -----------------------------------------------------
-# Order matters lightly: git first so we can clone, then python for the
-# runtime helpers, then gh + jq for the substrate (gist transport).
+# Order matters lightly: git first so we can clone, then gh for the
+# substrate (gist transport), then the Rust toolchain to build airc.
 # pwsh (PowerShell 7+) is intentionally NOT installed -- airc.ps1 is a
 # thin bash shim that runs fine on the built-in PS 5.1, and dropping it
 # removes a 30+ second prereq install (and the visible UAC prompt).
