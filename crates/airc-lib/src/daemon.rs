@@ -372,9 +372,21 @@ impl Airc {
         for channel in channels {
             // Initial attach + ack — fail fast so `subscribe()` errors if
             // the daemon is down right now (don't silently spin).
+            //
+            // Card bf0b5790: `from_now: true` — this is the LIVE
+            // subscribe surface. Without it the daemon interprets
+            // `from: None, from_now: false` as "resume from the start
+            // of the transcript" and full-replays days of history
+            // through the live stream (`airc join` flooded every
+            // attach with the entire event log). Catch-up is a
+            // separate, bounded concern (`resume_from_subscribed_filtered`
+            // with a stored cursor — see `join_feed`); the live stream
+            // starts at the live edge, same as the monitor attach
+            // (card 7d5b6a65).
             let mut stream = client
                 .attach(AttachRequest {
                     channel: Some(channel),
+                    from_now: true,
                     ..Default::default()
                 })
                 .await
@@ -463,10 +475,16 @@ impl Airc {
                         if tx.is_closed() {
                             return; // consumer dropped while we were down
                         }
+                        // Card bf0b5790: a drop BEFORE the first
+                        // delivered event leaves `from: None`; without
+                        // `from_now` that re-attach would full-replay
+                        // the transcript. With a cursor, resume the gap
+                        // exactly as before.
                         let mut s = match client
                             .attach(AttachRequest {
                                 channel: Some(channel),
                                 from,
+                                from_now: from.is_none(),
                                 ..Default::default()
                             })
                             .await
