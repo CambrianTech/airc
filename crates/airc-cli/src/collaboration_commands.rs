@@ -129,23 +129,24 @@ fn machine_account_home_for(scope_home: &Path) -> Option<std::path::PathBuf> {
     // guard the `starts_with($HOME)` check below pulls the REAL machine
     // registry into hermetic tempdir scopes (CI, tests) and real
     // enrolled peers leak into the count. Card b0a81c31; mirrors the
-    // same guard in `airc_lib::machine_account_home`.
+    // same guard in `airc_lib::machine_account_home`, including the
+    // PR #1119 sentinel carve-out: a HOME that is ITSELF temp-rooted is
+    // a test harness simulating a machine account — its temp scopes
+    // legitimately share it, so the guard must not fire.
+    let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)?;
+    let canon_user_home = user_home.canonicalize().unwrap_or(user_home);
     let temp = std::env::temp_dir();
     let canon_temp = temp.canonicalize().unwrap_or(temp);
     let canon_scope_for_temp = scope_home
         .canonicalize()
         .unwrap_or_else(|_| scope_home.to_path_buf());
-    if canon_scope_for_temp.starts_with(&canon_temp) {
+    let home_is_temp_rooted = canon_user_home.starts_with(&canon_temp);
+    if !home_is_temp_rooted && canon_scope_for_temp.starts_with(&canon_temp) {
         return None;
     }
-
-    let user_home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)?;
-    let canon_user_home = user_home.canonicalize().unwrap_or(user_home);
-    let canon_scope = scope_home
-        .canonicalize()
-        .unwrap_or_else(|_| scope_home.to_path_buf());
+    let canon_scope = canon_scope_for_temp;
     if canon_scope.starts_with(&canon_user_home) {
         Some(canon_user_home.join(".airc"))
     } else {

@@ -72,12 +72,29 @@ pub fn machine_account_home(scope_home: &Path) -> PathBuf {
     // `peer_record_count_requires_valid_json_files` started failing the
     // moment a real peer was enrolled on the machine, while virgin
     // boxes (and therefore CI) kept passing.
+    //
+    // Carve-out (sentinel on PR #1119): when HOME/USERPROFILE is ITSELF
+    // temp-rooted, a test harness is simulating a machine account by
+    // pointing the home at a TempDir (daemon_lifecycle does exactly
+    // this) — its scopes legitimately share that simulated account, so
+    // the temp guard must not fire. Real boxes never have a temp-rooted
+    // home, so the b0a81c31 fix is unaffected.
     let temp = std::env::temp_dir();
     let normalized_temp = temp.canonicalize().unwrap_or(temp);
     let normalized_scope_for_temp = scope_home
         .canonicalize()
         .unwrap_or_else(|_| scope_home.to_path_buf());
-    if normalized_scope_for_temp.starts_with(&normalized_temp) {
+    let home_var = std::env::var_os("HOME").map(PathBuf::from);
+    let profile_var = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let any_home_is_temp_rooted = [home_var.as_ref(), profile_var.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|h| {
+            h.canonicalize()
+                .unwrap_or_else(|_| h.clone())
+                .starts_with(&normalized_temp)
+        });
+    if !any_home_is_temp_rooted && normalized_scope_for_temp.starts_with(&normalized_temp) {
         return scope_home.to_path_buf();
     }
 
