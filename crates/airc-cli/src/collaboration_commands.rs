@@ -124,6 +124,21 @@ fn rust_peer_registry_paths(home: &Path) -> Vec<std::path::PathBuf> {
 /// state. Keeps `peer_record_count` hermetic in tests while still
 /// surfacing same-machine peers when the user actually runs `airc`.
 fn machine_account_home_for(scope_home: &Path) -> Option<std::path::PathBuf> {
+    // Temp-rooted scopes never resolve a machine-account home. On
+    // Windows `%TEMP%` lives INSIDE `%USERPROFILE%`, so without this
+    // guard the `starts_with($HOME)` check below pulls the REAL machine
+    // registry into hermetic tempdir scopes (CI, tests) and real
+    // enrolled peers leak into the count. Card b0a81c31; mirrors the
+    // same guard in `airc_lib::machine_account_home`.
+    let temp = std::env::temp_dir();
+    let canon_temp = temp.canonicalize().unwrap_or(temp);
+    let canon_scope_for_temp = scope_home
+        .canonicalize()
+        .unwrap_or_else(|_| scope_home.to_path_buf());
+    if canon_scope_for_temp.starts_with(&canon_temp) {
+        return None;
+    }
+
     let user_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)?;
