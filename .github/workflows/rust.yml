@@ -101,6 +101,12 @@ jobs:
     # only execute when the test job actually runs on Windows.
     name: cargo test (${{ matrix.display }})
     runs-on: ${{ matrix.os }}
+    # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+    # only runs for pushes and same-repo PRs. The repo-level fork-PR
+    # approval policy (all_external_contributors) is a mutable SETTING;
+    # this condition lives in-repo so a policy regression alone can't
+    # put fork code on the bigmama runner. Hosted legs are unaffected.
+    if: ${{ !contains(toJSON(matrix.os), 'self-hosted') || github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
