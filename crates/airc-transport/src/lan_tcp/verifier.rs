@@ -86,7 +86,11 @@ impl ServerCertVerifier for PinnedServerVerifier {
                 expected = self.expected_peer
             ))),
             None => Err(RustlsError::General(format!(
-                "server cert pubkey is not enrolled (expected peer {})",
+                "server cert pubkey is not enrolled (expected peer {}) — either the \
+                 server runs an identity you never enrolled (compare `airc init` \
+                 output there), or this client consulted a different trust store \
+                 than the one you enrolled into (stores are per-scope; see the \
+                 lan-send preflight error for the store path)",
                 self.expected_peer
             ))),
         }

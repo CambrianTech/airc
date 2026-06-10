@@ -667,6 +667,15 @@ pub async fn run_lan_send(
     expected_peer: PeerId,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Card bf7c30e2: fail FAST with a self-diagnosing error before
+    // dialing. Trust stores are per-scope (cwd's git root), so a peer
+    // enrolled in one directory is invisible from another; without
+    // this preflight the mismatch surfaced as a mid-TLS-handshake
+    // "cert pubkey is not enrolled" that named neither the store it
+    // consulted nor the likely cause — which cost a live cross-machine
+    // route outage and a three-message debugging exchange. The walker
+    // only knows its cwd; the error must tell it which world it's in.
+    preflight_expected_peer(home, &peers, expected_peer).await?;
     let airc = Airc::open(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
@@ -679,6 +688,35 @@ pub async fn run_lan_send(
         current.name, current.channel
     );
     Ok(())
+}
+
+/// Card bf7c30e2: verify `expected_peer` is actually known to the
+/// trust material this invocation will use — the scope's persistent
+/// store at `home` plus any ad-hoc `--peer` specs — and if not, say
+/// exactly which store was consulted and what to do about it.
+async fn preflight_expected_peer(
+    home: &Path,
+    volatile: &[PeerSpec],
+    expected_peer: PeerId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if volatile.iter().any(|p| p.peer_id == expected_peer) {
+        return Ok(());
+    }
+    let enrolled = airc_trust::load(home).await?;
+    if enrolled.iter().any(|p| p.peer_id == expected_peer) {
+        return Ok(());
+    }
+    Err(format!(
+        "peer {expected_peer} is not enrolled in the trust store this command uses:\n  \
+         store: {home} ({n} peer(s) enrolled)\n  \
+         Trust stores are per-scope — the scope comes from the cwd's git root \
+         (or $AIRC_HOME). If you enrolled this peer in a different directory, \
+         re-run from there, pass --home <that-scope>, or enrol here:\n  \
+         airc peer add <uuid>:<pubkey>",
+        home = home.display(),
+        n = enrolled.len(),
+    )
+    .into())
 }
 
 /// `lan-listen` — bind a TLS server, accept peers, print frames.
@@ -1327,6 +1365,48 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card bf7c30e2: the preflight error is self-diagnosing — it
+    /// names the exact store consulted, its enrolled count, and the
+    /// per-scope cause, so a cwd mismatch is identifiable from the
+    /// error alone (the program-pointer rule: the walker only knows
+    /// its cwd; the error must tell it which world it's in).
+    #[tokio::test]
+    async fn lan_send_preflight_names_the_store_it_consulted() {
+        let scope = tempfile::tempdir().expect("tempdir");
+        let expected = PeerId::from_uuid("55536f5f-ffde-4e9f-ae1f-32d1a33ec31e".parse().unwrap());
+        let err = preflight_expected_peer(scope.path(), &[], expected)
+            .await
+            .expect_err("empty store must fail preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&scope.path().display().to_string()),
+            "error must name the consulted store path: {msg}"
+        );
+        assert!(
+            msg.contains("0 peer(s) enrolled"),
+            "error must state the enrolled count: {msg}"
+        );
+        assert!(
+            msg.contains("per-scope"),
+            "error must explain the per-scope cause: {msg}"
+        );
+    }
+
+    /// An ad-hoc `--peer` spec for the expected peer satisfies the
+    /// preflight without touching the persistent store.
+    #[tokio::test]
+    async fn lan_send_preflight_accepts_volatile_peer_spec() {
+        let scope = tempfile::tempdir().expect("tempdir");
+        let spec: PeerSpec =
+            "55536f5f-ffde-4e9f-ae1f-32d1a33ec31e:-OPD_KbcJrqfZlXcBiN9x3QN9EtahW4URXCdY30b-s8"
+                .parse()
+                .expect("spec parses");
+        let expected = spec.peer_id;
+        preflight_expected_peer(scope.path(), &[spec.clone()], expected)
+            .await
+            .expect("volatile spec must satisfy preflight");
+    }
 
     fn status(commit: Option<&str>, protocol: Option<u32>) -> airc_ipc::StatusResponse {
         airc_ipc::StatusResponse {
