@@ -713,6 +713,13 @@ async fn preflight_expected_peer(
     if volatile.iter().any(|p| p.peer_id == expected_peer) {
         return Ok(());
     }
+    // Self-dial is always legal: the verifier registry enrols this
+    // scope's own identity (loopback testing), but `peers()` filters
+    // self out — without this check the preflight refuses a dial TLS
+    // would accept (round-3 review catch).
+    if expected_peer == airc.peer_id() {
+        return Ok(());
+    }
     let enrolled = airc.peers().await?;
     if enrolled.iter().any(|p| p.peer_id == expected_peer) {
         return Ok(());
@@ -727,7 +734,7 @@ async fn preflight_expected_peer(
          re-run from there, pass --home <that-scope>, or enrol here:\n  \
          airc peer add <uuid>:<pubkey>",
         home = home.display(),
-        machine = airc_lib::machine_account_home(home).display(),
+        machine = airc.wire_root().display(),
         n = enrolled.len(),
     )
     .into())
@@ -1437,10 +1444,24 @@ mod tests {
             .await
             .expect("volatile spec must satisfy preflight");
 
-        airc.add_peer(spec).await.expect("persist peer");
+        // THE DISCRIMINATING CASE (round-3 mutation-test catch): enrol
+        // into the WIRE-ROOT (machine) store ONLY — the store round-1's
+        // buggy preflight could not see. This test fails under the
+        // round-1 mutation (`airc_trust::load(home)`) and passes with
+        // the union; the prior version (add_peer → scope store) passed
+        // under both and pinned nothing.
+        peers_store::add(wire_root.path(), spec.peer_id, spec.pubkey)
+            .await
+            .expect("enrol into wire-root store");
         preflight_expected_peer(&airc, scope.path(), &[], expected)
             .await
-            .expect("persistently enrolled peer must satisfy preflight");
+            .expect("machine-store-only peer must satisfy preflight (verifier union)");
+
+        // Self-dial: peers() filters self, the verifier accepts self —
+        // preflight must side with the verifier.
+        preflight_expected_peer(&airc, scope.path(), &[], airc.peer_id())
+            .await
+            .expect("own peer id must always pass preflight");
     }
 
     fn status(commit: Option<&str>, protocol: Option<u32>) -> airc_ipc::StatusResponse {

@@ -406,6 +406,15 @@ impl Airc {
         &self.inner.home
     }
 
+    /// The wire root this handle actually resolves shared state
+    /// against (the machine-account home in production; an isolated
+    /// root under the for-test constructors). Exposed so diagnostics
+    /// can name the REAL store consulted instead of recomputing a
+    /// path that may diverge (card bf7c30e2 round 3).
+    pub fn wire_root(&self) -> &Path {
+        &self.inner.wire_root
+    }
+
     /// Return the local peer's stable identifier.
     pub fn peer_id(&self) -> PeerId {
         self.inner.identity.peer_id
