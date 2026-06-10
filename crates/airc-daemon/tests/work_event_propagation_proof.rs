@@ -123,11 +123,7 @@ async fn collect_envelopes(
 ) -> Vec<Envelope> {
     let client = DaemonClient::new(socket);
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            ..Default::default()
-        })
+        .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {

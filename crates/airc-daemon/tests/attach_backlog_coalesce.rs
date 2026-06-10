@@ -18,11 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
+use airc_core::{Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, DaemonClient, IpcDelivery, IpcKind, IpcTarget, PublishRequest, Response,
+    AttachRequest, AttachStart, DaemonClient, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
+    Response,
 };
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, InMemoryEventStore};
@@ -129,15 +130,7 @@ async fn attach_from_now_skips_full_backlog() {
 
     let client = DaemonClient::new(daemon.socket.clone());
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            from_now: true,
-            coalesce_backlog: false,
-            kinds: None,
-            delivery: None,
-            headers: HeaderFilter::default(),
-        })
+        .attach(AttachRequest::new(channel, AttachStart::Live))
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
@@ -215,15 +208,9 @@ async fn attach_coalesce_backlog_emits_one_summary_then_live() {
 
     let client = DaemonClient::new(daemon.socket.clone());
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            from_now: false,
-            coalesce_backlog: true,
-            kinds: None,
-            delivery: None,
-            headers: HeaderFilter::default(),
-        })
+        .attach(
+            AttachRequest::new(channel, AttachStart::FromTranscriptStart).with_coalesced_backlog(),
+        )
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
@@ -307,12 +294,11 @@ async fn attach_legacy_shape_still_replays_event_by_event() {
 
     let client = DaemonClient::new(daemon.socket.clone());
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            // Both new fields default to false — the legacy wire shape.
-            ..Default::default()
-        })
+        // The legacy wire shape: full transcript replay, named explicitly.
+        .attach(AttachRequest::new(
+            channel,
+            AttachStart::FromTranscriptStart,
+        ))
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
