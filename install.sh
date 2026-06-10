@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# AIRC installer
+# AIRC installer — DEV PATH ONLY (zero-friction doctrine,
+# docs/ZERO-FRICTION-PATH.md): users get prebuilt signed binaries and
+# never see this script or a compiler. This source-build path serves
+# contributors, grid operators on unreleased branches, and CI; it moves
+# behind --dev once the release pipeline lands.
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
@@ -212,8 +216,10 @@ _ensure_windows_msvc_toolchain() {
     || warn "winget BuildTools install returned non-zero; probing anyway"
 
   # Re-probe: vswhere ships with Build Tools, so it exists now if the
-  # install worked even when it didn't exist before.
-  vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  # install worked even when it didn't exist before. Reuse the resolved
+  # pf86 (not a hardcoded /c/...) so Cygwin (/cygdrive/c) and relocated
+  # ProgramFiles(x86) do not false-fail after a successful install.
+  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
   if [ -x "$vswhere" ] && [ -n "$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null)" ]; then
     ok "MSVC C++ build tools installed"
   else
