@@ -29,7 +29,7 @@ Every row below is a thing a human did during the 2026-06-10 5090 bring-up. None
 | Installed rustup + MSVC BuildTools, compiled from source | **Prebuilt signed release binaries** per platform (win-x64, mac-arm64/x64, linux-x64) built by CI on tag; installer = download + verify hash/signature + run. Source build stays behind `--dev`. | release.yml: NO. Installer rework: #1115 reframed dev-path | NEW: release pipeline card |
 | Wrong branch installed (legacy canary vs rust-rewrite), parallel ghost mesh | **Single release channel + protocol-line marker in rendezvous artifacts**; join REFUSES or loudly warns on line mismatch ("this room lives on a newer protocol — updating…" → self-update → retry) | NO (card 01c7320c) | 01c7320c |
 | `cargo install` wrote to a dir PATH didn't serve (stale binary ran for hours) | **Self-updating binary**: the daemon checks the release feed, swaps itself atomically in ONE canonical location, restarts. The version-skew banner stops telling humans to run cargo; it becomes a trigger for self-update. | NO (cards 6564fcc6 + this) | 6564fcc6 grows into self-update |
-| Manual peer-spec paste (uuid:pubkey over a gist) | **Machines pair THEMSELVES — the pairing waterfall** (Joel: 'don't frustrate users with stupid codes we can pass ourselves'). What must cross is tiny and machine-readable: signed peer record (peer_id, pubkey, endpoints, protocol-line). Any authenticated channel both machines already hold carries it automatically — tonight's irony is that BOTH machines had the same gh auth and agents hand-pasted specs through a gist; airc must do natively what we did manually: publish signed peer-record blobs to the account store, read peers', mutually enrol. See §Pairing waterfall. Codes exist only at the waterfall's bottom. | Account-registry room convergence: YES (rooms only). Peer-record carriage: NO. Mnemonic fallback: YES | NEW card (peer-record auto-exchange) + 625abe6d |
+| Manual peer-spec paste (uuid:pubkey over a gist) | **Machines pair THEMSELVES — the pairing waterfall** (Joel: 'don't frustrate users with stupid codes we can pass ourselves'). What must cross is tiny and machine-readable: signed peer record (peer_id, pubkey, endpoints, protocol-line). Any authenticated channel both machines already hold carries it automatically — tonight's irony is that BOTH machines had the same gh auth and agents hand-pasted specs through a gist; airc must do natively what we did manually: publish signed peer-record blobs to the account store, read peers', mutually enrol. See §Pairing waterfall. Codes exist only at the waterfall's bottom. | Account-registry room convergence: YES; carriage SCHEMA exists (AccountRegistryDocument.peers has peer_spec+endpoints) but join/resolver never consume it. Mnemonic fallback: YES | e3ebce7a (regression-restore, wiring) + 625abe6d |
 | Manual endpoint exchange + lan-send/lan-listen bisection | **LAN auto-discovery (mDNS/DNS-SD)**: every node announces (peer_id, endpoints, protocol-line) on the local network; resolver collects candidates without any exchange. `mdns-sd` crate, pure Rust, no elevation. | NO | 625abe6d (discovery leg) |
 | Routes never formed (peer records have no endpoint) | **Multi-endpoint peer records raced in cost order** (LAN → tailnet → relay), continuous health-checks, automatic failover, relay-by-default forwarding with original-signature preservation | NO — THE routes card | 625abe6d (owner: 5090 agent) |
 | Windows Firewall inbound caveat | **Outbound-only participation as a hard guarantee**: listen endpoints are an optimization some nodes advertise, never a requirement. A node that can make ONE outbound TLS/QUIC connection to any reachable peer is fully on the mesh (relay carries the rest). No inbound rule can ever be needed. | Doctrine accepted into 625abe6d design | 625abe6d |
@@ -44,15 +44,26 @@ What pairing must exchange: one **signed peer record** per machine — `(peer_id
 endpoints[], protocol-line)`, ~200 bytes. Small enough for ANY channel. The waterfall
 tries channels in order; the user is involved only when a rung requires it:
 
-1. **Shared authenticated store** (dev: the gh account that machines already hold;
-   user: whatever sign-in the platform already gave the machine — Apple/Google/OS
-   account, or a continuum account created once). Each machine publishes its signed
-   peer record there; all machines subscribed to the store auto-enrol each other and
-   gossip endpoint updates. **Zero interaction. This is what the gists were for.**
+1. **Shared authenticated store** — and "shared" is defined honestly: the store rides
+   ONE designated credential, resolved in order: (a) a continuum account if the user
+   has one (the only credential that spans a mac+windows+linux household — for the
+   cross-platform case this IS a journey step: one sign-in per machine, stated, not
+   hidden); (b) the gh account for dev installs; (c) a same-ecosystem platform account
+   (Apple/Google) only when every machine shares it. Multi-account machines use the
+   credential the install was performed under — never guessed. Each machine publishes
+   its signed peer record there; all machines holding the store auto-enrol each other
+   and gossip endpoint updates. **Zero interaction in the common case. This is what
+   the gists were for.**
 
    **The anti-cheat rule (no a-priori knowledge):** the store's location must be
    DERIVED from the credential alone — discovered by convention (well-known marker on
-   the account's own artifacts), created if absent by whichever machine arrives first.
+   the account's own artifacts). **No single create-if-absent store**: the codebase
+   already solved the creation race with per-writer artifacts + reader-side merge
+   (`gh_account_registry.rs`, "why not a single shared gist") — each machine writes its
+   own record artifact; readers merge all of them. No clock-based arbitration, no race.
+   The carriage schema ALREADY EXISTS (`AccountRegistryDocument.peers` carries
+   `peer_spec` + `endpoints` — `account_registry.rs`): card e3ebce7a is a WIRING
+   regression-restore, not new construction.
    Nothing is ever exchanged out-of-band: no URLs, no codes, no hand-carried specs.
    The 2026-06-10 bootstrap gist (manually created, URL relayed by the operator) is
    the canonical EXAMPLE OF FAILURE — it proved agents can compensate for a missing
@@ -64,8 +75,13 @@ tries channels in order; the user is involved only when a rung requires it:
    rung 1's store, cached) proves same-owner; auto-pair. Zero interaction, works when
    the store is unreachable (offline LAN).
 3. **Same LAN, no shared anchor** — mDNS finds the candidate; an EXISTING grid machine
-   surfaces "found 'bigmama' on your network — yours? [yes]". **One tap on a machine
-   the user already trusts. No codes, nothing typed on the new machine.**
+   surfaces the adoption prompt. **Name-only confirmation is forbidden** (mDNS announces
+   are forgeable; on open wifi an attacker can win adoption in either direction): both
+   screens display the same short authentication string derived from the key exchange
+   (emoji/word pair), and the prompt is "found 'bigmama' — does it show 🦊-🌊? [yes]".
+   One glance, one tap, nothing typed — but the tap now verifies cryptographic material,
+   not an attacker-chosen name. A node admitted with a skipped/failed SAS lands at
+   `Untrusted` tier with explicit promotion required (trust tiers survive automation).
 4. **Remote + no common anything** — only here does the 4-word mnemonic / QR appear,
    and it is generated and consumed by machines (user relays it once, by voice or
    camera). This rung is the FALLBACK, never the design center.
@@ -81,8 +97,14 @@ that already exists — never mint a new credential, never show a human a token.
 1. **Release pipeline** (binaries + signatures + channels) — unlocks binary-first installer
    AND self-update AND the promotion story (main = stable channel). Smallest slice with
    the largest deletion of friction. The 5090 is the Windows build/test bench.
-2. **625abe6d routes** (endpoints, cost-order racing, outbound-only, relay, self-heal) —
-   unlocks cross-machine steady state, deletes all manual transport ceremony. In flight.
+2. **625abe6d routes + e3ebce7a record carriage TOGETHER** (the resolver's input feed is
+   the store-carried records — schema already present, wiring only; sequencing them
+   apart was a dependency inversion). Unlocks cross-machine steady state. In flight.
+   **Relay provisioning is named here, not assumed**: outbound-only is only a hard
+   guarantee when some inbound-accepting node exists — any grid node with a reachable
+   endpoint qualifies (relay-by-default), tailnet covers the interim, and the
+   two-NAT'd-machines-no-LAN case is served by the federated self-hostable relay that
+   ships WITH unlock #5's rendezvous service (one deployable, two roles).
 3. **Self-update + continuous doctor** — deletes the entire version-skew class.
 4. **Pairing waterfall rungs 1-3** (peer-record auto-exchange via existing store, mDNS +
    anchor, one-tap LAN adopt) — deletes pairing ceremony outright; the mnemonic survives
