@@ -310,6 +310,22 @@ impl Airc {
                 peer.peer_spec.pubkey,
             )
             .await?;
+            // Card 625abe6d slice 1: persist the beacon's endpoints on
+            // the trust record so route discovery can dial them after
+            // a restart (the in-memory ImportedInviteTable fed below
+            // does not survive one). Empty beacons leave the column
+            // alone — a registry refresh without endpoints must not
+            // wipe endpoints learned elsewhere.
+            if !peer.endpoints.is_empty() {
+                let endpoints_json = crate::route::endpoints_to_json(&peer.endpoints)
+                    .map_err(|error| AircError::Transport(error.to_string()))?;
+                airc_trust::set_endpoints_json(
+                    &self.inner.wire_root,
+                    peer.peer_spec.peer_id,
+                    Some(endpoints_json),
+                )
+                .await?;
+            }
             self.enrol_volatile_peer(&peer.peer_spec)?;
             crate::coordinator::publish_store(
                 self.coordinator_store(),

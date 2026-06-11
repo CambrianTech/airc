@@ -56,6 +56,15 @@ pub async fn run_health(
     } else {
         println!("lan peers: {}", snapshot.connected_lan_peers.len());
     }
+    // Card 625abe6d slice 1: every failed outbound dial to a stored
+    // peer endpoint is visible here — an offline peer is normal mesh
+    // weather, a silently-undialed endpoint is a bug.
+    for failure in &snapshot.peer_dial_failures {
+        println!(
+            "dial failed: {} via {:?} — {}",
+            failure.peer_id, failure.endpoint, failure.error
+        );
+    }
 
     if degraded == 0 || !fail {
         Ok(())

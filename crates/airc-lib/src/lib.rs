@@ -124,9 +124,10 @@ pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use room::Room;
 pub use route::{
-    ImportedInvite, InviteBeacon, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint,
-    RoutePolicy, TransportCandidate, TransportHealthSample, TransportHealthState,
-    TransportHealthTable, TransportKind, TransportResolver, TransportRole, TransportRoute,
+    endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, PeerDialFailure,
+    RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
+    TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
+    TransportKind, TransportResolver, TransportRole, TransportRoute,
 };
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{

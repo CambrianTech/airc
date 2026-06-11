@@ -117,6 +117,11 @@ pub struct StoredPeer {
     /// (Sub-B detection, `airc peer add --tier=…`) sets a higher
     /// tier.
     pub tier: TrustTier,
+    /// Card 625abe6d slice 1: serde JSON of the peer's advertised
+    /// `Vec<RouteEndpoint>`. Opaque at this layer (the enum lives in
+    /// airc-lib, above this crate); `None` = identity-only enrolment
+    /// — the route resolver gets no dial candidates from this record.
+    pub endpoints_json: Option<String>,
 }
 
 impl StoredPeer {

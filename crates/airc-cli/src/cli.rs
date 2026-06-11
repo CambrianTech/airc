@@ -1080,6 +1080,13 @@ pub struct PeerArgs {
     pub action: PeerAction,
 }
 
+/// clap value_parser shim for `--endpoint` — clap wants a
+/// `fn(&str) -> Result<T, E>` and the typed parser lives with the
+/// enum in airc-lib.
+fn parse_cli_route_endpoint(input: &str) -> Result<airc_lib::RouteEndpoint, String> {
+    airc_lib::RouteEndpoint::parse_cli(input)
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PeerAction {
     /// Enrol a peer by spec. If a daemon is running on
@@ -1099,6 +1106,16 @@ pub enum PeerAction {
         /// Toby's airc, OwnAccount on his other machine, etc.).
         #[arg(long, value_enum)]
         tier: Option<CliTrustTier>,
+        /// Card 625abe6d slice 1 (DEV verb — production endpoints
+        /// arrive via the account registry / mDNS): advertise where
+        /// this peer can be dialed. Repeatable; stored order = dial
+        /// cost order. Forms: `lan-tcp:HOST:PORT`,
+        /// `tailscale-tcp:HOST:PORT`, `udp:HOST:PORT`, `relay:URL`.
+        /// Route discovery (`airc transport health`, daemon refresh)
+        /// dials these outbound — the peer never needs an inbound
+        /// rule on OUR side.
+        #[arg(long = "endpoint", value_parser = parse_cli_route_endpoint)]
+        endpoints: Vec<airc_lib::RouteEndpoint>,
     },
     /// Remove a peer from local trust.
     Remove {

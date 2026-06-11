@@ -13,9 +13,11 @@ pub mod resolver;
 
 pub(crate) mod execution;
 
-pub use discovery::RouteDiscoverySnapshot;
+pub use discovery::{PeerDialFailure, RouteDiscoverySnapshot};
 pub use health::{TransportHealthSample, TransportHealthState, TransportHealthTable};
-pub use invite::{ImportedInvite, InviteBeacon, RouteEndpoint};
+pub use invite::{
+    endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, RouteEndpoint,
+};
 pub use policy::{
     RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind, TransportRole,
 };

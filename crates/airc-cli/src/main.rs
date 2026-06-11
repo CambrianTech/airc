@@ -396,9 +396,20 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Part { room } => commands::run_part(&home, room).await,
 
         Command::Peer(args) => match args.action {
-            PeerAction::Add { spec, socket, tier } => {
-                commands::run_peer_add(&home, spec, default_or(socket, &home), tier.map(Into::into))
-                    .await
+            PeerAction::Add {
+                spec,
+                socket,
+                tier,
+                endpoints,
+            } => {
+                commands::run_peer_add(
+                    &home,
+                    spec,
+                    default_or(socket, &home),
+                    tier.map(Into::into),
+                    endpoints,
+                )
+                .await
             }
             PeerAction::Remove { peer_id, socket } => {
                 let peer_id = parse_peer_id(&peer_id)?;
