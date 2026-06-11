@@ -1603,6 +1603,7 @@ fn apply_windowed_skips_missing_anchor_and_fails_structural_errors() {
         created_by: peer(3),
         created_at_ms: 100,
         reviews: None,
+        origin: None,
     });
     projection.apply_windowed(&created).unwrap();
     assert!(projection.card(card_id).is_some());
