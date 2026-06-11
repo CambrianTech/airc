@@ -435,6 +435,34 @@ mod tests {
         }
     }
 
+    /// Card 13cae1db: the EXACT serialized bytes for each `AttachStart`
+    /// variant ARE the cross-version contract. The decode side is pinned
+    /// by the raw-JSON tests below; this pins the encode side, so a
+    /// SYMMETRIC serde rename (e.g. `from_now` → `start_now` on both the
+    /// field and these literals) still fails a test instead of silently
+    /// breaking old daemons that only speak the legacy flag pair.
+    #[test]
+    fn attach_start_wire_bytes_are_pinned_per_variant() {
+        let channel = airc_core::RoomId(Uuid::nil());
+        for (start, expected) in [
+            (
+                AttachStart::Live,
+                r#"{"channel":"00000000-0000-0000-0000-000000000000","from_now":true,"headers":"any"}"#,
+            ),
+            (
+                AttachStart::After(cursor(7)),
+                r#"{"channel":"00000000-0000-0000-0000-000000000000","from":{"epoch":1,"counter":7,"event_id":"00000000-0000-0000-0000-00000000feed"},"headers":"any"}"#,
+            ),
+            (
+                AttachStart::FromTranscriptStart,
+                r#"{"channel":"00000000-0000-0000-0000-000000000000","headers":"any"}"#,
+            ),
+        ] {
+            let encoded = serde_json::to_string(&AttachRequest::new(channel, start)).unwrap();
+            assert_eq!(encoded, expected, "wire bytes of {start:?}");
+        }
+    }
+
     /// Card c0cb6cdc: a bare request from a pre-AttachStart client
     /// (no `from`, no `from_now` on the wire) keeps its legacy meaning —
     /// full transcript replay — so version-skewed peers interoperate.
