@@ -1060,6 +1060,19 @@ impl Airc {
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let mut rooms = Vec::new();
 
+        // Card 1eae6f3e: the default room is DURABLE scope state. This
+        // method re-runs constantly (init re-runs, daemon-bounce
+        // recovery, monitor resume) and often from a cwd with no git
+        // checkout, where the inferred context default degrades to
+        // `#general`. Treating that inference as authoritative on every
+        // run silently demoted `#cambriantech` → `#general` and the
+        // next `airc msg` misrouted. Snapshot what was subscribed
+        // BEFORE this run so the context default is promoted only when
+        // it is genuinely new to this scope (first entry into a project
+        // context) — never to overwrite an established default.
+        let previous_default = set.default.clone();
+        let context_default_was_subscribed = set.subscribed.contains_key(&context.default);
+
         for channel in context.channels {
             if set.parted.contains(&channel) {
                 continue;
@@ -1069,8 +1082,27 @@ impl Airc {
             rooms.push(subscription.as_room());
         }
 
-        if set.subscribed.contains_key(&context.default) {
+        let default_missing_or_dangling = match &set.default {
+            None => true,
+            Some(name) => !set.subscribed.contains_key(name),
+        };
+        if set.subscribed.contains_key(&context.default)
+            && (default_missing_or_dangling || !context_default_was_subscribed)
+        {
             set.set_default(context.default)?;
+        }
+        if let (Some(old), Some(new)) = (&previous_default, &set.default) {
+            if old != new {
+                // LOUD state-change visibility (card 1eae6f3e): a
+                // default-room change re-targets every short-shape
+                // `airc msg` in this scope. Never let it happen
+                // silently.
+                tracing::warn!(
+                    old = %old.display_with_hash(),
+                    new = %new.display_with_hash(),
+                    "default room CHANGED by join context — short-shape sends now target the new room"
+                );
+            }
         }
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
