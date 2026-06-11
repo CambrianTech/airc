@@ -52,6 +52,22 @@ yours. Specifically:
   feature branches (the `feat/owner-daemon-slice1` pattern earlier
   this session was the anti-pattern — `airc work claim` spawns
   per-card branches that get deleted on merge, not persistent lanes).
+- **Never idle on review or CI — they are asynchronous and
+  self-resolving.** A PR in Review or a CI run in flight is **not** a
+  blocker and **not** a reason to stop; the author does not wait on
+  their own PR. The moment you hand a card to Review, claim the next
+  card (airc work next) and keep moving. When work is continuous, stack
+  the next branch on your last rather than waiting for the predecessor
+  to merge. Arm an auto-merge-on-green watcher (or lean on the merger
+  daemon once it exists) instead of polling — arm a sentinel and go.
+  The **only** real blockers are: a failing gate you must fix, a
+  genuine human-only decision, or code that cannot compile without
+  unmerged work (and then base the branch on the one that has it).
+  Idle while claimable work exists is a defect, not a rest state — for
+  every agent, and for personas, which inherit this by attaching to the
+  same room. Structural enforcement (Review state not marking the
+  author busy, work-next auto-suggest, the merger daemon) is tracked as
+  the companion P0 card `d327b903`.
 - **Self-review during edits.** `cargo fmt` + `cargo clippy
   --all-targets -- -D warnings` LOCALLY before commit, not relying on
   CI to catch what you should have caught. Drift across 26 files
