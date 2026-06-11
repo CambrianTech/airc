@@ -108,6 +108,11 @@ pub use daemon::decode_wire_event;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
+// Observability macros live in the substrate (airc-diagnostics) so
+// every consumer reaches for them downward: `airc_lib::probe!` /
+// `airc_lib::time_probe!`. The `probe` re-export carries both the
+// `probe!`/`time_probe!` macros and the `probe::class` constants.
+pub use airc_diagnostics::{probe, time_probe};
 pub use error::AircError;
 pub use external_identity::{
     BridgedMessage, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource,
