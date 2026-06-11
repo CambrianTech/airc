@@ -111,12 +111,31 @@ impl Airc {
     }
 
     /// Return a list of enrolled peers.
+    ///
+    /// A node legitimately carries MORE THAN ONE of its own
+    /// identities under a single machine account: the scope identity
+    /// (`home`) that this handle was opened with, AND the
+    /// machine-account identity that the daemon's account-registry
+    /// loop opens against `machine_account_home(home)` (its own
+    /// distinct keypair). Both are SELF — neither is a paired remote
+    /// peer. The account-registry auto-discovery keystone (card
+    /// a134b370) made this split observable: the loop's `Airc::open`
+    /// enrols its machine-account identity into the SHARED `wire_root`
+    /// trust store, and a `peers()` that filtered only the scope
+    /// identity then counted the node's OWN beacon as a "1 paired
+    /// remote peer" — violating the no-lying-about-delivery invariant
+    /// a lone node depends on (events_commands
+    /// `send_receipt_distinguishes_zero_paired_peers_without_lying_about_delivery`).
+    /// Excluding EVERY self identity (across all of the node's homes)
+    /// is the correct boundary: a peer is "remote" only if its key is
+    /// none of ours.
     pub async fn peers(&self) -> Result<Vec<EnrolledPeer>, AircError> {
+        let self_ids = self.self_peer_ids().await?;
         let stored =
             crate::airc::load_peer_registries(&self.inner.home, &self.inner.wire_root).await?;
         let mut peers = stored
             .into_iter()
-            .filter(|p| p.peer_id != self.inner.identity.peer_id)
+            .filter(|p| !self_ids.contains(&p.peer_id))
             .map(|p| EnrolledPeer {
                 peer_id: p.peer_id,
                 pubkey_b64: p.pubkey_b64,
@@ -125,5 +144,113 @@ impl Airc {
         peers.sort_by_key(|p| p.peer_id.to_string());
         peers.dedup_by_key(|p| p.peer_id);
         Ok(peers)
+    }
+
+    /// The set of peer ids that are THIS node — never a paired remote
+    /// peer. Always includes the in-memory scope identity this handle
+    /// holds. When the machine-account home differs from the scope
+    /// home (the daemon/account-registry-loop case), it ALSO includes
+    /// the machine-account identity recorded in the shared wire-root
+    /// coordinator store, so a node's own auto-discovery beacon can
+    /// never round-trip back as a "remote" peer. Best-effort on the
+    /// wire-root lookup: a missing/unreadable machine-account identity
+    /// degrades to the scope-only filter (the prior behaviour), never
+    /// an error on the hot send path.
+    pub(crate) async fn self_peer_ids(&self) -> Result<Vec<PeerId>, AircError> {
+        let mut ids = vec![self.inner.identity.peer_id];
+        if self.inner.wire_root != self.inner.home {
+            if let Ok(Some(stored)) = self.coordinator_store().load_local_identity().await {
+                if !ids.contains(&stored.peer_id) {
+                    ids.push(stored.peer_id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Airc;
+    use tempfile::tempdir;
+
+    /// Regression for the account-registry auto-discovery keystone
+    /// (card a134b370): the daemon's registry-refresh loop opens its
+    /// OWN `Airc` handle against the machine-account home — a distinct
+    /// keypair from any scope handle — and `Airc::open` enrols that
+    /// machine-account identity into the SHARED wire-root trust store.
+    /// A scope handle's `peers()` must NOT count that as a paired
+    /// remote peer: it is the node's own auto-discovery beacon. This
+    /// is exactly the topology behind the events_commands failure
+    /// (`send` with zero real peers reported "1 paired peer").
+    #[tokio::test]
+    async fn peers_excludes_machine_account_self_identity() {
+        let dir = tempdir().unwrap();
+        // The machine-account home == the shared wire root, mirroring
+        // `machine_account_home(scope)` resolving to `$HOME/.airc`.
+        let machine_account_home = dir.path().join(".airc");
+        let scope_home = dir.path().join("scope");
+
+        // The daemon's registry loop opens against the machine-account
+        // home (its wire_root == its home there). This writes the
+        // loop's distinct identity into the wire-root trust store —
+        // the node's own beacon.
+        let loop_handle =
+            Airc::open_with_wire_root_for_test(&machine_account_home, &machine_account_home)
+                .await
+                .unwrap();
+
+        // The foreground send client: a separate scope home sharing the
+        // same wire root (the `attached_airc` topology).
+        let send_client = Airc::open_with_wire_root_for_test(&scope_home, &machine_account_home)
+            .await
+            .unwrap();
+
+        // Both identities are now in the shared wire-root trust store,
+        // but BOTH are self (scope identity + machine-account identity).
+        assert_ne!(
+            loop_handle.peer_id(),
+            send_client.peer_id(),
+            "loop and send client must have distinct identities for this to be a real test"
+        );
+
+        let peers = send_client.peers().await.unwrap();
+        assert!(
+            peers.is_empty(),
+            "a lone node with no real remote peers must report 0 paired peers — \
+             the machine-account loop's own beacon is self, not a remote peer; got: {peers:?}"
+        );
+    }
+
+    /// The inverse: a genuine remote peer enrolled into the wire root
+    /// IS counted. Guards against the self-filter over-reaching and
+    /// hiding real peers.
+    #[tokio::test]
+    async fn peers_still_counts_a_genuine_remote_peer() {
+        let dir = tempdir().unwrap();
+        let machine_account_home = dir.path().join(".airc");
+        let scope_home = dir.path().join("scope");
+
+        let _loop_handle =
+            Airc::open_with_wire_root_for_test(&machine_account_home, &machine_account_home)
+                .await
+                .unwrap();
+        let send_client = Airc::open_with_wire_root_for_test(&scope_home, &machine_account_home)
+            .await
+            .unwrap();
+
+        let remote_id = airc_core::PeerId::new();
+        let remote = airc_protocol::PeerKeypair::generate();
+        airc_trust::add(&machine_account_home, remote_id, remote.public_bytes())
+            .await
+            .unwrap();
+
+        let peers = send_client.peers().await.unwrap();
+        assert_eq!(
+            peers.len(),
+            1,
+            "a genuine enrolled remote peer must still surface; got: {peers:?}"
+        );
+        assert_eq!(peers[0].peer_id, remote_id);
     }
 }

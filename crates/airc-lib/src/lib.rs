@@ -57,6 +57,7 @@ mod messaging;
 mod peers;
 pub mod publish;
 pub mod registry;
+pub mod registry_refresh;
 mod relay;
 pub mod room;
 pub mod route;
@@ -129,6 +130,10 @@ pub use mesh_identity::{
 pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
+pub use registry_refresh::{
+    run_loop as run_registry_refresh_loop, sync_once as registry_sync_once, RegistryRefreshConfig,
+    RegistryRefreshGate, TickReport as RegistrySyncReport,
+};
 pub use room::Room;
 pub use route::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, PeerDialFailure,

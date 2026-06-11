@@ -69,6 +69,8 @@ mod queue_card_plan;
 mod queue_card_projection;
 mod queue_card_runtime;
 mod queue_card_staleness;
+mod registry_cli;
+mod registry_commands;
 mod route_cli;
 mod route_commands;
 mod route_proof_commands;
@@ -437,6 +439,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Route(args) => match args.action {
             RouteAction::Status(args) => route_commands::run_status(args),
             RouteAction::Proof(args) => route_proof_commands::run(args).await,
+        },
+
+        Command::Registry(args) => match args.action {
+            registry_cli::RegistryAction::Sync => registry_commands::run_sync(&home).await,
         },
 
         Command::Transport(args) => match args.action {
