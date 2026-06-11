@@ -175,8 +175,17 @@ impl Airc {
                     // Relay/UDP/WebRTC/Reticulum dialing lands in later
                     // slices; recording them as failures here would be
                     // noise about unimplemented transports, not signal
-                    // about unreachable peers.
-                    _ => continue,
+                    // about unreachable peers. Variants enumerated, not
+                    // wildcarded, per the production no-silent-fallback
+                    // clippy gate: a FUTURE endpoint variant must force
+                    // this match to be revisited, not silently fall into
+                    // "skip" (the wildcard slipped past #1120's review
+                    // because the merge-push CI run was hand-cancelled —
+                    // caught by the #1121 sentinel).
+                    RouteEndpoint::Udp { .. }
+                    | RouteEndpoint::Relay { .. }
+                    | RouteEndpoint::Reticulum { .. }
+                    | RouteEndpoint::WebRtcSignaling { .. } => continue,
                 };
                 // #1120 sentinel blocking-2: connect_lan has no inner
                 // timeout, and a SYN-dropping firewall (the default
