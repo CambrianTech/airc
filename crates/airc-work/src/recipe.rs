@@ -15,6 +15,18 @@
 //! is a valid runtime state — `IdleVerdict::SynthesizeNow` just produces
 //! zero proposals and the engine continues.
 //!
+//! ## Layering: where the adapter→registry glue lives
+//!
+//! `airc-lib` depends on `airc-work`, not the other way around — the
+//! `ConsumerAdapter` trait (9c63f3d8) is therefore unreachable from this
+//! module by construction. `RecipeRegistry::register` takes a bare
+//! `Arc<dyn Recipe>` because that's the layering-correct seam: the
+//! adapter→registry glue (translate a `ConsumerAdapter` install event
+//! into a `register` call) lives in `airc-lib` and gets wired at the
+//! `idle_tick` ServiceModule boot site (slice E). Slice C uses this
+//! registry directly via `propose_all` without going through any
+//! adapter abstraction.
+//!
 //! ## Doctrines
 //!
 //! - `[[strong-typing-across-boundaries]]` — `RecipeRef` is a typed
@@ -34,6 +46,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use airc_core::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::goal::Goal;
@@ -77,6 +90,12 @@ impl std::fmt::Display for RecipeRef {
 /// substrate guarantees `now_ms` is injected (no `Instant::now()` per
 /// `[[concurrency-style-guide]]` — recipes must be reproducible against
 /// captured snapshots).
+///
+/// Field set matches the v2 design memo (IDLE-AGENT-ENGINE.md line 109)
+/// verbatim — `{goal, board, my_peer_id, now_ms}`. Adding a field later
+/// would break every consumer `Recipe` impl's struct-literal call site,
+/// so the shape is fixed at slice B even though `my_peer_id` has no
+/// in-tree consumer until slice C wires the synthesizer.
 pub struct RecipeContext<'a> {
     /// The goal this dispatch is proposing against. Recipes inspect
     /// `goal.state` to decide what to propose (or whether to propose
@@ -88,6 +107,11 @@ pub struct RecipeContext<'a> {
     /// to every recipe in one dispatch so cross-recipe coherence is
     /// guaranteed.
     pub board: &'a BoardSnapshot,
+    /// The peer running this synthesis tick. Recipes that need to
+    /// distinguish "is this card already claimed by me?" from "is this
+    /// card claimed by another peer?" key off this. Slice C's
+    /// synthesizer injects the running peer's id.
+    pub my_peer_id: PeerId,
     /// Injected wall-clock; substrate doctrine forbids
     /// `Instant::now()` inside hot paths and recipes are particularly
     /// sensitive to this — replay-from-event-log expects deterministic
@@ -169,6 +193,15 @@ impl RecipeRegistry {
     /// Register a recipe. Returns the previously-registered recipe
     /// with the same `RecipeRef`, if any (so callers can log the
     /// replacement explicitly).
+    ///
+    /// `#[must_use]` is what makes the "replacement is loud" doc claim
+    /// real: `registry.register(r);` is a compile-time warning under
+    /// the substrate's `-D warnings` gate, so a silent last-wins swap
+    /// can't slip through. Callers that genuinely want to discard the
+    /// displaced recipe must say so with `let _ = registry.register(r);`.
+    #[must_use = "register returns the previously-registered recipe with the same id; \
+                  drop explicitly with `let _ = registry.register(r);` to acknowledge \
+                  the swap"]
     pub fn register(&mut self, recipe: Arc<dyn Recipe>) -> Option<Arc<dyn Recipe>> {
         let id = recipe.id().clone();
         self.inner.insert(id, recipe)
@@ -315,6 +348,7 @@ mod tests {
         let ctx = RecipeContext {
             goal: &goal,
             board: &board,
+            my_peer_id: PeerId::new(),
             now_ms: 0,
         };
         assert_eq!(registry.len(), 0);
@@ -340,6 +374,7 @@ mod tests {
         let ctx = RecipeContext {
             goal: &goal,
             board: &board,
+            my_peer_id: PeerId::new(),
             now_ms: 0,
         };
         let proposals = registry.propose_all(&ctx);
@@ -359,10 +394,11 @@ mod tests {
         // Per docs: replace is the right semantic; the displaced
         // recipe is returned so logs can name what was replaced.
         let mut registry = RecipeRegistry::new();
-        registry.register(Arc::new(AlwaysProposes {
+        let none = registry.register(Arc::new(AlwaysProposes {
             id: RecipeRef::new("test::dup"),
             title: "v1".into(),
         }));
+        assert!(none.is_none(), "first register displaces nothing");
         let displaced = registry.register(Arc::new(AlwaysProposes {
             id: RecipeRef::new("test::dup"),
             title: "v2".into(),
@@ -375,6 +411,7 @@ mod tests {
         let ctx = RecipeContext {
             goal: &goal,
             board: &board,
+            my_peer_id: PeerId::new(),
             now_ms: 0,
         };
         let proposals = registry.propose_all(&ctx);
@@ -390,7 +427,7 @@ mod tests {
         // the purpose). An empty return is the most common honest
         // outcome.
         let mut registry = RecipeRegistry::new();
-        registry.register(Arc::new(NeverProposes {
+        let _ = registry.register(Arc::new(NeverProposes {
             id: RecipeRef::new("test::never"),
         }));
         let goal = goal();
@@ -398,6 +435,7 @@ mod tests {
         let ctx = RecipeContext {
             goal: &goal,
             board: &board,
+            my_peer_id: PeerId::new(),
             now_ms: 0,
         };
         let proposals = registry.propose_all(&ctx);
@@ -410,16 +448,26 @@ mod tests {
         // shadows another's (e.g. if `propose_all` short-circuits on
         // first non-empty return). Every registered recipe must run
         // every tick; the synthesizer dedups, not the registry.
+        //
+        // INTERIM SCOPE NOTE: "every registered recipe runs every tick"
+        // is the slice-B contract because Goal lacks `recipe_refs`
+        // today. Once slice C lands `Goal.recipe_refs: Vec<RecipeRef>`,
+        // dispatch will be goal-scoped per the v2 design memo ("runs
+        // each goal's recipes", IDLE-AGENT-ENGINE.md §Recipe). The
+        // synthesizer will iterate goals and dispatch only the
+        // `recipe_refs` registered for each. This test pins the
+        // unscoped behavior as load-bearing for the *registry*; the
+        // *synthesizer*'s slice-C tests will pin the scoped variant.
         let mut registry = RecipeRegistry::new();
-        registry.register(Arc::new(AlwaysProposes {
+        let _ = registry.register(Arc::new(AlwaysProposes {
             id: RecipeRef::new("test::a"),
             title: "A".into(),
         }));
-        registry.register(Arc::new(AlwaysProposes {
+        let _ = registry.register(Arc::new(AlwaysProposes {
             id: RecipeRef::new("test::b"),
             title: "B".into(),
         }));
-        registry.register(Arc::new(NeverProposes {
+        let _ = registry.register(Arc::new(NeverProposes {
             id: RecipeRef::new("test::silent"),
         }));
         assert_eq!(registry.len(), 3);
@@ -429,6 +477,7 @@ mod tests {
         let ctx = RecipeContext {
             goal: &goal,
             board: &board,
+            my_peer_id: PeerId::new(),
             now_ms: 0,
         };
         let proposals = registry.propose_all(&ctx);
