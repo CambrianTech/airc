@@ -28,6 +28,63 @@ pub enum RouteEndpoint {
     WebRtcSignaling { url: String },
 }
 
+/// Card 625abe6d slice 1 — encode endpoints for the opaque
+/// `peer_trust.endpoints_json` column. The store crate sits below
+/// this one in the dependency graph and must not know the variants,
+/// so the typed boundary lives here with the enum.
+pub fn endpoints_to_json(endpoints: &[RouteEndpoint]) -> Result<String, serde_json::Error> {
+    serde_json::to_string(endpoints)
+}
+
+/// Inverse of [`endpoints_to_json`]. A decode failure is surfaced,
+/// never swallowed — a peer record carrying endpoint JSON this binary
+/// can't read is version skew the operator must see, not an empty
+/// route list.
+pub fn endpoints_from_json(json: &str) -> Result<Vec<RouteEndpoint>, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+impl RouteEndpoint {
+    /// Parse the operator-facing endpoint syntax used by the dev verb
+    /// `airc peer add --endpoint`:
+    ///
+    /// - `lan-tcp:HOST:PORT`
+    /// - `tailscale-tcp:HOST:PORT`
+    /// - `udp:HOST:PORT`
+    /// - `relay:URL`
+    ///
+    /// Errors name the supported forms — this string arrives from a
+    /// human (or an agent quoting a human), so the failure message is
+    /// the documentation.
+    pub fn parse_cli(input: &str) -> Result<Self, String> {
+        let (kind, rest) = input.split_once(':').ok_or_else(|| {
+            format!(
+                "endpoint {input:?} has no kind prefix; expected \
+                 lan-tcp:HOST:PORT, tailscale-tcp:HOST:PORT, udp:HOST:PORT, or relay:URL"
+            )
+        })?;
+        match kind {
+            "lan-tcp" | "tailscale-tcp" | "udp" => {
+                let addr: SocketAddr = rest.parse().map_err(|error| {
+                    format!("endpoint {input:?}: {rest:?} is not a valid HOST:PORT: {error}")
+                })?;
+                Ok(match kind {
+                    "lan-tcp" => RouteEndpoint::LanTcp { addr },
+                    "tailscale-tcp" => RouteEndpoint::TailscaleTcp { addr },
+                    _ => RouteEndpoint::Udp { addr },
+                })
+            }
+            "relay" => Ok(RouteEndpoint::Relay {
+                url: rest.to_string(),
+            }),
+            other => Err(format!(
+                "endpoint kind {other:?} not supported by --endpoint; expected \
+                 lan-tcp, tailscale-tcp, udp, or relay"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteBeacon {
     pub schema_version: u16,

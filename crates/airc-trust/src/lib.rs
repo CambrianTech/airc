@@ -237,6 +237,27 @@ pub async fn set_tier(
         .map_err(Into::into)
 }
 
+/// Card 625abe6d slice 1 — replace the advertised endpoints on an
+/// enrolled peer. `endpoints_json` is the serde JSON of
+/// `Vec<RouteEndpoint>`; the enum lives in airc-lib (above this
+/// crate), so the payload is opaque here — typed encode/decode stays
+/// with the enum. `None` clears back to identity-only.
+///
+/// Returns `Ok(None)` when the peer isn't enrolled: endpoints without
+/// a trust anchor are meaningless (there is no pubkey to cert-pin the
+/// dial against), so this never inserts a row.
+pub async fn set_endpoints_json(
+    home: &Path,
+    peer_id: PeerId,
+    endpoints_json: Option<String>,
+) -> Result<Option<StoredPeer>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .set_peer_trust_endpoints(peer_id, endpoints_json)
+        .await
+        .map_err(Into::into)
+}
+
 /// Card 34942ec1 Sub-B — pure detection helper.
 ///
 /// Returns the trust tier that should apply when we observe a peer

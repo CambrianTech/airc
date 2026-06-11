@@ -1090,6 +1090,7 @@ pub async fn run_peer_add(
     spec: PeerSpec,
     socket: PathBuf,
     tier: Option<airc_store::TrustTier>,
+    endpoints: Vec<airc_lib::RouteEndpoint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = Airc::open(home).await?;
     let pubkey_b64 = base64::Engine::encode(
@@ -1118,6 +1119,28 @@ pub async fn run_peer_add(
         println!("enroled peer_id={peer_id} (pubkey 32 bytes) tier={tier}");
     } else {
         println!("enroled peer_id={peer_id} (pubkey 32 bytes) tier=untrusted (default)");
+    }
+
+    // Card 625abe6d slice 1: persist advertised endpoints alongside
+    // the trust anchor. Same two-step shape (and same justification)
+    // as the tier write above. Dial happens at route discovery time
+    // (`airc transport health`, daemon refresh), not here — `peer add`
+    // stays a pure enrolment verb.
+    if !endpoints.is_empty() {
+        let endpoints_json = airc_lib::endpoints_to_json(&endpoints)
+            .map_err(|error| format!("encoding --endpoint values: {error}"))?;
+        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json))
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "internal: just-added peer {peer_id} missing during endpoint-set — \
+                     report this as a substrate bug"
+                )
+            })?;
+        println!(
+            "stored {} endpoint(s) for {peer_id}; route discovery will dial outbound.",
+            endpoints.len()
+        );
     }
 
     // Best-effort daemon sync. If the daemon isn't running, that's
@@ -1246,6 +1269,10 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
                     "pubkey_b64": p.pubkey_b64,
                     "added_at_ms": p.added_at_ms,
                     "tier": p.tier.as_wire_str(),
+                    // Card 625abe6d slice 1: raw endpoint JSON (already
+                    // a serde document; nesting it re-parsed keeps the
+                    // machine surface honest about decode failures).
+                    "endpoints_json": p.endpoints_json,
                 })
             })
             .collect();
@@ -1257,8 +1284,19 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
         return Ok(());
     }
     for peer in &peers {
+        // Card 625abe6d slice 1: surface stored endpoints so the
+        // operator can see what route discovery will dial. A record
+        // with endpoint JSON this binary can't decode prints the
+        // error inline rather than hiding the column.
+        let endpoints = match peer.endpoints_json.as_deref() {
+            None => String::new(),
+            Some(json) => match airc_lib::endpoints_from_json(json) {
+                Ok(endpoints) => format!("  endpoints={endpoints:?}"),
+                Err(error) => format!("  endpoints=<undecodable: {error}>"),
+            },
+        };
         println!(
-            "{}  {}  tier={}",
+            "{}  {}  tier={}{endpoints}",
             peer.peer_id,
             peer.pubkey_b64,
             peer.tier.as_wire_str()

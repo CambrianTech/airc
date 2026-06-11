@@ -18,6 +18,11 @@ pub struct Model {
     /// keep working without a backfill pass.
     #[sea_orm(default_value = "untrusted")]
     pub tier: String,
+    /// Card 625abe6d slice 1: serde JSON of the peer's advertised
+    /// `Vec<RouteEndpoint>` (typed at the airc-lib layer; opaque
+    /// string here — store sits below lib in the dependency graph).
+    /// NULL = identity-only enrolment, no dial candidates.
+    pub endpoints_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

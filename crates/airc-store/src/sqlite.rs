@@ -207,6 +207,7 @@ impl SqliteEventStore {
                     pubkey_b64: row.pubkey_b64,
                     added_at_ms: i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?,
                     tier,
+                    endpoints_json: row.endpoints_json,
                 })
             })
             .collect()
@@ -250,6 +251,7 @@ impl SqliteEventStore {
             pubkey_b64: Set(pubkey_b64.clone()),
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
             tier: Set(tier.as_wire_str().to_string()),
+            endpoints_json: Set(None),
         };
         let insert = peer_trust::Entity::insert(active)
             .on_conflict(
@@ -290,6 +292,7 @@ impl SqliteEventStore {
             pubkey_b64: stored.pubkey_b64,
             added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
             tier: stored_tier,
+            endpoints_json: stored.endpoints_json,
         })
     }
 
@@ -304,16 +307,22 @@ impl SqliteEventStore {
         // orthogonal — losing it on rotate would silently demote a
         // Friend back to Untrusted, which would be a security
         // regression). For a fresh insert, default to Untrusted.
-        let existing_tier = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+        // Card 625abe6d: endpoints are preserved for the same reason —
+        // a key rotation doesn't move the peer's machines.
+        let existing = peer_trust::Entity::find_by_id(peer_id.as_uuid())
             .one(&self.db)
-            .await?
+            .await?;
+        let existing_tier = existing
+            .as_ref()
             .and_then(|row| TrustTier::from_wire_str(&row.tier))
             .unwrap_or_else(TrustTier::default_for_new_peer);
+        let existing_endpoints = existing.and_then(|row| row.endpoints_json);
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
             tier: Set(existing_tier.as_wire_str().to_string()),
+            endpoints_json: Set(existing_endpoints.clone()),
         };
         peer_trust::Entity::insert(active)
             .on_conflict(
@@ -328,6 +337,7 @@ impl SqliteEventStore {
             pubkey_b64,
             added_at_ms,
             tier: existing_tier,
+            endpoints_json: existing_endpoints,
         })
     }
 
@@ -358,6 +368,7 @@ impl SqliteEventStore {
             pubkey_b64: stored.pubkey_b64,
             added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
             tier: removed_tier,
+            endpoints_json: stored.endpoints_json,
         }))
     }
 
@@ -396,6 +407,49 @@ impl SqliteEventStore {
             pubkey_b64: existing.pubkey_b64,
             added_at_ms: i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?,
             tier,
+            endpoints_json: existing.endpoints_json,
+        }))
+    }
+
+    /// Card 625abe6d slice 1 — replace the advertised endpoints on an
+    /// existing peer row. The payload is the serde JSON of
+    /// `Vec<RouteEndpoint>` (typed at the airc-lib layer). `None`
+    /// clears the record back to identity-only.
+    ///
+    /// Returns `Ok(None)` if the peer isn't enrolled — endpoints
+    /// without a trust anchor are meaningless (nothing to cert-pin
+    /// the dial against), so no row is inserted.
+    ///
+    /// Idempotent: writing the same JSON returns the row unchanged.
+    pub async fn set_peer_trust_endpoints(
+        &self,
+        peer_id: PeerId,
+        endpoints_json: Option<String>,
+    ) -> Result<Option<StoredPeer>, StoreError> {
+        let txn = self.db.begin().await?;
+        let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+        let stored_tier = TrustTier::from_wire_str(&existing.tier).ok_or_else(|| {
+            StoreError::InvalidStoredEnumString {
+                column: "peer_trust.tier",
+                value: existing.tier.clone(),
+            }
+        })?;
+        let mut active: peer_trust::ActiveModel = existing.clone().into();
+        active.endpoints_json = Set(endpoints_json.clone());
+        peer_trust::Entity::update(active).exec(&txn).await?;
+        txn.commit().await?;
+        Ok(Some(StoredPeer {
+            peer_id,
+            pubkey_b64: existing.pubkey_b64,
+            added_at_ms: i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?,
+            tier: stored_tier,
+            endpoints_json,
         }))
     }
 
@@ -1974,6 +2028,55 @@ mod tests {
         let loaded = store.load_peers().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].tier, TrustTier::Untrusted);
+    }
+
+    /// Card 625abe6d / #1120 sentinel mutation M1 pin: a key
+    /// rotation (replace_peer_trust) must PRESERVE stored endpoints —
+    /// rotating key material does not move the peer's machines.
+    /// Without this pin, `endpoints_json: Set(None)` in replace
+    /// survives the whole suite.
+    #[tokio::test]
+    async fn replace_peer_trust_preserves_stored_endpoints() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x5151_e0e0);
+        store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 100)
+            .await
+            .unwrap();
+        let json = r#"[{"kind":"lan_tcp","addr":"192.168.1.232:7474"}]"#;
+        store
+            .set_peer_trust_endpoints(peer_id, Some(json.to_string()))
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+
+        let rotated = store
+            .replace_peer_trust(peer_id, "BBBB".repeat(11), 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated.endpoints_json.as_deref(),
+            Some(json),
+            "rotation must carry endpoints forward"
+        );
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].endpoints_json.as_deref(), Some(json));
+        assert_eq!(loaded[0].pubkey_b64, "BBBB".repeat(11));
+    }
+
+    /// Card 625abe6d: endpoint set on an unknown peer is a refused
+    /// no-op (Ok(None)), never an implicit insert — endpoints without
+    /// a pubkey to cert-pin the dial against are meaningless.
+    #[tokio::test]
+    async fn set_endpoints_on_unknown_peer_returns_none_no_row_inserted() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0xdead_beef);
+        let result = store
+            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(store.load_peers().await.unwrap().is_empty());
     }
 
     #[tokio::test]
