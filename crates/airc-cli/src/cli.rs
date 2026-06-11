@@ -614,6 +614,14 @@ pub enum Command {
     /// Inspect transport route policy and candidate selection.
     Route(RouteArgs),
 
+    /// Account-mesh registry: same-account cross-machine discovery.
+    ///
+    /// The daemon runs publish/refresh on a cadence automatically; this
+    /// verb is the manual proof + Mac-bootstrap surface — one
+    /// publish+refresh against the gh-gist rendezvous, printing what was
+    /// published and who was enrolled.
+    Registry(crate::registry_cli::RegistryArgs),
+
     /// Inspect transport health and substrate connectivity.
     Transport(TransportArgs),
 

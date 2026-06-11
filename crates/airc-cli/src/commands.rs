@@ -835,12 +835,66 @@ pub async fn run_daemon(
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
     let route_refresh_task = spawn_route_refresh(home.to_path_buf(), state.clone());
+
+    // KEYSTONE (card a134b370-10b1-49c6-aa42-e1a05446e887): spawn the
+    // account-registry publish/refresh loop alongside the IPC accept
+    // loop. THIS is what makes two machines on the same gh account
+    // discover and route to each other with zero human action — the
+    // already-built `publish_account_registry`/`refresh_account_registry`
+    // were never called on a cadence before this. The loop opens its
+    // own `Airc` handle against the same machine-account home the
+    // daemon owns and publishes to the gh-gist rendezvous, gated on
+    // `gh auth` (optional transport — skips cleanly if unauthed).
+    //
+    // Shutdown shares the daemon's `Notify`: the Stop handler's
+    // `notify_waiters()` wakes both the accept loop AND this loop. The
+    // loop registers its waiter via the pinned `notified()` future it
+    // holds internally (same lost-wakeup discipline as `server::run`).
+    let registry_state = state.clone();
+    let registry_home = state.home.clone();
+    let registry_handle = tokio::spawn(async move {
+        let airc = match Airc::open(&registry_home).await {
+            Ok(airc) => airc,
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: account-registry loop disabled — could not open handle: {error}"
+                );
+                return;
+            }
+        };
+        let db_path = airc_lib::machine_account_home(&registry_home).join("events.sqlite");
+        let event_store = match SqliteEventStore::open_path(&db_path).await {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: account-registry loop disabled — could not open store: {error}"
+                );
+                return;
+            }
+        };
+        let store = airc_lib::GhAccountRegistryStore::new(event_store);
+        let gate = airc_lib::RegistryRefreshGate::GhAuth { gh_bin: None };
+        airc_lib::run_registry_refresh_loop(
+            airc,
+            store,
+            gate,
+            airc_lib::RegistryRefreshConfig::default(),
+            registry_state.shutdown.notified(),
+        )
+        .await;
+    });
+
     run_daemon_server(state, socket).await?;
-    // The refresh loop exits on the shutdown `Notify` that ended the
-    // accept loop; abort is the backstop for the listener-error path,
-    // where Stop never fired (same abort discipline as
+    // The route-refresh loop exits on the shutdown `Notify` that ended
+    // the accept loop; abort is the backstop for the listener-error
+    // path, where Stop never fired (same abort discipline as
     // `HeartbeatTask::stop`).
     route_refresh_task.abort();
+    // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
+    // waiter was woken by the same `notify_waiters()`. Await its clean
+    // exit so the process doesn't drop an in-flight gist write
+    // mid-flight.
+    let _ = registry_handle.await;
     println!("airc daemon: stopped.");
     Ok(())
 }

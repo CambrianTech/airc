@@ -39,6 +39,8 @@ pub enum DiagnosticCode {
     FrameVerificationFailed,
     StoreAppendFailed,
     TrustRefreshFailed,
+    AccountRegistryPublishFailed,
+    AccountRegistryRefreshFailed,
     WireLostEmitFailed,
     MalformedReplayFrameSkipped,
     UnverifiableReplayFrameSkipped,
