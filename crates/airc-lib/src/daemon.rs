@@ -308,23 +308,29 @@ impl Airc {
         Ok(merged)
     }
 
-    /// Fetch ALL transcript events on `channel` via the daemon, paging
-    /// forward from the start. The daemon-attached source for projections
-    /// that need the complete history (e.g. the work board).
-    pub(crate) async fn daemon_room_transcripts(
+    /// Fetch every transcript event on `channel` strictly after
+    /// `cursor`, paging forward. The daemon-attached source for
+    /// complete-history projections (the work board): pass the zero
+    /// cursor for the full history, or a cached projection's
+    /// last-applied cursor to resume incrementally (card 1291173d)
+    /// instead of replaying the room from event zero. The SDK
+    /// `lamport` is the losslessly-packed owner-core `(epoch,
+    /// counter)` seq, so unpacking it reproduces the exact IPC
+    /// cursor the daemon paged with.
+    pub(crate) async fn daemon_room_transcripts_since(
         &self,
         channel: RoomId,
+        cursor: &TranscriptCursor,
         page_size: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let page_size = page_size.max(1);
         let client = self.require_daemon_client()?;
         let mut all = Vec::new();
-        // Start strictly after the zero cursor ⇒ from the first event
-        // (epochs begin at 1, so (0,0) precedes everything).
+        let (epoch, counter) = unpack_seq(cursor.lamport);
         let mut since = Some(IpcCursor {
-            epoch: 0,
-            counter: 0,
-            event_id: airc_core::EventId::from_u128(0),
+            epoch,
+            counter,
+            event_id: cursor.event_id,
         });
         loop {
             let response = client
@@ -347,6 +353,31 @@ impl Airc {
             }
         }
         Ok(all)
+    }
+
+    /// Cursor of the newest transcript event on `channel` via the
+    /// daemon, or `None` for an empty room. The cheap freshness probe
+    /// for a cached work-board projection (card 1291173d): when an
+    /// incremental resume returns no events, the cache is only valid
+    /// if its cursor IS the room tip — anything else (log rewound,
+    /// store wiped) is a mismatch and the caller rebuilds from
+    /// scratch instead of serving stale state.
+    pub(crate) async fn daemon_latest_transcript_cursor(
+        &self,
+        channel: RoomId,
+    ) -> Result<Option<TranscriptCursor>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .inbox(InboxRequest {
+                since: None,
+                channel: Some(channel),
+                limit: Some(1),
+            })
+            .await?;
+        let Some(bytes) = response.envelopes.into_iter().next_back() else {
+            return Ok(None);
+        };
+        Ok(Some(decode_wire_event(bytes)?.cursor()))
     }
 
     /// Live subscribe across `channels` via the daemon: open one IPC

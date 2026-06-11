@@ -15,6 +15,10 @@ use airc_work::{
 use airc_work_store::WorkEventStore;
 
 use crate::time::now_ms;
+use crate::work_board_cache::{
+    cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
+    WORK_BOARD_CACHE_FORMAT_VERSION,
+};
 use crate::{Airc, AircError};
 
 const WORK_MUTATION_PAGE_SIZE: usize = 512;
@@ -814,21 +818,174 @@ impl Airc {
     /// otherwise. Centralises the read so the whole work subsystem is
     /// daemon-aware — work is event-sourced, so its reads must follow the
     /// same path as its writes (`send_frame` → daemon when attached).
+    ///
+    /// Card 1291173d: the complete projection no longer replays the
+    /// room from event zero on every read. A snapshot of the
+    /// projection, keyed by the cursor of the last transcript event
+    /// folded into it, is persisted under this scope's home; the next
+    /// read resumes strictly after that cursor and applies only the
+    /// new events. Any cache anomaly (corrupt file, version bump,
+    /// source mismatch, a cursor the log no longer agrees with) is
+    /// logged loudly and recovered by a full from-scratch replay —
+    /// the cache is an accelerator, never an authority.
     async fn project_room_work_board(
         &self,
         room: &crate::Room,
         page_size: usize,
     ) -> Result<WorkBoardProjection, AircError> {
-        if self.is_daemon_attached() {
-            let transcripts = self
-                .daemon_room_transcripts(room.channel, page_size)
-                .await?;
-            return Ok(airc_work_store::project_transcripts(transcripts)?);
+        let source = if self.is_daemon_attached() {
+            WorkBoardCacheSource::Daemon
+        } else {
+            WorkBoardCacheSource::Store
+        };
+        if let Some(cache) = WorkBoardCache::load(self.home(), room.channel, source) {
+            if let Some(projection) = self
+                .resume_work_board(room, cache, source, page_size)
+                .await?
+            {
+                return Ok(projection);
+            }
         }
-        let store = WorkEventStore::new(self.event_store());
-        Ok(store
-            .project_complete(Some(room.channel), page_size)
-            .await?)
+
+        // Cold start or discarded cache: full replay from event zero.
+        let transcripts = self
+            .room_transcripts_since(room, &zero_transcript_cursor(), page_size)
+            .await?;
+        let cursor = transcripts.last().map(airc_core::TranscriptEvent::cursor);
+        let projection = airc_work_store::project_transcripts(transcripts)?;
+        if let Some(cursor) = cursor {
+            WorkBoardCache {
+                version: WORK_BOARD_CACHE_FORMAT_VERSION,
+                channel: room.channel,
+                source,
+                cursor,
+                projection: projection.clone(),
+            }
+            .save(self.home());
+        }
+        Ok(projection)
+    }
+
+    /// Resume the work-board projection from a persisted snapshot:
+    /// fetch only the transcript events strictly after the snapshot's
+    /// cursor and fold them in with the same windowed-apply rule the
+    /// full replay uses. Returns `Ok(None)` when the snapshot must be
+    /// discarded (the log disagrees with its cursor) — the caller
+    /// rebuilds from scratch. Transport/store errors propagate; they
+    /// are not a cache problem.
+    async fn resume_work_board(
+        &self,
+        room: &crate::Room,
+        cache: WorkBoardCache,
+        source: WorkBoardCacheSource,
+        page_size: usize,
+    ) -> Result<Option<WorkBoardProjection>, AircError> {
+        let new_transcripts = self
+            .room_transcripts_since(room, &cache.cursor, page_size)
+            .await?;
+
+        let Some(first) = new_transcripts.first() else {
+            // Nothing strictly after the cached cursor. That is only
+            // consistent with the log if the cursor IS the room tip;
+            // anything else (rewound / wiped store, foreign cursor)
+            // means the snapshot describes a log that no longer
+            // exists — rebuild, never serve it.
+            let tip = self.room_latest_cursor(room).await?;
+            if tip.as_ref() == Some(&cache.cursor) {
+                return Ok(Some(cache.projection));
+            }
+            eprintln!(
+                "work board cache: snapshot cursor (lamport {}) is not the tip of channel {} — \
+                 log rewound or replaced; rebuilding projection from scratch",
+                cache.cursor.lamport, room.channel
+            );
+            return Ok(None);
+        };
+
+        // Resume is strictly-after: the first new event must sort after
+        // the cached cursor or the log's ordering contradicts the
+        // snapshot.
+        let first_cursor = first.cursor();
+        if !cursor_strictly_before(&cache.cursor, &first_cursor) {
+            eprintln!(
+                "work board cache: channel {} returned event at lamport {} not strictly after \
+                 snapshot cursor (lamport {}) — rebuilding projection from scratch",
+                room.channel, first_cursor.lamport, cache.cursor.lamport
+            );
+            return Ok(None);
+        }
+
+        let mut projection = cache.projection;
+        // Non-empty page ⇒ a newest cursor always exists; track it from
+        // the same fetch that produced the events so the snapshot can
+        // never run ahead of what was actually folded in.
+        let newest = new_transcripts
+            .last()
+            .map(airc_core::TranscriptEvent::cursor)
+            .unwrap_or(first_cursor);
+        airc_work_store::apply_transcripts(&mut projection, new_transcripts)?;
+        WorkBoardCache {
+            version: WORK_BOARD_CACHE_FORMAT_VERSION,
+            channel: room.channel,
+            source,
+            cursor: newest,
+            projection: projection.clone(),
+        }
+        .save(self.home());
+        Ok(Some(projection))
+    }
+
+    /// Every transcript event on `room`'s channel strictly after
+    /// `cursor`, in transcript order — via the daemon when attached,
+    /// the local store otherwise. Pass the zero cursor for the
+    /// complete history.
+    async fn room_transcripts_since(
+        &self,
+        room: &crate::Room,
+        cursor: &airc_core::TranscriptCursor,
+        page_size: usize,
+    ) -> Result<Vec<airc_core::TranscriptEvent>, AircError> {
+        if self.is_daemon_attached() {
+            return self
+                .daemon_room_transcripts_since(room.channel, cursor, page_size)
+                .await;
+        }
+        let store = self.event_store();
+        let page_size = page_size.max(1);
+        let mut cursor = cursor.clone();
+        let mut all = Vec::new();
+        loop {
+            let page = store
+                .resume_from(&cursor, Some(room.channel), page_size)
+                .await
+                .map_err(AircError::from)?;
+            let count = page.len();
+            let Some(newest) = page.last().map(airc_core::TranscriptEvent::cursor) else {
+                break;
+            };
+            all.extend(page);
+            if count < page_size {
+                break;
+            }
+            cursor = newest;
+        }
+        Ok(all)
+    }
+
+    /// Cursor of the newest transcript event on `room`'s channel, or
+    /// `None` for an empty room — via the daemon when attached, the
+    /// local store otherwise.
+    async fn room_latest_cursor(
+        &self,
+        room: &crate::Room,
+    ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
+        if self.is_daemon_attached() {
+            return self.daemon_latest_transcript_cursor(room.channel).await;
+        }
+        self.event_store()
+            .latest_cursor(Some(room.channel))
+            .await
+            .map_err(AircError::from)
     }
 
     /// Return work cards this peer could reasonably take next. This
