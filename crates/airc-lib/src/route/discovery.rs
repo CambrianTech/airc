@@ -12,6 +12,15 @@ use crate::route::invite::RouteEndpoint;
 use crate::route::policy::TransportKind;
 use crate::Airc;
 
+/// Card 625abe6d slice 1 — per-dial deadline. LAN/tailnet targets
+/// complete a TCP+TLS handshake well inside this on any healthy
+/// path; a SYN-dropping firewall otherwise pins the OS connect for
+/// ~21s (Windows) to ~130s (Linux) PER endpoint, turning
+/// `transport health` / `doctor` into a multi-minute hang — and a
+/// poisoned registry document could plant tarpit endpoints
+/// deliberately (#1120 sentinel blocking-2).
+const PEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Card 625abe6d slice 1 — a stored peer endpoint that could not be
 /// dialed during discovery. Surfaced on the snapshot (and printed by
 /// `airc transport health`) instead of being swallowed: an offline
@@ -85,13 +94,18 @@ impl Airc {
     /// CONNECTION failures are not errors — offline peers are a normal
     /// mesh state — but every failed attempt is returned for display.
     async fn dial_stored_peer_endpoints(&self) -> Result<Vec<PeerDialFailure>, AircError> {
-        // Both registries: the scope's own store (where the CLI's
-        // `peer add --endpoint` writes) and the machine-account wire
-        // root (where account-registry import writes). Mirrors
-        // load_peer_registries' two-store union in airc.rs.
-        let mut stored = airc_trust::load(&self.inner.home)
-            .await
-            .map_err(|error| AircError::Transport(error.to_string()))?;
+        // Both registries: the machine-account wire root (where
+        // account-registry import writes) FIRST, then the scope's own
+        // store (where the CLI's `peer add --endpoint` writes).
+        // Endpoints are MERGED per peer across both stores — #1120
+        // sentinel blocking-1 proved that first-record-wins dedupe
+        // lets an endpoint-LESS row from one store shadow the
+        // endpoint-carrying row from the other (the import path
+        // creates exactly that split), silently producing zero dials
+        // on every real machine while single-store tests stay green.
+        // Wire-root order first = fresh registry data dials before a
+        // possibly-stale dev `--endpoint` override.
+        let mut stored = Vec::new();
         if self.inner.wire_root != self.inner.home {
             stored.extend(
                 airc_trust::load(&self.inner.wire_root)
@@ -99,44 +113,92 @@ impl Airc {
                     .map_err(|error| AircError::Transport(error.to_string()))?,
             );
         }
+        stored.extend(
+            airc_trust::load(&self.inner.home)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+
         let connected: std::collections::HashSet<PeerId> =
             self.connected_lan_peers().await.into_iter().collect();
         let mut failures = Vec::new();
-        // A peer enrolled in both stores appears twice in the union;
-        // dial each peer at most once per refresh.
-        let mut seen = std::collections::HashSet::new();
+
+        // Merge endpoints per peer, preserving first-seen (wire-root)
+        // order and dropping duplicates. A record whose endpoint JSON
+        // this binary can't decode becomes a PER-PEER failure, not a
+        // whole-refresh abort — one skewed record must not brick route
+        // discovery for every other peer (the repo's version-skew
+        // posture: tolerate what you don't understand, loudly).
+        let mut order: Vec<PeerId> = Vec::new();
+        let mut merged: std::collections::HashMap<PeerId, Vec<RouteEndpoint>> =
+            std::collections::HashMap::new();
         for peer in stored {
-            if peer.peer_id == self.inner.identity.peer_id {
-                continue;
-            }
-            if connected.contains(&peer.peer_id) || !seen.insert(peer.peer_id) {
+            if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
                 continue;
             }
             let Some(json) = peer.endpoints_json.as_deref() else {
                 continue;
             };
-            let endpoints = crate::route::endpoints_from_json(json).map_err(|error| {
-                AircError::Transport(format!(
-                    "peer {} has endpoint JSON this binary cannot decode \
-                     (version skew?): {error}",
-                    peer.peer_id
-                ))
-            })?;
+            let endpoints = match crate::route::endpoints_from_json(json) {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    failures.push(PeerDialFailure {
+                        peer_id: peer.peer_id,
+                        endpoint: RouteEndpoint::Relay {
+                            url: "<undecodable record>".to_string(),
+                        },
+                        error: format!(
+                            "endpoint JSON this binary cannot decode (version skew?): {error}"
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let slot = merged.entry(peer.peer_id).or_insert_with(|| {
+                order.push(peer.peer_id);
+                Vec::new()
+            });
+            for endpoint in endpoints {
+                if !slot.contains(&endpoint) {
+                    slot.push(endpoint);
+                }
+            }
+        }
+
+        for peer_id in order {
+            let Some(endpoints) = merged.get(&peer_id) else {
+                continue;
+            };
             for endpoint in endpoints {
                 let addr = match endpoint {
-                    RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => addr,
+                    RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => *addr,
                     // Relay/UDP/WebRTC/Reticulum dialing lands in later
                     // slices; recording them as failures here would be
                     // noise about unimplemented transports, not signal
                     // about unreachable peers.
                     _ => continue,
                 };
-                match self.connect_lan(addr, peer.peer_id).await {
-                    Ok(()) => break,
-                    Err(error) => failures.push(PeerDialFailure {
-                        peer_id: peer.peer_id,
-                        endpoint,
+                // #1120 sentinel blocking-2: connect_lan has no inner
+                // timeout, and a SYN-dropping firewall (the default
+                // posture of the NATs this card exists to cross) hangs
+                // the OS connect for ~21-130s per endpoint. Bound every
+                // dial; a timeout is a recorded failure like any other.
+                match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id)).await
+                {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => failures.push(PeerDialFailure {
+                        peer_id,
+                        endpoint: endpoint.clone(),
                         error: error.to_string(),
+                    }),
+                    Err(_elapsed) => failures.push(PeerDialFailure {
+                        peer_id,
+                        endpoint: endpoint.clone(),
+                        error: format!(
+                            "dial timed out after {}s (endpoint unreachable or \
+                             firewall drops SYN)",
+                            PEER_DIAL_TIMEOUT.as_secs()
+                        ),
                     }),
                 }
             }

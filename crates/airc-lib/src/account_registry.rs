@@ -324,7 +324,18 @@ impl Airc {
                     peer.peer_spec.peer_id,
                     Some(endpoints_json),
                 )
-                .await?;
+                .await?
+                // The peer was added to this exact store two lines up;
+                // a vanished row here is a structural bug, and
+                // endpoints silently not stored is the failure mode
+                // this card exists to delete (#1120 sentinel risk note).
+                .ok_or_else(|| {
+                    AircError::Transport(format!(
+                        "peer {} vanished between trust add and endpoint store \
+                         during registry import — report as a substrate bug",
+                        peer.peer_spec.peer_id
+                    ))
+                })?;
             }
             self.enrol_volatile_peer(&peer.peer_spec)?;
             crate::coordinator::publish_store(

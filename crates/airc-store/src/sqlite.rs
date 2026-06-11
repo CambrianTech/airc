@@ -2030,6 +2030,55 @@ mod tests {
         assert_eq!(loaded[0].tier, TrustTier::Untrusted);
     }
 
+    /// Card 625abe6d / #1120 sentinel mutation M1 pin: a key
+    /// rotation (replace_peer_trust) must PRESERVE stored endpoints —
+    /// rotating key material does not move the peer's machines.
+    /// Without this pin, `endpoints_json: Set(None)` in replace
+    /// survives the whole suite.
+    #[tokio::test]
+    async fn replace_peer_trust_preserves_stored_endpoints() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x5151_e0e0);
+        store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 100)
+            .await
+            .unwrap();
+        let json = r#"[{"kind":"lan_tcp","addr":"192.168.1.232:7474"}]"#;
+        store
+            .set_peer_trust_endpoints(peer_id, Some(json.to_string()))
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+
+        let rotated = store
+            .replace_peer_trust(peer_id, "BBBB".repeat(11), 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated.endpoints_json.as_deref(),
+            Some(json),
+            "rotation must carry endpoints forward"
+        );
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].endpoints_json.as_deref(), Some(json));
+        assert_eq!(loaded[0].pubkey_b64, "BBBB".repeat(11));
+    }
+
+    /// Card 625abe6d: endpoint set on an unknown peer is a refused
+    /// no-op (Ok(None)), never an implicit insert — endpoints without
+    /// a pubkey to cert-pin the dial against are meaningless.
+    #[tokio::test]
+    async fn set_endpoints_on_unknown_peer_returns_none_no_row_inserted() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0xdead_beef);
+        let result = store
+            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(store.load_peers().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn add_peer_trust_with_tier_round_trips_explicit_tier() {
         // The with_tier variant lets Sub-B detection (UDS sibling →
