@@ -129,9 +129,13 @@ fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
 const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    // Clippy on Windows flags an early `return` here as unneeded — and
+    // it's right: with the cfg-split, each branch is the function's
+    // tail expression. (First caught by the first-ever Windows clippy
+    // run, on bigmama; the hosted clippy gate is ubuntu-only.)
     #[cfg(windows)]
     {
-        return match std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("airc-main".to_string())
             .stack_size(WINDOWS_MAIN_STACK_BYTES)
             .spawn(run_main)
@@ -147,7 +151,7 @@ fn main() -> ExitCode {
                 eprintln!("airc: failed to start main thread: {error}");
                 ExitCode::FAILURE
             }
-        };
+        }
     }
 
     #[cfg(not(windows))]

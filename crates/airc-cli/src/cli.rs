@@ -263,11 +263,18 @@ fn resolve_socket_path(
     // `machine_home == home`, two distinct cases:
     //   (a) `home` IS literally `$HOME/.airc` — already
     //       machine-singular; share.
-    //   (b) `home` is outside `$HOME` (CI temp dir, test root) —
-    //       isolated; use the per-project socket so parallel
-    //       isolated scopes don't collide.
+    //   (b) `home` is an isolated scope (CI temp dir, test root) —
+    //       use the per-project socket so parallel isolated scopes
+    //       don't collide.
+    // Case (a) must be an EQUALITY check, not "machine_home under
+    // user_home": on Windows `%TEMP%` lives under `%USERPROFILE%`, so
+    // the prefix form classified temp-rooted isolated scopes as
+    // machine-account scopes and resolved the PRODUCTION socket —
+    // `ensure_daemon_running`'s build-mismatch path then stopped the
+    // real daemon (bite 3 of card b0a81c31; flagged by the #1119
+    // sentinel).
     let is_machine_account_scope =
-        machine_home != home || path_starts_with(machine_home, user_home);
+        machine_home != home || user_home.map(|uh| machine_home == uh.join(".airc")) == Some(true);
     let legacy_fallback =
         machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
     if is_machine_account_scope {
@@ -373,19 +380,6 @@ fn machine_account_key(path: &std::path::Path) -> String {
         s.push(HEX[(b & 0xf) as usize] as char);
     }
     s
-}
-
-/// `Path::starts_with` with canonicalization on both sides + a tolerant
-/// fallback when one side fails to canonicalize (test paths that don't
-/// exist yet). Used by [`resolve_socket_path`] to test "this scope is
-/// inside the OS user account."
-fn path_starts_with(path: &std::path::Path, base: Option<&std::path::Path>) -> bool {
-    let Some(base) = base else {
-        return false;
-    };
-    let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let normalized_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    normalized_path.starts_with(&normalized_base)
 }
 
 /// AIRC substrate CLI.
@@ -896,6 +890,64 @@ mod tests {
             rendered.contains("airc-machine-"),
             "machine-account scopes must use the machine-singular \
              socket name 'airc-machine-<account-hash>-v<N>.sock', got: {rendered}"
+        );
+    }
+
+    /// Card b0a81c31 bite 3 (#1119 sentinel): on Windows, `%TEMP%`
+    /// lives UNDER `%USERPROFILE%`. The old clause classified any
+    /// `machine_home` under `user_home` as a machine-account scope, so
+    /// a temp-rooted `--home` (integration tests spawning the binary
+    /// without a HOME override) resolved the PRODUCTION machine socket
+    /// — and `ensure_daemon_running`'s build-mismatch path then stopped
+    /// the real daemon. Pure path math, so this pins the Windows shape
+    /// on every platform. With the b0a81c31 lib fix,
+    /// `machine_account_home(temp_scope)` returns the scope itself, and
+    /// this function must then treat it as ISOLATED (per-project
+    /// socket), never the machine-account socket.
+    #[test]
+    fn temp_rooted_scope_under_userprofile_never_resolves_the_machine_socket() {
+        use super::resolve_socket_path;
+        let user_home = std::path::PathBuf::from("/synthetic/userprofile");
+        let runtime_dir = std::path::PathBuf::from("/synthetic/runtime");
+        // Windows shape: the temp dir nests INSIDE the user home.
+        let temp_scope = user_home
+            .join("AppData/Local/Temp/.tmpAbC123")
+            .join("agent");
+        let project_socket = runtime_dir.join("airc-temp-scope-v0.sock");
+
+        let socket = resolve_socket_path(
+            &temp_scope,
+            // Post-fix lib behavior: temp-rooted scope is its own
+            // account boundary.
+            &temp_scope,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            None,
+            Some(project_socket.clone()),
+        );
+
+        assert_eq!(
+            socket, project_socket,
+            "a temp-rooted scope under the user profile must stay \
+             isolated (per-project socket); resolving the machine \
+             socket here is how integration tests reached — and \
+             stopped — the production daemon (card b0a81c31 bite 3)"
+        );
+        // And the literal machine home keeps sharing (case (a) of the
+        // clause this test tightened — equality, not prefix).
+        let machine_home = user_home.join(".airc");
+        let machine_socket = resolve_socket_path(
+            &machine_home,
+            &machine_home,
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            None,
+            Some(project_socket.clone()),
+        );
+        assert!(
+            machine_socket.to_string_lossy().contains("airc-machine-"),
+            "literal $HOME/.airc must still resolve the machine-singular \
+             socket, got {machine_socket:?}"
         );
     }
 

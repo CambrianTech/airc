@@ -62,6 +62,42 @@ const LIVE_BROADCAST_CAPACITY: usize = 1024;
 /// outside `$HOME` (CI temp dirs, isolated test roots) get their own
 /// `scope_home` back — they are their own account boundary.
 pub fn machine_account_home(scope_home: &Path) -> PathBuf {
+    // Temp-rooted scopes are their own account boundary on EVERY
+    // platform. On Linux/macOS that falls out of `/tmp` living outside
+    // `$HOME`, but on Windows `%TEMP%` is
+    // `C:\Users\<user>\AppData\Local\Temp` — INSIDE `%USERPROFILE%` —
+    // so without this guard a tempdir scope (CI, hermetic tests)
+    // resolves to the REAL machine account and leaks real-world state.
+    // Caught live on the 5090 node (card b0a81c31):
+    // `peer_record_count_requires_valid_json_files` started failing the
+    // moment a real peer was enrolled on the machine, while virgin
+    // boxes (and therefore CI) kept passing.
+    //
+    // Carve-out (sentinel on PR #1119): when HOME/USERPROFILE is ITSELF
+    // temp-rooted, a test harness is simulating a machine account by
+    // pointing the home at a TempDir (daemon_lifecycle does exactly
+    // this) — its scopes legitimately share that simulated account, so
+    // the temp guard must not fire. Real boxes never have a temp-rooted
+    // home, so the b0a81c31 fix is unaffected.
+    let temp = std::env::temp_dir();
+    let normalized_temp = temp.canonicalize().unwrap_or(temp);
+    let normalized_scope_for_temp = scope_home
+        .canonicalize()
+        .unwrap_or_else(|_| scope_home.to_path_buf());
+    let home_var = std::env::var_os("HOME").map(PathBuf::from);
+    let profile_var = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let any_home_is_temp_rooted = [home_var.as_ref(), profile_var.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|h| {
+            h.canonicalize()
+                .unwrap_or_else(|_| h.clone())
+                .starts_with(&normalized_temp)
+        });
+    if !any_home_is_temp_rooted && normalized_scope_for_temp.starts_with(&normalized_temp) {
+        return scope_home.to_path_buf();
+    }
+
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         let normalized_home = home.canonicalize().unwrap_or(home);
@@ -1530,5 +1566,19 @@ mod room_trust_policy_tests {
     #[test]
     fn wall_category_constant_is_stable() {
         assert_eq!(super::Airc::WALL_CATEGORY_TRUST_POLICY, "trust-policy");
+    }
+
+    /// Card b0a81c31: a temp-rooted scope must stay its own account
+    /// boundary on every platform. On Windows `%TEMP%` lives inside
+    /// `%USERPROFILE%`, so before the temp_dir guard this resolved to
+    /// the REAL machine account (`$USERPROFILE/.airc`) and leaked real
+    /// peer registries / daemon state into hermetic tests — failing
+    /// only on machines with actual enrolled peers, never in CI.
+    #[test]
+    fn machine_account_home_keeps_temp_scopes_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path().join("scope-home");
+        std::fs::create_dir(&scope).unwrap();
+        assert_eq!(super::machine_account_home(&scope), scope);
     }
 }
