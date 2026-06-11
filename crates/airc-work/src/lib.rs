@@ -9,6 +9,7 @@ pub mod codec;
 pub mod drain_policy;
 pub mod event;
 pub mod goal;
+pub mod goal_event;
 pub mod ids;
 pub mod local_git;
 pub mod model;
@@ -38,6 +39,9 @@ pub use event::{
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use goal::{ExitCondition, Goal, GoalState};
+pub use goal_event::{
+    CardOrigin, ExternalSource, GoalAbandoned, GoalAchieved, GoalCreated, GoalDryTickRecorded,
+};
 pub use ids::{ClaimId, GoalId, LaneId, RepoId, WorkCardId, WorkspaceId};
 pub use local_git::{
     local_git_events_since, CommandGitRunner, GitCommandRunner, LocalGitError, LocalGitObserver,

@@ -140,10 +140,16 @@ pub enum ExitCondition {
     /// open cards exist for it.
     AllCardsClosed,
     /// No automatic transition. Only an explicit `GoalAchieved` event
-    /// from an operator (or `GoalAbandoned`) moves the goal out of
-    /// `InProgress`. Per `[[no-fallbacks-ever]]`: this is the only
-    /// "manual" arm, and it's explicitly named — there's no implicit
-    /// fallthrough.
+    /// (operator-path: `condition: OperatorOnly`,
+    /// `achieved_by: Some(peer_id)`) or `GoalAbandoned` moves the goal
+    /// out of `InProgress`. The `goal_event::GoalAchieved` event in
+    /// slice C1 carries both emission paths structurally — the
+    /// projection (slice C2) auto-fires the deterministic conditions
+    /// (`DryForTicks`/`MilestoneClosed`/`AllCardsClosed`) with
+    /// `achieved_by: None`; operator-only goals reach `Achieved` only
+    /// via the operator path. Per `[[no-fallbacks-ever]]`: this is
+    /// the only "manual" arm, and it's explicitly named — there's no
+    /// implicit fallthrough.
     OperatorOnly,
 }
 
