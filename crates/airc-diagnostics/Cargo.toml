@@ -17,3 +17,12 @@ workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `probe!` / `time_probe!` expand to `tracing` events/spans so they
+# inherit tracing's build-time level gating (zero-cost when filtered
+# out) and compose with the fmt/bus subscribers hosts already install.
+tracing = "0.1"
+
+[dev-dependencies]
+# Capturing subscriber for the probe-macro tests (renders events to an
+# in-memory buffer we assert on).
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

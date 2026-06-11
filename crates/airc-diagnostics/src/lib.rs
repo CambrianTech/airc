@@ -4,6 +4,12 @@
 //! [`DiagnosticEvent`] values through a [`DiagnosticSink`]; terminal
 //! hosts can render them to stderr, and integrations can route them to
 //! ORM/event projections without parsing CLI text.
+//!
+//! Measurements are a separate channel: see [`probe!`] / [`time_probe!`]
+//! in the [`probe`] module — the macro-based, sink-free path you reach
+//! for to interrogate the running substrate.
+
+pub mod probe;
 
 use std::collections::BTreeMap;
 use std::io::Write;
