@@ -112,11 +112,15 @@ async fn tick_once(
     airc: &Airc,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Limit chosen large enough to surface every Review card with a
-    // PR in practice. The board fetch already filters heartbeats
-    // (card 79953b4d), so 256 work events back is several days of
-    // realistic mutation rate.
-    let board = airc.work_board(256).await?;
+    // Card 1291173d: the COMPLETE board, not a recent window — a
+    // Review card whose last event scrolled out of a fixed 256-event
+    // window would silently never merge. `work_board_complete` is the
+    // documented surface for scheduling code, and with the persistent
+    // projection cache each tick costs one incremental resume from
+    // the last-applied cursor instead of a full event-log replay.
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
     let snapshot = board.snapshot();
 
     // Card d5b7b07d: fetch the baseline (rust-rewrite HEAD's failing

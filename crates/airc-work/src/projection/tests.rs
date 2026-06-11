@@ -1549,3 +1549,45 @@ fn bench_projection_snapshot_clone_cost() {
         "projection.snapshot regressed to {ns_per_snapshot} ns/snapshot"
     );
 }
+
+// Card 1291173d: `apply_windowed` is the one apply rule shared by
+// `replay_window` and incremental resume from a cached snapshot —
+// missing-anchor events are skipped, structural errors stay loud.
+#[test]
+fn apply_windowed_skips_missing_anchor_and_fails_structural_errors() {
+    let card_id = WorkCardId::from_u128(1);
+    let mut projection = WorkBoardProjection::new();
+
+    // Anchor missing: the card was created before this window /
+    // snapshot — skip, exactly like replay_window.
+    projection
+        .apply_windowed(&WorkEvent::CardStateChanged(CardStateChanged {
+            card_id,
+            state: CardState::Review,
+            changed_by: peer(3),
+            changed_at_ms: 100,
+        }))
+        .unwrap();
+    assert!(projection.card(card_id).is_none());
+
+    let created = WorkEvent::CardCreated(CardCreated {
+        card_id,
+        repo: repo(),
+        title: "windowed apply".to_string(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        created_by: peer(3),
+        created_at_ms: 100,
+        reviews: None,
+    });
+    projection.apply_windowed(&created).unwrap();
+    assert!(projection.card(card_id).is_some());
+
+    // Structural error (duplicate create) is NOT window tolerance —
+    // it must stay loud on both the replay and the resume paths.
+    assert_eq!(
+        projection.apply_windowed(&created),
+        Err(ProjectionError::DuplicateCard(card_id))
+    );
+}

@@ -323,3 +323,96 @@ async fn drain_sequence_through_store_replays_into_projection_state() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].outcome.bytes_reclaimed, 800);
 }
+
+// ---------------------------------------------------------------------
+// Card 1291173d: incremental resume (`apply_transcripts`) must be the
+// SAME fold as the from-scratch replay (`project_transcripts`) — split
+// anywhere, including across a first-write-wins arbitration boundary.
+// ---------------------------------------------------------------------
+
+fn card_claimed(card_id: WorkCardId, claim: u128, owner: u128, claimed_at_ms: u64) -> WorkEvent {
+    WorkEvent::CardClaimed(airc_work::WorkCardClaimed {
+        card_id,
+        claim_id: airc_work::ClaimId::from_u128(claim),
+        owner: PeerId::from_u128(owner),
+        ttl_ms: 600_000,
+        claimed_at_ms,
+    })
+}
+
+#[test]
+fn apply_transcripts_resume_equals_full_replay_across_claim_arbitration() {
+    let room = RoomId::from_u128(10);
+    let card_a = WorkCardId::from_u128(20);
+    let card_b = WorkCardId::from_u128(21);
+
+    // Claim by peer 300 lands first; peer 301's racing claim arrives
+    // AFTER the snapshot boundary and must still lose first-write-wins
+    // arbitration against state restored from the snapshot.
+    let transcripts = vec![
+        work_transcript(1, room, 1, &card_created(card_a)),
+        work_transcript(2, room, 2, &card_claimed(card_a, 90, 300, 5_000)),
+        // ---- snapshot boundary ----
+        work_transcript(3, room, 3, &card_claimed(card_a, 91, 301, 6_000)),
+        work_transcript(4, room, 4, &card_created(card_b)),
+    ];
+
+    let full = project_transcripts(transcripts.clone()).unwrap();
+
+    let mut resumed = project_transcripts(transcripts[..2].to_vec()).unwrap();
+    let newest = apply_transcripts(&mut resumed, transcripts[2..].to_vec())
+        .unwrap()
+        .expect("non-empty increment yields a cursor");
+
+    assert_eq!(resumed, full, "incremental fold diverged from full replay");
+    assert_eq!(newest.event_id, EventId::from_u128(4));
+    // The arbitration itself: the pre-boundary claim won, the
+    // post-boundary racer was dropped without state change.
+    let card = resumed.card(card_a).expect("card A projected");
+    assert_eq!(card.owner, Some(PeerId::from_u128(300)));
+    assert_eq!(card.claim_id, Some(airc_work::ClaimId::from_u128(90)));
+}
+
+#[test]
+fn apply_transcripts_advances_cursor_past_non_work_events() {
+    let room = RoomId::from_u128(10);
+    let card_id = WorkCardId::from_u128(20);
+    let mut projection =
+        project_transcripts(vec![work_transcript(1, room, 1, &card_created(card_id))]).unwrap();
+    let before = projection.clone();
+
+    // A chat-only increment applies nothing but still advances the
+    // resume cursor — otherwise every subsequent resume would refetch
+    // the same chat tail forever.
+    let newest = apply_transcripts(&mut projection, vec![chat_transcript(9, room, 9)])
+        .unwrap()
+        .expect("chat transcript still yields a cursor");
+    assert_eq!(newest.event_id, EventId::from_u128(9));
+    assert_eq!(newest.lamport, 9);
+    assert_eq!(projection, before);
+}
+
+#[test]
+fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
+    let room = RoomId::from_u128(10);
+    let card_a = WorkCardId::from_u128(20);
+    let mut projection =
+        project_transcripts(vec![work_transcript(1, room, 1, &card_created(card_a))]).unwrap();
+
+    // Missing anchor (state change for a card the snapshot never saw):
+    // skipped, same as replay_window.
+    let unknown = WorkCardId::from_u128(99);
+    apply_transcripts(
+        &mut projection,
+        vec![work_transcript(2, room, 2, &card_state_changed(unknown))],
+    )
+    .unwrap();
+    assert!(projection.card(unknown).is_none());
+
+    // Structural error (duplicate create): loud failure, not a skip.
+    let result = apply_transcripts(
+        &mut projection,
+        vec![work_transcript(3, room, 3, &card_created(card_a))],
+    );
+    assert!(matches!(result, Err(WorkStoreError::Projection(_))));
+}

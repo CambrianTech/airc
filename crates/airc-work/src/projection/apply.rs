@@ -73,6 +73,21 @@ impl WorkBoardProjection {
         Ok(projection)
     }
 
+    /// Apply one event with bounded-window tolerance: an event whose
+    /// anchor entity is missing (its creation predates the window /
+    /// snapshot) is skipped, exactly as [`Self::replay_window`] skips
+    /// it; structural errors still fail. This is the single apply
+    /// rule shared by windowed replay AND incremental resume from a
+    /// cached projection (card 1291173d) — the two paths stay
+    /// semantically identical by construction.
+    pub fn apply_windowed(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
+        match self.apply(event) {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_missing_window_anchor() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Replay a bounded transcript window. Events whose anchor entity
     /// was created before the window are skipped; structural errors
     /// inside the window still fail.
@@ -81,11 +96,7 @@ impl WorkBoardProjection {
     ) -> Result<Self, ProjectionError> {
         let mut projection = Self::new();
         for event in events {
-            match projection.apply(&event) {
-                Ok(()) => {}
-                Err(error) if error.is_missing_window_anchor() => {}
-                Err(error) => return Err(error),
-            }
+            projection.apply_windowed(&event)?;
         }
         Ok(projection)
     }

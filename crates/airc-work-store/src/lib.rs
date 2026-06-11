@@ -118,8 +118,28 @@ where
 pub fn project_transcripts(
     transcripts: Vec<TranscriptEvent>,
 ) -> Result<WorkBoardProjection, WorkStoreError> {
+    let mut projection = WorkBoardProjection::new();
+    apply_transcripts(&mut projection, transcripts)?;
+    Ok(projection)
+}
+
+/// Apply a caller-supplied transcript page **incrementally** onto an
+/// existing projection (card 1291173d: cached work-board resume).
+/// Decode + apply rule is byte-identical to [`project_transcripts`] —
+/// both funnel through `WorkBoardProjection::apply_windowed` — so
+/// `project_transcripts(a ++ b)` ≡ `project_transcripts(a)` then
+/// `apply_transcripts(b)`. Returns the cursor of the newest transcript
+/// event consumed (work event or not), i.e. the resume point for the
+/// next increment.
+pub fn apply_transcripts(
+    projection: &mut WorkBoardProjection,
+    transcripts: Vec<TranscriptEvent>,
+) -> Result<Option<TranscriptCursor>, WorkStoreError> {
     let page = decode_page(transcripts)?;
-    Ok(WorkBoardProjection::replay_window(page.events)?)
+    for event in &page.events {
+        projection.apply_windowed(event)?;
+    }
+    Ok(page.newest_cursor)
 }
 
 fn decode_page(transcripts: Vec<TranscriptEvent>) -> Result<WorkEventPage, WorkStoreError> {
