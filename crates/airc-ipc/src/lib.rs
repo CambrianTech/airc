@@ -42,8 +42,8 @@ pub const IPC_PROTOCOL_VERSION: u16 = 5;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{
-    AddPeerRequest, AttachRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PublishRequest, RemovePeerRequest, Request, SendRequest,
+    AddPeerRequest, AttachParts, AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery,
+    IpcKind, IpcTarget, PublishRequest, RemovePeerRequest, Request, SendRequest,
 };
 pub use response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
 pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};

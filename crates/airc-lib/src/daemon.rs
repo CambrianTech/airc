@@ -19,8 +19,8 @@ use airc_bus::envelope::{Envelope, Kind, Target};
 use airc_core::{Body, MentionTarget, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind};
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest, Response,
-    SendRequest,
+    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest,
+    Response, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -373,22 +373,12 @@ impl Airc {
             // Initial attach + ack — fail fast so `subscribe()` errors if
             // the daemon is down right now (don't silently spin).
             //
-            // Card bf0b5790: `from_now: true` — this is the LIVE
-            // subscribe surface. Without it the daemon interprets
-            // `from: None, from_now: false` as "resume from the start
-            // of the transcript" and full-replays days of history
-            // through the live stream (`airc join` flooded every
-            // attach with the entire event log). Catch-up is a
-            // separate, bounded concern (`resume_from_subscribed_filtered`
-            // with a stored cursor — see `join_feed`); the live stream
-            // starts at the live edge, same as the monitor attach
-            // (card 7d5b6a65).
+            // Card bf0b5790: this is the LIVE subscribe surface, so the
+            // stream starts at the live edge. Catch-up is a separate,
+            // bounded concern (`resume_from_subscribed_filtered` with a
+            // stored cursor — see `join_feed`).
             let mut stream = client
-                .attach(AttachRequest {
-                    channel: Some(channel),
-                    from_now: true,
-                    ..Default::default()
-                })
+                .attach(AttachRequest::live(channel))
                 .await
                 .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
             match read_frame::<_, Response>(&mut stream).await {
@@ -476,17 +466,16 @@ impl Airc {
                             return; // consumer dropped while we were down
                         }
                         // Card bf0b5790: a drop BEFORE the first
-                        // delivered event leaves `from: None`; without
-                        // `from_now` that re-attach would full-replay
-                        // the transcript. With a cursor, resume the gap
+                        // delivered event leaves no cursor — re-attach
+                        // at the live edge rather than replaying the
+                        // transcript. With a cursor, resume the gap
                         // exactly as before.
+                        let start = match from {
+                            Some(cursor) => AttachStart::After(cursor),
+                            None => AttachStart::Live,
+                        };
                         let mut s = match client
-                            .attach(AttachRequest {
-                                channel: Some(channel),
-                                from,
-                                from_now: from.is_none(),
-                                ..Default::default()
-                            })
+                            .attach(AttachRequest::new(channel, start))
                             .await
                         {
                             Ok(s) => s,

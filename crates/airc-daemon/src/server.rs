@@ -26,7 +26,7 @@ use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
 use airc_ipc::codec::{read_frame, write_frame};
-use airc_ipc::request::{AttachRequest, IpcDelivery, IpcKind, Request};
+use airc_ipc::request::{AttachRequest, AttachStart, IpcDelivery, IpcKind, Request};
 use airc_ipc::response::Response;
 use airc_ipc::transport::{IpcListener, IpcStream};
 
@@ -269,9 +269,14 @@ async fn stream_attach<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    // Card c0cb6cdc: the request destructures into typed parts — the
+    // start position is already an `AttachStart`, decoded once in
+    // `AttachRequest::start`. No flag precedence to re-derive here.
+    let parts = attach.into_parts();
+
     // The owner-core router subscribes per channel (no global table to
     // scan). A client attaches once per room it cares about.
-    let channel = match attach.channel {
+    let channel = match parts.channel {
         Some(channel) => channel,
         None => {
             return write_response(
@@ -283,33 +288,28 @@ where
             .await;
         }
     };
-    // Resume strictly after the client's cursor (replay the gap missed
-    // while detached), then go live with no dup at the seam. `from` is
-    // advanced as we send, so a re-subscribe after a lag drop resumes
-    // exactly where we left off.
+    // Map the typed start onto the router cursor. `from` is advanced as
+    // we send, so a re-subscribe after a lag drop resumes exactly where
+    // we left off (replay the gap, no dup at the seam).
     //
-    // Card 7d5b6a65: `from_now` overrides any cursor the client passed
-    // with the channel's current head — the agent-Monitor live-tail
-    // shape. The router's `subscribe_with_lag` interprets a
-    // forward-pointing cursor as "nothing newer than this yet," so the
-    // ring snapshot + deep replay legs return empty and we go straight
-    // to live.
+    // `Live` (card 7d5b6a65): start at the channel's current head. The
+    // router's `subscribe_with_lag` interprets a forward-pointing cursor
+    // as "nothing newer than this yet," so the ring snapshot + deep
+    // replay legs return empty and we go straight to live.
     //
     // Critical: when the in-memory ring is empty (fresh daemon, no
     // events yet this process-lifetime), `router.head_cursor` returns
     // None — but the SINK still has the durable transcript. Without
-    // the sink fallback below, `from: None` would fall through to a
-    // full sink replay (the very bug card 7d5b6a65 closes). Query the
-    // sink for its head when the ring is empty.
-    let mut from = if attach.from_now {
-        match state.router.head_cursor(channel) {
+    // the sink fallback below, `Live` would fall through to a full
+    // sink replay (the very bug card 7d5b6a65 closes). Query the sink
+    // for its head when the ring is empty.
+    let mut from = match parts.start {
+        AttachStart::Live => match state.router.head_cursor(channel) {
             Some(c) => Some(c),
             None => state.router.sink_head_cursor(channel).await,
-        }
-    } else {
-        attach
-            .from
-            .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id))
+        },
+        AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
+        AttachStart::FromTranscriptStart => None,
     };
 
     // Card 7d5b6a65: `coalesce_backlog` lets the daemon collapse all
@@ -317,21 +317,21 @@ where
     // frame instead of streaming each event individually. We track the
     // ring-snapshot's high-water cursor; everything at or before it is
     // backlog (collapsed), everything after it is live (streamed
-    // event-by-event as before).
-    let coalesce_backlog = attach.coalesce_backlog && !attach.from_now;
+    // event-by-event as before). `Live` has no backlog to coalesce.
+    let coalesce_backlog = parts.coalesce_backlog && parts.start != AttachStart::Live;
 
     // Compile the consumer's kind/delivery/header filters into the router
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
     // consumer would discard (Hermes → Command/CommandResult; Continuum →
     // scoped `forge.*` headers; a media tap → StreamChunk only).
     let mut filter = Filter::channel(channel);
-    if let Some(kinds) = attach.kinds {
+    if let Some(kinds) = parts.kinds {
         filter = filter.with_kinds(kinds.into_iter().map(map_ipc_kind).collect());
     }
-    if let Some(delivery) = attach.delivery {
+    if let Some(delivery) = parts.delivery {
         filter = filter.with_delivery(delivery.into_iter().map(map_ipc_delivery).collect());
     }
-    filter = filter.with_headers(attach.headers);
+    filter = filter.with_headers(parts.headers);
 
     // Subscribe BEFORE acking. Once the client sees `Ok`, the
     // subscription is already registered at the live edge, so a publish

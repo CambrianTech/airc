@@ -109,11 +109,7 @@ async fn persona_collect(
 ) -> Vec<Vec<u8>> {
     let client = DaemonClient::new(socket);
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            ..Default::default()
-        })
+        .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
@@ -152,11 +148,7 @@ async fn collect_envelopes(
 ) -> Vec<Envelope> {
     let client = DaemonClient::new(socket);
     let mut stream = client
-        .attach(AttachRequest {
-            channel: Some(channel),
-            from: None,
-            ..Default::default()
-        })
+        .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
@@ -591,11 +583,7 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
     let worker = tokio::spawn(async move {
         let client = DaemonClient::new(worker_socket);
         let mut stream = client
-            .attach(AttachRequest {
-                channel: Some(channel),
-                kinds: Some(vec![IpcKind::Command]),
-                ..Default::default()
-            })
+            .attach(AttachRequest::live(channel).with_kinds(vec![IpcKind::Command]))
             .await
             .expect("worker attach");
         assert!(matches!(
@@ -643,11 +631,7 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
     let requester = tokio::spawn(async move {
         let client = DaemonClient::new(req_socket);
         let mut stream = client
-            .attach(AttachRequest {
-                channel: Some(channel),
-                kinds: Some(vec![IpcKind::CommandResult]),
-                ..Default::default()
-            })
+            .attach(AttachRequest::live(channel).with_kinds(vec![IpcKind::CommandResult]))
             .await
             .expect("requester attach");
         assert!(matches!(
@@ -724,14 +708,12 @@ async fn attach_header_filter_scopes_subscription_router_side() {
     let collector = tokio::spawn(async move {
         let client = DaemonClient::new(socket);
         let mut stream = client
-            .attach(AttachRequest {
-                channel: Some(channel),
-                headers: HeaderFilter::Exact {
+            .attach(
+                AttachRequest::live(channel).with_headers(HeaderFilter::Exact {
                     key: "forge.room".to_string(),
                     value: "alpha".to_string(),
-                },
-                ..Default::default()
-            })
+                }),
+            )
             .await
             .expect("attach");
         assert!(matches!(

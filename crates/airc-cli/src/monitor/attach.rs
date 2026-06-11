@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
-use airc_ipc::{codec::read_frame, AttachRequest, DaemonClient, Response};
+use airc_ipc::{codec::read_frame, AttachRequest, AttachStart, DaemonClient, Response};
 use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
@@ -47,28 +47,28 @@ pub(crate) async fn run(
     // feed. Each daemon `Event` carries airc-wire bytes — decoded once
     // here via the shared projection.
     //
-    // Card 7d5b6a65: `from_now=true` (the default) asks the daemon to
-    // skip transcript replay and start at the live edge — no backlog
-    // flood. `coalesce_backlog=true` (only meaningful when `from_now`
-    // is false) asks the daemon to collapse the catch-up phase into a
-    // single `AttachCursorAdvanced` summary frame which the renderer
-    // surfaces as ONE stdout line instead of N historical events.
+    // Card 7d5b6a65: `from_now` (the CLI default) maps to
+    // `AttachStart::Live` — no backlog flood. Without it the monitor
+    // replays the transcript (`FromTranscriptStart`), where
+    // `coalesce_backlog` collapses the catch-up phase into a single
+    // `AttachCursorAdvanced` summary frame which the renderer surfaces
+    // as ONE stdout line instead of N historical events.
+    let start = if from_now {
+        AttachStart::Live
+    } else {
+        AttachStart::FromTranscriptStart
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<MonitorFrame>(1024);
     for channel in channels {
         let socket = socket.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let client = DaemonClient::new(socket);
-            let mut stream = match client
-                .attach(AttachRequest {
-                    channel: Some(channel),
-                    from: None,
-                    from_now,
-                    coalesce_backlog,
-                    ..Default::default()
-                })
-                .await
-            {
+            let mut request = AttachRequest::new(channel, start);
+            if coalesce_backlog {
+                request = request.with_coalesced_backlog();
+            }
+            let mut stream = match client.attach(request).await {
                 Ok(stream) => stream,
                 Err(_) => return,
             };

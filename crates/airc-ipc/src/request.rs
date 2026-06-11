@@ -141,67 +141,178 @@ pub struct InboxRequest {
     pub limit: Option<usize>,
 }
 
+/// Where an attach stream starts. One intentional choice — not a
+/// `from`/`from_now` flag pair whose precedence lived in a server-side
+/// comment (card c0cb6cdc; the pair let `..Default::default()` mean
+/// "replay days of transcript," which is how bf0b5790 happened).
+///
+/// `Live` is the default because it is the only start that can never
+/// flood a consumer. Both replaying variants must be named at the call
+/// site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttachStart {
+    /// Start at the channel's live edge: deliver only events published
+    /// after the subscription is registered. The subscribe contract.
+    #[default]
+    Live,
+    /// Resume strictly after this cursor — replay the gap the client
+    /// missed while detached, then continue live with no duplicate at
+    /// the seam.
+    After(IpcCursor),
+    /// Replay the full transcript before going live. Audit/replay
+    /// tools only — on a long-lived room this is days of backlog, so
+    /// pair it with [`AttachRequest::with_coalesced_backlog`] unless
+    /// every historical envelope is genuinely wanted.
+    FromTranscriptStart,
+}
+
 /// Parameters for `Attach`. Filters are applied **router-side** so the
 /// daemon never fans out events the consumer would discard — the
 /// adaptable/performant subscription: Hermes attaches to
 /// Command/CommandResult, Continuum scopes by `forge.continuum.*`
 /// headers, a game attaches to one room's StreamChunk only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// Fields are private: construction goes through [`AttachRequest::new`]
+/// / [`AttachRequest::live`] so the start position is always a typed
+/// [`AttachStart`], never an implicit flag combination. The wire shape
+/// is unchanged (`from` + `from_now` encode the enum), so version-skewed
+/// daemon/client pairs interoperate: an old client's bare request decodes
+/// as [`AttachStart::FromTranscriptStart`], exactly its legacy meaning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachRequest {
     /// The channel (room) to attach to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<airc_core::RoomId>,
-    /// Resume strictly after this cursor before going live — replay the
-    /// gap the client missed while detached, then continue live with no
-    /// duplicate at the seam.
-    ///
-    /// `None` historically meant "give me everything from the beginning
-    /// of the transcript" (despite the prior docstring claiming "live
-    /// edge"). Card 7d5b6a65 splits intent: pair `from: None` with
-    /// `from_now: true` for "skip backlog, just go live," and pair it
-    /// with `from_now: false` for the legacy full-backlog behavior.
-    /// Existing callers that omit `from_now` keep the prior shape (no
-    /// behavior change on the wire for pre-card-7d5b6a65 clients).
+    channel: Option<airc_core::RoomId>,
+    /// Wire encoding of [`AttachStart::After`]. See [`Self::start`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<IpcCursor>,
-    /// **Card 7d5b6a65.** When `true`, the daemon overrides any `from`
-    /// value with the current head cursor at attach time — the client
-    /// gets no backlog at all, only events published strictly after
-    /// the attach call returns. This is the agent-Monitor live-tail
-    /// shape (the existing `from: None` behaviour replayed days of
-    /// transcript and fired one notification per historical event).
-    ///
-    /// Default `false` preserves the prior `from: None` = full-replay
-    /// behaviour for tools that depend on it (audit, replay,
-    /// codex-hook poll's first-attach catch-up).
+    from: Option<IpcCursor>,
+    /// Wire encoding of [`AttachStart::Live`] (card 7d5b6a65): the
+    /// daemon starts at the channel head, ignoring `from`. See
+    /// [`Self::start`] — the precedence lives there, nowhere else.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub from_now: bool,
+    from_now: bool,
     /// **Card 7d5b6a65.** When `true`, the daemon emits ONE
     /// [`Response::AttachCursorAdvanced`] summary frame at the end of
     /// the backlog catch-up phase instead of streaming each historical
-    /// event individually, then transitions to live tail. Live events
-    /// still arrive one-at-a-time as before.
-    ///
-    /// Has no effect when there is no backlog to coalesce
-    /// (`from_now: true` or `from` already at head). Has no effect on
-    /// live events — only on the catch-up phase.
-    ///
-    /// Default `false` preserves the prior event-by-event replay so
-    /// audit/replay tools that need to see every historical envelope
-    /// keep working unchanged.
+    /// event individually, then transitions to live tail. Orthogonal to
+    /// [`AttachStart`]: it shapes how backlog is delivered, not where
+    /// the stream starts, and is a no-op when there is no backlog
+    /// (`Live`, or a cursor already at head).
     #[serde(default, skip_serializing_if = "is_false")]
-    pub coalesce_backlog: bool,
+    coalesce_backlog: bool,
     /// If set, only these kinds are delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kinds: Option<Vec<IpcKind>>,
+    kinds: Option<Vec<IpcKind>>,
     /// If set, only these delivery classes are delivered (e.g. just
     /// `StreamChunk` for a media tap, or just `Durable` for a transcript
     /// tail).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<Vec<IpcDelivery>>,
+    delivery: Option<Vec<IpcDelivery>>,
     /// Header predicate evaluated router-side. `Any` (default) matches
     /// all; consumers scope by their `forge.*` projection headers.
     #[serde(default)]
+    headers: HeaderFilter,
+}
+
+impl AttachRequest {
+    /// Attach to `channel`, starting at `start`. No filters: every
+    /// event class on the channel is delivered. Narrow with the
+    /// `with_*` builders.
+    pub fn new(channel: airc_core::RoomId, start: AttachStart) -> Self {
+        let (from, from_now) = match start {
+            AttachStart::Live => (None, true),
+            AttachStart::After(cursor) => (Some(cursor), false),
+            AttachStart::FromTranscriptStart => (None, false),
+        };
+        Self {
+            channel: Some(channel),
+            from,
+            from_now,
+            coalesce_backlog: false,
+            kinds: None,
+            delivery: None,
+            headers: HeaderFilter::default(),
+        }
+    }
+
+    /// [`Self::new`] with [`AttachStart::Live`] — the common shape.
+    pub fn live(channel: airc_core::RoomId) -> Self {
+        Self::new(channel, AttachStart::Live)
+    }
+
+    /// Decode the wire flag pair back into the typed start position.
+    /// This is the ONLY place the `from_now`-overrides-`from`
+    /// precedence exists.
+    pub fn start(&self) -> AttachStart {
+        if self.from_now {
+            AttachStart::Live
+        } else if let Some(cursor) = self.from {
+            AttachStart::After(cursor)
+        } else {
+            AttachStart::FromTranscriptStart
+        }
+    }
+
+    /// The channel this request attaches to, if one was set (requests
+    /// from legacy clients may omit it; the daemon rejects those).
+    pub fn channel(&self) -> Option<airc_core::RoomId> {
+        self.channel
+    }
+
+    /// Whether backlog catch-up is collapsed into one summary frame.
+    pub fn coalesces_backlog(&self) -> bool {
+        self.coalesce_backlog
+    }
+
+    /// Deliver only these event kinds.
+    pub fn with_kinds(mut self, kinds: Vec<IpcKind>) -> Self {
+        self.kinds = Some(kinds);
+        self
+    }
+
+    /// Deliver only these delivery classes.
+    pub fn with_delivery(mut self, delivery: Vec<IpcDelivery>) -> Self {
+        self.delivery = Some(delivery);
+        self
+    }
+
+    /// Scope by header predicate (router-side).
+    pub fn with_headers(mut self, headers: HeaderFilter) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Collapse backlog catch-up into one summary frame (card 7d5b6a65).
+    pub fn with_coalesced_backlog(mut self) -> Self {
+        self.coalesce_backlog = true;
+        self
+    }
+
+    /// Destructure for the daemon's attach handler: moves the filter
+    /// vectors out (no clone) with the start already decoded. One-way —
+    /// there is no path from parts back to a request, so the typed
+    /// start cannot be bypassed.
+    pub fn into_parts(self) -> AttachParts {
+        let start = self.start();
+        AttachParts {
+            channel: self.channel,
+            start,
+            coalesce_backlog: self.coalesce_backlog,
+            kinds: self.kinds,
+            delivery: self.delivery,
+            headers: self.headers,
+        }
+    }
+}
+
+/// Owned view of an [`AttachRequest`] for the serving side. Produced by
+/// [`AttachRequest::into_parts`]; not constructible into a request.
+pub struct AttachParts {
+    pub channel: Option<airc_core::RoomId>,
+    pub start: AttachStart,
+    pub coalesce_backlog: bool,
+    pub kinds: Option<Vec<IpcKind>>,
+    pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
 }
 
@@ -298,6 +409,77 @@ pub struct PublishRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cursor(counter: u64) -> IpcCursor {
+        IpcCursor {
+            epoch: 1,
+            counter,
+            event_id: airc_core::EventId::from_u128(0xfeed),
+        }
+    }
+
+    /// Card c0cb6cdc: every `AttachStart` survives the wire round-trip —
+    /// the legacy flag-pair encoding decodes back to the same typed start.
+    #[test]
+    fn attach_start_roundtrips_through_wire_encoding() {
+        for start in [
+            AttachStart::Live,
+            AttachStart::After(cursor(7)),
+            AttachStart::FromTranscriptStart,
+        ] {
+            let request = AttachRequest::new(airc_core::RoomId(Uuid::nil()), start);
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: AttachRequest = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.start(), start, "round-trip of {start:?}");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    /// Card c0cb6cdc: a bare request from a pre-AttachStart client
+    /// (no `from`, no `from_now` on the wire) keeps its legacy meaning —
+    /// full transcript replay — so version-skewed peers interoperate.
+    #[test]
+    fn legacy_bare_attach_decodes_as_transcript_start() {
+        let legacy = format!(r#"{{"channel":"{}"}}"#, Uuid::nil());
+        let decoded: AttachRequest = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(decoded.start(), AttachStart::FromTranscriptStart);
+        assert!(!decoded.coalesces_backlog());
+    }
+
+    /// Card c0cb6cdc: `from_now` wins over a cursor on the wire — the
+    /// precedence exists in exactly one place (`AttachRequest::start`),
+    /// pinned here so it never silently drifts.
+    #[test]
+    fn from_now_takes_precedence_over_cursor_on_the_wire() {
+        let skewed = format!(
+            r#"{{"channel":"{}","from":{},"from_now":true}}"#,
+            Uuid::nil(),
+            serde_json::to_string(&cursor(3)).unwrap(),
+        );
+        let decoded: AttachRequest = serde_json::from_str(&skewed).unwrap();
+        assert_eq!(decoded.start(), AttachStart::Live);
+    }
+
+    /// Card c0cb6cdc: the dangerous start must be named — the safe
+    /// default of the typed enum is `Live`.
+    #[test]
+    fn attach_start_default_is_live() {
+        assert_eq!(AttachStart::default(), AttachStart::Live);
+    }
+
+    #[test]
+    fn into_parts_moves_filters_with_decoded_start() {
+        let parts = AttachRequest::new(
+            airc_core::RoomId(Uuid::nil()),
+            AttachStart::After(cursor(9)),
+        )
+        .with_kinds(vec![IpcKind::Command])
+        .with_coalesced_backlog()
+        .into_parts();
+        assert_eq!(parts.start, AttachStart::After(cursor(9)));
+        assert!(parts.coalesce_backlog);
+        assert_eq!(parts.kinds.as_deref(), Some(&[IpcKind::Command][..]));
+    }
 
     #[test]
     fn ping_serializes_compactly() {
