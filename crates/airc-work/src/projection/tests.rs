@@ -32,6 +32,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             created_by: owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }))
         .unwrap();
     projection
@@ -82,6 +83,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             created_by: owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: merged_card,
@@ -106,6 +108,7 @@ fn terminal_cards_do_not_surface_stale_claims() {
             created_by: owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id: closed_card,
@@ -143,6 +146,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             created_by: owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -190,6 +194,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             created_by: owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -240,6 +245,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             created_by: first_owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -289,6 +295,7 @@ fn expired_claim_can_be_superseded_by_new_claim() {
             created_by: expired_owner,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,
@@ -391,6 +398,7 @@ fn lane_card_and_pr_merge_projection_is_deterministic() {
             created_by: owner,
             created_at_ms: 2,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::PullRequestLinked(PullRequestLinked {
             card_id,
@@ -433,6 +441,7 @@ fn workspace_lease_lifecycle_projects_status_and_disk() {
             created_by: owner,
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }))
         .unwrap();
     projection
@@ -702,6 +711,7 @@ fn heartbeat_for_non_active_claim_is_dropped_silently() {
             created_by: owner,
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }))
         .unwrap();
     projection
@@ -745,6 +755,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             created_by: owner_a,
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }))
         .unwrap();
     projection
@@ -814,6 +825,7 @@ fn concurrent_card_creates_with_distinct_ids_project_independently() {
             created_by: alice,
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }))
         .expect("alice's create projects");
     projection
@@ -827,6 +839,7 @@ fn concurrent_card_creates_with_distinct_ids_project_independently() {
             created_by: bob,
             created_at_ms: 101,
             reviews: None,
+            origin: None,
         }))
         .expect("bob's create projects independently");
 
@@ -860,6 +873,7 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
             created_by: peer(1),
             created_at_ms: 100,
             reviews: None,
+            origin: None,
         }))
         .expect("first create projects");
     let err = projection
@@ -873,6 +887,7 @@ fn duplicate_card_id_on_create_surfaces_error_never_silent_clobber() {
             created_by: peer(2),
             created_at_ms: 200,
             reviews: None,
+            origin: None,
         }))
         .expect_err("duplicate card_id must surface as an error");
     assert!(
@@ -918,6 +933,7 @@ fn cards_omitting_reviews_link_project_with_none() {
             created_by: peer(1),
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }))
         .expect("ordinary create projects");
 
@@ -948,6 +964,7 @@ fn review_card_links_to_parent_and_surfaces_on_query() {
             created_by: peer(1),
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }))
         .expect("parent create projects");
 
@@ -963,6 +980,7 @@ fn review_card_links_to_parent_and_surfaces_on_query() {
             created_by: peer(2),
             created_at_ms: 2,
             reviews: Some(parent_id),
+            origin: None,
         }))
         .expect("review create projects");
 
@@ -1013,6 +1031,7 @@ fn multiple_reviewers_each_surface_for_the_same_parent() {
                 created_by: by,
                 created_at_ms: ts,
                 reviews,
+                origin: None,
             }))
             .expect("create projects");
     }
@@ -1055,6 +1074,7 @@ fn reviews_field_round_trips_through_serde_with_back_compat() {
         created_by: PeerId::new(),
         created_at_ms: 200,
         reviews: Some(parent),
+        origin: None,
     };
     let json = serde_json::to_value(&review_event).expect("encode");
     assert_eq!(
@@ -1072,6 +1092,7 @@ fn reviews_field_round_trips_through_serde_with_back_compat() {
     // UUID strings, which can be malformed or collide in p2p.
     let plain = CardCreated {
         reviews: None,
+        origin: None,
         ..review_event
     };
     let plain_json = serde_json::to_value(&plain).expect("encode plain");
@@ -1119,6 +1140,7 @@ fn project_card_with(
             created_by: peer(1),
             created_at_ms,
             reviews: None,
+            origin: None,
         }))
         .expect("create projects");
 }
@@ -1410,6 +1432,7 @@ fn build_realistic_event_log(n_cards: u32, mutations_per_card: u32) -> Vec<WorkE
             created_by: owner,
             created_at_ms: 1_000 + u64::from(i),
             reviews: None,
+            origin: None,
         }));
         events.push(WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,

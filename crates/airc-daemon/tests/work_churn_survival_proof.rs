@@ -263,6 +263,7 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
             created_by: alice,
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,

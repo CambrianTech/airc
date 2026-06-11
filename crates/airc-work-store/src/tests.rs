@@ -23,6 +23,7 @@ fn card_created(card_id: WorkCardId) -> WorkEvent {
         created_by: PeerId::from_u128(200),
         created_at_ms: 1000,
         reviews: None,
+        origin: None,
     })
 }
 

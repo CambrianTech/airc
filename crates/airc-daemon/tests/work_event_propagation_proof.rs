@@ -257,6 +257,7 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
             created_by: owner,
             created_at_ms: 1,
             reviews: None,
+            origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
             card_id,

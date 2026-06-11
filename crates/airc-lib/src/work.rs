@@ -4,13 +4,13 @@ use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
     encode_work_event, local_git_events_since, pull_request_events_since, AgentAvailabilityRecord,
-    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, CardState,
-    CardStateChanged, ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner, LaneCreated,
-    LaneId, LaneState, LaneStateChanged, LocalGitObserver, LocalGitSnapshot, LocalGitWorkspace,
-    ManagerHatClaimed, ManagerHatReleased, Priority, PullRequestObserver, PullRequestSource,
-    RepoId, RepoPullRequestSnapshot, StaleClaim, WorkBoardProjection, WorkCard, WorkCardClaimed,
-    WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId, WorkspaceReleased,
-    WorkspaceRequested,
+    AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, CardOrigin,
+    CardState, CardStateChanged, ClaimHeartbeat, ClaimId, ClaimReleased, CommandGitRunner,
+    LaneCreated, LaneId, LaneState, LaneStateChanged, LocalGitObserver, LocalGitSnapshot,
+    LocalGitWorkspace, ManagerHatClaimed, ManagerHatReleased, Priority, PullRequestObserver,
+    PullRequestSource, RepoId, RepoPullRequestSnapshot, StaleClaim, WorkBoardProjection, WorkCard,
+    WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId,
+    WorkspaceReleased, WorkspaceRequested,
 };
 use airc_work_store::WorkEventStore;
 
@@ -400,23 +400,50 @@ pub struct ObservedPullRequests {
     pub emitted_event_ids: Vec<EventId>,
 }
 
+/// Pure helper: build the typed `CardCreated` event for the
+/// operator path. Extracted from `Airc::create_work_card` so the
+/// emitter's wire shape (specifically `origin`) is unit-testable
+/// without standing up a full Airc instance.
+///
+/// **Invariant pinned by tests**: this helper ALWAYS produces
+/// `origin: Some(CardOrigin::Operator { peer_id })` — never
+/// `None`. The `None`-arm interpretation in the C2b projection
+/// (`None => Operator { peer_id: created_by }`) is reserved for
+/// legacy pre-C2a transcripts; new operator emissions carry
+/// typed provenance on the wire per v2 A1.
+fn build_operator_card_created(
+    card_id: WorkCardId,
+    peer_id: airc_core::PeerId,
+    now_ms: u64,
+    request: CreateWorkCard,
+) -> CardCreated {
+    CardCreated {
+        card_id,
+        repo: request.repo,
+        title: request.title,
+        body: request.body,
+        priority: request.priority,
+        lane_id: request.lane_id,
+        created_by: peer_id,
+        created_at_ms: now_ms,
+        reviews: request.reviews,
+        origin: Some(CardOrigin::Operator { peer_id }),
+    }
+}
+
 impl Airc {
     /// Create a work card in the current room and publish it as a
     /// signed work-domain event. Returns the UUIDv4 card id generated
     /// locally for this card.
     pub async fn create_work_card(&self, request: CreateWorkCard) -> Result<WorkCardId, AircError> {
         let card_id = WorkCardId::new();
-        let event = WorkEvent::CardCreated(CardCreated {
+        let peer_id = self.peer_id();
+        let event = WorkEvent::CardCreated(build_operator_card_created(
             card_id,
-            repo: request.repo,
-            title: request.title,
-            body: request.body,
-            priority: request.priority,
-            lane_id: request.lane_id,
-            created_by: self.peer_id(),
-            created_at_ms: now_ms()?,
-            reviews: request.reviews,
-        });
+            peer_id,
+            now_ms()?,
+            request,
+        ));
         self.publish_work_event(&event).await?;
         Ok(card_id)
     }
@@ -1219,5 +1246,46 @@ mod tests {
         );
         mixed_headers.insert("forge.work.card_id".to_owned(), "abc".to_owned());
         assert!(is_work_event_transcript(&event_with_headers(mixed_headers)));
+    }
+
+    #[test]
+    fn build_operator_card_created_never_emits_origin_none() {
+        // what this catches: regression where the production operator
+        // emitter falls back to `origin: None`. Verdict 4679774882
+        // blocker 1: stamping `None` here would normalize the legacy
+        // arm (C2b's `None => Operator { peer_id: created_by }` rule)
+        // as the permanent operator encoding, making new operator
+        // cards wire-indistinguishable from pre-C2a transcripts and
+        // removing the future tripwire that catches a synthesizer
+        // forgetting to stamp `Synthesized`. The contract is:
+        // `build_operator_card_created` ALWAYS emits typed Operator
+        // provenance with the caller's peer_id; structural assertions
+        // (not just `is_some()`) pin the exact variant + field.
+        let peer_id = airc_core::PeerId::new();
+        let request = CreateWorkCard::new(
+            RepoId::new("CambrianTech/airc").unwrap(),
+            "exercise the operator emitter",
+            Priority::P2,
+        );
+        let event = build_operator_card_created(WorkCardId::new(), peer_id, 42, request);
+
+        // Structural assertion: the typed variant carries this peer_id.
+        // Pattern-matching directly (rather than `event.origin.is_some()`)
+        // is the load-bearing part — it kills both "drift to None" AND
+        // "drift to Synthesized/External with bogus payload" mutations.
+        match event.origin {
+            Some(CardOrigin::Operator { peer_id: stamped }) => {
+                assert_eq!(
+                    stamped, peer_id,
+                    "operator emitter must stamp the calling peer's id, not a placeholder"
+                );
+            }
+            other => {
+                panic!("operator emitter must produce Some(CardOrigin::Operator), got {other:?}")
+            }
+        }
+        // Belt-and-suspenders: `created_by` and the `Operator.peer_id`
+        // are the same identity by construction at the operator emitter.
+        assert_eq!(event.created_by, peer_id);
     }
 }
