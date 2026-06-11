@@ -51,22 +51,59 @@ impl IpcStream {
         }
         #[cfg(windows)]
         {
+            use tokio::net::windows::named_pipe::ClientOptions;
+
+            // ERROR_PIPE_BUSY: every server instance is currently
+            // serving another client. Under concurrent connects this is
+            // EXPECTED, not fatal — the daemon cycles instances one
+            // accept at a time, so simultaneous callers race for the
+            // listening instance and the losers must wait for the next
+            // one. The canonical Windows named-pipe client contract is
+            // to retry on BUSY (the `WaitNamedPipe` semantics); the old
+            // single-shot `open()` is why contending tabs surfaced
+            // `os error 231` and the lifecycle test hung (card
+            // 8763f167). We retry with a short backoff, bounded by an
+            // overall deadline so an ABSENT daemon still fails fast.
+            // Callers wrap this in their own RPC timeout (250ms for
+            // fast probes, 5s for real commands); whichever fires first
+            // governs, so fast probes keep failing fast under load and
+            // real commands get the room to ride out a burst.
+            const ERROR_PIPE_BUSY: i32 = 231;
             let pipe_name = resolve_pipe_name(path);
-            let client = tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                tokio::task::spawn_blocking(move || {
-                    tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name)
-                }),
-            )
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timed out opening daemon named pipe",
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let name = pipe_name.clone();
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    tokio::task::spawn_blocking(move || ClientOptions::new().open(&name)),
                 )
-            })?
-            .map_err(|error| std::io::Error::other(format!("named-pipe open task: {error}")))??;
-            Ok(IpcStream::WindowsClient(client))
+                .await;
+                match attempt {
+                    Ok(joined) => {
+                        let opened = joined.map_err(|error| {
+                            std::io::Error::other(format!("named-pipe open task: {error}"))
+                        })?;
+                        match opened {
+                            Ok(client) => return Ok(IpcStream::WindowsClient(client)),
+                            Err(error)
+                                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                                    && tokio::time::Instant::now() < deadline =>
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(_elapsed) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "timed out opening daemon named pipe",
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -195,17 +232,31 @@ impl IpcListener {
             }
             #[cfg(windows)]
             IpcListener::Windows { pipe_name, next } => {
-                // Take the pre-created server, wait for a client,
-                // then create the next server instance so subsequent
-                // accept() calls find one waiting.
+                // Take the pre-created server instance, then create the
+                // NEXT instance BEFORE blocking on this one's connect.
+                //
+                // The original ordering created the next instance only
+                // AFTER `connect()` returned, so for the entire time we
+                // sat in `connect().await` there was exactly ONE pipe
+                // instance and it was the one being claimed — a second
+                // client arriving in that window hit ERROR_PIPE_BUSY
+                // (os error 231) and, with the old single-shot client,
+                // failed outright. Eight contending tabs deadlocked the
+                // owner-core lifecycle test on the self-hosted Windows
+                // runner exactly this way (card 8763f167). Creating the
+                // next instance first means a fresh instance is always
+                // listening while we serve the current one; combined
+                // with the client-side BUSY retry in `connect`, bursts
+                // beyond the in-flight+1 capacity simply retry instead
+                // of failing.
                 let mut guard = next.lock().await;
                 let server = guard.take().ok_or_else(|| {
                     std::io::Error::other("ipc listener: no next pipe instance prepared")
                 })?;
-                server.connect().await?;
-                // Prepare next instance before returning.
                 *guard =
                     Some(tokio::net::windows::named_pipe::ServerOptions::new().create(pipe_name)?);
+                drop(guard);
+                server.connect().await?;
                 Ok(IpcStream::WindowsServer(server))
             }
         }
@@ -434,6 +485,63 @@ mod tests {
         assert_eq!(&received_b, b"PING-B", "home B received its own ping");
         assert_eq!(&reply_a, b"PONG-A", "home A client got A's pong");
         assert_eq!(&reply_b, b"PONG-B", "home B client got B's pong");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_concurrent_clients_all_connect_without_pipe_busy() {
+        // Regression for card 8763f167 / os error 231 (ERROR_PIPE_BUSY):
+        // the owner-core lifecycle test fires 8 tabs at one daemon at
+        // once. The old listener created the next pipe instance only
+        // AFTER `connect()` returned, so during each accept exactly one
+        // instance existed and concurrent clients hit ERROR_PIPE_BUSY;
+        // the old single-shot client then failed outright and the test
+        // hung. This drives a real accept loop and connects N clients
+        // simultaneously — every one must complete a round trip.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = IpcListener::bind(&sock).await.expect("bind");
+
+        // Server accept loop: echo 4 bytes per connection, mirroring the
+        // daemon's spawn-a-handler-per-connection shape (server.rs:96).
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..16usize {
+                let mut stream = listener.accept().await.expect("accept");
+                handlers.push(tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    stream.read_exact(&mut buf).await.unwrap();
+                    stream.write_all(b"PONG").await.unwrap();
+                    stream.flush().await.unwrap();
+                }));
+            }
+            for h in handlers {
+                h.await.unwrap();
+            }
+        });
+
+        // Fire all clients at once — the contention the daemon sees when
+        // a burst of tabs each spawn an `airc` invocation.
+        let mut clients = Vec::new();
+        for _ in 0..16usize {
+            let sock = sock.clone();
+            clients.push(tokio::spawn(async move {
+                let mut client = IpcStream::connect(&sock)
+                    .await
+                    .expect("every concurrent client must connect (no ERROR_PIPE_BUSY)");
+                client.write_all(b"PING").await.unwrap();
+                client.flush().await.unwrap();
+                let mut reply = [0u8; 4];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"PONG");
+            }));
+        }
+        for c in clients {
+            c.await.expect("client task must not panic");
+        }
+        server.await.expect("server loop completes");
     }
 
     #[test]

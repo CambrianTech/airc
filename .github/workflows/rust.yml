@@ -137,6 +137,14 @@ jobs:
     # only execute when the test job actually runs on Windows.
     name: cargo test (${{ matrix.display }})
     runs-on: ${{ matrix.os }}
+    # Defense-in-depth: a hung test must never pin a runner indefinitely.
+    # On 2026-06-11 a single windows-self-hosted job hung for ~18h on a
+    # daemon-stdout-inheritance deadlock (card 8763f167), holding the one
+    # self-hosted leg while 10+ runs starved behind it. The deadlock is
+    # fixed, but the runner is a shared singleton, so a per-job ceiling
+    # is the backstop: any future hang self-aborts and frees the leg
+    # instead of wedging the queue. 25 min is ~3x a healthy cold run.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

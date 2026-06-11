@@ -461,6 +461,53 @@ fn detach_daemon(command: &mut Command) {
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+    // Stop the detached daemon from inheriting THIS process's standard
+    // handles. When `airc` is itself launched with piped stdio — every
+    // CLI integration test does (`Command::output()`), and so do agent
+    // harnesses that capture our output — our stdout/stderr are the
+    // inheritable write-ends of a pipe the parent reads to EOF. Rust
+    // spawns children with `bInheritHandles=TRUE` (it must, to hand the
+    // daemon its redirected log-file handle), and std offers no way to
+    // scope WHICH handles inherit, so without intervention the daemon
+    // also inherits the parent's pipe write-end and keeps it open for
+    // its whole life. The launching `airc init`/`send` then exits, but
+    // the parent's read never sees EOF (the daemon still holds a writer)
+    // and `.output()` blocks forever. That is the owner-core lifecycle
+    // hang on the self-hosted Windows runner (card 8763f167): the
+    // daemon outlives its launcher, so any captured-stdout caller
+    // deadlocks. Clearing the inherit flag on our own std handles makes
+    // the next CreateProcess (this daemon) leave them behind; the
+    // daemon's log-file handles are separate and still inherit fine.
+    unsafe {
+        clear_std_handle_inheritance();
+    }
+}
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's std handles so a
+/// subsequently-spawned child does not duplicate them. `GetStdHandle` /
+/// `SetHandleInformation` live in kernel32, which is always linked — no
+/// crate dependency. Best-effort: a handle we can't touch is left as-is
+/// (the daemon redirects its own stdio regardless).
+#[cfg(windows)]
+unsafe fn clear_std_handle_inheritance() {
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn SetHandleInformation(h_object: isize, dw_mask: u32, dw_flags: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = GetStdHandle(id);
+        if handle != 0 && handle != INVALID_HANDLE_VALUE {
+            // Clear only the inherit bit; the handle stays valid for our
+            // own use (this process keeps writing to stdout normally).
+            let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 }
 
 /// Push the current scope's peer trust into the running daemon's
