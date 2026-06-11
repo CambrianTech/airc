@@ -140,6 +140,14 @@ Three of these four shapes are visible in tonight's work without me inventing th
 
 ### `Synthesizer`
 
+> **⚠️ SUPERSEDED by [v2 A1 + A4](#a1--provenance-is-structural-on-the-card-not-a-side-channel-event).** The v1 design below routes audit attribution through a side-channel `SynthesisRecorded` event and routes goal progress through a count-bearing `GoalProgressed` payload. Both were retired:
+>
+> - **`SynthesisRecorded` is deleted** — provenance lives structurally on `CardCreated.origin: CardOrigin::Synthesized { goal_id, recipe_id, synthesizer_peer, dedup_key }`. The audit trail rides the primary object; there is no side-channel event to lose or join.
+> - **`GoalProgressed` payload counts are deleted** — `GoalState::InProgress { open_cards, closed_cards }` counts are derived by the projection from arbitrated `CardCreated` events keyed by `CardOrigin::Synthesized.goal_id`. The synthesizer doesn't supply pre-arbitration counts.
+> - **Dedup arbitration is projection-side** (v2 A4a, first-write-wins on `dedup_key`).
+>
+> Read the v1 paragraphs below for the dispatch shape; do NOT implement the events/payloads they describe.
+
 The synthesizer is the seam that:
 
 1. On idle-tick: iterates active goals, runs each goal's recipes, collects proposals.
@@ -252,6 +260,8 @@ The tick is cheap when idle isn't fully met (most of the time). Cards only get p
 ---
 
 ## Cards this design implies (the first synthesis output)
+
+> **⚠️ SUPERSEDED by [v2's updated slice list](#updated-slice-list).** The list below is the v1 plan. Slice F (in-tree `FollowupExtractionRecipe`) was retired in v2 A2/A3 (semantic recipes move consumer-side); slice C's `SynthesisRecorded` event was retired in v2 A1 (provenance is structural on the card). See [v2 § Updated slice list](#updated-slice-list) for the shipping plan.
 
 If this memo lands, the next batch of cards to build the engine would be:
 
