@@ -396,6 +396,80 @@ if (Test-Path $skillsSrc) {
     }
 }
 
+# -- Git fetch-before-commit/push staleness guard (card 64621946) --------
+# Parity with install.sh's _install_airc_git_hooks. The hooks themselves
+# are bash and run under git-bash on Windows, so the cleanest Windows path
+# is to drive the SAME composition logic through bash rather than maintain
+# a divergent PowerShell reimplementation. We invoke git-bash to run the
+# composer that writes the wrapper hooks, composing (not clobbering) any
+# pre-existing hooks — identical contract to the .sh side.
+if ($env:AIRC_SKIP_GIT_HOOKS -ne '1') {
+    $gitHooksWorker = Join-Path $CLONE_DIR 'integrations\git-hooks\airc-fetch-base.sh'
+    $bashExe = $null
+    foreach ($cand in @(
+        (Get-Command bash.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source),
+        'C:\Program Files\Git\bin\bash.exe',
+        'C:\Program Files\Git\usr\bin\bash.exe'
+    )) {
+        if ($cand -and (Test-Path $cand)) { $bashExe = $cand; break }
+    }
+    if (-not (Test-Path $gitHooksWorker)) {
+        Write-Warn2 "Git hook worker not found: $gitHooksWorker (skipping hook install)"
+    } elseif (-not $bashExe) {
+        Write-Warn2 'git-bash not found; skipping git fetch-before-commit/push hook install'
+    } else {
+        Write-Step 'Wiring git fetch-before-commit/push staleness guard (card 64621946)'
+        $cloneForBash = $CLONE_DIR -replace '\\','/'
+        $composer = @'
+set -u
+CLONE_DIR="$1"
+hooks_dir="$CLONE_DIR/.git/hooks"
+worker="$CLONE_DIR/integrations/git-hooks/airc-fetch-base.sh"
+hp="$(git -C "$CLONE_DIR" config --get core.hooksPath 2>/dev/null || true)"
+if [ -n "$hp" ]; then
+  case "$hp" in
+    /*|[A-Za-z]:*) hooks_dir="$hp" ;;
+    *) hooks_dir="$CLONE_DIR/$hp" ;;
+  esac
+fi
+[ -d "$CLONE_DIR/.git" ] || exit 0
+[ -f "$worker" ] || exit 0
+mkdir -p "$hooks_dir" || exit 0
+chmod +x "$worker" 2>/dev/null || true
+marker="# AIRC-FETCH-HOOK"
+for phase in pre-commit pre-push; do
+  hook="$hooks_dir/$phase"
+  if [ -f "$hook" ] && ! grep -qF "$marker" "$hook" 2>/dev/null; then
+    if [ ! -f "$hook.local" ]; then
+      mv "$hook" "$hook.local"
+      chmod +x "$hook.local" 2>/dev/null || true
+    else
+      rm -f "$hook"
+    fi
+  fi
+  tmp="$hook.airc-tmp.$$"
+  {
+    printf '%s\n' "#!/usr/bin/env bash"
+    printf '%s %s\n' "$marker" "— managed by airc install.ps1 (card 64621946); do not edit."
+    printf '%s\n' "set -u"
+    printf 'WORKER=%q\n' "$worker"
+    printf 'LOCAL="${BASH_SOURCE[0]}.local"\n'
+    printf 'if [ -x "$WORKER" ] || [ -f "$WORKER" ]; then\n'
+    printf '  bash "$WORKER" %q "$@" || exit $?\n' "$phase"
+    printf 'fi\n'
+    printf 'if [ -x "$LOCAL" ]; then exec "$LOCAL" "$@"; fi\n'
+    printf 'exit 0\n'
+  } > "$tmp"
+  mv "$tmp" "$hook"
+  chmod +x "$hook" 2>/dev/null || true
+  echo "  + Git hook installed: $phase"
+done
+'@
+        & $bashExe --noprofile --norc -c $composer 'airc-githooks' $cloneForBash 2>&1 | ForEach-Object { Write-Host "  $_" }
+        Write-Ok 'Git fetch-before-commit/push staleness guard wired'
+    }
+}
+
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'

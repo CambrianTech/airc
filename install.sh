@@ -924,6 +924,78 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_hooks
 fi
 
+# ── Git fetch-before-commit/push staleness guard (card 64621946) ───────
+# Wire the repo's own dev workflow with a pre-commit (advisory) + pre-push
+# (may hard-gate) hook that fetches the integration base and warns/blocks
+# when the local base is stale. This is what stops tonight's hazard:
+# branches cut off a 5-commits-behind rust-rewrite → E0063 between slices.
+#
+# Composition contract (CBAR Extension Bar — extend, don't clobber):
+# if $CLONE_DIR already has a pre-commit / pre-push hook that is NOT
+# ours, we preserve it: the original is moved to <hook>.local and our
+# wrapper chains to it after running the guard. Re-running install
+# rewrites only the airc-owned wrapper (marker-gated), so it is fully
+# idempotent. Installs ONLY into the airc clone's own .git/hooks — this
+# is a dev-tree guard, not a product-surface change for end users.
+
+_install_airc_git_hooks() {
+  [ "${AIRC_SKIP_GIT_HOOKS:-0}" = "1" ] && return 0
+  local hooks_dir="$CLONE_DIR/.git/hooks"
+  local worker="$CLONE_DIR/integrations/git-hooks/airc-fetch-base.sh"
+  # core.hooksPath override (e.g. when the repo points hooks elsewhere).
+  local hp
+  hp="$(git -C "$CLONE_DIR" config --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$hp" ]; then
+    case "$hp" in
+      /*|[A-Za-z]:*) hooks_dir="$hp" ;;
+      *) hooks_dir="$CLONE_DIR/$hp" ;;
+    esac
+  fi
+  [ -d "$CLONE_DIR/.git" ] || { return 0; }   # not a clone (curl-piped src tree edge case)
+  [ -f "$worker" ] || { warn "Git hook worker not found: $worker"; return 0; }
+  mkdir -p "$hooks_dir" 2>/dev/null || { warn "Could not create $hooks_dir"; return 0; }
+  chmod +x "$worker" 2>/dev/null || true
+
+  local phase hook tmp marker="# AIRC-FETCH-HOOK"
+  for phase in pre-commit pre-push; do
+    hook="$hooks_dir/$phase"
+    # If a foreign (non-airc) hook is already here, preserve it as .local
+    # so our wrapper can chain to it. Don't re-stash our own wrapper.
+    if [ -f "$hook" ] && ! grep -qF "$marker" "$hook" 2>/dev/null; then
+      if [ ! -f "$hook.local" ]; then
+        mv "$hook" "$hook.local"
+        chmod +x "$hook.local" 2>/dev/null || true
+        info "Preserved existing $phase hook as $phase.local (chained)"
+      else
+        # A .local already exists; drop the un-marked file rather than clobber it.
+        rm -f "$hook"
+      fi
+    fi
+    tmp="$hook.airc-tmp.$$"
+    {
+      printf '%s\n' "#!/usr/bin/env bash"
+      printf '%s %s\n' "$marker" "— managed by airc install.sh (card 64621946); do not edit."
+      printf '%s\n' "# Runs the fetch-before-commit/push staleness guard, then chains any"
+      printf '%s\n' "# pre-existing hook preserved as this file + .local."
+      printf '%s\n' "set -u"
+      printf 'WORKER=%q\n' "$worker"
+      printf 'LOCAL="${BASH_SOURCE[0]}.local"\n'
+      printf '%s\n' "# Guard runs first. pre-push may exit non-zero (hard-gate when behind)."
+      printf 'if [ -x "$WORKER" ] || [ -f "$WORKER" ]; then\n'
+      printf '  bash "$WORKER" %q "$@" || exit $?\n' "$phase"
+      printf 'fi\n'
+      printf '%s\n' "# Chain a preserved local hook, forwarding stdin (pre-push gets refs on stdin)."
+      printf 'if [ -x "$LOCAL" ]; then exec "$LOCAL" "$@"; fi\n'
+      printf 'exit 0\n'
+    } > "$tmp"
+    mv "$tmp" "$hook"
+    chmod +x "$hook" 2>/dev/null || true
+    ok "Git hook installed: $phase (fetch-before-$phase staleness guard)"
+  done
+}
+
+_install_airc_git_hooks
+
 # ── Codex GH_TOKEN env injection ───────────────────────────────────────
 # Codex's sandbox can't reliably reach the macOS Keychain to validate
 # gh's stored token. Result: gh auth status flakes between ✓ and X
