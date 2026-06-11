@@ -46,6 +46,19 @@ jobs:
     name: cargo fmt --check
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -58,6 +71,19 @@ jobs:
     name: cargo clippy (deny warnings)
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -101,12 +127,6 @@ jobs:
     # only execute when the test job actually runs on Windows.
     name: cargo test (${{ matrix.display }})
     runs-on: ${{ matrix.os }}
-    # Self-defending guard (sentinel ask on #1116): the self-hosted leg
-    # only runs for pushes and same-repo PRs. The repo-level fork-PR
-    # approval policy (all_external_contributors) is a mutable SETTING;
-    # this condition lives in-repo so a policy regression alone can't
-    # put fork code on the bigmama runner. Hosted legs are unaffected.
-    if: ${{ !contains(toJSON(matrix.os), 'self-hosted') || github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +144,19 @@ jobs:
           - { os: macos-latest, display: macos-latest }
           - { os: [self-hosted, windows], display: windows-self-hosted }
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: rustup toolchain install stable --profile minimal
