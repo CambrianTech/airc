@@ -8,7 +8,11 @@ pub fn run_lan_ip() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn detect_lan_ip() -> Option<Ipv4Addr> {
+/// Best-effort primary LAN IPv4 of this host (the source address the OS
+/// would use to reach the internet). `pub(crate)` so the daemon can
+/// advertise it as its dialable LAN endpoint in the account-registry
+/// beacon — the endpoint-in-beacon half of same-account auto-discovery.
+pub(crate) fn detect_lan_ip() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
     match socket.local_addr().ok()?.ip() {

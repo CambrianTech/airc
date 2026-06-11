@@ -494,6 +494,12 @@ fn detach_daemon(command: &mut Command) {
     // deadlocks. Clearing the inherit flag on our own std handles makes
     // the next CreateProcess (this daemon) leave them behind; the
     // daemon's log-file handles are separate and still inherit fine.
+    //
+    // SAFETY: `clear_std_handle_inheritance` only calls `GetStdHandle` +
+    // `SetHandleInformation` (kernel32) on this process's own standard
+    // handles, with valid in-range arguments and the result ignored —
+    // no raw pointers, no aliasing, no lifetime concerns. It is sound to
+    // call at any point; worst case a handle we can't touch is left as-is.
     unsafe {
         clear_std_handle_inheritance();
     }
@@ -924,6 +930,48 @@ pub async fn run_daemon(
                 return;
             }
         };
+
+        // Endpoint-in-beacon (the second half of same-account
+        // auto-discovery): bind a LAN listener on THIS handle so its
+        // `route_endpoints()` carries a dialable address, which the
+        // registry-refresh loop below then publishes in the account
+        // beacon. Without this the beacon advertises `endpoints: none`
+        // and a same-account peer that imports our record has nothing
+        // to dial — auto-discovery enrols but never routes (validated
+        // 2026-06-11: `registry sync` published with no endpoint, so the
+        // Mac side could enrol 5090 but not reach it). Bind to the
+        // detected LAN IP (not 0.0.0.0) so the advertised addr is the
+        // one peers actually dial. Best-effort + loud: a node with no
+        // routable LAN (or a bind failure) still reaches the mesh by
+        // dialing OUT to listening peers / relay — it just isn't
+        // dialable itself, which we say plainly rather than swallow.
+        match crate::network_commands::detect_lan_ip() {
+            Some(lan_ip) => {
+                match airc
+                    .listen_lan(std::net::SocketAddr::from((lan_ip, 0)))
+                    .await
+                {
+                    Ok(addr) => {
+                        eprintln!(
+                            "airc daemon: advertising LAN endpoint {addr} in the account registry"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "airc daemon: LAN listener bind failed ({error}) — account beacon \
+                             carries no LAN endpoint; this node reaches the mesh by dialing out \
+                             / relay but is not itself dialable on LAN"
+                        );
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "airc daemon: no routable LAN IPv4 detected — account beacon carries no LAN \
+                     endpoint (outbound-dial / relay only)"
+                );
+            }
+        }
         let db_path = airc_lib::machine_account_home(&registry_home).join("events.sqlite");
         let event_store = match SqliteEventStore::open_path(&db_path).await {
             Ok(store) => Arc::new(store),
