@@ -48,8 +48,17 @@ pub use crate::ids::GoalId;
 /// slice deliberately omits:
 ///
 /// - `recipe_refs: Vec<RecipeRef>` — which recipes are eligible to
-///   propose for this goal. `RecipeRef` is slice B's vocabulary; the
-///   field lands on `Goal` in slice B alongside it.
+///   propose for this goal. `RecipeRef` lands in slice B (PR #1125),
+///   but the `recipe_refs` field on `Goal` lands in slice C alongside
+///   the synthesizer. Rationale: coupling Goal lifecycle (this module)
+///   to recipe registration timing belongs at the synthesizer seam
+///   where dispatch happens, not here where the lifecycle is pure data.
+///   Slice C also wires the projection-side dedup arbitration (v2 A4a)
+///   that needs to see `recipe_refs` to scope per-goal dispatch
+///   correctly. Slice B's `RecipeRegistry::propose_all` dispatches all
+///   registered recipes against any goal as an interim shape; once
+///   `recipe_refs` lands in slice C, the synthesizer scopes dispatch
+///   per goal per the v2 design memo's "runs each goal's recipes" line.
 /// - `last_synthesis_at_ms: Option<u64>` — projection-derived from
 ///   `CardCreated` events with `CardOrigin::Synthesized.goal_id == self.id`,
 ///   not stored on the event-sourced goal. The synthesizer reads it via
