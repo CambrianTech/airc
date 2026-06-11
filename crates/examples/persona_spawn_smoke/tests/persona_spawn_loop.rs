@@ -137,6 +137,7 @@ async fn parent_requests_turn_and_spawned_persona_replies() {
         activity_id: "activity-1".to_string(),
         turn_id: "turn-1".to_string(),
         prompt: "what's the meta-goal?".to_string(),
+        model_hint: None,
         requested_at_ms: now_ms().expect("clock"),
     };
     let (headers, body) =

@@ -171,6 +171,14 @@ pub enum PersonaCodecError {
         header: &'static str,
         value: String,
     },
+    /// A turn reply decoded as a persona event, but not the expected
+    /// variant. A cross-grid inference reply MUST be a `TurnEmitted`; any
+    /// other variant on the correlation is a protocol violation surfaced
+    /// loudly rather than silently dropped.
+    UnexpectedReplyVariant {
+        actual: &'static str,
+        expected: &'static str,
+    },
     Json(serde_json::Error),
 }
 
@@ -192,6 +200,10 @@ impl std::fmt::Display for PersonaCodecError {
                     "persona turn request header {header:?} malformed: {value:?}"
                 )
             }
+            Self::UnexpectedReplyVariant { actual, expected } => write!(
+                f,
+                "persona turn reply variant mismatch: actual={actual:?}, expected={expected:?}",
+            ),
             Self::Json(error) => write!(f, "persona event JSON codec failed: {error}"),
         }
     }
@@ -556,6 +568,149 @@ pub fn select_candidate_for_turn(
         ttl_ms,
     };
     registry.match_for(&query, trust_of).into_iter().next()
+}
+
+// ---------------------------------------------------------------------------
+// Local-first inference routing — card cae4bab1 (persona-peer 8/8)
+// ---------------------------------------------------------------------------
+//
+// The protocol spine for cross-grid inference. THE binding principle (Joel):
+// a requesting node tries its OWN local capability FIRST and only escalates
+// to the mesh (the cross-grid request/reply path) when local cannot meet the
+// need. This module owns the decision (`resolve_inference_target`) and the
+// escalation helper (`request_inference_remote`); it adds NO new substrate
+// primitives — it composes 3/8's `request_turn` / `Airc::await_reply` with
+// 4/8's `select_candidate_for_turn`.
+//
+// Layering: the local capability is an airc-core `PersonaCapabilities`, the
+// registry is airc-lib, the turn types are consumer-shapes. All three already
+// compose here (exactly where `select_candidate_for_turn` lives), so the
+// decision belongs here too — no dependency is inverted.
+
+/// Where a turn should run, decided LOCAL-FIRST.
+///
+/// `resolve_inference_target` returns this; the caller branches on it. The
+/// shape is deliberately three-valued and exhaustive so a grid-of-one with
+/// no capable node is a *typed* outcome the caller must handle, never a
+/// silent hang or an unwrap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferenceTarget {
+    /// This node can satisfy the turn itself — run it in-process, emit NO
+    /// cross-grid request. The preferred outcome whenever local can meet
+    /// the need.
+    Local,
+    /// No local match, but a mesh peer advertises the needed capability.
+    /// The caller escalates via [`request_inference_remote`] to this peer.
+    Remote(CapabilityCandidate),
+    /// Neither local nor any live remote can meet the need (grid-of-one,
+    /// or a model nobody advertises). A LOUD typed terminal — the caller
+    /// surfaces it, never blocks waiting for a reply that cannot come.
+    Unavailable,
+}
+
+/// Does the local node's own capability card satisfy this turn's need?
+///
+/// The need is the union of the turn's `model_hint` (treated as a required
+/// tag, identically to [`select_candidate_for_turn`]) and any
+/// `extra_required_tags`. Local satisfies it iff it advertises ALL of them.
+/// An empty need (no hint, no extra tags) is satisfied by any local persona
+/// — "run it yourself" is always valid when nothing specific is required.
+fn local_satisfies(
+    local: &PersonaCapabilities,
+    request: &TurnRequested,
+    extra_required_tags: &[&str],
+) -> bool {
+    let hint = request.model_hint.as_deref();
+    let needed = extra_required_tags
+        .iter()
+        .copied()
+        .chain(hint)
+        .collect::<Vec<&str>>();
+    needed.iter().all(|need| {
+        local
+            .capability_tags
+            .iter()
+            .any(|have| have.as_str() == *need)
+    })
+}
+
+/// Decide where a turn runs, LOCAL-FIRST.
+///
+/// 1. If `local` advertises every required tag (model hint + extras),
+///    return [`InferenceTarget::Local`] — no registry consultation, no
+///    network request.
+/// 2. Otherwise consult the cross-grid [`CapabilityRegistry`] via
+///    [`select_candidate_for_turn`]; a match returns
+///    [`InferenceTarget::Remote`].
+/// 3. No local AND no remote → [`InferenceTarget::Unavailable`], a loud
+///    typed terminal (the grid-of-one with no capable node).
+///
+/// `local` is `None` when this node hosts no persona at all (a pure
+/// requester / relay); then step 1 is skipped and it goes straight to the
+/// registry. This is a pure decision: it emits nothing, so it cannot hang.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_inference_target(
+    local: Option<&PersonaCapabilities>,
+    registry: &CapabilityRegistry,
+    request: &TurnRequested,
+    extra_required_tags: &[&str],
+    now_ms: u64,
+    ttl_ms: u64,
+    trust_of: impl Fn(PeerId) -> TrustTier,
+) -> InferenceTarget {
+    if let Some(local) = local {
+        if local_satisfies(local, request, extra_required_tags) {
+            return InferenceTarget::Local;
+        }
+    }
+    match select_candidate_for_turn(
+        registry,
+        request,
+        extra_required_tags,
+        now_ms,
+        ttl_ms,
+        trust_of,
+    ) {
+        Some(candidate) => InferenceTarget::Remote(candidate),
+        None => InferenceTarget::Unavailable,
+    }
+}
+
+/// Run the cross-grid request/reply against a [`InferenceTarget::Remote`]
+/// candidate and await its [`TurnEmitted`] reply within `deadline`.
+///
+/// Composes the existing primitives, adding none: 3/8's [`request_turn`]
+/// (which rides [`Airc::request`], stamping correlation/reply-to/deadline)
+/// directs the turn at the chosen peer; [`Airc::await_reply`] resolves with
+/// the responder's reply event, deadline-bounded by construction; the typed
+/// [`TurnEmitted`] is decoded back out. A deadline elapsing surfaces as
+/// `AircError::CommandDeadline` through [`PersonaTurnError::Substrate`] —
+/// loud, never a hang.
+pub async fn request_inference_remote(
+    airc: &Airc,
+    candidate: &CapabilityCandidate,
+    request: &TurnRequested,
+    deadline: Duration,
+) -> Result<TurnEmitted, PersonaTurnError> {
+    let pending = request_turn(
+        airc,
+        MentionTarget::Peer(candidate.peer_id),
+        request,
+        deadline,
+    )
+    .await?;
+    let reply = airc.await_reply(pending).await?;
+    match decode_persona_event(&reply.headers, reply.body.as_ref())? {
+        PersonaEvent::TurnEmitted(emitted) => Ok(emitted),
+        other @ (PersonaEvent::TurnRequested(_)
+        | PersonaEvent::ActivityStarted(_)
+        | PersonaEvent::ActivityEnded(_)) => Err(PersonaTurnError::Codec(
+            PersonaCodecError::UnexpectedReplyVariant {
+                actual: other.variant_kind(),
+                expected: "turn_emitted",
+            },
+        )),
+    }
 }
 
 /// A consumer-side filter that admits any persona event. Combine
