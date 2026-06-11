@@ -47,6 +47,11 @@ uuid_id!(WorkCardId);
 uuid_id!(LaneId);
 uuid_id!(ClaimId);
 uuid_id!(WorkspaceId);
+// Card e4cad280 slice A: idle-agent engine goals (long-running
+// aspirations recipes synthesize work against). Goal events + projection
+// land in slice C; the ID type joins its siblings here so the typed-newtype
+// pattern stays canonical.
+uuid_id!(GoalId);
 
 /// Repository key such as `CambrianTech/continuum`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
