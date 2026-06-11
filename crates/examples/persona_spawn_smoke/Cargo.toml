@@ -1,0 +1,28 @@
+[package]
+name = "persona-spawn-smoke"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Worked example: the Continuum persona-spawn loop over AIRC. A spawned persona peer opens its own home, advertises PersonaCapabilities on its identity card, enrols its parent at OwnMachine tier, joins the persona room, and answers TurnRequested with TurnEmitted. NOT product code; reference example + integration proof only."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The persona agent consumes airc-lib like any embedder, plus the two
+# typed vocabularies it speaks: airc-core for the PersonaCapabilities
+# identity contract (card 9e5f8844) and consumer-shapes for the
+# Continuum PersonaEvent wire shapes. airc-trust is the substrate's
+# public trust-store API — the spawn loop pins its parent at
+# OwnMachine tier through it, same surface the CLI uses.
+airc-core = { path = "../../airc-core" }
+airc-lib = { path = "../../airc-lib" }
+airc-trust = { path = "../../airc-trust" }
+consumer-shapes = { path = "../consumer_shapes" }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }
