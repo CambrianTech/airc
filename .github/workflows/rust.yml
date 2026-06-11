@@ -37,6 +37,16 @@ on:
       - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
 
+# A new push to the same PR/branch obsoletes the in-flight run —
+# cancel it instead of queueing behind it. Three moot runs were
+# cancelled by hand on 2026-06-10 alone, and every moot run occupies
+# the single self-hosted Windows leg (bigmama) that everything else
+# queues behind. `github.ref` is unique per PR (refs/pull/N/merge) and
+# per branch, so unrelated runs never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
