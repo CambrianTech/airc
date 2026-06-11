@@ -127,47 +127,40 @@ pub struct GoalCreated {
     pub created_at_ms: u64,
 }
 
-/// A goal reached its `ExitCondition` and transitioned to
-/// `GoalState::Achieved`. There are two emission paths, distinguished
-/// by `achieved_by`:
+/// A goal reached its `ExitCondition` via the **operator path** —
+/// some peer explicitly marked the goal achieved (typically via
+/// `airc work goal achieve`, slice E CLI). This is the ONLY way
+/// `ExitCondition::OperatorOnly` goals reach `Achieved`, per slice A
+/// goal.rs:142-144 (landed in #1124).
 ///
-/// 1. **Auto-projection path** (`achieved_by: None`): the projection
-///    (slice C2) emits this event when a typed `ExitCondition` fires
-///    deterministically — `DryForTicks { n }` after observing `n`
-///    consecutive `GoalDryTickRecorded` events, `MilestoneClosed`
-///    when the named card closes, `AllCardsClosed` when the last
-///    Synthesized-origin card for the goal closes.
-/// 2. **Operator path** (`achieved_by: Some(peer_id)`): an operator
-///    explicitly marks the goal achieved (typically via
-///    `airc work goal achieve`, slice E CLI). This is the ONLY way
-///    `ExitCondition::OperatorOnly` goals reach `Achieved` — slice A
-///    goal.rs:142-144 (landed in #1124) names this as the load-bearing
-///    invariant.
+/// **The auto-projection path is purely derived, NOT emitted.** For
+/// deterministic `ExitCondition` variants (`DryForTicks` after `n`
+/// consecutive `GoalDryTickRecorded` events; `MilestoneClosed` when
+/// the named card closes; `AllCardsClosed` when the last
+/// Synthesized-origin card for the goal closes), the projection
+/// (slice C2b) computes `GoalState::Achieved` directly from the
+/// underlying signals. No event lands on the wire — resolves PR
+/// #1123 verdict residual 4 ("if each replayer emits, the log gets
+/// N copies"). Pure derivation = same state across replayer counts
+/// without designating an emission owner.
 ///
-/// `condition` records the goal's declared `ExitCondition` for audit;
-/// it matches the goal's `exit_condition` field regardless of which
-/// emission path fired the event. Recipes do NOT emit `GoalAchieved`
-/// directly per `[[no-fallbacks-ever]]` (recipes could lie about the
-/// condition); the synthesizer (slice C3) is not an emitter either.
+/// `condition` records the goal's declared `ExitCondition` at
+/// achievement time, for audit. `achieved_by` is required (never
+/// `None`) because this event ONLY exists for the operator path; the
+/// auto path is silent. Recipes do NOT emit `GoalAchieved` directly
+/// per `[[no-fallbacks-ever]]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalAchieved {
     pub goal_id: GoalId,
     /// The goal's `ExitCondition` at the moment of achievement —
-    /// audit-only, the projection records it for replay. Any variant
-    /// is valid: deterministic exits (`DryForTicks` / `MilestoneClosed`
-    /// / `AllCardsClosed`) pair with `achieved_by: None`; `OperatorOnly`
-    /// pairs with `achieved_by: Some(_)` — though the type system
-    /// can't enforce that pairing, the projection (slice C2) does.
+    /// audit-only. For operator-path achievement, any variant is
+    /// valid; `OperatorOnly` is the most common because operator-only
+    /// goals have no auto path.
     pub condition: ExitCondition,
-    /// Set when an operator explicitly marked the goal achieved;
-    /// `None` when the projection auto-fired the deterministic
-    /// condition. The two paths must be distinguishable in the audit
-    /// trail without joining other events. Per
-    /// `[[strong-typing-across-boundaries]]`: the difference between
-    /// "achieved by deterministic exit" and "achieved by operator
-    /// declaration" is structural, not inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub achieved_by: Option<PeerId>,
+    /// The peer that marked the goal achieved. Required (no `Option`)
+    /// because `GoalAchieved` exists only for the operator path; the
+    /// auto-projection path is silent (pure derivation, no event).
+    pub achieved_by: PeerId,
     pub achieved_at_ms: u64,
 }
 
@@ -369,61 +362,72 @@ mod tests {
     }
 
     #[test]
-    fn goal_achieved_auto_projection_path_has_no_achieved_by() {
-        // what this catches: regression where the projection-fired
-        // path (deterministic ExitCondition) accidentally stamps an
-        // achieved_by, breaking the audit trail's distinction between
-        // "the projection fired this when the condition reached
-        // threshold" and "an operator declared the goal done." The
-        // distinction is structural, not inferred.
+    fn goal_achieved_is_operator_path_only_required_achieved_by() {
+        // what this catches: regression where `achieved_by` becomes
+        // optional or where the wire shape diverges from "operator-
+        // path-only emission" — both would re-open verdict residual 4
+        // (auto path emission gets N copies under N replayers). The
+        // resolution baked into slice C2a: GoalAchieved is the
+        // operator path; the auto-projection path is purely derived
+        // state with no event on the wire. `achieved_by: PeerId` is
+        // required (not `Option<PeerId>`); any wire payload without
+        // it fails decode.
+        let event = GoalAchieved {
+            goal_id: GoalId::new(),
+            condition: ExitCondition::OperatorOnly,
+            achieved_by: peer(),
+            achieved_at_ms: 999,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            json.contains("achieved_by"),
+            "achieved_by must always be on the wire for the operator path: {json}"
+        );
+        let parsed: GoalAchieved = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, event);
+
+        // A payload without `achieved_by` must fail decode loudly,
+        // not silently default to some "anonymous achievement" state
+        // per [[no-fallbacks-ever]].
+        let no_field = r#"{
+            "goal_id": "00000000-0000-0000-0000-000000000001",
+            "condition": {"kind": "operator_only"},
+            "achieved_at_ms": 999
+        }"#;
+        let result: Result<GoalAchieved, _> = serde_json::from_str(no_field);
+        assert!(
+            result.is_err(),
+            "payload without achieved_by must fail decode"
+        );
+    }
+
+    #[test]
+    fn goal_achieved_round_trips_with_any_condition_variant() {
+        // what this catches: regression where the `condition` field's
+        // shape diverges from the source `ExitCondition` enum.
+        // Operator-path GoalAchieved is valid for ANY ExitCondition
+        // variant — an operator can declare a goal done before its
+        // auto-projection threshold triggers — so the round-trip must
+        // work for every variant.
         let conditions = [
             ExitCondition::DryForTicks { n: 3 },
             ExitCondition::MilestoneClosed {
                 card_id: WorkCardId::new(),
             },
             ExitCondition::AllCardsClosed,
+            ExitCondition::OperatorOnly,
         ];
         for c in conditions {
             let event = GoalAchieved {
                 goal_id: GoalId::new(),
                 condition: c.clone(),
-                achieved_by: None,
+                achieved_by: peer(),
                 achieved_at_ms: 999,
             };
             let json = serde_json::to_string(&event).expect("serialize");
             let parsed: GoalAchieved = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(parsed, event);
-            assert!(parsed.achieved_by.is_none());
-            // skip_serializing_if must drop the field from the wire
-            // when None, so the auto-projection path has the same
-            // bytes pre-and-post the operator-path addition.
-            assert!(
-                !json.contains("achieved_by"),
-                "achieved_by must be omitted from wire when None: {json}"
-            );
         }
-    }
-
-    #[test]
-    fn goal_achieved_operator_path_pairs_with_operator_only() {
-        // what this catches: regression where the operator-fired path
-        // (slice A goal.rs:142-144's load-bearing 'explicit
-        // GoalAchieved from an operator moves OperatorOnly goals out
-        // of InProgress' contract) loses its structural representation.
-        // This is the ONLY way OperatorOnly goals reach Achieved;
-        // without achieved_by on the wire, the audit trail can't
-        // distinguish operator-declared from deterministic exits.
-        let event = GoalAchieved {
-            goal_id: GoalId::new(),
-            condition: ExitCondition::OperatorOnly,
-            achieved_by: Some(peer()),
-            achieved_at_ms: 999,
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        let parsed: GoalAchieved = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, event);
-        assert!(parsed.achieved_by.is_some());
-        assert!(matches!(parsed.condition, ExitCondition::OperatorOnly));
     }
 
     #[test]

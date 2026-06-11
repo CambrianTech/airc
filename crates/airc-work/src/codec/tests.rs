@@ -2,6 +2,11 @@ use airc_core::{Body, PeerId};
 use airc_protocol::{FrameKind, HEADER_FORGE_BODY_HINT};
 
 use super::*;
+use crate::goal::{ExitCondition, GoalId};
+use crate::goal_event::{
+    CardOrigin, GoalAbandoned, GoalAchieved, GoalCreated, GoalDryTickRecorded,
+};
+use crate::recipe::RecipeRef;
 use crate::{
     AgentAvailabilityReported, AgentAvailabilityState, BranchName, CardCreated, ClaimId,
     DrainCandidate, DrainCandidateCategory, DrainOutcome, GitBranchMoved, GitObjectId, LaneId,
@@ -21,6 +26,7 @@ fn card_created() -> WorkEvent {
         created_by: PeerId::from_u128(3),
         created_at_ms: 4,
         reviews: None,
+        origin: None,
     })
 }
 
@@ -306,5 +312,195 @@ fn availability_event_roundtrips_with_repo_and_state_headers() {
     assert_eq!(
         headers.get(HEADER_FORGE_WORK_STATE).map(String::as_str),
         Some("ready")
+    );
+}
+
+// Slice C2a coverage — wire-shape + header-projection tests for the
+// four new Goal-lifecycle WorkEvent variants. Projection logic (apply
+// arms in WorkBoardProjection::apply) lands in C2b; here we pin the
+// codec round-trip + the routing headers the wire-side relies on.
+
+fn goal_id(n: u128) -> GoalId {
+    GoalId::from_u128(n)
+}
+
+fn peer(n: u128) -> PeerId {
+    PeerId::from_u128(n)
+}
+
+#[test]
+fn card_created_origin_field_round_trips_when_synthesized() {
+    // what this catches: regression where `CardCreated.origin` drops
+    // from the serde wire shape or its `Synthesized` variant fails to
+    // round-trip. C2a's central wire claim is that provenance rides
+    // the primary object — losing this round-trip means downstream
+    // replayers can't attribute synthesizer-minted cards.
+    let event = WorkEvent::CardCreated(CardCreated {
+        card_id: WorkCardId::from_u128(10),
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        title: "synthesized follow-up".to_string(),
+        body: None,
+        priority: Priority::P2,
+        lane_id: None,
+        created_by: peer(11),
+        created_at_ms: 12,
+        reviews: None,
+        origin: Some(CardOrigin::Synthesized {
+            goal_id: goal_id(13),
+            recipe_id: RecipeRef::new("follow-up-extraction"),
+            synthesizer_peer: peer(14),
+            dedup_key: "goal-13::follow-up-#15".to_string(),
+        }),
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    let decoded = decode_work_event(&headers, Some(&body)).unwrap();
+    assert_eq!(decoded, event);
+}
+
+#[test]
+fn card_created_legacy_payload_without_origin_decodes_with_none() {
+    // what this catches: regression where removing `#[serde(default)]`
+    // from `CardCreated.origin` breaks legacy-event decode. Every card
+    // filed before C2a lands has no `origin` field on the wire; the
+    // projection (C2b) interprets `None` as Operator { peer_id:
+    // created_by }, so silently failing to decode would silently break
+    // every pre-C2a transcript. Verdict-anchored back-compat.
+    let json = serde_json::to_value(CardCreated {
+        card_id: WorkCardId::from_u128(20),
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        title: "legacy operator-filed card".to_string(),
+        body: None,
+        priority: Priority::P1,
+        lane_id: None,
+        created_by: peer(21),
+        created_at_ms: 22,
+        reviews: None,
+        origin: None,
+    })
+    .unwrap();
+
+    // Sanity: `origin: None` is skipped from the wire under
+    // `skip_serializing_if = "Option::is_none"`, so the encoded shape
+    // is exactly a legacy payload. Decoding it back must succeed and
+    // produce `origin: None`.
+    assert!(
+        json.get("origin").is_none(),
+        "origin must be omitted from wire when None: {json}"
+    );
+    let decoded: CardCreated = serde_json::from_value(json).unwrap();
+    assert!(decoded.origin.is_none());
+}
+
+#[test]
+fn goal_created_event_projects_goal_id_and_repo_headers() {
+    // what this catches: regression where `GoalCreated` either fails to
+    // round-trip or loses the goal_id / default_repo header projection
+    // the routing layer keys on. Subscribers filtering by goal_id
+    // depend on this header landing structurally.
+    let event = WorkEvent::GoalCreated(GoalCreated {
+        goal_id: goal_id(30),
+        title: "ship cross-grid inference".into(),
+        default_repo: RepoId::new("CambrianTech/airc").unwrap(),
+        exit_condition: ExitCondition::OperatorOnly,
+        recipe_refs: vec![],
+        created_by: peer(31),
+        created_at_ms: 32,
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("goal_created")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_GOAL_ID).map(String::as_str),
+        Some(goal_id(30).to_string().as_str())
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_REPO).map(String::as_str),
+        Some("CambrianTech/airc")
+    );
+}
+
+#[test]
+fn goal_achieved_event_projects_goal_id_header() {
+    // what this catches: regression where the operator-path goal
+    // achievement event loses its goal_id routing header. The auto
+    // path is silent (pure derived state per v2 residual 4); the
+    // operator path is the ONLY wire emission for goal achievement.
+    let event = WorkEvent::GoalAchieved(GoalAchieved {
+        goal_id: goal_id(40),
+        condition: ExitCondition::OperatorOnly,
+        achieved_by: peer(41),
+        achieved_at_ms: 42,
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("goal_achieved")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_GOAL_ID).map(String::as_str),
+        Some(goal_id(40).to_string().as_str())
+    );
+}
+
+#[test]
+fn goal_abandoned_event_projects_goal_id_header() {
+    // what this catches: regression where the operator-path goal
+    // abandonment event loses its goal_id routing header. Distinct
+    // from GoalAchieved in the audit trail; both kill the synthesizer.
+    let event = WorkEvent::GoalAbandoned(GoalAbandoned {
+        goal_id: goal_id(50),
+        abandoned_by: peer(51),
+        reason: "scope cut".into(),
+        abandoned_at_ms: 52,
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("goal_abandoned")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_GOAL_ID).map(String::as_str),
+        Some(goal_id(50).to_string().as_str())
+    );
+}
+
+#[test]
+fn goal_dry_tick_recorded_event_projects_goal_id_header() {
+    // what this catches: regression where the dry-tick event loses its
+    // goal_id header. The projection (C2b) counts consecutive instances
+    // per goal_id to fire `ExitCondition::DryForTicks { n }`; a missing
+    // routing header would break per-goal-scoped filtering on subscribe.
+    let event = WorkEvent::GoalDryTickRecorded(GoalDryTickRecorded {
+        goal_id: goal_id(60),
+        synthesizer_peer: peer(61),
+        recorded_at_ms: 62,
+    });
+
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("goal_dry_tick_recorded")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_GOAL_ID).map(String::as_str),
+        Some(goal_id(60).to_string().as_str())
     );
 }

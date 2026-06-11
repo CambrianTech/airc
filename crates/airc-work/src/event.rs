@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use airc_core::PeerId;
 
+use crate::goal_event::{
+    CardOrigin, GoalAbandoned, GoalAchieved, GoalCreated, GoalDryTickRecorded,
+};
 use crate::ids::{ClaimId, LaneId, RepoId, WorkCardId, WorkspaceId};
 use crate::model::{
     AgentAvailabilityState, BranchName, CardState, DirtyState, DrainCandidate, DrainOutcome,
@@ -41,6 +44,20 @@ pub enum WorkEvent {
     ManagerHatClaimed(ManagerHatClaimed),
     ManagerHatReleased(ManagerHatReleased),
     AgentAvailabilityReported(AgentAvailabilityReported),
+    // Card e4cad280 slice C2a: idle-agent engine goal-lifecycle events.
+    // Goal creation, operator-path achievement, and abandonment ride
+    // the WorkEvent union so the codec, replay, and subscription paths
+    // all carry them without per-event-type plumbing. Per the verdict
+    // residual 4 on PR #1123 ('every replayer re-derives the condition;
+    // if each emits, the log gets N copies'), the auto-projection path
+    // for ExitCondition::{DryForTicks/MilestoneClosed/AllCardsClosed}
+    // is PURELY DERIVED state — no event on the wire. GoalAchieved
+    // exists only for the operator path. GoalDryTickRecorded is the
+    // synthesizer's typed dry-tick witness (v2 residual 1 fix).
+    GoalCreated(GoalCreated),
+    GoalAchieved(GoalAchieved),
+    GoalAbandoned(GoalAbandoned),
+    GoalDryTickRecorded(GoalDryTickRecorded),
 }
 
 impl WorkEvent {
@@ -73,6 +90,10 @@ impl WorkEvent {
             WorkEvent::ManagerHatClaimed(e) => e.claimed_at_ms,
             WorkEvent::ManagerHatReleased(e) => e.released_at_ms,
             WorkEvent::AgentAvailabilityReported(e) => e.reported_at_ms,
+            WorkEvent::GoalCreated(e) => e.created_at_ms,
+            WorkEvent::GoalAchieved(e) => e.achieved_at_ms,
+            WorkEvent::GoalAbandoned(e) => e.abandoned_at_ms,
+            WorkEvent::GoalDryTickRecorded(e) => e.recorded_at_ms,
         }
     }
 }
@@ -99,6 +120,24 @@ pub struct CardCreated {
     /// `CardCreated` events on the wire decode with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviews: Option<WorkCardId>,
+    /// Typed provenance per v2 A1 (PR #1123 verdict). Card e4cad280
+    /// slice C2a: the `Synthesized` variant carries dedup_key, goal_id,
+    /// recipe_id, and synthesizer_peer so the projection (C2b) can
+    /// arbitrate first-write-wins and attribute the audit trail without
+    /// joining a side-channel event. Per
+    /// `[[strong-typing-across-boundaries]]` and the positron #1602
+    /// "first-class but never anonymous" precedent: provenance rides
+    /// the primary object.
+    ///
+    /// Optional with `#[serde(default)]` so legacy `CardCreated` events
+    /// (every card filed before C2a lands) decode with `None`. The
+    /// projection treats `None` as the `Operator { peer_id: created_by }`
+    /// origin per the legacy-event interpretation rule (no `Synthesized`
+    /// origin can be inferred without explicit metadata — silent
+    /// inference would violate `[[no-fallbacks-ever]]`). Same back-compat
+    /// shape as the `reviews` field on this struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CardOrigin>,
 }
 
 /// Amend a card's editable fields after creation. Card 5ac0a359 —
@@ -417,6 +456,7 @@ mod tests {
             created_by: PeerId::from_u128(2),
             created_at_ms: 10,
             reviews: None,
+            origin: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "card_created");

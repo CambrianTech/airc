@@ -17,6 +17,7 @@ pub const HEADER_FORGE_WORK_GIT_BRANCH: &str = "forge.work.git_branch";
 pub const HEADER_FORGE_WORK_GIT_COMMIT: &str = "forge.work.git_commit";
 pub const HEADER_FORGE_WORK_PR_NUMBER: &str = "forge.work.pr_number";
 pub const HEADER_FORGE_WORK_STATE: &str = "forge.work.state";
+pub const HEADER_FORGE_WORK_GOAL_ID: &str = "forge.work.goal_id";
 
 pub fn work_event_headers(event: &WorkEvent) -> Headers {
     let mut headers = Headers::new();
@@ -147,6 +148,22 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
                 HEADER_FORGE_WORK_STATE.to_string(),
                 format!("{:?}", e.state).to_ascii_lowercase(),
             );
+        }
+        WorkEvent::GoalCreated(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_GOAL_ID, e.goal_id);
+            headers.insert(
+                HEADER_FORGE_WORK_REPO.to_string(),
+                e.default_repo.to_string(),
+            );
+        }
+        WorkEvent::GoalAchieved(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_GOAL_ID, e.goal_id);
+        }
+        WorkEvent::GoalAbandoned(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_GOAL_ID, e.goal_id);
+        }
+        WorkEvent::GoalDryTickRecorded(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_GOAL_ID, e.goal_id);
         }
     }
 }

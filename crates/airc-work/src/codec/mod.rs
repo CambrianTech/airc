@@ -18,8 +18,9 @@ mod tests;
 pub use headers::{
     work_event_headers, HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID,
     HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_GIT_BRANCH, HEADER_FORGE_WORK_GIT_COMMIT,
-    HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_PR_NUMBER,
-    HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_STATE, HEADER_FORGE_WORK_WORKSPACE_ID,
+    HEADER_FORGE_WORK_GOAL_ID, HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID,
+    HEADER_FORGE_WORK_PR_NUMBER, HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_STATE,
+    HEADER_FORGE_WORK_WORKSPACE_ID,
 };
 
 pub const BODY_HINT_FORGE_WORK_EVENT: &str = "forge.work.event.v1";
@@ -110,5 +111,9 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::ManagerHatClaimed(_) => "manager_hat_claimed",
         WorkEvent::ManagerHatReleased(_) => "manager_hat_released",
         WorkEvent::AgentAvailabilityReported(_) => "agent_availability_reported",
+        WorkEvent::GoalCreated(_) => "goal_created",
+        WorkEvent::GoalAchieved(_) => "goal_achieved",
+        WorkEvent::GoalAbandoned(_) => "goal_abandoned",
+        WorkEvent::GoalDryTickRecorded(_) => "goal_dry_tick_recorded",
     }
 }

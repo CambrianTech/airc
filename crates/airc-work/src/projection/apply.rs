@@ -62,6 +62,17 @@ impl WorkBoardProjection {
                 self.apply_agent_availability_reported(e);
                 Ok(())
             }
+            // Slice C2a ships typed wire shapes only. Projection logic
+            // (Goal materialization, dedup arbitration, derived Achieved
+            // state from DryForTicks / MilestoneClosed / AllCardsClosed)
+            // lands in C2b. The match arms exist here so adding the
+            // WorkEvent variants in C2a doesn't break exhaustiveness;
+            // applying them is a structural no-op until C2b wires them
+            // through.
+            WorkEvent::GoalCreated(_)
+            | WorkEvent::GoalAchieved(_)
+            | WorkEvent::GoalAbandoned(_)
+            | WorkEvent::GoalDryTickRecorded(_) => Ok(()),
         }
     }
 
