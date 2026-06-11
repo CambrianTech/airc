@@ -172,6 +172,7 @@ async fn request_persona_turn(alice: &Airc) -> PersonaEvent {
         activity_id: "activity-chat".to_string(),
         turn_id: "turn-001".to_string(),
         prompt: "take a turn".to_string(),
+        model_hint: None,
         requested_at_ms: 1_700_000_000_000,
     });
     let reply = request_typed(alice, encode_persona_event(&request).unwrap()).await;

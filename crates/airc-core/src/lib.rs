@@ -12,6 +12,7 @@
 //!
 //! - [`ids`]        — newtype wrappers for identifier strings
 //! - [`identity`]   — the per-peer Identity card (the user/account abstraction)
+//! - [`persona`]    — typed persona capability metadata on Identity.integrations
 //! - [`body`]       — opaque payload (Json | Binary) consumers carry
 //! - [`transcript`] — TranscriptEvent + TranscriptKind + MentionTarget
 //! - [`cursor`]     — cursor + paging primitives for transcript fetch
@@ -35,6 +36,7 @@ pub mod headers;
 pub mod humanhash;
 pub mod identity;
 pub mod ids;
+pub mod persona;
 pub mod receipt;
 pub mod transcript;
 
@@ -51,5 +53,6 @@ pub use headers::{HeaderFilter, Headers};
 pub use humanhash::{humanhash, HumanhashError};
 pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
+pub use persona::{PersonaCapabilities, PersonaCapabilitiesError, PERSONA_CAPABILITIES_KEY};
 pub use receipt::{Receipt, ReceiptKind};
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};
