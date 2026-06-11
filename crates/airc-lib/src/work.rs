@@ -412,6 +412,7 @@ impl Airc {
             created_by: self.peer_id(),
             created_at_ms: now_ms()?,
             reviews: request.reviews,
+            origin: None,
         });
         self.publish_work_event(&event).await?;
         Ok(card_id)
