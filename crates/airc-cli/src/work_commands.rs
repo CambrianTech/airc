@@ -1426,7 +1426,6 @@ pub async fn run_merge(
     dry_run: bool,
     pending_timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::gh_client::GhClient as _;
     use airc_work::model::CardState;
 
     let airc = crate::commands::attached_airc(home).await?;
@@ -1460,8 +1459,11 @@ pub async fn run_merge(
         .into());
     };
 
-    let gh = crate::gh_client::ShellGhClient::new();
-    let baseline = crate::merger::fetch_baseline_failures(&gh).await;
+    // Card c1090a24: backend selected by production_gh_client —
+    // ReqwestGhClient by default (no per-call gh spawn on the gate +
+    // merge path), shell only by explicit opt-out or loud fallback.
+    let gh = crate::gh_reqwest::production_gh_client();
+    let baseline = crate::merger::fetch_baseline_failures(gh.as_ref()).await;
     if !baseline.is_empty() {
         eprintln!(
             "airc: baseline has {} failing check(s) on rust-rewrite — inherited \
@@ -1478,7 +1480,7 @@ pub async fn run_merge(
         now_ms: crate::merger::now_ms(),
     };
 
-    match crate::merger::check_pr_gate(&gh, &pr, &baseline, policy).await {
+    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &baseline, policy).await {
         Ok(crate::merger::GateResult::Green) => {
             if dry_run {
                 println!(

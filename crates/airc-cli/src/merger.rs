@@ -75,11 +75,13 @@ pub async fn run(
     );
     eprintln!("airc-merger: peer_id={}", airc.peer_id());
 
-    // Cards dec35ec7 + a094aa81: one ShellGhClient per merger session,
-    // passed downstream as `&dyn GhClient` so an alternative impl
-    // (mock, HTTP-direct) can substitute at the boundary without
-    // touching the merger's gate logic.
-    let gh = crate::gh_client::ShellGhClient::new();
+    // Cards dec35ec7 + a094aa81: one GhClient per merger session,
+    // passed downstream as `&dyn GhClient` so the gate logic never
+    // knows which impl it's on. Card c1090a24: the impl is selected
+    // by production_gh_client — ReqwestGhClient by default (no
+    // per-call gh spawn), ShellGhClient only via explicit
+    // AIRC_GH_BACKEND=shell or a loudly-warned construction fallback.
+    let gh = crate::gh_reqwest::production_gh_client();
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -95,7 +97,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                if let Err(error) = tick_once(&gh, &airc, dry_run).await {
+                if let Err(error) = tick_once(gh.as_ref(), &airc, dry_run).await {
                     // A tick failing should NOT bring down the loop —
                     // gh might be rate-limited, the daemon might be
                     // momentarily unreachable, etc. Log and continue.
