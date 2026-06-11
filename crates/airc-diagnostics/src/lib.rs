@@ -45,6 +45,14 @@ pub enum DiagnosticCode {
     ReplayFramesSkipped,
     WebRtcOfferAnswerFailed,
     WorkspaceLeaseViolation,
+    /// Card 625abe6d slice 2: the daemon's periodic route-discovery
+    /// refresh failed as a whole (substrate handle could not open, or
+    /// the refresh itself errored). The loop retries next interval.
+    RouteRefreshFailed,
+    /// Card 625abe6d slice 2: one stored peer endpoint did not answer
+    /// an outbound route-discovery dial. Offline peers are normal mesh
+    /// weather — but every failed dial attempt must be visible.
+    PeerDialFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

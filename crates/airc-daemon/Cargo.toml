@@ -43,3 +43,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "s
 # work-domain agnostic — payloads are opaque to the router.
 airc-work = { path = "../airc-work" }
 tempfile = "3"
+# `start_paused` time-control for the route_refresh scheduling tests
+# (card 625abe6d slice 2) — dev-only; the daemon itself runs on the
+# real clock.
+tokio = { version = "1", features = ["test-util"] }
