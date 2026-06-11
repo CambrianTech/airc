@@ -39,6 +39,7 @@ pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
 mod broadcast_deduper;
+pub mod capability_registry;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;
@@ -85,6 +86,9 @@ pub use airc::{machine_account_home, Airc};
 pub use airc_protocol::{
     AssertionError, IdentityAssertion, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
     HEADER_AIRC_REPLY_TO,
+};
+pub use capability_registry::{
+    CapabilityCandidate, CapabilityEntry, CapabilityQuery, CapabilityRegistry, DEFAULT_OFFER_TTL_MS,
 };
 pub use command_bus::PendingCommand;
 pub use coordinator::{
@@ -168,8 +172,12 @@ pub use airc_core::{
     body::Body,
     headers::{HeaderFilter, Headers},
     transcript::MentionTarget,
-    ClientId, EventId, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
+    ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,
+    TranscriptCursor, TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,
 };
+// Trust tiers are the capability-registry ranking axis (card a9580f9d);
+// re-export so consumers ranking candidates don't pull airc-store.
+pub use airc_store::peer_trust::TrustTier;
 pub use airc_work::{
     AgentAvailabilityRecord, AgentAvailabilityReported, AgentAvailabilityState, BoardSnapshot,
     BranchName, CardState, CardUpdated, ClaimId, DirtyState, GitObjectId, LaneId, LaneState,

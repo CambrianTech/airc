@@ -27,8 +27,9 @@
 //! [`Airc::await_reply`] resolves with the `TurnEmitted` event.
 
 use airc_lib::{
-    Airc, AircError, Body, EventFilter, HeaderFilter, Headers, MentionTarget, PeerId,
-    PendingCommand, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE, HEADER_AIRC_REPLY_TO,
+    Airc, AircError, Body, CapabilityCandidate, CapabilityQuery, CapabilityRegistry, EventFilter,
+    HeaderFilter, Headers, MentionTarget, PeerId, PendingCommand, PersonaCapabilities, TrustTier,
+    HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE, HEADER_AIRC_REPLY_TO,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
@@ -406,6 +407,155 @@ pub async fn reply_turn_emitted(
     airc.reply(address.reply_to, address.correlation_id, headers, body)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Capability offer + registry routing — card a9580f9d (persona-peer 4/8)
+// ---------------------------------------------------------------------------
+//
+// The organic two-sided matcher. A persona node ADVERTISES what it can
+// do (a capability offer carrying its card-9e5f8844 `PersonaCapabilities`
+// + its `peer_id`); a scheduler expressing a NEED matches against those
+// offers via [`airc_lib::CapabilityRegistry`]. This is the escalation
+// half of local-first routing: try the local node first, consult the
+// registry only when local can't meet the need. Grid-of-one is normal —
+// a node with no peers ingests no offers and the registry stays
+// empty-but-valid.
+
+/// Body hint for a capability offer. Versioned independently of the
+/// persona-event hint: an offer is a distinct wire shape (a standing
+/// advert, not an activity event), so it gets its own additive `v1`
+/// rather than becoming a `PersonaEvent` variant.
+pub const BODY_HINT_FORGE_PERSONA_CAPABILITY_OFFER: &str = "forge.persona.capability_offer.v1";
+
+/// Header projecting the offering node's peer id, so a scheduler can
+/// filter offers by source without decoding the body. Consumer-owned
+/// `forge.persona.*` namespace.
+pub const HEADER_FORGE_PERSONA_PEER_ID: &str = "forge.persona.peer_id";
+
+/// A node's standing capability advert, published to the room.
+///
+/// Reuses card 9e5f8844's [`PersonaCapabilities`] verbatim (the WHAT)
+/// and pairs it with the offering [`PeerId`] (the WHO). Additive +
+/// versioned like the `model_hint` field was: a future shape gets a new
+/// body hint, never a silent change to `v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityOffer {
+    /// The node making the offer. Registry candidates key off this.
+    pub peer_id: PeerId,
+    /// Exactly what this node advertises about itself (card 9e5f8844).
+    pub capabilities: PersonaCapabilities,
+    /// When the offer was produced (epoch-ms). The registry's ageing
+    /// clock is fed from this — a node that keeps re-advertising stays
+    /// live, one that goes quiet ages out.
+    pub offered_at_ms: u64,
+}
+
+/// Encode a [`CapabilityOffer`] to `(Headers, Body)` for
+/// [`airc_lib::Airc::send`]. Projects the body hint + offering peer id
+/// as headers so subscribers filter without decoding the body — same
+/// pattern as [`encode_persona_event`].
+pub fn encode_capability_offer(
+    offer: &CapabilityOffer,
+) -> Result<(Headers, Body), PersonaCodecError> {
+    let mut headers = Headers::new();
+    headers.insert(
+        HEADER_FORGE_BODY_HINT.to_string(),
+        BODY_HINT_FORGE_PERSONA_CAPABILITY_OFFER.to_string(),
+    );
+    headers.insert(
+        HEADER_FORGE_PERSONA_PEER_ID.to_string(),
+        offer.peer_id.to_string(),
+    );
+    headers.insert(
+        HEADER_FORGE_PERSONA_ID.to_string(),
+        offer.capabilities.persona_id.clone(),
+    );
+    let body = Body::Json(serde_json::to_value(offer)?);
+    Ok((headers, body))
+}
+
+/// Decode a [`CapabilityOffer`] off an event's headers + body. Loud on a
+/// body-hint mismatch (an offer mis-read as something else would silently
+/// never enter the registry, dropping a capable node from routing).
+pub fn decode_capability_offer(
+    headers: &Headers,
+    body: Option<&Body>,
+) -> Result<CapabilityOffer, PersonaCodecError> {
+    match headers.get(HEADER_FORGE_BODY_HINT) {
+        Some(value) if value == BODY_HINT_FORGE_PERSONA_CAPABILITY_OFFER => {}
+        actual => {
+            return Err(PersonaCodecError::BodyHintMismatch {
+                actual: actual.cloned(),
+                expected: BODY_HINT_FORGE_PERSONA_CAPABILITY_OFFER,
+            });
+        }
+    }
+    let body = body.ok_or(PersonaCodecError::MissingBody)?;
+    let Body::Json(value) = body else {
+        return Err(PersonaCodecError::NonJsonBody);
+    };
+    Ok(serde_json::from_value(value.clone())?)
+}
+
+/// Subscription filter admitting capability offers (and only those).
+pub fn capability_offer_filter() -> EventFilter {
+    EventFilter {
+        channel: None,
+        channels: HashSet::new(),
+        kinds: BTreeSet::new(),
+        headers_filter: HeaderFilter::Exact {
+            key: HEADER_FORGE_BODY_HINT.to_string(),
+            value: BODY_HINT_FORGE_PERSONA_CAPABILITY_OFFER.to_string(),
+        },
+    }
+}
+
+/// Ingest a decoded [`CapabilityOffer`] into a [`CapabilityRegistry`].
+/// The bridge from the wire event (consumer-shapes layer) to the
+/// wire-agnostic projection (airc-lib layer): the registry holds
+/// `PersonaCapabilities` keyed by `peer_id`, never the wire envelope.
+pub fn ingest_capability_offer(registry: &mut CapabilityRegistry, offer: &CapabilityOffer) {
+    registry.ingest_offer(
+        offer.peer_id,
+        offer.capabilities.clone(),
+        offer.offered_at_ms,
+    );
+}
+
+/// Pick the best registry candidate to route a [`TurnRequested`] to,
+/// given its `model_hint` (card ee2a339f) and/or extra required tags.
+///
+/// This is the bridge between 3/8's `forge.persona.model_hint` header
+/// and 4/8's actual selection. A `model_hint`, when present, is treated
+/// as one more required capability tag — a node advertising it (in its
+/// `capability_tags`) is preferred. With no hint and no extra tags, this
+/// degrades to a "best available node" sweep (highest trust, then widest
+/// context window) via the empty-tags path.
+///
+/// Returns `None` (never an error) when nothing matches — grid-of-one,
+/// or no node advertises the hinted model. The caller then runs locally
+/// or queues; selection does not editorialise.
+pub fn select_candidate_for_turn(
+    registry: &CapabilityRegistry,
+    request: &TurnRequested,
+    extra_required_tags: &[&str],
+    now_ms: u64,
+    ttl_ms: u64,
+    trust_of: impl Fn(PeerId) -> TrustTier,
+) -> Option<CapabilityCandidate> {
+    let mut required: Vec<&str> = extra_required_tags.to_vec();
+    if let Some(hint) = request.model_hint.as_deref() {
+        if !required.contains(&hint) {
+            required.push(hint);
+        }
+    }
+    let query = CapabilityQuery {
+        required_tags: &required,
+        now_ms,
+        ttl_ms,
+    };
+    registry.match_for(&query, trust_of).into_iter().next()
 }
 
 /// A consumer-side filter that admits any persona event. Combine
