@@ -294,11 +294,15 @@ mod tests {
 
     #[test]
     fn goal_created_round_trips_with_empty_recipe_refs() {
-        // what this catches: regression where `GoalCreated.recipe_refs`
-        // loses its `#[serde(default)]` and a legacy event without the
-        // field fails to deserialize. Empty Vec at creation is valid
-        // per docs; the synthesizer (C3) treats empty as "no synthesis
-        // until a recipe is bound."
+        // what this catches: regression where the empty-Vec case fails
+        // round-trip. `recipe_refs: vec![]` is a legitimate creation
+        // state — the synthesizer (C3) treats empty as "no synthesis
+        // until a recipe is bound" — so the encode→decode path must
+        // preserve it. (The companion test
+        // `goal_created_payload_without_recipe_refs_fails_decode`
+        // pins the no-`#[serde(default)]` contract: a payload that
+        // OMITS the field must fail decode, not silently default to
+        // empty.)
         let event = GoalCreated {
             goal_id: GoalId::new(),
             title: "ship cross-grid inference".into(),

@@ -315,7 +315,15 @@ pub enum CardOrigin {
 }
 ```
 
-`CardCreated.origin: CardOrigin` is non-optional. `SynthesisRecorded` is deleted from the design — the audit trail is the `Synthesized` variant on the card itself. Replays remain decisive: every replayed card knows where it came from without needing two events in the right order.
+**`CardCreated.origin` is `Option<CardOrigin>` — optional on the wire for decode back-compat, semantically required for new emissions** (slice C2a fold-in). Two failure modes are kept apart: old transcripts predating C2a have no `origin` key and MUST decode (legacy rule below); every new emission MUST stamp a typed variant so provenance rides the primary object.
+
+- **Wire shape:** `origin: Option<CardOrigin>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Pre-C2a `CardCreated` events on the wire have no `origin` key; they decode with `None` and replay without breakage.
+- **Production operator emitter:** `Airc::create_work_card` (airc-lib) ALWAYS stamps `Some(CardOrigin::Operator { peer_id })` — never `None`. Pinned by `build_operator_card_created_never_emits_origin_none`. Stamping `None` here would erode the "first-class but never anonymous" contract on day one.
+- **Synthesizer (C3) emitter:** MUST stamp `Some(CardOrigin::Synthesized { goal_id, recipe_id, synthesizer_peer, dedup_key })` — the four fields C2b's projection arbitrates on.
+- **External bridge emitter:** MUST stamp `Some(CardOrigin::External { source, foreign_id })`.
+- **C2b projection legacy rule:** any `CardCreated` whose `origin` field is `None` (which can only be a legacy pre-C2a transcript, given the emitter contracts above) is interpreted as `Operator { peer_id: created_by }`. This rule exists ONLY to keep historical transcripts replayable; it never applies to a new emission because no new emission produces `None`. A future synthesizer that forgets to stamp `Synthesized` would land on the legacy arm — exactly the misattribution-by-indistinguishability the never-None pin exists to catch.
+
+`SynthesisRecorded` is deleted from the design — the audit trail is the `Synthesized` variant on the card itself. Replays remain decisive: every replayed card knows where it came from without needing two events in the right order.
 
 ### A2/A3 — Pluggable recipe registry via ConsumerAdapter; semantic recipes live consumer-side
 

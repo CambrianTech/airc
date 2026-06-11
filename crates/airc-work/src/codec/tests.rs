@@ -504,3 +504,174 @@ fn goal_dry_tick_recorded_event_projects_goal_id_header() {
         Some(goal_id(60).to_string().as_str())
     );
 }
+
+// Verdict 4679774882 blocker 2 — envelope-tag pins for the 4 goal
+// WorkEvent variants. The codec tests above pin only the HEADER kind
+// (which comes from `event_kind()`'s independent string literal);
+// `decode_work_event` never reads the kind header, so the body's
+// serde tag IS the decode contract — and it was unpinned. Mutation
+// proof: `#[serde(rename = "goal_minted")]` on `GoalCreated` passes
+// every existing test. These tests assert the literal `kind` value
+// in the encoded JSON body so a variant rename either updates the
+// assertion deliberately or fails loudly. Same pattern as the
+// `card_origin_operator_variant_has_stable_wire_tag` test in
+// goal_event.rs.
+
+/// Helper: extract the body JSON from an encoded WorkEvent. The codec
+/// emits `Body::Json(serde_json::Value)`; this helper unwraps that to
+/// the `Value` so per-tag assertions stay terse.
+fn body_value(body: &Body) -> &serde_json::Value {
+    match body {
+        Body::Json(v) => v,
+        other => panic!("expected Body::Json, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_created_body_serde_tag_is_pinned_literal() {
+    // what this catches: mutation of the `GoalCreated` variant name
+    // (e.g. `#[serde(rename = "goal_minted")]`) that drifts the body
+    // wire shape away from `"goal_created"`. Verdict 4679774882
+    // blocker 2: round-trip tests are tag-blind (encode + decode
+    // shift together); header-kind assertions ride a separate code
+    // path (`event_kind()`); ONLY a literal-JSON assertion on the
+    // body's `kind` tag catches the regression. Header + body MUST
+    // agree.
+    let event = WorkEvent::GoalCreated(GoalCreated {
+        goal_id: goal_id(70),
+        title: "x".into(),
+        default_repo: RepoId::new("CambrianTech/airc").unwrap(),
+        exit_condition: ExitCondition::OperatorOnly,
+        recipe_refs: vec![],
+        created_by: peer(71),
+        created_at_ms: 72,
+    });
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+        Some("goal_created"),
+        "WorkEvent::GoalCreated body MUST encode `\"kind\":\"goal_created\"` — \
+         any rename is a deliberate wire break and must update this assertion"
+    );
+    // Header/body consistency: the routing header's kind value MUST
+    // match the body's serde tag. Divergence between them is the
+    // exact tag-blindness failure mode this slice's review uncovered.
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+        "envelope kind header must equal body serde tag"
+    );
+}
+
+#[test]
+fn goal_achieved_body_serde_tag_is_pinned_literal() {
+    // what this catches: mutation of `GoalAchieved` variant name.
+    // See goal_created counterpart for the full rationale.
+    let event = WorkEvent::GoalAchieved(GoalAchieved {
+        goal_id: goal_id(80),
+        condition: ExitCondition::OperatorOnly,
+        achieved_by: peer(81),
+        achieved_at_ms: 82,
+    });
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+        Some("goal_achieved")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+    );
+}
+
+#[test]
+fn goal_abandoned_body_serde_tag_is_pinned_literal() {
+    // what this catches: mutation of `GoalAbandoned` variant name.
+    let event = WorkEvent::GoalAbandoned(GoalAbandoned {
+        goal_id: goal_id(90),
+        abandoned_by: peer(91),
+        reason: "scope cut".into(),
+        abandoned_at_ms: 92,
+    });
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+        Some("goal_abandoned")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+    );
+}
+
+#[test]
+fn goal_dry_tick_recorded_body_serde_tag_is_pinned_literal() {
+    // what this catches: mutation of `GoalDryTickRecorded` variant
+    // name. The projection (C2b) counts consecutive instances by
+    // event kind; a body-tag drift breaks `ExitCondition::DryForTicks`
+    // structurally without any header-side signal.
+    let event = WorkEvent::GoalDryTickRecorded(GoalDryTickRecorded {
+        goal_id: goal_id(100),
+        synthesizer_peer: peer(101),
+        recorded_at_ms: 102,
+    });
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+        Some("goal_dry_tick_recorded")
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        body_value(&body).get("kind").and_then(|v| v.as_str()),
+    );
+}
+
+#[test]
+fn card_created_origin_field_name_is_pinned_literal() {
+    // what this catches: mutation of `CardCreated.origin` field name
+    // (e.g. `#[serde(rename = "provenance")]`). Verdict 4679774882
+    // blocker 3: the round-trip test is field-name-blind (encode +
+    // decode shift together) and the legacy test only pins absence.
+    // Pinning the literal `"origin"` key on a Synthesized payload
+    // kills field-rename mutations structurally.
+    let event = WorkEvent::CardCreated(CardCreated {
+        card_id: WorkCardId::from_u128(110),
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        title: "synthesized follow-up".to_string(),
+        body: None,
+        priority: Priority::P2,
+        lane_id: None,
+        created_by: peer(111),
+        created_at_ms: 112,
+        reviews: None,
+        origin: Some(CardOrigin::Synthesized {
+            goal_id: goal_id(113),
+            recipe_id: RecipeRef::new("follow-up-extraction"),
+            synthesizer_peer: peer(114),
+            dedup_key: "goal-113::dedup-test".to_string(),
+        }),
+    });
+    let (_headers, body) = encode_work_event(&event).unwrap();
+    let value = body_value(&body);
+    let origin = value.get("origin").expect(
+        "CardCreated body MUST encode the field name `\"origin\"` — \
+                 any rename is a deliberate wire break",
+    );
+    // Pin the inner tagged shape too: `{"kind":"synthesized", ...}`.
+    // This belt-and-suspenders catches the case where someone
+    // renames both `origin` AND the variant tag in lockstep, which
+    // a single-key check would miss.
+    assert_eq!(
+        origin.get("kind").and_then(|v| v.as_str()),
+        Some("synthesized"),
+        "CardOrigin::Synthesized body tag MUST be `\"synthesized\"`"
+    );
+}
