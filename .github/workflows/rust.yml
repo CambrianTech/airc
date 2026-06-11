@@ -28,6 +28,17 @@ on:
       - "Cargo.lock"
       - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
+  # Merge queue: GitHub builds the queued PR(s) on top of the latest
+  # rust-rewrite on a `gh-readonly-queue/...` ref and emits a
+  # `merge_group` event. Without this trigger those checks never run,
+  # so the queue would wait forever. No `paths` filter here on purpose
+  # — `merge_group` doesn't honour path filters, and a queued docs-only
+  # PR still needs to report the required contexts (the rust legs pass
+  # trivially with no crate changes). This is the gate that catches the
+  # merge-race class that broke rust-rewrite on 2026-06-11 (#1127×#1137
+  # each green alone, broken combined): the queue compiles the COMBINED
+  # result before it can land.
+  merge_group:
   push:
     branches: [canary, main, rust-rewrite]
     paths:
