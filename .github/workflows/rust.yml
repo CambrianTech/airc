@@ -46,6 +46,19 @@ jobs:
     name: cargo fmt --check
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -58,6 +71,19 @@ jobs:
     name: cargo clippy (deny warnings)
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -99,13 +125,38 @@ jobs:
     # install-only checks is not sufficient; runtime tests gated by
     # `#[cfg(windows)]` (like the named-pipe IPC concurrent-bind test)
     # only execute when the test job actually runs on Windows.
-    name: cargo test (${{ matrix.os }})
+    name: cargo test (${{ matrix.display }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows runs on the self-hosted bigmama runner (5090 grid
+        # node) — GitHub-hosted windows-latest has been queue-starved
+        # for days and was blocking merges (#1114). The install-smoke
+        # jobs in ci.yml deliberately STAY on windows-latest: they do
+        # real machine-wide winget installs and need a virgin box,
+        # which a persistent self-hosted runner is not.
+        # Security: repo fork-PR approval policy is set to
+        # all_external_contributors, so no fork code reaches the
+        # self-hosted runner without a maintainer's explicit approval.
+        include:
+          - { os: ubuntu-latest, display: ubuntu-latest }
+          - { os: macos-latest, display: macos-latest }
+          - { os: [self-hosted, windows], display: windows-self-hosted }
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: rustup toolchain install stable --profile minimal
