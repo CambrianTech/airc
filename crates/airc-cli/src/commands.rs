@@ -175,11 +175,26 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
         }
         None => {
             let cwd = std::env::current_dir()?;
+            // Card 1eae6f3e: snapshot the durable default BEFORE the
+            // context re-infer (raw read — `subscription_set` has no
+            // lazy-seed side effects) so a default change is reported
+            // loudly instead of silently re-targeting `airc msg`.
+            let default_before = airc.subscription_set().await?.default;
             let rooms = airc.join_default_context(cwd).await?;
             let current = airc.current_room().await?;
             println!("joined default account context:");
             for room in rooms {
                 println!("  #{} ({})", room.name, room.channel);
+            }
+            if let Some(before) = default_before {
+                if before.as_str() != current.name {
+                    eprintln!(
+                        "WARNING: default room CHANGED: {} -> #{} — `airc msg` now targets #{}",
+                        before.display_with_hash(),
+                        current.name,
+                        current.name
+                    );
+                }
             }
             println!("default: #{}", current.name);
             println!("wire:    {}", current.wire.display());
