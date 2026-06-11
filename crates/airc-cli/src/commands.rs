@@ -22,6 +22,9 @@ use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
 use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_identity::LocalIdentity;
 use airc_ipc::{AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response};
 use airc_lib::{Airc, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
@@ -828,9 +831,101 @@ pub async fn run_daemon(
         identity.peer_id,
         socket.display()
     );
+    // Card 625abe6d slice 2: the daemon, not the operator, keeps
+    // routes alive. Spawn the periodic route-discovery refresh before
+    // the accept loop blocks; it exits on the same shutdown notifier.
+    let route_refresh_task = spawn_route_refresh(home.to_path_buf(), state.clone());
     run_daemon_server(state, socket).await?;
+    // The refresh loop exits on the shutdown `Notify` that ended the
+    // accept loop; abort is the backstop for the listener-error path,
+    // where Stop never fired (same abort discipline as
+    // `HeartbeatTask::stop`).
+    route_refresh_task.abort();
     println!("airc daemon: stopped.");
     Ok(())
+}
+
+/// Card 625abe6d slice 2 — daemon-resident continuous route
+/// discovery. `refresh_route_discovery` (slice 1) dials every
+/// enrolled peer's stored endpoints outbound; this task calls it on
+/// the daemon clock (`route_refresh::FIRST_REFRESH_DELAY` after
+/// start, then every `route_refresh::REFRESH_INTERVAL`) so stored-
+/// endpoint dials and route health are continuous — sleep/wake and
+/// daemon restarts re-establish routes with zero operator action,
+/// instead of waiting for someone to run `airc transport health`.
+///
+/// The `Airc` handle is opened lazily and then kept for the daemon's
+/// lifetime: LAN connections established by discovery dials live on
+/// the handle's adapter, so re-opening per tick would sever them on
+/// every refresh. Lazy-with-retry (rather than open-or-die at spawn)
+/// is the no-single-point-of-failure posture: a transient store
+/// failure at boot must neither take the IPC daemon down nor
+/// permanently disable route refresh — the open is retried, loudly,
+/// on every tick until it succeeds.
+fn spawn_route_refresh(home: PathBuf, state: Arc<DaemonState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let handle: tokio::sync::Mutex<Option<Airc>> = tokio::sync::Mutex::new(None);
+        airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
+            refresh_routes_once(&home, &handle)
+        })
+        .await;
+    })
+}
+
+/// One periodic route refresh: ensure the daemon's substrate handle
+/// is open, run discovery (which dials stored peer endpoints
+/// outbound, 3s-bounded each), and surface every failure through the
+/// daemon's diagnostic sink — loud, never silent. Failures never
+/// propagate: the loop's next tick is the retry path (self-heal
+/// doctrine, card 625abe6d).
+async fn refresh_routes_once(home: &Path, handle: &tokio::sync::Mutex<Option<Airc>>) {
+    let mut guard = handle.lock().await;
+    if guard.is_none() {
+        match Airc::open(home).await {
+            Ok(airc) => *guard = Some(airc),
+            Err(error) => {
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::RouteRefreshFailed,
+                        "route refresh could not open the substrate handle; retrying next interval",
+                    )
+                    .with_field("home", home.display())
+                    .with_field("error", error),
+                );
+                return;
+            }
+        }
+    }
+    let Some(airc) = guard.as_ref() else {
+        return;
+    };
+    match airc.refresh_route_discovery().await {
+        Ok(snapshot) => {
+            for failure in &snapshot.peer_dial_failures {
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::warn(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::PeerDialFailed,
+                        "stored peer endpoint did not answer a route-discovery dial",
+                    )
+                    .with_field("peer_id", failure.peer_id)
+                    .with_field("endpoint", format!("{:?}", failure.endpoint))
+                    .with_field("error", &failure.error),
+                );
+            }
+        }
+        Err(error) => {
+            StderrJsonDiagnosticSink.emit(
+                DiagnosticEvent::error(
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::RouteRefreshFailed,
+                    "periodic route-discovery refresh failed; retrying next interval",
+                )
+                .with_field("error", error),
+            );
+        }
+    }
 }
 
 fn current_daemon_runtime_info() -> DaemonRuntimeInfo {

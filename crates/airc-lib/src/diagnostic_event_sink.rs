@@ -189,6 +189,8 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ReplayFramesSkipped => "replay_frames_skipped",
         DiagnosticCode::WebRtcOfferAnswerFailed => "webrtc_offer_answer_failed",
         DiagnosticCode::WorkspaceLeaseViolation => "workspace_lease_violation",
+        DiagnosticCode::RouteRefreshFailed => "route_refresh_failed",
+        DiagnosticCode::PeerDialFailed => "peer_dial_failed",
     }
 }
 
@@ -233,6 +235,8 @@ mod tests {
             DiagnosticCode::ReplayFramesSkipped,
             DiagnosticCode::WebRtcOfferAnswerFailed,
             DiagnosticCode::WorkspaceLeaseViolation,
+            DiagnosticCode::RouteRefreshFailed,
+            DiagnosticCode::PeerDialFailed,
         ] {
             let header = code_header_value(code);
             assert!(!header.is_empty(), "{code:?} should map to non-empty");

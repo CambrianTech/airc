@@ -13,6 +13,9 @@
 //!   - `state` — shared daemon state ([`DaemonState`]).
 //!   - `handlers` — match arms for each `Request` variant.
 //!   - `trust_refresh` — durable peer-trust store -> live verifier sync.
+//!   - `route_refresh` — clock for the daemon-resident periodic route
+//!     discovery loop (card 625abe6d slice 2); the host supplies what
+//!     one refresh does.
 //!   - `airc-ipc` — wire-protocol types shared by daemon and clients.
 //!
 //! Adding a new operation:
@@ -30,6 +33,7 @@
 #![deny(unsafe_code)]
 
 pub mod handlers;
+pub mod route_refresh;
 pub mod server;
 pub mod state;
 pub mod trust_refresh;
