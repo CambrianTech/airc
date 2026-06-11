@@ -14,10 +14,26 @@
 //!   - `forge.persona.id`    — the persona that emitted the event
 //!   - `forge.continuum.activity_id` — scoping activity, when applicable
 //!   - `forge.continuum.turn_id`     — per-turn id, when applicable
+//!   - `forge.persona.model_hint`    — optional model preference on a
+//!     `TurnRequested`, when set
+//!
+//! Command-bus carriage (card ee2a339f): `TurnRequested` /
+//! `TurnEmitted` double as the request/reply pair of
+//! [`airc_lib::command_bus`]. The substrate stamps its own
+//! `airc.correlation_id` / `airc.reply_to` / `airc.deadline` headers
+//! on the request (via [`Airc::request`]); the persona-side responder
+//! reads them back through [`turn_reply_address`] and echoes the
+//! correlation via [`reply_turn_emitted`] so the requester's
+//! [`Airc::await_reply`] resolves with the `TurnEmitted` event.
 
-use airc_lib::{Body, EventFilter, HeaderFilter, Headers};
+use airc_lib::{
+    Airc, AircError, Body, EventFilter, HeaderFilter, Headers, MentionTarget, PeerId,
+    PendingCommand, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE, HEADER_AIRC_REPLY_TO,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
+use std::time::Duration;
+use uuid::Uuid;
 
 pub const BODY_HINT_FORGE_PERSONA_EVENT: &str = "forge.persona.event.v1";
 
@@ -25,6 +41,10 @@ pub const HEADER_FORGE_PERSONA_KIND: &str = "forge.persona.kind";
 pub const HEADER_FORGE_PERSONA_ID: &str = "forge.persona.id";
 pub const HEADER_FORGE_CONTINUUM_ACTIVITY_ID: &str = "forge.continuum.activity_id";
 pub const HEADER_FORGE_CONTINUUM_TURN_ID: &str = "forge.continuum.turn_id";
+/// Optional model preference projected off a [`TurnRequested`] so
+/// schedulers can route a turn to a capable persona host without
+/// decoding the body. Consumer-owned `forge.persona.*` namespace.
+pub const HEADER_FORGE_PERSONA_MODEL_HINT: &str = "forge.persona.model_hint";
 
 const HEADER_FORGE_BODY_HINT: &str = "forge.body_hint";
 
@@ -51,6 +71,12 @@ pub struct TurnRequested {
     pub activity_id: String,
     pub turn_id: String,
     pub prompt: String,
+    /// Optional model preference (adapter / checkpoint label) the
+    /// requester wants the persona runtime to honor. Additive +
+    /// optional so pre-existing encoded bodies still decode.
+    /// Projected to `forge.persona.model_hint` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hint: Option<String>,
     pub requested_at_ms: u64,
 }
 
@@ -108,6 +134,13 @@ impl PersonaEvent {
         }
     }
 
+    pub fn model_hint(&self) -> Option<&str> {
+        match self {
+            Self::TurnRequested(e) => e.model_hint.as_deref(),
+            Self::TurnEmitted(_) | Self::ActivityStarted(_) | Self::ActivityEnded(_) => None,
+        }
+    }
+
     fn variant_kind(&self) -> &'static str {
         match self {
             Self::TurnRequested(_) => "turn_requested",
@@ -126,6 +159,17 @@ pub enum PersonaCodecError {
         actual: Option<String>,
         expected: &'static str,
     },
+    /// A command-bus header required for the turn request/reply pairing
+    /// is absent (the request did not travel via [`Airc::request`]).
+    MissingHeader {
+        header: &'static str,
+    },
+    /// A command-bus header is present but does not parse (correlation /
+    /// reply-to must be UUIDs; deadline must be decimal epoch-ms).
+    MalformedHeader {
+        header: &'static str,
+        value: String,
+    },
     Json(serde_json::Error),
 }
 
@@ -138,6 +182,15 @@ impl std::fmt::Display for PersonaCodecError {
                 f,
                 "persona event body hint mismatch: actual={actual:?}, expected={expected:?}",
             ),
+            Self::MissingHeader { header } => {
+                write!(f, "persona turn request missing required header {header:?}")
+            }
+            Self::MalformedHeader { header, value } => {
+                write!(
+                    f,
+                    "persona turn request header {header:?} malformed: {value:?}"
+                )
+            }
             Self::Json(error) => write!(f, "persona event JSON codec failed: {error}"),
         }
     }
@@ -178,6 +231,12 @@ pub fn encode_persona_event(event: &PersonaEvent) -> Result<(Headers, Body), Per
             turn_id.to_string(),
         );
     }
+    if let Some(model_hint) = event.model_hint() {
+        headers.insert(
+            HEADER_FORGE_PERSONA_MODEL_HINT.to_string(),
+            model_hint.to_string(),
+        );
+    }
     let body = Body::Json(serde_json::to_value(event)?);
     Ok((headers, body))
 }
@@ -200,6 +259,153 @@ pub fn decode_persona_event(
         return Err(PersonaCodecError::NonJsonBody);
     };
     Ok(serde_json::from_value(value.clone())?)
+}
+
+// ---------------------------------------------------------------------------
+// Command-bus carriage — card ee2a339f (persona-peer 3/8)
+// ---------------------------------------------------------------------------
+//
+// The header names below are NOT a parallel vocabulary: they are the
+// exact `airc.correlation_id` / `airc.reply_to` / `airc.deadline`
+// constants the command bus itself stamps (re-exported by airc-lib
+// from airc-protocol's `headers_keys`). The persona contract only
+// reads them back; generic correlation plumbing stays in
+// `airc_lib::command_bus`.
+
+/// Command-bus addressing read off a [`TurnRequested`] request event.
+///
+/// [`Airc::request`] stamps `airc.correlation_id`, `airc.reply_to`,
+/// and `airc.deadline` on the outgoing event; the persona-side
+/// responder recovers them through this typed view to reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnReplyAddress {
+    /// Pairs the reply with the in-flight request
+    /// (`airc.correlation_id`). [`Airc::await_reply`] resolves only
+    /// when the reply echoes this exact value.
+    pub correlation_id: Uuid,
+    /// Requester peer the reply is directed at (`airc.reply_to`).
+    pub reply_to: PeerId,
+    /// Requester-stamped wall-clock deadline (`airc.deadline`,
+    /// epoch-ms). Responders may drop turns whose deadline already
+    /// passed instead of doing dead work.
+    pub deadline_at_ms: Option<u64>,
+}
+
+/// Read the command-bus reply address off a request event's headers.
+/// Errors loudly when the correlation/reply-to pairing is absent or
+/// malformed — a turn request that cannot be replied to is a bug, not
+/// a silently droppable event.
+pub fn turn_reply_address(headers: &Headers) -> Result<TurnReplyAddress, PersonaCodecError> {
+    let correlation =
+        headers
+            .get(HEADER_AIRC_CORRELATION_ID)
+            .ok_or(PersonaCodecError::MissingHeader {
+                header: HEADER_AIRC_CORRELATION_ID,
+            })?;
+    let correlation_id =
+        Uuid::parse_str(correlation).map_err(|_| PersonaCodecError::MalformedHeader {
+            header: HEADER_AIRC_CORRELATION_ID,
+            value: correlation.clone(),
+        })?;
+    let reply_to_raw =
+        headers
+            .get(HEADER_AIRC_REPLY_TO)
+            .ok_or(PersonaCodecError::MissingHeader {
+                header: HEADER_AIRC_REPLY_TO,
+            })?;
+    let reply_to = Uuid::parse_str(reply_to_raw)
+        .map(PeerId::from_uuid)
+        .map_err(|_| PersonaCodecError::MalformedHeader {
+            header: HEADER_AIRC_REPLY_TO,
+            value: reply_to_raw.clone(),
+        })?;
+    let deadline_at_ms = match headers.get(HEADER_AIRC_DEADLINE) {
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .map_err(|_| PersonaCodecError::MalformedHeader {
+                    header: HEADER_AIRC_DEADLINE,
+                    value: raw.clone(),
+                })?,
+        ),
+        None => None,
+    };
+    Ok(TurnReplyAddress {
+        correlation_id,
+        reply_to,
+        deadline_at_ms,
+    })
+}
+
+/// Errors from the turn request/reply helpers: either the persona
+/// codec rejected the payload/headers, or the substrate send failed.
+#[derive(Debug)]
+pub enum PersonaTurnError {
+    Codec(PersonaCodecError),
+    Substrate(AircError),
+}
+
+impl std::fmt::Display for PersonaTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codec(error) => write!(f, "persona turn codec failed: {error}"),
+            Self::Substrate(error) => write!(f, "persona turn substrate send failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PersonaTurnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(error) => Some(error),
+            Self::Substrate(error) => Some(error),
+        }
+    }
+}
+
+impl From<PersonaCodecError> for PersonaTurnError {
+    fn from(error: PersonaCodecError) -> Self {
+        Self::Codec(error)
+    }
+}
+
+impl From<AircError> for PersonaTurnError {
+    fn from(error: AircError) -> Self {
+        Self::Substrate(error)
+    }
+}
+
+/// Send a [`TurnRequested`] through the command-bus request path.
+///
+/// The persona codec headers (body hint, kind, persona/activity/turn
+/// ids, optional model hint) ride alongside the substrate-stamped
+/// `airc.correlation_id` / `airc.reply_to` / `airc.deadline`. Await
+/// the turn with [`Airc::await_reply`] — it resolves with the
+/// responder's [`TurnEmitted`] event, or errors with
+/// `AircError::CommandDeadline` when the deadline elapses first.
+pub async fn request_turn(
+    airc: &Airc,
+    target: MentionTarget,
+    request: &TurnRequested,
+    deadline: Duration,
+) -> Result<PendingCommand, PersonaTurnError> {
+    let (headers, body) = encode_persona_event(&PersonaEvent::TurnRequested(request.clone()))?;
+    Ok(airc.request(target, headers, body, deadline).await?)
+}
+
+/// Reply to a command-bus [`TurnRequested`] with a [`TurnEmitted`],
+/// echoing the request's correlation id so the requester's
+/// [`Airc::await_reply`] resolves with this event. `request_headers`
+/// are the headers off the request event as received.
+pub async fn reply_turn_emitted(
+    airc: &Airc,
+    request_headers: &Headers,
+    emitted: &TurnEmitted,
+) -> Result<(), PersonaTurnError> {
+    let address = turn_reply_address(request_headers)?;
+    let (headers, body) = encode_persona_event(&PersonaEvent::TurnEmitted(emitted.clone()))?;
+    airc.reply(address.reply_to, address.correlation_id, headers, body)
+        .await?;
+    Ok(())
 }
 
 /// A consumer-side filter that admits any persona event. Combine
