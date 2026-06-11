@@ -41,6 +41,19 @@ pub use crate::ids::GoalId;
 /// doesn't invent goals; it acts within existing ones. Same shape as
 /// `airc work create` for cards; goals get `airc work goal create` (CLI
 /// lands in slice E).
+///
+/// ## Spec fields that don't land here
+///
+/// The v1 design memo's pseudo-`Goal` carried two fields that this
+/// slice deliberately omits:
+///
+/// - `recipe_refs: Vec<RecipeRef>` — which recipes are eligible to
+///   propose for this goal. `RecipeRef` is slice B's vocabulary; the
+///   field lands on `Goal` in slice B alongside it.
+/// - `last_synthesis_at_ms: Option<u64>` — projection-derived from
+///   `CardCreated` events with `CardOrigin::Synthesized.goal_id == self.id`,
+///   not stored on the event-sourced goal. The synthesizer reads it via
+///   the projection in slice E's `idle_tick`, not from the `Goal` value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Goal {
     pub id: GoalId,
@@ -73,23 +86,25 @@ pub enum GoalState {
     Fresh,
     /// At least one card synthesized for this goal is or has been on
     /// the board.
-    InProgress {
-        open_cards: u32,
-        closed_cards: u32,
-    },
+    ///
+    /// Loser-side drift guard (verdict 4677490672 residual 3): the
+    /// projection (slice C) MUST derive these counts from arbitrated
+    /// `CardCreated` events keyed by `CardOrigin::Synthesized.goal_id`,
+    /// never from a synthesizer-supplied `GoalProgressed` payload. Under
+    /// the v2 design's projection-side first-write-wins dedup (A4a), the
+    /// racing-loser peer's local view of `(open_cards, closed_cards)` is
+    /// pre-arbitration and would poison the projection if the loser's
+    /// payload were trusted. The fields here are projection-only output;
+    /// any wire event that carries them is advisory at best.
+    InProgress { open_cards: u32, closed_cards: u32 },
     /// `ExitCondition` fired. Recipes refuse to propose; the synthesizer
     /// skips this goal until an operator re-opens it (event TBD,
     /// slice C).
-    Achieved {
-        at_ms: u64,
-    },
+    Achieved { at_ms: u64 },
     /// Operator marked the goal abandoned. Recipes refuse to propose;
     /// same shape as `Achieved` for the synthesizer but distinguishable
     /// for the audit trail.
-    Abandoned {
-        at_ms: u64,
-        reason: String,
-    },
+    Abandoned { at_ms: u64, reason: String },
 }
 
 /// How the projection decides a goal has been achieved automatically.
@@ -104,15 +119,11 @@ pub enum ExitCondition {
     /// projection can count, because dry ticks otherwise emit no
     /// events and the projection couldn't observe them. The event +
     /// projection wiring land in slice C.
-    DryForTicks {
-        n: u8,
-    },
+    DryForTicks { n: u8 },
     /// Achieved when a specific named card closes. Useful for "ship
     /// positron substrate end-to-end on canary" style goals where one
     /// milestone closure is THE achievement.
-    MilestoneClosed {
-        card_id: crate::ids::WorkCardId,
-    },
+    MilestoneClosed { card_id: crate::ids::WorkCardId },
     /// Achieved when every card whose `CardOrigin::Synthesized.goal_id`
     /// equals this goal is closed AND at least one such card has ever
     /// existed. The "at least one ever existed" guard prevents a
@@ -280,8 +291,7 @@ mod tests {
         ];
         for s in states {
             let json = serde_json::to_string(&s).expect("serialize GoalState");
-            let parsed: GoalState =
-                serde_json::from_str(&json).expect("deserialize GoalState");
+            let parsed: GoalState = serde_json::from_str(&json).expect("deserialize GoalState");
             assert_eq!(s, parsed, "round-trip mismatch for {json}");
         }
     }
