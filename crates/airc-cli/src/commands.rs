@@ -1151,36 +1151,51 @@ pub async fn run_daemon(
         // routable LAN (or a bind failure) still reaches the mesh by
         // dialing OUT to listening peers / relay — it just isn't
         // dialable itself, which we say plainly rather than swallow.
-        // Prefer the Tailscale endpoint over LAN. Every node on the same
-        // gh account is on the Tailscale mesh, so a 100.x address is
-        // dialable from ANY network and traverses NAT/firewalls, whereas a
-        // 192.168.x LAN address only works same-subnet and dies behind a
-        // firewall (the cross-machine keystone failure: nodes advertised
-        // LAN-only and could enrol each other but never connect). Fall back
-        // to LAN when Tailscale is down.
-        let advertise = crate::network_commands::detect_tailscale_ip()
-            .map(|ip| (ip, "Tailscale"))
-            .or_else(|| crate::network_commands::detect_lan_ip().map(|ip| (ip, "LAN")));
-        match advertise {
-            Some((ip, kind)) => match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
-                Ok(addr) => {
+        // Advertise BOTH the LAN and Tailscale addresses (the connection
+        // ladder: local → LAN → Tailscale → greater-grid P2P). Tailscale
+        // is unnecessary for same-subnet peers — a 192.168.x dial is
+        // direct, while routing same-LAN traffic over 100.x is a wasted
+        // hop. So we publish the LAN address (dialed first, no hop) AND
+        // the Tailscale address (the NAT-traversing fallback dialed only
+        // when the LAN dial times out, i.e. when peers are on different
+        // networks). One wildcard listener serves both interfaces; the
+        // endpoint sort order (LanTcp before TailscaleTcp) makes the
+        // dialer try LAN first and break on success — Tailscale only if
+        // we leave the LAN. Earlier this preferred Tailscale exclusively,
+        // forcing every same-LAN peer through an unnecessary 100.x hop.
+        let lan_ip = crate::network_commands::detect_lan_ip();
+        let tailscale_ip = crate::network_commands::detect_tailscale_ip();
+        if lan_ip.is_none() && tailscale_ip.is_none() {
+            eprintln!(
+                "airc daemon: no routable LAN or Tailscale IPv4 detected — account beacon \
+                 carries no endpoint (outbound-dial / relay only)"
+            );
+        } else {
+            match airc.listen_lan_advertising(lan_ip, tailscale_ip).await {
+                Ok(endpoints) => {
+                    let summary = endpoints
+                        .iter()
+                        .map(|endpoint| match endpoint {
+                            airc_lib::RouteEndpoint::LanTcp { addr } => format!("LAN {addr}"),
+                            airc_lib::RouteEndpoint::TailscaleTcp { addr } => {
+                                format!("Tailscale {addr}")
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" + ");
                     eprintln!(
-                        "airc daemon: advertising {kind} endpoint {addr} in the account registry"
+                        "airc daemon: advertising {summary} in the account registry \
+                         (LAN dialed first, Tailscale only if peers leave the LAN)"
                     );
                 }
                 Err(error) => {
                     eprintln!(
-                        "airc daemon: {kind} listener bind failed ({error}) — account beacon \
-                             carries no endpoint; this node reaches the mesh by dialing out / \
-                             relay but is not itself dialable"
+                        "airc daemon: LAN listener bind failed ({error}) — account beacon \
+                         carries no endpoint; this node reaches the mesh by dialing out / \
+                         relay but is not itself dialable"
                     );
                 }
-            },
-            None => {
-                eprintln!(
-                    "airc daemon: no Tailscale or routable LAN IPv4 detected — account beacon \
-                     carries no endpoint (outbound-dial / relay only)"
-                );
             }
         }
         // Card 4b6a0ffa (#33): record the endpoints this handle now

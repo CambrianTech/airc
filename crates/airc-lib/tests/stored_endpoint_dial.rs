@@ -19,7 +19,7 @@
 //!     offline peers are normal mesh weather, invisible dial attempts
 //!     are bugs.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use airc_lib::{endpoints_to_json, Airc, PeerSpec, RouteEndpoint};
 use tempfile::TempDir;
@@ -126,6 +126,115 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
     assert!(
         !failure.error.is_empty(),
         "the dial error must be carried for display"
+    );
+}
+
+/// The dual-advertise contract: `listen_lan_advertising` binds ONE
+/// wildcard listener and publishes BOTH the LAN and the Tailscale
+/// address under the same port, LAN sorted first. This is the daemon's
+/// connection ladder (local → LAN → Tailscale → grid): a same-subnet
+/// peer dials the LAN address directly and Tailscale is dialed only if
+/// the peer has left the LAN. Earlier the daemon advertised Tailscale
+/// exclusively, forcing every same-LAN peer through a wasted 100.x hop.
+#[tokio::test]
+async fn advertise_publishes_both_lan_and_tailscale_lan_first() {
+    let tmp = TempDir::new().expect("tempdir");
+    let airc = Airc::open(tmp.path().join(".airc")).await.expect("open");
+
+    let lan_ip = Ipv4Addr::new(192, 168, 1, 50);
+    let tailscale_ip = Ipv4Addr::new(100, 79, 156, 3);
+    let advertised = airc
+        .listen_lan_advertising(Some(lan_ip), Some(tailscale_ip))
+        .await
+        .expect("advertise both");
+
+    let endpoints = airc.route_endpoints().expect("read endpoints");
+    assert_eq!(
+        endpoints, advertised,
+        "the method's return value must mirror the advertised table"
+    );
+    assert_eq!(endpoints.len(), 2, "exactly LAN + Tailscale: {endpoints:?}");
+
+    // LAN sorts before Tailscale (RouteEndpointKind order) so the dialer
+    // tries it first and breaks on success — Tailscale only off-LAN.
+    let (lan_port, ts_port) = match (&endpoints[0], &endpoints[1]) {
+        (RouteEndpoint::LanTcp { addr: lan }, RouteEndpoint::TailscaleTcp { addr: ts }) => {
+            assert_eq!(lan.ip(), std::net::IpAddr::V4(lan_ip));
+            assert_eq!(ts.ip(), std::net::IpAddr::V4(tailscale_ip));
+            (lan.port(), ts.port())
+        }
+        other => panic!("expected [LanTcp, TailscaleTcp] in order, got {other:?}"),
+    };
+    assert_eq!(
+        lan_port, ts_port,
+        "one wildcard listener → both endpoints share its port"
+    );
+    assert_ne!(lan_port, 0, "the OS-assigned port must be concrete");
+    // The wildcard bind address itself is NEVER advertised — peers only
+    // ever receive specific, dialable IPs.
+    assert!(
+        !endpoints.iter().any(|endpoint| matches!(
+            endpoint,
+            RouteEndpoint::LanTcp { addr } if addr.ip().is_unspecified()
+        )),
+        "0.0.0.0 must never be advertised: {endpoints:?}"
+    );
+}
+
+/// End-to-end ladder pin: a peer that imports BOTH advertised endpoints
+/// connects via the LAN rung and never touches the (unreachable, off-box)
+/// Tailscale rung. The wildcard listener accepts the loopback dial, so we
+/// advertise 127.0.0.1 as the "LAN" address and a real-range 100.x that
+/// nothing answers — discovery must connect with ZERO failures, proving
+/// LAN-first-break (Tailscale only if we leave the LAN).
+#[tokio::test]
+async fn peer_dials_lan_rung_and_skips_tailscale() {
+    let tmp_a = TempDir::new().expect("alice tempdir");
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let alice = Airc::open(tmp_a.path().join(".airc"))
+        .await
+        .expect("alice open");
+    let bob = Airc::open(tmp_b.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    alice.add_peer(bob_spec).await.expect("alice trusts bob");
+    bob.add_peer(alice_spec).await.expect("bob trusts alice");
+
+    // Loopback stands in for the LAN IP (reachable via the wildcard
+    // listener); the 100.x Tailscale address is off-box and unreachable.
+    let advertised = alice
+        .listen_lan_advertising(
+            Some(Ipv4Addr::LOCALHOST),
+            Some(Ipv4Addr::new(100, 79, 156, 3)),
+        )
+        .await
+        .expect("alice advertises both");
+
+    let endpoints_json = endpoints_to_json(&advertised).expect("encode endpoints");
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+        .await
+        .expect("store endpoints")
+        .expect("alice must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+
+    assert!(
+        snapshot.connected_lan_peers.contains(&alice.peer_id()),
+        "bob must connect via the LAN rung: connected {:?}, failures {:?}",
+        snapshot.connected_lan_peers,
+        snapshot.peer_dial_failures
+    );
+    assert!(
+        snapshot.peer_dial_failures.is_empty(),
+        "LAN-first must break before the unreachable Tailscale rung is \
+         ever dialed — no failure should be recorded: {:?}",
+        snapshot.peer_dial_failures
     );
 }
 
