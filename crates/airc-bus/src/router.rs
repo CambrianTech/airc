@@ -151,6 +151,17 @@ impl RecentEventIds {
         self.order.push_back(id);
         true
     }
+
+    /// Forget `id`. Used by [`EventRouter::publish_if_new`] when a
+    /// publish FAILED after the id was optimistically marked — a
+    /// poisoned entry would make a legitimate retry of the same frame
+    /// report `Duplicate` (and the receiver ack delivered) for an
+    /// event that never entered the router.
+    fn remove(&mut self, id: &airc_core::EventId) {
+        if self.seen.remove(id) {
+            self.order.retain(|other| other != id);
+        }
+    }
 }
 
 /// Outcome of [`EventRouter::publish_if_new`].
@@ -418,11 +429,33 @@ impl EventRouter {
         }
         // Off-lock durable probe. The id is already marked, so even if
         // this await parks, a concurrent same-id call short-circuits.
-        if self.inner.sink.contains(env.event_id).await? {
-            return Ok(PublishIfNew::Duplicate);
+        // On ANY failure from here on, unmark the id: a poisoned entry
+        // would turn a legitimate retry into a false `Duplicate` (and a
+        // false delivered ack) for an event the router never took.
+        let event_id = env.event_id;
+        let unmark = |router: &Self| {
+            let mut recent = router
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            recent.remove(&event_id);
+        };
+        match self.inner.sink.contains(event_id).await {
+            Ok(true) => return Ok(PublishIfNew::Duplicate),
+            Ok(false) => {}
+            Err(error) => {
+                unmark(self);
+                return Err(error);
+            }
         }
-        let seq = self.publish(env).await?;
-        Ok(PublishIfNew::Published(seq))
+        match self.publish(env).await {
+            Ok(seq) => Ok(PublishIfNew::Published(seq)),
+            Err(error) => {
+                unmark(self);
+                Err(error)
+            }
+        }
     }
 
     /// The write-behind drain loop (§3.3 deliver-first / persist-async, §3.8
