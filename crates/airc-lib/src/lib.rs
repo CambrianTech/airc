@@ -62,6 +62,7 @@ pub mod registry_refresh;
 mod relay;
 pub mod room;
 pub mod route;
+pub mod route_forwarder;
 pub mod router_bridge;
 mod stream;
 pub mod subscriptions;
@@ -158,6 +159,7 @@ pub use route::{
     TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
     TransportKind, TransportResolver, TransportRole, TransportRoute,
 };
+pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{

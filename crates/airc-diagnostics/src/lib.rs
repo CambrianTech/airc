@@ -83,6 +83,18 @@ pub enum DiagnosticCode {
     /// this only means the SENDER sees an ack timeout instead of the
     /// typed outcome.
     DeliveryAckSendFailed,
+    /// Card 1998f6cb: a locally published durable event could not be
+    /// enqueued toward a routed LAN peer because the bounded forward
+    /// queue for that peer was full. The event is delivered locally
+    /// (router transcript intact) but will NOT reach that peer's
+    /// machine — loud, counted, never silent.
+    RoutedForwardQueueSaturated,
+    /// Card 1998f6cb: a routed forward to a LAN peer ended NOT
+    /// confirmed delivered after all retry attempts (remote persist
+    /// failure, no ack within timeout, route lost mid-forward, or the
+    /// remote reports the channel unbound). The local transcript is
+    /// intact; the remote machine did not confirm visibility.
+    RoutedForwardFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

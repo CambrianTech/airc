@@ -51,6 +51,6 @@ pub use ephemeral::EphemeralCache;
 pub use error::{BusError, Result};
 pub use filter::Filter;
 pub use ring::HotRing;
-pub use router::{EventRouter, LagFlag, PublishIfNew, RouterConfig};
+pub use router::{EventRouter, ForwardItem, LagFlag, PublishIfNew, RouterConfig};
 pub use seq::{EpochStore, InMemoryEpochStore, SeqSource};
 pub use sink::{DurableSink, InMemoryDurableSink};
