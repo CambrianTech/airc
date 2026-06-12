@@ -1162,22 +1162,20 @@ pub async fn run_daemon(
             .map(|ip| (ip, "Tailscale"))
             .or_else(|| crate::network_commands::detect_lan_ip().map(|ip| (ip, "LAN")));
         match advertise {
-            Some((ip, kind)) => {
-                match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
-                    Ok(addr) => {
-                        eprintln!(
-                            "airc daemon: advertising {kind} endpoint {addr} in the account registry"
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "airc daemon: {kind} listener bind failed ({error}) — account beacon \
+            Some((ip, kind)) => match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
+                Ok(addr) => {
+                    eprintln!(
+                        "airc daemon: advertising {kind} endpoint {addr} in the account registry"
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "airc daemon: {kind} listener bind failed ({error}) — account beacon \
                              carries no endpoint; this node reaches the mesh by dialing out / \
                              relay but is not itself dialable"
-                        );
-                    }
+                    );
                 }
-            }
+            },
             None => {
                 eprintln!(
                     "airc daemon: no Tailscale or routable LAN IPv4 detected — account beacon \
