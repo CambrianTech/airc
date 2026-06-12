@@ -63,13 +63,12 @@ pub fn scope_home_is_temp_rooted(scope_home: &Path) -> bool {
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    let tempish = lossy == "/tmp"
+    lossy == "/tmp"
         || lossy.starts_with("/tmp/")
         || lossy.starts_with("/private/tmp/")
         || lossy.starts_with("/var/folders/")
         || lossy.starts_with("/private/var/folders/")
-        || lossy.contains("/appdata/local/temp/");
-    tempish
+        || lossy.contains("/appdata/local/temp/")
 }
 
 /// Outcome of [`merge_registry_documents`]: the merged view plus the
@@ -145,8 +144,10 @@ pub fn merge_registry_documents(
         };
     }
 
-    let mut peers: Vec<AccountPeerBeacon> =
-        freshest.into_values().map(|(_, _, beacon)| beacon).collect();
+    let mut peers: Vec<AccountPeerBeacon> = freshest
+        .into_values()
+        .map(|(_, _, beacon)| beacon)
+        .collect();
     peers.sort_by_key(|peer| peer.peer_id().to_string());
     channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 

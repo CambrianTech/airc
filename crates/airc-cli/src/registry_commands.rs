@@ -7,8 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use airc_lib::{
-    machine_account_home, Airc, GateBlock, GhAccountRegistryStore, RegistryRefreshGate,
-    SyncOutcome,
+    machine_account_home, Airc, GateBlock, GhAccountRegistryStore, RegistryRefreshGate, SyncOutcome,
 };
 use airc_store::SqliteEventStore;
 

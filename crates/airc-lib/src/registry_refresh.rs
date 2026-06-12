@@ -127,8 +127,7 @@ impl RegistryRefreshGate {
     async fn block(&self) -> Option<GateBlock> {
         match self {
             RegistryRefreshGate::GhAuth { gh_bin, scope_home } => {
-                if let Some(block) =
-                    crate::gh_account_registry::account_registry_block(scope_home)
+                if let Some(block) = crate::gh_account_registry::account_registry_block(scope_home)
                 {
                     return Some(GateBlock::Hermetic(block));
                 }

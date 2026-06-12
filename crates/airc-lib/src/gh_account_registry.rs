@@ -449,7 +449,10 @@ impl GhAccountRegistryStore {
         // `gh gist edit <id> --filename <name> -` reads new content
         // from stdin.
         let (ok, _stdout, stderr) = self
-            .gh_run(&["gist", "edit", id, "--filename", filename, "-"], Some(body))
+            .gh_run(
+                &["gist", "edit", id, "--filename", filename, "-"],
+                Some(body),
+            )
             .await?;
         if !ok {
             return Err(AccountRegistryError::Adapter(format!(
@@ -704,7 +707,10 @@ mod tests {
 
     #[test]
     fn sanitize_writer_component_is_stable_and_safe() {
-        assert_eq!(sanitize_writer_component("Joels-MacBook-Pro.local"), "joels-macbook-pro-local");
+        assert_eq!(
+            sanitize_writer_component("Joels-MacBook-Pro.local"),
+            "joels-macbook-pro-local"
+        );
         assert_eq!(sanitize_writer_component("BIGMAMA"), "bigmama");
         assert_eq!(sanitize_writer_component("  weird host!! "), "weird-host");
         assert_eq!(sanitize_writer_component(""), "unknown");
@@ -836,8 +842,11 @@ exit 0
                 let state = dir.join("gh-state");
                 std::fs::create_dir_all(&state).unwrap();
                 let bin = dir.join("gh");
-                std::fs::write(&bin, STUB_SCRIPT.replace("__STATE__", &state.to_string_lossy()))
-                    .unwrap();
+                std::fs::write(
+                    &bin,
+                    STUB_SCRIPT.replace("__STATE__", &state.to_string_lossy()),
+                )
+                .unwrap();
                 std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
                 Self { bin, state }
             }
@@ -916,7 +925,10 @@ exit 0
             }
         }
 
-        fn document(generated_at_ms: u64, peers: Vec<AccountPeerBeacon>) -> AccountRegistryDocument {
+        fn document(
+            generated_at_ms: u64,
+            peers: Vec<AccountPeerBeacon>,
+        ) -> AccountRegistryDocument {
             AccountRegistryDocument::new(mesh(), generated_at_ms, Vec::new(), peers)
         }
 
@@ -935,7 +947,11 @@ exit 0
             let tick_two = document(2_000, Vec::new());
             store.publish(&tick_two).await.unwrap();
 
-            assert_eq!(stub.create_count(), 1, "same writer -> same gist, no duplicates");
+            assert_eq!(
+                stub.create_count(),
+                1,
+                "same writer -> same gist, no duplicates"
+            );
             assert!(
                 stub.calls()
                     .iter()
@@ -1003,20 +1019,22 @@ exit 0
             let dir = tempfile::tempdir().unwrap();
             let stub = StubGh::install(dir.path());
             let scope_home = dir.path().join("scope/.airc");
-            let store = store_at(
-                &stub,
-                &dir.path().join("db"),
-                &scope_home.to_string_lossy(),
-            )
-            .await;
+            let store =
+                store_at(&stub, &dir.path().join("db"), &scope_home.to_string_lossy()).await;
 
             let publish_error = store
                 .publish(&document(1_000, Vec::new()))
                 .await
                 .expect_err("temp-rooted scope must refuse to publish");
             let message = publish_error.to_string();
-            assert!(message.contains("HERMETIC GATE"), "loud refusal, got: {message}");
-            assert!(message.contains("temp-rooted"), "reason named, got: {message}");
+            assert!(
+                message.contains("HERMETIC GATE"),
+                "loud refusal, got: {message}"
+            );
+            assert!(
+                message.contains("temp-rooted"),
+                "reason named, got: {message}"
+            );
 
             let refresh_error = store
                 .refresh(&mesh())
@@ -1042,8 +1060,18 @@ exit 0
             let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
 
             let shared = PeerId::new();
-            let stale = beacon_for(shared, "/machine/a/.airc", 1_000, "https://stale.example.test");
-            let fresh = beacon_for(shared, "/machine/a/.airc", 5_000, "https://fresh.example.test");
+            let stale = beacon_for(
+                shared,
+                "/machine/a/.airc",
+                1_000,
+                "https://stale.example.test",
+            );
+            let fresh = beacon_for(
+                shared,
+                "/machine/a/.airc",
+                5_000,
+                "https://fresh.example.test",
+            );
             let phantom = beacon(
                 r"C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc",
                 9_000,
@@ -1058,7 +1086,11 @@ exit 0
                 "airc-account-mesh-registry.json",
                 &document(2_000, vec![stale, phantom]),
             );
-            stub.seed_gist("g2", &writer_filename(), &document(6_000, vec![fresh.clone()]));
+            stub.seed_gist(
+                "g2",
+                &writer_filename(),
+                &document(6_000, vec![fresh.clone()]),
+            );
 
             let merged = store
                 .refresh(&mesh())
@@ -1066,9 +1098,16 @@ exit 0
                 .unwrap()
                 .expect("documents must merge");
 
-            assert_eq!(merged.peers.len(), 1, "phantom dropped, shared peer deduped");
+            assert_eq!(
+                merged.peers.len(),
+                1,
+                "phantom dropped, shared peer deduped"
+            );
             assert_eq!(merged.peers[0].peer_id(), shared);
-            assert_eq!(merged.peers[0].endpoints, fresh.endpoints, "freshest beacon wins");
+            assert_eq!(
+                merged.peers[0].endpoints, fresh.endpoints,
+                "freshest beacon wins"
+            );
         }
     }
 }

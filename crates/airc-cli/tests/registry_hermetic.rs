@@ -243,7 +243,11 @@ fn daemon_with_disable_env_never_runs_registry_loop() {
     let socket = tmp.path().join("d.sock");
 
     let _daemon = spawn_daemon(&home, &socket, &stub, true);
-    let log = wait_for_log(&home, "account-registry loop DISABLED", Duration::from_secs(30));
+    let log = wait_for_log(
+        &home,
+        "account-registry loop DISABLED",
+        Duration::from_secs(30),
+    );
 
     assert!(
         log.contains("AIRC_DISABLE_ACCOUNT_REGISTRY"),
@@ -268,7 +272,11 @@ fn daemon_with_temp_home_never_runs_registry_loop() {
     let socket = tmp.path().join("d2.sock");
 
     let _daemon = spawn_daemon(&home, &socket, &stub, false);
-    let log = wait_for_log(&home, "account-registry loop DISABLED", Duration::from_secs(30));
+    let log = wait_for_log(
+        &home,
+        "account-registry loop DISABLED",
+        Duration::from_secs(30),
+    );
 
     assert!(
         log.contains("temp-rooted"),
