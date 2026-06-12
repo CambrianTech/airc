@@ -18,10 +18,11 @@ use airc_bus::{Clock, Seq, SystemClock};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
     AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    RemovePeerRequest, Request, SendRequest,
+    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, StatusResponse,
+    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, RoomTipResponse,
+    StatusResponse,
 };
 use bytes::Bytes;
 
@@ -48,6 +49,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
+        Request::RoomTip(tip) => handle_room_tip(state, tip).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
         },
@@ -237,6 +239,25 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
         }
     });
     Response::Inbox(InboxResponse { envelopes, newest })
+}
+
+/// Card a1562dbc: the O(1) tip probe. Answered by the router's
+/// `durable_tip` — hot-ring newest-durable, else one indexed sink row —
+/// NEVER by replaying the room. A store error is surfaced loudly; there
+/// is no scan fallback.
+async fn handle_room_tip(state: Arc<DaemonState>, request: RoomTipRequest) -> Response {
+    match state.router.durable_tip(request.channel).await {
+        Ok(tip) => Response::RoomTip(RoomTipResponse {
+            tip: tip.map(|cursor| IpcCursor {
+                epoch: cursor.seq.epoch,
+                counter: cursor.seq.counter,
+                event_id: cursor.event_id,
+            }),
+        }),
+        Err(error) => Response::Error {
+            message: format!("room_tip: {error}"),
+        },
+    }
 }
 
 async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Response {

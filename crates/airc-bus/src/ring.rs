@@ -112,6 +112,23 @@ impl HotRing {
         self.slots.back().map(|slot| slot.env.cursor())
     }
 
+    /// **Card a1562dbc.** The cursor of the most-recent **`Durable`**
+    /// entry currently retained, if any — the transcript tip as seen
+    /// from RAM. Walks back-to-front, so the cost is bounded by the
+    /// ring capacity (a constant), never by room history.
+    ///
+    /// Eviction pops from the front (oldest first), so whenever the
+    /// ring holds *any* durable entry, the newest one in the ring IS
+    /// the globally newest durable event on this channel — the sink
+    /// only ever lags the ring (write-behind), never leads it.
+    pub fn newest_durable_cursor(&self) -> Option<Cursor> {
+        self.slots
+            .iter()
+            .rev()
+            .find(|slot| slot.env.delivery.is_durable())
+            .map(|slot| slot.env.cursor())
+    }
+
     /// The cursor of the oldest entry currently retained, if any. A
     /// `from_cursor` older than this means the ring cannot serve the full
     /// replay and the deep (sink) leg must cover `(from, oldest_in_ring)`.
@@ -187,6 +204,34 @@ mod tests {
         ring.mark_persisted(EventId::from_u128(1)); // counter 0
         assert_eq!(ring.len(), 2, "unpinned oldest reclaimed back to capacity");
         assert_eq!(ring.oldest_cursor().unwrap().seq.counter, 1);
+    }
+
+    /// Card a1562dbc: the durable tip skips non-durable tail entries
+    /// (a StreamChunk burst after the last chat message must not move
+    /// the transcript tip) and is `None` when no durable is retained.
+    #[test]
+    fn newest_durable_cursor_skips_non_durable_tail() {
+        let mut ring = HotRing::new(10);
+        assert_eq!(ring.newest_durable_cursor(), None, "empty ring");
+
+        ring.push(Arc::new(env_at(0, DeliveryClass::StreamChunk)));
+        assert_eq!(
+            ring.newest_durable_cursor(),
+            None,
+            "non-durable only ⇒ no transcript tip in RAM"
+        );
+
+        ring.push(Arc::new(env_at(1, DeliveryClass::Durable)));
+        ring.push(Arc::new(env_at(2, DeliveryClass::StreamChunk)));
+        ring.push(Arc::new(env_at(3, DeliveryClass::EphemeralWindow)));
+
+        let tip = ring.newest_durable_cursor().expect("durable tip");
+        assert_eq!(tip.seq.counter, 1, "tip is the durable, not the ring back");
+        assert_eq!(
+            ring.newest_cursor().expect("ring back").seq.counter,
+            3,
+            "sanity: the unfiltered newest IS the non-durable back"
+        );
     }
 
     #[test]
