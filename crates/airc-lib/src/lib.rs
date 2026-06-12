@@ -77,7 +77,8 @@ pub mod work_roster;
 pub mod work_subscription;
 
 pub use account_registry::{
-    AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
+    merge_registry_documents, scope_home_is_temp_rooted, AccountPeerBeacon,
+    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore, RegistryMergeOutcome,
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
 };
 pub use agent_heartbeat::{
@@ -118,7 +119,10 @@ pub use external_identity::{
     BridgedMessage, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource,
     HEADER_BRIDGE_HANDLE, HEADER_BRIDGE_SOURCE,
 };
-pub use gh_account_registry::{gh_auth_ready, GhAccountRegistryStore};
+pub use gh_account_registry::{
+    account_registry_block, gh_auth_ready, writer_filename, writer_key, AccountRegistryBlock,
+    GhAccountRegistryStore, AIRC_DISABLE_ACCOUNT_REGISTRY_ENV,
+};
 pub use gh_client::{
     parse_pr_url, parse_pr_view, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
     PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
@@ -137,8 +141,8 @@ pub use peers::EnrolledPeer;
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use registry_refresh::{
-    run_loop as run_registry_refresh_loop, sync_once as registry_sync_once, RegistryRefreshConfig,
-    RegistryRefreshGate, TickReport as RegistrySyncReport,
+    run_loop as run_registry_refresh_loop, sync_once as registry_sync_once, GateBlock,
+    RegistryRefreshConfig, RegistryRefreshGate, SyncOutcome, TickReport as RegistrySyncReport,
 };
 pub use room::Room;
 pub use route::{

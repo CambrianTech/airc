@@ -79,25 +79,65 @@ impl Default for RegistryRefreshConfig {
 /// Whether (and how) to gate a tick on transport availability.
 #[derive(Debug, Clone)]
 pub enum RegistryRefreshGate {
-    /// gh gist rendezvous: skip the tick unless `gh auth status` is
-    /// ready. `gh_bin` is the gh binary path override (`None` = `gh`
-    /// on PATH). This is the production gate for `GhAccountRegistryStore`.
-    GhAuth { gh_bin: Option<PathBuf> },
+    /// gh gist rendezvous: skip the tick unless the hermetic gate
+    /// (card d793c242) allows this scope to touch gh AND `gh auth
+    /// status` is ready. `gh_bin` is the gh binary path override
+    /// (`None` = `gh` on PATH); `scope_home` is the publishing
+    /// scope's AIRC_HOME (the hermetic gate's input). This is the
+    /// production gate for `GhAccountRegistryStore`.
+    GhAuth {
+        gh_bin: Option<PathBuf>,
+        scope_home: PathBuf,
+    },
     /// No gate — always run the tick. Used by Sqlite/in-memory stores
     /// that need no external auth (acceptance test + manual `registry
     /// sync` against a local store).
     Always,
 }
 
-impl RegistryRefreshGate {
-    /// Returns `true` if a tick should proceed. A `false` here is the
-    /// "transport not ready, skip cleanly" path — NOT an error.
-    async fn ready(&self) -> bool {
+/// Why a tick was skipped. Both variants are clean skips, NOT errors —
+/// but they are LOUD skips: every caller logs the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateBlock {
+    /// Hermetic gate (card d793c242): this scope must never touch the
+    /// gh account rendezvous. The payload says exactly why.
+    Hermetic(crate::gh_account_registry::AccountRegistryBlock),
+    /// `gh` is not authenticated — the optional same-account
+    /// rendezvous transport is simply unavailable.
+    GhNotReady,
+}
+
+impl std::fmt::Display for GateBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RegistryRefreshGate::GhAuth { gh_bin } => {
-                crate::gh_account_registry::gh_auth_ready(gh_bin.as_deref()).await
+            Self::Hermetic(block) => write!(f, "{block}"),
+            Self::GhNotReady => write!(
+                f,
+                "gh transport not ready (not authenticated); this is the optional \
+                 same-account rendezvous — skipping cleanly"
+            ),
+        }
+    }
+}
+
+impl RegistryRefreshGate {
+    /// Returns `None` if a tick should proceed, or the reason it must
+    /// not. The hermetic gate is checked FIRST: a hermetic scope must
+    /// not even probe `gh auth status`.
+    async fn block(&self) -> Option<GateBlock> {
+        match self {
+            RegistryRefreshGate::GhAuth { gh_bin, scope_home } => {
+                if let Some(block) =
+                    crate::gh_account_registry::account_registry_block(scope_home)
+                {
+                    return Some(GateBlock::Hermetic(block));
+                }
+                if !crate::gh_account_registry::gh_auth_ready(gh_bin.as_deref()).await {
+                    return Some(GateBlock::GhNotReady);
+                }
+                None
             }
-            RegistryRefreshGate::Always => true,
+            RegistryRefreshGate::Always => None,
         }
     }
 }
@@ -156,19 +196,29 @@ pub struct TickReport {
     pub enrolled_peers: usize,
 }
 
+/// Outcome of [`sync_once`]: the tick either ran, or was skipped for
+/// a typed, printable reason. The reason is part of the contract —
+/// callers MUST surface it (no silent skips, card d793c242).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Ran(TickReport),
+    Skipped(GateBlock),
+}
+
 /// Run exactly one publish+refresh, honoring the gate. Used by the
 /// `registry sync` CLI verb (manual proof + Mac bootstrap surface) and
-/// composable into the loop. A gate-skip returns `Ok(None)`.
+/// composable into the loop. A gate-skip returns
+/// `Ok(SyncOutcome::Skipped(reason))`.
 pub async fn sync_once(
     airc: &Airc,
     store: &dyn AccountRegistryStore,
     gate: &RegistryRefreshGate,
-) -> Result<Option<TickReport>, crate::error::AircError> {
-    if !gate.ready().await {
-        return Ok(None);
+) -> Result<SyncOutcome, crate::error::AircError> {
+    if let Some(block) = gate.block().await {
+        return Ok(SyncOutcome::Skipped(block));
     }
     let report = run_tick(airc, store, &StderrJsonDiagnosticSink).await?;
-    Ok(Some(report))
+    Ok(SyncOutcome::Ran(report))
 }
 
 /// The daemon-resident loop. Ticks publish+refresh on a cadence until
@@ -205,13 +255,16 @@ pub async fn run_loop<S>(
             biased;
             _ = &mut shutdown => break,
             _ = ticker.tick() => {
-                if !gate.ready().await {
+                if let Some(block) = gate.block().await {
+                    let code = match &block {
+                        GateBlock::Hermetic(_) => DiagnosticCode::AccountRegistryHermeticSkip,
+                        GateBlock::GhNotReady => DiagnosticCode::AccountRegistryPublishFailed,
+                    };
                     sink.emit(
                         DiagnosticEvent::warn(
                             DiagnosticComponent::Daemon,
-                            DiagnosticCode::AccountRegistryPublishFailed,
-                            "account registry tick skipped: gh transport not ready (not authenticated); \
-                             this is the optional same-account rendezvous — skipping cleanly",
+                            code,
+                            format!("account registry tick skipped: {block}"),
                         ),
                     );
                     continue;
@@ -314,10 +367,12 @@ mod tests {
         // `sqlite_registry_bridges_two_isolated_machine_homes` test
         // models, now asserted through the wired `sync_once` entry.
         let gate = RegistryRefreshGate::Always;
-        let a_report = sync_once(&airc_a, &store, &gate).await.unwrap();
-        assert!(a_report.is_some(), "gate Always must run A's tick");
+        let a_report = match sync_once(&airc_a, &store, &gate).await.unwrap() {
+            SyncOutcome::Ran(report) => report,
+            SyncOutcome::Skipped(block) => panic!("gate Always must run A's tick: {block}"),
+        };
         assert!(
-            a_report.map(|r| r.published_peers).unwrap_or(0) >= 1,
+            a_report.published_peers >= 1,
             "A must publish at least its own beacon"
         );
 
@@ -384,12 +439,47 @@ mod tests {
             .unwrap();
 
         // A gh binary that does not exist → gh_auth_ready is false →
-        // gate skips. Bounded (gh_auth_ready has its own 750ms timeout).
+        // gate skips. Bounded (gh_auth_ready has its own timeout).
+        // scope_home is production-shaped so the HERMETIC gate does
+        // not fire first — this test pins the auth-skip arm.
         let gate = RegistryRefreshGate::GhAuth {
             gh_bin: Some(PathBuf::from("airc-nonexistent-gh-binary-for-gate-test")),
+            scope_home: PathBuf::from("/machine/prod/.airc"),
         };
-        let report = sync_once(&airc, &store, &gate).await.unwrap();
-        assert!(report.is_none(), "unready gate must skip, returning None");
+        let outcome = sync_once(&airc, &store, &gate).await.unwrap();
+        assert_eq!(
+            outcome,
+            SyncOutcome::Skipped(GateBlock::GhNotReady),
+            "unready gate must skip with the gh-not-ready reason"
+        );
+    }
+
+    // HERMETIC GATE (card d793c242): a gh-gated scope whose home is
+    // temp-rooted must skip the tick with the hermetic reason — gh is
+    // never probed, nothing is published. Mutation check: removing the
+    // hermetic arm from `RegistryRefreshGate::block` makes this fall
+    // through to GhNotReady (or run), failing the assert.
+    #[tokio::test]
+    async fn sync_once_skips_hermetically_for_temp_scope_home() {
+        let dir = tempdir().unwrap();
+        let machine = dir.path().join("machine/.airc");
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let store = sqlite_registry_store_at(&dir.path().join("rendezvous")).await;
+        let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
+            .await
+            .unwrap();
+
+        let gate = RegistryRefreshGate::GhAuth {
+            gh_bin: Some(PathBuf::from("airc-nonexistent-gh-binary-for-gate-test")),
+            scope_home: machine.clone(),
+        };
+        match sync_once(&airc, &store, &gate).await.unwrap() {
+            SyncOutcome::Skipped(GateBlock::Hermetic(
+                crate::gh_account_registry::AccountRegistryBlock::TempScopeHome { scope_home },
+            )) => assert_eq!(scope_home, machine),
+            other => panic!("temp-rooted scope must skip hermetically, got {other:?}"),
+        }
     }
 
     // The loop honors shutdown promptly even with a long cadence —

@@ -56,6 +56,11 @@ fn spawn_daemon(home: &std::path::Path, socket: &std::path::Path) -> DaemonGuard
             .arg("daemon")
             .arg("--socket")
             .arg(socket)
+            // Hermetic gate (card d793c242): test daemons must never
+            // touch the operator's real gh account rendezvous. The
+            // temp-rooted home blocks it too — this is the intentional
+            // layer.
+            .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
