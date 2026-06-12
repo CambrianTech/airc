@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use airc_bus::{BusError, Clock, EventRouter, RouterConfig, SeqSource, SystemClock};
 use airc_core::PeerId;
+use airc_ipc::IpcRouteEndpoint;
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, SqliteDurableSink};
 
@@ -54,6 +55,14 @@ pub struct DaemonState {
     /// Runtime metadata reported through IPC status so clients can
     /// replace stale daemons after updates.
     pub runtime: DaemonRuntimeInfo,
+    /// Card 4b6a0ffa (#33): the dialable endpoints this daemon
+    /// currently advertises in its account-registry beacon. Written by
+    /// the registry glue after it binds its LAN listener; served to
+    /// clients via `Request::RouteEndpoints` so a short-lived CLI
+    /// publisher (`airc registry sync`) can publish the daemon's LIVE
+    /// endpoints instead of an endpoint-less beacon. Empty = this
+    /// daemon is not dialable (no listener bound).
+    pub route_endpoints: RwLock<Vec<IpcRouteEndpoint>>,
 }
 
 impl DaemonState {
@@ -96,6 +105,7 @@ impl DaemonState {
             trusted_roots: Mutex::new(HashMap::new()),
             shutdown: Notify::new(),
             runtime,
+            route_endpoints: RwLock::new(Vec::new()),
         })
     }
 

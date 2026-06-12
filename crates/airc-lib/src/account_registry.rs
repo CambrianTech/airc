@@ -98,6 +98,12 @@ pub struct RegistryMergeOutcome {
 /// - per `peer_id`, the FRESHEST beacon wins (highest
 ///   `heartbeat_at_ms`, tie-broken by the carrying document's
 ///   `generated_at_ms`);
+/// - if the freshest beacon for a peer carries NO endpoints but an
+///   older beacon for the same peer does, the merged beacon keeps the
+///   freshest presence and retains the freshest NON-EMPTY endpoint
+///   set (card 4b6a0ffa / #33: an endpoint-less manual-sync document
+///   must not shadow a dialable daemon document — same doctrine as
+///   the import guard "empty beacons leave the column alone");
 /// - channels are the sorted union; `generated_at_ms` is the max of
 ///   the contributing documents.
 pub fn merge_registry_documents(
@@ -109,6 +115,11 @@ pub fn merge_registry_documents(
     let mut channels: Vec<ChannelName> = Vec::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, beacon)
     let mut freshest: HashMap<airc_core::PeerId, (u64, u64, AccountPeerBeacon)> = HashMap::new();
+    // peer_id -> (heartbeat_at_ms, doc generated_at_ms, endpoints) of
+    // the freshest beacon that actually CARRIES endpoints — the
+    // backfill source when the overall-freshest beacon is endpoint-less.
+    type EndpointKey = (u64, u64, Vec<RouteEndpoint>);
+    let mut endpoint_carriers: HashMap<airc_core::PeerId, EndpointKey> = HashMap::new();
     let mut matched_any = false;
 
     for document in documents {
@@ -128,6 +139,15 @@ pub fn merge_registry_documents(
                 continue;
             }
             let key = (beacon.presence.heartbeat_at_ms, document.generated_at_ms);
+            if !beacon.endpoints.is_empty() {
+                match endpoint_carriers.get(&beacon.peer_id()) {
+                    Some((heartbeat, doc_ms, _)) if (*heartbeat, *doc_ms) >= key => {}
+                    _ => {
+                        endpoint_carriers
+                            .insert(beacon.peer_id(), (key.0, key.1, beacon.endpoints.clone()));
+                    }
+                }
+            }
             match freshest.get(&beacon.peer_id()) {
                 Some((heartbeat, doc_ms, _)) if (*heartbeat, *doc_ms) >= key => {}
                 _ => {
@@ -148,6 +168,16 @@ pub fn merge_registry_documents(
         .into_values()
         .map(|(_, _, beacon)| beacon)
         .collect();
+    // Endpoint retention (card 4b6a0ffa / #33): an endpoint-less winner
+    // (e.g. a fresher manual-sync doc) must not erase a peer's known
+    // dialable endpoints from the merged view.
+    for peer in &mut peers {
+        if peer.endpoints.is_empty() {
+            if let Some((_, _, endpoints)) = endpoint_carriers.remove(&peer.peer_id()) {
+                peer.endpoints = endpoints;
+            }
+        }
+    }
     peers.sort_by_key(|peer| peer.peer_id().to_string());
     channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
@@ -420,10 +450,30 @@ impl Airc {
         // layer. Stamp a fresh self-beacon (we are definitionally live: we
         // are publishing right now) carrying our dialable endpoints.
         if !document.peers.iter().any(|peer| peer.peer_id() == self_id) {
+            // Card cbbcf18d (post-#1146 audit): the stamped self-beacon's
+            // channel list comes from `self.subscriptions()` — the LOCAL
+            // single source of truth — not from presence-derived
+            // `snapshot.live_channels`. In the exact stale-self scenario
+            // this branch exists for, `live` is empty, so live_channels
+            // is [] even while this scope is subscribed; identity, key,
+            // and endpoints already follow the publisher-is-alive
+            // doctrine and the channel list must too.
+            let subscribed_channels: Vec<ChannelName> = self
+                .subscriptions()
+                .await?
+                .into_iter()
+                .map(|subscription| subscription.name)
+                .collect();
+            for channel in &subscribed_channels {
+                if !document.channels.contains(channel) {
+                    document.channels.push(channel.clone());
+                }
+            }
+            document.channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             let presence = crate::coordinator::beacon_now(
                 self_id,
                 self.inner.home.clone(),
-                snapshot.live_channels.clone(),
+                subscribed_channels,
                 std::process::id(),
                 crate::time::now_ms()?,
             );
@@ -894,6 +944,72 @@ mod tests {
         assert!(merged.peers.iter().any(|p| p.peer_id() == only_in_old));
     }
 
+    // Card 4b6a0ffa / #33 (endpoint-less shadow): when the FRESHEST
+    // beacon for a peer carries no endpoints (the manual `registry
+    // sync` overwrite shape), the merge keeps the fresh presence but
+    // retains the freshest NON-EMPTY endpoint set from an older
+    // beacon — a first-contact reader still learns a dialable
+    // endpoint. Mutation check: removing the endpoint-retention
+    // backfill from merge_registry_documents leaves the merged beacon
+    // endpoint-less and the endpoints assert fails.
+    #[test]
+    fn merge_retains_endpoints_when_fresher_beacon_is_endpointless() {
+        let peer = PeerId::new();
+        let spec = peer_spec(peer);
+        let daemon_beacon = AccountPeerBeacon {
+            presence: crate::coordinator::beacon_now(
+                peer,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                123,
+                1_000,
+            ),
+            peer_spec: spec.clone(),
+            endpoints: vec![RouteEndpoint::LanTcp {
+                addr: SocketAddr::from(([10, 0, 0, 2], 7717)),
+            }],
+        };
+        let manual_sync_beacon = AccountPeerBeacon {
+            presence: crate::coordinator::beacon_now(
+                peer,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                456,
+                5_000,
+            ),
+            peer_spec: spec,
+            endpoints: Vec::new(),
+        };
+        let daemon_doc = AccountRegistryDocument::new(
+            mesh(),
+            2_000,
+            vec![channel("general")],
+            vec![daemon_beacon],
+        );
+        let manual_doc = AccountRegistryDocument::new(
+            mesh(),
+            6_000,
+            vec![channel("general")],
+            vec![manual_sync_beacon],
+        );
+
+        let outcome = merge_registry_documents(vec![daemon_doc, manual_doc], &mesh());
+
+        let merged = outcome.document.expect("document must merge");
+        assert_eq!(merged.peers.len(), 1);
+        assert_eq!(
+            merged.peers[0].presence.heartbeat_at_ms, 5_000,
+            "freshest presence still wins"
+        );
+        assert_eq!(
+            merged.peers[0].endpoints,
+            vec![RouteEndpoint::LanTcp {
+                addr: SocketAddr::from(([10, 0, 0, 2], 7717)),
+            }],
+            "endpoint-less fresh beacon must not erase known dialable endpoints"
+        );
+    }
+
     #[test]
     fn merge_skips_foreign_mesh_documents() {
         let peer = PeerId::new();
@@ -956,5 +1072,110 @@ mod tests {
             .stale
             .iter()
             .any(|peer| peer.peer_id == airc_a.peer_id()));
+    }
+
+    // THE KEYSTONE PIN (card cbbcf18d, post-#1146 audit — the mutation
+    // that SURVIVED). The #1146 fix stamps a fresh self-beacon into the
+    // published document when this peer's own presence heartbeat has
+    // outlived the coordinator TTL (`snapshot.stale`, NOT `live`).
+    // Every pre-existing publish-path test joined a channel immediately
+    // before publishing, keeping self coordinator-live and bypassing
+    // the fix's branch entirely — so removing the branch left all
+    // tests green. This test reproduces the bug's ACTUAL trigger:
+    // self's beacon is past-TTL at document time.
+    //
+    // Mutation checks (both verified):
+    //   1. bypass the self-insertion branch in
+    //      `account_registry_document` (`if false && …`) → the
+    //      exactly-one-self-beacon assert fails;
+    //   2. revert the stamped beacon's channels to presence-derived
+    //      `snapshot.live_channels` → the subscribed_channels assert
+    //      fails (live is empty here, subscriptions are not).
+    #[tokio::test]
+    async fn stale_self_publish_stamps_one_self_beacon_with_endpoints_and_channels() {
+        let dir = tempdir().unwrap();
+        let machine = dir.path().join("machine/.airc");
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
+            .await
+            .unwrap();
+
+        // Subscribe (local SoT: subscriptions exist) and give self a
+        // dialable endpoint, as the daemon's registry glue does.
+        airc.join("general").await.unwrap();
+        airc.upsert_route_endpoint(RouteEndpoint::Relay {
+            url: "https://self.example.test".to_string(),
+        })
+        .unwrap();
+
+        // Overwrite self's presence with a PAST-TTL heartbeat — the
+        // registry tick landing after the heartbeat TTL, the exact
+        // trigger verified live on bigmama. heartbeat_at_ms=1_000 is
+        // ~56 years past any real `now_ms`, far beyond the 60s TTL.
+        let stale_self = crate::coordinator::beacon_now(
+            airc.peer_id(),
+            machine.clone(),
+            vec![channel("general")],
+            std::process::id(),
+            1_000,
+        );
+        crate::coordinator::publish_store(airc.coordinator_store(), &mesh(), &stale_self)
+            .await
+            .unwrap();
+
+        // Sanity: self must be STALE, not live — otherwise this test
+        // degenerates into the bypassing shape the audit flagged.
+        let snapshot = crate::coordinator::snapshot_store(
+            airc.coordinator_store(),
+            &mesh(),
+            &crate::coordinator::CoordinatorConfig::default(),
+            crate::time::now_ms().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            snapshot.live.iter().all(|p| p.peer_id != airc.peer_id()),
+            "precondition: self must NOT be coordinator-live"
+        );
+        assert!(
+            snapshot.stale.iter().any(|p| p.peer_id == airc.peer_id()),
+            "precondition: self must be in snapshot.stale"
+        );
+
+        let document = airc.account_registry_document().await.unwrap();
+
+        let self_beacons: Vec<_> = document
+            .peers
+            .iter()
+            .filter(|peer| peer.peer_id() == airc.peer_id())
+            .collect();
+        assert_eq!(
+            self_beacons.len(),
+            1,
+            "stale-self publish must stamp exactly one self-beacon"
+        );
+        let self_beacon = self_beacons[0];
+        let expected_endpoints = airc.route_endpoints().unwrap();
+        assert!(
+            !expected_endpoints.is_empty(),
+            "precondition: this handle has endpoints to advertise"
+        );
+        assert_eq!(
+            self_beacon.endpoints, expected_endpoints,
+            "self-beacon must carry route_endpoints()"
+        );
+        // Card cbbcf18d item 2: channels from the LOCAL SoT
+        // (self.subscriptions()), not presence-derived live_channels
+        // (empty in this exact scenario).
+        assert_eq!(
+            self_beacon.presence.subscribed_channels,
+            vec![channel("general")],
+            "stamped self-beacon channels must come from self.subscriptions()"
+        );
+        assert!(
+            document.channels.contains(&channel("general")),
+            "document channels must include the local subscriptions"
+        );
     }
 }

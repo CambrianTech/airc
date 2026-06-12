@@ -21,7 +21,8 @@ use crate::request::{
     RoomTipRequest, SendRequest,
 };
 use crate::response::{
-    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse, StatusResponse,
+    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -209,6 +210,18 @@ impl DaemonClient {
     pub async fn remove_peer(&self, request: RemovePeerRequest) -> Result<(), ClientError> {
         match self.call(Request::RemovePeer(request)).await? {
             Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Card 4b6a0ffa (#33): the dialable endpoints this daemon
+    /// currently advertises in its account-registry beacon. An old
+    /// daemon that predates the verb fails the call (decode error or
+    /// `Response::Error`) — callers must treat ANY failure as
+    /// "endpoints unavailable", never as publishable-empty.
+    pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
+        match self.call(Request::RouteEndpoints).await? {
+            Response::RouteEndpoints(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
