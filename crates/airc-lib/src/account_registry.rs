@@ -254,23 +254,55 @@ impl Airc {
             crate::time::now_ms()?,
         )
         .await?;
-        let mut peer_specs = vec![PeerSpec {
-            peer_id: self.inner.identity.peer_id,
+        let self_id = self.inner.identity.peer_id;
+        let self_spec = PeerSpec {
+            peer_id: self_id,
             pubkey: self.inner.identity.keypair.public_bytes(),
-        }];
+        };
+        let mut peer_specs = vec![self_spec.clone()];
         for stored in airc_trust::load(&self.inner.wire_root).await? {
             peer_specs.push(PeerSpec {
                 peer_id: stored.peer_id,
                 pubkey: stored.pubkey_bytes()?,
             });
         }
-        let endpoints = vec![(self.inner.identity.peer_id, self.route_endpoints()?)];
-        Ok(AccountRegistryDocument::from_snapshot(
+        let self_endpoints = self.route_endpoints()?;
+        let endpoints = vec![(self_id, self_endpoints.clone())];
+        let mut document = AccountRegistryDocument::from_snapshot(
             &snapshot,
             peer_specs,
             endpoints,
             crate::time::now_ms()?,
-        ))
+        );
+
+        // KEYSTONE (card 0ac…/#35): the publishing node MUST advertise its
+        // OWN beacon for same-account cross-machine discovery — that's the
+        // entire point of publishing. `from_snapshot` only emits peers in
+        // `snapshot.live`, but our own presence is heartbeated for
+        // liveness and a registry tick can easily land after its TTL,
+        // leaving us in `stale`. The document then went out with peers:0
+        // (verified live on bigmama), so a same-account peer reading it
+        // discovered nothing — enrol-but-never-route, the keystone's last
+        // layer. Stamp a fresh self-beacon (we are definitionally live: we
+        // are publishing right now) carrying our dialable endpoints.
+        if !document.peers.iter().any(|peer| peer.peer_id() == self_id) {
+            let presence = crate::coordinator::beacon_now(
+                self_id,
+                self.inner.home.clone(),
+                snapshot.live_channels.clone(),
+                std::process::id(),
+                crate::time::now_ms()?,
+            );
+            document.peers.push(AccountPeerBeacon {
+                presence,
+                peer_spec: self_spec,
+                endpoints: self_endpoints,
+            });
+            document
+                .peers
+                .sort_by_key(|peer| peer.peer_id().to_string());
+        }
+        Ok(document)
     }
 
     pub async fn publish_account_registry(
