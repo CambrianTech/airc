@@ -185,6 +185,10 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::TrustRefreshFailed => "trust_refresh_failed",
         DiagnosticCode::AccountRegistryPublishFailed => "account_registry_publish_failed",
         DiagnosticCode::AccountRegistryRefreshFailed => "account_registry_refresh_failed",
+        DiagnosticCode::AccountRegistryHermeticSkip => "account_registry_hermetic_skip",
+        DiagnosticCode::AccountRegistryTempBeaconsIgnored => {
+            "account_registry_temp_beacons_ignored"
+        }
         DiagnosticCode::WireLostEmitFailed => "wire_lost_emit_failed",
         DiagnosticCode::MalformedReplayFrameSkipped => "malformed_replay_frame_skipped",
         DiagnosticCode::UnverifiableReplayFrameSkipped => "unverifiable_replay_frame_skipped",

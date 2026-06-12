@@ -33,6 +33,10 @@ fn tab(account: &Path, scope: &str, client: &str, args: &[&str]) -> std::process
         .env("HOME", account)
         .env("USERPROFILE", account)
         .env("AIRC_CLIENT_ID", client)
+        // Hermetic gate (card d793c242): tabs spawn-or-connect the
+        // daemon, which inherits this env — the spawned daemon must
+        // never touch the operator's real gh account rendezvous.
+        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
         .output()
         .expect("airc must spawn")
 }

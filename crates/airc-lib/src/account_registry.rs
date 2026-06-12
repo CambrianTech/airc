@@ -11,6 +11,7 @@
 //! media, and model payloads are explicitly out of scope.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,6 +28,139 @@ use crate::time;
 use crate::Airc;
 
 pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
+
+/// True when `scope_home` is rooted under a temp directory — the
+/// signature of a hermetic test / CI daemon, NEVER a production scope.
+///
+/// Two layers, because this is consulted on BOTH sides of the wire:
+///
+/// 1. **Local resolution** (publish gate): canonicalized-prefix match
+///    against this machine's `std::env::temp_dir()` — the same check
+///    `machine_account_home` uses for state isolation (card b0a81c31).
+/// 2. **Cross-platform markers** (reader hygiene): a beacon read from
+///    the rendezvous carries a `scope_home` minted on a DIFFERENT
+///    machine/OS, where our local `temp_dir()` prefix is meaningless.
+///    Recognize the well-known temp roots of every platform airc runs
+///    on: live evidence for card d793c242 was a beacon with scope_home
+///    `C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc` published
+///    to the production joelteply rendezvous.
+pub fn scope_home_is_temp_rooted(scope_home: &Path) -> bool {
+    // Layer 1: this machine's temp root (canonicalize both sides so
+    // macOS's `/tmp` -> `/private/tmp` symlink can't dodge the check).
+    let temp = std::env::temp_dir();
+    let temp = temp.canonicalize().unwrap_or(temp);
+    let resolved = scope_home
+        .canonicalize()
+        .unwrap_or_else(|_| scope_home.to_path_buf());
+    if resolved.starts_with(&temp) {
+        return true;
+    }
+
+    // Layer 2: cross-platform markers, for paths minted elsewhere.
+    // Normalize separators + case so `C:\Users\…\AppData\Local\Temp\…`
+    // and `/tmp/…` both land in one comparison space.
+    let lossy = scope_home
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    lossy == "/tmp"
+        || lossy.starts_with("/tmp/")
+        || lossy.starts_with("/private/tmp/")
+        || lossy.starts_with("/var/folders/")
+        || lossy.starts_with("/private/var/folders/")
+        || lossy.contains("/appdata/local/temp/")
+}
+
+/// Outcome of [`merge_registry_documents`]: the merged view plus the
+/// hygiene counters the caller must surface (count, not full dump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryMergeOutcome {
+    pub document: Option<AccountRegistryDocument>,
+    /// Beacons dropped because their `scope_home` is temp-rooted —
+    /// phantom hermetic-test peers from old polluted documents
+    /// (card d793c242). Never enrolled, never dialed.
+    pub ignored_temp_beacons: usize,
+}
+
+/// Reader-side merge across per-machine registry documents.
+///
+/// The rendezvous is one document per WRITER (machine); a reader must
+/// combine them. Previously the reader picked the single newest
+/// document wholesale, which (a) dropped beacons only present in older
+/// machines' documents and (b) trusted whatever a polluted document
+/// carried. This merge is intentional:
+///
+/// - documents that fail validation or belong to a different mesh
+///   identity are skipped;
+/// - beacons whose `scope_home` is temp-rooted are IGNORED and counted
+///   ([`scope_home_is_temp_rooted`]) — belt-and-braces against the
+///   already-published phantom test peers of card d793c242;
+/// - per `peer_id`, the FRESHEST beacon wins (highest
+///   `heartbeat_at_ms`, tie-broken by the carrying document's
+///   `generated_at_ms`);
+/// - channels are the sorted union; `generated_at_ms` is the max of
+///   the contributing documents.
+pub fn merge_registry_documents(
+    documents: Vec<AccountRegistryDocument>,
+    mesh_identity: &MeshIdentity,
+) -> RegistryMergeOutcome {
+    let mut ignored_temp_beacons = 0usize;
+    let mut generated_at_ms = 0u64;
+    let mut channels: Vec<ChannelName> = Vec::new();
+    // peer_id -> (heartbeat_at_ms, doc generated_at_ms, beacon)
+    let mut freshest: HashMap<airc_core::PeerId, (u64, u64, AccountPeerBeacon)> = HashMap::new();
+    let mut matched_any = false;
+
+    for document in documents {
+        if document.mesh_identity != *mesh_identity || document.validate().is_err() {
+            continue;
+        }
+        matched_any = true;
+        generated_at_ms = generated_at_ms.max(document.generated_at_ms);
+        for channel in &document.channels {
+            if !channels.contains(channel) {
+                channels.push(channel.clone());
+            }
+        }
+        for beacon in document.peers {
+            if scope_home_is_temp_rooted(&beacon.presence.scope_home) {
+                ignored_temp_beacons += 1;
+                continue;
+            }
+            let key = (beacon.presence.heartbeat_at_ms, document.generated_at_ms);
+            match freshest.get(&beacon.peer_id()) {
+                Some((heartbeat, doc_ms, _)) if (*heartbeat, *doc_ms) >= key => {}
+                _ => {
+                    freshest.insert(beacon.peer_id(), (key.0, key.1, beacon));
+                }
+            }
+        }
+    }
+
+    if !matched_any {
+        return RegistryMergeOutcome {
+            document: None,
+            ignored_temp_beacons,
+        };
+    }
+
+    let mut peers: Vec<AccountPeerBeacon> = freshest
+        .into_values()
+        .map(|(_, _, beacon)| beacon)
+        .collect();
+    peers.sort_by_key(|peer| peer.peer_id().to_string());
+    channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+    RegistryMergeOutcome {
+        document: Some(AccountRegistryDocument::new(
+            mesh_identity.clone(),
+            generated_at_ms,
+            channels,
+            peers,
+        )),
+        ignored_temp_beacons,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRegistryDocument {
@@ -614,6 +748,163 @@ mod tests {
                 url: "https://relay.example.test".to_string()
             }]
         );
+    }
+
+    fn beacon_at(peer_id: PeerId, scope_home: &str, heartbeat_ms: u64) -> AccountPeerBeacon {
+        AccountPeerBeacon {
+            presence: crate::coordinator::beacon_now(
+                peer_id,
+                scope_home.into(),
+                vec![channel("general")],
+                123,
+                heartbeat_ms,
+            ),
+            peer_spec: peer_spec(peer_id),
+            endpoints: Vec::new(),
+        }
+    }
+
+    // Card d793c242: temp-rooted scope homes are the signature of
+    // hermetic test daemons — recognized for THIS machine (via
+    // std::env::temp_dir) and cross-platform (a beacon's scope_home is
+    // minted on another OS). The Windows path below is the literal
+    // live-evidence scope_home that polluted the joelteply rendezvous.
+    #[test]
+    fn temp_scope_home_detection_is_cross_platform() {
+        assert!(scope_home_is_temp_rooted(Path::new(
+            r"C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc"
+        )));
+        assert!(scope_home_is_temp_rooted(Path::new("/tmp/airc-test/.airc")));
+        assert!(scope_home_is_temp_rooted(Path::new(
+            "/private/tmp/scope/.airc"
+        )));
+        assert!(scope_home_is_temp_rooted(Path::new(
+            "/var/folders/ab/c123/T/tmp.xyz/.airc"
+        )));
+        // This machine's real temp root, however it is spelled.
+        let dir = tempdir().unwrap();
+        assert!(scope_home_is_temp_rooted(dir.path()));
+
+        // Production shapes must NOT match — the gate may never block
+        // a real daemon.
+        assert!(!scope_home_is_temp_rooted(Path::new("/Users/joel/.airc")));
+        assert!(!scope_home_is_temp_rooted(Path::new(
+            "/Users/joel/Development/airc/.airc"
+        )));
+        assert!(!scope_home_is_temp_rooted(Path::new(
+            r"C:\Users\green\.airc"
+        )));
+        assert!(!scope_home_is_temp_rooted(Path::new("/home/ci/.airc")));
+    }
+
+    // Card d793c242 item 3 (reader hygiene): merge drops temp-scoped
+    // phantom beacons and COUNTS them. Mutation check: removing the
+    // temp filter from merge_registry_documents leaves the phantom in
+    // `peers` and zeroes the count — both asserts fail.
+    #[test]
+    fn merge_ignores_temp_scoped_beacons_and_counts_them() {
+        let prod = PeerId::new();
+        let phantom_windows = PeerId::new();
+        let phantom_unix = PeerId::new();
+        let document = AccountRegistryDocument::new(
+            mesh(),
+            2_000,
+            vec![channel("general")],
+            vec![
+                beacon_at(prod, "/machine/a/.airc", 1_000),
+                beacon_at(
+                    phantom_windows,
+                    r"C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc",
+                    1_500,
+                ),
+                beacon_at(phantom_unix, "/tmp/airc-hermetic/.airc", 1_500),
+            ],
+        );
+
+        let outcome = merge_registry_documents(vec![document], &mesh());
+
+        assert_eq!(outcome.ignored_temp_beacons, 2);
+        let merged = outcome.document.expect("document must merge");
+        assert_eq!(merged.peers.len(), 1);
+        assert_eq!(merged.peers[0].peer_id(), prod);
+    }
+
+    // Card d793c242 item 3: per peer_id the FRESHEST beacon wins
+    // across per-machine documents, and peers present in only one
+    // document survive the merge (the old pick-newest-document reader
+    // dropped them).
+    #[test]
+    fn merge_prefers_freshest_beacon_per_peer_and_unions_documents() {
+        let shared = PeerId::new();
+        let only_in_old = PeerId::new();
+        let shared_spec = peer_spec(shared);
+
+        let stale = AccountPeerBeacon {
+            presence: crate::coordinator::beacon_now(
+                shared,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                123,
+                1_000,
+            ),
+            peer_spec: shared_spec.clone(),
+            endpoints: vec![RouteEndpoint::Relay {
+                url: "https://stale.example.test".to_string(),
+            }],
+        };
+        let fresh = AccountPeerBeacon {
+            presence: crate::coordinator::beacon_now(
+                shared,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                123,
+                5_000,
+            ),
+            peer_spec: shared_spec,
+            endpoints: vec![RouteEndpoint::Relay {
+                url: "https://fresh.example.test".to_string(),
+            }],
+        };
+        let old_doc = AccountRegistryDocument::new(
+            mesh(),
+            2_000,
+            vec![channel("general")],
+            vec![stale, beacon_at(only_in_old, "/machine/b/.airc", 900)],
+        );
+        let new_doc = AccountRegistryDocument::new(mesh(), 6_000, vec![], vec![fresh]);
+
+        let outcome = merge_registry_documents(vec![old_doc, new_doc], &mesh());
+
+        let merged = outcome.document.expect("document must merge");
+        assert_eq!(outcome.ignored_temp_beacons, 0);
+        assert_eq!(merged.generated_at_ms, 6_000);
+        assert_eq!(merged.peers.len(), 2, "union across documents");
+        let shared_beacon = merged
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id() == shared)
+            .expect("shared peer present");
+        assert_eq!(
+            shared_beacon.endpoints,
+            vec![RouteEndpoint::Relay {
+                url: "https://fresh.example.test".to_string()
+            }],
+            "freshest beacon per peer_id must win"
+        );
+        assert!(merged.peers.iter().any(|p| p.peer_id() == only_in_old));
+    }
+
+    #[test]
+    fn merge_skips_foreign_mesh_documents() {
+        let peer = PeerId::new();
+        let foreign = AccountRegistryDocument::new(
+            MeshIdentity::new("someone-else"),
+            2_000,
+            vec![],
+            vec![beacon_at(peer, "/machine/a/.airc", 1_000)],
+        );
+        let outcome = merge_registry_documents(vec![foreign], &mesh());
+        assert!(outcome.document.is_none());
     }
 
     // Two SEPARATE machine accounts, same gh identity, bridged ONLY

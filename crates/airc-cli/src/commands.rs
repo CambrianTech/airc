@@ -1064,6 +1064,17 @@ pub async fn run_daemon(
     let registry_state = state.clone();
     let registry_home = state.home.clone();
     let registry_handle = tokio::spawn(async move {
+        // HERMETIC GATE (card d793c242): test/temp daemons inherit the
+        // operator's working gh auth, so without this gate they publish
+        // test identities to the PRODUCTION account rendezvous (live
+        // evidence: temp-scoped Windows test daemon landed in joelteply
+        // gist 1214fb43d2c00d667c4712e6023b2165). Blocked scopes never
+        // spawn the loop at all — ONE loud line says why. The same gate
+        // is re-checked per tick and inside the gh store itself.
+        if let Some(block) = airc_lib::account_registry_block(&registry_home) {
+            eprintln!("airc daemon: account-registry loop DISABLED — {block}");
+            return;
+        }
         let airc = match Airc::open(&registry_home).await {
             Ok(airc) => airc,
             Err(error) => {
@@ -1141,11 +1152,13 @@ pub async fn run_daemon(
             );
         }
         let store = match &gh_bin {
-            Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store).with_bin(bin.clone()),
-            None => airc_lib::GhAccountRegistryStore::new(event_store),
+            Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home)
+                .with_bin(bin.clone()),
+            None => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home),
         };
         let gate = airc_lib::RegistryRefreshGate::GhAuth {
             gh_bin: gh_bin.clone(),
+            scope_home: registry_home.clone(),
         };
         airc_lib::run_registry_refresh_loop(
             airc,

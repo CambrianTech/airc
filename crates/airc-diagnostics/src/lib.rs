@@ -47,6 +47,15 @@ pub enum DiagnosticCode {
     TrustRefreshFailed,
     AccountRegistryPublishFailed,
     AccountRegistryRefreshFailed,
+    /// Card d793c242: the account-registry gh transport was
+    /// intentionally suppressed — `AIRC_DISABLE_ACCOUNT_REGISTRY` is
+    /// set, or the scope home is temp-rooted (hermetic test daemon).
+    /// LOUD by doctrine: every suppressed tick says why.
+    AccountRegistryHermeticSkip,
+    /// Card d793c242: reader-merge dropped beacons whose scope_home is
+    /// temp-rooted (phantom hermetic-test peers in polluted documents).
+    /// Carries the count, not the dump.
+    AccountRegistryTempBeaconsIgnored,
     WireLostEmitFailed,
     MalformedReplayFrameSkipped,
     UnverifiableReplayFrameSkipped,

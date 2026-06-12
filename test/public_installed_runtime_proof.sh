@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Hermetic gate (card d793c242): every daemon this proof spawns runs
+# under the operator's real gh auth — it must NEVER publish its test
+# identities to the production account rendezvous. (The temp-rooted
+# homes below are the defense-in-depth layer; this is the intentional
+# one.)
+export AIRC_DISABLE_ACCOUNT_REGISTRY=1
+
 # Public installed-command proof.
 #
 # Verifies the contract a stranger landing at the repo + running
