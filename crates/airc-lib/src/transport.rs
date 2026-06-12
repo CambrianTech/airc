@@ -288,7 +288,14 @@ impl Airc {
             return;
         }
         let ack_requested = airc_protocol::wants_delivery_ack(&frame);
-        let ack_origin = frame.envelope.sender;
+        // Card 1998f6cb: the ack must travel back over the LINK the
+        // frame arrived on. For a point-to-point send the link peer IS
+        // `envelope.sender`; for a daemon-forwarded routed frame the
+        // sender is a remote scope identity with no connection here —
+        // the link peer is the forwarding daemon, which re-signed the
+        // envelope. The verified signer therefore identifies the link
+        // origin in both shapes (the TLS connection is keyed by it).
+        let ack_origin = link_origin(&frame);
         let frame_channel = frame.envelope.channel;
         let frame_cursor = airc_core::TranscriptCursor {
             lamport: frame.envelope.lamport,
@@ -500,6 +507,21 @@ impl Airc {
             )
             .with_field("error", error),
         );
+    }
+}
+
+/// Card 1998f6cb: the LAN-link peer a verified inbound frame came
+/// from. The connection (and the ack return path) is keyed by the
+/// peer whose key signed the frame: a scope's own point-to-point
+/// send is signed by the scope (signer == sender == link peer),
+/// while a daemon-routed forward is re-signed by the forwarding
+/// daemon (signer == link peer != sender). Unsigned frames (dev
+/// policy / in-process tests) fall back to `sender`. Shared by the
+/// ack return path and the inbound bridge's loop-prevention origin.
+pub(crate) fn link_origin(frame: &Frame) -> airc_core::PeerId {
+    match frame.envelope.signature {
+        airc_protocol::Signature::Ed25519 { signer, .. } => signer,
+        airc_protocol::Signature::Unsigned => frame.envelope.sender,
     }
 }
 

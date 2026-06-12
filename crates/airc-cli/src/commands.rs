@@ -1094,10 +1094,22 @@ pub async fn run_daemon(
         identity.peer_id,
         socket.display()
     );
+    // Card 1998f6cb: the OUTBOUND mirror of the inbound router bridge.
+    // Install the routed forwarder on the daemon's router BEFORE any
+    // transport handle comes up, so every durable publish (local IPC
+    // sends AND bridged inbound frames) is offered to the route layer
+    // and traverses established LAN connections — with delivery acks,
+    // loop prevention by origin link, and loud bounded-queue drops.
+    let routed_forwarder = airc_lib::RoutedForwarder::install(
+        &state.router,
+        airc_lib::RoutedForwarderConfig::default(),
+    );
+
     // Card 625abe6d slice 2: the daemon, not the operator, keeps
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
-    let route_refresh_task = spawn_route_refresh(home.to_path_buf(), state.clone());
+    let route_refresh_task =
+        spawn_route_refresh(home.to_path_buf(), state.clone(), routed_forwarder.clone());
 
     // KEYSTONE (card a134b370-10b1-49c6-aa42-e1a05446e887): spawn the
     // account-registry publish/refresh loop alongside the IPC accept
@@ -1115,6 +1127,7 @@ pub async fn run_daemon(
     // holds internally (same lost-wakeup discipline as `server::run`).
     let registry_state = state.clone();
     let registry_home = state.home.clone();
+    let registry_forwarder = routed_forwarder.clone();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -1148,6 +1161,11 @@ pub async fn run_daemon(
             registry_state.router.clone(),
             registry_state.coordinator_store.clone(),
         )));
+
+        // Card 1998f6cb: this handle's LAN connections (accepted by
+        // the listener below) are routes the forwarder may reuse for
+        // outbound traversal of router publishes.
+        registry_forwarder.add_link(airc.clone()).await;
 
         // Endpoint-in-beacon (the second half of same-account
         // auto-discovery): bind a LAN listener on THIS handle so its
@@ -1291,12 +1309,16 @@ pub async fn run_daemon(
 /// failure at boot must neither take the IPC daemon down nor
 /// permanently disable route refresh — the open is retried, loudly,
 /// on every tick until it succeeds.
-fn spawn_route_refresh(home: PathBuf, state: Arc<DaemonState>) -> tokio::task::JoinHandle<()> {
+fn spawn_route_refresh(
+    home: PathBuf,
+    state: Arc<DaemonState>,
+    forwarder: airc_lib::RoutedForwarder,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let handle: tokio::sync::Mutex<Option<Airc>> = tokio::sync::Mutex::new(None);
         let refresh_state = state.clone();
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&home, &handle, &refresh_state)
+            refresh_routes_once(&home, &handle, &refresh_state, &forwarder)
         })
         .await;
     })
@@ -1312,6 +1334,7 @@ async fn refresh_routes_once(
     home: &Path,
     handle: &tokio::sync::Mutex<Option<Airc>>,
     state: &Arc<DaemonState>,
+    forwarder: &airc_lib::RoutedForwarder,
 ) {
     let mut guard = handle.lock().await;
     if guard.is_none() {
@@ -1327,6 +1350,10 @@ async fn refresh_routes_once(
                     state.router.clone(),
                     state.coordinator_store.clone(),
                 )));
+                // Card 1998f6cb: the stored-endpoint dials this handle
+                // makes are routes the forwarder reuses for outbound
+                // traversal of router publishes.
+                forwarder.add_link(airc.clone()).await;
                 *guard = Some(airc)
             }
             Err(error) => {

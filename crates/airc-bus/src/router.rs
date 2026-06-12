@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
-use airc_core::RoomId;
+use airc_core::{PeerId, RoomId};
 
 use crate::clock::Clock;
 use crate::envelope::{Cursor, Envelope};
@@ -164,6 +164,24 @@ impl RecentEventIds {
     }
 }
 
+/// Card 1998f6cb: one durable envelope the router accepted, handed to
+/// the installed outbound forward sink (route layer) so it can
+/// traverse established LAN routes. The OUTBOUND mirror of card
+/// 4132f48c's inbound bridge: inbound goes transport → router via
+/// `publish_if_new`; outbound goes router → transport via this item.
+#[derive(Debug, Clone)]
+pub struct ForwardItem {
+    /// The published envelope, post owner-stamping (`seq` /
+    /// `occurred_at_ms` assigned). Shared, never deep-copied.
+    pub env: Arc<Envelope>,
+    /// The LAN-link peer this envelope ARRIVED from, when it entered
+    /// the router through the inbound bridge (`publish_if_new_from`).
+    /// `None` = locally originated (IPC publish). Loop prevention: the
+    /// forwarder must never send a frame back over the link it came
+    /// from.
+    pub origin: Option<PeerId>,
+}
+
 /// Outcome of [`EventRouter::publish_if_new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishIfNew {
@@ -196,6 +214,17 @@ struct RouterInner {
     /// event (or the same inbound frame arriving on two LAN links) can
     /// never fan out twice.
     recent_ids: Mutex<RecentEventIds>,
+    /// Card 1998f6cb: the outbound route-layer sink. When installed
+    /// (`set_forward_sink`), every successfully published **durable**
+    /// envelope is offered here (bounded `try_send`, never blocking the
+    /// hot path) so the daemon's forwarder can send it over established
+    /// LAN routes. Saturation is LOUD: counted + traced, never silent.
+    forward_tx: Mutex<Option<mpsc::Sender<ForwardItem>>>,
+    /// Count of durable envelopes NOT handed to the forward sink because
+    /// its bounded queue was full (or the forwarder task was gone).
+    /// Surfaced for diagnostics/tests; every increment also traces at
+    /// error level.
+    forward_drop_count: AtomicU64,
     /// Count of events shed because the write-behind queue was saturated and
     /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
     shed_count: AtomicU64,
@@ -233,6 +262,8 @@ impl EventRouter {
             sink,
             write_behind_tx,
             recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
+            forward_tx: Mutex::new(None),
+            forward_drop_count: AtomicU64::new(0),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
         });
@@ -265,7 +296,83 @@ impl EventRouter {
     /// 3. Off the lock: enqueue `Durable` envelopes to write-behind.
     ///
     /// [`Seq`]: crate::Seq
-    pub async fn publish(&self, mut env: Envelope) -> crate::Result<crate::Seq> {
+    pub async fn publish(&self, env: Envelope) -> crate::Result<crate::Seq> {
+        self.publish_from(env, None).await
+    }
+
+    /// Card 1998f6cb: install the outbound route-layer sink. Every
+    /// successfully published durable envelope is offered to `tx`
+    /// (bounded, non-blocking) as a [`ForwardItem`] carrying the
+    /// origin LAN peer (if the publish came through the inbound
+    /// bridge) so the forwarder can apply loop prevention.
+    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) {
+        let mut guard = self
+            .inner
+            .forward_tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = Some(tx);
+    }
+
+    /// Card 1998f6cb: durable envelopes NOT offered to the forward sink
+    /// because its queue was saturated (or its task gone). Loud-drop
+    /// counter — pairs with the error-level trace at the drop site.
+    pub fn forward_drop_count(&self) -> u64 {
+        self.inner.forward_drop_count.load(Ordering::SeqCst)
+    }
+
+    /// Offer a just-published durable envelope to the forward sink, if
+    /// one is installed. `try_send` only — the route layer must never
+    /// backpressure the in-memory hot path; a full queue is a LOUD,
+    /// counted drop (the forwarder is expected to be drained far faster
+    /// than the LAN can be saturated by room chat).
+    fn offer_to_forward_sink(&self, env: &Arc<Envelope>, origin: Option<PeerId>) {
+        let tx = {
+            let guard = self
+                .inner
+                .forward_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let item = ForwardItem {
+            env: Arc::clone(env),
+            origin,
+        };
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    event_id = %item.env.event_id,
+                    channel = %item.env.channel,
+                    "airc-bus forward sink queue FULL — durable event was published locally \
+                     but will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(item)) => {
+                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    event_id = %item.env.event_id,
+                    channel = %item.env.channel,
+                    "airc-bus forward sink receiver is GONE — durable event was published \
+                     locally but will NOT be forwarded over LAN routes (card 1998f6cb)"
+                );
+            }
+        }
+    }
+
+    /// [`EventRouter::publish`] with the originating LAN-link peer
+    /// attached (card 1998f6cb). `origin` is purely forward-sink
+    /// metadata — local delivery semantics are identical to `publish`.
+    async fn publish_from(
+        &self,
+        mut env: Envelope,
+        origin: Option<PeerId>,
+    ) -> crate::Result<crate::Seq> {
         let seq = self.inner.seq.next();
         env.seq = seq;
         env.occurred_at_ms = self.inner.clock.now_ms();
@@ -389,6 +496,12 @@ impl EventRouter {
                     return Err(crate::BusError::Sink("write-behind task gone".into()));
                 }
             }
+            // Card 1998f6cb: the event is accepted locally (ring +
+            // fan-out + write-behind enqueued) — offer it to the
+            // route layer so it traverses established LAN routes.
+            // Durable only: ephemeral/stream classes stay machine-
+            // local in this slice. Off the shard lock, non-blocking.
+            self.offer_to_forward_sink(&env, origin);
         }
 
         Ok(seq)
@@ -416,6 +529,23 @@ impl EventRouter {
     /// `publish_if_new` calls for the same id race to exactly one
     /// `Published`.
     pub async fn publish_if_new(&self, env: Envelope) -> crate::Result<PublishIfNew> {
+        self.publish_if_new_from(env, None).await
+    }
+
+    /// [`EventRouter::publish_if_new`] with the LAN-link peer the frame
+    /// arrived from (card 1998f6cb). The inbound bridge passes the
+    /// verified link origin here so a `Published` outcome reaches the
+    /// forward sink carrying it — the forwarder then never echoes the
+    /// frame back over the link it came from, and a `Duplicate` is
+    /// never re-forwarded at all (the first arrival already was). The
+    /// pair of those two rules is what makes mesh forwarding terminate:
+    /// a frame floods outward once per node, and every re-arrival is a
+    /// duplicate dead-end.
+    pub async fn publish_if_new_from(
+        &self,
+        env: Envelope,
+        origin: Option<PeerId>,
+    ) -> crate::Result<PublishIfNew> {
         let already_recent = {
             let mut recent = self
                 .inner
@@ -449,7 +579,7 @@ impl EventRouter {
                 return Err(error);
             }
         }
-        match self.publish(env).await {
+        match self.publish_from(env, origin).await {
             Ok(seq) => Ok(PublishIfNew::Published(seq)),
             Err(error) => {
                 unmark(self);

@@ -158,7 +158,11 @@ impl InboundFrameSink for RouterInboundBridge {
         let env = bus_envelope_for_inbound(frame);
         let event_id = frame.envelope.event_id;
         let channel = frame.envelope.channel;
-        match self.router.publish_if_new(env).await {
+        // Card 1998f6cb: attach the verified link origin so the
+        // router's outbound forward sink (when installed) never
+        // echoes this frame back over the link it arrived on.
+        let origin = crate::transport::link_origin(frame);
+        match self.router.publish_if_new_from(env, Some(origin)).await {
             // Duplicate IS delivered: the existing copy stands, so the
             // ack stays truthful and the second LAN link's copy never
             // double-fans-out.
