@@ -39,7 +39,9 @@ fn is_routable_lan_ipv4(ip: Ipv4Addr) -> bool {
 /// a `192.168.x` endpoint only works same-subnet and dies behind a firewall.
 pub(crate) fn detect_tailscale_ip() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(100, 100, 100, 100), 80)).ok()?;
+    socket
+        .connect((Ipv4Addr::new(100, 100, 100, 100), 80))
+        .ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if is_tailscale_ipv4(ip) => Some(ip),
         IpAddr::V4(_) | IpAddr::V6(_) => None,

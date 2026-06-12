@@ -70,6 +70,19 @@ pub enum DiagnosticCode {
     /// an outbound route-discovery dial. Offline peers are normal mesh
     /// weather — but every failed dial attempt must be visible.
     PeerDialFailed,
+    /// Card 39d37629: an accepted inbound frame could not be routed /
+    /// persisted into a bound room transcript (unknown channel, store
+    /// append failure, decode failure, verification failure, or no
+    /// attached subscriber). Every such frame MUST emit this — silent
+    /// drops between transport accept and transcript persistence are
+    /// the bug class this code makes impossible.
+    FrameUndeliverable,
+    /// Card 39d37629: a delivery-ack response could not be written
+    /// back to the requesting sender (no live connection, dead
+    /// socket). The frame's own fate was already decided and logged;
+    /// this only means the SENDER sees an ack timeout instead of the
+    /// typed outcome.
+    DeliveryAckSendFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

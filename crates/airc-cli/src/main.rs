@@ -351,10 +351,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::LanSend {
             to,
             expected_peer,
+            ack_timeout_ms,
             text,
         } => {
             let expected = parse_peer_id(&expected_peer)?;
-            commands::run_lan_send(&home, parsed.peers, to, expected, &text).await
+            commands::run_lan_send(&home, parsed.peers, to, expected, ack_timeout_ms, &text).await
         }
 
         Command::LanListen { bind, replay } => {

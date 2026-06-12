@@ -21,6 +21,7 @@
 
 pub mod assertion;
 pub mod canonical;
+pub mod delivery_ack;
 pub mod envelope;
 pub mod headers_keys;
 pub mod keypair;
@@ -36,6 +37,10 @@ pub mod trust_rotation;
 
 pub use assertion::{AssertionError, IdentityAssertion, ASSERTION_DOMAIN};
 pub use canonical::{canonical_signed_bytes, CanonicalError};
+pub use delivery_ack::{
+    decode_delivery_ack, wants_delivery_ack, DeliveryAck, DeliveryOutcome, UndeliverableReason,
+    DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE, HEADER_AIRC_DELIVERY_ACK,
+};
 pub use envelope::{ChannelId, Envelope, Frame, FrameKind};
 pub use headers_keys::{
     HEADER_AIRC_BODY_ENC_AAD, HEADER_AIRC_BODY_ENC_KEY_ID, HEADER_AIRC_BODY_ENC_SCHEME,

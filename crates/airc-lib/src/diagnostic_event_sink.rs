@@ -197,6 +197,8 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::WorkspaceLeaseViolation => "workspace_lease_violation",
         DiagnosticCode::RouteRefreshFailed => "route_refresh_failed",
         DiagnosticCode::PeerDialFailed => "peer_dial_failed",
+        DiagnosticCode::FrameUndeliverable => "frame_undeliverable",
+        DiagnosticCode::DeliveryAckSendFailed => "delivery_ack_send_failed",
     }
 }
 

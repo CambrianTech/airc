@@ -873,12 +873,22 @@ pub async fn run_listen(
 }
 
 /// `lan-send` — TLS-wrapped single-shot send to a remote peer, on
-/// the current room's channel.
+/// the current room's channel, with a delivery-ack wait.
+///
+/// Card 39d37629: "sent" used to mean "bytes flushed to the TLS
+/// socket" — a receiver could accept the frame and silently lose it
+/// before transcript persistence (live repro 2026-06-12 02:36Z: 5090
+/// → mac printed "sent over lan-tcp to general", exit 0; the frame
+/// reached NO store on the receiving machine). The verb now requests
+/// a typed ack that the receiver emits only AFTER its persistence
+/// decision, waits up to `ack_timeout_ms`, prints the typed outcome,
+/// and exits nonzero for anything that is not `delivered`.
 pub async fn run_lan_send(
     home: &Path,
     peers: Vec<PeerSpec>,
     to: std::net::SocketAddr,
     expected_peer: PeerId,
+    ack_timeout_ms: u64,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Card bf7c30e2: fail FAST with a self-diagnosing error before
@@ -905,12 +915,54 @@ pub async fn run_lan_send(
     preflight_expected_peer(&airc, home, &peers, expected_peer).await?;
     let current = airc.current_room().await?;
     airc.connect_lan(to, expected_peer).await?;
-    airc.say_with_headers(text, runtime_headers()?).await?;
-    println!(
-        "sent over lan-tcp to {} ({}).",
-        current.name, current.channel
-    );
-    Ok(())
+    let timeout = std::time::Duration::from_millis(ack_timeout_ms);
+    let outcome = airc
+        .send_with_delivery_ack(text, runtime_headers()?, timeout)
+        .await?;
+    match outcome {
+        airc_lib::DeliverySendOutcome::Delivered { event_id, ack } => {
+            match ack.outcome {
+                airc_lib::DeliveryOutcome::Delivered { channel, cursor } => {
+                    println!(
+                        "delivered over lan-tcp to {} ({channel}) — receiver {} persisted \
+                         event {event_id} at lamport {}.",
+                        current.name, ack.receiver, cursor.lamport
+                    );
+                }
+                // `DeliverySendOutcome::Delivered` is constructed only
+                // from a Delivered ack; keep the match honest anyway.
+                airc_lib::DeliveryOutcome::Undeliverable { reason } => {
+                    return Err(format!(
+                        "internal: delivered outcome carried undeliverable ack ({})",
+                        reason.as_str()
+                    )
+                    .into());
+                }
+            }
+            Ok(())
+        }
+        airc_lib::DeliverySendOutcome::Undeliverable { event_id, ack } => {
+            let reason = match ack.outcome {
+                airc_lib::DeliveryOutcome::Undeliverable { reason } => reason.as_str(),
+                airc_lib::DeliveryOutcome::Delivered { .. } => "unknown",
+            };
+            Err(format!(
+                "NOT delivered: receiver {} reports event {event_id} undeliverable \
+                 (reason: {reason}). The frame was accepted on the wire but will not \
+                 appear in the receiving scope's {} transcript.",
+                ack.receiver, current.name
+            )
+            .into())
+        }
+        airc_lib::DeliverySendOutcome::NoAck { event_id, waited } => Err(format!(
+            "NOT confirmed: no delivery ack for event {event_id} within {}ms. The frame \
+             was flushed to the wire, but the receiver never confirmed persistence — it \
+             may be running an older build (which never acks) or it dropped the frame. \
+             Treat as undelivered.",
+            waited.as_millis()
+        )
+        .into()),
+    }
 }
 
 /// Card bf7c30e2: verify `expected_peer` is known to the SAME trust
@@ -1110,22 +1162,20 @@ pub async fn run_daemon(
             .map(|ip| (ip, "Tailscale"))
             .or_else(|| crate::network_commands::detect_lan_ip().map(|ip| (ip, "LAN")));
         match advertise {
-            Some((ip, kind)) => {
-                match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
-                    Ok(addr) => {
-                        eprintln!(
-                            "airc daemon: advertising {kind} endpoint {addr} in the account registry"
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "airc daemon: {kind} listener bind failed ({error}) — account beacon \
+            Some((ip, kind)) => match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
+                Ok(addr) => {
+                    eprintln!(
+                        "airc daemon: advertising {kind} endpoint {addr} in the account registry"
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "airc daemon: {kind} listener bind failed ({error}) — account beacon \
                              carries no endpoint; this node reaches the mesh by dialing out / \
                              relay but is not itself dialable"
-                        );
-                    }
+                    );
                 }
-            }
+            },
             None => {
                 eprintln!(
                     "airc daemon: no Tailscale or routable LAN IPv4 detected — account beacon \

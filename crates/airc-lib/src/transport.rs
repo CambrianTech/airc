@@ -212,7 +212,7 @@ impl Airc {
                         item = stream.next() => match item {
                             Some(Ok(frame)) => airc.append_received_frame(frame).await,
                             Some(Err(verify_err)) => {
-                                warn_frame_verify_failed(&verify_err);
+                                airc.warn_frame_verify_failed(&verify_err);
                             }
                             None => break "stream_ended",
                         }
@@ -222,7 +222,7 @@ impl Airc {
                     match stream.next().await {
                         Some(Ok(frame)) => airc.append_received_frame(frame).await,
                         Some(Err(verify_err)) => {
-                            warn_frame_verify_failed(&verify_err);
+                            airc.warn_frame_verify_failed(&verify_err);
                         }
                         None => break "stream_ended",
                     }
@@ -278,6 +278,23 @@ impl Airc {
     }
 
     pub(crate) async fn append_received_frame(&self, frame: Frame) {
+        // Card 39d37629: delivery-ack responses are receipts, not
+        // transcript content — intercept them ahead of persistence
+        // and hand them to in-process `send_with_delivery_ack`
+        // waiters. Old peers never request acks, so they never see
+        // these frames at all.
+        if let Some(ack) = airc_protocol::decode_delivery_ack(&frame) {
+            let _ = self.inner.ack_tx.send(ack);
+            return;
+        }
+        let ack_requested = airc_protocol::wants_delivery_ack(&frame);
+        let ack_origin = frame.envelope.sender;
+        let frame_channel = frame.envelope.channel;
+        let frame_cursor = airc_core::TranscriptCursor {
+            lamport: frame.envelope.lamport,
+            event_id: frame.envelope.event_id,
+        };
+
         let event = frame.into_transcript_event();
         let event_id = event.event_id;
         // The store dedups persistence by event_id —
@@ -306,34 +323,81 @@ impl Airc {
         // wire tail is async) but still wasted work that contends
         // for the DB connection with subsequent sends.
         if !self.mark_broadcast(event_id) {
+            // Already broadcast in-process ⇒ already persisted; an
+            // ack-requesting duplicate still deserves its receipt.
+            if ack_requested {
+                self.conclude_delivery_ack(ack_origin, event_id, frame_channel, frame_cursor)
+                    .await;
+            }
             return;
         }
         match self.inner.store.append(event.clone()).await {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
                 let _ = self.inner.live_tx.send(Arc::new(event));
+                // Card 39d37629: the receipt fires only AFTER the
+                // append committed (or was already durable) — never
+                // on mere transport accept.
+                if ack_requested {
+                    self.conclude_delivery_ack(ack_origin, event_id, frame_channel, frame_cursor)
+                        .await;
+                }
             }
             Err(err) => {
-                StderrJsonDiagnosticSink.emit(
+                self.emit_diag(
                     DiagnosticEvent::error(
                         DiagnosticComponent::Subscriber,
                         DiagnosticCode::StoreAppendFailed,
                         "subscriber store append failed",
                     )
                     .with_field("event_id", event_id)
-                    .with_field("error", err),
+                    .with_field("error", &err),
                 );
+                if ack_requested {
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "accepted frame could not be persisted — undeliverable",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::PersistFailed.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("error", err),
+                    );
+                    self.respond_delivery_ack(
+                        ack_origin,
+                        event_id,
+                        frame_channel,
+                        airc_protocol::DeliveryOutcome::Undeliverable {
+                            reason: airc_protocol::UndeliverableReason::PersistFailed,
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
-}
 
-fn warn_frame_verify_failed(error: &impl std::fmt::Display) {
-    if std::env::var_os("AIRC_REPLAY_WARN").is_some() {
-        StderrJsonDiagnosticSink.emit(
+    fn warn_frame_verify_failed(&self, error: &impl std::fmt::Display) {
+        // Card 39d37629: this used to be gated behind AIRC_REPLAY_WARN
+        // — a live frame failing verification was a SILENT drop. The
+        // subscriber streams here carry live frames (from_cursor:
+        // None, no replay backlog), so every failure is a frame a
+        // sender believes was sent. Loud, always; the dedicated
+        // Malformed/UnverifiableReplayFrameSkipped codes still cover
+        // the replay path separately.
+        self.emit_diag(
             DiagnosticEvent::warn(
                 DiagnosticComponent::Subscriber,
-                DiagnosticCode::FrameVerificationFailed,
-                "subscriber frame verification failed",
+                DiagnosticCode::FrameUndeliverable,
+                "subscriber frame verification failed — frame dropped",
+            )
+            .with_field(
+                "reason",
+                airc_protocol::UndeliverableReason::VerificationFailed.as_str(),
             )
             .with_field("error", error),
         );

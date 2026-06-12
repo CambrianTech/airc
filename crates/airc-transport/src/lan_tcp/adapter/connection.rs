@@ -13,6 +13,9 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use airc_core::PeerId;
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::Frame;
 
 use crate::lan_tcp::adapter::dispatch::dispatch_to_subscribers;
@@ -130,9 +133,23 @@ where
 
         let frame: Frame = match serde_json::from_slice(&payload) {
             Ok(frame) => frame,
-            Err(_error) => {
-                // Malformed payload — drop the connection rather
-                // than silently skipping.
+            Err(error) => {
+                // Malformed payload — drop the connection rather than
+                // silently skipping. Card 39d37629: this is a frame the
+                // sender saw flushed ("sent") that will never reach a
+                // transcript — it MUST be loud. Build skew between
+                // peers (frame schema drift) lands exactly here.
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Transport,
+                        DiagnosticCode::FrameUndeliverable,
+                        "inbound lan-tcp frame did not decode — frame dropped, connection closed",
+                    )
+                    .with_field("reason", "decode_failure")
+                    .with_field("peer", peer_id)
+                    .with_field("payload_bytes", payload.len())
+                    .with_field("error", error),
+                );
                 inner.connections.lock().await.remove(&peer_id);
                 return;
             }

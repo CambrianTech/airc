@@ -193,6 +193,36 @@ impl LanTcpAdapter {
         handle_client_connection(self.inner.clone(), tls_stream).await?;
         Ok(())
     }
+
+    /// Targeted unicast: send `frame` to exactly one connected peer.
+    ///
+    /// Card 39d37629 — delivery-ack responses must travel back to the
+    /// requesting sender only, not broadcast to every connection. Same
+    /// flush-to-wire contract as `send()`: returns `Ok` only after the
+    /// write loop confirmed the frame is in the kernel send buffer.
+    pub async fn send_to(&self, peer: PeerId, frame: Frame) -> Result<(), LanTcpError> {
+        let payload = serde_json::to_vec(&frame)?;
+        if payload.len() > MAX_FRAME_BYTES as usize {
+            return Err(LanTcpError::FrameTooLarge {
+                announced: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        let tx = {
+            let connections = self.inner.connections.lock().await;
+            connections
+                .get(&peer)
+                .cloned()
+                .ok_or(LanTcpError::NoActivePeers)?
+        };
+        let (flushed, flushed_rx) = oneshot::channel();
+        tx.send(Outbound { payload, flushed })
+            .await
+            .map_err(|_closed| LanTcpError::NoActivePeers)?;
+        flushed_rx
+            .await
+            .map_err(|_dropped| LanTcpError::NoActivePeers)
+    }
 }
 
 #[async_trait]

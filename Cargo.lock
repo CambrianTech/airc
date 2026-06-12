@@ -281,6 +281,7 @@ name = "airc-transport"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-diagnostics",
  "airc-protocol",
  "async-trait",
  "ed25519-dalek",
