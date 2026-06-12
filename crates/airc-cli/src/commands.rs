@@ -1099,30 +1099,37 @@ pub async fn run_daemon(
         // routable LAN (or a bind failure) still reaches the mesh by
         // dialing OUT to listening peers / relay — it just isn't
         // dialable itself, which we say plainly rather than swallow.
-        match crate::network_commands::detect_lan_ip() {
-            Some(lan_ip) => {
-                match airc
-                    .listen_lan(std::net::SocketAddr::from((lan_ip, 0)))
-                    .await
-                {
+        // Prefer the Tailscale endpoint over LAN. Every node on the same
+        // gh account is on the Tailscale mesh, so a 100.x address is
+        // dialable from ANY network and traverses NAT/firewalls, whereas a
+        // 192.168.x LAN address only works same-subnet and dies behind a
+        // firewall (the cross-machine keystone failure: nodes advertised
+        // LAN-only and could enrol each other but never connect). Fall back
+        // to LAN when Tailscale is down.
+        let advertise = crate::network_commands::detect_tailscale_ip()
+            .map(|ip| (ip, "Tailscale"))
+            .or_else(|| crate::network_commands::detect_lan_ip().map(|ip| (ip, "LAN")));
+        match advertise {
+            Some((ip, kind)) => {
+                match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
                     Ok(addr) => {
                         eprintln!(
-                            "airc daemon: advertising LAN endpoint {addr} in the account registry"
+                            "airc daemon: advertising {kind} endpoint {addr} in the account registry"
                         );
                     }
                     Err(error) => {
                         eprintln!(
-                            "airc daemon: LAN listener bind failed ({error}) — account beacon \
-                             carries no LAN endpoint; this node reaches the mesh by dialing out \
-                             / relay but is not itself dialable on LAN"
+                            "airc daemon: {kind} listener bind failed ({error}) — account beacon \
+                             carries no endpoint; this node reaches the mesh by dialing out / \
+                             relay but is not itself dialable"
                         );
                     }
                 }
             }
             None => {
                 eprintln!(
-                    "airc daemon: no routable LAN IPv4 detected — account beacon carries no LAN \
-                     endpoint (outbound-dial / relay only)"
+                    "airc daemon: no Tailscale or routable LAN IPv4 detected — account beacon \
+                     carries no endpoint (outbound-dial / relay only)"
                 );
             }
         }
