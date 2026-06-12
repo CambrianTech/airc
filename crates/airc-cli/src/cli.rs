@@ -452,8 +452,10 @@ pub enum Command {
         replay: bool,
     },
 
-    /// Same-LAN secure send: dial a peer over TLS and send a single
-    /// text frame to the current room's channel.
+    /// Same-LAN secure send: dial a peer over TLS, send a single
+    /// text frame to the current room's channel, and wait for the
+    /// receiver's typed delivery ack (card 39d37629). Exit 0 only on
+    /// `delivered`; undeliverable or no-ack outcomes exit nonzero.
     LanSend {
         /// Address of the listening peer (e.g. `127.0.0.1:7474`).
         #[arg(long)]
@@ -461,6 +463,10 @@ pub enum Command {
         /// UUID of the listening peer (for cert pinning).
         #[arg(long)]
         expected_peer: String,
+        /// How long to wait for the receiver's delivery ack before
+        /// reporting no-ack (older receivers never ack).
+        #[arg(long, default_value_t = 10_000)]
+        ack_timeout_ms: u64,
         /// Message body.
         text: String,
     },

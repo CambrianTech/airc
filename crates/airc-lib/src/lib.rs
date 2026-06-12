@@ -43,6 +43,7 @@ pub mod capability_registry;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;
+pub mod delivery_ack;
 pub mod diagnostic_event_sink;
 pub mod error;
 pub mod external_identity;
@@ -90,6 +91,10 @@ pub use airc_protocol::{
     AssertionError, IdentityAssertion, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
     HEADER_AIRC_REPLY_TO,
 };
+pub use airc_protocol::{
+    DeliveryAck, DeliveryOutcome, UndeliverableReason, DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE,
+    HEADER_AIRC_DELIVERY_ACK,
+};
 pub use capability_registry::{
     CapabilityCandidate, CapabilityEntry, CapabilityQuery, CapabilityRegistry, DEFAULT_OFFER_TTL_MS,
 };
@@ -106,6 +111,7 @@ pub use coordinator::{
     DEFAULT_REFRESH_INTERVAL_MS as COORDINATOR_REFRESH_INTERVAL_MS,
 };
 pub use daemon::decode_wire_event;
+pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };

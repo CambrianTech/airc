@@ -206,7 +206,21 @@ pub(crate) struct AircInner {
     /// share it and the equality check would (incorrectly) suppress
     /// the cross-process peer's frames as "our own."
     pub(crate) recently_broadcast: std::sync::Mutex<BroadcastDeduper>,
+    /// Card 39d37629: in-process fan-out of delivery-ack responses.
+    /// Ack frames are intercepted by `append_received_frame` BEFORE
+    /// persistence (they are receipts, not transcript content) and
+    /// published here for `send_with_delivery_ack` waiters.
+    pub(crate) ack_tx: broadcast::Sender<airc_protocol::DeliveryAck>,
+    /// Card 39d37629: where receive-path diagnostics land. Defaults to
+    /// stderr JSON; tests inject a `MemoryDiagnosticSink` so "the
+    /// diagnostic fired" is a hard assertion, not a log-scrape.
+    pub(crate) diag_sink: std::sync::RwLock<Arc<dyn airc_diagnostics::DiagnosticSink>>,
 }
+
+/// Capacity of the delivery-ack fan-out channel. Acks are tiny,
+/// short-lived, and consumed by at most a handful of in-flight
+/// `send_with_delivery_ack` waiters; lag just drops stale receipts.
+pub(crate) const ACK_BROADCAST_CAPACITY: usize = 64;
 
 /// Capacity of the recently-broadcast ring. Sized to a multiple of
 /// [`LIVE_BROADCAST_CAPACITY`] so even a maximally-lagging consumer
@@ -422,6 +436,10 @@ impl Airc {
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                     RECENTLY_BROADCAST_CAPACITY,
                 )),
+                ack_tx: broadcast::channel(ACK_BROADCAST_CAPACITY).0,
+                diag_sink: std::sync::RwLock::new(Arc::new(
+                    airc_diagnostics::StderrJsonDiagnosticSink,
+                )),
             }),
         })
     }
@@ -435,6 +453,32 @@ impl Airc {
             Err(poisoned) => poisoned.into_inner(),
         };
         ring.mark(event_id)
+    }
+
+    /// Replace the diagnostic sink used by this handle's receive
+    /// path (card 39d37629). Production keeps the stderr-JSON
+    /// default; tests inject a `MemoryDiagnosticSink` to assert that
+    /// undeliverable frames emit a typed diagnostic — making the
+    /// "suppress the diagnostic" mutation a test failure.
+    pub fn set_diagnostic_sink(&self, sink: Arc<dyn airc_diagnostics::DiagnosticSink>) {
+        let mut guard = match self.inner.diag_sink.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = sink;
+    }
+
+    pub(crate) fn diag_sink(&self) -> Arc<dyn airc_diagnostics::DiagnosticSink> {
+        let guard = match self.inner.diag_sink.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    }
+
+    /// Emit a diagnostic through this handle's configured sink.
+    pub(crate) fn emit_diag(&self, event: airc_diagnostics::DiagnosticEvent) {
+        self.diag_sink().emit(event);
     }
 
     /// Return the home directory backing this handle.
@@ -850,6 +894,8 @@ impl Airc {
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
             )),
+            ack_tx: self.inner.ack_tx.clone(),
+            diag_sink: std::sync::RwLock::new(self.diag_sink()),
         };
         Self {
             inner: Arc::new(inner),
