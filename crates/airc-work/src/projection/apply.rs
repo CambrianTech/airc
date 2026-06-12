@@ -3,8 +3,8 @@ use crate::event::{
     ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
-    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkspaceAllocated,
-    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent,
+    WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 use crate::ids::{WorkCardId, WorkspaceId};
@@ -54,6 +54,7 @@ impl WorkBoardProjection {
                 Ok(())
             }
             WorkEvent::PullRequestLinked(e) => self.apply_pull_request_linked(e),
+            WorkEvent::PullRequestRelinked(e) => self.apply_pull_request_relinked(e),
             WorkEvent::PullRequestMerged(e) => self.apply_pull_request_merged(e),
             WorkEvent::HygieneReportRecorded(e) => self.apply_hygiene_report_recorded(e),
             WorkEvent::ManagerHatClaimed(e) => self.apply_manager_hat_claimed(e),
@@ -495,6 +496,41 @@ impl WorkBoardProjection {
         card.pull_request = Some(e.pull_request.clone());
         card.state = CardState::Review;
         card.updated_at_ms = e.linked_at_ms;
+        Ok(())
+    }
+
+    /// Card 09fddedd: supersede a card's linked PR with a successor.
+    ///
+    /// The emitter (`Airc::relink_card_pull_request`) is the loud
+    /// validation layer — card must exist, must currently have a
+    /// linked PR, the successor must differ and target the same base.
+    /// The projection apply is the deterministic replay layer:
+    ///
+    ///   * Unknown card → `ProjectionError::UnknownCard`, same as
+    ///     `apply_pull_request_linked` (and equally tolerated by
+    ///     `apply_windowed` as a missing window anchor).
+    ///   * Card already `Merged`/`Closed` → drop silently. A relink
+    ///     racing a terminal transition lost the race; flipping a
+    ///     Merged card back into Review would make the merger merge a
+    ///     successor for work that already shipped, and erroring would
+    ///     poison every consumer's board (same tolerant-replay rule as
+    ///     ghost claim heartbeats above).
+    ///   * Otherwise: adopt the successor and (re)enter Review, exactly
+    ///     like `apply_pull_request_linked`, so the merger gate sees
+    ///     the new PR as the card's single source of truth. The
+    ///     superseded link survives in the transcript event, not in
+    ///     projection state.
+    fn apply_pull_request_relinked(
+        &mut self,
+        e: &PullRequestRelinked,
+    ) -> Result<(), ProjectionError> {
+        let card = self.card_mut(e.card_id)?;
+        if matches!(card.state, CardState::Merged | CardState::Closed) {
+            return Ok(());
+        }
+        card.pull_request = Some(e.new_pull_request.clone());
+        card.state = CardState::Review;
+        card.updated_at_ms = e.relinked_at_ms;
         Ok(())
     }
 

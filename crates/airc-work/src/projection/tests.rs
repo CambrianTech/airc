@@ -1615,3 +1615,202 @@ fn apply_windowed_skips_missing_anchor_and_fails_structural_errors() {
         Err(ProjectionError::DuplicateCard(card_id))
     );
 }
+
+// Card 09fddedd — `PullRequestRelinked` projection semantics. The
+// loud-refusal layer lives in `Airc::relink_card_pull_request`
+// (airc-lib); the projection layer is the deterministic-replay rule:
+// adopt the successor on live cards, drop silently on terminal cards,
+// error (window-anchor-tolerantly) on unknown cards.
+
+fn relink_pr(number: u64, head: &str) -> PullRequestRef {
+    PullRequestRef {
+        repo: repo(),
+        number,
+        head: BranchName::new(head).unwrap(),
+        base: BranchName::new("rust-rewrite").unwrap(),
+    }
+}
+
+fn relink_card_created(card_id: WorkCardId, owner: PeerId) -> WorkEvent {
+    WorkEvent::CardCreated(CardCreated {
+        card_id,
+        repo: repo(),
+        title: "relink projection".to_string(),
+        body: None,
+        priority: Priority::P2,
+        lane_id: None,
+        created_by: owner,
+        created_at_ms: 1,
+        reviews: None,
+        origin: None,
+    })
+}
+
+#[test]
+fn relink_supersedes_stale_link_and_reenters_review() {
+    // what this catches: the exact failure class of card 6967921d —
+    // a card whose round-1 PR went stale could never adopt the
+    // round-2 PR. After PullRequestRelinked the projection must hold
+    // ONLY the successor (the superseded link survives in the
+    // transcript event, not in projection state) and the card must be
+    // in Review so the merger gate sees it.
+    let card_id = WorkCardId::from_u128(1);
+    let owner = peer(2);
+    let old = relink_pr(1078, "feat/round-1");
+    let new = relink_pr(1137, "feat/round-2");
+
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&relink_card_created(card_id, owner))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestLinked(PullRequestLinked {
+            card_id,
+            pull_request: old.clone(),
+            linked_by: owner,
+            linked_at_ms: 2,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestRelinked(PullRequestRelinked {
+            card_id,
+            old_pull_request: old,
+            new_pull_request: new.clone(),
+            relinked_by: owner,
+            relinked_at_ms: 3,
+        }))
+        .unwrap();
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(
+        card.pull_request,
+        Some(new),
+        "successor is the single source of truth"
+    );
+    assert_eq!(
+        card.state,
+        CardState::Review,
+        "relink must (re)enter Review for the merger"
+    );
+    assert_eq!(card.updated_at_ms, 3);
+}
+
+#[test]
+fn relink_racing_terminal_state_is_dropped_without_poisoning_projection() {
+    // what this catches: a relink event that lost a race against
+    // PullRequestMerged (or a close) flipping a finished card back
+    // into Review — the merger would then merge a successor for work
+    // that already shipped. The projection must drop the event
+    // silently (same tolerant-replay rule as ghost claim heartbeats):
+    // state, link, and updated_at_ms all stay exactly as the terminal
+    // transition left them.
+    let card_id = WorkCardId::from_u128(1);
+    let owner = peer(2);
+    let old = relink_pr(1078, "feat/round-1");
+
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&relink_card_created(card_id, owner))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestLinked(PullRequestLinked {
+            card_id,
+            pull_request: old.clone(),
+            linked_by: owner,
+            linked_at_ms: 2,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestMerged(PullRequestMerged {
+            card_id,
+            pull_request: old.clone(),
+            merged_by: owner,
+            merged_at_ms: 3,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestRelinked(PullRequestRelinked {
+            card_id,
+            old_pull_request: old.clone(),
+            new_pull_request: relink_pr(1137, "feat/round-2"),
+            relinked_by: owner,
+            relinked_at_ms: 4,
+        }))
+        .unwrap();
+
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(
+        card.state,
+        CardState::Merged,
+        "merged card must stay merged"
+    );
+    assert_eq!(
+        card.pull_request,
+        Some(old),
+        "merged card keeps the PR that shipped"
+    );
+    assert_eq!(
+        card.updated_at_ms, 3,
+        "dropped relink must not even bump updated_at_ms"
+    );
+
+    // Closed cards get the same drop.
+    let closed_id = WorkCardId::from_u128(10);
+    projection
+        .apply(&relink_card_created(closed_id, owner))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestLinked(PullRequestLinked {
+            card_id: closed_id,
+            pull_request: relink_pr(1200, "feat/closed-round-1"),
+            linked_by: owner,
+            linked_at_ms: 5,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::CardStateChanged(CardStateChanged {
+            card_id: closed_id,
+            state: CardState::Closed,
+            changed_by: owner,
+            changed_at_ms: 6,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::PullRequestRelinked(PullRequestRelinked {
+            card_id: closed_id,
+            old_pull_request: relink_pr(1200, "feat/closed-round-1"),
+            new_pull_request: relink_pr(1201, "feat/closed-round-2"),
+            relinked_by: owner,
+            relinked_at_ms: 7,
+        }))
+        .unwrap();
+    let closed = projection.card(closed_id).unwrap();
+    assert_eq!(closed.state, CardState::Closed);
+    assert_eq!(
+        closed.pull_request,
+        Some(relink_pr(1200, "feat/closed-round-1"))
+    );
+}
+
+#[test]
+fn relink_for_unknown_card_errors_strict_and_skips_windowed() {
+    // what this catches: drift in the missing-window-anchor contract.
+    // Strict apply must surface UnknownCard (loud failure for full
+    // replays); apply_windowed must skip it (bounded windows and
+    // cache resume legally start after the card's creation event).
+    let owner = peer(2);
+    let event = WorkEvent::PullRequestRelinked(PullRequestRelinked {
+        card_id: WorkCardId::from_u128(404),
+        old_pull_request: relink_pr(1078, "feat/round-1"),
+        new_pull_request: relink_pr(1137, "feat/round-2"),
+        relinked_by: owner,
+        relinked_at_ms: 1,
+    });
+
+    let mut projection = WorkBoardProjection::new();
+    assert_eq!(
+        projection.apply(&event),
+        Err(ProjectionError::UnknownCard(WorkCardId::from_u128(404)))
+    );
+    assert_eq!(projection.apply_windowed(&event), Ok(()));
+}

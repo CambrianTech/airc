@@ -122,6 +122,42 @@ pub enum AircError {
         owner: Option<airc_core::PeerId>,
     },
 
+    /// Card 09fddedd: `relink` supersedes an EXISTING link — a card
+    /// with no linked PR has nothing to supersede. Use `airc work
+    /// link` for the first link; refusing here keeps the audit
+    /// semantics honest (`PullRequestRelinked.old_pull_request` must
+    /// record a real prior link, never a fabricated placeholder).
+    #[error(
+        "work card {card_id} has no linked pull_request to supersede; use `airc work link` for the first link"
+    )]
+    WorkCardHasNoLinkedPullRequest { card_id: airc_work::WorkCardId },
+
+    /// Card 09fddedd: relinking a card to the PR it already tracks is
+    /// always an operator mistake (wrong card id or wrong PR number) —
+    /// emitting a no-op supersede event would only pollute the audit
+    /// trail, so the SDK refuses loudly instead.
+    #[error(
+        "work card {card_id} is already linked to PR #{number} ({repo}); relink requires a different successor PR"
+    )]
+    WorkCardRelinkSamePullRequest {
+        card_id: airc_work::WorkCardId,
+        repo: airc_work::RepoId,
+        number: u64,
+    },
+
+    /// Card 09fddedd: a card in a terminal state (`Merged`/`Closed`)
+    /// has finished its lifecycle; superseding its PR link would point
+    /// the merger at a successor for work that already shipped. The
+    /// projection drops such events defensively on replay; the SDK
+    /// refuses up front so the operator hears about it.
+    #[error(
+        "work card {card_id} is in terminal state {state:?}; its pull_request link cannot be superseded"
+    )]
+    WorkCardRelinkTerminalState {
+        card_id: airc_work::WorkCardId,
+        state: airc_work::CardState,
+    },
+
     /// Caller passed a peer registry operation referencing a peer
     /// not in the local registry.
     #[error("unknown peer: {0}")]

@@ -126,6 +126,13 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             project_pull_request(headers, &e.pull_request);
         }
+        WorkEvent::PullRequestRelinked(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            // Route on the SUCCESSOR — it is the card's new source of
+            // truth and what subscribers (merger, board renderers)
+            // care about. The superseded PR rides the body for audit.
+            project_pull_request(headers, &e.new_pull_request);
+        }
         WorkEvent::PullRequestMerged(e) => {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             project_pull_request(headers, &e.pull_request);

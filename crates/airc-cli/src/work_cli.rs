@@ -349,6 +349,25 @@ pub enum WorkAction {
         #[arg(long)]
         pr: u64,
     },
+    /// Card 09fddedd: re-point a card's linked PR at a successor PR.
+    /// `airc work link` is first-write-wins — a card whose round-1 PR
+    /// was closed/superseded (orphaned stacked PRs, recovered lanes)
+    /// could never track the round-2 PR carrying the real fix, so the
+    /// merger skipped the card forever and Review cards orphaned
+    /// (failure class: card 6967921d). Relink emits a typed
+    /// `PullRequestRelinked` event recording the superseded link for
+    /// audit. Refuses loudly when the card has no linked PR (use
+    /// `link`), is already Merged/Closed, the successor IS the current
+    /// PR, or the successor doesn't exist / targets a different base
+    /// than the link it supersedes (validated via `gh --json`).
+    Relink {
+        /// Work card UUID whose PR link to supersede.
+        card_id: String,
+        /// Successor PR: a number (e.g. 1137) or a full GitHub PR URL
+        /// (e.g. https://github.com/CambrianTech/airc/pull/1137).
+        #[arg(long)]
+        pr: String,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]

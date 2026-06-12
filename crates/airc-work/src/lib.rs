@@ -35,8 +35,8 @@ pub use event::{
     ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
-    PullRequestMerged, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent, WorkspaceAllocated,
-    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent,
+    WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use goal::{ExitCondition, Goal, GoalState};

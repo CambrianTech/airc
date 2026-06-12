@@ -39,6 +39,7 @@ pub enum WorkEvent {
     PullRequestReviewSubmitted(PullRequestReviewSubmitted),
     PullRequestMergeStateChanged(PullRequestMergeStateChanged),
     PullRequestLinked(PullRequestLinked),
+    PullRequestRelinked(PullRequestRelinked),
     PullRequestMerged(PullRequestMerged),
     HygieneReportRecorded(HygieneReportRecorded),
     ManagerHatClaimed(ManagerHatClaimed),
@@ -85,6 +86,7 @@ impl WorkEvent {
             WorkEvent::PullRequestReviewSubmitted(e) => e.submitted_at_ms,
             WorkEvent::PullRequestMergeStateChanged(e) => e.changed_at_ms,
             WorkEvent::PullRequestLinked(e) => e.linked_at_ms,
+            WorkEvent::PullRequestRelinked(e) => e.relinked_at_ms,
             WorkEvent::PullRequestMerged(e) => e.merged_at_ms,
             WorkEvent::HygieneReportRecorded(e) => e.report.recorded_at_ms,
             WorkEvent::ManagerHatClaimed(e) => e.claimed_at_ms,
@@ -400,6 +402,36 @@ pub struct PullRequestLinked {
     pub pull_request: PullRequestRef,
     pub linked_by: PeerId,
     pub linked_at_ms: u64,
+}
+
+/// Card 09fddedd: re-point a card's linked PR at a successor PR.
+///
+/// `PullRequestLinked` is effectively first-write-wins at the CLI
+/// layer (`airc work link` / `state review` both no-op on an
+/// already-linked card), so a card whose round-1 PR was closed or
+/// merged without the real fix (orphaned stacked PRs, recovered
+/// lanes — failure class: card 6967921d) could never be pointed at
+/// the round-2 PR carrying the actual work. The merger then skips
+/// the card forever and the successor PR needs a manual merge.
+///
+/// This event is the intentional-supersede path: it records BOTH
+/// links — `old_pull_request` for auditability (which PR the card
+/// abandoned, and why the transcript shows two), `new_pull_request`
+/// as the new single source of truth the projection adopts. It is
+/// deliberately a distinct variant rather than a second
+/// `PullRequestLinked` so replayers can tell a supersede from a
+/// duplicate link without diffing projection state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestRelinked {
+    pub card_id: WorkCardId,
+    /// The link being superseded, exactly as the projection held it
+    /// when the relink was emitted. Audit trail — the projection
+    /// drops it, the transcript keeps it.
+    pub old_pull_request: PullRequestRef,
+    /// The successor PR the card now tracks.
+    pub new_pull_request: PullRequestRef,
+    pub relinked_by: PeerId,
+    pub relinked_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

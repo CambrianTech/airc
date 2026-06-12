@@ -764,6 +764,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 pending_timeout_secs,
             } => work_commands::run_merge(&home, card_id, dry_run, pending_timeout_secs).await,
             WorkAction::Link { card_id, pr } => work_commands::run_link(&home, card_id, pr).await,
+            WorkAction::Relink { card_id, pr } => {
+                work_commands::run_relink(&home, card_id, pr).await
+            }
         },
 
         Command::Lane(args) => match args.action {

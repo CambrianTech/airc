@@ -164,8 +164,9 @@ pub use work::{
     ClaimableWorkItem, ClaimableWorkQuery, CreateWorkCard, CreateWorkLane, HeartbeatWorkClaim,
     HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged, ObserveLocalGitWorkspace,
     ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
-    ReleaseWorkClaim, ReleaseWorkspace, ReportAgentAvailability, RequestWorkspace, UpdateWorkCard,
-    WorkQueueStatus, WorkQueueStatusQuery, WORK_BOARD_PROJECTION_PAGE_SIZE,
+    ReleaseWorkClaim, ReleaseWorkspace, RelinkCardPullRequest, ReportAgentAvailability,
+    RequestWorkspace, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
+    WORK_BOARD_PROJECTION_PAGE_SIZE,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,
