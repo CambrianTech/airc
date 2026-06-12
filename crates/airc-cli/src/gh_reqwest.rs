@@ -22,10 +22,18 @@ use tokio::process::Command;
 //
 // Implementation surface mirrors ShellGhClient — same GhClient trait, same
 // typed errors, so swap is a one-line change at the call site. Auth comes
-// from GITHUB_TOKEN env first, fallback to a one-time `gh auth token` spawn
-// (cached for the process lifetime; gh's tokens are valid ~1h, refresh on
-// HTTP 401).
+// from GH_TOKEN/GITHUB_TOKEN env first, fallback to a one-time `gh auth
+// token` spawn (cached for the process lifetime; on an HTTP 401 the chain
+// re-runs ONCE and the request retries with the fresh token — card
+// 09cd0afb Sub-3, because gh tokens rotate mid-session and a long-lived
+// merger daemon must survive that without a restart).
 // ============================================================================
+
+/// Test seam for the 401-refresh tests: replaces the env/gh-spawn token
+/// resolution chain so "stale cached token → fresh resolved token" is
+/// observable without racy env mutation. Never compiled into production.
+#[cfg(test)]
+type TokenResolver = std::sync::Arc<dyn Fn() -> Result<String, GhError> + Send + Sync>;
 
 /// Direct-HTTP [`GhClient`] backed by `reqwest`. One shared `reqwest::Client`
 /// across calls so the TCP+TLS handshake amortises — that's where the
@@ -33,11 +41,18 @@ use tokio::process::Command;
 #[derive(Clone)]
 pub struct ReqwestGhClient {
     http: reqwest::Client,
-    token: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Resolved bearer token. `RwLock<Option<…>>` (not `OnceLock`) so a
+    /// 401 can evict and replace it — gh API tokens rotate mid-process
+    /// (documented operational fact), and `OnceLock` made that fatal
+    /// until restart. Happy path cost is one uncontended read-lock +
+    /// one `String` clone per request, same as the old `get().clone()`.
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// API origin. `https://api.github.com` in production; tests point
     /// it at a local listener so the wire shape (auth header, accept,
     /// api-version) is pinned without touching live GitHub.
     api_base: String,
+    #[cfg(test)]
+    test_resolver: Option<TokenResolver>,
 }
 
 // Card c1090a24: manual Debug — the derived impl would print the
@@ -46,9 +61,13 @@ pub struct ReqwestGhClient {
 // been resolved yet.
 impl std::fmt::Debug for ReqwestGhClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let resolved = match self.token.read() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        };
         f.debug_struct("ReqwestGhClient")
             .field("api_base", &self.api_base)
-            .field("token", &self.token.get().map(|_| "<redacted>"))
+            .field("token", &resolved.then_some("<redacted>"))
             .finish_non_exhaustive()
     }
 }
@@ -70,8 +89,10 @@ impl ReqwestGhClient {
             .map_err(|e| GhError::Process(std::io::Error::other(e.to_string())))?;
         Ok(Self {
             http,
-            token: std::sync::Arc::new(std::sync::OnceLock::new()),
+            token: std::sync::Arc::new(std::sync::RwLock::new(None)),
             api_base: "https://api.github.com".to_string(),
+            #[cfg(test)]
+            test_resolver: None,
         })
     }
 
@@ -81,29 +102,65 @@ impl ReqwestGhClient {
     #[cfg(test)]
     pub(crate) fn for_test(api_base: String, token: String) -> Result<Self, GhError> {
         let client = Self::new()?;
-        let _ = client.token.set(token);
+        client.store_token(token);
         Ok(Self { api_base, ..client })
     }
 
-    /// Resolve a GitHub token. Tries `GH_TOKEN` then `GITHUB_TOKEN` env
-    /// first (cheap, what CI typically provides; same precedence as the
-    /// gh CLI itself); falls back to a one-time `gh auth token` spawn
-    /// (~50ms; cached for the process lifetime, refreshed only on a
-    /// 401 from a subsequent call).
-    async fn ensure_token(&self) -> Result<String, GhError> {
-        if let Some(token) = self.token.get() {
-            return Ok(token.clone());
+    /// Test seam for the 401-refresh path: like [`Self::for_test`] but
+    /// the resolution chain is replaced by `resolver`, so a refresh
+    /// observably swaps `initial_token` for whatever `resolver` yields.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_resolver(
+        api_base: String,
+        initial_token: String,
+        resolver: TokenResolver,
+    ) -> Result<Self, GhError> {
+        let mut client = Self::for_test(api_base, initial_token)?;
+        client.test_resolver = Some(resolver);
+        Ok(client)
+    }
+
+    /// Read the cached token, surviving lock poisoning (a panicked
+    /// holder can't corrupt an `Option<String>` — the value is either
+    /// the old token or the new one, both valid states).
+    fn cached_token(&self) -> Option<String> {
+        match self.token.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Replace the cached token.
+    fn store_token(&self, token: String) {
+        let mut guard = match self.token.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(token);
+    }
+
+    /// Run the token resolution chain, IGNORING the cache. Tries
+    /// `GH_TOKEN` then `GITHUB_TOKEN` env first (cheap, what CI
+    /// typically provides; same precedence as the gh CLI itself);
+    /// falls back to a `gh auth token` spawn (~50ms). Used for both
+    /// first resolution and the 401-triggered refresh — the keychain
+    /// copy `gh auth token` reads usually outlives a rotated env copy,
+    /// so the re-spawn is the part that actually rescues a long-lived
+    /// daemon.
+    async fn resolve_token_uncached(&self) -> Result<String, GhError> {
+        #[cfg(test)]
+        if let Some(resolver) = &self.test_resolver {
+            return resolver();
         }
         for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
             if let Ok(env) = std::env::var(var) {
                 if !env.is_empty() {
-                    let _ = self.token.set(env.clone());
                     return Ok(env);
                 }
             }
         }
-        // One-time gh-auth-token spawn. Same shape as ShellGhClient's
-        // subprocess pattern; this is the only gh process spawn we do.
+        // gh-auth-token spawn. Same shape as ShellGhClient's subprocess
+        // pattern; this is the only gh process spawn we do.
         let output = Command::new("gh")
             .args(["auth", "token"])
             .output()
@@ -120,31 +177,134 @@ impl ReqwestGhClient {
                 stderr: "`gh auth token` returned empty".to_string(),
             });
         }
-        let _ = self.token.set(token.clone());
         Ok(token)
     }
 
-    /// Common request bootstrap: token + accept header + json body.
-    async fn authed(
+    /// Cached-token fast path: no resolution cost per request once a
+    /// token is held; first call resolves and caches.
+    async fn ensure_token(&self) -> Result<String, GhError> {
+        if let Some(token) = self.cached_token() {
+            return Ok(token);
+        }
+        let token = self.resolve_token_uncached().await?;
+        self.store_token(token.clone());
+        Ok(token)
+    }
+
+    /// 401 path (card 09cd0afb Sub-3): bypass the cache, re-run the
+    /// resolution chain once, replace the cached token, return it. A
+    /// resolution failure here propagates loudly — there is no silent
+    /// fallback to the shell backend.
+    async fn refresh_token(&self) -> Result<String, GhError> {
+        let token = self.resolve_token_uncached().await?;
+        self.store_token(token.clone());
+        Ok(token)
+    }
+
+    /// Build one authenticated request: GitHub Accept + api-version
+    /// headers, bearer auth, optional JSON body.
+    fn build_request<B>(
         &self,
         method: reqwest::Method,
-        url: String,
-    ) -> Result<reqwest::RequestBuilder, GhError> {
-        let token = self.ensure_token().await?;
-        Ok(self
+        url: &str,
+        token: &str,
+        body: Option<&B>,
+    ) -> reqwest::RequestBuilder
+    where
+        B: serde::Serialize + ?Sized,
+    {
+        let mut request = self
             .http
             .request(method, url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header("X-GitHub-Api-Version", "2022-11-28"))
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        request
+    }
+
+    /// Send an authenticated request with EXACTLY ONE 401-triggered
+    /// token refresh + retry (card 09cd0afb Sub-3). On the first 401,
+    /// the resolution chain re-runs (cache bypassed, `gh auth token`
+    /// re-spawned) and the request retries with the fresh token. If the
+    /// retry also 401s, fail loudly with an actionable error — never a
+    /// retry storm, never a silent fallback. Non-401 responses (success
+    /// or otherwise) are returned to the caller for status handling.
+    async fn send_authed<B>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&B>,
+    ) -> Result<reqwest::Response, GhError>
+    where
+        B: serde::Serialize + ?Sized + Sync,
+    {
+        let token = self.ensure_token().await?;
+        let first = self
+            .build_request(method.clone(), url, &token, body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        if first.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        // Token expired/rotated mid-process. One refresh, one retry.
+        drop(first);
+        let fresh = self.refresh_token().await?;
+        let second = self
+            .build_request(method, url, &fresh, body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        if second.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // The error names the resolution chain and the fix, never
+            // the token values themselves.
+            let github_said = second.text().await.unwrap_or_default();
+            return Err(GhError::AuthRequired {
+                stderr: format!(
+                    "GitHub returned 401 twice for {url} — the cached token AND a freshly \
+                     re-resolved one (GH_TOKEN → GITHUB_TOKEN → `gh auth token`) were both \
+                     rejected. Re-authenticate (`gh auth login`) or rotate the GH_TOKEN / \
+                     GITHUB_TOKEN env var. GitHub said: {github_said}"
+                ),
+            });
+        }
+        Ok(second)
     }
 }
+
+/// `None` body for GET-shaped calls through [`ReqwestGhClient::send_authed`]
+/// (a typed `None` so the generic parameter is inferable).
+const NO_BODY: Option<&serde_json::Value> = None;
 
 // Card 00e3aa39 Sub-2: deliberately no `Default` impl. `new()` returns
 // `Result<Self, GhError>` because the reqwest builder can in principle
 // fail (TLS init, etc.); callers should handle that result rather than
 // hiding it behind a panicking `Default`. clippy::expect_used (denied
 // workspace-wide) caught the original `.expect("…")` shortcut.
+
+/// `POST /repos/{owner}/{repo}/pulls` request body — the single source
+/// of truth for the wire field names (pinned by the pr_create
+/// wire-shape test). Holds no token; field set mirrors what the gh CLI
+/// sends for `gh pr create --base <base>` (no draft flag → false).
+#[derive(Debug, serde::Serialize)]
+struct PrCreateRequest<'a> {
+    title: &'a str,
+    body: &'a str,
+    head: &'a str,
+    base: &'a str,
+    draft: bool,
+}
+
+/// The slice of GitHub's create-PR response we consume; unknown fields
+/// are ignored (GitHub adds fields freely).
+#[derive(Debug, serde::Deserialize)]
+struct PrCreateResponse {
+    html_url: String,
+    number: u64,
+}
 
 #[async_trait]
 impl GhClient for ReqwestGhClient {
@@ -160,11 +320,8 @@ impl GhClient for ReqwestGhClient {
             self.api_base, args.repo, args.number
         );
         let pr_resp = self
-            .authed(reqwest::Method::GET, pr_url)
-            .await?
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+            .send_authed(reqwest::Method::GET, &pr_url, NO_BODY)
+            .await?;
         let pr_json: serde_json::Value = handle_response(pr_resp).await?;
 
         let head_sha = pr_json
@@ -183,11 +340,8 @@ impl GhClient for ReqwestGhClient {
             self.api_base, args.repo, head_sha
         );
         let runs_resp = self
-            .authed(reqwest::Method::GET, runs_url)
-            .await?
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+            .send_authed(reqwest::Method::GET, &runs_url, NO_BODY)
+            .await?;
         let runs_bytes = runs_resp.bytes().await.map_err(map_reqwest_error)?;
         let check_runs = airc_lib::gh_client::parse_check_runs(&runs_bytes)?;
 
@@ -225,18 +379,55 @@ impl GhClient for ReqwestGhClient {
     }
 
     async fn pr_create(&self, args: PrCreateArgs) -> Result<PrCreated, GhError> {
-        // pr_create is rare on the merger hot path (it runs in
-        // open_pr_and_link, not per-tick). Implemented for surface
-        // parity with ShellGhClient; the gh-cli body-derivation logic
-        // (subject/body from HEAD commit) stays in the caller, this
-        // just executes the POST.
-        let _ = args;
-        Err(GhError::OutputParse(
-            "ReqwestGhClient::pr_create is not yet wired — \
-             the existing open_pr_and_link path uses ShellGhClient's \
-             body-derivation flow. Sub-3 wires this through."
-                .to_string(),
-        ))
+        // Card 09cd0afb Sub-3: POST /repos/{owner}/{repo}/pulls.
+        // Mirrors ShellGhClient::pr_create semantics (`gh pr create
+        // --fill --base <base>` from args.cwd): gh resolves the repo
+        // from the origin remote, the head from the current branch,
+        // and the title/body from the HEAD commit — we do the same
+        // resolution explicitly via the existing work_commands_git
+        // helpers (single source of truth; deterministic HEAD
+        // subject/body rather than --fill's branch-name heuristic,
+        // see the card 13131f1c note on those helpers). Like the
+        // shell path, no draft flag → draft: false. The git reads are
+        // short-lived plumbing spawns; pr_create is off the per-tick
+        // hot path (it runs once per PR open).
+        let cwd = args.cwd.to_string_lossy().to_string();
+        let repo = crate::work_commands_git::cwd_github_repo_id(&cwd).ok_or_else(|| {
+            GhError::NotInGithubRepo {
+                stderr: format!(
+                    "{} has no github.com origin remote — cannot resolve owner/repo \
+                     for POST /pulls",
+                    args.cwd.display()
+                ),
+            }
+        })?;
+        let head = crate::work_commands_git::git_rev_parse_branch(&cwd)
+            .map_err(|e| GhError::Process(std::io::Error::other(e.to_string())))?;
+        let subject = crate::work_commands_git::git_show_format(&cwd, "%s")
+            .map_err(|e| GhError::Process(std::io::Error::other(e.to_string())))?;
+        let body_text = crate::work_commands_git::git_show_format(&cwd, "%b")
+            .map_err(|e| GhError::Process(std::io::Error::other(e.to_string())))?;
+
+        let url = format!("{}/repos/{}/pulls", self.api_base, repo);
+        let request = PrCreateRequest {
+            title: subject.trim(),
+            body: body_text.trim(),
+            head: &head,
+            base: &args.base,
+            draft: false,
+        };
+        let resp = self
+            .send_authed(reqwest::Method::POST, &url, Some(&request))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error_status(status, resp).await);
+        }
+        let created: PrCreateResponse = resp.json().await.map_err(map_reqwest_error)?;
+        Ok(PrCreated {
+            url: created.html_url,
+            number: created.number,
+        })
     }
 
     async fn pr_merge(&self, args: PrMergeArgs) -> Result<MergeReceipt, GhError> {
@@ -246,12 +437,8 @@ impl GhClient for ReqwestGhClient {
         );
         let body = serde_json::json!({ "merge_method": "squash" });
         let resp = self
-            .authed(reqwest::Method::PUT, url)
-            .await?
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+            .send_authed(reqwest::Method::PUT, &url, Some(&body))
+            .await?;
         // Successful merge returns 200 with `merged: true`. 405 (method
         // not allowed) and 409 (conflict) both map to PrNotMergeable.
         let status = resp.status();
@@ -278,12 +465,8 @@ impl GhClient for ReqwestGhClient {
         );
         let body = serde_json::json!({ "base": args.base });
         let resp = self
-            .authed(reqwest::Method::PATCH, url)
-            .await?
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+            .send_authed(reqwest::Method::PATCH, &url, Some(&body))
+            .await?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -302,11 +485,8 @@ impl GhClient for ReqwestGhClient {
             self.api_base, args.repo, args.branch
         );
         let resp = self
-            .authed(reqwest::Method::GET, url)
-            .await?
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+            .send_authed(reqwest::Method::GET, &url, NO_BODY)
+            .await?;
         if !resp.status().is_success() {
             return Err(map_http_error_status(resp.status(), resp).await);
         }
@@ -445,44 +625,72 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// One-shot local HTTP listener: accepts a single connection,
-    /// captures the raw request head, replies with the given JSON body.
-    /// Returns (base_url, join-handle-yielding-request-text).
-    async fn one_shot_server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    /// Scripted local HTTP listener: accepts ONE connection per
+    /// scripted (status, body) response, captures each raw request
+    /// (head + body, honouring Content-Length), replies, closes.
+    /// Returns (base_url, join-handle-yielding-captured-requests).
+    /// The listener drops after the last scripted response, so any
+    /// extra request (a retry storm) fails to connect — loud in the
+    /// caller's error, and visible as `captured.len()` to asserts.
+    async fn scripted_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local listener");
         let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut buf = vec![0u8; 16 * 1024];
-            let mut read_total = 0;
-            // Read until end of headers — GET requests have no body.
-            loop {
-                let n = stream
-                    .read(&mut buf[read_total..])
+            let mut captured = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read headers, then Content-Length more bytes (POST/PUT
+                // bodies); GETs have no body and stop at the blank line.
+                let request = loop {
+                    let n = stream.read(&mut chunk).await.expect("read request");
+                    if n == 0 {
+                        break String::from_utf8_lossy(&buf).to_string();
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(headers_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..headers_end]).to_lowercase();
+                        let content_length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= headers_end + 4 + content_length {
+                            break String::from_utf8_lossy(&buf).to_string();
+                        }
+                    }
+                };
+                captured.push(request);
+                let reason = if status < 400 { "OK" } else { "NOPE" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
                     .await
-                    .expect("read request");
-                read_total += n;
-                if n == 0 || buf[..read_total].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
+                    .expect("write response");
+                stream.flush().await.expect("flush");
             }
-            let request = String::from_utf8_lossy(&buf[..read_total]).to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-            stream.flush().await.expect("flush");
-            request
+            captured
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Await the scripted server with a deadline so a client that makes
+    /// FEWER requests than scripted hangs the test loudly instead of
+    /// forever.
+    async fn join_server(handle: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("server saw fewer requests than scripted (client gave up early?)")
+            .expect("server task panicked")
     }
 
     /// Card c1090a24 wire-shape pin — the load-bearing one. The
@@ -491,7 +699,8 @@ mod tests {
     /// GitHub Accept + api-version headers REST requires.
     #[tokio::test]
     async fn branch_check_rollup_sends_bearer_auth_and_github_headers() {
-        let (base, server) = one_shot_server(r#"{"total_count":0,"check_runs":[]}"#).await;
+        let (base, server) =
+            scripted_server(vec![(200, r#"{"total_count":0,"check_runs":[]}"#)]).await;
         let client = ReqwestGhClient::for_test(base, "test-token-sekrit".to_string())
             .expect("client builds");
         let runs = client
@@ -503,7 +712,9 @@ mod tests {
             .expect("rollup against local listener");
         assert!(runs.is_empty(), "empty check_runs envelope → empty vec");
 
-        let request = server.await.expect("server task");
+        let mut requests = join_server(server).await;
+        assert_eq!(requests.len(), 1, "exactly one request expected");
+        let request = requests.remove(0);
         let lowered = request.to_lowercase();
         assert!(
             lowered.contains("authorization: bearer test-token-sekrit"),
@@ -521,6 +732,190 @@ mod tests {
             request.starts_with("GET /repos/octo/repo/commits/main/check-runs"),
             "unexpected request line; request was:\n{request}"
         );
+    }
+
+    /// Card 09cd0afb Sub-3 pin (a): a 401 triggers EXACTLY ONE token
+    /// re-resolution, and the retry carries the REFRESHED token, not
+    /// the stale one. Mutation check: make the retry reuse the stale
+    /// token and the second-request assert fails.
+    #[tokio::test]
+    async fn refresh_on_401_retries_once_with_fresh_token() {
+        let (base, server) = scripted_server(vec![
+            (401, r#"{"message":"Bad credentials"}"#),
+            (200, r#"{"total_count":0,"check_runs":[]}"#),
+        ])
+        .await;
+        let resolver: TokenResolver =
+            std::sync::Arc::new(|| Ok("fresh-token-after-rotation".to_string()));
+        let client = ReqwestGhClient::for_test_with_resolver(
+            base,
+            "stale-token-expired".to_string(),
+            resolver,
+        )
+        .expect("client builds");
+        let runs = client
+            .branch_check_rollup(BranchCheckRollupArgs {
+                repo: "octo/repo".to_string(),
+                branch: "main".to_string(),
+            })
+            .await
+            .expect("401 then 200 must succeed via one refresh");
+        assert!(runs.is_empty());
+
+        let requests = join_server(server).await;
+        assert_eq!(requests.len(), 2, "one original + one retry, nothing more");
+        let first = requests[0].to_lowercase();
+        let second = requests[1].to_lowercase();
+        assert!(
+            first.contains("authorization: bearer stale-token-expired"),
+            "first request must carry the cached (stale) token; was:\n{}",
+            requests[0]
+        );
+        assert!(
+            second.contains("authorization: bearer fresh-token-after-rotation"),
+            "retry must carry the REFRESHED token — retrying with the stale \
+             token is the exact bug this pins; was:\n{}",
+            requests[1]
+        );
+        assert!(
+            !second.contains("stale-token-expired"),
+            "stale token must not appear on the retry; was:\n{}",
+            requests[1]
+        );
+    }
+
+    /// Card 09cd0afb Sub-3 pin (b): when the refreshed token ALSO 401s,
+    /// fail loudly with AuthRequired after exactly two requests — one
+    /// refresh attempt per request, never a retry storm. Mutation
+    /// check: loop the refresh and the third connect fails (listener
+    /// closed), turning the error non-AuthRequired → this test fails.
+    #[tokio::test]
+    async fn double_401_fails_loud_after_exactly_two_requests() {
+        let (base, server) = scripted_server(vec![
+            (401, r#"{"message":"Bad credentials"}"#),
+            (401, r#"{"message":"Bad credentials"}"#),
+        ])
+        .await;
+        let resolver: TokenResolver =
+            std::sync::Arc::new(|| Ok("sekrit-fresh-rejected".to_string()));
+        let client = ReqwestGhClient::for_test_with_resolver(
+            base,
+            "sekrit-stale-rejected".to_string(),
+            resolver,
+        )
+        .expect("client builds");
+        let error = client
+            .branch_check_rollup(BranchCheckRollupArgs {
+                repo: "octo/repo".to_string(),
+                branch: "main".to_string(),
+            })
+            .await
+            .expect_err("double 401 must be a loud error, not a hang or a storm");
+        match error {
+            GhError::AuthRequired { ref stderr } => {
+                assert!(
+                    stderr.contains("401 twice"),
+                    "error must say the refresh was attempted and also rejected: {stderr}"
+                );
+                assert!(
+                    stderr.contains("gh auth login"),
+                    "error must be actionable: {stderr}"
+                );
+                assert!(
+                    !stderr.contains("sekrit-stale-rejected")
+                        && !stderr.contains("sekrit-fresh-rejected"),
+                    "token values must NEVER appear in error messages: {stderr}"
+                );
+            }
+            ref other => panic!("expected GhError::AuthRequired, got: {other:?}"),
+        }
+        let requests = join_server(server).await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one refresh attempt per request — no retry storm"
+        );
+    }
+
+    /// Card 09cd0afb Sub-3 pin (c): pr_create wire shape. POST to
+    /// /repos/{owner}/{repo}/pulls with the literal JSON field names
+    /// GitHub's create-PR endpoint requires, values resolved from the
+    /// worktree exactly like the shell backend (origin remote → repo,
+    /// current branch → head, HEAD commit → title/body, no draft).
+    #[tokio::test]
+    async fn pr_create_posts_typed_body_to_pulls_endpoint() {
+        // A real throwaway git repo: pr_create resolves repo/head/
+        // title/body from worktree state, mirroring ShellGhClient.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--initial-branch", "agent/feature-branch"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Wire Shape Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/octo/repo.git",
+        ]);
+        std::fs::write(temp.path().join("file.txt"), "payload").expect("write file");
+        git(&["add", "."]);
+        git(&[
+            "commit",
+            "-m",
+            "feat(gh): wire pr_create\n\nBody of the commit.",
+        ]);
+
+        let (base, server) = scripted_server(vec![(
+            201,
+            r#"{"html_url":"https://github.com/octo/repo/pull/77","number":77,"state":"open"}"#,
+        )])
+        .await;
+        let client =
+            ReqwestGhClient::for_test(base, "test-token-sekrit".to_string()).expect("client");
+        let created = client
+            .pr_create(PrCreateArgs {
+                cwd: temp.path().to_path_buf(),
+                base: "rust-rewrite".to_string(),
+            })
+            .await
+            .expect("pr_create against local listener");
+        assert_eq!(created.number, 77);
+        assert_eq!(created.url, "https://github.com/octo/repo/pull/77");
+
+        let requests = join_server(server).await;
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /repos/octo/repo/pulls HTTP/1.1"),
+            "method + path pin; request was:\n{request}"
+        );
+        // Literal JSON field-name pins — the GitHub REST contract.
+        for expected in [
+            r#""title":"feat(gh): wire pr_create""#,
+            r#""body":"Body of the commit.""#,
+            r#""head":"agent/feature-branch""#,
+            r#""base":"rust-rewrite""#,
+            r#""draft":false"#,
+        ] {
+            assert!(
+                request.contains(expected),
+                "pr_create body missing {expected}; request was:\n{request}"
+            );
+        }
     }
 
     /// Card c1090a24 token-never-logged pin: `{:?}` of the client must
