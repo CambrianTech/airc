@@ -25,6 +25,11 @@ pub enum Response {
     /// "newest cursor" the caller threads back on the next call to keep
     /// the stream consume-once.
     Inbox(InboxResponse),
+    /// **Card a1562dbc.** Response to `RoomTip` — the cursor of the
+    /// newest durable event on the requested channel, straight from the
+    /// store's index. No envelope bytes ride along: the probe returns
+    /// the cursor value only, never a copy of an event body.
+    RoomTip(RoomTipResponse),
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
@@ -111,6 +116,18 @@ pub struct InboxResponse {
     /// page was empty — the caller's `since` stays authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest: Option<IpcCursor>,
+}
+
+/// Result of a `RoomTip` probe (card a1562dbc): the durable tip of one
+/// channel. Mirrors `InboxResponse.newest`'s wire shape (`tip` absent
+/// when the room has no durable history) so the two cursors are
+/// interchangeable as watermark inputs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomTipResponse {
+    /// Cursor of the newest durable event on the channel. `None` (and
+    /// absent on the wire) when the room has no durable events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<IpcCursor>,
 }
 
 /// Owner-assigned receipt returned by `Send` / `Publish`. The
@@ -214,6 +231,36 @@ mod tests {
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Card a1562dbc: the EXACT wire bytes of `RoomTip` are pinned per
+    /// shape — `kind` tag, `tip` field name, nested cursor field names
+    /// all literal. Both shapes covered: a populated tip, and the
+    /// empty-room shape where `tip` is ABSENT (not `null`), mirroring
+    /// `InboxResponse.newest`.
+    #[test]
+    fn room_tip_response_wire_bytes_are_pinned_per_shape() {
+        for (response, expected) in [
+            (
+                Response::RoomTip(RoomTipResponse {
+                    tip: Some(IpcCursor {
+                        epoch: 3,
+                        counter: 17,
+                        event_id: EventId::from_u128(0xfeed),
+                    }),
+                }),
+                r#"{"kind":"room_tip","tip":{"epoch":3,"counter":17,"event_id":"00000000-0000-0000-0000-00000000feed"}}"#,
+            ),
+            (
+                Response::RoomTip(RoomTipResponse { tip: None }),
+                r#"{"kind":"room_tip"}"#,
+            ),
+        ] {
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_eq!(encoded, expected, "wire bytes of {response:?}");
+            let decoded: Response = serde_json::from_str(expected).unwrap();
+            assert_eq!(decoded, response, "decode of pinned literal");
+        }
     }
 
     #[test]

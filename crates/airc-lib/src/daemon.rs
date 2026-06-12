@@ -20,7 +20,7 @@ use airc_core::{Body, MentionTarget, RoomId, TranscriptCursor, TranscriptEvent, 
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
     AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest,
-    Response, SendRequest,
+    Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -362,22 +362,24 @@ impl Airc {
     /// if its cursor IS the room tip — anything else (log rewound,
     /// store wiped) is a mismatch and the caller rebuilds from
     /// scratch instead of serving stale state.
+    ///
+    /// Card a1562dbc: served by the typed `room_tip` IPC op — the
+    /// daemon answers from its ring/sink index in constant work. The
+    /// previous shape (`Inbox { since: None, limit: 1 }`) made the
+    /// daemon replay the ENTIRE room and keep the last envelope: O(n)
+    /// in room history for a probe whose answer is one cursor.
     pub(crate) async fn daemon_latest_transcript_cursor(
         &self,
         channel: RoomId,
     ) -> Result<Option<TranscriptCursor>, AircError> {
         let response = self
             .require_daemon_client()?
-            .inbox(InboxRequest {
-                since: None,
-                channel: Some(channel),
-                limit: Some(1),
-            })
+            .room_tip(RoomTipRequest { channel })
             .await?;
-        let Some(bytes) = response.envelopes.into_iter().next_back() else {
-            return Ok(None);
-        };
-        Ok(Some(decode_wire_event(bytes)?.cursor()))
+        Ok(response.tip.map(|tip| TranscriptCursor {
+            lamport: pack_seq(tip.epoch, tip.counter),
+            event_id: tip.event_id,
+        }))
     }
 
     /// Live subscribe across `channels` via the daemon: open one IPC

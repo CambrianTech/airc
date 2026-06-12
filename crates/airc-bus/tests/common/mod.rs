@@ -136,4 +136,8 @@ impl DurableSink for GatedSink {
     ) -> Result<Vec<Envelope>, BusError> {
         self.inner.page(channel, from_cursor, limit).await
     }
+
+    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>, BusError> {
+        self.inner.head_cursor(channel).await
+    }
 }

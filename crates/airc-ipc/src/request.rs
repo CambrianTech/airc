@@ -114,6 +114,14 @@ pub enum Request {
     /// tier (no gap at the ring/sink seam). Pass back the response's
     /// `newest` cursor for consume-once paging.
     Inbox(InboxRequest),
+    /// **Card a1562dbc.** The O(1) tip probe: cursor of the newest
+    /// durable event on a channel, answered from the router's hot ring
+    /// / the sink's index — never by replaying the room. The cheap
+    /// "what is the newest cursor?" op for reconnect watermarking, idle
+    /// detection, and projection-cache validation; a first-class typed
+    /// op, not a `limit: 1` flag on the `Inbox` scan. Returns
+    /// `Response::RoomTip`.
+    RoomTip(RoomTipRequest),
     /// Attach to the daemon's live event stream. Long-lived: after an
     /// initial `Response::Ok`, the daemon streams `Response::Event`
     /// frames (airc-wire bytes) until the client disconnects. Optionally
@@ -139,6 +147,15 @@ pub struct InboxRequest {
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// Parameters for `RoomTip` (card a1562dbc). The channel is mandatory:
+/// the tip is a per-room property in the owner-core model, exactly like
+/// `Inbox` paging.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomTipRequest {
+    /// The channel (room) whose durable tip is being probed.
+    pub channel: airc_core::RoomId,
 }
 
 /// Where an attach stream starts. One intentional choice — not a
@@ -590,6 +607,59 @@ mod tests {
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Card a1562dbc: the EXACT wire bytes of `RoomTip` are the
+    /// cross-version contract — `op` tag and `channel` field name
+    /// pinned as literal strings. A serde rename (even a symmetric
+    /// one) must fail here, not silently strand old daemons.
+    #[test]
+    fn room_tip_wire_bytes_are_pinned() {
+        let request = Request::RoomTip(RoomTipRequest {
+            channel: airc_core::RoomId(Uuid::nil()),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"op":"room_tip","channel":"00000000-0000-0000-0000-000000000000"}"#
+        );
+    }
+
+    /// Card a1562dbc: decode-side pin — the literal wire JSON an
+    /// already-shipped client would send must decode to the typed
+    /// variant. Pins the decode half independently of the encode half
+    /// so a symmetric rename cannot pass both.
+    #[test]
+    fn room_tip_literal_wire_json_decodes() {
+        let decoded: Request = serde_json::from_str(
+            r#"{"op":"room_tip","channel":"00000000-0000-0000-0000-000000000042"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            Request::RoomTip(RoomTipRequest {
+                channel: airc_core::RoomId::from_u128(0x42),
+            })
+        );
+    }
+
+    /// Card a1562dbc: adding the `RoomTip` variant must not perturb the
+    /// decoding of pre-existing ops — the literal pre-RoomTip wire
+    /// bytes of a neighbouring op still decode unchanged.
+    #[test]
+    fn room_tip_addition_keeps_existing_inbox_wire_compat() {
+        let decoded: Request = serde_json::from_str(
+            r#"{"op":"inbox","channel":"00000000-0000-0000-0000-000000000042","limit":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            Request::Inbox(InboxRequest {
+                since: None,
+                channel: Some(airc_core::RoomId::from_u128(0x42)),
+                limit: Some(1),
+            })
+        );
     }
 
     #[test]

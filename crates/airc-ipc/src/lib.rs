@@ -43,9 +43,11 @@ pub const IPC_PROTOCOL_VERSION: u16 = 5;
 pub use client::{ClientError, DaemonClient};
 pub use request::{
     AddPeerRequest, AttachParts, AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery,
-    IpcKind, IpcTarget, PublishRequest, RemovePeerRequest, Request, SendRequest,
+    IpcKind, IpcTarget, PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
-pub use response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
+pub use response::{
+    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse, StatusResponse,
+};
 pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};
 // IpcListener / IpcStream stay under `transport` because only the
 // daemon host and low-level tests need the raw byte transport.

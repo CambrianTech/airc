@@ -378,6 +378,35 @@ impl EventRouter {
         self.inner.sink.head_cursor(channel).await.ok().flatten()
     }
 
+    /// **Card a1562dbc.** The channel's **durable transcript tip**: the
+    /// cursor of the newest `Durable` envelope on `channel`, or `None`
+    /// for a room with no durable history. Constant work regardless of
+    /// room depth — this is the O(1) probe behind the `room_tip` IPC op
+    /// (reconnect watermarking, idle detection, projection-cache
+    /// validation), replacing the "replay the whole room, keep the last
+    /// event" scan.
+    ///
+    /// Two constant-cost legs, NOT a perf fallback:
+    /// - the hot ring's newest durable entry (bounded by ring capacity).
+    ///   Eviction is oldest-first, so when the ring holds any durable,
+    ///   its newest durable IS the channel's global durable tip — the
+    ///   sink only lags the ring (write-behind), never leads it.
+    /// - otherwise the sink's [`DurableSink::head_cursor`] (one indexed
+    ///   row on SQLite). A sink error propagates — it is never papered
+    ///   over with a scan.
+    pub async fn durable_tip(&self, channel: airc_core::RoomId) -> crate::Result<Option<Cursor>> {
+        let ring_tip = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            map.get(&channel.0.as_u128())
+                .and_then(|state| state.ring.newest_durable_cursor())
+        }; // shard lock released before the sink await
+        if ring_tip.is_some() {
+            return Ok(ring_tip);
+        }
+        self.inner.sink.head_cursor(channel).await
+    }
+
     /// Subscribe (§4 subscribe, §3.5 cursor contract).
     ///
     /// Returns a stream that yields **every** envelope on the filter strictly

@@ -52,17 +52,14 @@ pub trait DurableSink: Send + Sync {
     /// transcript replay because `ring.newest_cursor()` returned None
     /// and the deep-replay leg pages from `None` (= beginning).
     ///
-    /// Default impl walks the full sink page to find the last cursor;
-    /// concrete impls should override with an efficient query
-    /// (`SELECT max((epoch, counter, event_id))` on SQLite, back-of-vec
-    /// on in-memory).
-    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>> {
-        Ok(self
-            .page(channel, None, usize::MAX)
-            .await?
-            .last()
-            .map(|env| env.cursor()))
-    }
+    /// **Card a1562dbc — required, no scan default.** This is also the
+    /// sink leg of [`crate::EventRouter::durable_tip`], the O(1) room
+    /// tip probe. The previous default impl paged the entire channel to
+    /// find the last cursor — exactly the silent O(n) fallback that the
+    /// tip probe exists to kill — so every impl must now answer in
+    /// constant work (one indexed `ORDER BY … DESC LIMIT 1` row on
+    /// SQLite, back-of-vec on in-memory) or fail loudly.
+    async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>>;
 }
 
 /// In-memory durable tier for tests. Records append count so the

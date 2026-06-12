@@ -18,9 +18,11 @@ use crate::transport::IpcStream;
 
 use crate::request::{
     AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
-    SendRequest,
+    RoomTipRequest, SendRequest,
 };
-use crate::response::{InboxResponse, PeersResponse, PublishResponse, Response, StatusResponse};
+use crate::response::{
+    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse, StatusResponse,
+};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -175,6 +177,17 @@ impl DaemonClient {
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Card a1562dbc: the O(1) tip probe — cursor of the newest durable
+    /// event on a channel, without replaying the room. The cheap
+    /// freshness/watermark query; pair the returned cursor with
+    /// `inbox(since: tip)` or `AttachStart::After(tip)`.
+    pub async fn room_tip(&self, request: RoomTipRequest) -> Result<RoomTipResponse, ClientError> {
+        match self.call(Request::RoomTip(request)).await? {
+            Response::RoomTip(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
