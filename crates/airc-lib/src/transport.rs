@@ -295,6 +295,105 @@ impl Airc {
             event_id: frame.envelope.event_id,
         };
 
+        // Card 4132f48c: daemon-host mode. When an inbound sink is
+        // installed, the machine's owner-core router — the transcript
+        // every attached scope reads — owns delivery. Persisting into
+        // this handle's scope store instead is exactly the store-split
+        // bug (durable in `~/.airc` events, invisible to every operator
+        // scope), so the sink REPLACES the store append; its verdict is
+        // the persistence decision the delivery ack reports. The sink
+        // is idempotent on event_id (router-level recent-ids window +
+        // durable-tier probe), so a frame arriving on both the daemon's
+        // listener and dialer handles delivers exactly once.
+        if let Some(sink) = self.inbound_frame_sink() {
+            let verdict = sink.deliver(&frame).await;
+            let event_id = frame.envelope.event_id;
+            match verdict {
+                crate::router_bridge::InboundDeliveryVerdict::Delivered => {
+                    // In-process fan-out for any subscriber of THIS
+                    // handle, ring-deduped exactly like the store path.
+                    let event = frame.into_transcript_event();
+                    if self.mark_broadcast(event_id) {
+                        let _ = self.inner.live_tx.send(Arc::new(event));
+                    }
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Delivered {
+                                channel: frame_channel,
+                                cursor: frame_cursor,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                crate::router_bridge::InboundDeliveryVerdict::UnknownChannel => {
+                    // Loud regardless of whether an ack was requested —
+                    // a durable frame no scope will surface is the
+                    // silent-drop class this card closes.
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "inbound frame routed to the machine transcript, but no scope \
+                             on this machine has the channel bound — no transcript surface \
+                             will show it",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::UnknownChannel.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("channel", frame_channel)
+                        .with_field("persisted", true),
+                    );
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Undeliverable {
+                                reason: airc_protocol::UndeliverableReason::UnknownChannel,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                crate::router_bridge::InboundDeliveryVerdict::Failed(error) => {
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "inbound frame could not be delivered into the machine \
+                             transcript — undeliverable",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::PersistFailed.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("error", error),
+                    );
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Undeliverable {
+                                reason: airc_protocol::UndeliverableReason::PersistFailed,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            return;
+        }
+
         let event = frame.into_transcript_event();
         let event_id = event.event_id;
         // The store dedups persistence by event_id —

@@ -215,6 +215,14 @@ pub(crate) struct AircInner {
     /// stderr JSON; tests inject a `MemoryDiagnosticSink` so "the
     /// diagnostic fired" is a hard assertion, not a log-scrape.
     pub(crate) diag_sink: std::sync::RwLock<Arc<dyn airc_diagnostics::DiagnosticSink>>,
+    /// Card 4132f48c: where inbound transport frames are delivered when
+    /// a daemon hosts this handle. `None` (every non-daemon handle) =
+    /// the classic path: append to this scope's store + in-process
+    /// fan-out. `Some` = the daemon's router bridge owns delivery, so
+    /// inbound LAN/relay frames land in the machine transcript every
+    /// attached scope reads — not in this handle's private scope store.
+    pub(crate) inbound_sink:
+        std::sync::RwLock<Option<Arc<dyn crate::router_bridge::InboundFrameSink>>>,
 }
 
 /// Capacity of the delivery-ack fan-out channel. Acks are tiny,
@@ -440,6 +448,7 @@ impl Airc {
                 diag_sink: std::sync::RwLock::new(Arc::new(
                     airc_diagnostics::StderrJsonDiagnosticSink,
                 )),
+                inbound_sink: std::sync::RwLock::new(None),
             }),
         })
     }
@@ -466,6 +475,30 @@ impl Airc {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = sink;
+    }
+
+    /// Install the inbound-frame delivery sink (card 4132f48c). Daemon
+    /// hosts call this on their transport-owning handles so inbound
+    /// LAN/relay frames are delivered into the owner-core router —
+    /// the transcript every attached scope reads — instead of this
+    /// handle's private scope store. See
+    /// [`crate::router_bridge::RouterInboundBridge`].
+    pub fn set_inbound_frame_sink(&self, sink: Arc<dyn crate::router_bridge::InboundFrameSink>) {
+        let mut guard = match self.inner.inbound_sink.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(sink);
+    }
+
+    pub(crate) fn inbound_frame_sink(
+        &self,
+    ) -> Option<Arc<dyn crate::router_bridge::InboundFrameSink>> {
+        let guard = match self.inner.inbound_sink.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
     }
 
     pub(crate) fn diag_sink(&self) -> Arc<dyn airc_diagnostics::DiagnosticSink> {
@@ -896,6 +929,7 @@ impl Airc {
             )),
             ack_tx: self.inner.ack_tx.clone(),
             diag_sink: std::sync::RwLock::new(self.diag_sink()),
+            inbound_sink: std::sync::RwLock::new(self.inbound_frame_sink()),
         };
         Self {
             inner: Arc::new(inner),

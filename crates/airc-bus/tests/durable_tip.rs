@@ -72,6 +72,10 @@ impl DurableSink for CountingSink {
         self.head_cursor_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.head_cursor(channel).await
     }
+
+    async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
+        self.inner.contains(event_id).await
+    }
 }
 
 /// A sink whose `head_cursor` fails — proves the tip probe surfaces a
@@ -95,6 +99,10 @@ impl DurableSink for FailingHeadSink {
 
     async fn head_cursor(&self, _channel: RoomId) -> Result<Option<Cursor>, BusError> {
         Err(BusError::Sink("index unavailable".to_string()))
+    }
+
+    async fn contains(&self, _event_id: airc_core::EventId) -> Result<bool, BusError> {
+        Ok(false)
     }
 }
 

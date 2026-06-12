@@ -100,6 +100,13 @@ impl DaemonFixture {
         (state, handle)
     }
 
+    /// The daemon's owner-core router. Card 4132f48c tests build the
+    /// production `RouterInboundBridge` against it, exactly like
+    /// `run_daemon` does.
+    pub fn router(&self) -> airc_bus::EventRouter {
+        self.state.router.clone()
+    }
+
     /// Faithful daemon restart on the same socket + durable db. Fires the
     /// shutdown notifier (graceful `airc stop` equivalent) so the accept
     /// loop AND every live connection handler return — that's what closes
@@ -146,6 +153,13 @@ impl Machine {
     /// Hard-restart this machine's daemon (same socket + durable db).
     pub async fn restart_daemon(&mut self) {
         self.daemon.restart().await;
+    }
+
+    /// The shared wire root every scope on this machine resolves —
+    /// where presence beacons + the mesh-identity cache live
+    /// (`<root>/events.sqlite`), i.e. the machine coordinator store.
+    pub fn wire_root(&self) -> &std::path::Path {
+        self.root.path()
     }
 
     /// Attach a new scope ("tab"/agent) to this machine's daemon.
