@@ -380,6 +380,7 @@ pub async fn ensure_daemon_running(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    inject_gh_token(&mut command);
     detach_daemon(&mut command);
     let child = command.spawn()?;
     let daemon_pid = child.id();
@@ -453,6 +454,132 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Hand the spawned daemon a `GH_TOKEN` so its account-registry loop can
+/// authenticate to the gh-gist rendezvous.
+///
+/// The daemon talks to GitHub via `gh`, but `gh auth login` stores its
+/// OAuth token in the OS keyring (Windows Credential Manager / macOS
+/// Keychain), and a `DETACHED_PROCESS` daemon can't always reach that
+/// keyring from its spawned session — so its `gh auth status` gate
+/// returns "not authenticated" and the loop never publishes. THIS is the
+/// real same-account cross-machine blocker: the daemon is the only place
+/// holding the live LAN endpoint, so when it can't publish, beacons go
+/// out endpoint-less (via the manual `registry sync` fallback) and peers
+/// enrol each other but never route.
+///
+/// The parent here runs in the user's interactive session and DOES have
+/// working auth, so we resolve the token it would use (`gh auth token`)
+/// and pass it down as `GH_TOKEN` — env-based auth that works in any
+/// process context, keyring or not. Derived from the live credential at
+/// spawn time (no hardcoding, no a-priori knowledge — same-account =
+/// same grid, automatically). Best-effort: if `GH_TOKEN`/`GITHUB_TOKEN`
+/// is already set we inherit it untouched; if the parent isn't authed
+/// either, we set nothing and the daemon degrades exactly as before
+/// (skips the optional rendezvous cleanly).
+fn inject_gh_token(command: &mut Command) {
+    // Only inherit an existing token if it is NON-EMPTY — an
+    // exported-but-empty `GITHUB_TOKEN=""` (common in some shells/CI)
+    // must NOT short-circuit extraction, or the daemon inherits a blank
+    // token and `gh auth status` fails.
+    let has_real = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    if has_real("GH_TOKEN") || has_real("GITHUB_TOKEN") {
+        return;
+    }
+    let token = match resolve_gh_token() {
+        Some(token) => token,
+        None => {
+            eprintln!(
+                "airc: could not resolve a gh token to hand the daemon — its account-registry \
+                 loop will skip the same-account rendezvous (run `gh auth login`, or set GH_TOKEN)"
+            );
+            return;
+        }
+    };
+    eprintln!(
+        "airc: provisioning daemon with GH_TOKEN (len {}) for the account rendezvous",
+        token.len()
+    );
+    command.env("GH_TOKEN", token);
+}
+
+/// `gh auth token` from the parent, robust to PATH-resolution quirks in
+/// a bash-descended process (where bare `gh` may not resolve the same as
+/// in an interactive shell). Tries `gh` on PATH first, then known
+/// install locations.
+fn resolve_gh_token() -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("gh")];
+    #[cfg(windows)]
+    {
+        candidates.push(std::path::PathBuf::from(
+            r"C:\Program Files\GitHub CLI\gh.exe",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/gh"));
+        candidates.push(std::path::PathBuf::from("/usr/local/bin/gh"));
+        candidates.push(std::path::PathBuf::from("/usr/bin/gh"));
+    }
+    for bin in candidates {
+        let Ok(output) = std::process::Command::new(&bin)
+            .args(["auth", "token"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// First gh executable that actually responds (`gh --version` exits
+/// zero), trying PATH then known install locations. The daemon hands
+/// this explicit path to its account-registry gate + store so a
+/// bash-format / install-dir-less PATH can't make `Command::new("gh")`
+/// silently fail. Returns `None` if gh isn't installed — the daemon then
+/// degrades to bare `gh` (and the rendezvous skips cleanly if that too
+/// can't resolve).
+fn resolve_gh_bin() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("gh")];
+    #[cfg(windows)]
+    {
+        candidates.push(std::path::PathBuf::from(
+            r"C:\Program Files\GitHub CLI\gh.exe",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/gh"));
+        candidates.push(std::path::PathBuf::from("/usr/local/bin/gh"));
+        candidates.push(std::path::PathBuf::from("/usr/bin/gh"));
+    }
+    for bin in candidates {
+        if let Ok(output) = std::process::Command::new(&bin).arg("--version").output() {
+            if output.status.success() {
+                return Some(bin);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -982,8 +1109,28 @@ pub async fn run_daemon(
                 return;
             }
         };
-        let store = airc_lib::GhAccountRegistryStore::new(event_store);
-        let gate = airc_lib::RegistryRefreshGate::GhAuth { gh_bin: None };
+        // Resolve gh's full path for the daemon's own use. The gate +
+        // store default to bare `gh`, but a DETACHED daemon descended
+        // from a bash launcher has a PATH `Command::new("gh")` can't
+        // resolve on Windows (unix-format / missing the install dir), so
+        // every tick failed `gh auth status` and the rendezvous never
+        // published — the real cross-machine blocker. An explicit path
+        // makes gh invocable regardless of PATH shape (GH_TOKEN handles
+        // the auth half via inject_gh_token).
+        let gh_bin = resolve_gh_bin();
+        if let Some(bin) = &gh_bin {
+            eprintln!(
+                "airc daemon: account-registry using gh at {}",
+                bin.display()
+            );
+        }
+        let store = match &gh_bin {
+            Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store).with_bin(bin.clone()),
+            None => airc_lib::GhAccountRegistryStore::new(event_store),
+        };
+        let gate = airc_lib::RegistryRefreshGate::GhAuth {
+            gh_bin: gh_bin.clone(),
+        };
         airc_lib::run_registry_refresh_loop(
             airc,
             store,

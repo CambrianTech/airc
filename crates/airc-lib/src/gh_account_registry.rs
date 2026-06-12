@@ -355,7 +355,16 @@ pub async fn gh_auth_ready(gh_bin: Option<&Path>) -> bool {
         Ok(child) => child,
         Err(_) => return false,
     };
-    match timeout(Duration::from_millis(750), child.wait()).await {
+    // `gh auth status` is slower than it looks: gh's startup + an OS
+    // keyring lookup runs ~900ms on Windows (measured on bigmama:
+    // 881-950ms), well past a 750ms budget — so the gate timed out on
+    // EVERY tick and reported "not authenticated" despite valid auth,
+    // which is why same-account cross-machine discovery never published
+    // a beacon and peers could enrol but never route (the days-long
+    // keystone blocker). A genuinely-unauthenticated `gh auth status`
+    // still fails fast (well under this), so the wider budget only ever
+    // costs latency on the slow-but-authed path it exists to allow.
+    match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) => status.success(),
         Ok(Err(_)) => false,
         Err(_) => {
