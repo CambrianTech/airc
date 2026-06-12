@@ -52,9 +52,9 @@ use tokio::time::{timeout, Duration};
 use airc_store::{SqliteEventStore, StoredAccountRegistryGistSentinel};
 
 use crate::account_registry::{
-    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
+    AccountPeerBeacon, AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
 };
-use crate::subscriptions::MeshIdentity;
+use crate::subscriptions::{ChannelName, MeshIdentity};
 use crate::time;
 
 /// Filename used for the registry blob inside each per-machine gist.
@@ -280,7 +280,20 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             )));
         }
 
-        let mut best: Option<AccountRegistryDocument> = None;
+        // UNION peers across ALL matching docs. Every machine on the
+        // account publishes its OWN doc (one gist per node), so the
+        // rendezvous only converges if we merge them. The previous code
+        // kept a single `best` doc (the newest generated_at_ms) and
+        // discarded the rest — so whichever node published last "won" and
+        // every other machine's beacon vanished, meaning no two nodes ever
+        // saw each other. THAT was the cross-machine convergence bug. Merge
+        // by peer_id, keeping the freshest beacon per peer (scored by its
+        // source doc's generated_at_ms); union channels too.
+        let mut merged_peers: std::collections::HashMap<String, (u64, AccountPeerBeacon)> =
+            std::collections::HashMap::new();
+        let mut merged_channels: Vec<ChannelName> = Vec::new();
+        let mut newest_at: u64 = 0;
+        let mut found_any = false;
         for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
             let entry: GistListEntry = match serde_json::from_str(line) {
                 Ok(e) => e,
@@ -311,12 +324,36 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             if doc.validate().is_err() {
                 continue;
             }
-            match &best {
-                Some(prev) if prev.generated_at_ms >= doc.generated_at_ms => {}
-                _ => best = Some(doc),
+            found_any = true;
+            newest_at = newest_at.max(doc.generated_at_ms);
+            for channel in doc.channels {
+                if !merged_channels.contains(&channel) {
+                    merged_channels.push(channel);
+                }
+            }
+            for peer in doc.peers {
+                let id = peer.peer_id().to_string();
+                let fresher = match merged_peers.get(&id) {
+                    Some((existing_ms, _)) => doc.generated_at_ms > *existing_ms,
+                    None => true,
+                };
+                if fresher {
+                    merged_peers.insert(id, (doc.generated_at_ms, peer));
+                }
             }
         }
-        Ok(best)
+        if !found_any {
+            return Ok(None);
+        }
+        let mut peers: Vec<AccountPeerBeacon> =
+            merged_peers.into_values().map(|(_, beacon)| beacon).collect();
+        peers.sort_by_key(|peer| peer.peer_id().to_string());
+        Ok(Some(AccountRegistryDocument::new(
+            mesh_identity.clone(),
+            newest_at,
+            merged_channels,
+            peers,
+        )))
     }
 }
 
