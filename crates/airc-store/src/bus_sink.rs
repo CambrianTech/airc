@@ -201,6 +201,16 @@ impl DurableSink for SqliteDurableSink {
             )
         }))
     }
+
+    /// Card 4132f48c: one indexed primary-key probe (`event_id` is the
+    /// PK) — the durable leg of `EventRouter::publish_if_new`.
+    async fn contains(&self, event_id: EventId) -> Result<bool, BusError> {
+        let row = bus_event::Entity::find_by_id(event_id.as_uuid())
+            .one(&self.db)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+        Ok(row.is_some())
+    }
 }
 
 /// Put the connection in WAL journal mode (§3.3). WAL lets the

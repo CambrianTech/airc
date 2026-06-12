@@ -1137,6 +1137,18 @@ pub async fn run_daemon(
             }
         };
 
+        // Card 4132f48c: this handle owns the daemon's LAN listener, so
+        // every inbound cross-machine frame is ingested HERE. Route it
+        // into the daemon's owner-core router — the transcript every
+        // attached scope reads — instead of this handle's private store
+        // (the store-split bug: durable in `~/.airc` events, invisible
+        // to every operator scope). Must be installed BEFORE the
+        // listener binds so no frame can race past it.
+        airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
+            registry_state.router.clone(),
+            registry_state.coordinator_store.clone(),
+        )));
+
         // Endpoint-in-beacon (the second half of same-account
         // auto-discovery): bind a LAN listener on THIS handle so its
         // `route_endpoints()` carries a dialable address, which the
@@ -1282,8 +1294,9 @@ pub async fn run_daemon(
 fn spawn_route_refresh(home: PathBuf, state: Arc<DaemonState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let handle: tokio::sync::Mutex<Option<Airc>> = tokio::sync::Mutex::new(None);
+        let refresh_state = state.clone();
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&home, &handle)
+            refresh_routes_once(&home, &handle, &refresh_state)
         })
         .await;
     })
@@ -1295,11 +1308,27 @@ fn spawn_route_refresh(home: PathBuf, state: Arc<DaemonState>) -> tokio::task::J
 /// daemon's diagnostic sink — loud, never silent. Failures never
 /// propagate: the loop's next tick is the retry path (self-heal
 /// doctrine, card 625abe6d).
-async fn refresh_routes_once(home: &Path, handle: &tokio::sync::Mutex<Option<Airc>>) {
+async fn refresh_routes_once(
+    home: &Path,
+    handle: &tokio::sync::Mutex<Option<Airc>>,
+    state: &Arc<DaemonState>,
+) {
     let mut guard = handle.lock().await;
     if guard.is_none() {
         match Airc::open(home).await {
-            Ok(airc) => *guard = Some(airc),
+            Ok(airc) => {
+                // Card 4132f48c: discovery dials open LAN connections
+                // whose inbound frames are ingested on THIS handle —
+                // same router bridge as the listener handle, so a frame
+                // arriving on either (or both — `publish_if_new` dedups
+                // by event_id) lands in the machine transcript scopes
+                // read.
+                airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
+                    state.router.clone(),
+                    state.coordinator_store.clone(),
+                )));
+                *guard = Some(airc)
+            }
             Err(error) => {
                 StderrJsonDiagnosticSink.emit(
                     DiagnosticEvent::error(

@@ -114,6 +114,56 @@ struct WriteBehindItem {
     env: Arc<Envelope>,
 }
 
+/// Capacity of the router's recent-event-ids window (card 4132f48c).
+/// Sized well past the per-channel ring capacity so a same-moment echo
+/// of any event still in flight is always caught in memory; older
+/// re-injections fall through to the durable [`DurableSink::contains`]
+/// probe in [`EventRouter::publish_if_new`].
+const RECENT_PUBLISH_IDS_CAPACITY: usize = 4096;
+
+/// Bounded FIFO set of recently published event ids (card 4132f48c).
+/// `insert` answers "was this id already recorded?" and records it;
+/// capacity overflow rolls the oldest id off.
+struct RecentEventIds {
+    order: std::collections::VecDeque<airc_core::EventId>,
+    seen: std::collections::HashSet<airc_core::EventId>,
+}
+
+impl RecentEventIds {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            order: std::collections::VecDeque::with_capacity(capacity),
+            seen: std::collections::HashSet::with_capacity(capacity),
+        }
+    }
+
+    /// Record `id`. Returns `true` if it was new, `false` if already
+    /// present (already published through this router recently).
+    fn insert(&mut self, id: airc_core::EventId) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        if self.order.len() == RECENT_PUBLISH_IDS_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(id);
+        true
+    }
+}
+
+/// Outcome of [`EventRouter::publish_if_new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishIfNew {
+    /// The envelope was new: published with this owner-assigned seq.
+    Published(crate::Seq),
+    /// An event with this `event_id` already went through this router
+    /// (recent-ids window) or is already in the durable tier — the
+    /// envelope was NOT re-published. The existing copy stands.
+    Duplicate,
+}
+
 /// The owner-core event router (§3).
 ///
 /// Cheap to clone via the `Arc` fields; clones share the same router.
@@ -129,6 +179,12 @@ struct RouterInner {
     seq: Arc<SeqSource>,
     sink: Arc<dyn DurableSink>,
     write_behind_tx: mpsc::Sender<WriteBehindItem>,
+    /// Recently published event ids (card 4132f48c) — the in-memory leg of
+    /// [`EventRouter::publish_if_new`]'s idempotency check. Every publish
+    /// records its id here so a transport echo of a locally published
+    /// event (or the same inbound frame arriving on two LAN links) can
+    /// never fan out twice.
+    recent_ids: Mutex<RecentEventIds>,
     /// Count of events shed because the write-behind queue was saturated and
     /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
     shed_count: AtomicU64,
@@ -165,6 +221,7 @@ impl EventRouter {
             seq,
             sink,
             write_behind_tx,
+            recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
         });
@@ -201,6 +258,18 @@ impl EventRouter {
         let seq = self.inner.seq.next();
         env.seq = seq;
         env.occurred_at_ms = self.inner.clock.now_ms();
+
+        // Card 4132f48c: record the id so a later `publish_if_new` of the
+        // same event (a transport echo of this publish) is a duplicate.
+        // One short mutex hold; never crosses an await.
+        {
+            let mut recent = self
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            recent.insert(env.event_id);
+        }
 
         // Wrap ONCE: from here on every delivery (ring, ephemeral, fan-out,
         // write-behind) is an `Arc::clone` — a refcount bump, never a deep copy
@@ -312,6 +381,48 @@ impl EventRouter {
         }
 
         Ok(seq)
+    }
+
+    /// Idempotent publish keyed on `env.event_id` (card 4132f48c).
+    ///
+    /// This is the transport-ingest entry point: inbound LAN/relay frames
+    /// carry sender-minted event ids and can legitimately reach the
+    /// router more than once (the same frame arriving on two LAN links,
+    /// an echo of a locally published event, a re-inject after restart).
+    /// [`EventRouter::publish`] assumes a fresh id and would fan the copy
+    /// out to every live subscriber a second time; the durable sink alone
+    /// can't prevent that because its idempotency only covers the
+    /// write-behind tier, not the ring/live legs.
+    ///
+    /// Check order:
+    /// 1. recent-ids window (in-memory, covers everything this router
+    ///    instance published recently — including local IPC publishes,
+    ///    so a wire echo of a local send can never double-deliver);
+    /// 2. [`DurableSink::contains`] (covers ids older than the window
+    ///    and publishes from before a daemon restart).
+    ///
+    /// The id is recorded *before* the checks complete so two concurrent
+    /// `publish_if_new` calls for the same id race to exactly one
+    /// `Published`.
+    pub async fn publish_if_new(&self, env: Envelope) -> crate::Result<PublishIfNew> {
+        let already_recent = {
+            let mut recent = self
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            !recent.insert(env.event_id)
+        };
+        if already_recent {
+            return Ok(PublishIfNew::Duplicate);
+        }
+        // Off-lock durable probe. The id is already marked, so even if
+        // this await parks, a concurrent same-id call short-circuits.
+        if self.inner.sink.contains(env.event_id).await? {
+            return Ok(PublishIfNew::Duplicate);
+        }
+        let seq = self.publish(env).await?;
+        Ok(PublishIfNew::Published(seq))
     }
 
     /// The write-behind drain loop (§3.3 deliver-first / persist-async, §3.8

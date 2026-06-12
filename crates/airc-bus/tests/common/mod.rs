@@ -140,4 +140,8 @@ impl DurableSink for GatedSink {
     async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>, BusError> {
         self.inner.head_cursor(channel).await
     }
+
+    async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
+        self.inner.contains(event_id).await
+    }
 }

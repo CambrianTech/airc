@@ -60,6 +60,19 @@ pub trait DurableSink: Send + Sync {
     /// constant work (one indexed `ORDER BY … DESC LIMIT 1` row on
     /// SQLite, back-of-vec on in-memory) or fail loudly.
     async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>>;
+
+    /// **Card 4132f48c.** Whether an event with this `event_id` is already
+    /// persisted. This is the durable leg of
+    /// [`crate::EventRouter::publish_if_new`]'s idempotency check: an
+    /// inbound transport frame re-injected after the router's in-memory
+    /// recent-ids window rolled (daemon restart, late echo) must not
+    /// re-enter the hot ring / live fan-out as a second copy.
+    ///
+    /// Required, no scan default (same posture as `head_cursor`, card
+    /// a1562dbc): every impl answers in indexed work — one primary-key
+    /// probe on SQLite, a per-bucket id check on the in-memory test
+    /// sinks — or fails loudly.
+    async fn contains(&self, event_id: airc_core::EventId) -> Result<bool>;
 }
 
 /// In-memory durable tier for tests. Records append count so the
@@ -167,6 +180,14 @@ impl DurableSink for InMemoryDurableSink {
             .cloned()
             .collect();
         Ok(out)
+    }
+
+    async fn contains(&self, event_id: airc_core::EventId) -> Result<bool> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(guard
+            .events
+            .values()
+            .any(|bucket| bucket.iter().any(|e| e.event_id == event_id)))
     }
 }
 
