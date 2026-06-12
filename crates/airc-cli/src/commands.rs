@@ -479,6 +479,22 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
 /// either, we set nothing and the daemon degrades exactly as before
 /// (skips the optional rendezvous cleanly).
 fn inject_gh_token(command: &mut Command) {
+    // Hermetic-isolation opt-out. Integration tests (and any caller
+    // that deliberately runs against a throwaway `$HOME`) set
+    // `AIRC_NO_GH_TOKEN_INJECT=1` so a daemon spawned under that clean
+    // room does NOT reach out to the host's real `gh` credential for
+    // the OPTIONAL account rendezvous. Without this, on a gh-authed
+    // host the daemon is handed the real machine token but points at a
+    // mismatched throwaway home, the rendezvous fails, and the
+    // foreground command that spawned it inherits the failure. The
+    // rendezvous is best-effort; it must never be the reason a clean
+    // CLI invocation exits non-zero.
+    if std::env::var("AIRC_NO_GH_TOKEN_INJECT")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
     // Only inherit an existing token if it is NON-EMPTY — an
     // exported-but-empty `GITHUB_TOKEN=""` (common in some shells/CI)
     // must NOT short-circuit extraction, or the daemon inherits a blank

@@ -579,6 +579,12 @@ fn command_for_home(home: &Path) -> Command {
     let account_home = home.parent().unwrap_or(home);
     command.env("HOME", account_home);
     command.env("USERPROFILE", account_home);
+    // Hermetic: these tests run against a throwaway $HOME. Forbid the
+    // daemon from reaching the host's real `gh` token for the optional
+    // account rendezvous — on a gh-authed runner that token + the
+    // throwaway home are mismatched, the rendezvous fails, and the
+    // command exits non-zero. See `inject_gh_token` in commands.rs.
+    command.env("AIRC_NO_GH_TOKEN_INJECT", "1");
     command
 }
 
