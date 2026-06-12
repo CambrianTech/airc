@@ -1109,5 +1109,66 @@ exit 0
                 "freshest beacon wins"
             );
         }
+
+        // Card 4b6a0ffa item 1 (post-#1146 audit): refresh is a UNION
+        // across per-machine writer gists, exactly as the module doc
+        // promises — a peer present only in an OLDER writer's document
+        // (with its endpoints) survives a refresh even when a newer
+        // writer's document lacks it. Mutation check: reverting
+        // `refresh` to pick the single newest document drops peer A
+        // entirely and both asserts fail.
+        #[tokio::test]
+        async fn refresh_unions_peers_across_writer_gists_keeping_endpoints() {
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
+
+            let peer_a = beacon_for(
+                PeerId::new(),
+                "/machine/a/.airc",
+                1_000,
+                "https://machine-a.example.test",
+            );
+            let peer_b = beacon_for(
+                PeerId::new(),
+                "/machine/b/.airc",
+                5_000,
+                "https://machine-b.example.test",
+            );
+
+            // Older writer gist carries peer A (with endpoints); the
+            // NEWER writer gist does not mention A at all.
+            stub.seed_gist(
+                "older-writer",
+                "airc-account-mesh-registry.older-machine.json",
+                &document(2_000, vec![peer_a.clone()]),
+            );
+            stub.seed_gist(
+                "newer-writer",
+                "airc-account-mesh-registry.newer-machine.json",
+                &document(6_000, vec![peer_b.clone()]),
+            );
+
+            let merged = store
+                .refresh(&mesh())
+                .await
+                .unwrap()
+                .expect("documents must merge");
+
+            assert_eq!(
+                merged.peers.len(),
+                2,
+                "refresh must union per-machine documents, not pick the newest"
+            );
+            let merged_a = merged
+                .peers
+                .iter()
+                .find(|peer| peer.peer_id() == peer_a.peer_id())
+                .expect("peer A from the older writer must survive the merge");
+            assert_eq!(
+                merged_a.endpoints, peer_a.endpoints,
+                "peer A's dialable endpoints must survive the merge"
+            );
+        }
     }
 }

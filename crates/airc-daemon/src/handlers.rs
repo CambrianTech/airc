@@ -22,7 +22,7 @@ use airc_ipc::request::{
 };
 use airc_ipc::response::{
     InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    StatusResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -56,6 +56,12 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::AddPeer(add) => handle_add_peer(state, add).await,
         Request::RemovePeer(remove) => handle_remove_peer(state, remove).await,
         Request::ListPeers => handle_list_peers(state).await,
+        // Card 4b6a0ffa (#33): serve the endpoints the registry glue
+        // recorded after binding its listener. Empty means "up but not
+        // dialable" — the client decides what that implies.
+        Request::RouteEndpoints => Response::RouteEndpoints(RouteEndpointsResponse {
+            endpoints: state.route_endpoints.read().await.clone(),
+        }),
         Request::Stop => {
             // Don't actually stop here; just signal. The server's accept
             // loop watches the same notifier and exits after sending

@@ -208,7 +208,13 @@ impl Airc {
         Ok(Some(beacon))
     }
 
-    pub(crate) fn upsert_route_endpoint(&self, endpoint: RouteEndpoint) -> Result<(), AircError> {
+    /// Record an endpoint this handle advertises (one slot per
+    /// endpoint kind, latest wins). Public since card 4b6a0ffa (#33):
+    /// the manual `registry sync` CLI seeds its short-lived handle
+    /// with the DAEMON's read-back endpoints before publishing, so
+    /// the account beacon carries a dialable address instead of an
+    /// endpoint-less overwrite.
+    pub fn upsert_route_endpoint(&self, endpoint: RouteEndpoint) -> Result<(), AircError> {
         self.inner.route_endpoints.upsert(endpoint);
         Ok(())
     }

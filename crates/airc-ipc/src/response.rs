@@ -7,6 +7,8 @@
 //! ignorant of the envelope's shape (no `airc-bus` dependency leaks
 //! here, no per-hop re-serialize).
 
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 use airc_core::{EventId, PeerId, RoomId};
@@ -57,6 +59,12 @@ pub enum Response {
     /// Response to `ListPeers` — the daemon's currently-enrolled
     /// peers (peer_id + URL-safe-no-padding base64 pubkey).
     Peers(PeersResponse),
+    /// **Card 4b6a0ffa (#33).** Response to `RouteEndpoints` — the
+    /// dialable endpoints this daemon currently advertises in its
+    /// account-registry beacon. Short-lived CLI publishers (`airc
+    /// registry sync`) read these back instead of advertising their
+    /// own dead listener or overwriting the gist endpoint-less.
+    RouteEndpoints(RouteEndpointsResponse),
     /// Generic success for ops that don't return data (`AddPeer`,
     /// `RemovePeer`, `Stop`, and the initial `Attach` ack).
     Ok,
@@ -128,6 +136,68 @@ pub struct RoomTipResponse {
     /// absent on the wire) when the room has no durable events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<IpcCursor>,
+}
+
+/// One dialable endpoint advertised by the daemon (card 4b6a0ffa /
+/// #33). Mirrors `airc_lib::RouteEndpoint` — same `kind`-tagged
+/// snake_case wire shape — without leaking the lib type across the
+/// IPC boundary (this crate sits below `airc-lib` in the dependency
+/// graph, exactly like `IpcDelivery` mirrors the bus class). The
+/// conversion lives in `airc-cli`, the only crate that sees both.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IpcRouteEndpoint {
+    LanTcp {
+        #[serde(with = "socket_addr_string")]
+        addr: SocketAddr,
+    },
+    TailscaleTcp {
+        #[serde(with = "socket_addr_string")]
+        addr: SocketAddr,
+    },
+    Udp {
+        #[serde(with = "socket_addr_string")]
+        addr: SocketAddr,
+    },
+    Relay {
+        url: String,
+    },
+    Reticulum {
+        destination: String,
+    },
+    WebRtcSignaling {
+        url: String,
+    },
+}
+
+/// `SocketAddr` as its `Display`/`FromStr` string on the wire,
+/// EXPLICITLY. std's serde impl picks string vs. struct form off the
+/// format's `is_human_readable`, which does not round-trip through
+/// the CBOR frame codec — and an implicit format-dependent shape is
+/// not a contract. One spelled-out shape (`"10.0.0.2:7717"`), pinned
+/// by the literal-JSON tests below, identical in JSON and CBOR.
+mod socket_addr_string {
+    use std::net::SocketAddr;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(addr: &SocketAddr, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(addr)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Result of a `RouteEndpoints` probe: every endpoint the daemon's
+/// registry glue currently advertises. Empty means the daemon is up
+/// but not dialable (no LAN listener bound, no relay) — the caller
+/// must treat that exactly like "no daemon" for publish decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteEndpointsResponse {
+    pub endpoints: Vec<IpcRouteEndpoint>,
 }
 
 /// Owner-assigned receipt returned by `Send` / `Publish`. The
@@ -259,6 +329,55 @@ mod tests {
             let encoded = serde_json::to_string(&response).unwrap();
             assert_eq!(encoded, expected, "wire bytes of {response:?}");
             let decoded: Response = serde_json::from_str(expected).unwrap();
+            assert_eq!(decoded, response, "decode of pinned literal");
+        }
+    }
+
+    /// Card 4b6a0ffa (#33): the EXACT wire bytes of `RouteEndpoints`
+    /// are the cross-version contract — outer `kind` tag, `endpoints`
+    /// field, and every endpoint variant's tag + field names pinned as
+    /// literals. The endpoint shape deliberately matches
+    /// `airc_lib::RouteEndpoint`'s serde shape (`kind`-tagged,
+    /// snake_case) so the two sides of the CLI conversion can never
+    /// drift apart silently: a rename on either side fails here.
+    #[test]
+    fn route_endpoints_response_wire_bytes_are_pinned_per_variant() {
+        for (response, expected) in [
+            (
+                Response::RouteEndpoints(RouteEndpointsResponse {
+                    endpoints: vec![
+                        IpcRouteEndpoint::LanTcp {
+                            addr: "10.0.0.2:7717".parse().expect("valid socket addr"),
+                        },
+                        IpcRouteEndpoint::TailscaleTcp {
+                            addr: "100.64.0.7:7717".parse().expect("valid socket addr"),
+                        },
+                        IpcRouteEndpoint::Udp {
+                            addr: "10.0.0.2:7718".parse().expect("valid socket addr"),
+                        },
+                        IpcRouteEndpoint::Relay {
+                            url: "https://relay.example.test".to_string(),
+                        },
+                        IpcRouteEndpoint::Reticulum {
+                            destination: "abcdef0123456789".to_string(),
+                        },
+                        IpcRouteEndpoint::WebRtcSignaling {
+                            url: "wss://signal.example.test".to_string(),
+                        },
+                    ],
+                }),
+                r#"{"kind":"route_endpoints","endpoints":[{"kind":"lan_tcp","addr":"10.0.0.2:7717"},{"kind":"tailscale_tcp","addr":"100.64.0.7:7717"},{"kind":"udp","addr":"10.0.0.2:7718"},{"kind":"relay","url":"https://relay.example.test"},{"kind":"reticulum","destination":"abcdef0123456789"},{"kind":"web_rtc_signaling","url":"wss://signal.example.test"}]}"#,
+            ),
+            (
+                Response::RouteEndpoints(RouteEndpointsResponse {
+                    endpoints: Vec::new(),
+                }),
+                r#"{"kind":"route_endpoints","endpoints":[]}"#,
+            ),
+        ] {
+            let encoded = serde_json::to_string(&response).expect("encode");
+            assert_eq!(encoded, expected, "wire bytes of {response:?}");
+            let decoded: Response = serde_json::from_str(expected).expect("decode");
             assert_eq!(decoded, response, "decode of pinned literal");
         }
     }

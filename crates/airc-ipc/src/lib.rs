@@ -46,7 +46,8 @@ pub use request::{
     IpcKind, IpcTarget, PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 pub use response::{
-    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse, StatusResponse,
+    InboxResponse, IpcRouteEndpoint, PeersResponse, PublishResponse, Response, RoomTipResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};
 // IpcListener / IpcStream stay under `transport` because only the

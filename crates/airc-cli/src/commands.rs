@@ -1126,6 +1126,26 @@ pub async fn run_daemon(
                 );
             }
         }
+        // Card 4b6a0ffa (#33): record the endpoints this handle now
+        // advertises into the daemon's IPC-served state, so a manual
+        // `airc registry sync` can read them back over
+        // `Request::RouteEndpoints` and publish a DIALABLE beacon
+        // instead of an endpoint-less overwrite. Loud on failure —
+        // an unreadable endpoint table is a bug, not a shrug.
+        match airc.route_endpoints() {
+            Ok(endpoints) => {
+                *registry_state.route_endpoints.write().await = endpoints
+                    .into_iter()
+                    .map(crate::registry_commands::route_endpoint_to_ipc)
+                    .collect();
+            }
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: could not record route endpoints for IPC read-back \
+                     ({error}) — `airc registry sync` will refuse endpoint-less publishes"
+                );
+            }
+        }
         let db_path = airc_lib::machine_account_home(&registry_home).join("events.sqlite");
         let event_store = match SqliteEventStore::open_path(&db_path).await {
             Ok(store) => Arc::new(store),

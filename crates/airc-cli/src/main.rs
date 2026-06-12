@@ -443,7 +443,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Registry(args) => match args.action {
-            registry_cli::RegistryAction::Sync => registry_commands::run_sync(&home).await,
+            registry_cli::RegistryAction::Sync { allow_endpointless } => {
+                registry_commands::run_sync(&home, allow_endpointless).await
+            }
         },
 
         Command::Transport(args) => match args.action {

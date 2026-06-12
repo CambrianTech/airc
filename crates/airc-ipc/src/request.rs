@@ -102,6 +102,14 @@ pub enum Request {
     /// Snapshot of currently-enrolled peers (peer_id + pubkey).
     /// Returned via `Response::Peers`.
     ListPeers,
+    /// **Card 4b6a0ffa (#33).** The dialable endpoints this daemon
+    /// currently advertises (its registry glue's LAN listener, relay,
+    /// …). Returned via `Response::RouteEndpoints`. Lets a short-lived
+    /// CLI publisher (`airc registry sync`) publish the DAEMON's live
+    /// endpoints instead of an endpoint-less beacon — a CLI binding
+    /// its own listener would advertise a port that dies with the
+    /// process.
+    RouteEndpoints,
     /// Send a text Message on a channel. The daemon publishes it to its
     /// `EventRouter` as a `Durable` envelope and returns a receipt.
     Send(SendRequest),
@@ -660,6 +668,18 @@ mod tests {
                 limit: Some(1),
             })
         );
+    }
+
+    /// Card 4b6a0ffa (#33): the EXACT wire bytes of `RouteEndpoints`
+    /// are the cross-version contract — the `op` tag pinned as a
+    /// literal on both the encode and decode side, so a symmetric
+    /// serde rename cannot pass.
+    #[test]
+    fn route_endpoints_wire_bytes_are_pinned() {
+        let encoded = serde_json::to_string(&Request::RouteEndpoints).unwrap();
+        assert_eq!(encoded, r#"{"op":"route_endpoints"}"#);
+        let decoded: Request = serde_json::from_str(r#"{"op":"route_endpoints"}"#).unwrap();
+        assert_eq!(decoded, Request::RouteEndpoints);
     }
 
     #[test]

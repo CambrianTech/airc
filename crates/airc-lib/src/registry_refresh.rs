@@ -123,8 +123,12 @@ impl std::fmt::Display for GateBlock {
 impl RegistryRefreshGate {
     /// Returns `None` if a tick should proceed, or the reason it must
     /// not. The hermetic gate is checked FIRST: a hermetic scope must
-    /// not even probe `gh auth status`.
-    async fn block(&self) -> Option<GateBlock> {
+    /// not even probe `gh auth status`. Public so the manual `registry
+    /// sync` CLI verb can order its checks intentionally: gate first,
+    /// THEN the dialable-endpoint requirement (card 4b6a0ffa / #33) —
+    /// a gh-unauthed box must hear "gh not ready", not a misleading
+    /// endpoint refusal.
+    pub async fn block(&self) -> Option<GateBlock> {
         match self {
             RegistryRefreshGate::GhAuth { gh_bin, scope_home } => {
                 if let Some(block) = crate::gh_account_registry::account_registry_block(scope_home)
