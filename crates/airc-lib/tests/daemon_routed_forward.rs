@@ -144,6 +144,22 @@ fn copies_in(events: &[airc_core::TranscriptEvent], event_id: EventId) -> usize 
     events.iter().filter(|e| e.event_id == event_id).count()
 }
 
+/// Poll a forwarder until at least `n` forwards are ack-confirmed
+/// delivered (10s budget). The confirmation is asynchronous with
+/// remote visibility: the remote publishes (visible to its scopes)
+/// BEFORE its ack travels back, so asserting the counter immediately
+/// after observing visibility is a race the slower CI runners lose.
+async fn wait_for_confirmed(forwarder: &RoutedForwarder, n: u64) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let confirmed = forwarder.confirmed_count();
+        if confirmed >= n || tokio::time::Instant::now() >= deadline {
+            return confirmed;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// THE acceptance test (the card): an ordinary room send on daemon A —
 /// the routed IPC path, NOT the point-to-point `lan-send` verb —
 /// appears in daemon B's subscribed scope transcript, and the reverse
@@ -184,13 +200,14 @@ async fn routed_room_send_traverses_lan_both_directions() {
          to machine A's subscribed scope"
     );
 
-    // Truthful semantics: each forwarder got a delivered confirmation.
+    // Truthful semantics: each forwarder gets a delivered confirmation
+    // (asynchronous with visibility — poll, don't race the ack leg).
     assert!(
-        a.forwarder.confirmed_count() >= 1,
+        wait_for_confirmed(&a.forwarder, 1).await >= 1,
         "A→B must be ack-confirmed"
     );
     assert!(
-        b.forwarder.confirmed_count() >= 1,
+        wait_for_confirmed(&b.forwarder, 1).await >= 1,
         "B→A must be ack-confirmed"
     );
 
@@ -363,12 +380,8 @@ async fn remote_persist_failure_then_retry_is_exactly_once_visible() {
     let event_id = op_a.say(MARKER).await.expect("op-a says");
 
     // The retry (same event_id) must conclude delivered…
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while a.forwarder.confirmed_count() == 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     assert_eq!(
-        a.forwarder.confirmed_count(),
+        wait_for_confirmed(&a.forwarder, 1).await,
         1,
         "the retry of the same event identity must be ack-confirmed delivered \
          (the remote deduped it — duplicate IS delivered)"
