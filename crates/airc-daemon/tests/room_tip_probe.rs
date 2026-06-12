@@ -125,11 +125,31 @@ fn stream_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
 async fn publish_n(client: &DaemonClient, channel: RoomId, n: usize) -> PublishResponse {
     let mut last = None;
     for i in 0..n {
-        let receipt = client
-            .publish(durable_text(channel, &format!("event {i}")))
-            .await
-            .expect("publish");
-        last = Some(receipt);
+        let request = durable_text(channel, &format!("event {i}"));
+        // The write-behind queue is bounded: on a slow runner a tight
+        // publish loop can outpace the SQLite drain, and the daemon
+        // sheds with a LOUD typed error (§3.8 — the designed
+        // back-pressure signal, never a silent drop). Honour the
+        // contract the way a real producer would: back off and retry
+        // the same event. Any other error is a real failure.
+        let mut receipt = None;
+        for _ in 0..500 {
+            match client.publish(request.clone()).await {
+                Ok(r) => {
+                    receipt = Some(r);
+                    break;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("saturated"),
+                        "unexpected publish error: {message}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        last = Some(receipt.expect("publish kept saturating after 500 backoff retries"));
     }
     last.expect("n > 0")
 }
