@@ -156,6 +156,7 @@ impl GhAccountRegistryStore {
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
+        gh_no_window(&mut cmd);
         let mut child = cmd.spawn().map_err(|error| {
             AccountRegistryError::Adapter(format!("spawn gh {}: {error}", args.join(" ")))
         })?;
@@ -340,18 +341,39 @@ fn extract_gist_id(stdout: &str) -> Option<String> {
     None
 }
 
+/// Suppress the console window when spawning the `gh` console app on Windows.
+///
+/// The account-registry daemon is spawned `DETACHED_PROCESS` (no console), and
+/// on Windows a console subsystem app launched from a console-less parent gets
+/// a brand-new console *window* allocated unless `CREATE_NO_WINDOW` is set. The
+/// daemon shells out to `gh` on every registry tick (`gh auth status`, publish),
+/// so without this each tick flashes a window — and if `gh` stalls (e.g. a slow
+/// keyring lookup) the window lingers and piles up. gh's stdout/stderr are
+/// always captured or nulled here, so suppressing the console hides nothing.
+/// No-op off Windows.
+#[inline]
+fn gh_no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// Probe whether the local `gh` is authenticated against GitHub.
 /// Returns Ok(()) if `gh auth status` exits zero. Used by callers
 /// (e.g., `Airc::join_default_context`) to skip publish/refresh
 /// cleanly when the operator isn't logged in.
 pub async fn gh_auth_ready(gh_bin: Option<&Path>) -> bool {
     let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
-    let mut child = match Command::new(bin)
-        .args(["auth", "status"])
+    let mut cmd = Command::new(bin);
+    cmd.args(["auth", "status"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    gh_no_window(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
