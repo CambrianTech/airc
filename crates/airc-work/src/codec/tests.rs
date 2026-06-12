@@ -634,6 +634,176 @@ fn goal_dry_tick_recorded_body_serde_tag_is_pinned_literal() {
     );
 }
 
+// Card 09fddedd — wire pins for `PullRequestRelinked`. Three layers,
+// per this repo's known failure class ("a pin that pins nothing"):
+// round-trip (tag-blind, catches struct drift), literal body-tag +
+// field-name pins (catch serde renames the round-trip can't see), and
+// a hand-written literal payload decode (proves the pinned names are
+// the ACTUAL decode contract, not just the encode shape).
+
+fn pull_request_relinked_event() -> WorkEvent {
+    let repo = RepoId::new("CambrianTech/airc").unwrap();
+    WorkEvent::PullRequestRelinked(crate::event::PullRequestRelinked {
+        card_id: WorkCardId::from_u128(0x09f),
+        old_pull_request: PullRequestRef {
+            repo: repo.clone(),
+            number: 1078,
+            head: BranchName::new("feat/round-1").unwrap(),
+            base: BranchName::new("rust-rewrite").unwrap(),
+        },
+        new_pull_request: PullRequestRef {
+            repo,
+            number: 1137,
+            head: BranchName::new("feat/round-2").unwrap(),
+            base: BranchName::new("rust-rewrite").unwrap(),
+        },
+        relinked_by: peer(0x6967),
+        relinked_at_ms: 7,
+    })
+}
+
+#[test]
+fn pull_request_relinked_roundtrips_with_card_and_successor_pr_headers() {
+    // what this catches: regression where the new variant fails to
+    // round-trip, or its routing headers drop. Headers must route on
+    // the SUCCESSOR PR — the card's new source of truth — with the
+    // superseded PR riding only the body for audit.
+    let event = pull_request_relinked_event();
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(decode_work_event(&headers, Some(&body)).unwrap(), event);
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        Some("pull_request_relinked")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_CARD_ID).map(String::as_str),
+        Some("00000000-0000-0000-0000-00000000009f")
+    );
+    assert_eq!(
+        headers.get(HEADER_FORGE_WORK_PR_NUMBER).map(String::as_str),
+        Some("1137"),
+        "pr_number header must carry the SUCCESSOR, not the superseded PR"
+    );
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_GIT_BRANCH)
+            .map(String::as_str),
+        Some("feat/round-2"),
+        "branch header must carry the successor's head"
+    );
+}
+
+#[test]
+fn pull_request_relinked_body_wire_shape_is_pinned_literal() {
+    // what this catches: a serde rename of the variant tag or of any
+    // field (`old_pull_request` → `previous`, etc.). Round-trip tests
+    // are tag- and field-name-blind; these literal assertions are the
+    // wire contract. Renaming anything here is a deliberate wire break
+    // and must update this test in the same commit.
+    let event = pull_request_relinked_event();
+    let (headers, body) = encode_work_event(&event).unwrap();
+    let value = body_value(&body);
+    assert_eq!(
+        value.get("kind").and_then(|v| v.as_str()),
+        Some("pull_request_relinked"),
+        "WorkEvent::PullRequestRelinked body MUST encode `\"kind\":\"pull_request_relinked\"`"
+    );
+    // Header/body consistency — same rule the goal-event pins enforce.
+    assert_eq!(
+        headers
+            .get(HEADER_FORGE_WORK_EVENT_KIND)
+            .map(String::as_str),
+        value.get("kind").and_then(|v| v.as_str()),
+        "envelope kind header must equal body serde tag"
+    );
+    for field in [
+        "card_id",
+        "old_pull_request",
+        "new_pull_request",
+        "relinked_by",
+        "relinked_at_ms",
+    ] {
+        assert!(
+            value.get(field).is_some(),
+            "PullRequestRelinked body MUST encode field {field:?}; got {value}"
+        );
+    }
+    // The two PR refs are full PullRequestRef objects, not bare
+    // numbers — the audit payload must be self-contained.
+    assert_eq!(
+        value
+            .get("old_pull_request")
+            .and_then(|v| v.get("number"))
+            .and_then(|v| v.as_u64()),
+        Some(1078)
+    );
+    assert_eq!(
+        value
+            .get("new_pull_request")
+            .and_then(|v| v.get("number"))
+            .and_then(|v| v.as_u64()),
+        Some(1137)
+    );
+}
+
+#[test]
+fn pull_request_relinked_literal_wire_payload_decodes() {
+    // what this catches: drift where the encode side and the pinned
+    // names move together but a hand-authored / cross-version payload
+    // no longer decodes. This literal JSON is frozen as the v1 wire
+    // shape of the event.
+    let payload = serde_json::json!({
+        "kind": "pull_request_relinked",
+        "card_id": "00000000-0000-0000-0000-00000000009f",
+        "old_pull_request": {
+            "repo": "CambrianTech/airc",
+            "number": 1078,
+            "head": "feat/round-1",
+            "base": "rust-rewrite"
+        },
+        "new_pull_request": {
+            "repo": "CambrianTech/airc",
+            "number": 1137,
+            "head": "feat/round-2",
+            "base": "rust-rewrite"
+        },
+        "relinked_by": "00000000-0000-0000-0000-000000006967",
+        "relinked_at_ms": 7
+    });
+    let decoded: WorkEvent = serde_json::from_value(payload).unwrap();
+    assert_eq!(decoded, pull_request_relinked_event());
+}
+
+#[test]
+fn pull_request_linked_literal_wire_payload_still_decodes() {
+    // what this catches: the new `PullRequestRelinked` variant (or any
+    // future enum surgery) breaking decode of EXISTING events on the
+    // wire. Every `pull_request_linked` event already in transcripts
+    // must keep decoding byte-for-byte — wire-compat is the hard
+    // constraint on extending `WorkEvent`.
+    let payload = serde_json::json!({
+        "kind": "pull_request_linked",
+        "card_id": "00000000-0000-0000-0000-00000000009f",
+        "pull_request": {
+            "repo": "CambrianTech/airc",
+            "number": 1078,
+            "head": "feat/round-1",
+            "base": "rust-rewrite"
+        },
+        "linked_by": "00000000-0000-0000-0000-000000006967",
+        "linked_at_ms": 5
+    });
+    let decoded: WorkEvent = serde_json::from_value(payload).unwrap();
+    let WorkEvent::PullRequestLinked(linked) = decoded else {
+        panic!("legacy pull_request_linked payload must decode to PullRequestLinked");
+    };
+    assert_eq!(linked.card_id, WorkCardId::from_u128(0x09f));
+    assert_eq!(linked.pull_request.number, 1078);
+    assert_eq!(linked.linked_at_ms, 5);
+}
+
 #[test]
 fn card_created_origin_field_name_is_pinned_literal() {
     // what this catches: mutation of `CardCreated.origin` field name

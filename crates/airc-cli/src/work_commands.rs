@@ -1403,6 +1403,45 @@ pub async fn run_link(
     crate::work_commands_gh::link_existing_pr(&airc, card_uuid, pr).await
 }
 
+/// Card 09fddedd: `airc work relink <CARD_ID> --pr <number-or-url>` —
+/// supersede a card's stale PR link with a successor PR. Thin
+/// orchestration over `work_commands_gh::relink_card_pr` — attach,
+/// parse the card id + PR spec, delegate. Sibling of [`run_link`].
+pub async fn run_relink(
+    home: &Path,
+    card_id: String,
+    pr: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = crate::commands::attached_airc(home).await?;
+    let card_uuid = parse_work_card_id(&card_id)?;
+    let pr_number = parse_pr_spec(&pr)?;
+    crate::work_commands_gh::relink_card_pr(&airc, card_uuid, pr_number).await
+}
+
+/// Parse a `--pr` argument that is either a bare PR number (`1137`) or
+/// a full GitHub PR URL (`https://github.com/owner/repo/pull/1137`).
+/// Anything else is a loud error — no guessing, no substring scraping.
+fn parse_pr_spec(input: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = input.trim();
+    if let Ok(number) = trimmed.parse::<u64>() {
+        return Ok(number);
+    }
+    // URL form: require the `/pull/<number>` path segment explicitly
+    // so an arbitrary URL (or a branch name with digits) can't sneak
+    // through as a PR number.
+    if let Some((_, tail)) = trimmed.split_once("/pull/") {
+        let digits = tail.split(['/', '?', '#']).next().unwrap_or("");
+        if let Ok(number) = digits.parse::<u64>() {
+            return Ok(number);
+        }
+    }
+    Err(format!(
+        "--pr {input:?} is neither a PR number nor a GitHub PR URL \
+         (expected e.g. 1137 or https://github.com/owner/repo/pull/1137)"
+    )
+    .into())
+}
+
 /// Card a399b342: `airc work merge <CARD_ID>` — manual one-shot merge
 /// behind the same gate the auto-merger uses. Refuses unless the card
 /// is in Review state with a PR linked AND the PR's CI is green per
@@ -2165,6 +2204,56 @@ impl From<CliCardState> for CardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Card 09fddedd — `--pr <number-or-url>` parser for `airc work
+    // relink`. Loud failures only: anything that is not a bare PR
+    // number or a URL with an explicit `/pull/<n>` segment refuses.
+
+    #[test]
+    fn parse_pr_spec_accepts_bare_number_and_pull_url() {
+        assert_eq!(parse_pr_spec("1137").unwrap(), 1137);
+        assert_eq!(parse_pr_spec("  1137 ").unwrap(), 1137);
+        assert_eq!(
+            parse_pr_spec("https://github.com/CambrianTech/airc/pull/1137").unwrap(),
+            1137
+        );
+        // Trailing path / query / fragment after the number is fine —
+        // gh emits and humans paste all three shapes.
+        assert_eq!(
+            parse_pr_spec("https://github.com/CambrianTech/airc/pull/1137/files").unwrap(),
+            1137
+        );
+        assert_eq!(
+            parse_pr_spec("https://github.com/CambrianTech/airc/pull/1137?diff=split").unwrap(),
+            1137
+        );
+        assert_eq!(
+            parse_pr_spec("https://github.com/CambrianTech/airc/pull/1137#discussion_r1").unwrap(),
+            1137
+        );
+    }
+
+    #[test]
+    fn parse_pr_spec_refuses_non_pr_shapes_loudly() {
+        // what this catches: the parser degrading into digit-scraping.
+        // An issue URL, a branch name with digits, or an empty string
+        // must refuse — guessing a PR number here would relink a card
+        // to an arbitrary PR.
+        for input in [
+            "",
+            "abc",
+            "-5",
+            "https://github.com/CambrianTech/airc/issues/1137",
+            "https://github.com/CambrianTech/airc/pull/",
+            "https://github.com/CambrianTech/airc/pull/not-a-number",
+            "feat/1137-branch",
+        ] {
+            assert!(
+                parse_pr_spec(input).is_err(),
+                "parse_pr_spec({input:?}) must refuse, not guess"
+            );
+        }
+    }
 
     #[test]
     fn lease_renders_dash_when_no_claim() {

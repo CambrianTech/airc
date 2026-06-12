@@ -417,3 +417,60 @@ fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
     );
     assert!(matches!(result, Err(WorkStoreError::Projection(_))));
 }
+
+#[test]
+fn apply_transcripts_resume_applies_relink_after_snapshot_boundary() {
+    // Card 09fddedd — the work-board-cache resume path (card 1291173d:
+    // projection snapshot keyed by last-applied cursor) must fold a
+    // `PullRequestRelinked` event that lands AFTER the snapshot
+    // boundary identically to a full from-zero replay. If the resume
+    // rule and the full-replay rule ever diverge on the new variant,
+    // cached boards would keep pointing the merger at the superseded
+    // PR — the exact stale-link failure the relink verb exists to fix.
+    let room = RoomId::from_u128(11);
+    let card = WorkCardId::from_u128(30);
+    let pr = |number: u64, head: &str| airc_work::PullRequestRef {
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        number,
+        head: airc_work::BranchName::new(head).unwrap(),
+        base: airc_work::BranchName::new("rust-rewrite").unwrap(),
+    };
+    let linked = WorkEvent::PullRequestLinked(airc_work::PullRequestLinked {
+        card_id: card,
+        pull_request: pr(1078, "feat/round-1"),
+        linked_by: PeerId::from_u128(200),
+        linked_at_ms: 1100,
+    });
+    let relinked = WorkEvent::PullRequestRelinked(airc_work::PullRequestRelinked {
+        card_id: card,
+        old_pull_request: pr(1078, "feat/round-1"),
+        new_pull_request: pr(1137, "feat/round-2"),
+        relinked_by: PeerId::from_u128(201),
+        relinked_at_ms: 1200,
+    });
+
+    let transcripts = vec![
+        work_transcript(1, room, 1, &card_created(card)),
+        work_transcript(2, room, 2, &linked),
+        // ---- snapshot boundary (cache cursor parked here) ----
+        work_transcript(3, room, 3, &relinked),
+    ];
+
+    let full = project_transcripts(transcripts.clone()).unwrap();
+
+    let mut resumed = project_transcripts(transcripts[..2].to_vec()).unwrap();
+    assert_eq!(
+        resumed.card(card).unwrap().pull_request,
+        Some(pr(1078, "feat/round-1")),
+        "snapshot state must hold the superseded link before catch-up"
+    );
+    let newest = apply_transcripts(&mut resumed, transcripts[2..].to_vec())
+        .unwrap()
+        .expect("non-empty increment yields a cursor");
+
+    assert_eq!(resumed, full, "cache catch-up diverged from full replay");
+    assert_eq!(newest.event_id, EventId::from_u128(3));
+    let caught_up = resumed.card(card).unwrap();
+    assert_eq!(caught_up.pull_request, Some(pr(1137, "feat/round-2")));
+    assert_eq!(caught_up.state, CardState::Review);
+}

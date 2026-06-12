@@ -185,6 +185,28 @@ pub struct LinkCardPullRequest {
     pub pull_request: airc_work::model::PullRequestRef,
 }
 
+/// Card 09fddedd: supersede a card's linked PR with a successor PR.
+/// `LinkCardPullRequest` is first-write-wins at every CLI entry point
+/// (`airc work link` and `state review` both no-op on an already-linked
+/// card), so a card whose round-1 PR was closed/merged without the real
+/// fix could never track the round-2 PR — the merger skipped the card
+/// forever (failure class: orphaned Review cards, 6967921d). The
+/// emitted `PullRequestRelinked` event records the superseded link for
+/// auditability; the projection adopts the successor and (re)enters
+/// `CardState::Review`.
+///
+/// `Airc::relink_card_pull_request` validates loudly before emitting:
+/// the card must exist in the current room, must currently have a
+/// linked PR, must not be in a terminal state, and the successor must
+/// be a different PR. Forge-side validation (successor exists, targets
+/// the same base) is the CLI adapter's job — the SDK stays free of any
+/// hard GitHub dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelinkCardPullRequest {
+    pub card_id: WorkCardId,
+    pub new_pull_request: airc_work::model::PullRequestRef,
+}
+
 /// Card f16650cd: attest that a PR has been merged. Published by the
 /// continuous-merge background task (`airc work merger run`) AFTER it
 /// successfully calls `gh pr merge`. The projection picks this up and
@@ -550,6 +572,40 @@ impl Airc {
         });
         self.publish_work_event(&event).await?;
         Ok(())
+    }
+
+    /// Card 09fddedd: supersede the card's linked PR with a successor
+    /// (see [`RelinkCardPullRequest`]). Validates against the current
+    /// room's projection and refuses loudly — no fallback link, no
+    /// silent no-op — then emits `WorkEvent::PullRequestRelinked`
+    /// carrying BOTH links (old for audit, new as the projection's
+    /// new source of truth). Returns the superseded link so callers
+    /// can surface what was replaced.
+    pub async fn relink_card_pull_request(
+        &self,
+        request: RelinkCardPullRequest,
+    ) -> Result<airc_work::model::PullRequestRef, AircError> {
+        let room = self.current_room().await?;
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
+            .await?;
+        let Some(card) = board.card(request.card_id) else {
+            return Err(AircError::WorkCardNotInCurrentRoom {
+                card_id: request.card_id,
+                room_name: room.name,
+                room_id: room.channel,
+            });
+        };
+        let old_pull_request = validate_relink_card_pull_request(card, &request.new_pull_request)?;
+        let event = WorkEvent::PullRequestRelinked(airc_work::event::PullRequestRelinked {
+            card_id: request.card_id,
+            old_pull_request: old_pull_request.clone(),
+            new_pull_request: request.new_pull_request,
+            relinked_by: self.peer_id(),
+            relinked_at_ms: now_ms()?,
+        });
+        self.publish_work_event(&event).await?;
+        Ok(old_pull_request)
     }
 
     /// Card f16650cd: attest that the linked PR has been merged. The
@@ -1176,6 +1232,46 @@ impl Airc {
     }
 }
 
+/// Card 09fddedd — pure relink gate, extracted from
+/// `Airc::relink_card_pull_request` so each refusal is unit-testable
+/// without standing up a full Airc instance. Returns the superseded
+/// link on success; every refusal is a typed `AircError`, never a
+/// silent no-op (`[[no-fallbacks-ever]]`).
+///
+/// Order of the checks is deliberate: terminal state first (the card's
+/// lifecycle is over — reporting "no linked PR" on a Closed card would
+/// send the operator to `airc work link`, which is the wrong tool),
+/// then link presence, then same-PR.
+fn validate_relink_card_pull_request(
+    card: &WorkCard,
+    new_pull_request: &airc_work::model::PullRequestRef,
+) -> Result<airc_work::model::PullRequestRef, AircError> {
+    if matches!(card.state, CardState::Merged | CardState::Closed) {
+        return Err(AircError::WorkCardRelinkTerminalState {
+            card_id: card.card_id,
+            state: card.state,
+        });
+    }
+    let Some(old_pull_request) = card.pull_request.clone() else {
+        return Err(AircError::WorkCardHasNoLinkedPullRequest {
+            card_id: card.card_id,
+        });
+    };
+    // Identity of a PR is (repo, number) — head/base can legitimately
+    // drift on the forge side (retarget, force-push) without making
+    // the PR a different PR, so they do not participate in this check.
+    if old_pull_request.repo == new_pull_request.repo
+        && old_pull_request.number == new_pull_request.number
+    {
+        return Err(AircError::WorkCardRelinkSamePullRequest {
+            card_id: card.card_id,
+            repo: old_pull_request.repo,
+            number: old_pull_request.number,
+        });
+    }
+    Ok(old_pull_request)
+}
+
 fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
     match state {
         AgentAvailabilityState::Ready => 0,
@@ -1287,5 +1383,113 @@ mod tests {
         // Belt-and-suspenders: `created_by` and the `Operator.peer_id`
         // are the same identity by construction at the operator emitter.
         assert_eq!(event.created_by, peer_id);
+    }
+
+    // Card 09fddedd — relink gate. Each refusal is pinned as a typed
+    // error variant so the CLI surface can't drift into a silent no-op
+    // (the failure class this card fixes was exactly a silent skip:
+    // first-write-wins link + no supersede path = orphaned Review
+    // cards, 6967921d).
+
+    fn pr_ref(number: u64) -> airc_work::model::PullRequestRef {
+        airc_work::model::PullRequestRef {
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            number,
+            head: airc_work::BranchName::new(format!("feat/pr-{number}")).unwrap(),
+            base: airc_work::BranchName::new("rust-rewrite").unwrap(),
+        }
+    }
+
+    fn card_in(
+        state: CardState,
+        pull_request: Option<airc_work::model::PullRequestRef>,
+    ) -> WorkCard {
+        WorkCard {
+            card_id: WorkCardId::from_u128(1),
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: "relink gate".to_string(),
+            body: None,
+            priority: Priority::P2,
+            lane_id: None,
+            state,
+            owner: None,
+            claim_id: None,
+            claim_expires_at_ms: None,
+            last_heartbeat_at_ms: None,
+            pull_request,
+            created_by: airc_core::PeerId::from_u128(2),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            reviews: None,
+        }
+    }
+
+    #[test]
+    fn relink_gate_returns_superseded_link_for_review_card() {
+        // what this catches: the success path must hand back the OLD
+        // link (the audit payload for PullRequestRelinked), not the new
+        // one — returning the new ref would silently fabricate the
+        // audit trail while every assertion on "did it error" passes.
+        let old = pr_ref(1078);
+        let card = card_in(CardState::Review, Some(old.clone()));
+        let superseded = validate_relink_card_pull_request(&card, &pr_ref(1137))
+            .expect("review card with a stale link must be relinkable");
+        assert_eq!(superseded, old, "gate must return the superseded link");
+    }
+
+    #[test]
+    fn relink_gate_refuses_card_without_linked_pr() {
+        // what this catches: relink degrading into a first-link path.
+        // `airc work link` owns the first link; relink on an unlinked
+        // card must refuse loudly so old_pull_request is never faked.
+        let card = card_in(CardState::InProgress, None);
+        match validate_relink_card_pull_request(&card, &pr_ref(1137)) {
+            Err(AircError::WorkCardHasNoLinkedPullRequest { card_id }) => {
+                assert_eq!(card_id, card.card_id);
+            }
+            other => panic!("expected WorkCardHasNoLinkedPullRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relink_gate_refuses_same_pull_request() {
+        // what this catches: emitting a no-op supersede event (old ==
+        // new), which would pollute the transcript's audit trail and
+        // mask an operator typo. Identity is (repo, number): a changed
+        // head branch on the same PR number is still the same PR.
+        let mut old = pr_ref(1137);
+        old.head = airc_work::BranchName::new("feat/old-head").unwrap();
+        let card = card_in(CardState::Review, Some(old));
+        match validate_relink_card_pull_request(&card, &pr_ref(1137)) {
+            Err(AircError::WorkCardRelinkSamePullRequest { number, .. }) => {
+                assert_eq!(number, 1137);
+            }
+            other => panic!("expected WorkCardRelinkSamePullRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relink_gate_refuses_merged_and_closed_cards() {
+        // what this catches: pointing the merger at a successor PR for
+        // work that already shipped. Terminal-state refusal must win
+        // over every other check — even a merged card WITH a link and a
+        // distinct successor refuses on state, and a closed card
+        // WITHOUT a link reports the terminal state (not "no linked
+        // PR", which would misdirect the operator to `airc work link`).
+        let merged = card_in(CardState::Merged, Some(pr_ref(1078)));
+        match validate_relink_card_pull_request(&merged, &pr_ref(1137)) {
+            Err(AircError::WorkCardRelinkTerminalState { state, .. }) => {
+                assert_eq!(state, CardState::Merged);
+            }
+            other => panic!("expected WorkCardRelinkTerminalState, got {other:?}"),
+        }
+
+        let closed = card_in(CardState::Closed, None);
+        match validate_relink_card_pull_request(&closed, &pr_ref(1137)) {
+            Err(AircError::WorkCardRelinkTerminalState { state, .. }) => {
+                assert_eq!(state, CardState::Closed);
+            }
+            other => panic!("expected WorkCardRelinkTerminalState, got {other:?}"),
+        }
     }
 }

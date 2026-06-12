@@ -274,6 +274,111 @@ pub(crate) async fn link_existing_pr(
     Ok(())
 }
 
+/// Card 09fddedd — supersede a card's linked PR with a successor PR.
+/// Sibling of [`link_existing_pr`]: same `gh pr view --json` read (no
+/// stdout scraping of human output), same explicit `--repo` so it
+/// works after the card's worktree is gone.
+///
+/// Division of labour: this adapter validates the things only the
+/// forge knows — the successor PR must EXIST and must target the SAME
+/// base branch as the link it supersedes (a relink across bases is a
+/// retarget, not a supersede, and would hand the merger a PR landing
+/// somewhere the card never promised). Projection-side validation
+/// (card exists, currently linked, not terminal, successor differs)
+/// lives in `Airc::relink_card_pull_request`, the single emit path.
+pub(crate) async fn relink_card_pr(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+    pr_number: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use airc_work::model::{BranchName, PullRequestRef};
+
+    let board = airc
+        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+        .await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    let Some(current) = &card.pull_request else {
+        return Err(format!(
+            "card {card_id} has no linked pull_request to supersede — \
+             use `airc work link {card_id} --pr {pr_number}` for the first link"
+        )
+        .into());
+    };
+    let repo = card.repo.clone();
+
+    // Read the successor PR's actual head/base/state from GitHub —
+    // typed JSON, explicit --repo, never parsed from human output.
+    let out = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo.as_str(),
+            "--json",
+            "state,headRefName,baseRefName",
+            "--jq",
+            ".state + \"\\t\" + .headRefName + \"\\t\" + .baseRefName",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr view #{pr_number} ({}) failed — successor PR must exist: {}",
+            repo.as_str(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    let line = String::from_utf8(out.stdout)?;
+    let mut fields = line.trim().split('\t');
+    let state = fields.next().unwrap_or("").trim().to_string();
+    let head = fields.next().unwrap_or("").trim().to_string();
+    let base = fields.next().unwrap_or("").trim().to_string();
+    if head.is_empty() || base.is_empty() {
+        return Err(format!(
+            "could not parse head/base for PR #{pr_number} ({}) — got state={state:?}",
+            repo.as_str()
+        )
+        .into());
+    }
+    if base != current.base.as_str() {
+        return Err(format!(
+            "refusing to relink card {card_id}: successor PR #{pr_number} targets base {base:?} \
+             but the superseded PR #{} targets {:?} — a cross-base relink is a retarget, not a \
+             supersede; open the successor against the same base first",
+            current.number,
+            current.base.as_str()
+        )
+        .into());
+    }
+    if state != "OPEN" {
+        // Same convention as `airc work link`: a non-OPEN successor is
+        // recorded (history is honest) but the merger won't act on it,
+        // so the caller hears about it loudly.
+        eprintln!("airc: warning — successor PR #{pr_number} state is {state}, not OPEN");
+    }
+
+    let new_pull_request = PullRequestRef {
+        repo,
+        number: pr_number,
+        head: BranchName::new(head)?,
+        base: BranchName::new(base)?,
+    };
+    let superseded = airc
+        .relink_card_pull_request(airc_lib::RelinkCardPullRequest {
+            card_id,
+            new_pull_request,
+        })
+        .await?;
+    println!(
+        "pull_request_relinked: card={card_id} old=#{} new=#{pr_number}",
+        superseded.number
+    );
+    Ok(())
+}
+
 pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
     // `Command::current_dir(...)` so `gh repo view` resolves the
