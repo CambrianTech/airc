@@ -38,6 +38,7 @@ mod events_commands;
 mod gh_cli;
 mod gh_client;
 mod gh_commands;
+mod gh_reqwest;
 mod gh_state;
 mod gist_cli;
 mod gist_commands;

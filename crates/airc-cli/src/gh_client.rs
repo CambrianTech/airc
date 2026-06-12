@@ -185,7 +185,11 @@ fn classify_gh_failure(output: &std::process::Output) -> GhError {
 /// typed shape. The "gh not found on PATH" case is special because
 /// it's actionable as operator config — distinguish it from a
 /// generic process failure.
-fn map_spawn_error(error: std::io::Error) -> GhError {
+///
+/// `pub(crate)` so the sibling `gh_reqwest` module reuses this for
+/// the one gh-process spawn it does (`gh auth token`) — same error
+/// surface, no duplication.
+pub(crate) fn map_spawn_error(error: std::io::Error) -> GhError {
     if error.kind() == std::io::ErrorKind::NotFound {
         GhError::GhNotFound(error)
     } else {
@@ -293,19 +297,37 @@ mod tests {
     // ReqwestGhClient impl; this bench is its acceptance criterion.
     // ------------------------------------------------------------------
 
+    /// Card 00e3aa39 (with Joel's "public substrate" fix): parameterise
+    /// the bench target via env vars so a fork running these benches
+    /// hits THEIR repo, not the airc upstream. Skip with a clear
+    /// message when unset — the bench is `#[ignore]`'d anyway, but a
+    /// fork that opts in via `--ignored` shouldn't accidentally
+    /// hammer CambrianTech.
+    fn bench_target() -> Option<(String, String)> {
+        let repo = std::env::var("AIRC_BENCH_REPO").ok()?;
+        let branch = std::env::var("AIRC_BENCH_BRANCH").unwrap_or_else(|_| "main".to_string());
+        if repo.is_empty() {
+            return None;
+        }
+        Some((repo, branch))
+    }
+
     #[tokio::test]
-    #[ignore = "card 00e3aa39: hits live GitHub API; run manually with --ignored to measure the gh-CLI-spawn perf gap"]
+    #[ignore = "card 00e3aa39: hits live GitHub API; set AIRC_BENCH_REPO=<owner/name> (and optionally AIRC_BENCH_BRANCH) and run with --ignored"]
     async fn bench_branch_check_rollup_against_live_github() {
-        // Establishes the baseline for the ReqwestGhClient
-        // follow-up. Runs branch_check_rollup against
-        // CambrianTech/airc's rust-rewrite branch a small number of
-        // times so the operator can read the per-call cost off the
-        // printed timing.
+        let Some((repo, branch)) = bench_target() else {
+            eprintln!(
+                "card 00e3aa39: skipping live bench — set AIRC_BENCH_REPO=<owner/name> \
+                 (default branch 'main' or override via AIRC_BENCH_BRANCH) to run"
+            );
+            return;
+        };
         let client = ShellGhClient::new();
         let args = BranchCheckRollupArgs {
-            repo: "CambrianTech/airc".to_string(),
-            branch: "rust-rewrite".to_string(),
+            repo: repo.clone(),
+            branch: branch.clone(),
         };
+        eprintln!("card 00e3aa39: target = {repo}@{branch}");
 
         // Warmup so the first-call DNS / TLS handshake doesn't skew
         // the measured cost. The gh binary has its own auth cache,
@@ -352,6 +374,93 @@ mod tests {
         assert!(
             avg.as_secs() < 5,
             "ShellGhClient regressed to {avg:?} per call — investigate"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Card 00e3aa39 Sub-2 — live bench measuring ReqwestGhClient vs
+    // ShellGhClient, head-to-head, against the SAME endpoint on the
+    // SAME machine. Same env-parameterised target as the Sub-1 bench.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "card 00e3aa39 Sub-2: set AIRC_BENCH_REPO + (optionally) AIRC_BENCH_BRANCH and run with --ignored to verify ReqwestGhClient speedup vs ShellGhClient"]
+    async fn bench_reqwest_vs_shell_head_to_head() {
+        let Some((repo, branch)) = bench_target() else {
+            eprintln!(
+                "card 00e3aa39 Sub-2: skipping head-to-head bench — set \
+                 AIRC_BENCH_REPO=<owner/name> to run"
+            );
+            return;
+        };
+        let shell = ShellGhClient::new();
+        let reqw = crate::gh_reqwest::ReqwestGhClient::new()
+            .expect("reqwest client builds — rustls-tls feature is enabled in Cargo.toml");
+        let args = BranchCheckRollupArgs {
+            repo: repo.clone(),
+            branch: branch.clone(),
+        };
+        eprintln!("card 00e3aa39 Sub-2: target = {repo}@{branch}");
+
+        // Warmup both — DNS, TLS handshake, gh-auth-token cache.
+        let _ = shell.branch_check_rollup(args.clone()).await;
+        let _ = reqw.branch_check_rollup(args.clone()).await;
+
+        const ITERS: u32 = 5;
+
+        let mut shell_total = std::time::Duration::ZERO;
+        for i in 0..ITERS {
+            let start = std::time::Instant::now();
+            let result = shell.branch_check_rollup(args.clone()).await;
+            let elapsed = start.elapsed();
+            shell_total += elapsed;
+            match result {
+                Ok(runs) => eprintln!(
+                    "card 00e3aa39 Sub-2: ShellGhClient #{i} → {elapsed:?} ({} runs)",
+                    runs.len()
+                ),
+                Err(e) => {
+                    eprintln!("card 00e3aa39 Sub-2: ShellGhClient #{i} FAILED in {elapsed:?}: {e}")
+                }
+            }
+        }
+        let shell_avg = shell_total / ITERS;
+
+        let mut reqw_total = std::time::Duration::ZERO;
+        for i in 0..ITERS {
+            let start = std::time::Instant::now();
+            let result = reqw.branch_check_rollup(args.clone()).await;
+            let elapsed = start.elapsed();
+            reqw_total += elapsed;
+            match result {
+                Ok(runs) => eprintln!(
+                    "card 00e3aa39 Sub-2: ReqwestGhClient #{i} → {elapsed:?} ({} runs)",
+                    runs.len()
+                ),
+                Err(e) => eprintln!(
+                    "card 00e3aa39 Sub-2: ReqwestGhClient #{i} FAILED in {elapsed:?}: {e}"
+                ),
+            }
+        }
+        let reqw_avg = reqw_total / ITERS;
+
+        let speedup = shell_avg.as_secs_f64() / reqw_avg.as_secs_f64().max(0.0001);
+        eprintln!(
+            "card 00e3aa39 Sub-2 HEAD-TO-HEAD AVERAGE over {ITERS} calls each: \
+             Shell={shell_avg:?}  Reqwest={reqw_avg:?}  speedup={speedup:.2}×"
+        );
+
+        // Honest floor (per session conversation): ReqwestGhClient
+        // must be at least 1.2× faster than ShellGhClient. The
+        // original 4× projection was overstated — GitHub's REST API
+        // is ~400ms regardless of caller; the real lever is GraphQL
+        // batching, carded as Sub-3.
+        let one_two_x_floor = reqw_avg.as_secs_f64() * 1.2 <= shell_avg.as_secs_f64();
+        assert!(
+            one_two_x_floor,
+            "ReqwestGhClient did not clear the 1.2× honest floor: \
+             Shell={shell_avg:?}  Reqwest={reqw_avg:?}  speedup={speedup:.2}×. \
+             Sub-3 (GraphQL batching) is where the 4× actually lives — see the card."
         );
     }
 }
