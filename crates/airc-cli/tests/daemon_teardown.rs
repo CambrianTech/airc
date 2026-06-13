@@ -161,6 +161,47 @@ fn reaper_finds_and_kills_a_spawned_daemon() {
     // guard drop is now a no-op (already reaped) — proves idempotence.
 }
 
+/// ps-scan layer — the reaper kills a daemon whose `daemon.pid` is NOT
+/// discoverable under `root` (its home derivation put the pidfile
+/// elsewhere, or it never wrote one) purely from its `--home` argument
+/// being under `root`. This is the belt-and-braces that fixed the
+/// macOS-only leak the CI zero-leak guard caught: a daemon whose pidfile
+/// landed outside the walked tree.
+///
+/// MUTATION PIN: delete `pids_from_process_scan` (or its union in
+/// `reap_daemons_under`) and, with the pidfile removed, the reaper can
+/// no longer find the daemon — `wait_child_gone` times out and this
+/// fails.
+#[cfg(unix)]
+#[test]
+fn reaper_ps_scan_kills_daemon_with_no_discoverable_pidfile() {
+    let guard = common::daemon_tempdir();
+    let root = guard.path().to_path_buf();
+    let home = root.join(".airc");
+    let socket = home.join("daemon.sock");
+
+    let mut child = spawn_daemon(&home, &socket, None);
+    let pid = wait_for_pidfile(&root, Duration::from_secs(10));
+
+    // Simulate the failure mode: the pidfile is not where the reaper's
+    // tree-walk looks (deleted here). Only the ps-scan over `--home`
+    // can still find the live daemon.
+    let _ = std::fs::remove_file(home.join("daemon.pid"));
+    assert_eq!(
+        common::find_daemon_pid_under(&root),
+        None,
+        "precondition: no pidfile is discoverable under root"
+    );
+
+    common::reap_daemons_under(&root);
+
+    assert!(
+        wait_child_gone(&mut child, Duration::from_secs(8)),
+        "the ps-scan must reap a daemon whose --home is under root even \
+         with no discoverable pidfile (pid {pid})"
+    );
+}
+
 /// Layer 2 — belt-and-braces self-exit. A temp-home daemon with no
 /// connected client must exit BY ITSELF after the (test-shortened)
 /// idle window, WITHOUT any teardown. This is what catches a SIGKILLed
