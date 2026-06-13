@@ -128,8 +128,9 @@ pub use external_identity::{
     HEADER_BRIDGE_HANDLE, HEADER_BRIDGE_SOURCE,
 };
 pub use gh_account_registry::{
-    account_registry_block, gh_auth_ready, writer_filename, writer_key, AccountRegistryBlock,
-    GhAccountRegistryStore, AIRC_DISABLE_ACCOUNT_REGISTRY_ENV,
+    account_registry_block, gh_auth_ready, gh_auth_ready_with_token, re_resolve_gh_token,
+    writer_filename, writer_key, AccountRegistryBlock, GhAccountRegistryStore, GhTokenOverride,
+    AIRC_DISABLE_ACCOUNT_REGISTRY_ENV, GH_AUTH_READY_TIMEOUT,
 };
 pub use gh_client::{
     parse_pr_url, parse_pr_view, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,

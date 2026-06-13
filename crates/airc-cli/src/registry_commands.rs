@@ -131,8 +131,15 @@ pub async fn run_sync(
     let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
     let store = GhAccountRegistryStore::new(event_store, home);
     let gate = RegistryRefreshGate::GhAuth {
-        gh_bin: None,
+        // Honor the operator's AIRC_GH_BIN here too (card 1f2cbffa):
+        // the store's `new()` already reads it, but the gate used to
+        // probe bare `gh` — an override pointing at a different gh
+        // would pass/fail the gate against the WRONG binary. `None`
+        // token slot: a manual sync runs in the operator's live
+        // session, where env/keyring are already current.
+        gh_bin: crate::commands::gh_bin_override(),
         scope_home: home.to_path_buf(),
+        token_override: None,
     };
 
     // Gate FIRST (hermetic, then gh-auth): a blocked scope must hear
