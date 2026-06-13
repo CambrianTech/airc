@@ -756,6 +756,23 @@ _install_airc_binary() {
 
 _install_airc_binary
 
+# ── Record the install source for `airc update` ────────────────────────
+# install.sh's _default_clone_dir installs FROM a dev checkout (the cwd)
+# when run inside one, and rust-rewrite currently ships ONLY as a dev
+# checkout (no release channel yet) — so the source is frequently NOT
+# ~/.airc/src. The Rust `airc update` reads this marker to find the
+# source; without it, update died with "No git checkout at ~/.airc/src"
+# for every dev-checkout install (caught live 2026-06-13). The native
+# (non-MSYS) path form is REQUIRED: the airc binary is native and its
+# std::fs / git -C cannot resolve a `/c/...` MSYS path on Windows.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) _install_source="$(_to_win_path "$CLONE_DIR")" ;;
+  *)                    _install_source="$CLONE_DIR" ;;
+esac
+mkdir -p "$HOME/.airc"
+printf '%s\n' "$_install_source" > "$HOME/.airc/install-source"
+ok "Recorded install source for 'airc update': $_install_source"
+
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
 #
 # Both Claude Code and OpenAI Codex use the same on-disk skill format:

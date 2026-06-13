@@ -156,8 +156,33 @@ pub(crate) fn install_source_dir() -> Result<PathBuf, Box<dyn std::error::Error>
     }
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or("HOME is not set; cannot resolve ~/.airc/src")?;
-    Ok(PathBuf::from(home).join(".airc").join("src"))
+        .ok_or("HOME is not set; cannot resolve the airc install source")?;
+    let home = PathBuf::from(home);
+    // install.sh / install.ps1 record the dir they actually installed
+    // FROM in this marker. install.sh's _default_clone_dir installs from a
+    // dev checkout (e.g. ~/work/airc) when run inside one — and
+    // rust-rewrite currently ships ONLY as a dev checkout (no release
+    // channel yet) — so the source is frequently NOT ~/.airc/src. Without
+    // the marker, `airc update` died with "No git checkout at
+    // ~/.airc/src" for every dev-checkout install (caught live
+    // 2026-06-13). Honor the marker before falling back to the default.
+    if let Some(recorded) = read_install_source_marker(&home) {
+        return Ok(recorded);
+    }
+    Ok(home.join(".airc").join("src"))
+}
+
+/// Read the path recorded in `~/.airc/install-source`, if present and
+/// non-empty. Returns `None` on any read error or blank content so the
+/// caller falls back to the default location.
+fn read_install_source_marker(home: &Path) -> Option<PathBuf> {
+    let marker = home.join(".airc").join("install-source");
+    let contents = std::fs::read_to_string(&marker).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -259,6 +284,75 @@ mod tests {
                 assert_eq!(
                     install_source_dir().unwrap(),
                     PathBuf::from("/tmp/home/.airc/src")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn install_source_reads_marker_when_no_env() {
+        // what this catches: airc update finding a dev-checkout install
+        // source recorded by install.sh, instead of dying on ~/.airc/src
+        // (regression for the 2026-06-13 "No git checkout" dev-install bug).
+        let temp = tempfile::TempDir::new().unwrap();
+        let airc = temp.path().join(".airc");
+        std::fs::create_dir_all(&airc).unwrap();
+        std::fs::write(airc.join("install-source"), "/opt/dev/airc\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("AIRC_DIR", None::<&str>),
+                ("HOME", Some(temp.path().to_str().unwrap())),
+                ("USERPROFILE", None::<&str>),
+            ],
+            || {
+                assert_eq!(
+                    install_source_dir().unwrap(),
+                    PathBuf::from("/opt/dev/airc")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn install_source_airc_dir_beats_marker() {
+        // what this catches: explicit AIRC_DIR must still win over a
+        // recorded marker (precedence order regression).
+        let temp = tempfile::TempDir::new().unwrap();
+        let airc = temp.path().join(".airc");
+        std::fs::create_dir_all(&airc).unwrap();
+        std::fs::write(airc.join("install-source"), "/opt/dev/airc\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("AIRC_DIR", Some("/explicit/override")),
+                ("HOME", Some(temp.path().to_str().unwrap())),
+            ],
+            || {
+                assert_eq!(
+                    install_source_dir().unwrap(),
+                    PathBuf::from("/explicit/override")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn install_source_blank_marker_falls_back_to_default() {
+        // what this catches: a blank/whitespace marker must not resolve to
+        // an empty path; fall through to ~/.airc/src.
+        let temp = tempfile::TempDir::new().unwrap();
+        let airc = temp.path().join(".airc");
+        std::fs::create_dir_all(&airc).unwrap();
+        std::fs::write(airc.join("install-source"), "  \n").unwrap();
+        temp_env::with_vars(
+            [
+                ("AIRC_DIR", None::<&str>),
+                ("HOME", Some(temp.path().to_str().unwrap())),
+                ("USERPROFILE", None::<&str>),
+            ],
+            || {
+                assert_eq!(
+                    install_source_dir().unwrap(),
+                    temp.path().join(".airc").join("src")
                 );
             },
         );

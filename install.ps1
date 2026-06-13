@@ -293,6 +293,15 @@ if (-not (Test-Path $channelFile) -or (Get-Content $channelFile -Raw -ErrorActio
     Set-Content -Path $channelFile -Value $DEFAULT_CHANNEL -NoNewline
 }
 
+# Record the install source so `airc update` can find it even when it's a
+# dev checkout outside ~/.airc/src (parity with install.sh; the Rust
+# update command reads ~/.airc/install-source). $CLONE_DIR is already a
+# native Windows path here, which is what the native binary needs.
+$aircHome = Join-Path $env:USERPROFILE '.airc'
+New-Item -ItemType Directory -Force -Path $aircHome | Out-Null
+Set-Content -Path (Join-Path $aircHome 'install-source') -Value $CLONE_DIR
+Write-Ok "Recorded install source for 'airc update': $CLONE_DIR"
+
 # -- Build + install the Rust airc binary -------------------------------
 # Mirrors install.sh's `_install_airc_binary`: PR #864 demolished the bash
 # wrapper, airc IS the Rust binary now. On Windows that's
