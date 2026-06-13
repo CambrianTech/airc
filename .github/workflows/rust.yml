@@ -21,23 +21,26 @@ name: rust
 # Rust workspace as it grows.
 
 on:
+  # NO `paths` filter on pull_request — on purpose. The required contexts
+  # (`cargo clippy (deny warnings)`, `cargo test (ubuntu-latest)`) must
+  # REPORT on every PR, because GitHub's merge queue refuses to ingest a
+  # PR whose required checks never ran ("N of N required status checks
+  # are expected" from the enqueue API). A `paths` filter here meant the
+  # rust legs never triggered on docs/scripts/skills PRs, which silently
+  # made EVERY non-Rust PR unmergeable through the queue (caught live
+  # 2026-06-13 — #1164/#1165 stuck with no way in, not even --admin).
+  # The `changes` job below decides whether the heavy jobs do real work;
+  # non-Rust PRs SKIP them (a skipped required check counts as satisfied)
+  # so the self-hosted runner stays free. merge_group always runs the
+  # real legs regardless (see below).
   pull_request:
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "test/rust_quality_guard.sh"
-      - ".github/workflows/rust.yml"
   # Merge queue: GitHub builds the queued PR(s) on top of the latest
   # rust-rewrite on a `gh-readonly-queue/...` ref and emits a
-  # `merge_group` event. Without this trigger those checks never run,
-  # so the queue would wait forever. No `paths` filter here on purpose
-  # — `merge_group` doesn't honour path filters, and a queued docs-only
-  # PR still needs to report the required contexts (the rust legs pass
-  # trivially with no crate changes). This is the gate that catches the
-  # merge-race class that broke rust-rewrite on 2026-06-11 (#1127×#1137
-  # each green alone, broken combined): the queue compiles the COMBINED
-  # result before it can land.
+  # `merge_group` event. The heavy jobs run UNCONDITIONALLY on
+  # merge_group (their `if` short-circuits on event != pull_request), so
+  # the rust legs always validate the COMBINED queued result — the gate
+  # that catches the merge-race class that broke rust-rewrite on
+  # 2026-06-11 (#1127×#1137 each green alone, broken combined).
   merge_group:
   push:
     branches: [canary, main, rust-rewrite]
@@ -63,8 +66,42 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Detect whether this PR touches Rust-relevant files. Drives the `if`
+  # on the real jobs so non-Rust PRs skip the heavy work (reporting the
+  # required contexts as skipped = satisfied) while the contexts still
+  # exist so the merge queue can ingest the PR. Only meaningful on
+  # pull_request; on merge_group/push the heavy jobs run unconditionally.
+  changes:
+    name: detect rust-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      # No checkout, no third-party action: ask the API for the PR's
+      # changed files and grep for Rust-relevant paths. `gh` + the
+      # built-in token are always present on GitHub-hosted runners.
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename')"
+          if printf '%s\n' "$files" | grep -qE '^(crates/|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$)'; then
+            echo "rust=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: cargo fmt --check
+    # Run on merge_group/push always; on a PR only when Rust changed.
+    # `!cancelled()` lets this run even though `changes` is skipped on
+    # non-pull_request events (a skipped dependency would otherwise skip
+    # this job too).
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     steps:
       # Self-defending guard (sentinel ask on #1116): the self-hosted leg
@@ -90,6 +127,8 @@ jobs:
 
   clippy:
     name: cargo clippy (deny warnings)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     steps:
       # Self-defending guard (sentinel ask on #1116): the self-hosted leg
@@ -134,6 +173,8 @@ jobs:
 
   quality:
     name: rust quality guard
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,6 +188,13 @@ jobs:
     # `#[cfg(windows)]` (like the named-pipe IPC concurrent-bind test)
     # only execute when the test job actually runs on Windows.
     name: cargo test (${{ matrix.display }})
+    # Gate as fmt/clippy: skip on non-Rust PRs (keeps the contended
+    # self-hosted Windows leg free), run real on merge_group/push and
+    # Rust PRs. `cargo test (ubuntu-latest)` is a required context, so on
+    # a skipped non-Rust PR it reports skipped = satisfied, letting the
+    # queue ingest; merge_group then runs the real matrix on the candidate.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ${{ matrix.os }}
     # Defense-in-depth: a hung test must never pin a runner indefinitely.
     # On 2026-06-11 a single windows-self-hosted job hung for ~18h on a
