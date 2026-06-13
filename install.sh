@@ -431,6 +431,37 @@ ensure_prereqs() {
       fi
     fi
   fi
+
+  # Git author identity. Agents in this substrate commit and open PRs,
+  # and a fresh machine has no global user.name/user.email — the first
+  # commit then dies with "Author identity unknown" (caught live on a
+  # clean Windows box 2026-06-13). Derive it from the authenticated gh
+  # account when unset; never clobber an identity the user already set.
+  # Email prefers the account's public email, falling back to the GitHub
+  # noreply alias (<id>+<login>@users.noreply.github.com), which always
+  # matches the account and avoids leaking a private address.
+  if command -v gh >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    _need_name=0; _need_email=0
+    if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
+    if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
+    if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
+      _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
+      _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+      _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
+      _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
+      if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
+        _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
+      fi
+      if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
+        git config --global user.name "$_gh_name"
+        info "git user.name set from gh: $_gh_name (override: git config --global user.name ...)"
+      fi
+      if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
+        git config --global user.email "$_gh_email"
+        info "git user.email set from gh: $_gh_email (override: git config --global user.email ...)"
+      fi
+    fi
+  fi
 }
 
 ensure_prereqs
@@ -537,38 +568,74 @@ fi
 
 _add_path_entry() {
   local path_entry="$1"
-  local rc
+  local rc rc_target=""
   # Always reconcile the rc file regardless of current-shell PATH
   # state. The rc is persistent; $PATH is transient and may have been
   # manually augmented by the operator in this shell. Conflating them
   # (early-return when PATH already contains the entry) was the bug
   # that left stale airc-managed PATH lines in ~/.zshrc after install
   # re-runs — caught live 2026-05-20.
+  #
+  # Pass 1: reconcile EVERY rc that already exists (strip stale
+  # airc-managed lines so reruns are idempotent and entries pointing at
+  # retired install dirs don't accumulate), and remember the first
+  # existing one as the write target.
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     [ -f "$rc" ] || continue
     # Strip any pre-existing airc-managed PATH lines (marked with the
-    # trailing `# airc` comment) so reruns are idempotent and stale
-    # entries pointing at retired install dirs (e.g., ~/.local/bin from
-    # the pre-rust-rewrite install) don't accumulate. We only touch
-    # lines we ourselves wrote; user-managed PATH lines stay put.
+    # trailing `# airc` comment). We only touch lines we ourselves
+    # wrote; user-managed PATH lines stay put.
     if grep -qE '^export PATH=.*# airc$' "$rc"; then
       local tmp; tmp="$(mktemp "${rc}.airc.XXXXXX")"
-      grep -vE '^export PATH=.*# airc$' "$rc" > "$tmp" && mv "$tmp" "$rc"
+      # `|| true` is load-bearing: when the rc contains ONLY airc-managed
+      # lines (e.g. a freshly-created ~/.bashrc holding just our PATH
+      # entry), grep -v emits nothing and exits 1, which would skip the
+      # mv under `&&` and leave the stale line in place — duplicating it
+      # on the next append. Decouple the mv from grep's exit code.
+      grep -vE '^export PATH=.*# airc$' "$rc" > "$tmp" || true
+      mv "$tmp" "$rc"
     fi
-    # Ensure rc ends with a newline so the append starts on its own
-    # line. Without this, an rc that ends with `alias foo="bar"` (no
-    # trailing \n) produces the broken line
-    # `alias foo="bar"export PATH="...:$PATH"  # airc`
-    # which zsh parses as one malformed alias declaration and never
-    # sets PATH. Caught live 2026-05-20 — Joel's `airc` resolved fine
-    # from a manually-augmented PATH but new shells got nothing.
-    if [ -s "$rc" ] && [ "$(tail -c1 "$rc")" != "$(printf '\n')" ]; then
-      printf '\n' >> "$rc"
-    fi
-    printf 'export PATH="%s:$PATH"  # airc\n' "$path_entry" >> "$rc"
-    ok "Added $path_entry to PATH in $(basename "$rc")"
-    break
+    [ -z "$rc_target" ] && rc_target="$rc"
   done
+  # No rc file existed at all. A fresh Git Bash / MSYS box ships NONE of
+  # ~/.bashrc / ~/.bash_profile / ~/.profile, so the old "[ -f ] ||
+  # continue" loop wrote the PATH line to NOTHING and `airc` ended up on
+  # PATH in no shell — current OR future. Caught live on a clean Windows
+  # Git Bash box 2026-06-13. Create the rc that matches the user's
+  # shell so the entry has a home.
+  if [ -z "$rc_target" ]; then
+    case "${SHELL:-}" in
+      *zsh) rc_target="$HOME/.zshrc" ;;
+      *)    rc_target="$HOME/.bashrc" ;;
+    esac
+    : > "$rc_target"
+    info "Created $(basename "$rc_target") (no shell rc existed) for the airc PATH entry"
+    # Login bash (Git Bash launches `bash --login -i`) sources
+    # ~/.bash_profile / ~/.bash_login / ~/.profile, NOT ~/.bashrc, unless
+    # told to. Without this shim the freshly-created ~/.bashrc is never
+    # read by a login shell and the PATH entry is dead on arrival. Only
+    # create the shim when no login file already exists (don't clobber a
+    # user's own ~/.bash_profile).
+    if [ "$rc_target" = "$HOME/.bashrc" ] \
+       && [ ! -f "$HOME/.bash_profile" ] \
+       && [ ! -f "$HOME/.bash_login" ] \
+       && [ ! -f "$HOME/.profile" ]; then
+      printf '# created by airc installer: load ~/.bashrc in login shells\nif [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n' > "$HOME/.bash_profile"
+      info "Created ~/.bash_profile to source ~/.bashrc in login shells"
+    fi
+  fi
+  # Ensure rc ends with a newline so the append starts on its own
+  # line. Without this, an rc that ends with `alias foo="bar"` (no
+  # trailing \n) produces the broken line
+  # `alias foo="bar"export PATH="...:$PATH"  # airc`
+  # which zsh parses as one malformed alias declaration and never
+  # sets PATH. Caught live 2026-05-20 — Joel's `airc` resolved fine
+  # from a manually-augmented PATH but new shells got nothing.
+  if [ -s "$rc_target" ] && [ "$(tail -c1 "$rc_target")" != "$(printf '\n')" ]; then
+    printf '\n' >> "$rc_target"
+  fi
+  printf 'export PATH="%s:$PATH"  # airc\n' "$path_entry" >> "$rc_target"
+  ok "Added $path_entry to PATH in $(basename "$rc_target")"
   # Only export into current env if not already there. Avoids
   # gratuitously prepending duplicate PATH segments when the operator
   # has already sourced their rc.
