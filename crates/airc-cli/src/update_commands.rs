@@ -205,12 +205,49 @@ fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Err
 
 fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_checked(
-        Command::new("bash")
+        Command::new(installer_shell())
             .arg(source.join("install.sh"))
             .env("AIRC_DIR", source)
             .env("AIRC_INSTALL_NO_PULL", "1"),
         "install.sh",
     )
+}
+
+/// The shell used to run install.sh during `airc update`.
+///
+/// On Windows, a plain `bash` resolves to `C:\Windows\System32\bash.exe`
+/// — the WSL launcher — which fails with "Windows Subsystem for Linux has
+/// no installed distributions" when no distro is present, so `airc
+/// update` died at the reinstall step (caught live 2026-06-13). Prefer
+/// the Git-for-Windows bash derived from `git --exec-path` (git is an
+/// airc prereq). On Unix there is no `bin/bash.exe`, so this finds
+/// nothing and the caller falls back to plain `bash` — unchanged.
+fn installer_shell() -> std::ffi::OsString {
+    if let Some(bash) = git_bundled_bash() {
+        return bash.into_os_string();
+    }
+    std::ffi::OsString::from("bash")
+}
+
+fn git_bundled_bash() -> Option<PathBuf> {
+    let output = Command::new("git").arg("--exec-path").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec = String::from_utf8(output.stdout).ok()?;
+    bash_in_git_root(Path::new(exec.trim()))
+}
+
+/// Walk up from a git exec-path (e.g. `.../Git/mingw64/libexec/git-core`)
+/// looking for a bundled `bin/bash.exe` or `usr/bin/bash.exe` under any
+/// ancestor. Pure path logic so it is testable on every platform.
+fn bash_in_git_root(exec_path: &Path) -> Option<PathBuf> {
+    exec_path.ancestors().find_map(|root| {
+        ["bin/bash.exe", "usr/bin/bash.exe"]
+            .iter()
+            .map(|rel| root.join(rel))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn git_text<const N: usize>(
@@ -356,6 +393,32 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn bash_in_git_root_finds_bundled_bash() {
+        // what this catches: airc update finding Git-for-Windows' bash via
+        // git --exec-path instead of invoking the System32 WSL launcher
+        // (regression for the 2026-06-13 "WSL has no distributions" bug).
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("mingw64").join("libexec").join("git-core")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin").join("bash.exe"), b"#!/bin/sh\n").unwrap();
+        let exec = root.join("mingw64").join("libexec").join("git-core");
+        assert_eq!(
+            bash_in_git_root(&exec).unwrap(),
+            root.join("bin").join("bash.exe")
+        );
+    }
+
+    #[test]
+    fn bash_in_git_root_none_when_absent() {
+        // what this catches: no false positive when no bundled bash exists,
+        // so installer_shell falls back to plain `bash` (Unix path).
+        let temp = tempfile::TempDir::new().unwrap();
+        let exec = temp.path().join("mingw64").join("libexec").join("git-core");
+        assert!(bash_in_git_root(&exec).is_none());
     }
 
     #[test]
