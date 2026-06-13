@@ -24,9 +24,9 @@ Captures `before` and `after` SHAs. Prints one of:
 
 ### Claude Code flow
 
-1. **TaskStop the Monitor task you armed for `/join`** in this session. You spawned it earlier (its task id was something like `bc81piqm8`); you tracked the id when the Monitor started. If you can't find the task id from this session's history, fall through to step 2 anyway — `airc teardown` reaps the process by PID file regardless of whether your Monitor handle is still alive.
+1. **TaskStop the Monitor task you armed for `/join`** in this session. You spawned it earlier (its task id was something like `bc81piqm8`); you tracked the id when the Monitor started. If you can't find the task id from this session's history, fall through to step 2 anyway — `airc stop` shuts down this scope's daemon by IPC regardless of whether your Monitor handle is still alive.
 
-2. **Run `airc teardown`** in Bash. This kills the current scope's running airc processes by reading scope-owned runtime state. Plain teardown — NOT `--flush` — preserves identity, peer records, and subscriptions.
+2. **Run `airc stop`** in Bash. This gracefully shuts down the current scope's running daemon. It preserves identity, peer records, and subscriptions — there is no state wipe (the old `airc teardown --flush` has no equivalent in the rust-rewrite).
 
 3. **Re-arm a new Monitor with `airc join`**:
    ```

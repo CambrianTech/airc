@@ -33,10 +33,10 @@ airc join
 ## Failure modes
 
 - `Not initialized (<scope>). Run: airc join` — scope is fresh (no saved pairing). The user needs an actual join string from the host; use `/join <string>` instead.
-- `Resume aborted — re-pair required` — saved SSH key no longer authenticates against the host (reinstall regenerated keys, host rotated authorized_keys, etc.). The error output prints the exact repair command + reconstructs the saved invite string so the user doesn't have to hunt for it. Follow it verbatim: `airc teardown --flush && airc join <invite-string>`.
-- Silent resume (AIRC process running but no inbound ever arrives): used to be a silent failure mode pre-fix. Now the auth probe catches it at connect time. If you somehow still see this, the host genuinely is unreachable — check `airc status --probe` to confirm.
+- `Resume aborted — re-pair required` — saved pairing no longer authenticates against the host (reinstall regenerated keys, host rotated authorized_keys, etc.). Recover with `airc stop && airc join <join-string>` (the `/repair` skill wraps this).
+- Silent resume (airc daemon running but no inbound ever arrives): if you still see this, the host genuinely is unreachable — check `airc status` to confirm the local daemon and route are healthy.
 
 ## Notes
 
-- `airc join` (no args) and `airc resume` are the same command — `resume` is just a mnemonic alias.
+- There is no `airc resume` CLI verb. This `/resume` skill is purely a mnemonic that wraps `airc join` with no args.
 - Skills `/join` and `/resume` both resolve to the same `airc join` invocation; which one to use is a matter of user-facing intent ("I'm starting" vs "I'm coming back").
