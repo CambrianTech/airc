@@ -49,6 +49,7 @@ pub mod error;
 pub mod external_identity;
 pub mod gh_account_registry;
 pub mod gh_client;
+pub mod gh_governor;
 pub mod join_context;
 mod lan;
 pub mod lane_coordination;
