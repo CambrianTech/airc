@@ -1,21 +1,36 @@
 #!/usr/bin/env bash
 #
-# AIRC installer
+# AIRC installer — DEV PATH ONLY (zero-friction doctrine,
+# docs/ZERO-FRICTION-PATH.md): users get prebuilt signed binaries and
+# never see this script or a compiler. This source-build path serves
+# contributors, grid operators on unreleased branches, and CI; it moves
+# behind --dev once the release pipeline lands.
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
-# Clones the repo, puts `airc` on PATH, symlinks skills into ~/.claude/skills/
+# Clones the repo, puts the source `airc` on PATH, and installs AIRC skills.
 
 set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
-CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
-# BIN_DIR + SKILLS_TARGET respect env-var overrides so test harnesses
-# (and packagers, distros, etc.) can point install.sh at a sandbox
-# instead of stomping ~/.local/bin and ~/.claude/skills. Pre-fix, a
-# test passing BIN_DIR=/tmp/foo would be silently ignored and the
-# real ~/.local/bin/airc symlink would get rewritten to point at the
-# test dir — caught when our own canary test corrupted the real install.
+
+_default_clone_dir() {
+  local script="${BASH_SOURCE[0]:-}"
+  local script_dir=""
+  if [ -n "$script" ] && [ -f "$script" ]; then
+    script_dir="$(cd "$(dirname "$script")" && pwd -P)"
+    if [ -f "$script_dir/Cargo.toml" ] && [ -d "$script_dir/crates/airc-cli" ]; then
+      printf '%s\n' "$script_dir"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$HOME/.airc/src"
+}
+
+CLONE_DIR="${AIRC_DIR:-$(_default_clone_dir)}"
+# BIN_DIR holds the installed Rust binary copied from CLONE_DIR.
+# PATH points at this stable binary, not at mutable source-tree build
+# artifacts and not at a shell wrapper.
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
@@ -49,11 +64,10 @@ _to_bash_path() {
 # install via the platform's package manager, then verify. Designed for
 # FIRST-TIME users with nothing pre-installed beyond a shell.
 #
-# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip)
+# Required: git, gh, ssh-keygen, cargo (to build the Rust substrate CLI).
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
-# Deliberately not required: openssl. Issue #341 — identity Ed25519 ops
-# moved to the venv cryptography module so we don't depend on system
-# openssl flavoring (LibreSSL vs OpenSSL etc).
+# Deliberately not required: openssl or Python. Identity, signing, hooks,
+# config, and message parsing are Rust-owned.
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -100,11 +114,15 @@ pkgname_for() {
         apk)    echo "openssh-client" ;;
         winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
       esac ;;
-    python3)
+    cargo)
       case "$mgr" in
-        pacman) echo "python" ;;
-        winget) echo "Python.Python.3.12" ;;
-        *)      echo "python3" ;;
+        brew)   echo "rust" ;;
+        apt)    echo "cargo" ;;
+        dnf)    echo "cargo" ;;
+        pacman) echo "rust" ;;
+        apk)    echo "cargo" ;;
+        winget) echo "Rustlang.Rustup" ;;
+        *)      echo "cargo" ;;
       esac ;;
     git)
       case "$mgr" in
@@ -147,6 +165,71 @@ install_with_pkgmgr() {
 }
 
 
+
+# Windows (Git Bash / MSYS / Cygwin): rustup's default target is
+# x86_64-pc-windows-msvc, which CANNOT LINK without the Visual Studio C++
+# build tools — `cargo build` dies with a per-crate wall of
+# `error: linking with link.exe failed: exit code: 1` and no guidance.
+# Validated live on a fresh Windows 11 box (2026-06-10). The windows-gnu
+# toolchain is NOT a viable fallback for airc: windows-sys raw-dylib
+# import libs hit the upstream bundled-dlltool bug (rust-lang/rust#103939)
+# and `ring` needs a real C compiler regardless. So when we're on Windows
+# with winget available, probe for the VC.Tools component via vswhere and
+# auto-install the (license-free) VS 2022 Build Tools C++ workload.
+_ensure_windows_msvc_toolchain() {
+  local mgr="$1"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) return 0 ;;
+  esac
+
+  # %ProgramFiles(x86)% can't be read as a bash variable (parens are
+  # invalid in names) — ask cmd for it, fall back to the standard path.
+  local pf86
+  pf86=$(cmd //c 'echo %ProgramFiles(x86)%' 2>/dev/null | tr -d '\r')
+  [ -z "$pf86" ] || [ "$pf86" = '%ProgramFiles(x86)%' ] && pf86='C:\Program Files (x86)'
+  local vswhere
+  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
+  [ -x "$vswhere" ] || vswhere=""
+
+  if [ -n "$vswhere" ]; then
+    local vs_path
+    vs_path=$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null || true)
+    if [ -n "$vs_path" ]; then
+      ok "MSVC C++ build tools already installed"
+      return 0
+    fi
+  fi
+
+  if [ "$mgr" != "winget" ]; then
+    warn "MSVC C++ build tools not found and winget unavailable — cargo cannot link on Windows without them."
+    warn "  Install 'Visual Studio 2022 Build Tools' with the 'Desktop development with C++' workload, then re-run."
+    return 0
+  fi
+
+  info "Installing Visual Studio 2022 Build Tools + C++ workload (required to link Rust on Windows; ~2 GB, several minutes)..."
+  local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
+  [ -z "$wbin" ] && return 0
+  "$wbin" install --id Microsoft.VisualStudio.2022.BuildTools --exact --silent \
+    --accept-source-agreements --accept-package-agreements --disable-interactivity \
+    --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" \
+    || warn "winget BuildTools install returned non-zero; probing anyway"
+
+  # Re-probe: vswhere ships with Build Tools, so it exists now if the
+  # install worked even when it didn't exist before. Reuse the resolved
+  # pf86 (not a hardcoded /c/...) so Cygwin (/cygdrive/c) and relocated
+  # ProgramFiles(x86) do not false-fail after a successful install.
+  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [ -x "$vswhere" ] && [ -n "$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null)" ]; then
+    ok "MSVC C++ build tools installed"
+  else
+    # Most likely: a VS/BuildTools product exists but lacks the C++
+    # workload, and winget won't modify an existing install.
+    fail "MSVC C++ build tools still missing after install attempt.
+       Open 'Visual Studio Installer' -> Modify -> check 'Desktop development with C++' -> Install.
+       Then re-run install.sh. (Without it, cargo cannot link on Windows.)"
+  fi
+}
 
 ensure_prereqs() {
   [ "${AIRC_SKIP_PREREQS:-0}" = "1" ] && { info "AIRC_SKIP_PREREQS=1 -- skipping prereq install"; return 0; }
@@ -193,27 +276,17 @@ ensure_prereqs() {
       fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
-      warn "Required prereqs: git, gh, python3 (cryptography via pip)"
+      warn "Required prereqs: git, gh, cargo"
       return 0
     fi
   fi
 
   local missing=() pkgs=() unmappable=()
-  # #188: jq removed — airc's gist envelope parser now uses Python's
-  # stdlib JSON (lib/airc_core/gistparse.py). Python was already a hard
-  # dep since #152 Phase 0; jq was redundant. Drop the dep + the
-  # winget step that would install it.
-  # Issue #341 follow-up: openssl removed from the prereq list. airc
-  # no longer shells out to it for Ed25519 — identity gen + signing
-  # both route through the venv cryptography module (which is already
-  # a hard dep, pip-installed below). LibreSSL on macOS used to make
-  # this an ordeal; now it's a non-issue at the source.
-  for cmd in git gh ssh-keygen python3; do
+  # jq, openssl, and Python are not install prereqs. JSON handling,
+  # Ed25519 identity/signing, hooks, and config mutation are Rust-owned.
+  for cmd in git gh ssh-keygen cargo; do
     # Strict probe: presence on PATH AND a successful --version invocation.
-    # Used selectively: python3 needs the strict variant because Windows
-    # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (2026-04-27). git/gh all
-    # support --version cleanly. ssh-keygen does NOT have a version
+    # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
     # produces false positives — Joel 2026-04-28 saw "ssh-keygen needs
@@ -261,15 +334,29 @@ ensure_prereqs() {
   else
     ok "All required prereqs present"
   fi
-  # Issue #341 follow-up: openssl Ed25519-capability probe + brew
-  # install dance removed. Identity gen + signing live in the venv
-  # cryptography module now; the system openssl version (LibreSSL or
-  # otherwise) is irrelevant to airc.
 
-  # Post-3c: sshd setup + Tailscale install fully removed. Cross-network
-  # messaging routes through gh-as-bearer (envelope-encrypted gist),
-  # which works on every platform with `gh auth login` — no privileged
-  # daemon, no sign-in popup, no admin elevation. The earlier sshd-on-
+  # Session PATH refresh after a winget rustup install. rustup-init puts
+  # %USERPROFILE%\.cargo\bin on the *registry* User PATH, but this Git
+  # Bash session inherited its PATH at launch — without this export the
+  # script auto-installs Rust and then immediately dies at
+  # _install_airc_binary's "cargo is required" probe. Caught live on a
+  # fresh Windows 11 box, 2026-06-10.
+  if ! command -v cargo >/dev/null 2>&1; then
+    if [ -x "$HOME/.cargo/bin/cargo" ] || [ -x "$HOME/.cargo/bin/cargo.exe" ]; then
+      export PATH="$HOME/.cargo/bin:$PATH"
+      ok "Added ~/.cargo/bin to this session's PATH (rustup install is brand-new)"
+    fi
+  fi
+
+  _ensure_windows_msvc_toolchain "$mgr"
+
+  # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
+  # Identity gen + signing live in Rust, so system OpenSSL and Python
+  # package state are irrelevant to airc install correctness.
+
+  # Post-3c: sshd setup + Tailscale install fully removed from install.
+  # Cross-network messaging is owned by Rust transports/discovery, while
+  # GitHub remains rendezvous/control-plane only. The earlier sshd-on-
   # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +
   # CI auto-detect) was deleted as part of issue #341 follow-up #345
   # (doctor's sshd probe also dropped); leaving this single tombstone
@@ -344,13 +431,44 @@ ensure_prereqs() {
       fi
     fi
   fi
+
+  # Git author identity. Agents in this substrate commit and open PRs,
+  # and a fresh machine has no global user.name/user.email — the first
+  # commit then dies with "Author identity unknown" (caught live on a
+  # clean Windows box 2026-06-13). Derive it from the authenticated gh
+  # account when unset; never clobber an identity the user already set.
+  # Email prefers the account's public email, falling back to the GitHub
+  # noreply alias (<id>+<login>@users.noreply.github.com), which always
+  # matches the account and avoids leaking a private address.
+  if command -v gh >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    _need_name=0; _need_email=0
+    if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
+    if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
+    if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
+      _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
+      _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+      _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
+      _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
+      if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
+        _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
+      fi
+      if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
+        git config --global user.name "$_gh_name"
+        info "git user.name set from gh: $_gh_name (override: git config --global user.name ...)"
+      fi
+      if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
+        git config --global user.email "$_gh_email"
+        info "git user.email set from gh: $_gh_email (override: git config --global user.email ...)"
+      fi
+    fi
+  fi
 }
 
 ensure_prereqs
 
 # ── Clone or update ─────────────────────────────────────────────────────
 
-if [ -d "$CLONE_DIR/.git" ]; then
+if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
   # AIRC_INSTALL_NO_PULL=1: trust CLONE_DIR's checked-out tree exactly
   # as-is — no branch switch, no pull. CI uses this when it has already
   # staged the PR's tree at $CLONE_DIR via `cp -r .` and wants the
@@ -448,116 +566,212 @@ fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
 
-mkdir -p "$BIN_DIR"
-# Single-source rule (#543/#544 follow-up): on real Linux/macOS the
-# symlink is fine — the kernel resolves it to $CLONE_DIR/airc each
-# invocation, so `airc update` propagates instantly. On Git Bash for
-# Windows (MINGW), `ln -sf` falls back to a literal COPY because
-# Developer Mode is off by default; that copy goes stale the moment
-# `airc update` (run from WSL) refreshes the canonical clone, and
-# Claude Code's Monitor running this stale copy was the root cause
-# of months of "Windows runs old code while airc version reports new
-# SHA" diagnoses. Use the polyglot shim on Windows instead — it
-# delegates to whichever live install (WSL canonical, then native)
-# is present at runtime. No copies, no drift.
-case "$(uname -s 2>/dev/null)" in
-  MINGW*|MSYS*|CYGWIN*)
-    if [ -f "$CLONE_DIR/airc.shim" ]; then
-      # Replace any pre-existing full-script copy that earlier installs
-      # might have left in PATH. Failing soft is fine — best-effort
-      # cleanup is enough to fix dual-install drift.
-      [ -f "$BIN_DIR/airc" ] && rm -f "$BIN_DIR/airc" 2>/dev/null || true
-      [ -f "$BIN_DIR/relay" ] && rm -f "$BIN_DIR/relay" 2>/dev/null || true
-      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/airc"
-      cp -f "$CLONE_DIR/airc.shim" "$BIN_DIR/relay"
-      chmod +x "$BIN_DIR/airc" "$BIN_DIR/relay" 2>/dev/null || true
-    else
-      # Repo predates the shim (transitional). Symlink-or-copy the full
-      # script as before; clean the duplicate next install.
-      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-      ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
-    fi
-    [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
-    [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
-    ;;
-  *)
-    # Real Linux/macOS: symlink is right.
-    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
-    # Back-compat: `relay` still works for muscle-memory and stale docs.
-    ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
-    ;;
-esac
-
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
+_add_path_entry() {
+  local path_entry="$1"
+  local rc rc_target=""
+  # Always reconcile the rc file regardless of current-shell PATH
+  # state. The rc is persistent; $PATH is transient and may have been
+  # manually augmented by the operator in this shell. Conflating them
+  # (early-return when PATH already contains the entry) was the bug
+  # that left stale airc-managed PATH lines in ~/.zshrc after install
+  # re-runs — caught live 2026-05-20.
+  #
+  # Pass 1: reconcile EVERY rc that already exists (strip stale
+  # airc-managed lines so reruns are idempotent and entries pointing at
+  # retired install dirs don't accumulate), and remember the first
+  # existing one as the write target.
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    if [ -f "$rc" ] && ! grep -q 'airc' "$rc"; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"  # airc' >> "$rc"
-      ok "Added ~/.local/bin to PATH in $(basename "$rc")"
-      break
+    [ -f "$rc" ] || continue
+    # Strip any pre-existing airc-managed PATH lines (marked with the
+    # trailing `# airc` comment). We only touch lines we ourselves
+    # wrote; user-managed PATH lines stay put.
+    if grep -qE '^export PATH=.*# airc$' "$rc"; then
+      local tmp; tmp="$(mktemp "${rc}.airc.XXXXXX")"
+      # `|| true` is load-bearing: when the rc contains ONLY airc-managed
+      # lines (e.g. a freshly-created ~/.bashrc holding just our PATH
+      # entry), grep -v emits nothing and exits 1, which would skip the
+      # mv under `&&` and leave the stale line in place — duplicating it
+      # on the next append. Decouple the mv from grep's exit code.
+      grep -vE '^export PATH=.*# airc$' "$rc" > "$tmp" || true
+      mv "$tmp" "$rc"
+    fi
+    [ -z "$rc_target" ] && rc_target="$rc"
+  done
+  # No rc file existed at all. A fresh Git Bash / MSYS box ships NONE of
+  # ~/.bashrc / ~/.bash_profile / ~/.profile, so the old "[ -f ] ||
+  # continue" loop wrote the PATH line to NOTHING and `airc` ended up on
+  # PATH in no shell — current OR future. Caught live on a clean Windows
+  # Git Bash box 2026-06-13. Create the rc that matches the user's
+  # shell so the entry has a home.
+  if [ -z "$rc_target" ]; then
+    case "${SHELL:-}" in
+      *zsh) rc_target="$HOME/.zshrc" ;;
+      *)    rc_target="$HOME/.bashrc" ;;
+    esac
+    : > "$rc_target"
+    info "Created $(basename "$rc_target") (no shell rc existed) for the airc PATH entry"
+    # Login bash (Git Bash launches `bash --login -i`) sources
+    # ~/.bash_profile / ~/.bash_login / ~/.profile, NOT ~/.bashrc, unless
+    # told to. Without this shim the freshly-created ~/.bashrc is never
+    # read by a login shell and the PATH entry is dead on arrival. Only
+    # create the shim when no login file already exists (don't clobber a
+    # user's own ~/.bash_profile).
+    if [ "$rc_target" = "$HOME/.bashrc" ] \
+       && [ ! -f "$HOME/.bash_profile" ] \
+       && [ ! -f "$HOME/.bash_login" ] \
+       && [ ! -f "$HOME/.profile" ]; then
+      printf '# created by airc installer: load ~/.bashrc in login shells\nif [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n' > "$HOME/.bash_profile"
+      info "Created ~/.bash_profile to source ~/.bashrc in login shells"
+    fi
+  fi
+  # Ensure rc ends with a newline so the append starts on its own
+  # line. Without this, an rc that ends with `alias foo="bar"` (no
+  # trailing \n) produces the broken line
+  # `alias foo="bar"export PATH="...:$PATH"  # airc`
+  # which zsh parses as one malformed alias declaration and never
+  # sets PATH. Caught live 2026-05-20 — Joel's `airc` resolved fine
+  # from a manually-augmented PATH but new shells got nothing.
+  if [ -s "$rc_target" ] && [ "$(tail -c1 "$rc_target")" != "$(printf '\n')" ]; then
+    printf '\n' >> "$rc_target"
+  fi
+  printf 'export PATH="%s:$PATH"  # airc\n' "$path_entry" >> "$rc_target"
+  ok "Added $path_entry to PATH in $(basename "$rc_target")"
+  # Only export into current env if not already there. Avoids
+  # gratuitously prepending duplicate PATH segments when the operator
+  # has already sourced their rc.
+  if ! echo "$PATH" | tr ':' '\n' | grep -qx "$path_entry"; then
+    export PATH="$path_entry:$PATH"
+  fi
+}
+
+# Minimum cargo version that can build this tree. Tracks Cargo.lock's
+# lockfile format: lockfile v4 (current) requires Cargo >= 1.78. Bump
+# this alongside any future Cargo.lock format bump or declared MSRV.
+AIRC_MIN_CARGO="${AIRC_MIN_CARGO:-1.78.0}"
+
+# _version_ge A B -> success (0) iff version A >= version B. Uses sort -V
+# (version sort) so 1.70.0 vs 1.78.0 compares numerically, not lexically.
+_version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+# Cargo present-but-too-old is a real first-time-user failure mode: a
+# machine with an old rustup default (e.g. 1.70 from 2023) passes the
+# `cargo --version` prereq probe, then `cargo build` dies with the
+# cryptic "lock file version 4 was found, but this version of Cargo does
+# not understand this lock file" and `set -e` aborts the whole install
+# with no guidance. ensure_prereqs only checks presence, not version, so
+# this gate + auto-recovery lives right before the build. Recovery order:
+# rustup (the common case) -> brew -> clear manual instructions.
+ensure_cargo_recent() {
+  command -v cargo >/dev/null 2>&1 || return 0  # absence handled by _install_airc_binary
+  local have
+  have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+    return 0
+  fi
+  warn "cargo ${have:-unknown} is too old to build airc (need >= $AIRC_MIN_CARGO; Cargo.lock is lockfile v4)."
+
+  if command -v rustup >/dev/null 2>&1; then
+    info "Updating the Rust toolchain via rustup (rustup update stable)..."
+    if rustup update stable; then
+      # Make sure the just-updated stable is what cargo resolves to. If a
+      # different toolchain is the rustup default, the shim still serves
+      # the old cargo; only switch when no per-directory override pins it.
+      rustup default stable >/dev/null 2>&1 || true
+      have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+      if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+        ok "Rust toolchain updated to cargo $have"
+        return 0
+      fi
+      warn "rustup update ran but cargo is still ${have:-unknown} (a rust-toolchain override may be pinning an old version)."
+    else
+      warn "rustup update stable failed."
+    fi
+  fi
+
+  # brew-managed rust (cargo from Homebrew rather than rustup).
+  if command -v brew >/dev/null 2>&1 && brew list rust >/dev/null 2>&1; then
+    info "Upgrading Homebrew rust (brew upgrade rust)..."
+    if brew upgrade rust 2>/dev/null || true; then
+      have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+      if [ -n "$have" ] && _version_ge "$have" "$AIRC_MIN_CARGO"; then
+        ok "Rust toolchain updated to cargo $have"
+        return 0
+      fi
+    fi
+  fi
+
+  fail "Could not obtain cargo >= $AIRC_MIN_CARGO (have ${have:-unknown}). Update Rust and re-run install.sh:
+         rustup:    rustup update stable
+         Homebrew:  brew upgrade rust
+         no rustup: install from https://rustup.rs"
+}
+
+# Build the Rust binary and place it on PATH as `airc`. No shell
+# wrapper, no .shim/.cmd/.ps1 trampolines — the Rust binary is the
+# user surface. Copy the built binary into BIN_DIR so PATH never points
+# at mutable target artifacts inside the source checkout.
+_install_airc_binary() {
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
+  if ! command -v cargo >/dev/null 2>&1; then
+    fail "cargo is required to build airc. Install Rust, then re-run install.sh."
+  fi
+  ensure_cargo_recent
+  info "Building Rust CLI: airc"
+  (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
+  mkdir -p "$BIN_DIR"
+
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      local built="$CLONE_DIR/target/release/airc.exe"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      cp -f "$built" "$BIN_DIR/airc.exe"
+      ok "Installed airc: $BIN_DIR/airc.exe"
+      ;;
+    *)
+      local built="$CLONE_DIR/target/release/airc"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      local tmp="$BIN_DIR/.airc.tmp.$$"
+      cp -f "$built" "$tmp"
+      chmod +x "$tmp"
+      mv -f "$tmp" "$BIN_DIR/airc"
+      ok "Installed airc: $BIN_DIR/airc"
+      ;;
+  esac
+
+  # Reap legacy install-shape leftovers (bash wrapper, airc-core
+  # binary, Windows trampolines). Reruns of install.sh on a machine
+  # that previously had the wrapper-era install converge cleanly to
+  # the redesigned layout.
+  for stale in "$BIN_DIR/airc-core" "$BIN_DIR/airc-core.exe" "$BIN_DIR/airc.cmd" "$BIN_DIR/airc.ps1"; do
+    if [ -L "$stale" ] || [ -e "$stale" ]; then
+      rm -f "$stale"
+      ok "Removed legacy install artifact: $stale"
     fi
   done
-  export PATH="$BIN_DIR:$PATH"
-fi
 
-# ── Python venv with crypto deps (Phase E: envelope encryption) ────────
-# airc's envelope-layer end-to-end encryption needs the cryptography
-# package. We create a venv inside the install dir and pip-install
-# there because PEP 668 makes `pip install --user` fail on managed
-# Pythons (homebrew, system Python on Debian/Ubuntu/etc). The venv
-# avoids touching system Python at all — fully self-contained.
-#
-# airc's bash wrapper detects this venv at AIRC_PYTHON resolution time
-# and prefers it over system python3. Ed25519 signing is required for
-# identity bootstrap, so cryptography is a hard install dependency: if
-# we cannot provide it through the venv or an existing system Python,
-# fail here instead of reporting "Installed" and breaking at first join.
-_airc_venv="$CLONE_DIR/.venv"
-if [ ! -d "$_airc_venv" ] && command -v python3 >/dev/null 2>&1; then
-  if python3 -m venv "$_airc_venv" 2>/dev/null; then
-    ok "Python venv created: $_airc_venv"
-  else
-    warn "Could not create Python venv (python3-venv missing?). Will use system python3 only if cryptography is already available."
-  fi
-fi
-# Locate venv pip — POSIX vs Windows-Git-Bash paths.
-_airc_venv_pip=""
-if [ -x "$_airc_venv/bin/pip" ]; then
-  _airc_venv_pip="$_airc_venv/bin/pip"
-elif [ -x "$_airc_venv/Scripts/pip.exe" ]; then
-  _airc_venv_pip="$_airc_venv/Scripts/pip.exe"
-fi
-if [ -n "$_airc_venv_pip" ]; then
-  # Check if cryptography is already installed (idempotent install).
-  _airc_venv_python_bin=""
-  if [ -x "$_airc_venv/bin/python" ]; then
-    _airc_venv_python_bin="$_airc_venv/bin/python"
-  elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
-    _airc_venv_python_bin="$_airc_venv/Scripts/python.exe"
-  fi
-  if [ -n "$_airc_venv_python_bin" ] && \
-     "$_airc_venv_python_bin" -c "import cryptography" >/dev/null 2>&1; then
-    : # already installed; skip
-  else
-    if "$_airc_venv_pip" install -q --upgrade pip >/dev/null 2>&1; then : ; fi
-    if "$_airc_venv_pip" install -q cryptography 2>&1 | tail -3; then
-      ok "cryptography installed in venv (envelope encryption ready)"
-    else
-      fail "cryptography install failed; airc requires it for Ed25519 signing. Manual fix: $_airc_venv_pip install cryptography"
-    fi
-  fi
-fi
+  _add_path_entry "$BIN_DIR"
+}
 
-_airc_crypto_python=""
-if [ -x "$_airc_venv/bin/python" ]; then
-  _airc_crypto_python="$_airc_venv/bin/python"
-elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
-  _airc_crypto_python="$_airc_venv/Scripts/python.exe"
-elif command -v python3 >/dev/null 2>&1; then
-  _airc_crypto_python="python3"
-fi
-if [ -z "$_airc_crypto_python" ] || ! "$_airc_crypto_python" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
-  fail "cryptography is not importable after install; airc cannot bootstrap signed identity. Re-run install.sh after fixing Python/pip."
-fi
+_install_airc_binary
+
+# ── Record the install source for `airc update` ────────────────────────
+# install.sh's _default_clone_dir installs FROM a dev checkout (the cwd)
+# when run inside one, and rust-rewrite currently ships ONLY as a dev
+# checkout (no release channel yet) — so the source is frequently NOT
+# ~/.airc/src. The Rust `airc update` reads this marker to find the
+# source; without it, update died with "No git checkout at ~/.airc/src"
+# for every dev-checkout install (caught live 2026-06-13). The native
+# (non-MSYS) path form is REQUIRED: the airc binary is native and its
+# std::fs / git -C cannot resolve a `/c/...` MSYS path on Windows.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) _install_source="$(_to_win_path "$CLONE_DIR")" ;;
+  *)                    _install_source="$CLONE_DIR" ;;
+esac
+mkdir -p "$HOME/.airc"
+printf '%s\n' "$_install_source" > "$HOME/.airc/install-source"
+ok "Recorded install source for 'airc update': $_install_source"
 
 # ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
 #
@@ -567,31 +781,16 @@ fi
 #   Claude Code → ~/.claude/skills/<name>/
 #   Codex       → ~/.codex/skills/<name>/
 #
-# We symlink airc's skills into both whenever the corresponding agent
-# is installed on the machine. Each agent picks up the same skill
-# content; airc's skill text is intentionally written to be agent-
-# generic where the operation is shell-callable (which most airc verbs
-# are). Claude-Code-specific nuances like Monitor invocations are
-# additive — Codex agents fall back to direct shell calls.
+# We copy airc's skills into both whenever the corresponding agent is
+# installed on the machine. Copies avoid symlink resolution differences
+# between shells, agents, Windows Git Bash, and future source checkouts.
+# Each copied skill carries a marker so uninstall can remove only
+# airc-owned skill directories.
 
 _install_airc_skills_into() {
   local skills_target="$1" agent_label="$2"
   [ -d "$CLONE_DIR/skills" ] || return 0
   mkdir -p "$skills_target"
-
-  # Clean up old symlinks from previous installs.
-  # Includes the airc-classic skill names (connect/send/rename/disconnect) that
-  # were renamed to IRC-canonical (join/msg/nick/quit) — leaving the old symlinks
-  # in place would shadow the new skills with stale content. (`uninstall` was
-  # previously listed here when the skill didn't exist; now that we ship a real
-  # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
-  # this list omits it.)
-  local old
-  for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
-             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect \
-             "$skills_target"/inbox "$skills_target"/tests; do
-    [ -L "$old" ] && rm "$old" 2>/dev/null
-  done
 
   local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
@@ -599,14 +798,12 @@ _install_airc_skills_into() {
     [ -f "$skill_dir/SKILL.md" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$skills_target/$skill_name"
-    # If the target is a real directory (from a pre-rename hand-install
-    # or an old copy-based installer), it shadows the new symlink. Nuke it.
-    if [ -d "$target" ] && [ ! -L "$target" ]; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
       rm -rf "$target"
-    elif [ -L "$target" ]; then
-      rm "$target"
     fi
-    ln -sf "$skill_dir" "$target"
+    mkdir -p "$target"
+    cp -R "$skill_dir"/. "$target"/
+    printf 'installed-by=airc\nsource=%s\n' "$skill_dir" > "$target/.airc-skill"
     ok "Skill ($agent_label): /$skill_name"
   done
 }
@@ -642,7 +839,7 @@ fi
 # Codex sessions via `codex --profile airc`.
 #
 # Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
-# skill symlinks but NOT the config write.
+# skill install but NOT the config write.
 
 _install_airc_codex_permission_profile() {
   local config="$HOME/.codex/config.toml"
@@ -673,7 +870,7 @@ TOML
   fi
 
   # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
-  # to ~/.airc-src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
+  # to ~/.airc/src/ + ~/.airc/ + a :project_roots
   # block — Codex's runtime hard-rejected the profile at startup with:
   #   "permissions profile requests filesystem writes outside the
   #   workspace root, which is not supported until the runtime enforces
@@ -686,51 +883,9 @@ TOML
   # When Codex's runtime supports outside-workspace filesystem profiles,
   # restore the block (history at git log -- install.sh).
 
-  # Cleanup: machines that ran the buggy intermediate (3b20369..c1)
-  # still have the [permissions.airc.filesystem] block in their
-  # config.toml and Codex won't start. Detect and strip it on every
-  # install.sh run so Codex starts cleanly without the user having
-  # to hand-edit their config.
-  if grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
-    info "Removing stale [permissions.airc.filesystem] block from ~/.codex/config.toml (Codex 0.125 doesn't support outside-workspace filesystem profiles; was breaking session startup)..."
-    "${AIRC_PYTHON:-python3}" - "$config" <<'PY'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-# Strip from any '# airc filesystem permissions' header (or bare
-# [permissions.airc.filesystem] header) through end of that section
-# and any [permissions.airc.filesystem.<sub>] children. Section ends
-# at the next top-level header that is NOT under [permissions.airc.filesystem].
-lines = text.splitlines(keepends=True)
-out = []
-in_airc_fs = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith('# airc filesystem permissions'):
-        # Drop the leading comment block too (cohesive with the section)
-        in_airc_fs = True
-        continue
-    if stripped.startswith('[permissions.airc.filesystem'):
-        in_airc_fs = True
-        continue
-    if in_airc_fs:
-        # Continue dropping comment lines and key=value lines until we
-        # hit a new section header that isn't airc.filesystem.
-        if stripped.startswith('[') and not stripped.startswith('[permissions.airc.filesystem'):
-            in_airc_fs = False
-            out.append(line)
-        # else: drop (comment, blank, or key=value within the section)
-        continue
-    out.append(line)
-# Collapse runs of >2 blank lines that the strip might have left.
-result = ''.join(out)
-result = re.sub(r'\n{3,}', '\n\n', result)
-with open(path, 'w') as f:
-    f.write(result)
-PY
-    _changed=1
-  fi
+  # Cleanup for managed [permissions.airc.filesystem] blocks lives in the
+  # Rust Codex hook installer below. Keep this profile function focused
+  # on the network profile it owns.
 
   # Set default_permissions = "airc" at the file's top level, but only if
   # no default is currently set. A pre-existing default belongs to the
@@ -762,13 +917,10 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 # ── Codex model-visible AIRC turn contract ─────────────────────────────
-# Codex currently has no Claude-style Monitor tool. A daemon can keep
-# the transport alive, but the model will not notice inbound peer
-# traffic unless it polls local state during a turn. Install a small
-# model-visible instruction so future Codex sessions surface AIRC
-# traffic reliably without hitting GitHub: `airc codex-poll` reads the
-# local messages.jsonl cursor, suppresses empty output, and excludes
-# this identity's own messages.
+# Codex currently has no Claude-style Monitor tool. Keep `airc join`
+# running as the live feed, and install a small model-visible
+# instruction so future Codex sessions distinguish the live stream from
+# the prompt-boundary hook catch-up.
 #
 # We only write this if the user has no existing developer_instructions
 # key. If they do, do not overwrite; they can copy the block manually or
@@ -777,21 +929,8 @@ fi
 
 _install_airc_codex_developer_instructions() {
   local config="$HOME/.codex/config.toml"
-  local hooks_json="$HOME/.codex/hooks.json"
   [ "${AIRC_SKIP_CODEX_INSTRUCTIONS:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
-
-  if grep -qE '^[[:space:]]*codex_hooks[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
-     && [ -f "$hooks_json" ] \
-     && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
-    if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
-      local _tmp; _tmp=$(mktemp)
-      sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
-      mv "$_tmp" "$config"
-    fi
-    info "  Codex AIRC hook already installed; skipping legacy developer_instructions polling contract"
-    return 0
-  fi
 
   if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
     local _tmp; _tmp=$(mktemp)
@@ -810,10 +949,11 @@ _install_airc_codex_developer_instructions() {
 # AIRC-CODEX-INSTRUCTIONS-START — managed by install.sh; remove this section through AIRC-CODEX-INSTRUCTIONS-END to opt out
 developer_instructions = """
 AIRC Codex runtime contract:
-- At the beginning of every user turn, before substantive work, if `airc` is available on PATH, run `airc codex-poll`.
-- `airc codex-poll` is local-only: it reads this scope's local message cursor, prints only unread peer messages, advances the cursor, and is silent when empty.
-- If `airc codex-poll` prints messages, briefly surface them to the user and account for them before continuing. If it is silent or says the scope is not initialized, continue normally.
-- Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually polled and seen peer traffic.
+- Keep `airc join` running as this session's live AIRC feed when coordinating with peer agents.
+- If no live join session id is available during a turn, run `airc codex-hook poll --wait-ms 1000` between tool steps. It is the bounded mid-turn feed and shares the same runtime cursor as the hook.
+- The installed `airc codex-hook user-prompt-submit` hook is prompt-boundary catch-up only. Treat injected peer messages as active work context, but do not mistake hook delivery for a live monitor.
+- Reply to direct peer questions with `airc msg`, not user-chat stdout. The peer sees AIRC, not this transcript.
+- Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually seen peer traffic.
 """
 # AIRC-CODEX-INSTRUCTIONS-END
 
@@ -821,7 +961,7 @@ TOML
     cat "$config"
   } > "$_tmp"
   mv "$_tmp" "$config"
-  ok "Added Codex AIRC turn contract to ~/.codex/config.toml — restart Codex to activate automatic local inbox polling"
+  ok "Added Codex AIRC turn contract to ~/.codex/config.toml — restart Codex to activate AIRC coordination guidance"
 }
 
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
@@ -840,20 +980,20 @@ _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _python="${_airc_venv_python_bin:-}"
-  if [ -z "$_python" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-      _python=python3
-    elif command -v python >/dev/null 2>&1; then
-      _python=python
-    else
-      warn "Could not install Codex AIRC hook: python not found"
-      return 0
-    fi
+  local _airc=""
+  if [ -x "$CLONE_DIR/target/release/airc" ]; then
+    _airc="$CLONE_DIR/target/release/airc"
+  elif [ -x "$CLONE_DIR/target/debug/airc" ]; then
+    _airc="$CLONE_DIR/target/debug/airc"
+  elif command -v airc >/dev/null 2>&1; then
+    _airc=$(command -v airc)
+  else
+    warn "Could not install Codex AIRC hook: airc binary not found"
+    return 0
   fi
 
   local out
-  if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$_python" -m airc_core.codex_install --codex-home "$HOME/.codex" install-hooks 2>&1); then
+  if out=$("$_airc" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | while IFS= read -r line; do
         ok "Codex AIRC hook: $line"
@@ -867,6 +1007,78 @@ _install_airc_codex_hooks() {
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_hooks
 fi
+
+# ── Git fetch-before-commit/push staleness guard (card 64621946) ───────
+# Wire the repo's own dev workflow with a pre-commit (advisory) + pre-push
+# (may hard-gate) hook that fetches the integration base and warns/blocks
+# when the local base is stale. This is what stops tonight's hazard:
+# branches cut off a 5-commits-behind rust-rewrite → E0063 between slices.
+#
+# Composition contract (CBAR Extension Bar — extend, don't clobber):
+# if $CLONE_DIR already has a pre-commit / pre-push hook that is NOT
+# ours, we preserve it: the original is moved to <hook>.local and our
+# wrapper chains to it after running the guard. Re-running install
+# rewrites only the airc-owned wrapper (marker-gated), so it is fully
+# idempotent. Installs ONLY into the airc clone's own .git/hooks — this
+# is a dev-tree guard, not a product-surface change for end users.
+
+_install_airc_git_hooks() {
+  [ "${AIRC_SKIP_GIT_HOOKS:-0}" = "1" ] && return 0
+  local hooks_dir="$CLONE_DIR/.git/hooks"
+  local worker="$CLONE_DIR/integrations/git-hooks/airc-fetch-base.sh"
+  # core.hooksPath override (e.g. when the repo points hooks elsewhere).
+  local hp
+  hp="$(git -C "$CLONE_DIR" config --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$hp" ]; then
+    case "$hp" in
+      /*|[A-Za-z]:*) hooks_dir="$hp" ;;
+      *) hooks_dir="$CLONE_DIR/$hp" ;;
+    esac
+  fi
+  [ -d "$CLONE_DIR/.git" ] || { return 0; }   # not a clone (curl-piped src tree edge case)
+  [ -f "$worker" ] || { warn "Git hook worker not found: $worker"; return 0; }
+  mkdir -p "$hooks_dir" 2>/dev/null || { warn "Could not create $hooks_dir"; return 0; }
+  chmod +x "$worker" 2>/dev/null || true
+
+  local phase hook tmp marker="# AIRC-FETCH-HOOK"
+  for phase in pre-commit pre-push; do
+    hook="$hooks_dir/$phase"
+    # If a foreign (non-airc) hook is already here, preserve it as .local
+    # so our wrapper can chain to it. Don't re-stash our own wrapper.
+    if [ -f "$hook" ] && ! grep -qF "$marker" "$hook" 2>/dev/null; then
+      if [ ! -f "$hook.local" ]; then
+        mv "$hook" "$hook.local"
+        chmod +x "$hook.local" 2>/dev/null || true
+        info "Preserved existing $phase hook as $phase.local (chained)"
+      else
+        # A .local already exists; drop the un-marked file rather than clobber it.
+        rm -f "$hook"
+      fi
+    fi
+    tmp="$hook.airc-tmp.$$"
+    {
+      printf '%s\n' "#!/usr/bin/env bash"
+      printf '%s %s\n' "$marker" "— managed by airc install.sh (card 64621946); do not edit."
+      printf '%s\n' "# Runs the fetch-before-commit/push staleness guard, then chains any"
+      printf '%s\n' "# pre-existing hook preserved as this file + .local."
+      printf '%s\n' "set -u"
+      printf 'WORKER=%q\n' "$worker"
+      printf 'LOCAL="${BASH_SOURCE[0]}.local"\n'
+      printf '%s\n' "# Guard runs first. pre-push may exit non-zero (hard-gate when behind)."
+      printf 'if [ -x "$WORKER" ] || [ -f "$WORKER" ]; then\n'
+      printf '  bash "$WORKER" %q "$@" || exit $?\n' "$phase"
+      printf 'fi\n'
+      printf '%s\n' "# Chain a preserved local hook, forwarding stdin (pre-push gets refs on stdin)."
+      printf 'if [ -x "$LOCAL" ]; then exec "$LOCAL" "$@"; fi\n'
+      printf 'exit 0\n'
+    } > "$tmp"
+    mv "$tmp" "$hook"
+    chmod +x "$hook" 2>/dev/null || true
+    ok "Git hook installed: $phase (fetch-before-$phase staleness guard)"
+  done
+}
+
+_install_airc_git_hooks
 
 # ── Codex GH_TOKEN env injection ───────────────────────────────────────
 # Codex's sandbox can't reliably reach the macOS Keychain to validate

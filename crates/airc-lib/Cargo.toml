@@ -1,0 +1,70 @@
+[package]
+name = "airc-lib"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Consumer-facing AIRC API. Composes:
+#   - airc-identity::LocalIdentity (Ed25519 identity persisted at <home>)
+#   - airc-ipc (typed daemon client for daemon-attached mode)
+#   - airc-store::SqliteEventStore (durable transcript backing)
+#   - airc-trust (durable peer trust + signed rotation)
+#   - airc-transport (signed local-fs + LAN-TCP send/subscribe)
+#   - airc-protocol (Frame ↔ TranscriptEvent boundary)
+#
+# Target use case (per operating doc gate 4 — Consumer Embedding):
+# any consumer (Continuum, OpenClaw, Hermes, opencode, generic Rust
+# app) can `use airc_lib::Airc;`, call `Airc::open(home).await`, and
+# `airc.join(room).await`, `airc.say("hi").await`, `airc.page_recent(...)`
+# without shelling out to the CLI or parsing prose.
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-bus = { path = "../airc-bus" }
+airc-core = { path = "../airc-core" }
+airc-diagnostics = { path = "../airc-diagnostics" }
+airc-identity = { path = "../airc-identity" }
+airc-ipc = { path = "../airc-ipc" }
+airc-protocol = { path = "../airc-protocol" }
+airc-wire = { path = "../airc-wire" }
+airc-store = { path = "../airc-store" }
+airc-trust = { path = "../airc-trust" }
+airc-transport = { path = "../airc-transport" }
+airc-work = { path = "../airc-work" }
+airc-work-store = { path = "../airc-work-store" }
+
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+tracing = "0.1"
+dashmap = "6"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+rtc = "0.20.0-alpha.1"
+rtc-media = "0.20.0-alpha.1"
+uuid = { version = "1", features = ["v4", "v5"] }
+webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["runtime-tokio"] }
+
+[features]
+# Card bac49e0c: `MockGhClient` testable impl of `gh_client::GhClient`.
+# Off by default so consumers don't pay for test-only code; tests in
+# this crate enable it automatically via dev-dependencies, downstream
+# consumers (airc-cli, future merger tests) opt in.
+mock = []
+
+[dev-dependencies]
+airc-daemon = { path = "../airc-daemon" }
+airc-relay = { path = "../airc-relay" }
+airc-protocol = { path = "../airc-protocol" }
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tempfile = "3"
+temp-env = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

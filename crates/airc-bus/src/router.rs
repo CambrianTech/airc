@@ -1,0 +1,1005 @@
+//! The event router — hot-path, in-memory, sharded (§3.1, §3.2, §3.5, §3.8).
+//!
+//! Owns:
+//! - a **sharded** per-channel subscriber index (mutex-striped: unrelated
+//!   rooms never serialize on one lock, §3.1). DashMap was the spec's
+//!   alternative; striped mutexes are chosen here because they keep the hot
+//!   path deterministic and make "no lock across `.await`" a syntactic
+//!   property (every lock is a sync `MutexGuard` in a non-async block).
+//! - a per-channel **hot ring** (bounded, pinned-until-persisted floor, §3.2).
+//! - a per-channel coalesced **ephemeral cache** (latest-wins + TTL, §3.4).
+//! - a bounded **write-behind** path to the [`DurableSink`] (§3.3, §3.8).
+//!
+//! ## The two load-bearing invariants
+//!
+//! **No-gap cursor (§3.5).** `subscribe` registers the live sender *and*
+//! snapshots the ring under the **same** shard lock, so no event slips between
+//! "what replay saw" and "what live delivers." Replay then covers
+//! `(from_cursor, ring.oldest)` from the sink (deep) + the ring snapshot
+//! (recent); live delivery dedups by a replay high-watermark so the seam admits
+//! no miss and no dup. A `Durable` event evicted-pending from the ring is still
+//! in the ring (pinned, §3.8) *or* already in the sink — never neither — so the
+//! deep leg can always cover it.
+//!
+//! **Slow subscriber (§3.5).** Fan-out is `try_send` into each subscriber's
+//! bounded channel. A full channel marks that subscriber **lagged** and drops
+//! the live push — it NEVER blocks the shard or the other subscribers. A lagged
+//! subscriber resumes from the sink via its cursor. No lock is held across the
+//! fan-out (it's all synchronous `try_send`), and certainly none across an
+//! `.await`.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures::stream::Stream;
+use tokio::sync::mpsc;
+
+use airc_core::{PeerId, RoomId};
+
+use crate::clock::Clock;
+use crate::envelope::{Cursor, Envelope};
+use crate::ephemeral::EphemeralCache;
+use crate::filter::Filter;
+use crate::ring::HotRing;
+use crate::seq::SeqSource;
+use crate::sink::DurableSink;
+
+/// Tunables for an [`EventRouter`].
+#[derive(Debug, Clone)]
+pub struct RouterConfig {
+    /// Number of shards (mutex stripes). Rooms hash onto a shard; unrelated
+    /// rooms on different shards never serialize.
+    pub shards: usize,
+    /// Nominal per-channel hot-ring capacity. The §3.8 floor means a ring may
+    /// temporarily exceed this while un-persisted `Durable` entries are pinned.
+    pub ring_capacity: usize,
+    /// Bound on each subscriber's live channel. Full = subscriber is lagged.
+    pub subscriber_buffer: usize,
+    /// Bound on the write-behind queue (§3.8 ≥ ring floor).
+    pub write_behind_buffer: usize,
+    /// Ephemeral coalesced-entry TTL in ms (§3.4).
+    pub ephemeral_ttl_ms: u64,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            shards: 16,
+            ring_capacity: 256,
+            subscriber_buffer: 1024,
+            write_behind_buffer: 1024,
+            ephemeral_ttl_ms: 30_000,
+        }
+    }
+}
+
+/// A registered subscriber's live delivery handle, held in the channel's
+/// subscriber list.
+struct SubscriberHandle {
+    tx: mpsc::Sender<Arc<Envelope>>,
+    filter: Filter,
+    /// Set when a `try_send` failed because the bounded channel was full
+    /// (§3.5). Shared with the subscriber's stream so it can observe "I
+    /// lagged, resume from the sink."
+    lagged: Arc<AtomicBool>,
+}
+
+/// Per-channel state: hot ring + ephemeral cache + subscriber list. Lives
+/// inside a shard, behind that shard's mutex.
+struct ChannelState {
+    ring: HotRing,
+    ephemeral: EphemeralCache,
+    subscribers: Vec<SubscriberHandle>,
+}
+
+impl ChannelState {
+    fn new(ring_capacity: usize, ephemeral_ttl_ms: u64) -> Self {
+        Self {
+            ring: HotRing::new(ring_capacity),
+            ephemeral: EphemeralCache::new(ephemeral_ttl_ms),
+            subscribers: Vec::new(),
+        }
+    }
+}
+
+/// One shard: a map of channel -> state, behind one mutex.
+struct Shard {
+    channels: Mutex<HashMap<u128, ChannelState>>,
+}
+
+/// A durable envelope queued for the write-behind task, paired with the shard
+/// index so the task can re-lock and unpin the ring entry on confirmation.
+struct WriteBehindItem {
+    env: Arc<Envelope>,
+}
+
+/// Capacity of the router's recent-event-ids window (card 4132f48c).
+/// Sized well past the per-channel ring capacity so a same-moment echo
+/// of any event still in flight is always caught in memory; older
+/// re-injections fall through to the durable [`DurableSink::contains`]
+/// probe in [`EventRouter::publish_if_new`].
+const RECENT_PUBLISH_IDS_CAPACITY: usize = 4096;
+
+/// Bounded FIFO set of recently published event ids (card 4132f48c).
+/// `insert` answers "was this id already recorded?" and records it;
+/// capacity overflow rolls the oldest id off.
+struct RecentEventIds {
+    order: std::collections::VecDeque<airc_core::EventId>,
+    seen: std::collections::HashSet<airc_core::EventId>,
+}
+
+impl RecentEventIds {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            order: std::collections::VecDeque::with_capacity(capacity),
+            seen: std::collections::HashSet::with_capacity(capacity),
+        }
+    }
+
+    /// Record `id`. Returns `true` if it was new, `false` if already
+    /// present (already published through this router recently).
+    fn insert(&mut self, id: airc_core::EventId) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        if self.order.len() == RECENT_PUBLISH_IDS_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(id);
+        true
+    }
+
+    /// Forget `id`. Used by [`EventRouter::publish_if_new`] when a
+    /// publish FAILED after the id was optimistically marked — a
+    /// poisoned entry would make a legitimate retry of the same frame
+    /// report `Duplicate` (and the receiver ack delivered) for an
+    /// event that never entered the router.
+    fn remove(&mut self, id: &airc_core::EventId) {
+        if self.seen.remove(id) {
+            self.order.retain(|other| other != id);
+        }
+    }
+}
+
+/// Card 1998f6cb: one durable envelope the router accepted, handed to
+/// the installed outbound forward sink (route layer) so it can
+/// traverse established LAN routes. The OUTBOUND mirror of card
+/// 4132f48c's inbound bridge: inbound goes transport → router via
+/// `publish_if_new`; outbound goes router → transport via this item.
+#[derive(Debug, Clone)]
+pub struct ForwardItem {
+    /// The published envelope, post owner-stamping (`seq` /
+    /// `occurred_at_ms` assigned). Shared, never deep-copied.
+    pub env: Arc<Envelope>,
+    /// The LAN-link peer this envelope ARRIVED from, when it entered
+    /// the router through the inbound bridge (`publish_if_new_from`).
+    /// `None` = locally originated (IPC publish). Loop prevention: the
+    /// forwarder must never send a frame back over the link it came
+    /// from.
+    pub origin: Option<PeerId>,
+}
+
+/// Outcome of [`EventRouter::publish_if_new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishIfNew {
+    /// The envelope was new: published with this owner-assigned seq.
+    Published(crate::Seq),
+    /// An event with this `event_id` already went through this router
+    /// (recent-ids window) or is already in the durable tier — the
+    /// envelope was NOT re-published. The existing copy stands.
+    Duplicate,
+}
+
+/// The owner-core event router (§3).
+///
+/// Cheap to clone via the `Arc` fields; clones share the same router.
+#[derive(Clone)]
+pub struct EventRouter {
+    inner: Arc<RouterInner>,
+}
+
+struct RouterInner {
+    shards: Vec<Shard>,
+    config: RouterConfig,
+    clock: Arc<dyn Clock>,
+    seq: Arc<SeqSource>,
+    sink: Arc<dyn DurableSink>,
+    write_behind_tx: mpsc::Sender<WriteBehindItem>,
+    /// Recently published event ids (card 4132f48c) — the in-memory leg of
+    /// [`EventRouter::publish_if_new`]'s idempotency check. Every publish
+    /// records its id here so a transport echo of a locally published
+    /// event (or the same inbound frame arriving on two LAN links) can
+    /// never fan out twice.
+    recent_ids: Mutex<RecentEventIds>,
+    /// Card 1998f6cb: the outbound route-layer sink. When installed
+    /// (`set_forward_sink`), every successfully published **durable**
+    /// envelope is offered here (bounded `try_send`, never blocking the
+    /// hot path) so the daemon's forwarder can send it over established
+    /// LAN routes. Saturation is LOUD: counted + traced, never silent.
+    forward_tx: Mutex<Option<mpsc::Sender<ForwardItem>>>,
+    /// Count of durable envelopes NOT handed to the forward sink because
+    /// its bounded queue was full (or the forwarder task was gone).
+    /// Surfaced for diagnostics/tests; every increment also traces at
+    /// error level.
+    forward_drop_count: AtomicU64,
+    /// Count of events shed because the write-behind queue was saturated and
+    /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
+    shed_count: AtomicU64,
+    /// Number of channel-state maps that have ever been created (across all
+    /// shards) — the many-rooms test reads this as the allocation proxy.
+    channels_created: AtomicU64,
+}
+
+impl EventRouter {
+    /// Build a router and spawn its write-behind task.
+    ///
+    /// `seq` is built once per daemon start (it has already bumped the epoch).
+    /// `sink` is the durable tier behind the trait. The write-behind task runs
+    /// until the router (and all clones) drop.
+    pub fn new(
+        config: RouterConfig,
+        clock: Arc<dyn Clock>,
+        seq: Arc<SeqSource>,
+        sink: Arc<dyn DurableSink>,
+    ) -> Self {
+        let shards = (0..config.shards.max(1))
+            .map(|_| Shard {
+                channels: Mutex::new(HashMap::new()),
+            })
+            .collect();
+
+        let (write_behind_tx, write_behind_rx) =
+            mpsc::channel::<WriteBehindItem>(config.write_behind_buffer.max(1));
+
+        let inner = Arc::new(RouterInner {
+            shards,
+            config,
+            clock,
+            seq,
+            sink,
+            write_behind_tx,
+            recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
+            forward_tx: Mutex::new(None),
+            forward_drop_count: AtomicU64::new(0),
+            shed_count: AtomicU64::new(0),
+            channels_created: AtomicU64::new(0),
+        });
+
+        // Write-behind task: drains durable envelopes, persists each, then
+        // re-locks the owning shard and unpins the ring entry (§3.8). This is
+        // the ONLY place that holds an `.await` near the durable tier, and it
+        // never holds a shard lock across it.
+        let task_inner = Arc::clone(&inner);
+        tokio::spawn(async move {
+            Self::run_write_behind(task_inner, write_behind_rx).await;
+        });
+
+        Self { inner }
+    }
+
+    fn shard_for(&self, channel: RoomId) -> &Shard {
+        let n = self.inner.shards.len();
+        let idx = (channel.0.as_u128() % n as u128) as usize;
+        &self.inner.shards[idx]
+    }
+
+    /// Publish an envelope (§4 publish-hot). Returns the assigned [`Seq`].
+    ///
+    /// Steps, all synchronous up to the write-behind enqueue:
+    /// 1. Stamp owner metadata: `seq` (generational) + `occurred_at_ms`.
+    /// 2. Under the shard lock: push to the ring (deliver-first), coalesce if
+    ///    `EphemeralLatest`, fan out to matching subscribers via `try_send`
+    ///    (lagging ones marked, never blocking). Release the lock.
+    /// 3. Off the lock: enqueue `Durable` envelopes to write-behind.
+    ///
+    /// [`Seq`]: crate::Seq
+    pub async fn publish(&self, env: Envelope) -> crate::Result<crate::Seq> {
+        self.publish_from(env, None).await
+    }
+
+    /// Card 1998f6cb: install the outbound route-layer sink. Every
+    /// successfully published durable envelope is offered to `tx`
+    /// (bounded, non-blocking) as a [`ForwardItem`] carrying the
+    /// origin LAN peer (if the publish came through the inbound
+    /// bridge) so the forwarder can apply loop prevention.
+    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) {
+        let mut guard = self
+            .inner
+            .forward_tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = Some(tx);
+    }
+
+    /// Card 1998f6cb: durable envelopes NOT offered to the forward sink
+    /// because its queue was saturated (or its task gone). Loud-drop
+    /// counter — pairs with the error-level trace at the drop site.
+    pub fn forward_drop_count(&self) -> u64 {
+        self.inner.forward_drop_count.load(Ordering::SeqCst)
+    }
+
+    /// Offer a just-published durable envelope to the forward sink, if
+    /// one is installed. `try_send` only — the route layer must never
+    /// backpressure the in-memory hot path; a full queue is a LOUD,
+    /// counted drop (the forwarder is expected to be drained far faster
+    /// than the LAN can be saturated by room chat).
+    fn offer_to_forward_sink(&self, env: &Arc<Envelope>, origin: Option<PeerId>) {
+        let tx = {
+            let guard = self
+                .inner
+                .forward_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let item = ForwardItem {
+            env: Arc::clone(env),
+            origin,
+        };
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    event_id = %item.env.event_id,
+                    channel = %item.env.channel,
+                    "airc-bus forward sink queue FULL — durable event was published locally \
+                     but will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(item)) => {
+                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    event_id = %item.env.event_id,
+                    channel = %item.env.channel,
+                    "airc-bus forward sink receiver is GONE — durable event was published \
+                     locally but will NOT be forwarded over LAN routes (card 1998f6cb)"
+                );
+            }
+        }
+    }
+
+    /// [`EventRouter::publish`] with the originating LAN-link peer
+    /// attached (card 1998f6cb). `origin` is purely forward-sink
+    /// metadata — local delivery semantics are identical to `publish`.
+    async fn publish_from(
+        &self,
+        mut env: Envelope,
+        origin: Option<PeerId>,
+    ) -> crate::Result<crate::Seq> {
+        let seq = self.inner.seq.next();
+        env.seq = seq;
+        env.occurred_at_ms = self.inner.clock.now_ms();
+
+        // Card 4132f48c: record the id so a later `publish_if_new` of the
+        // same event (a transport echo of this publish) is a duplicate.
+        // One short mutex hold; never crosses an await.
+        {
+            let mut recent = self
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            recent.insert(env.event_id);
+        }
+
+        // Wrap ONCE: from here on every delivery (ring, ephemeral, fan-out,
+        // write-behind) is an `Arc::clone` — a refcount bump, never a deep copy
+        // of the envelope or its `headers` BTreeMap. This is the hot-path
+        // zero-copy keystone: per-subscriber CPU is one atomic increment.
+        let env = Arc::new(env);
+
+        // --- synchronous hot path: NO await while the shard lock is held ---
+        {
+            let shard = self.shard_for(env.channel);
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            let key = env.channel.0.as_u128();
+            let is_new = !map.contains_key(&key);
+            let state = map.entry(key).or_insert_with(|| {
+                ChannelState::new(
+                    self.inner.config.ring_capacity,
+                    self.inner.config.ephemeral_ttl_ms,
+                )
+            });
+            if is_new {
+                self.inner.channels_created.fetch_add(1, Ordering::SeqCst);
+            }
+
+            if env.delivery.is_ephemeral_latest() {
+                // §3.4: coalesce latest-wins; do NOT ring it (it's a
+                // projection, not a log) and do NOT persist it.
+                state
+                    .ephemeral
+                    .coalesce(Arc::clone(&env), env.occurred_at_ms);
+            } else {
+                // Recent log: ring it (pins if Durable, §3.8).
+                state.ring.push(Arc::clone(&env));
+            }
+
+            // Fan out live to matching subscribers. try_send only — a slow
+            // subscriber is marked lagged, never blocks the shard (§3.5). Each
+            // send is an `Arc::clone` (refcount bump), NOT a deep copy.
+            //
+            // Card 800ce5bd: per-publish observability. The fan-out is the
+            // load-bearing path that carries chat from `airc msg` to attached
+            // subscribers, and it has been opaque — when chat doesn't arrive,
+            // we couldn't tell whether the publish reached this loop, how
+            // many subscribers were considered, which were filtered out,
+            // which were closed. INFO so `RUST_LOG=airc_bus=info` turns it
+            // on for diagnosis without flooding the operator at default level.
+            let subscribers_before = state.subscribers.len();
+            let mut matched = 0usize;
+            let mut sent_ok = 0usize;
+            let mut sent_lagged = 0usize;
+            let mut sent_closed = 0usize;
+            state.subscribers.retain(|sub| {
+                if !sub.filter.matches(&env) {
+                    return true; // not for this subscriber, keep it
+                }
+                matched += 1;
+                match sub.tx.try_send(Arc::clone(&env)) {
+                    Ok(()) => {
+                        sent_ok += 1;
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Lagged: drop the live push, flag it; the subscriber
+                        // resumes from the sink via its cursor.
+                        sub.lagged.store(true, Ordering::SeqCst);
+                        sent_lagged += 1;
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Receiver gone -> drop the handle.
+                        sent_closed += 1;
+                        false
+                    }
+                }
+            });
+            tracing::info!(
+                channel = %env.channel,
+                epoch = env.seq.epoch,
+                counter = env.seq.counter,
+                kind = ?env.kind,
+                delivery = ?env.delivery,
+                subscribers_before,
+                matched,
+                sent_ok,
+                sent_lagged,
+                sent_closed,
+                "airc-bus publish: fan-out summary"
+            );
+        } // shard lock released here, before any await
+
+        // --- write-behind (durable only), off the hot lock ---
+        if env.delivery.is_durable() {
+            match self.inner.write_behind_tx.try_send(WriteBehindItem {
+                env: Arc::clone(&env),
+            }) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // §3.8: bounded write-behind full. Slice-1 fire-and-forget
+                    // policy: shed + surface, never silently drop, never OOM.
+                    // (The `await_durable`/blocking publisher variant is a
+                    // later refinement; the default path sheds with a surfaced
+                    // error so the contract is explicit.)
+                    self.inner.shed_count.fetch_add(1, Ordering::SeqCst);
+                    return Err(crate::BusError::WriteBehindSaturated);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(crate::BusError::Sink("write-behind task gone".into()));
+                }
+            }
+            // Card 1998f6cb: the event is accepted locally (ring +
+            // fan-out + write-behind enqueued) — offer it to the
+            // route layer so it traverses established LAN routes.
+            // Durable only: ephemeral/stream classes stay machine-
+            // local in this slice. Off the shard lock, non-blocking.
+            self.offer_to_forward_sink(&env, origin);
+        }
+
+        Ok(seq)
+    }
+
+    /// Idempotent publish keyed on `env.event_id` (card 4132f48c).
+    ///
+    /// This is the transport-ingest entry point: inbound LAN/relay frames
+    /// carry sender-minted event ids and can legitimately reach the
+    /// router more than once (the same frame arriving on two LAN links,
+    /// an echo of a locally published event, a re-inject after restart).
+    /// [`EventRouter::publish`] assumes a fresh id and would fan the copy
+    /// out to every live subscriber a second time; the durable sink alone
+    /// can't prevent that because its idempotency only covers the
+    /// write-behind tier, not the ring/live legs.
+    ///
+    /// Check order:
+    /// 1. recent-ids window (in-memory, covers everything this router
+    ///    instance published recently — including local IPC publishes,
+    ///    so a wire echo of a local send can never double-deliver);
+    /// 2. [`DurableSink::contains`] (covers ids older than the window
+    ///    and publishes from before a daemon restart).
+    ///
+    /// The id is recorded *before* the checks complete so two concurrent
+    /// `publish_if_new` calls for the same id race to exactly one
+    /// `Published`.
+    pub async fn publish_if_new(&self, env: Envelope) -> crate::Result<PublishIfNew> {
+        self.publish_if_new_from(env, None).await
+    }
+
+    /// [`EventRouter::publish_if_new`] with the LAN-link peer the frame
+    /// arrived from (card 1998f6cb). The inbound bridge passes the
+    /// verified link origin here so a `Published` outcome reaches the
+    /// forward sink carrying it — the forwarder then never echoes the
+    /// frame back over the link it came from, and a `Duplicate` is
+    /// never re-forwarded at all (the first arrival already was). The
+    /// pair of those two rules is what makes mesh forwarding terminate:
+    /// a frame floods outward once per node, and every re-arrival is a
+    /// duplicate dead-end.
+    pub async fn publish_if_new_from(
+        &self,
+        env: Envelope,
+        origin: Option<PeerId>,
+    ) -> crate::Result<PublishIfNew> {
+        let already_recent = {
+            let mut recent = self
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            !recent.insert(env.event_id)
+        };
+        if already_recent {
+            return Ok(PublishIfNew::Duplicate);
+        }
+        // Off-lock durable probe. The id is already marked, so even if
+        // this await parks, a concurrent same-id call short-circuits.
+        // On ANY failure from here on, unmark the id: a poisoned entry
+        // would turn a legitimate retry into a false `Duplicate` (and a
+        // false delivered ack) for an event the router never took.
+        let event_id = env.event_id;
+        let unmark = |router: &Self| {
+            let mut recent = router
+                .inner
+                .recent_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            recent.remove(&event_id);
+        };
+        match self.inner.sink.contains(event_id).await {
+            Ok(true) => return Ok(PublishIfNew::Duplicate),
+            Ok(false) => {}
+            Err(error) => {
+                unmark(self);
+                return Err(error);
+            }
+        }
+        match self.publish_from(env, origin).await {
+            Ok(seq) => Ok(PublishIfNew::Published(seq)),
+            Err(error) => {
+                unmark(self);
+                Err(error)
+            }
+        }
+    }
+
+    /// The write-behind drain loop (§3.3 deliver-first / persist-async, §3.8
+    /// ring-pinned-until-persisted). For each durable item: `sink.append` then
+    /// re-lock the shard and `mark_persisted` so the ring may evict it.
+    async fn run_write_behind(inner: Arc<RouterInner>, mut rx: mpsc::Receiver<WriteBehindItem>) {
+        while let Some(item) = rx.recv().await {
+            // append is the only point we touch the durable tier; no shard
+            // lock is held across it.
+            let appended = inner.sink.append(&item.env).await;
+            if appended.is_err() {
+                // Append failed: leave the ring entry pinned so the no-gap
+                // precondition still holds (the event is still in RAM). A real
+                // sink would retry; the in-memory test sink never fails.
+                continue;
+            }
+            // Confirmed persisted -> unpin in the ring.
+            let n = inner.shards.len();
+            let idx = (item.env.channel.0.as_u128() % n as u128) as usize;
+            let shard = &inner.shards[idx];
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = map.get_mut(&item.env.channel.0.as_u128()) {
+                state.ring.mark_persisted(item.env.event_id);
+            }
+        }
+    }
+
+    /// **Card 7d5b6a65.** Return the cursor of the most-recent envelope
+    /// in the channel's ring snapshot, or `None` if the channel has not
+    /// yet received any envelope.
+    ///
+    /// Callers use this to implement "subscribe from the live edge":
+    /// pass the returned cursor as `from_cursor` to [`Self::subscribe`]
+    /// and the deep-replay + ring-snapshot legs return empty (their
+    /// `is_after` predicate filters them out), so the subscriber gets
+    /// only events published strictly after the call. This is the
+    /// agent-Monitor live-tail shape — the `AttachRequest::from_now`
+    /// flag.
+    pub fn head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        let n = self.inner.shards.len();
+        let idx = (channel.0.as_u128() % n as u128) as usize;
+        let shard = &self.inner.shards[idx];
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .and_then(|state| state.ring.newest_cursor())
+    }
+
+    /// **Card 7d5b6a65.** Async fallback for [`Self::head_cursor`] that
+    /// queries the durable sink. Callers use this when the in-memory
+    /// ring is empty (fresh daemon start with backlog in the sink):
+    ///
+    /// ```ignore
+    /// let from = match router.head_cursor(channel) {
+    ///     Some(c) => Some(c),
+    ///     None => router.sink_head_cursor(channel).await,
+    /// };
+    /// ```
+    ///
+    /// Without this fallback, an `AttachRequest::from_now: true`
+    /// against a freshly-started daemon would fall through to
+    /// `from: None` and replay the whole sink — the exact bug card
+    /// 7d5b6a65 closes.
+    pub async fn sink_head_cursor(&self, channel: airc_core::RoomId) -> Option<Cursor> {
+        self.inner.sink.head_cursor(channel).await.ok().flatten()
+    }
+
+    /// **Card a1562dbc.** The channel's **durable transcript tip**: the
+    /// cursor of the newest `Durable` envelope on `channel`, or `None`
+    /// for a room with no durable history. Constant work regardless of
+    /// room depth — this is the O(1) probe behind the `room_tip` IPC op
+    /// (reconnect watermarking, idle detection, projection-cache
+    /// validation), replacing the "replay the whole room, keep the last
+    /// event" scan.
+    ///
+    /// Two constant-cost legs, NOT a perf fallback:
+    /// - the hot ring's newest durable entry (bounded by ring capacity).
+    ///   Eviction is oldest-first, so when the ring holds any durable,
+    ///   its newest durable IS the channel's global durable tip — the
+    ///   sink only lags the ring (write-behind), never leads it.
+    /// - otherwise the sink's [`DurableSink::head_cursor`] (one indexed
+    ///   row on SQLite). A sink error propagates — it is never papered
+    ///   over with a scan.
+    pub async fn durable_tip(&self, channel: airc_core::RoomId) -> crate::Result<Option<Cursor>> {
+        let ring_tip = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            map.get(&channel.0.as_u128())
+                .and_then(|state| state.ring.newest_durable_cursor())
+        }; // shard lock released before the sink await
+        if ring_tip.is_some() {
+            return Ok(ring_tip);
+        }
+        self.inner.sink.head_cursor(channel).await
+    }
+
+    /// **Card 8428ae8c.** The newest `limit` **durable** envelopes on
+    /// `channel`, in ascending total order — the "most recent N" leg of
+    /// the inbox path. Work is bounded by `limit` and the ring capacity,
+    /// NEVER by room depth: the previous shape
+    /// (`resume_from_cursor(channel, None)` + truncate) materialized the
+    /// entire room to answer N.
+    ///
+    /// Merge contract (mirrors [`Self::subscribe`]'s seam, reversed):
+    /// - the hot ring is authoritative for the recent tail — it may hold
+    ///   durables the sink lacks (write-behind lag), and eviction is
+    ///   oldest-first with §3.8 pinning (a durable is never evicted
+    ///   before it is persisted), so the ring's durables are exactly the
+    ///   channel's newest durables and everything older is in the sink;
+    /// - when the ring's durables don't cover `limit`, the remainder
+    ///   comes from ONE [`DurableSink::page_tail`] call for the events
+    ///   strictly before the ring's oldest retained cursor (`None` =
+    ///   channel tail when the ring is empty — fresh-start shape). The
+    ///   sink only ever holds durables, so no class filter is needed on
+    ///   that leg. A sink error propagates — it is never papered over
+    ///   with a full forward scan.
+    pub async fn durable_tail(
+        &self,
+        channel: RoomId,
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (mut tail, ring_oldest) = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            match map.get(&channel.0.as_u128()) {
+                Some(state) => (
+                    state
+                        .ring
+                        .replay_after(None)
+                        .into_iter()
+                        .filter(|env| env.delivery.is_durable())
+                        .collect::<Vec<_>>(),
+                    state.ring.oldest_cursor(),
+                ),
+                None => (Vec::new(), None),
+            }
+        }; // shard lock released before the sink await
+        if tail.len() >= limit {
+            // The ring alone covers N — zero store reads.
+            return Ok(tail.split_off(tail.len() - limit));
+        }
+        // Ring durables are the newest; top up with the sink tail older
+        // than anything the ring still retains. Sink rows strictly
+        // before `ring_oldest` cannot also be in the ring, so the two
+        // legs concatenate with no dup and no gap.
+        let older = self
+            .inner
+            .sink
+            .page_tail(channel, ring_oldest, limit - tail.len())
+            .await?;
+        let mut out: Vec<Arc<Envelope>> = older.into_iter().map(Arc::new).collect();
+        out.append(&mut tail);
+        Ok(out)
+    }
+
+    /// Subscribe (§4 subscribe, §3.5 cursor contract).
+    ///
+    /// Returns a stream that yields **every** envelope on the filter strictly
+    /// after `from_cursor`, exactly once, with no gap at the replay→live seam:
+    ///
+    /// 1. Under the shard lock, register the live sender *and* snapshot the
+    ///    ring's replay + oldest cursor atomically. (Registering first means
+    ///    no live event published after this moment can be missed.)
+    /// 2. Off the lock, page the sink for the deep leg `(from_cursor,
+    ///    ring.oldest)` — covering anything older than the ring still retains,
+    ///    including a `Durable` event that was evicted-pending and is now in
+    ///    the sink (§3.8).
+    /// 3. Yield deep replay, then the ring snapshot (historical), tracking the
+    ///    highest cursor emitted.
+    /// 4. Drain the live channel, skipping anything at-or-before the replay
+    ///    high-watermark (dedup) — the seam admits no dup; step-1 ordering
+    ///    admits no miss.
+    pub fn subscribe(
+        &self,
+        filter: Filter,
+        from_cursor: Option<Cursor>,
+    ) -> impl Stream<Item = Arc<Envelope>> {
+        self.subscribe_with_lag(filter, from_cursor).0
+    }
+
+    /// Like [`EventRouter::subscribe`] but also returns a [`LagFlag`] the
+    /// caller can poll to learn whether the router dropped a live push to this
+    /// subscriber (§3.5 slow-subscriber). When lagged, the caller resumes via
+    /// [`EventRouter::resume_from_cursor`].
+    pub fn subscribe_with_lag(
+        &self,
+        filter: Filter,
+        from_cursor: Option<Cursor>,
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+        let inner = Arc::clone(&self.inner);
+        let channel = filter.channel;
+
+        // --- step 1: register live + snapshot ring under one lock ---
+        let lagged = Arc::new(AtomicBool::new(false));
+        let buffer_capacity = inner.config.subscriber_buffer.max(1);
+        let (tx, mut rx) = mpsc::channel::<Arc<Envelope>>(buffer_capacity);
+        let (ring_snapshot, ring_oldest, shard_idx, subscribers_after) = {
+            let n = inner.shards.len();
+            let idx = (channel.0.as_u128() % n as u128) as usize;
+            let shard = &inner.shards[idx];
+            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            let key = channel.0.as_u128();
+            let is_new = !map.contains_key(&key);
+            let state = map.entry(key).or_insert_with(|| {
+                ChannelState::new(inner.config.ring_capacity, inner.config.ephemeral_ttl_ms)
+            });
+            if is_new {
+                inner.channels_created.fetch_add(1, Ordering::SeqCst);
+            }
+            state.subscribers.push(SubscriberHandle {
+                tx,
+                filter: filter.clone(),
+                lagged: Arc::clone(&lagged),
+            });
+            // Snapshot recent replay + the oldest cursor still in RAM, while
+            // holding the same lock that gated live registration.
+            (
+                state.ring.replay_after(from_cursor),
+                state.ring.oldest_cursor(),
+                idx,
+                state.subscribers.len(),
+            )
+        }; // lock released; now we may await
+
+        // Card 800ce5bd: per-registration observability. Pairs with the
+        // per-publish summary so an operator can correlate "I subscribed at
+        // T=X on shard=Y for channel=Z" with "at T=X+ε a publish landed on
+        // shard=Y for channel=Z and saw N subscribers." A subscribe that
+        // doesn't appear in a subsequent publish's `subscribers_before` is
+        // the smoking gun for "wrong shard / wrong channel / wrong state."
+        tracing::info!(
+            channel = %channel,
+            shard_idx,
+            subscribers_after,
+            buffer_capacity,
+            filter_summary = ?filter,
+            "airc-bus subscribe_with_lag: registered"
+        );
+
+        let lag_flag = LagFlag(Arc::clone(&lagged));
+        let stream = async_stream::stream! {
+            // --- step 2: deep replay leg from the sink ---
+            // The sink covers `(from_cursor, ring_oldest)`: events older than
+            // the ring still retains. If the ring is non-empty we page the sink
+            // up to (but not including) the ring's oldest; if the ring is empty
+            // we page the whole tail after the cursor.
+            let mut high: Option<Cursor> = from_cursor;
+            let deep = inner
+                .sink
+                .page(channel, from_cursor, usize::MAX)
+                .await
+                .unwrap_or_default();
+            for env in deep {
+                // The sink (persistence) is a real copy boundary, so the deep
+                // leg arrives as owned `Envelope`s; wrap each once in `Arc` so
+                // the stream item type is uniform with the (already-`Arc`) ring
+                // and live legs and downstream stays zero-copy.
+                let env = Arc::new(env);
+                // Only emit sink events strictly before the ring snapshot's
+                // window — the ring snapshot is authoritative for the recent
+                // tail (it may hold un-persisted Durable the sink lacks).
+                let before_ring = match ring_oldest {
+                    Some(o) => env.cursor().is_before(&o),
+                    None => true,
+                };
+                let after_gate = match high {
+                    Some(h) => env.cursor().is_after(&h),
+                    None => true,
+                };
+                if before_ring && after_gate && filter.matches(&env) {
+                    high = Some(env.cursor());
+                    yield env;
+                }
+            }
+
+            // --- step 3: recent replay leg from the ring snapshot ---
+            for env in ring_snapshot {
+                let after_gate = match high {
+                    Some(h) => env.cursor().is_after(&h),
+                    None => true,
+                };
+                if after_gate && filter.matches(&env) {
+                    high = Some(env.cursor());
+                    yield env;
+                }
+            }
+
+            // --- step 4: live, deduped against the replay high-watermark ---
+            while let Some(env) = rx.recv().await {
+                let after_gate = match high {
+                    Some(h) => env.cursor().is_after(&h),
+                    None => true,
+                };
+                if after_gate {
+                    high = Some(env.cursor());
+                    yield env;
+                }
+                // events at-or-before `high` were already delivered by replay;
+                // dropping them is the no-dup half of the seam.
+            }
+        };
+        (stream, lag_flag)
+    }
+
+    /// Deep + recent catch-up for a **lagged** subscriber (§3.5): everything
+    /// strictly after its last cursor, recent-from-ring + deep-from-sink,
+    /// merged in total order with no dup. A lagging `Durable` subscriber calls
+    /// this to resume; fan-out to others was never blocked.
+    pub async fn resume_from_cursor(
+        &self,
+        channel: RoomId,
+        from_cursor: Option<Cursor>,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        // Recent from ring (snapshot under lock; no await held).
+        let (ring_events, ring_oldest) = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            match map.get(&channel.0.as_u128()) {
+                Some(state) => (
+                    state.ring.replay_after(from_cursor),
+                    state.ring.oldest_cursor(),
+                ),
+                None => (Vec::new(), None),
+            }
+        };
+
+        // Deep from sink for the window older than the ring.
+        let deep = self
+            .inner
+            .sink
+            .page(channel, from_cursor, usize::MAX)
+            .await?;
+
+        let mut out: Vec<Arc<Envelope>> = Vec::new();
+        for env in deep {
+            // Deep leg is owned `Envelope` from the sink copy boundary; wrap
+            // once so the merged output is uniformly `Arc<Envelope>`.
+            let env = Arc::new(env);
+            let before_ring = match ring_oldest {
+                Some(o) => env.cursor().is_before(&o),
+                None => true,
+            };
+            let after_gate = match &from_cursor {
+                Some(h) => env.cursor().is_after(h),
+                None => true,
+            };
+            if before_ring && after_gate {
+                out.push(env);
+            }
+        }
+        out.extend(ring_events);
+        // Total order, dedup by event_id (a Durable may appear in both legs if
+        // it was persisted between the two snapshots).
+        out.sort_by(|a, b| {
+            a.seq
+                .cmp(&b.seq)
+                .then_with(|| a.event_id.0.cmp(&b.event_id.0))
+        });
+        out.dedup_by(|a, b| a.event_id == b.event_id);
+        Ok(out)
+    }
+
+    /// The latest coalesced ephemeral value for `(channel, coalesce_key)`, if
+    /// live (§3.4). Used to seed a freshly-attached subscriber with current
+    /// presence/pose.
+    pub fn ephemeral_latest(&self, channel: RoomId, key: &str) -> Option<Arc<Envelope>> {
+        let now = self.inner.clock.now_ms();
+        let shard = self.shard_for(channel);
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .and_then(|s| s.ephemeral.get(key, now).map(Arc::clone))
+    }
+
+    /// Number of distinct channels that have ever had state allocated. The
+    /// many-rooms test uses this as the allocation/wakeup proxy: idle channels
+    /// that were merely *named* (never published/subscribed) cost nothing.
+    pub fn channels_created(&self) -> u64 {
+        self.inner.channels_created.load(Ordering::SeqCst)
+    }
+
+    /// Count of fire-and-forget durable events shed under write-behind
+    /// saturation (§3.8). Always counted, never silent.
+    pub fn shed_count(&self) -> u64 {
+        self.inner.shed_count.load(Ordering::SeqCst)
+    }
+
+    /// Test/diagnostic: pinned (un-persisted `Durable`) entries in a channel's
+    /// ring — the live un-persisted backlog (§3.8 floor).
+    pub fn pinned_in_ring(&self, channel: RoomId) -> usize {
+        let shard = self.shard_for(channel);
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .map_or(0, |s| s.ring.pinned_count())
+    }
+
+    /// Test/diagnostic: snapshot the count of retained ring entries.
+    pub fn ring_len(&self, channel: RoomId) -> usize {
+        let shard = self.shard_for(channel);
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128()).map_or(0, |s| s.ring.len())
+    }
+}
+
+/// A handle a subscriber polls to learn it has lagged (§3.5). Returned by
+/// [`EventRouter::subscribe_with_lag`] alongside the stream.
+#[derive(Clone)]
+pub struct LagFlag(Arc<AtomicBool>);
+
+impl LagFlag {
+    /// True once the router dropped a live push to this subscriber. The
+    /// subscriber then resumes via [`EventRouter::resume_from_cursor`].
+    pub fn is_lagged(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}

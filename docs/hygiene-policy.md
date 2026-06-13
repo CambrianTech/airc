@@ -25,7 +25,7 @@ Rust with `serde` without changing the command contract.
   "hooks": [],
   "report_paths": [],
   "warn_free_gb": 50.0,
-  "workspace_root": "~/.airc-worktrees"
+  "workspace_root": "~/.airc/worktrees"
 }
 ```
 
@@ -42,8 +42,8 @@ Rust with `serde` without changing the command contract.
 
 `airc hygiene clean --yes` removes only rebuildable lane caches by default:
 
-- `~/.airc-worktrees/*/src/workers/target`
-- `~/.airc-worktrees/*/src/node_modules`
+- `~/.airc/worktrees/*/src/workers/target`
+- `~/.airc/worktrees/*/src/node_modules`
 
 Main checkout caches and Docker prune are off by default. Projects can opt in
 when they know the tradeoff is acceptable.

@@ -24,7 +24,8 @@ name: auto-close-queue-cards
 #
 #   Runs `airc queue close-merged` from the checkout — no install
 #   step required because the `./airc` dispatcher works from a clone
-#   when python3 + gh + bash are present (all on ubuntu-latest).
+#   when gh + bash + the AIRC implementation binary are present (all on
+#   ubuntu-latest).
 #
 # Scope:
 #   - Same-repo only. Cross-repo refs (e.g. airc PR closing
@@ -62,12 +63,11 @@ jobs:
       - name: Checkout (for the airc dispatcher)
         uses: actions/checkout@v4
 
-      - name: Verify environment (gh + python3 + bash)
+      - name: Verify environment (gh + bash)
         run: |
           set -euo pipefail
-          which gh python3 bash
+          which gh bash
           gh --version | head -1
-          python3 --version
           bash --version | head -1
 
       - name: Run airc queue close-merged

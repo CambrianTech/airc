@@ -1,0 +1,42 @@
+[package]
+name = "airc-wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# The single well-defined binary wire/IPC encoding for `airc_bus::Envelope`.
+#
+# A FlatBuffers codec built on `planus` (pure-Rust FlatBuffers compiler +
+# runtime — NO C++ `flatc` at build time, so CI stays green on
+# ubuntu/macos/windows with the stock Rust toolchain). The `.fbs` schema in
+# `src/schema/wire.fbs` is the source of truth; the generated accessors in
+# `src/wire_generated.rs` are committed (deterministic, no build.rs).
+#
+# The opaque `payload` is forwarded VERBATIM, zero-copy: encode lays it into
+# the buffer once, and `decode` reconstructs `Envelope.payload` via
+# `bytes::Bytes::slice_ref` — a slice that shares the decoded buffer's
+# allocation, never a copy. The render loop is sacred.
+#
+# SCOPE: additive codec only. Nothing else in the workspace calls it yet
+# (the LAN adapter, IPC layer, daemon, and router adopt it in later slices).
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-bus = { path = "../airc-bus" }
+
+bytes = "1"
+planus = "1.3.0"
+# planus' generated accessors carry unconditional `#[derive(serde::*)]` on
+# the schema types (it has no flag to suppress them). serde is already a
+# pervasive workspace dep; adding it here keeps `wire_generated.rs`
+# byte-for-byte regenerable from the CLI rather than hand-editing it.
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

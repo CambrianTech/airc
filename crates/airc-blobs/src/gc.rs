@@ -176,11 +176,21 @@ mod tests {
 
     /// Set the mtime of `path` to `seconds_ago` seconds in the past.
     /// Test helper — production code never touches mtime directly.
+    ///
+    /// On Windows, `File::set_modified` requires the file to be
+    /// opened for write — `File::open` alone yields read-only access
+    /// and the syscall fails with ERROR_ACCESS_DENIED (Os code 5).
+    /// On Unix, `utimes(2)` only requires that the caller own the
+    /// file, so `File::open` is enough. Open for write everywhere
+    /// for cross-platform parity.
     fn set_mtime_seconds_ago(path: &Path, seconds_ago: u64) {
         let target = SystemTime::now()
             .checked_sub(Duration::from_secs(seconds_ago))
             .expect("subtract from now");
-        let file = fs::File::open(path).expect("open");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for write");
         file.set_modified(target).expect("set_modified");
     }
 

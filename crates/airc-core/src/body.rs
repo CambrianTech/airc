@@ -54,14 +54,62 @@ impl Body {
                 // surface as text.
                 Some(s.as_str())
             }
-            _ => None,
+            Body::Json(
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Array(_),
+            )
+            | Body::Binary(_) => None,
         }
+    }
+
+    /// Encode this body as the opaque `payload` bytes of an `airc-bus`
+    /// envelope. The bus/wire never parse the payload — this is airc's
+    /// native-chat consumer codec, the encode half of the boundary
+    /// (inverse of [`Body::from_payload`]). `Body` is always
+    /// serde-serializable (`Json(Value)` | `Binary(Vec<u8>)`), so a
+    /// failure here is a serializer bug, not a runtime condition.
+    ///
+    /// The `expect` is structurally safe — both variants serialize
+    /// via derived `Serialize` over `serde_json::Value` / `Vec<u8>`,
+    /// neither of which can fail. Allowlisting rather than threading
+    /// `Result` through 8 call sites for an impossible failure mode
+    /// (card ef168afe, CI strict-gate re-green).
+    #[allow(clippy::expect_used)]
+    pub fn to_payload(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("Body always serializes to JSON")
+    }
+
+    /// Decode the opaque `payload` bytes of an `airc-bus` envelope back
+    /// into a `Body`. The decode half of the boundary — surfaces a typed
+    /// error rather than silently dropping a malformed payload.
+    pub fn from_payload(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_payload_round_trips_json_and_binary() {
+        let text = Body::text("hello over the bus");
+        let decoded = Body::from_payload(&text.to_payload()).expect("json payload decodes");
+        assert_eq!(decoded, text);
+        assert_eq!(decoded.as_text(), Some("hello over the bus"));
+
+        let bin = Body::Binary(vec![0, 1, 2, 255, 42]);
+        let decoded = Body::from_payload(&bin.to_payload()).expect("binary payload decodes");
+        assert_eq!(decoded, bin);
+    }
+
+    #[test]
+    fn from_payload_surfaces_malformed_bytes_as_error() {
+        // Not a silent drop — a malformed payload is a typed Err.
+        assert!(Body::from_payload(b"\xff\x00not json").is_err());
+    }
 
     #[test]
     fn json_body_roundtrips_through_serde() {
@@ -99,7 +147,14 @@ mod tests {
                 assert_eq!(m["text"], "hi");
                 assert_eq!(m.len(), 1, "text helper produces exactly {{text: ...}}");
             }
-            _ => panic!("text() should produce Body::Json with object shape"),
+            Body::Json(
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_)
+                | serde_json::Value::Array(_),
+            )
+            | Body::Binary(_) => panic!("text() should produce Body::Json with object shape"),
         }
         assert_eq!(body.as_text(), Some("hi"));
     }

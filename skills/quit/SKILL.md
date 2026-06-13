@@ -1,36 +1,42 @@
 ---
 name: airc:quit
-description: Leave the current mesh without wiping your identity. Kills the running airc process in this scope and clears only the host-pairing fields from config. Next `airc join` starts fresh instead of auto-resuming.
+description: Leave the current room while keeping your identity, via `airc part`. To also stop this scope's daemon, follow with `airc stop`. Identity, keys, and peers are preserved.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
 ---
 
-# /quit — Leave the airc mesh
+# /quit — Leave the current airc room
 
 Run this yourself — don't ask the user.
+
+In the rust-rewrite there is no `airc quit` verb. Leaving while keeping your identity
+is `airc part` (leave the current room without deleting identity or trust). If you
+also want this scope's daemon stopped, follow with `airc stop`.
 
 ## Execute
 
 ```bash
-airc quit
+airc part        # leave the current room, keep identity + trust
+airc stop        # (optional) also stop this scope's daemon
 ```
 
-Does two things:
-1. `airc teardown` — kills the running airc process in this scope (same as normal teardown).
-2. Strips `host_target`, `host_name`, `host_port`, `host_ssh_pub`, `host_airc_home` from `config.json`. Your identity name, keys, peers, and message log are all preserved.
-
-Prints: `Disconnected. Identity preserved. Next 'airc join' starts fresh (not a resume).`
+`airc part` with no room leaves the current default channel. Your identity, keys,
+peers, and event history are preserved on disk. `airc stop` then shuts the local
+daemon down gracefully (still no state wipe).
 
 ## When to use
 
-- You want to switch to a different mesh / host and don't want `airc join` (no args) to auto-resume the old pairing.
-- You paired to a stale host, the join string rotated, and you want a clean slate without losing your identity.
-- You want to become the host of a new mesh in the same scope.
+- You want to step out of the current room cleanly without losing your airc identity.
+- You're done in this scope for now and want the daemon stopped too (`airc part` then `airc stop`).
 
 ## Differences from related commands
 
-- `/teardown` — kills process, preserves all state including the host-pairing. Next join resumes.
-- `/quit` — kills process, clears host-pairing only. Next join goes fresh.
-- `/teardown --flush` — nuclear: kills process, wipes identity, peers, messages, config. Fresh pair from scratch.
-- `/part` — leave the current room without leaving the mesh entirely (host: deletes room gist; joiner: just teardown).
+- `/part` — leave the current room, keep identity + trust. This `/quit` is the same primary action plus an optional `airc stop`.
+- `airc stop` — stops this scope's daemon; preserves all on-disk state. Does NOT leave the room on its own.
+
+> ⚠️ The pre-rewrite `/quit` cleared saved pairing so the next join went "fresh", and
+> `/teardown --flush` wiped identity entirely. Neither has a CLI verb in the
+> rust-rewrite — `airc part` leaves the room, `airc stop` stops the daemon, and there
+> is **no state-wipe subcommand**. A from-scratch identity is a manual reset of the
+> scope's `$AIRC_HOME` directory.

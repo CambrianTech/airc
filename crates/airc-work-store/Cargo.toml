@@ -1,0 +1,23 @@
+[package]
+name = "airc-work-store"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Store bridge for the work coordination domain. Keeps airc-work pure
+# and lets CLI/hooks/Continuum query persisted work state through the
+# generic EventStore contract.
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-store = { path = "../airc-store" }
+airc-work = { path = "../airc-work" }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+serde_json = "1"

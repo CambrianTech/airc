@@ -249,6 +249,8 @@ history to recover a session manager.
 
 Before Continuum integration, the implementation needs:
 
+- structured publish API with typed receipt for library, daemon, and
+  JSON-command callers
 - two local subscribers exchanging chat plus typing/thinking presence
 - deterministic replay after one subscriber restarts
 - self-filter test with two clients under one peer
@@ -275,3 +277,61 @@ Initial targets:
 5. Add transport adapter tests with duplicate ingest and self-filtering.
 6. Add CLI smoke commands only after the Rust library behavior is covered.
 7. Wire Continuum through adapters once benchmarks meet the alpha targets.
+
+## Decoupled Delivery (PR-2 implementation plan)
+
+**Status:** implementation plan for the bus above, 2026-05-26. Anchored by a
+reproducible baseline benchmark (`crates/airc-lib/tests/fanout_bench.rs`).
+
+### Why: the bottleneck is file-coupling, not the fan-out
+
+Measured baseline (this dev Mac, N=200 events/run, 1/4/14 subscribers):
+
+| path | p50 | p99 | vs gate (p95 < 20 ms) |
+|------|-----|-----|-----------------------|
+| polled wire (cross-process, current same-machine bus) | ~35 ms | ~54 ms | **FAILS** |
+| in-process broadcast (`live_tx`) | ~3 ms | ~7 ms | **PASSES** |
+
+The broadcast primitive itself is **sub-microsecond** (probed ~3.7 µs
+send→receive). All latency is file-coupling on two ends:
+
+1. **Receive side:** cross-process delivery waits on each subscriber's 50 ms
+   `POLL_INTERVAL` tail loop in `crates/airc-transport/src/local_fs.rs` —
+   a flat ~35 ms median / ~54 ms p99 tax on every message, at every subscriber
+   count. This is also the WebRTC/UDP signaling jitter killer.
+2. **Send side:** `Durable`/`Message`-kind sends `fsync()` (~27 ms here) in
+   `execute_send_route` **before** the `live_tx` fan-out
+   (`crates/airc-lib/src/messaging.rs`). And even co-located in-process sends
+   still do a per-send `LocalFsAdapter` flock+write (Path B's residual ~3 ms).
+
+### Fix: decouple delivery from durability on both ends
+
+- **Send — deliver-first, persist-async.** Fan out to local subscribers
+  *before* persisting; move the wire/ORM write to a write-behind task. The ORM
+  remains the durability source of truth, but it never sits on the delivery
+  hot path. Removes the ~27 ms send stall and the co-located file write.
+- **Receive — push, not poll.** Co-located subscribers (continuum embedding
+  `airc-lib`; its personas) already ride `live_tx` — stop routing them through
+  the wire write. Cross-process same-machine clients move off the 50 ms file
+  poll onto the daemon's existing `Attach` IPC push: one machine-account daemon
+  owns the wire+ORM and pushes to attached clients. This is the
+  one-daemon-per-machine collapse the account-mesh contract already implies.
+- **DeliveryClass routing** (the enum above): `Durable` → persist; presence/
+  typing → `EphemeralLatest` coalesced with TTL into `realtime_latest`;
+  realtime control (WebRTC signaling) → push-only, never the durable wire.
+  Media frames never enter AIRC — control-plane only.
+
+### Slices (each gated by `fanout_bench` ≤ 20 ms p95 + the smoke tests above)
+
+1. **Send reorder — deliver-first / persist-async.** In-process, smallest.
+   Target: Path B ~3 ms → sub-ms; `Durable`-kind 27 ms send stall removed.
+2. **DeliveryClass + presence coalescing** (`realtime_latest` projection, TTL).
+3. **Daemon IPC push; retire the same-machine 50 ms poll.** Target: Path A
+   ~54 ms p99 → low-single-digit ms — the dominant win.
+4. **SchemaAdapter + PayloadFamily** carrying Continuum JTAG / EventBridge /
+   GridFrame / LiveKit payloads unchanged.
+5. **WebRTC / LiveKit control-plane events** (offer/answer/ICE metadata,
+   participant lifecycle, reconnect) — no media frames.
+6. **Continuum embed proof** (Gate 4): personas as in-process subscriptions.
+
+Slices ship incrementally but compose into the single bus specified above.

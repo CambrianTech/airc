@@ -41,12 +41,11 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use async_trait::async_trait;
 use futures::stream::Stream;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use airc_core::PeerId;
@@ -54,12 +53,13 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    Inner, OutboundTx, SubscriberHandle, SUBSCRIBER_CHANNEL_DEPTH,
+    Inner, Outbound, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
 
 /// Secure same-LAN adapter.
+#[derive(Clone)]
 pub struct LanTcpAdapter {
     inner: Arc<Inner>,
 }
@@ -70,7 +70,7 @@ impl LanTcpAdapter {
     pub fn new(
         self_peer_id: PeerId,
         keypair: PeerKeypair,
-        registry: Arc<RwLock<PeerKeyRegistry>>,
+        registry: Arc<PeerKeyRegistry>,
     ) -> Result<Self, LanTcpError> {
         let server_config = build_server_config(self_peer_id, &keypair, registry.clone())?;
         Ok(Self {
@@ -88,7 +88,7 @@ impl LanTcpAdapter {
     }
 
     /// Snapshot of currently-connected peers. Useful for diagnostics
-    /// (`airc-rs peers`) + tests.
+    /// (`airc-core peers`) + tests.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.inner
             .connections
@@ -193,6 +193,36 @@ impl LanTcpAdapter {
         handle_client_connection(self.inner.clone(), tls_stream).await?;
         Ok(())
     }
+
+    /// Targeted unicast: send `frame` to exactly one connected peer.
+    ///
+    /// Card 39d37629 — delivery-ack responses must travel back to the
+    /// requesting sender only, not broadcast to every connection. Same
+    /// flush-to-wire contract as `send()`: returns `Ok` only after the
+    /// write loop confirmed the frame is in the kernel send buffer.
+    pub async fn send_to(&self, peer: PeerId, frame: Frame) -> Result<(), LanTcpError> {
+        let payload = serde_json::to_vec(&frame)?;
+        if payload.len() > MAX_FRAME_BYTES as usize {
+            return Err(LanTcpError::FrameTooLarge {
+                announced: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        let tx = {
+            let connections = self.inner.connections.lock().await;
+            connections
+                .get(&peer)
+                .cloned()
+                .ok_or(LanTcpError::NoActivePeers)?
+        };
+        let (flushed, flushed_rx) = oneshot::channel();
+        tx.send(Outbound { payload, flushed })
+            .await
+            .map_err(|_closed| LanTcpError::NoActivePeers)?;
+        flushed_rx
+            .await
+            .map_err(|_dropped| LanTcpError::NoActivePeers)
+    }
 }
 
 #[async_trait]
@@ -200,6 +230,19 @@ impl Transport for LanTcpAdapter {
     type Error = LanTcpError;
 
     async fn send(&self, frame: Frame) -> Result<(), Self::Error> {
+        // Pre-validate BEFORE enqueueing so any failure (serialize
+        // error, oversized payload) returns synchronously rather
+        // than being silently dropped by the write loop after the
+        // caller already saw Ok. Grievance §9: `send()` must mean
+        // something measurable.
+        let payload = serde_json::to_vec(&frame)?;
+        if payload.len() > MAX_FRAME_BYTES as usize {
+            return Err(LanTcpError::FrameTooLarge {
+                announced: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+
         // Snapshot under lock, drop, dispatch — never hold the
         // connections mutex across awaits.
         let targets: Vec<(PeerId, OutboundTx)> = {
@@ -213,18 +256,39 @@ impl Transport for LanTcpAdapter {
                 .collect()
         };
 
-        // Broadcast: send to each connected peer. Per-peer failures
-        // tolerated (peer may have dropped between snapshot + send;
-        // the read loop will GC the dead entry). Success if at least
-        // one peer received.
-        let mut delivered_any = false;
+        // Broadcast: enqueue to each connected peer's write loop, each
+        // with a `flushed` oneshot. Per-peer failures tolerated (peer may
+        // have dropped between snapshot + send; the read loop GCs the dead
+        // entry).
+        let mut pending: Vec<oneshot::Receiver<()>> = Vec::new();
         let mut last_error: Option<LanTcpError> = None;
         for (_peer, tx) in targets {
-            match tx.send(frame.clone()).await {
-                Ok(()) => delivered_any = true,
+            let (flushed, flushed_rx) = oneshot::channel();
+            match tx
+                .send(Outbound {
+                    payload: payload.clone(),
+                    flushed,
+                })
+                .await
+            {
+                Ok(()) => pending.push(flushed_rx),
                 Err(_closed) => {
                     last_error = Some(LanTcpError::NoActivePeers);
                 }
+            }
+        }
+
+        // Await flush-to-wire, NOT merely enqueue. `send()` returns only
+        // once at least one peer's write loop confirmed the frame is on
+        // the wire — so a caller that exits immediately after (the
+        // `lan-send` CLI) cannot lose the frame to its own teardown. A
+        // dropped sender (write loop hit a dead socket) resolves to Err
+        // and counts as non-delivery.
+        let mut delivered_any = false;
+        for flushed_rx in pending {
+            match flushed_rx.await {
+                Ok(()) => delivered_any = true,
+                Err(_dropped) => last_error = Some(LanTcpError::NoActivePeers),
             }
         }
         if delivered_any {
@@ -296,12 +360,12 @@ mod tests {
         let alice_kp = PeerKeypair::generate();
         let bob_kp = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
         registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
         let bob = LanTcpAdapter::new(bob_id, bob_kp, registry).unwrap();
@@ -356,11 +420,11 @@ mod tests {
         ensure_crypto_provider();
         let alice_id = PeerId::from_u128(0xa1);
         let alice_kp = PeerKeypair::generate();
-        let mut alice_registry = PeerKeyRegistry::new();
+        let alice_registry = PeerKeyRegistry::new();
         alice_registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
-        let alice_registry = Arc::new(RwLock::new(alice_registry));
+        let alice_registry = Arc::new(alice_registry);
         let alice = LanTcpAdapter::new(alice_id, alice_kp, alice_registry).unwrap();
 
         let stranger_id = PeerId::from_u128(0xdeadbeef);
@@ -376,14 +440,14 @@ mod tests {
             .unwrap();
             extract_ed25519_pubkey(&cert).unwrap()
         };
-        let mut stranger_registry = PeerKeyRegistry::new();
+        let stranger_registry = PeerKeyRegistry::new();
         stranger_registry
             .enrol(alice_id, 0, alice_pub_for_stranger)
             .unwrap();
         stranger_registry
             .enrol(stranger_id, 0, stranger_kp.public_bytes())
             .unwrap();
-        let stranger_registry = Arc::new(RwLock::new(stranger_registry));
+        let stranger_registry = Arc::new(stranger_registry);
         let stranger = LanTcpAdapter::new(stranger_id, stranger_kp, stranger_registry).unwrap();
 
         let bound = alice
@@ -419,7 +483,7 @@ mod tests {
         let bob_kp = PeerKeypair::generate();
         let charlie_kp = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(alice_id, 0, alice_kp.public_bytes())
             .unwrap();
@@ -427,7 +491,7 @@ mod tests {
         registry
             .enrol(charlie_id, 0, charlie_kp.public_bytes())
             .unwrap();
-        let registry = Arc::new(RwLock::new(registry));
+        let registry = Arc::new(registry);
 
         let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
         let bob = LanTcpAdapter::new(bob_id, bob_kp, registry.clone()).unwrap();
@@ -503,5 +567,52 @@ mod tests {
         let channel = RoomId::from_u128(0xc0ffee);
         let result = alice.send(frame_at(1, channel, "into the void")).await;
         assert!(matches!(result, Err(LanTcpError::NoActivePeers)));
+    }
+
+    #[tokio::test]
+    async fn send_oversized_frame_returns_err_synchronously_without_dispatch() {
+        // The defensible proof for grievance §9 / "no post-acceptance
+        // silent drops": when the frame's serialized form exceeds the
+        // per-frame size cap, `send()` must surface `FrameTooLarge`
+        // *before* enqueueing — so the caller learns about the
+        // failure rather than seeing Ok and never observing the drop
+        // on the wire. The bob-side never receives the frame.
+        let (alice_id, alice, bob_id, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+
+        let mut bob_stream = bob.subscribe(Subscription::default()).await.unwrap();
+
+        // Build a frame whose serialized JSON is guaranteed past the
+        // 16 MiB cap: a 17 MiB ASCII body alone exceeds the limit.
+        let oversized_body = "a".repeat((MAX_FRAME_BYTES as usize) + 1024 * 1024);
+        let channel = RoomId::from_u128(0xc0ffee);
+        let huge_frame = frame_at(1, channel, &oversized_body);
+
+        let send_result = alice.send(huge_frame).await;
+        assert!(
+            matches!(
+                send_result,
+                Err(LanTcpError::FrameTooLarge { announced, limit })
+                    if announced > limit && limit == MAX_FRAME_BYTES
+            ),
+            "expected FrameTooLarge with announced > limit, got {send_result:?}"
+        );
+
+        // Cross-check: bob's subscriber must not see the frame
+        // (because send() rejected it before enqueueing). Give the
+        // network a generous tick to surface anything in flight.
+        let bob_saw = tokio::time::timeout(Duration::from_millis(200), bob_stream.next()).await;
+        assert!(
+            bob_saw.is_err(),
+            "bob must not have received an oversized frame on the wire — got {bob_saw:?}"
+        );
+
+        // peer_id parameter is otherwise unused but the assertion is
+        // here to make the test's intent obvious in the diff.
+        let _ = bob_id;
     }
 }

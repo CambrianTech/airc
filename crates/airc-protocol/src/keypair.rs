@@ -89,6 +89,39 @@ impl PeerKeypair {
         self.signing.verifying_key()
     }
 
+    /// Raw Ed25519 signature over arbitrary bytes. Used by typed
+    /// signed-blob features (e.g. `trust_rotation::sign_rotation`)
+    /// that canonical-encode their own body and need a primitive
+    /// signing op. The 64-byte sig matches the Ed25519 contract.
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing.sign(msg).to_bytes()
+    }
+
+    /// Sign a domain-separated identity assertion — the airc analogue
+    /// of a WebAuthn assertion. The signature covers a versioned domain
+    /// tag + `context` (the RP/"type" binding) + `challenge`, in a
+    /// space DISJOINT from envelope/frame signatures (see
+    /// [`crate::assertion`]). Consumers build session tokens +
+    /// credential bindings on top; the raw key is never exposed, so a
+    /// later device-bound / Secure-Enclave signer is a drop-in.
+    pub fn sign_assertion(
+        &self,
+        signer: PeerId,
+        key_id: u32,
+        context: &str,
+        challenge: &[u8],
+    ) -> crate::assertion::IdentityAssertion {
+        let bytes = crate::assertion::assertion_signing_bytes(context, challenge);
+        crate::assertion::IdentityAssertion {
+            peer_id: signer,
+            key_id,
+            context: context.to_string(),
+            challenge: challenge.to_vec(),
+            signature: self.sign_bytes(&bytes),
+        }
+    }
+
     /// Sign an envelope: produces a `Signature::Ed25519` carrying the
     /// signer's PeerId, key_id (for rotation), and 64-byte signature
     /// over the envelope's canonical CBOR encoding.
@@ -161,7 +194,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         let frame = Frame {
@@ -180,7 +213,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         // Tamper with the body — substantive content change.
@@ -207,7 +240,7 @@ mod tests {
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
         envelope.lamport = 999;
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         let frame = Frame {
@@ -229,7 +262,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         envelope
@@ -256,7 +289,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, keypair.public_bytes()).unwrap();
 
         envelope.reply_to = Some(EventId::from_u128(0x99));
@@ -282,7 +315,7 @@ mod tests {
         let mut envelope = envelope_fixture(peer);
         envelope.signature = real_keypair.sign_envelope(&envelope, peer, 0).unwrap();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry
             .enrol(peer, 0, imposter_keypair.public_bytes())
             .unwrap();
@@ -329,7 +362,7 @@ mod tests {
         let old_keypair = PeerKeypair::generate();
         let new_keypair = PeerKeypair::generate();
 
-        let mut registry = PeerKeyRegistry::new();
+        let registry = PeerKeyRegistry::new();
         registry.enrol(peer, 0, old_keypair.public_bytes()).unwrap();
         registry.enrol(peer, 1, new_keypair.public_bytes()).unwrap();
 

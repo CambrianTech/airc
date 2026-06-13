@@ -1,5 +1,18 @@
 # airc reference contract
 
+**STATUS: LEGACY — HISTORICAL SPEC ONLY.** This contract describes
+the shell/Python+gist implementation of airc that the Rust rewrite
+supersedes. Current substrate specs live in
+`docs/architecture/AIRC-RUST-SUBSTRATE.md`,
+`docs/architecture/ACCOUNT-MESH-JOIN-CONTRACT.md`,
+`docs/architecture/INVITE-ROUTING-ARCHITECTURE.md`, and
+`docs/DATA-MODEL-REFERENCE.md`. The bearer/gist-as-data-plane code
+referenced below was removed in #899 + #900; `messages.jsonl` is
+no longer on the wire post-Phase 3.5. Read this doc only for
+historical context on how the original shell airc worked.
+
+---
+
 The trunk is this document. The leaves are `airc` (bash) and `airc.ps1` (PowerShell). Both implementations must conform to the function names, argument shapes, return shapes, preconditions, and postconditions specified here. Implementation details (how bash spawns a background loop vs how PS does it; how each language reads/writes the gist) are leaf concerns.
 
 A bug is one of:

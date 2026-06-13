@@ -9,9 +9,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::RwLock;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use airc_core::PeerId;
 use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
@@ -31,9 +30,27 @@ pub(super) const OUTBOUND_CHANNEL_DEPTH: usize = 256;
 /// Subscriber inbound channel depth — matches local-fs.
 pub(super) const SUBSCRIBER_CHANNEL_DEPTH: usize = 64;
 
-/// Active connection's sender half — write-task receives Frames from
-/// this and pushes them onto the TLS stream.
-pub(super) type OutboundTx = mpsc::Sender<Frame>;
+/// One queued outbound payload plus a completion signal the write loop
+/// fires AFTER it has flushed the bytes to the TLS stream.
+///
+/// `send()` awaits `flushed` so it returns only once the frame is on the
+/// wire (in the kernel send buffer), not merely enqueued. Without this a
+/// one-shot caller — e.g. the `lan-send` CLI — could enqueue, see `Ok`,
+/// print "sent", and exit, aborting the background write task before it
+/// flushed, silently losing the frame. (Enqueue-only `Ok` was a real
+/// intermittent frame drop under load.) The payload is pre-validated
+/// bytes (length-checked + serialized in `send()`), so the write loop
+/// still has no post-acceptance failure mode beyond a dead socket —
+/// grievance §9 / Codex audit 2026-05-19.
+pub(super) struct Outbound {
+    pub(super) payload: Vec<u8>,
+    pub(super) flushed: oneshot::Sender<()>,
+}
+
+/// Active connection's sender half — the write task receives
+/// [`Outbound`] items from this and pushes the framed bytes onto the
+/// TLS stream, signalling `flushed` once each is on the wire.
+pub(super) type OutboundTx = mpsc::Sender<Outbound>;
 
 /// One subscriber's filtered inbound channel + matching predicate.
 pub(super) struct SubscriberHandle {
@@ -48,7 +65,7 @@ pub(super) struct SubscriberHandle {
 pub(super) struct Inner {
     pub(super) self_peer_id: PeerId,
     pub(super) keypair: PeerKeypair,
-    pub(super) registry: Arc<RwLock<PeerKeyRegistry>>,
+    pub(super) registry: Arc<PeerKeyRegistry>,
     pub(super) server_config: Arc<rustls::ServerConfig>,
     /// Active connections keyed by remote `PeerId`. Filled by both
     /// the accept loop (server-side handshakes) and `connect()`

@@ -13,11 +13,14 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use airc_core::PeerId;
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::Frame;
 
 use crate::lan_tcp::adapter::dispatch::dispatch_to_subscribers;
 use crate::lan_tcp::adapter::error::LanTcpError;
-use crate::lan_tcp::adapter::inner::{Inner, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH};
+use crate::lan_tcp::adapter::inner::{Inner, Outbound, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH};
 use crate::lan_tcp::cert::extract_ed25519_pubkey;
 
 /// Post-handshake server-side connection handler: bind the peer
@@ -57,8 +60,10 @@ fn resolve_peer_from_server_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
-    let registry = inner.registry.read().ok()?;
-    registry.find_peer(&pubkey).map(|(peer, _key_id)| peer)
+    inner
+        .registry
+        .find_peer(&pubkey)
+        .map(|(peer, _key_id)| peer)
 }
 
 fn resolve_peer_from_client_stream(
@@ -68,8 +73,10 @@ fn resolve_peer_from_client_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
-    let registry = inner.registry.read().ok()?;
-    registry.find_peer(&pubkey).map(|(peer, _key_id)| peer)
+    inner
+        .registry
+        .find_peer(&pubkey)
+        .map(|(peer, _key_id)| peer)
 }
 
 /// Install the outbound channel into `inner` **before** spawning the
@@ -87,7 +94,7 @@ async fn install_and_spawn_loops<R, W>(
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_DEPTH);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_CHANNEL_DEPTH);
     // Install synchronously — when this function returns, the
     // connection IS ready to receive sends.
     inner.connections.lock().await.insert(peer_id, outbound_tx);
@@ -126,9 +133,23 @@ where
 
         let frame: Frame = match serde_json::from_slice(&payload) {
             Ok(frame) => frame,
-            Err(_error) => {
-                // Malformed payload — drop the connection rather
-                // than silently skipping.
+            Err(error) => {
+                // Malformed payload — drop the connection rather than
+                // silently skipping. Card 39d37629: this is a frame the
+                // sender saw flushed ("sent") that will never reach a
+                // transcript — it MUST be loud. Build skew between
+                // peers (frame schema drift) lands exactly here.
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Transport,
+                        DiagnosticCode::FrameUndeliverable,
+                        "inbound lan-tcp frame did not decode — frame dropped, connection closed",
+                    )
+                    .with_field("reason", "decode_failure")
+                    .with_field("peer", peer_id)
+                    .with_field("payload_bytes", payload.len())
+                    .with_field("error", error),
+                );
                 inner.connections.lock().await.remove(&peer_id);
                 return;
             }
@@ -138,20 +159,36 @@ where
     }
 }
 
-/// Write loop: drain the outbound channel, write framed bytes to TLS.
-async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Frame>)
+/// Write loop: drain the outbound channel, length-prefix the
+/// already-validated payload, write framed bytes to TLS, then signal
+/// the sender that the frame is flushed to the wire.
+///
+/// The payload is pre-serialized and size-checked by
+/// `LanTcpAdapter::send` before it lands in the channel — by the
+/// time it reaches this loop the bytes are known-valid, so the
+/// only failure mode is a dead socket (which terminates the loop).
+/// No silent drops.
+///
+/// The `flushed` signal is fired ONLY after a successful `flush()`, so a
+/// caller awaiting it knows the bytes are in the kernel send buffer and
+/// will survive the caller exiting. On any write/flush error the loop
+/// returns and drops the remaining `flushed` senders — their awaiting
+/// `send()` calls observe the closed channel and report non-delivery
+/// rather than a false success.
+async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Outbound>)
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    while let Some(frame) = outbound_rx.recv().await {
-        let payload = match serde_json::to_vec(&frame) {
-            Ok(bytes) => bytes,
-            Err(_) => continue, // skip malformed frame
-        };
-        if payload.len() > MAX_FRAME_BYTES as usize {
-            // Drop oversized frames — caller should be lifting bodies.
-            continue;
-        }
+    while let Some(Outbound { payload, flushed }) = outbound_rx.recv().await {
+        // Defense-in-depth assertion: the sender already enforced
+        // this, but if a future regression bypasses pre-validation
+        // we'd rather fail loudly here than silently truncate.
+        debug_assert!(
+            payload.len() <= MAX_FRAME_BYTES as usize,
+            "write_loop received oversized payload ({} bytes, limit {})",
+            payload.len(),
+            MAX_FRAME_BYTES
+        );
         let len = (payload.len() as u32).to_be_bytes();
         if write_half.write_all(&len).await.is_err() {
             return;
@@ -162,5 +199,8 @@ where
         if write_half.flush().await.is_err() {
             return;
         }
+        // Flushed to the wire — release the sender. A dropped receiver
+        // (caller no longer waiting) is fine: delivery still happened.
+        let _ = flushed.send(());
     }
 }

@@ -1,9 +1,9 @@
 ---
 name: airc:doctor
-description: Self-diagnose AIRC. AI checks environment health (gh, ssh, ports), runs the integration suite, and proactively fixes recoverable issues (install gh, etc.) instead of just reporting them.
+description: Self-diagnose AIRC. AI checks environment health and live route/process state, then proactively fixes recoverable issues instead of just reporting them.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "[scenario|all]"
+argument-hint: ""
 ---
 
 # /doctor — operational reference
@@ -14,40 +14,37 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 
 | Command | Purpose |
 |---|---|
-| `airc doctor` | env probe (gh, ssh, python, tailscale) — fast, local |
-| `airc doctor --join` | pre-flight before `airc join` (also probes cached host) |
-| `airc doctor --health` | LIVE bus health (rate-limit headroom, process, per-channel bearer last-recv) |
-| `airc doctor --fix` | repair recoverable issues (currently: gh auth re-login) |
-| `airc doctor --tests [scenario]` | full integration suite (~245 assertions, 32 scenarios) |
+| `airc doctor` | env probe — fast, local |
+| `airc doctor --health` | live route/process health |
+| `airc doctor --fix` | apply safe auto-recovery for detected issues (currently: stale daemon sockets) |
 
-CLI aliases for `--tests`: `airc tests`, `airc test`. Do not expose a separate tests skill; `/doctor` owns diagnosis and validation.
+`--health` and `--fix` compose with the env probe and with each other.
 
 ## Decision tree
 
 When something feels wrong, in this order:
 
-1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, join process stopped, bearer wedged). Green → bus is fine, issue is upstream.
-2. **`airc doctor`** — env regression check. Gh missing, sshd down, python broken.
-3. **`airc inbox --peek`** — most-recent unread context without advancing the cursor.
-4. **`airc doctor --tests`** — only if 1-3 are green and the bug is reproducible.
+1. **`airc doctor --health`** — live route/process state. Fast. Catches stopped local transport or bad route health. Green → bus is fine, issue is upstream.
+2. **`airc doctor`** — env regression check.
+3. **`airc inbox`** — pull buffered frames for the current room to confirm whether traffic is arriving.
+4. **`airc doctor --fix`** — apply safe auto-recovery (e.g. clear a stale daemon socket) once 1-3 point at a recoverable local issue.
 
 ## --health output classes
 
 | Marker | Meaning | Action |
 |---|---|---|
 | `[ok] gh core rate-limit: <N>/5000` | Healthy headroom | None |
-| `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced headroom | None; bearer auto-throttles per #416 |
+| `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced rendezvous headroom | Avoid unnecessary GitHub discovery |
 | `[WARN] gh core rate-limit: <N>/5000` (<100) | Bus may stall soon | Wait for window reset; peers resume automatically |
 | `[BLOCKED] gh API not reachable` | Network or token | Run `airc doctor` for env probe |
 | `[ok] gh governor: no active backoff` | Cross-process gh guard is healthy | None |
 | `[WARN] gh governor blocked <N>/<M>` | Local guard prevented gh spam recently | Wait; inspect top classes in output |
 | `[BLOCKED] gh governor shared backoff active` | GitHub told this user/device to wait | Do not retry; wait for displayed seconds |
-| `[ok] airc process running` | Join process up | None |
+| `[ok] airc process running` | Daemon up | None |
 | `[WARN] airc process not running` | Disconnected scope | `airc join` |
-| `[ok] #<channel> — last bearer recv <Ns>` (<60s) | Healthy | None |
-| `[info] #<channel> — last bearer recv <Ns>` (<5min) | Idle | None |
-| `[WARN] #<channel> — last bearer recv <Ns>` (5-30min stale) | Check join process + rate-limit | Surface to user |
-| `[BLOCKED] #<channel> — last bearer recv <Ns>` (>30min wedged) | Bearer wedged | `airc join` |
+| `[ok] route health` | Healthy selected route | None |
+| `[WARN] route health` | Degraded selected route | Run `airc transport health` |
+| `[BLOCKED] route health` | No usable route | `airc join`, then inspect discovery/transport health |
 
 ## env probe (`airc doctor`)
 
@@ -59,39 +56,20 @@ Emits one line per prereq with `[ok]`, `[MISSING]`, or `[info]` (optional). For 
 - `gh authenticated (gist scope)` is interactive (browser flow) → instruct user: type `! gh auth login -s gist` so it runs in their terminal.
 - `tailscale (optional)` lines never block (LAN-only mesh works without it).
 
-## Integration Suite (`--tests`)
+## --fix (`airc doctor --fix`)
 
-```bash
-airc doctor --tests $ARGUMENTS
-```
+Applies only safe auto-recovery for detected issues — currently stale daemon
+sockets. Identity partial states are reported with manual fix commands; doctor does
+**not** wipe identity/trust state automatically. Without `--fix`, doctor only reports.
 
-Empty `$ARGUMENTS` (or `all`) runs every scenario. Single-scenario invocation: `tabs`, `scope`, `room`, `teardown`, `reminder`, `resilience`, `reconnect`, `queue`, `status`, `auth_failure`, `resume_stale_auth`. Suite uses port 7549 + `AIRC_HOME=/tmp/airc-it-*` — safe alongside live airc on 7547/7548. Runtime: ~2min for `all`, 10-30s per scenario.
-
-Final line: `N passed, M failed`.
-
-## Failure → action (test scenarios)
-
-| Failure name | Cause | Action |
-|---|---|---|
-| `alpha host failed to start` | Port 7549 taken OR airc not on PATH | `lsof -iTCP:7549` → kill if safe; verify `command -v airc` |
-| `beta join failed` | sshd down OR firewall blocks loopback ssh | Enable Remote Login (mac) / start sshd (linux); `ssh localhost echo ok` |
-| `scope: ...` | Two-tier resolver regression | Bisect against last green sha; file issue |
-| `teardown in different scope killed foreign host` | Scope isolation broke (CRITICAL) | File issue immediately — would let one tab nuke another |
-| `room: alpha unexpectedly wrote room_gist_id under --no-gist` | `--no-gist` not honored on push branch | Regression in `cmd_connect` host-mode gist gate |
-| `room: alpha cmd_part DID NOT identify as host` | `cmd_part` host detection regressed | Host signal = `config.json::host_target` empty; do NOT fall back to gist_id presence |
-| `auth_failure: stderr did NOT mention re-pair` | `cmd_send` auth-class detection regressed | Check regex against `permission denied\|publickey\|host key\|...` |
-| `resume_stale_auth: invite string` | Resume probe didn't reconstruct invite | Regression in `cmd_connect` resume probe failure branch |
-
-Failure not in table:
-1. Read failure verbatim.
-2. Trace into `test/integration.sh` for that scenario name to find the failing assertion.
-3. Read the relevant section of the airc binary.
-4. Hypothesis → fix → re-run scenario alone: `airc doctor --tests <scenario>`.
+> ⚠️ The integration test suite (`airc doctor --tests <scenario>`, plus the `--join`
+> pre-flight flag) is **not available in the rust-rewrite**. Diagnosis is the env
+> probe + `--health` + `--fix`; there is no in-CLI scenario runner.
 
 ## Final report (one line)
 
-- Green: `Fixed X, Y. All tests green.`
-- Red:   `Fixed X. Tests N passed M failed; failures: <list>.`
+- Green: `Healthy. Fixed X, Y.`
+- Red:   `Fixed X. Still failing: <list>; next step <command>.`
 
 Be specific about what you DID, not what you found.
 

@@ -1,0 +1,39 @@
+[package]
+name = "airc-bus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Owner-daemon event-server core (slice 1 of AIRC-EVENT-SERVER).
+#
+# This crate is the in-memory, deterministic heart of the owner daemon:
+# the sharded router, per-channel hot ring, coalesced ephemeral cache,
+# cursor engine, and write-behind path to a durable tier. The durable
+# tier is behind the `DurableSink` trait — this crate NEVER depends on
+# airc-store. The ORM-backed `DurableSink` impl lands in a later slice;
+# tests here use an in-memory sink.
+#
+# No IPC wiring, no file-poll deletion: those are separate verticals.
+# Everything here is injectable (Clock + SeqSource + EpochStore) so the
+# acceptance suite is bit-deterministic (§9).
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+async-stream = "0.3"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"

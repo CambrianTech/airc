@@ -12,13 +12,17 @@
 //!
 //! - [`ids`]        — newtype wrappers for identifier strings
 //! - [`identity`]   — the per-peer Identity card (the user/account abstraction)
+//! - [`persona`]    — typed persona capability metadata on Identity.integrations
 //! - [`body`]       — opaque payload (Json | Binary) consumers carry
 //! - [`transcript`] — TranscriptEvent + TranscriptKind + MentionTarget
 //! - [`cursor`]     — cursor + paging primitives for transcript fetch
+//! - [`datetime`]   — fixed-format UTC timestamp parsing
 //! - [`receipt`]    — delivered/read/applied acknowledgments
 //! - [`attachment`] — file-attachment manifest (consumer-side richer view)
 //! - [`filter`]     — self-echo filtering for multi-tab consumers
 //! - [`headers`]    — envelope headers for routing/filtering without body parse
+//! - [`humanhash`]  — stable hash mnemonics for invite/client labels
+//! - [`temp_home`]  — temp-rooted scope-home detection (hermetic test daemons)
 //!
 //! Every public type a consumer needs is re-exported at the crate root so
 //! `use airc_core::Identity;` works without knowing the module split.
@@ -26,11 +30,16 @@
 pub mod attachment;
 pub mod body;
 pub mod cursor;
+pub mod datetime;
+pub mod doctrine;
 pub mod filter;
 pub mod headers;
+pub mod humanhash;
 pub mod identity;
 pub mod ids;
+pub mod persona;
 pub mod receipt;
+pub mod temp_home;
 pub mod transcript;
 
 // Re-exports — the public API surface. Callers that want stable imports
@@ -40,9 +49,13 @@ pub mod transcript;
 pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
+pub use datetime::{iso_to_epoch, DateTimeError};
 pub use filter::{filter_self_echoes, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
+pub use humanhash::{humanhash, HumanhashError};
 pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
+pub use persona::{PersonaCapabilities, PersonaCapabilitiesError, PERSONA_CAPABILITIES_KEY};
 pub use receipt::{Receipt, ReceiptKind};
+pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};

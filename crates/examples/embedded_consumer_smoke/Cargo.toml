@@ -1,0 +1,33 @@
+[package]
+name = "embedded-consumer-smoke"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Consumer-embedding proof: a downstream crate that links airc-lib and exercises the embedding pattern end-to-end. NOT product code; integration test only."
+
+[lints]
+workspace = true
+
+[dependencies]
+# This crate consumes airc-lib like any external embedder would. Its
+# only AIRC dependency is airc-lib, not the lower-level airc-core /
+# airc-protocol / airc-store / etc. That constraint is what proves
+# the API is genuinely consumable without reaching into substrate
+# internals.
+airc-lib = { path = "../../airc-lib" }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+# Same-machine delivery is the owner-core daemon's job, so the
+# integration tests stand up an in-process daemon and the consumer
+# `Airc::attach`es to it — exactly what the airc install provides in
+# production. These deps are TEST HARNESS only; the runtime embedding
+# surface (`src/agent.rs`) still depends solely on `airc-lib`.
+airc-daemon = { path = "../../airc-daemon" }
+airc-core = { path = "../../airc-core" }
+airc-protocol = { path = "../../airc-protocol" }
+airc-store = { path = "../../airc-store" }
+tempfile = "3"
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }

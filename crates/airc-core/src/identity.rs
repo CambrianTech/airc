@@ -9,19 +9,18 @@
 //! and Hermes bind their user records to airc identities by pubkey rather
 //! than maintaining parallel account semantics.
 //!
-//! Field shape mirrors the Python `airc identity show` output one-to-one
-//! so the Rust port doesn't redesign — same six top-level fields, same
-//! defaults, same serde behavior (missing fields default to empty rather
-//! than fail).
+//! Field shape is the stable `airc identity show` contract: same six
+//! top-level fields, same defaults, same serde behavior (missing fields
+//! default to empty rather than fail).
 
+use crate::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A peer's user-facing identity card.
 ///
-/// Constructed from the scope's `config.json` identity record (or its Rust-
-/// store equivalent) and exposed by `airc identity show`, `airc whois`,
-/// and presence/event surfaces.
+/// Constructed from the local identity store row and exposed by
+/// `airc identity show`, `airc whois`, and presence/event surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Identity {
     /// Display nick. Other peers see this in `from=` and `whois` output.
@@ -44,7 +43,7 @@ pub struct Identity {
     pub status: String,
     /// Short identity fingerprint derived from the peer's pubkey.
     /// Computed by airc identity tooling, not authored by the user.
-    /// Format: short hex string matching the Python `airc identity show`
+    /// Format: short hex string matching the `airc identity show`
     /// `fingerprint:` line.
     #[serde(default)]
     pub fingerprint: String,
@@ -70,14 +69,13 @@ impl Identity {
 
     /// Is this identity "minimally set up" — has the user provided at
     /// least pronouns + role + bio? Used by the `airc identity` UX prompt
-    /// to decide whether to nudge for completion. Mirrors the Python
-    /// `_identity_needs_setup` heuristic.
+    /// to decide whether to nudge for completion.
     pub fn is_complete(&self) -> bool {
         !self.pronouns.is_empty() && !self.role.is_empty() && !self.bio.is_empty()
     }
 
     /// Mark / clear an "away" status. Empty string clears it (matches the
-    /// Python `airc away ""` and `airc identity set --status ""` semantics).
+    /// `airc away ""` and `airc identity set --status ""` semantics).
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }
@@ -135,9 +133,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrips_with_defaults_for_unset_fields() {
-        // Forward-compat: an Identity stored in scope config.json when only
-        // the nick was set should deserialize cleanly — other fields default
-        // to empty rather than fail.
+        // Forward-compat: an Identity stored when only the nick was set
+        // should deserialize cleanly — other fields default to empty
+        // rather than fail.
         let stored = serde_json::json!({ "name": "bob" });
         let id: Identity = serde_json::from_value(stored).unwrap();
         assert_eq!(id.name, "bob");
@@ -182,5 +180,115 @@ mod tests {
         // cursors / replay records / diffs work consistently.
         let encoded = serde_json::to_string(&id.integrations).unwrap();
         assert!(encoded.find("continuum").unwrap() < encoded.find("github").unwrap());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Wire event: PeerIdentityCard
+//
+// First slice of the identity-roster substrate (card a63ad10a; parent
+// af40f46d). Defines the typed event a peer publishes so other peers
+// in the room can populate a roster of "who is here." Today the body
+// inlines the full `Identity` payload for slice-1 simplicity; the
+// long-term shape per AGENTS.md §9 + card 5842c35c is "carry a
+// Continuum persona id and let consumers fetch the persona" — that
+// refactor can happen additively without changing the kind tag.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Typed identity-domain events. Wire shape mirrors `airc_work::WorkEvent`:
+/// internally tagged via serde so a JSON body always carries a `kind`
+/// field consumers can switch on without parsing the entire payload.
+///
+/// One variant today (`PeerIdentityCard`); future identity-revocation
+/// or identity-forking events can join here without breaking the
+/// consumer codec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IdentityEvent {
+    PeerIdentityCard(PeerIdentityCard),
+}
+
+/// One peer's published identity card — the `Identity` payload plus
+/// the publishing peer's id and an emission timestamp. Projections
+/// (roster) use `emitted_at_ms` for latest-write-wins replacement on
+/// the same peer_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentityCard {
+    /// The peer this card describes. Also the publisher (peers
+    /// only publish their own cards; verification is by signed envelope).
+    pub peer_id: PeerId,
+    /// Full identity payload — name, pronouns, role, bio, status,
+    /// fingerprint, integrations. See [`Identity`].
+    pub identity: Identity,
+    /// Monotonic emission time. Roster projection takes the highest
+    /// `emitted_at_ms` per peer_id (LWW; ties broken by the durable
+    /// log's event order, which the projection sees naturally).
+    pub emitted_at_ms: u64,
+}
+
+#[cfg(test)]
+mod wire_event_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn sample_identity() -> Identity {
+        let mut id = Identity::new("alice");
+        id.pronouns = "she".into();
+        id.role = "claude-arch".into();
+        id.bio = "owner-daemon architect".into();
+        id.fingerprint = "ff00aa11".into();
+        id.integrations.insert("github".into(), "alice-gh".into());
+        id
+    }
+
+    #[test]
+    fn peer_identity_card_round_trips_through_serde() {
+        let card = PeerIdentityCard {
+            peer_id: PeerId::from_u128(42),
+            identity: sample_identity(),
+            emitted_at_ms: 1_700_000_000_000,
+        };
+        let event = IdentityEvent::PeerIdentityCard(card.clone());
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: IdentityEvent = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            IdentityEvent::PeerIdentityCard(got) => assert_eq!(got, card),
+        }
+    }
+
+    #[test]
+    fn wire_shape_carries_kind_discriminator_for_consumer_codec() {
+        // Other consumers (event_render, future roster projection)
+        // switch on the `kind` field without parsing the full body.
+        // Pin the discriminator string so a future serde change can't
+        // silently rename it.
+        let event = IdentityEvent::PeerIdentityCard(PeerIdentityCard {
+            peer_id: PeerId::from_u128(1),
+            identity: Identity::new("bob"),
+            emitted_at_ms: 0,
+        });
+        let value: Value = serde_json::to_value(&event).expect("to_value");
+        assert_eq!(
+            value.get("kind").and_then(Value::as_str),
+            Some("peer_identity_card"),
+            "wire kind discriminator must be stable",
+        );
+        // Identity fields are flattened at the top level alongside
+        // peer_id / emitted_at_ms — mirrors WorkEvent body shape.
+        assert!(value.get("peer_id").is_some());
+        assert!(value.get("identity").is_some());
+        assert!(value.get("emitted_at_ms").is_some());
+    }
+
+    #[test]
+    fn unknown_identity_kind_surfaces_as_decode_error() {
+        // Future-version event a current consumer doesn't know about
+        // must surface as a decode error (not silently mis-decode into
+        // the one known variant). Keeps the upgrade path honest:
+        // consumers explicitly choose how to handle unknown kinds.
+        let raw = r#"{"kind":"identity_revoked","peer_id":"00000000-0000-0000-0000-000000000001"}"#;
+        let result: Result<IdentityEvent, _> = serde_json::from_str(raw);
+        assert!(result.is_err(), "unknown kind must error");
     }
 }

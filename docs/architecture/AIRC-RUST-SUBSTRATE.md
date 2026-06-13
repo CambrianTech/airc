@@ -1,39 +1,74 @@
-# airc-rust — Generic Messaging Substrate
+# airc-rust — Backbone Bus for Cambrian AR, Continuum/OpenClaw/Hermes, and the p2p Grid
 
-**Status**: Draft. Outline + key decisions. Sections marked _stub_
-get fleshed out as peers + Joel iterate.
+**Status**: Living doctrine doc. Sections evolve as the substrate
+ships; non-negotiables in
+[`GRID-SUBSTRATE-AUDIT.md`](GRID-SUBSTRATE-AUDIT.md) lock the
+invariants.
 
 **Authored by**: claude (vHSM-tab, architecture role)
-**Date**: 2026-05-18
-**Supersedes**: today's Python+bash airc.
+**Date**: 2026-05-18, updated 2026-05-23 to widen the consumer
+framing past chat-only.
+**Supersedes**: original Python+bash airc.
 
 ## What airc-rust is
 
-airc-rust is a **network substrate that doubles as a messaging layer and
-an event bus**. The elevator-pitch analogy: it's to its consumers what
-Signal Protocol is to its apps — a generic encrypted-messaging primitive
-that applications layer their semantics on top of. Signal facilitates;
-the apps decide what they're saying.
+airc-rust is **Cambrian's backbone bus** — the substrate every
+internal system rides on for coordination, presence, event
+delivery, and command routing. Three consumer-classes drive the
+design pressure, in decreasing latency-sensitivity:
 
-Think IRC for the high-level shape: peers, rooms, messages, events,
-signaling, identity, durable scrollback. Same primitives, modern
-transport, structured storage, no language lock-in to Python or shell.
+1. **AR systems** — Continuum's headset/edge pose sync, shared
+   spatial anchors, AR event/command streams. 60–90Hz steady
+   state, sub-25ms p99 e2e on Tailnet/LAN, sub-8ms p99
+   same-machine. Highest-latency-sensitivity consumer; see
+   [AR-LATENCY-CONTRACT.md](AR-LATENCY-CONTRACT.md) for budgets.
+2. **All Cambrian internal coordination** — Continuum, OpenClaw,
+   Hermes, agent-relay, forge-alloy, sentinel-ai, plus
+   AI-agent runtimes (Claude Code, Codex, Cursor, opencode,
+   Windsurf). Different vocabularies, one substrate. See
+   [CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md](CAMBRIAN-CONSUMER-INTEGRATION-MATRIX.md).
+3. **The p2p grid** — Continuum's distributed compute + model
+   serving, multi-operator mesh, capability leasing. Same-machine,
+   then Tailnet/LAN, then grid-to-grid in priority order. See
+   [PEER-DISCOVERY-SCALABILITY.md](../PEER-DISCOVERY-SCALABILITY.md).
 
-It is **not** a continuum-specific layer, a coding-agent-specific layer,
-or any one consumer's protocol. Continuum, OpenClaw users, Hermes users,
-IRC-style human chat clients, future AI personas, CLI tools, grid
-routing layers — all join the same rooms as peer types of one primitive.
-None of them is mentioned by name in the core protocol.
+The elevator pitch: airc is to its consumers what Signal Protocol
+is to its apps — a generic encrypted-event primitive that
+applications layer their semantics on top of. Signal facilitates;
+the apps decide what they're saying. We add presence, multi-room
+subscriptions, durable transcript, and a route resolver across
+local-fs / LAN / Tailscale / relay / WebRTC / Reticulum.
+
+It is **not** chat-shaped at heart, even though chat is one of
+its consumer profiles. Pose streams at 60Hz, command/reply traffic
+with deadlines, ephemeral telemetry, and durable chat all ride the
+same envelope shape. None of them is mentioned by name in the
+core protocol.
 
 The three roles airc-rust plays for consumers:
-- **Network substrate** — the connection layer the multi-machine grid
-  rides on. Peer discovery, addressing, encryption, reachability
-  resolution. (Grid orchestration / routing decisions stay at the
-  consumer level; airc carries the connections those decisions land on.)
-- **Messaging layer** — durable chat-shaped store + scrollback + cursors.
-  The kind of substrate `irssi` would expect.
-- **Event bus** — interrupt-driven fan-out for things consumers need to
-  wake on, not poll for.
+- **Network substrate** — the connection layer the multi-machine
+  grid rides on. Peer discovery, addressing, encryption,
+  reachability resolution. Routine same-machine traffic never
+  depends on GitHub; gh is rendezvous metadata only
+  (non-negotiable #2).
+- **Event bus** — interrupt-driven fan-out for everything
+  consumers need to wake on, not poll for. Subscription by header
+  filter, multi-room by default, replay via cursor.
+- **Command plane** (Phase 4, in flight) — typed request/reply
+  primitive with correlation, deadline, cancellation. Consumers
+  own the command vocabulary; airc owns delivery + correlation
+  matching.
+
+See [`INVITE-ROUTING-ARCHITECTURE.md`](INVITE-ROUTING-ARCHITECTURE.md) for the
+transport boundary: gh-gist is an invite/rendezvous beacon, not the live
+message/event data plane. Consumers see publish, subscribe, replay, and ack
+APIs; route resolution sits below them.
+
+See [`ACCOUNT-MESH-JOIN-CONTRACT.md`](ACCOUNT-MESH-JOIN-CONTRACT.md) for the
+join/subscription contract the Rust rewrite must preserve from the working
+system: bare `airc join` enters the account mesh and subscribes the scope to
+`#general` plus the inferred org/project channel. Channels are subscriptions
+on the mesh, not isolated one-room pairing worlds.
 
 ## What airc-rust is not
 
@@ -57,8 +92,9 @@ The three roles airc-rust plays for consumers:
    directly. No shell-out from runtime code.
 4. **Persist** durably with proper cursors, archive drain, and SQLite/
    Postgres backends via SeaORM.
-5. **Multi-transport** — same-host, same-LAN, Tailscale, gh-gist
-   (legacy bridge). Pluggable, capability-resolved.
+5. **Multi-transport** — same-host, same-LAN, Tailscale, UDP, relay,
+   WebRTC datachannel, Reticulum, and gh-gist invite/rendezvous.
+   Pluggable, capability-resolved.
 6. **Be more secure** than today's airc: per-message forward secrecy,
    hardware-backed identity keys, at-rest encryption.
 7. **No multimedia in the body** — protocol enforces media-ref
@@ -264,7 +300,7 @@ airc-rust/
 │   │   ├── local-fs/     # same-host peers via shared FS
 │   │   ├── lan-tcp/      # same-LAN direct peer connection
 │   │   ├── tailscale/    # cross-network via Tailscale
-│   │   └── gh-gist/      # legacy bridge (deprecated)
+│   │   └── gh-gist/      # invite/rendezvous beacon only
 │   ├── airc-blobs/       # content-addressed media storage
 │   ├── airc-daemon/      # long-running: workers, drain, fan-out
 │   ├── airc-lib/         # high-level Rust API — consumers depend on this
@@ -328,90 +364,312 @@ remain valid; scrollback queries that hit pre-drain ranges
 transparently consult the archive partition. Active DB stays
 bounded → constant query performance.
 
-## Transport resolver (adapter pattern, replaceable mid-life)
+## Transport control plane
 
-Same adapter discipline used everywhere else in our stack — inference
-providers in continuum, model registry candidates in Lane A, storage
-adapters in zsm-server, FFI surfaces in vHSM. airc-transport is
-another instance of the same craft.
+The transport layer is a control plane, not a pile of special-case
+adapters. Local and remote delivery are the same product behavior:
+the caller submits one signed envelope, gets one delivery contract,
+and observes one transcript/replay model. Whether the bytes moved
+through local filesystem, LAN-TCP, Tailscale, UDP, Reticulum, a relay, or
+WebRTC datachannel is invisible above the substrate boundary.
 
-`airc-transport::Resolver` picks a transport per recipient by
-capability + reachability:
+This is the telecom shape: separate the service contract from the
+transports underneath it. A room can contain a same-host Codex process,
+a LAN Claude, a Tailscale grid node, and an offline OpenClaw client.
+The send path does not switch to "local mode" or "remote mode". The
+control plane decomposes the envelope into delivery work per endpoint,
+leases resources, chooses routes, writes durable queue records where
+needed, and reassembles a single delivery state for observability.
 
-| Recipient location | Preferred transport |
-|---|---|
-| Same host, same scope | `local-fs` (shared `.airc/` dir, file-tail) |
-| Same LAN (mDNS / link-local) | `lan-tcp` (direct connection) |
-| Cross-network via Tailscale tailnet | `tailscale` |
-| Cross-network, no Tailscale | `gh-gist` (legacy bridge — slow, rate-limited) |
+### Layering
 
-Same-host peers **never round-trip through gh**. Today's "gh-only
-post-Phase-3c" decision is reverted with a proper bearer registry.
-gh-gist stays as a legacy bearer for cross-network peers who haven't
-paired via Tailscale yet, but it's not the only one.
+| Layer | Owns | Must not own |
+|---|---|---|
+| Protocol | Envelope, headers, body/media refs, signatures, frame kinds | Reachability, retries, batching, filesystem paths |
+| Identity/presence | Peer identity, client identity, device/session endpoints, capabilities, current leases | Transport implementation details |
+| Route graph | Endpoint-to-endpoint candidate edges, health, cost, priority, redundancy groups | Consumer semantics or body parsing |
+| Delivery scheduler | Durable outbound/inbound queues, batching, deadlines, acks, retry/backoff, resource leases | Adapter-specific protocol code |
+| Transport adapters | One implementation of the common transport contract per route edge | Route policy, admission decisions, consumer-visible behavior |
+| Store/replay | Transcript, delivery journal, cursors, replay fixtures, audit | Live route selection |
+| Consumer API | `Airc::send`, `Airc::subscribe`, `Airc::page_recent`, typed headers | Choosing GH/local/LAN/Tailscale directly |
 
-### Trait shape
+Every adapter is subordinate to the same control plane. The scheduler
+can use many adapters for one logical send, but consumers never call
+different APIs for local vs remote. Redundancy is modeled explicitly
+in route graph edges and delivery journals, never as catch blocks,
+implicit retries into weaker transports, or "try X then silently use Y"
+code.
+
+**Fallbacks are illegal.** The control plane performs admission before
+send. It selects an allowed route from current health, policy, leases,
+and budgets. If no route satisfies the contract, the delivery is
+`Queued` or `NoRoute`; it does not downgrade itself into a slower,
+less secure, or more expensive transport. A route can be re-planned
+later after health or leases change, but that is a new scheduler
+decision with an audit entry, not an exception handler improvising.
+
+**Unknown states are hard failures.** Any route, resource, or adapter
+state that is not represented in a closed Rust enum is not allowed to
+execute. There is no `Unknown => continue`, no "default transport", no
+`unwrap_or(cpu)`, no stringly status that slips through parsing. Unknown
+means `AdmissionRejected { reason: UnknownState }`, a structured event,
+and an audit row. This is the same rule needed for Continuum GPU/CPU
+placement: the system must never silently run on CPU just because GPU
+admission failed or a model/backend status could not be interpreted.
+
+### Endpoint model
+
+Identity is not enough to route. A human/persona/grid node can have
+multiple live endpoints: a laptop tab, a Codex runtime, an OpenClaw
+extension, a Hermes daemon, a render box. The route graph therefore
+routes to `EndpointId`, with `IdentityId` as the durable owner.
 
 ```rust
-pub trait Transport: Send + Sync {
-    fn id(&self) -> TransportId;
-    fn capabilities(&self) -> TransportCapabilities;
-    async fn send(&self, env: Envelope) -> Result<()>;
-    fn receive(&self) -> BoxStream<'static, Envelope>;
-    async fn health(&self) -> TransportHealth;
-}
-
-pub trait Bearer: Transport {
-    // Bearer-specific: durable cross-network store-and-forward.
-    // gh-gist is a Bearer; lan-tcp is a Transport but not a Bearer.
-    async fn fetch_since(&self, channel: ChannelId, cursor: Cursor)
-        -> Result<Vec<Envelope>>;
-    async fn ack(&self, sig: Signature) -> Result<()>;
+pub struct Endpoint {
+    pub endpoint_id: EndpointId,     // UUIDv4, live endpoint/session
+    pub identity_id: IdentityId,     // UUIDv4, durable peer/persona/user
+    pub client_id: ClientId,         // UUIDv4, app/runtime instance
+    pub channels: BTreeSet<ChannelId>,
+    pub capabilities: Capabilities,  // e.g. local-fs, lan-tcp, reticulum
+    pub resource_lease: Option<LeaseId>,
+    pub last_seen: Timestamp,
 }
 ```
 
-Transports register at runtime via a registry. The resolver multiplexes;
-each peer pair holds a list of viable transports sorted by preference.
+Presence updates mutate endpoint state; they do not alter the envelope
+contract. If a peer moves from same-host to Tailscale, the route graph
+changes and the same `Airc::send` call continues to work.
 
-### Resilient to bearer changes
+### Route graph
 
-The point: when gh-gist stops being viable (rate limits get worse,
-GitHub deprecates gists, our trust assumptions shift, whatever) —
+The resolver sees a graph, not a flat adapter list:
+
+```rust
+pub struct RouteEdge {
+    pub from: EndpointId,
+    pub to: EndpointId,
+    pub transport: TransportKind,
+    pub role: TransportRole,         // direct | relay | bootstrap
+    pub health: TransportHealth,
+    pub cost: RouteCost,             // latency, bandwidth, energy, budget
+    pub redundancy_group: Option<RedundancyGroupId>,
+}
+```
+
+Selection is per endpoint and preflighted. In a mixed room, same-host
+recipients get a same-host edge, LAN recipients get LAN, tailnet
+recipients get Tailscale or Reticulum, and offline recipients get queued
+for the next approved store-and-forward edge. This is still one send
+operation at the API boundary. No endpoint can drag another endpoint
+onto a worse transport just because its own best route is unavailable.
+
+### Delivery scheduler
+
+The delivery scheduler is the only layer allowed to decide retry,
+batch, defer, or duplicate-for-redundancy behavior.
+
+```rust
+pub enum DeliveryClass {
+    DurableMessage,      // transcript content; must persist + replay
+    Control,             // join/part/nick/heartbeat; ordered enough
+    LiveEvent,           // interrupt-style; lossy under pressure
+    BlobChunk,           // content-addressed transfer chunk
+}
+
+pub enum DeliveryState {
+    Accepted,
+    Delivered,
+    Acked,
+    Queued,
+    Deferred { reason: DeferReason, retry_after: Timestamp },
+    Failed { reason: FailureReason },
+}
+```
+
+The queue is not a fallback. It is a first-class delivery state chosen
+by policy. If GH is rate-limited, the remote store-and-forward edge is
+deferred and batched. Same-machine or LAN edges keep moving because
+they are separate edges in the same route graph. One remote participant
+must not force all local participants through GH or slow the local path.
+
+The scheduler must record why a route was selected or refused:
+
+```rust
+pub enum RouteRefusal {
+    NoHealthyApprovedEdge,
+    MissingLease,
+    BudgetExceeded,
+    CapabilityMismatch,
+    SecurityPolicyRejected,
+    UnknownState,
+}
+
+pub struct RouteDecisionAudit {
+    pub envelope_id: EventId,
+    pub endpoint_id: EndpointId,
+    pub selected: Option<TransportKind>,
+    pub refusal: Option<RouteRefusal>,
+    pub policy_version: PolicyVersion,
+}
+```
+
+This makes degraded behavior inspectable and replayable. If the system
+starts using GH for runtime data, that is a policy/test failure, not an
+acceptable fallback.
+
+### Closed state machines
+
+All runtime state that can affect performance, correctness, security,
+or cost is a closed enum and must be exhaustively matched:
+
+```rust
+pub enum TransportAdmission {
+    Admitted { edge: RouteEdgeId, lease: LeaseId },
+    Queued { reason: RouteRefusal },
+    Rejected { reason: RouteRefusal },
+}
+
+pub enum ResourceAdmission {
+    Admitted { lease: LeaseId, class: ResourceClass },
+    Queued { reason: ResourceRefusal },
+    Rejected { reason: ResourceRefusal },
+}
+
+pub enum ResourceClass {
+    Cpu,
+    MainMemory,
+    GpuVram,
+    UnifiedMemory,
+    Disk,
+    Network,
+}
+```
+
+Compile-time exhaustiveness is part of the architecture. If a new
+transport health state, resource class, or delivery refusal is added,
+callers must handle it explicitly. Tests must include a "no silent
+unknown" case for every state machine.
+
+Observability is not optional:
+- Every admitted delivery records selected route, endpoint, transport,
+  resource lease, and policy version.
+- Every queued/rejected delivery records the refusal enum.
+- Dashboards and `airc doctor` report route/resource class, not just
+  "slow" or "degraded".
+- Performance harnesses assert that forbidden paths do not appear
+  under normal scenarios, e.g. no GH runtime-data route for local peers
+  and no CPU inference route for GPU-required models.
+
+### Rust covenant
+
+The Rust rewrite exists to make illegal states unrepresentable. That
+requires discipline; merely rewriting Python/bash control flow in Rust
+does not buy safety.
+
+Rules for substrate code:
+- No `unwrap_or(...)` or `unwrap_or_else(...)` for policy, transport,
+  route, resource, model, security, or delivery decisions. Defaults
+  belong in typed config loaded at startup, not in runtime branches.
+- No wildcard match arms (`_ => ...`) on safety-critical enums. Match
+  every variant by name so adding a variant breaks compilation until
+  every caller handles it.
+- No stringly runtime state. Strings are serialization/display at the
+  boundary; internal state is enums/newtypes.
+- No catch-and-continue paths that convert an error into a weaker route
+  or resource class. Errors become refusal/queue/failure states.
+- No CPU/GH/relay substitute path for GPU/direct-required work unless
+  the policy explicitly admitted that exact class before execution.
+- No adapter-specific status leaking above the transport contract.
+  Adapters normalize into closed scheduler states.
+
+The test suite must pin these rules:
+- route policy rejects GH for runtime data
+- route policy rejects unknown/unclassified transport state
+- resource admission rejects GPU-required work without a GPU lease
+- delivery code records the selected route/resource or a refusal enum
+- no implementation can add a new safety-critical enum variant without
+  updating the admission/scheduler tests
+
+### One transport contract
+
+```rust
+pub trait Transport: Send + Sync {
+    fn kind(&self) -> TransportKind;
+    fn capabilities(&self) -> TransportCapabilities;
+    async fn open(&self, endpoint: Endpoint) -> Result<TransportHandle>;
+    async fn health(&self, edge: &RouteEdge) -> TransportHealth;
+}
+
+pub trait TransportHandle: Send + Sync {
+    async fn send(&self, batch: DeliveryBatch) -> Result<DeliveryReceipt>;
+    fn subscribe(&self, sub: Subscription) -> BoxStream<'static, TransportEvent>;
+}
+```
+
+There is no adapter-specific caller API. A local-fs adapter, LAN-TCP
+adapter, Tailscale adapter, UDP adapter, Reticulum adapter, relay adapter,
+and WebRTC datachannel adapter all implement the same contract. Adapter-specific
+configuration lives below `open`; adapter-specific errors are normalized
+into scheduler states above it.
+
+Store-and-forward is a capability, not a separate user-facing mode or
+fallback path:
+
+```rust
+pub struct TransportCapabilities {
+    pub direct: bool,
+    pub store_and_forward: bool,
+    pub ordered: bool,
+    pub durable: bool,
+    pub max_batch_bytes: u64,
+    pub supports_blobs: bool,
+}
+```
+
+### Resilient to transport changes
+
+The point: when any transport stops being viable (rate limits get worse,
+an upstream deprecates an API, our trust assumptions shift, whatever) —
 we **don't get stuck**. Adapter design means:
 
-- Roll a new bearer (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
-  our own continuum-hosted store-and-forward) — implement the `Bearer`
+- Roll a new transport (custom HTTP relay, NATS, MQTT broker, IPFS pubsub,
+  our own continuum-hosted store-and-forward) — implement the `Transport`
   trait, register it. Existing peer pairings auto-discover the new
-  bearer via the registry handshake.
-- Offer multiple bearers simultaneously — peers pick by health +
-  policy. Bearer-A goes down, traffic shifts to Bearer-B without
+  transport via the registry handshake.
+- Offer multiple transports simultaneously — peers pick by health +
+  policy. Transport-A goes down, traffic shifts to Transport-B without
   consumer involvement.
-- Deprecate a bearer gradually — mark it `deprecated_after_ts`; new
+- Deprecate a transport gradually — mark it `deprecated_after_ts`; new
   pairings prefer alternatives; existing pairings get a structured
   "your transport is sunsetting" event so consumers can re-pair.
 - Hot-swap mid-life — the resolver re-evaluates on every send; a
-  bearer added at runtime is usable immediately, no restart.
+  transport added at runtime is usable immediately, no restart.
 
 Same pride as the rest of the stack. No transport is a hard
 dependency. Whatever ships first is replaceable later.
 
-### Planned bearers / transports
+### Planned transports
 
 In the doc as anchors; not all in the v1 ship:
 
 - `local-fs` — same-host, same-scope. Ship v1.
 - `lan-tcp` — same-LAN direct. Ship v1.
-- `tailscale` — cross-network mesh. Ship v1.
-- `gh-gist` — legacy bridge. Ship v1 (for migration); deprecate
-  when we have a non-gh cross-network bearer.
+- `tailscale` — same-tailnet cross-network mesh. Ship v1.
+- `udp` — low-latency control/game/live packets where policy admits
+  unordered or partially ordered delivery. Future plugin.
+- `gh-gist-invite` — public invite/rendezvous beacon only. Ship v1.
+  Not admissible for live chat/event data-plane classes.
 - `airc-relay` — own-hosted cross-network store-and-forward. Future
-  ship; the gh-gist replacement.
+  ship; the cross-tailnet and NAT-boundary baseline.
 - `reticulum` — Mark Qvist's mesh networking stack. Future plugin.
   Useful for unreliable / radio / off-grid mesh.
 - `nats` or `mqtt` — for ops integration where consumers already run
   a broker. Future plugin.
-- `webrtc-data-channel` — direct browser ↔ desktop without TURN.
-  Future plugin.
+- `webrtc-data-channel` — direct browser, desktop, and live-mode
+  control traffic; TURN/relay when direct ICE fails. Future plugin.
+- `ssh` — optional administrative/debug adapter only. Not required
+  for install, pairing, chat, event delivery, Windows support, or
+  cross-machine operation.
 
 ## Identifiers — UUIDv4 everywhere
 
@@ -619,7 +877,7 @@ A generic fast-UDP path is substrate-level work. WebRTC needs it
 match-state sync at 60 Hz), multiplayer simulations need it (player
 position, projectile state), some IoT meshes need it. Every one of
 those consumers re-implementing ICE candidate gathering, NAT traversal,
-TURN fallback, STUN reachability, and UDP multiplexing is the wrong
+TURN relay selection, STUN reachability, and UDP multiplexing is the wrong
 factoring. airc owns the network primitive once; consumers ride it.
 
 `airc-rtc` crate (rename pending — the WebRTC-flavored name oversells
@@ -644,10 +902,11 @@ it) ships:
 
 Consumers hand `airc-rtc` either media tracks (audio/video frames)
 or raw UDP messages (game-state diffs, multiplayer events). It
-handles peer-direct UDP where possible, falls back to TURN-relay
-when NATs require it. The signaling (SDP/ICE for WebRTC; lobby/match
-state for games) flows as airc events alongside on the regular
-TCP/gh/local channels.
+handles peer-direct UDP when policy admits that route, or a TURN relay
+when relay is the approved route for that peer pair. TURN is not a
+fallback; it is a selected relay edge with its own lease, cost, and
+audit record. The signaling (SDP/ICE for WebRTC; lobby/match state
+for games) flows as airc events alongside on the regular channels.
 
 This is what "network related and fine" means: the substrate owns
 the network primitive even though the application owns what the
@@ -712,18 +971,22 @@ Built-in primitives:
 
 - **Keep-alive heartbeats** at the transport layer, separate from
   application heartbeats. Configurable cadence per transport (more
-  frequent for UDP/RTC paths, slower for gh-gist).
+  frequent for UDP/RTC paths, slower for store-and-forward relays).
 - **Dead-host detection**: if N consecutive heartbeats fail, the
-  peer is marked degraded; if N+M, marked dead. Subscribers get an
-  event; consumer can decide whether to fail-over to backup peers.
-- **Auto-reconnect with backoff**: when a transport reports failure,
-  airc-transport retries with exponential backoff. State (cursors,
-  subscriptions, pending sends) survives the reconnect.
+  peer is marked impaired; if N+M, marked dead. Subscribers get a
+  structured event. The scheduler refuses new admissions on impaired
+  edges unless policy explicitly permits that health state for the
+  delivery class.
+- **Reconnect with backoff**: when a selected transport reports
+  failure, its adapter reconnects within the lease/policy it was
+  granted. State (cursors, subscriptions, pending sends) survives the
+  reconnect. It does not switch to a different transport; route
+  changes are scheduler decisions with audit records.
 - **Self-healing host migration**: when the channel host evicts
   (today's `[HOST EVICTED]` flow), airc-rust formalizes the
-  re-host election. Cursors and pending sends migrate to the new
-  host transparently; consumers see a structured event, not a
-  protocol fault.
+  re-host election. Cursors and pending sends migrate to the newly
+  elected host through an explicit route-graph decision; consumers
+  see a structured event, not a protocol fault.
 - **Message durability across reconnect**: pending sends queue in
   `airc-store`; the daemon retries on reconnect. Loss is loud (event
   + audit-log entry) not silent.
@@ -831,8 +1094,9 @@ substrate primitives.
    consumers go away.
 4. **Phase 4 — CLI parity.** The Rust `airc` binary replaces the
    bash `airc` script. Subcommands behavior-identical at launch.
-5. **Phase 5 — Python/shell deletion.** All `airc_core/*.py` and
-   `cmd_*.sh` deleted. Only `install.sh` remains in shell.
+5. **Phase 5 — Python/shell deletion.** `lib/airc_core` and Python
+   tests are deleted. Remaining `cmd_*.sh` wrappers continue shrinking
+   toward install/bootstrap only.
 6. **Phase 6 — Security upgrade.** Double-ratchet + SQLCipher
    landed once stable. Pairing flows updated to produce attestation.
 

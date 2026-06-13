@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
 use airc_protocol::{Frame, FrameKind, Subscription};
 
 use crate::lan_tcp::adapter::error::LanTcpError;
@@ -26,6 +29,26 @@ pub(super) async fn dispatch_to_subscribers(inner: &Arc<Inner>, frame: Frame) {
             .map(|sub| (sub.id, sub.tx.clone()))
             .collect()
     };
+
+    // Card 39d37629: a durable frame that matches NO subscriber will
+    // never reach the ingest/persist path — the sender saw "sent", and
+    // without this line nothing anywhere would record the loss (live
+    // repro 2026-06-12 02:36Z: accepted frame in no store). Event-kind
+    // frames are lossy by contract, so only Message/Control are loud.
+    if targets.is_empty() && matches!(frame.kind, FrameKind::Message | FrameKind::Control) {
+        StderrJsonDiagnosticSink.emit(
+            DiagnosticEvent::error(
+                DiagnosticComponent::Transport,
+                DiagnosticCode::FrameUndeliverable,
+                "inbound lan-tcp frame matched no subscriber — frame dropped before persistence",
+            )
+            .with_field("reason", "no_subscriber")
+            .with_field("event_id", frame.envelope.event_id)
+            .with_field("sender", frame.envelope.sender)
+            .with_field("channel", frame.envelope.channel),
+        );
+        return;
+    }
 
     // 2. Dispatch outside the lock — slow consumers no longer block
     //    other subscribers or new registrations.

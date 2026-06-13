@@ -4,9 +4,13 @@ name: rust
 #
 # Three jobs on every PR + push touching Rust:
 #   fmt      — `cargo fmt --check` (no formatter drift)
-#   clippy   — `cargo clippy --all-targets --all-features -- -D warnings`
-#              (zero clippy warnings, treat all as errors)
+#   clippy   — regular all-target warning gate plus a production-only
+#              no-silent-fallback gate. Tests may stay concise, but
+#              library/binary code cannot use unwrap/expect/panic/todo/
+#              unimplemented or wildcard enum matches.
 #   test     — `cargo test --all-features` (every test green)
+#   quality  — repo policy guard for Rust lint inheritance and banned
+#              fallback/cutover command surfaces
 #
 # Per Joel's direction (2026-05-18): "use rust conventions and obsession
 # with tests. clippy, fmt etc." These three gates are the substrate-quality
@@ -17,29 +21,102 @@ name: rust
 # Rust workspace as it grows.
 
 on:
+  # NO `paths` filter on pull_request — on purpose. The required contexts
+  # (`cargo clippy (deny warnings)`, `cargo test (ubuntu-latest)`) must
+  # REPORT on every PR, because GitHub's merge queue refuses to ingest a
+  # PR whose required checks never ran ("N of N required status checks
+  # are expected" from the enqueue API). A `paths` filter here meant the
+  # rust legs never triggered on docs/scripts/skills PRs, which silently
+  # made EVERY non-Rust PR unmergeable through the queue (caught live
+  # 2026-06-13 — #1164/#1165 stuck with no way in, not even --admin).
+  # The `changes` job below decides whether the heavy jobs do real work;
+  # non-Rust PRs SKIP them (a skipped required check counts as satisfied)
+  # so the self-hosted runner stays free. merge_group always runs the
+  # real legs regardless (see below).
   pull_request:
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/rust.yml"
+  # Merge queue: GitHub builds the queued PR(s) on top of the latest
+  # rust-rewrite on a `gh-readonly-queue/...` ref and emits a
+  # `merge_group` event. The heavy jobs run UNCONDITIONALLY on
+  # merge_group (their `if` short-circuits on event != pull_request), so
+  # the rust legs always validate the COMBINED queued result — the gate
+  # that catches the merge-race class that broke rust-rewrite on
+  # 2026-06-11 (#1127×#1137 each green alone, broken combined).
+  merge_group:
   push:
     branches: [canary, main, rust-rewrite]
     paths:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
+
+# A new push to the same PR/branch obsoletes the in-flight run —
+# cancel it instead of queueing behind it. Three moot runs were
+# cancelled by hand on 2026-06-10 alone, and every moot run occupies
+# the single self-hosted Windows leg (bigmama) that everything else
+# queues behind. `github.ref` is unique per PR (refs/pull/N/merge) and
+# per branch, so unrelated runs never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Detect whether this PR touches Rust-relevant files. Drives the `if`
+  # on the real jobs so non-Rust PRs skip the heavy work (reporting the
+  # required contexts as skipped = satisfied) while the contexts still
+  # exist so the merge queue can ingest the PR. Only meaningful on
+  # pull_request; on merge_group/push the heavy jobs run unconditionally.
+  changes:
+    name: detect rust-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      # No checkout, no third-party action: ask the API for the PR's
+      # changed files and grep for Rust-relevant paths. `gh` + the
+      # built-in token are always present on GitHub-hosted runners.
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename')"
+          if printf '%s\n' "$files" | grep -qE '^(crates/|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$)'; then
+            echo "rust=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: cargo fmt --check
+    # Run on merge_group/push always; on a PR only when Rust changed.
+    # `!cancelled()` lets this run even though `changes` is skipped on
+    # non-pull_request events (a skipped dependency would otherwise skip
+    # this job too).
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -50,8 +127,23 @@ jobs:
 
   clippy:
     name: cargo clippy (deny warnings)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: |
@@ -63,16 +155,49 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo clippy production no-silent-fallback gate
+        run: >
+          cargo clippy --workspace --lib --bins --
+          -D warnings
+          -D clippy::unwrap_used
+          -D clippy::expect_used
+          -D clippy::panic
+          -D clippy::todo
+          -D clippy::unimplemented
+          -D clippy::wildcard_enum_match_arm
 
-  test:
-    name: cargo test
+  quality:
+    name: rust quality guard
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust quality guard
+        run: bash test/rust_quality_guard.sh
+
+  # The REQUIRED `cargo test (ubuntu-latest)` context — pulled out of the
+  # matrix ON PURPOSE. A skipped MATRIX job reports a single check named
+  # with the unexpanded template `cargo test (${{ matrix.display }})`, so
+  # the required name `cargo test (ubuntu-latest)` would never appear on a
+  # skipped non-Rust PR and the merge queue refuses to ingest it
+  # ("Required status check cargo test (ubuntu-latest) is expected" —
+  # caught live 2026-06-13 on #1164). A NON-matrix job keeps its literal
+  # name even when skipped, so the required context is always satisfied:
+  # skipped (= passing) on non-Rust PRs, real result on Rust PRs /
+  # merge_group. ubuntu-latest is GitHub-hosted (no fork-PR self-hosted
+  # guard needed).
+  test-ubuntu:
+    name: cargo test (ubuntu-latest)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
@@ -83,9 +208,121 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - name: cargo test --workspace --all-features
         run: cargo test --workspace --all-features
+      # Card f122b5b5 ZERO-LEAK GUARD (see matrix job for rationale).
+      - name: zero leaked temp-home daemons
+        shell: bash
+        run: |
+          leaked="$(ps -Ao pid=,args= \
+            | grep -E '(^|/)airc .* daemon' \
+            | grep -E -- '--home[ =](/private)?(/tmp|/var/folders|/var/tmp)/' \
+            || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::card f122b5b5 — temp-home airc daemons survived the test suite:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "zero leaked temp-home airc daemons after the suite (card f122b5b5)"
+
+  test:
+    # Cross-platform matrix (macOS + self-hosted Windows; the ubuntu leg
+    # is the dedicated test-ubuntu job above). The substrate must run on
+    # Linux, macOS, and Windows; runtime tests gated by `#[cfg(windows)]`
+    # (like the named-pipe IPC concurrent-bind test) only execute on
+    # Windows.
+    name: cargo test (${{ matrix.display }})
+    # Gate as fmt/clippy: skip on non-Rust PRs (keeps the contended
+    # self-hosted Windows leg free), run real on merge_group/push and
+    # Rust PRs. These legs are NOT required contexts (the required ubuntu
+    # leg is test-ubuntu), so the template-named skipped check here is
+    # harmless; merge_group still runs the real matrix on the candidate
+    # (the cross-platform merge-race guard).
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    runs-on: ${{ matrix.os }}
+    # Defense-in-depth: a hung test must never pin a runner indefinitely.
+    # On 2026-06-11 a single windows-self-hosted job hung for ~18h on a
+    # daemon-stdout-inheritance deadlock (card 8763f167), holding the one
+    # self-hosted leg while 10+ runs starved behind it. The deadlock is
+    # fixed, but the runner is a shared singleton, so a per-job ceiling
+    # is the backstop: any future hang self-aborts and frees the leg
+    # instead of wedging the queue. 25 min is ~3x a healthy cold run.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows runs on the self-hosted bigmama runner (5090 grid
+        # node) — GitHub-hosted windows-latest has been queue-starved
+        # for days and was blocking merges (#1114). The install-smoke
+        # jobs in ci.yml deliberately STAY on windows-latest: they do
+        # real machine-wide winget installs and need a virgin box,
+        # which a persistent self-hosted runner is not.
+        # Security: repo fork-PR approval policy is set to
+        # all_external_contributors, so no fork code reaches the
+        # self-hosted runner without a maintainer's explicit approval.
+        # ubuntu-latest is NOT here — it's the dedicated `test-ubuntu` job
+        # below. A SKIPPED matrix job reports ONE check named with the
+        # unexpanded template `cargo test (${{ matrix.display }})`, so the
+        # REQUIRED `cargo test (ubuntu-latest)` context would never appear
+        # on a skipped non-Rust PR. These two legs are NOT required, so
+        # their template-named skip is harmless.
+        include:
+          - { os: macos-latest, display: macos-latest }
+          - { os: [self-hosted, windows], display: windows-self-hosted }
+    steps:
+      # Self-defending guard (sentinel ask on #1116): the self-hosted leg
+      # refuses fork-PR code before checkout. Lives at STEP level because
+      # the `matrix` context is not available in job-level `if` — the
+      # original job-level form failed the whole workflow at parse time
+      # (zero-jobs startup failures since 23:13). The repo-level fork-PR
+      # approval policy (all_external_contributors) is a mutable SETTING;
+      # this guard lives in-repo so a policy regression alone can't put
+      # fork code on the bigmama runner. Hosted legs are unaffected.
+      - name: refuse fork PRs on self-hosted
+        if: ${{ contains(toJSON(matrix.os), 'self-hosted') && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "::error::fork-PR code must not execute on the self-hosted runner"
+          exit 1
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+      # Card f122b5b5 ZERO-LEAK GUARD: the acceptance is that a full
+      # `cargo test --workspace` leaves ZERO airc daemon processes whose
+      # `--home` is under a temp dir. Test daemons get RAII teardown + a
+      # temp-home idle self-exit watchdog; this step is the backstop that
+      # FAILS the leg if either defense ever regresses. ps-based and
+      # portable (ubuntu + macos); skipped on Windows where `ps`/`pgrep`
+      # differ and the self-hosted runner makes process scans noisy.
+      - name: zero leaked temp-home daemons
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # Match an `airc ... daemon` process whose `--home` argument
+          # points under a temp root (/tmp, /var/folders, /private/...,
+          # $TMPDIR). Production daemons (home under $HOME/.airc or a
+          # repo `.airc`) never match.
+          leaked="$(ps -Ao pid=,args= \
+            | grep -E '(^|/)airc .* daemon' \
+            | grep -E -- '--home[ =](/private)?(/tmp|/var/folders|/var/tmp)/' \
+            || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::card f122b5b5 — temp-home airc daemons survived the test suite:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "zero leaked temp-home airc daemons after the suite (card f122b5b5)"
