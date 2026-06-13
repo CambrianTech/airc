@@ -484,7 +484,10 @@ if ($ghAvail -and $gitAvail) {
     & gh auth status 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $ghHelper = & git config --global --get-all credential.https://github.com.helper 2>$null
-        if ($ghHelper -notmatch 'gh auth git-credential') {
+        # Join to a scalar before -notmatch: --get-all can return multiple
+        # helper values (array), and PS -notmatch on an array filters rather
+        # than returning a strict boolean. Scalar form is correct.
+        if ((@($ghHelper) -join "`n") -notmatch 'gh auth git-credential') {
             & gh auth setup-git 2>$null
             if ($LASTEXITCODE -eq 0) { Write-Ok 'gh token wired into git credential helper' }
         }

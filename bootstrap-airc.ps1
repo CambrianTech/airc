@@ -116,7 +116,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 # Idempotent: wire the credential helper if gh isn't already registered.
 $ghHelper = & git config --global --get-all credential.https://github.com.helper 2>$null
-if ($ghHelper -notmatch 'gh auth git-credential') {
+# Join to a scalar before -notmatch: --get-all can return multiple helper
+# values (array), and PS -notmatch on an array filters rather than returning
+# a strict boolean. Worst case without this is a redundant (idempotent)
+# setup-git, but the scalar form is correct.
+if ((@($ghHelper) -join "`n") -notmatch 'gh auth git-credential') {
     & gh auth setup-git 2>$null
     if ($LASTEXITCODE -eq 0) { OK 'gh token wired into git credential helper' }
 }
