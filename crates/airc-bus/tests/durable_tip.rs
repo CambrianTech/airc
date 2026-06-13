@@ -73,6 +73,15 @@ impl DurableSink for CountingSink {
         self.inner.head_cursor(channel).await
     }
 
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner.page_tail(channel, before, limit).await
+    }
+
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
         self.inner.contains(event_id).await
     }
@@ -98,6 +107,15 @@ impl DurableSink for FailingHeadSink {
     }
 
     async fn head_cursor(&self, _channel: RoomId) -> Result<Option<Cursor>, BusError> {
+        Err(BusError::Sink("index unavailable".to_string()))
+    }
+
+    async fn page_tail(
+        &self,
+        _channel: RoomId,
+        _before: Option<Cursor>,
+        _limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
         Err(BusError::Sink("index unavailable".to_string()))
     }
 

@@ -206,32 +206,41 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             }
         }
     };
-    let from = request
-        .since
-        .map(|c| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
-    let mut events = match state.router.resume_from_cursor(channel, from).await {
-        Ok(events) => events,
-        Err(error) => {
-            return Response::Error {
-                message: format!("inbox: {error}"),
+    let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
+    let events = match request.since {
+        // "Most recent N" when no cursor (card 8428ae8c): reverse-paged
+        // at the store layer — work bounded by N (ring tail + at most
+        // one indexed `page_tail`), NEVER a full-room replay truncated
+        // in memory. `durable_tail` is durable-only by contract.
+        None => match state.router.durable_tail(channel, limit).await {
+            Ok(events) => events,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("inbox: {error}"),
+                }
             }
+        },
+        // "First N after the cursor" when resuming.
+        Some(c) => {
+            let from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+            let mut events = match state.router.resume_from_cursor(channel, from).await {
+                Ok(events) => events,
+                Err(error) => {
+                    return Response::Error {
+                        message: format!("inbox: {error}"),
+                    }
+                }
+            };
+            // `inbox` is the DURABLE transcript. `resume_from_cursor`
+            // merges the hot ring (which transiently holds every class,
+            // incl. StreamChunk / EphemeralLatest for live attach-replay)
+            // with the sink, so filter to durable here — non-durable
+            // classes never belong in a replay (§3.4).
+            events.retain(|env| env.delivery.is_durable());
+            events.truncate(limit);
+            events
         }
     };
-    // `inbox` is the DURABLE transcript. `resume_from_cursor` merges the
-    // hot ring (which transiently holds every class, incl. StreamChunk /
-    // EphemeralLatest for live attach-replay) with the sink, so filter to
-    // durable here — non-durable classes never belong in a replay (§3.4).
-    events.retain(|env| env.delivery.is_durable());
-    let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
-    if events.len() > limit {
-        if request.since.is_none() {
-            // "Most recent N" when no cursor: keep the newest `limit`.
-            events = events.split_off(events.len() - limit);
-        } else {
-            // "First N after the cursor" when resuming.
-            events.truncate(limit);
-        }
-    }
     let envelopes: Vec<Vec<u8>> = events
         .iter()
         .map(|e| airc_wire::encode(e).to_vec())

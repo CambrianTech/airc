@@ -61,6 +61,25 @@ pub trait DurableSink: Send + Sync {
     /// SQLite, back-of-vec on in-memory) or fail loudly.
     async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>>;
 
+    /// **Card 8428ae8c — required, no scan default.** Return the **last**
+    /// `limit` events on `channel` strictly *before* `before` (or the
+    /// channel's tail when `before` is `None`), in ascending total order
+    /// `(epoch, counter, event_id)`. This is the reverse-paging leg of
+    /// the "most recent N" inbox path: the previous shape materialized
+    /// the WHOLE channel via [`DurableSink::page`] and truncated in
+    /// memory — O(room) for an answer of size N. Every impl must answer
+    /// in work bounded by `limit` (SQLite: `ORDER BY … DESC LIMIT N` on
+    /// the composite `(room_id, epoch, counter, event_id)` index, then
+    /// reverse in memory; in-memory: a back-of-vec slice) or fail
+    /// loudly. There is deliberately NO default impl: a sink that cannot
+    /// reverse-page is a compile error, never a silent forward scan.
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>>;
+
     /// **Card 4132f48c.** Whether an event with this `event_id` is already
     /// persisted. This is the durable leg of
     /// [`crate::EventRouter::publish_if_new`]'s idempotency check: an
@@ -180,6 +199,26 @@ impl DurableSink for InMemoryDurableSink {
             .cloned()
             .collect();
         Ok(out)
+    }
+
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
+            return Ok(Vec::new());
+        };
+        // The bucket is kept in ascending total order on insert, so the
+        // tail strictly before `before` is a contiguous back slice.
+        let end = match &before {
+            None => bucket.len(),
+            Some(b) => bucket.partition_point(|e| e.cursor().is_before(b)),
+        };
+        let start = end.saturating_sub(limit);
+        Ok(bucket[start..end].to_vec())
     }
 
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool> {

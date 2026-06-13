@@ -220,14 +220,22 @@ async fn room_tip_is_none_for_empty_room_and_tracks_publishes() {
     daemon.stop().await;
 }
 
-/// The honest perf evidence (card a1562dbc): on a room thousands of
-/// events deep, the typed tip probe answers the same cursor as the old
-/// `Inbox { since: None, limit: 1 }` shape — which forces a full-room
-/// replay inside the daemon — at a fraction of the cost. Real measured
-/// numbers are printed for the PR body; the hard structural O(1) gate
-/// (zero scan calls) lives in `airc-bus/tests/durable_tip.rs`.
+/// Card a1562dbc: on a room thousands of events deep, the typed tip
+/// probe answers the same cursor as `Inbox { since: None, limit: 1 }`.
+///
+/// History: when this test was written the inbox shape forced a
+/// full-room replay (99,129 µs/op vs the probe's 441 µs/op on this
+/// room — #1144's evidence) and the test asserted the probe was at
+/// least 2x cheaper. Card 8428ae8c then fixed the inbox path itself
+/// (reverse paging — `EventRouter::durable_tail`), making both legs
+/// bounded (~hundreds of µs, IPC-dominated), so the timing race
+/// between two O(1) paths became scheduling noise and was removed.
+/// What remains load-bearing here is the AGREEMENT pin; the hard
+/// structural no-scan gates live in `airc-bus/tests/durable_tip.rs`
+/// (the probe) and `airc-bus/tests/durable_tail.rs` (the inbox path).
+/// Measured numbers are still printed for the record.
 #[tokio::test]
-async fn deep_room_tip_probe_matches_inbox_scan_and_is_cheaper() {
+async fn deep_room_tip_probe_matches_inbox_newest() {
     const DEEP: usize = 5_000;
     const PROBES: u32 = 20;
 
@@ -237,8 +245,7 @@ async fn deep_room_tip_probe_matches_inbox_scan_and_is_cheaper() {
 
     let receipt = publish_n(&client, channel, DEEP).await;
 
-    // Old path: inbox with no cursor — daemon replays all DEEP events
-    // and returns the newest 1.
+    // Inbox shape: most-recent-1 (reverse-paged since card 8428ae8c).
     let scan_start = Instant::now();
     let mut scan_newest = None;
     for _ in 0..PROBES {
@@ -280,18 +287,8 @@ async fn deep_room_tip_probe_matches_inbox_scan_and_is_cheaper() {
     let probe_us = probe_elapsed.as_micros() / u128::from(PROBES);
     eprintln!(
         "card a1562dbc: room depth {DEEP}, {PROBES} probes each — \
-         inbox(limit:1) full-room scan: {scan_us} µs/op; \
+         inbox(limit:1) most-recent-1: {scan_us} µs/op; \
          room_tip probe: {probe_us} µs/op"
-    );
-
-    // …at strictly lower cost. The scan materializes DEEP envelopes per
-    // call; the probe reads one ring slot / one indexed row. A generous
-    // margin (2x) keeps this stable under CI scheduling noise — locally
-    // the gap is orders of magnitude.
-    assert!(
-        probe_elapsed * 2 < scan_elapsed,
-        "tip probe ({probe_us} µs/op) should be far cheaper than the \
-         full-room inbox scan ({scan_us} µs/op) on a {DEEP}-deep room"
     );
 
     daemon.stop().await;

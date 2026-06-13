@@ -368,10 +368,13 @@ impl Airc {
             .collect())
     }
 
-    /// Cursor of the newest event in the current room.
+    /// Cursor of the newest event in the current room — via the daemon
+    /// when attached (its ORM is the transcript; the local store can be
+    /// empty/stale on an attached scope), the local store otherwise
+    /// (card 8428ae8c).
     pub async fn latest_cursor(&self) -> Result<Option<TranscriptCursor>, AircError> {
         let room = self.current_room().await?;
-        Ok(self.inner.store.latest_cursor(Some(room.channel)).await?)
+        self.channel_latest_cursor(room.channel).await
     }
 
     /// Append a `TranscriptEvent` to the durable store directly.

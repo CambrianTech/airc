@@ -1057,18 +1057,12 @@ impl Airc {
 
     /// Cursor of the newest transcript event on `room`'s channel, or
     /// `None` for an empty room — via the daemon when attached, the
-    /// local store otherwise.
+    /// local store otherwise (the shared card-8428ae8c tip read).
     async fn room_latest_cursor(
         &self,
         room: &crate::Room,
     ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
-        if self.is_daemon_attached() {
-            return self.daemon_latest_transcript_cursor(room.channel).await;
-        }
-        self.event_store()
-            .latest_cursor(Some(room.channel))
-            .await
-            .map_err(AircError::from)
+        self.channel_latest_cursor(room.channel).await
     }
 
     /// Return work cards this peer could reasonably take next. This
