@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -16,7 +16,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn work_create_claim_release_projects_on_board() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -98,7 +98,7 @@ fn work_create_claim_release_projects_on_board() {
 
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -150,7 +150,7 @@ fn work_seed_is_idempotent_for_manager_candidates() {
 
 #[test]
 fn work_board_surfaces_stale_claims() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -210,7 +210,7 @@ fn work_board_surfaces_stale_claims() {
 
 #[test]
 fn work_availability_projects_to_board() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -244,7 +244,7 @@ fn work_availability_projects_to_board() {
 
 #[test]
 fn work_next_surfaces_availability_and_idle_guidance() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -275,7 +275,7 @@ fn work_next_surfaces_availability_and_idle_guidance() {
 
 #[test]
 fn work_roster_surfaces_availability_and_claims() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -332,7 +332,7 @@ fn work_roster_surfaces_availability_and_claims() {
 
 #[test]
 fn work_next_suggests_claimable_priority_cards() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -374,7 +374,7 @@ fn work_next_suggests_claimable_priority_cards() {
 
 #[test]
 fn work_close_removes_card_from_claimable_next() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -407,7 +407,7 @@ fn work_close_removes_card_from_claimable_next() {
 
 #[test]
 fn work_next_ignores_stale_claim_after_card_is_closed() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -457,7 +457,7 @@ fn work_next_ignores_stale_claim_after_card_is_closed() {
 
 #[test]
 fn lane_create_status_and_state_drive_work_projection() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -506,7 +506,7 @@ fn lane_create_status_and_state_drive_work_projection() {
 
 #[test]
 fn lane_manager_claim_status_and_release_project_from_board() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -547,7 +547,7 @@ fn work_claim_refuses_when_cwd_outside_lease_zone() {
     // test fixture's $HOME is a tempdir, and cwd is the source tree
     // (definitely not inside that tempdir's lease zone), so the
     // bare claim should fail with a clear refusal.
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -596,7 +596,7 @@ fn work_claim_refuses_when_cwd_outside_lease_zone() {
 
 #[test]
 fn work_board_empty_state_is_explicit() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);

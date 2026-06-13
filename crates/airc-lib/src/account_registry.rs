@@ -11,7 +11,6 @@
 //! media, and model payloads are explicitly out of scope.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,47 +28,12 @@ use crate::Airc;
 
 pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
 
-/// True when `scope_home` is rooted under a temp directory — the
-/// signature of a hermetic test / CI daemon, NEVER a production scope.
-///
-/// Two layers, because this is consulted on BOTH sides of the wire:
-///
-/// 1. **Local resolution** (publish gate): canonicalized-prefix match
-///    against this machine's `std::env::temp_dir()` — the same check
-///    `machine_account_home` uses for state isolation (card b0a81c31).
-/// 2. **Cross-platform markers** (reader hygiene): a beacon read from
-///    the rendezvous carries a `scope_home` minted on a DIFFERENT
-///    machine/OS, where our local `temp_dir()` prefix is meaningless.
-///    Recognize the well-known temp roots of every platform airc runs
-///    on: live evidence for card d793c242 was a beacon with scope_home
-///    `C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc` published
-///    to the production joelteply rendezvous.
-pub fn scope_home_is_temp_rooted(scope_home: &Path) -> bool {
-    // Layer 1: this machine's temp root (canonicalize both sides so
-    // macOS's `/tmp` -> `/private/tmp` symlink can't dodge the check).
-    let temp = std::env::temp_dir();
-    let temp = temp.canonicalize().unwrap_or(temp);
-    let resolved = scope_home
-        .canonicalize()
-        .unwrap_or_else(|_| scope_home.to_path_buf());
-    if resolved.starts_with(&temp) {
-        return true;
-    }
-
-    // Layer 2: cross-platform markers, for paths minted elsewhere.
-    // Normalize separators + case so `C:\Users\…\AppData\Local\Temp\…`
-    // and `/tmp/…` both land in one comparison space.
-    let lossy = scope_home
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    lossy == "/tmp"
-        || lossy.starts_with("/tmp/")
-        || lossy.starts_with("/private/tmp/")
-        || lossy.starts_with("/var/folders/")
-        || lossy.starts_with("/private/var/folders/")
-        || lossy.contains("/appdata/local/temp/")
-}
+/// Temp-rooted scope-home detection (#1150). The definition moved to
+/// [`airc_core::temp_home`] (card f122b5b5) so `airc-daemon`'s idle
+/// self-exit watchdog consults the SAME check without depending on
+/// this crate; re-exported here so existing callers keep their
+/// import path.
+pub use airc_core::scope_home_is_temp_rooted;
 
 /// Outcome of [`merge_registry_documents`]: the merged view plus the
 /// hygiene counters the caller must surface (count, not full dump).
@@ -573,6 +537,7 @@ mod tests {
     use airc_core::PeerId;
     use airc_protocol::PeerKeypair;
     use std::net::SocketAddr;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn mesh() -> MeshIdentity {

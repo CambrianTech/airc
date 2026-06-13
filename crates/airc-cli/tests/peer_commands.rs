@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -32,7 +32,7 @@ fn airc_core() -> &'static str {
 /// scope. Each call returns a distinct spec — keeps the tests honest
 /// about working with real key material.
 fn mint_peer_spec(seed: &str) -> String {
-    let probe = TempDir::new().expect("probe tempdir");
+    let probe = common::daemon_tempdir();
     let probe_home = probe.path().join(seed);
     let output = Command::new(airc_core())
         .arg("--home")
@@ -115,7 +115,7 @@ fn peer_add_without_tier_flag_defaults_to_untrusted() {
     // Card 34942ec1 Sub-A contract: a fresh peer has tier=Untrusted
     // until something explicitly promotes it. Sub-C must not change
     // that default — existing scripts/sessions stay correct.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
     let spec = mint_peer_spec("seed-1");
@@ -137,7 +137,7 @@ fn peer_add_with_tier_flag_persists_explicit_tier() {
     // V1 explicit arm: --tier=friend lands the row at Friend, not
     // the default. This is what Joel + Toby will use to pin trust
     // on each other's machine accounts.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
     let spec = mint_peer_spec("seed-2");
@@ -158,7 +158,7 @@ fn peer_add_accepts_every_trust_tier_variant() {
     // declares must be reachable from the CLI. Forgetting to wire
     // a new variant into the clap value_enum would silently fall
     // through to "default-Untrusted" without this test.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
 
@@ -194,7 +194,7 @@ fn peer_set_tier_updates_existing_peer() {
     // V2 happy path. Sub-B shipped the store-side
     // set_peer_trust_tier; Sub-C is the CLI surface that consumers
     // (Joel manually pinning Friend on Toby) reach for.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
     let spec = mint_peer_spec("seed-3");
@@ -228,7 +228,7 @@ fn peer_set_tier_refuses_unknown_peer() {
     // Ok(None) when the peer is missing; the CLI must surface this
     // as a non-zero exit with an explanatory error — silently doing
     // nothing would be misleading ("did it work? did it not?").
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
 
@@ -254,7 +254,7 @@ fn peer_set_tier_is_idempotent_when_already_at_target() {
     // marker. Sub-B's set_peer_trust_tier already shipped this at
     // the store layer; Sub-C must not crash or claim a change
     // happened when nothing did.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
     let spec = mint_peer_spec("seed-4");
@@ -278,7 +278,7 @@ fn peer_list_json_exposes_tier_field() {
     // off this output to build their routing tables. Without
     // --json, the substrate forces them to scrape human-format
     // text — guaranteed to break. JSON shape is the contract.
-    let ws = TempDir::new().expect("tempdir");
+    let ws = common::daemon_tempdir();
     let home = ws.path().join("agent");
     run_ok(&home, &["init"]);
     let spec_friend = mint_peer_spec("seed-5");

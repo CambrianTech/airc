@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -105,7 +105,7 @@ fn stop_daemon(account: &Path) {
 
 #[test]
 fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
-    let account = TempDir::new().expect("account tempdir");
+    let account = common::daemon_tempdir();
     let acct = account.path();
 
     // --- Launch: the first tab brings up exactly one daemon. ---
@@ -194,7 +194,7 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
 
 #[test]
 fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
-    let account = TempDir::new().expect("account tempdir");
+    let account = common::daemon_tempdir();
     let acct = account.path();
 
     // Durable chat into a room.

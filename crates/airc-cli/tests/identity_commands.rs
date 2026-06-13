@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use base64::{engine::general_purpose, Engine};
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -59,7 +59,7 @@ fn identity_pretty_defaults_unset_fields() {
 
 #[test]
 fn init_as_records_agent_name() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
 
     let init = run_ok(home, &["init", "--as", "codex"], "");
@@ -71,7 +71,7 @@ fn init_as_records_agent_name() {
 
 #[test]
 fn init_uses_airc_agent_name_env_when_as_is_absent() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
 
     let output = Command::new(airc_core())
@@ -94,7 +94,7 @@ fn init_uses_airc_agent_name_env_when_as_is_absent() {
 
 #[test]
 fn identity_set_link_and_show_round_trip_through_store() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
 
     run_ok(
@@ -141,7 +141,7 @@ fn identity_set_link_and_show_round_trip_through_store() {
 
 #[test]
 fn identity_import_continuum_merges_into_store_without_clearing_status() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
 
     run_ok(
@@ -170,7 +170,7 @@ fn identity_import_continuum_merges_into_store_without_clearing_status() {
 
 #[test]
 fn legacy_identity_commands_bootstrap_lookup_and_sign() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
     let identity_dir = home.join("identity");
     let peers_dir = home.join("peers");
@@ -246,7 +246,7 @@ fn legacy_identity_commands_bootstrap_lookup_and_sign() {
 
 #[test]
 fn legacy_envelope_wrap_encrypts_message_field() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path();
     let alice = home.join("alice");
     let bob = home.join("bob");

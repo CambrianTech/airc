@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -11,7 +11,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn workspace_request_allocate_heartbeat_release_projects_on_list() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);

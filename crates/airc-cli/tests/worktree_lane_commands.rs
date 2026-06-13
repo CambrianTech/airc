@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -12,7 +12,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn worktree_lane_registry_round_trips_from_cli() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let registry = workspace.path().join("lanes.jsonl");
 
     run_ok(
@@ -68,7 +68,7 @@ fn worktree_lane_registry_round_trips_from_cli() {
 
 #[test]
 fn worktree_lane_slug_and_abs_path_match_shell_contract() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let cwd = workspace.path();
 
     let slug = run_ok(&["worktree-lane", "slug", "#123: Codex Lane!"], None);

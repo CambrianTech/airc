@@ -200,3 +200,28 @@ jobs:
             ${{ runner.os }}-cargo-test-
       - name: cargo test --workspace --all-features
         run: cargo test --workspace --all-features
+      # Card f122b5b5 ZERO-LEAK GUARD: the acceptance is that a full
+      # `cargo test --workspace` leaves ZERO airc daemon processes whose
+      # `--home` is under a temp dir. Test daemons get RAII teardown + a
+      # temp-home idle self-exit watchdog; this step is the backstop that
+      # FAILS the leg if either defense ever regresses. ps-based and
+      # portable (ubuntu + macos); skipped on Windows where `ps`/`pgrep`
+      # differ and the self-hosted runner makes process scans noisy.
+      - name: zero leaked temp-home daemons
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # Match an `airc ... daemon` process whose `--home` argument
+          # points under a temp root (/tmp, /var/folders, /private/...,
+          # $TMPDIR). Production daemons (home under $HOME/.airc or a
+          # repo `.airc`) never match.
+          leaked="$(ps -Ao pid=,args= \
+            | grep -E '(^|/)airc .* daemon' \
+            | grep -E -- '--home[ =](/private)?(/tmp|/var/folders|/var/tmp)/' \
+            || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::card f122b5b5 — temp-home airc daemons survived the test suite:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "zero leaked temp-home airc daemons after the suite (card f122b5b5)"
