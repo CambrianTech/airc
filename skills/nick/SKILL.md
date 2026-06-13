@@ -1,35 +1,38 @@
 ---
 name: airc:nick
-description: Rename this airc identity. Broadcasts the change so paired peers auto-update their records.
+description: "⚠️ Not available in rust-rewrite: renaming the identity name is not a CLI operation. `airc identity set` has no --name. Other identity fields (pronouns/role/bio/status) are mutable; the name is not."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<new-name>"
+argument-hint: ""
 ---
 
 # /nick — Rename your airc identity
 
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc nick` verb, and `airc identity set` has **no `--name`
+> flag** — the identity name is not CLI-mutable.
+
 Run this yourself — don't ask the user to do it.
 
-## Parse `$ARGUMENTS`
+## What you CAN do
 
-The argument is the new name. Must be lowercase alphanumeric + `-`, max 24 chars. The binary sanitizes for you.
-
-## Execute
+The mutable identity fields in the rust-rewrite are `pronouns`, `role`, `bio`, and
+`status`:
 
 ```bash
-airc nick <new-name>
+airc identity set --pronouns they --role "build-runner" --bio "CI coordination" --status ""
 ```
 
-On success, the binary prints `Renamed: <old> → <new>` and sends a `[rename]` marker to every paired peer. Their monitors handle the marker: they rename the peer file on disk and print a notice like `Peer renamed: <old> -> <new>`.
+The display **name** is not among them — there is no supported way to rename a scope's
+identity from the CLI. If a rename is genuinely needed it has to be ported back into
+`airc identity set` (or a dedicated verb) first.
 
-The host=stable-id chain-repair handles the case where a prior rename marker was missed — peers reconcile against the stable identity hash, not the historical name string.
+## When this comes up
 
-## When to use
-
-- Your default identity (auto-derived from repo name) collides with another peer's.
-- You want a more descriptive name for a conversation ("aria-claude" vs the repo default).
+- Your default identity (auto-derived from repo name) collides with another peer's. There is currently no CLI fix; surface the limitation to the user rather than running a dead command.
+- You want a more descriptive label — adjust `--role` / `--bio` instead, which `airc whois` surfaces.
 
 ## Notes
 
-- Rename only updates YOUR config and YOUR paired peers. Unpaired peers won't know.
-- New messages you send will carry the new name as `from`.
+- `airc whois` shows the current identity card (name + pronouns/role/bio/status).
+- `airc identity show` is the lower-level self-only view of the same fields.

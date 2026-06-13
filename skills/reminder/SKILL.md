@@ -1,32 +1,30 @@
 ---
 name: airc:reminder
-description: Control the silence-reminder nudge. Fires once when no send happens within N seconds; resets on next send.
+description: "⚠️ Not available in rust-rewrite: there is no `airc reminder` verb and no silence-nudge timer. No CLI equivalent exists."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<seconds|off|pause>"
+argument-hint: ""
 ---
 
 # airc reminder
 
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc reminder` verb, and the silence-reminder nudge timer
+> (`airc reminder 300 | off | pause`) does not exist in the rust-rewrite. There is **no
+> CLI equivalent.**
+
 Run this yourself — don't ask the user.
 
-## Execute
+## What there is instead
 
-```bash
-airc reminder 300      # nudge after 300s of silence (default)
-airc reminder 0        # disable
-airc reminder off      # disable
-airc reminder pause    # temporarily disable without losing interval
-```
+Nothing maps directly. The rust-rewrite has no per-scope idle-nudge timer surfaced
+through the CLI. The closest related verb is `airc monitor`, which only *formats*
+monitor events for AI/runtime consumers — it does not arm a silence reminder.
 
-A background timer inside the monitor fires exactly once per silence period. When the user next sends, the "reminded" marker clears and the timer re-arms.
+## When this comes up
 
-## When to use
-
-- You want less/more prodding from the system during idle windows.
-- Tuning a long-running collaboration session where silence is normal.
+- "Remind me if the room goes quiet for N seconds" — explain that idle-reminder timing is not a CLI feature in the rust-rewrite. If you need idle awareness, the runtime's own loop (Claude Monitor / Codex poll) is where that lives, not an `airc` subcommand.
 
 ## Notes
 
-- Reminder text surfaces via the monitor as `[ts] airc: Reminder: ...` — same channel as all other airc events.
-- Default interval is 300s (5 min). Set at host time (persisted via handshake to joiners) or locally via this command.
+- Do not invent `airc reminder` — it does not exist in the rust-rewrite.

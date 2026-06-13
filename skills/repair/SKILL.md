@@ -1,26 +1,31 @@
 ---
 name: airc:repair
-description: Full re-pair of a stale airc mesh when identity/pairing state is corrupt. Most monitor recovery should use `airc join` instead.
+description: Recover a stale airc mesh by stopping this scope's daemon and re-joining. Most routine recovery should just use `airc join`.
 user-invocable: true
 allowed-tools: Bash, Monitor
-argument-hint: "[invite-string]"
+argument-hint: "[join-string | room | gist-id]"
 ---
 
 # airc repair
 
-The one-command recovery for the most common airc failure: your saved pairing is stale (SSH key rotated, host regenerated identity, reinstall broke things, you accidentally paired with the wrong host because of a port collision). Runs the full nuclear repair sequence so you don't have to remember the flag names or hunt for the invite string.
+Recovery for the common airc failure: your scope's daemon is wedged or the route is
+stale and a plain re-join isn't clearing it. In the rust-rewrite there is no `airc
+repair` verb — repair is the sequence **stop the daemon, then join again**.
 
 ## Execute
 
-If `$ARGUMENTS` contains an invite string, use it directly. Otherwise do a clean local reset and let `airc join` recreate the account-context subscriptions from the ORM-backed identity, subscription, peer, and coordinator stores. Do not reconstruct pairing from `config.json`; that file is not part of the redesigned runtime.
+If `$ARGUMENTS` contains a join string / room / gist id, pass it to `airc join`.
+Otherwise re-join with no args and let `airc join` recreate the account-context
+subscriptions from the ORM-backed identity, subscription, peer, and coordinator stores.
 
-### Step 1 — teardown --flush
+### Step 1 — stop the daemon
 
 ```bash
-airc teardown --flush
+airc stop
 ```
 
-Wipes identity, peer records, saved pairing, messages. State is gone.
+Gracefully shuts down this scope's running daemon. State (identity, peers,
+subscriptions, messages) is preserved on disk.
 
 ### Step 2 — join
 
@@ -34,22 +39,25 @@ Codex / non-Monitor runtimes:
 airc join ${ARGUMENTS:+"$ARGUMENTS"}
 ```
 
-Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.
+Fresh daemon, fresh handshake, clean re-attach to the mesh.
 
 ## When to use
 
-- `airc join` (resume) exited with `Resume aborted — re-pair required`.
-- `airc send` exited with `Authentication failure — re-pair required`.
+- `airc join` reported a re-pair-required condition and a plain re-join didn't clear it.
 - You re-installed airc and your mesh stopped working.
-- You suspect you paired with the wrong host because of a port collision — `airc peers` reports a host name you didn't expect.
-- "Nothing works and I don't know why" — repair is the cheap nuclear option.
+- You suspect you paired with the wrong host — `airc peers` reports an identity you didn't expect.
+- "Nothing works and I don't know why" — stop + join is the cheap reset.
 
 ## Failure modes
 
-- No invite passed and the peer is not discoverable through the account coordinator. User needs a fresh invite from the host. Ask them to get `/invite` output from the host and pass it as the argument.
-- Repair succeeds but still no messages — you may genuinely be on the wrong host. Run `airc peers` and confirm the host name matches who you meant to pair with. If not, ask the host to paste their `/invite` output and try `/repair <that-invite>`.
+- No join string passed and the peer is not discoverable. The user needs a fresh join string from the host — ask them to share one and pass it as the argument.
+- Repair succeeds but still no messages — you may genuinely be on the wrong host. Run `airc peers` and confirm the enrolled identity matches who you meant to pair with. If not, ask the host to share their join string and try `/repair <that-string>`.
 
 ## Notes
 
-- This is intentionally destructive. Identity keys, peer records, message mirror — all gone. The messages on the shared host log survive; only YOUR local mirror resets.
-- Safer than guessing which flag to `airc teardown` with. Pre-repair-skill, users reliably typed `airc teardown` (no flush) + `airc join` (resume) and silently stayed broken. Using this skill removes the footgun.
+> ⚠️ The pre-rewrite `/repair` did a destructive `airc teardown --flush` to wipe
+> identity/peers. The rust-rewrite has **no state-wipe CLI verb** — `airc stop` only
+> stops the daemon, it never wipes identity or trust. This skill is therefore
+> non-destructive: stop + re-join. If a from-scratch identity is truly required, that
+> is a manual reset of the scope's `$AIRC_HOME` directory, not an `airc` subcommand.
+- The messages on the shared host log survive across a stop/join. Local state is preserved too.

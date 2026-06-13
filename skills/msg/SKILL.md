@@ -24,18 +24,27 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 The `@` prefix on the first arg is the DM trigger. Everything else is the message body.
 
+`airc msg` has **no `--room` flag** — it always posts to the current room. To target a
+different room, either switch the current room first with `airc room <name>` then
+`airc msg ...`, or use `airc publish --room <name> --body-text "..."` for one-shot
+routing that doesn't move the current-room pointer. Note: `airc publish --room` only
+routes to a room you are **already subscribed to** — it does not auto-join.
+
 ## Execute
 
 ```bash
 airc msg hello everyone
 airc msg @alice quick question
+
+# target another room without leaving this one:
+airc publish --room project-x --body-text "heads up" --kind message
 ```
 
 On success: exit 0. Message is persisted through the Rust store/event substrate and delivered over the selected route.
 
 On failure, read the stderr — it tells you which class:
 
-- **`Authentication failure — re-pair required`**: SSH key no longer authenticates against the host. Retry will fail identically. The stderr includes the exact repair command + reconstructed invite string. Run `airc teardown --flush && airc join <invite-string>`.
+- **`Authentication failure — re-pair required`**: the saved pairing no longer authenticates against the host. Retry will fail identically. Recover with `airc stop && airc join <join-string>` (the `/repair` skill wraps this).
 - **`Network error reaching host — message queued for retry`**: the selected route is transiently unreachable. The Rust outbox/route layer will drain it automatically when the route recovers. Exit 0 in this case (queued = success for resilience purposes).
 - **`Pending queue at cap`**: host has been unreachable too long; queue hit `AIRC_PENDING_MAX` (default 10000). Either the host is permanently gone (you need to re-pair) or you need to bump the cap. Exit 1.
 

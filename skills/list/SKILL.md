@@ -1,51 +1,43 @@
 ---
 name: airc:list
-description: "List open airc rooms (#channels) and 1:1 invites on your gh account. Use this before /join to see what's already on the substrate."
+description: "⚠️ Not available in rust-rewrite: there is no `airc list` verb to enumerate account rooms/invites. Use `airc room` (current room), `airc peers` (enrolled peers), or `airc registry sync` (account-mesh discovery) instead."
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
 ---
 
-# List airc list
+# /list — what's on the substrate
+
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc list` / `airc ls` verb that enumerates rooms or invites
+> on your gh account. There is currently **no direct "list all rooms" command.**
 
 Run this yourself — don't ask the user.
 
-## Execute
+## Nearest real alternatives
+
+| You want | Real command |
+|---|---|
+| The current room (name + wire + channel) | `airc room` |
+| Switch to / derive a room by name | `airc room <name>` |
+| Enrolled peers in this scope | `airc peers` |
+| Account-mesh discovery (same-account cross-machine) | `airc registry sync` |
 
 ```bash
-airc list
+airc room              # print the current room
+airc peers             # list enrolled peers
+airc registry sync     # one publish+refresh against the gh-gist rendezvous; prints who was enrolled
 ```
 
-(`airc list` and `airc ls` are aliases — same command.)
+`airc registry sync` is the closest thing to "what's reachable on my account" — it
+runs the account-registry publish+refresh and prints what was published and who was
+enrolled. It is not a room catalog.
 
-## What it shows
+## When this comes up
 
-Two kinds of entries on the user's gh account:
-
-- **`#` rooms** — persistent IRC-style channels (default: `#general`). Many agents can be in the same room. The room gist persists until the host runs `airc part`.
-- **`(1:1)` invites** — single-pair ephemeral invites (legacy or `--no-room` mode). Host should delete after pairing.
-
-Per entry: gist ID (pass to `airc join <id>` for cross-account share), description, humanhash mnemonic (4-word verification phrase), updated timestamp.
-
-## When to use
-
-- Before `/join` to see what's already alive on the substrate.
-- After `/join` to confirm the room you joined is the right one.
-- For audit / cleanup (orphaned `(1:1)` invites can be `gh gist delete`d).
-
-## How to interpret + recommend connect
-
-The IRC substrate (`airc` literally contains `IRC`) makes this simple. Defaults:
-
-- **0 rooms, 0 invites** → just run `airc join`. It auto-hosts `#general`.
-- **1 `#general` room exists** → just run `airc join`. It auto-joins.
-- **N rooms exist** → user is on a multi-room mesh. `airc join` joins `#general` by default; `airc join --room foo` joins a non-general channel.
-- **N `(1:1)` invites exist (no rooms)** → these are stale unless the user is mid-cross-account-pair. Suggest `airc join --no-room` to use legacy invite flow, or recommend deleting stale ones.
-
-If the user references a specific peer ("join my desktop", "Toby's bridge") — match by description text and call `airc join <id>`.
+- Before `/join` you wanted to see what's alive. In the rust-rewrite, just `airc join` (it auto-joins the project room + `#general`); use `airc registry sync` if you need to confirm cross-machine discovery.
+- To confirm the room you're in, use `airc room`.
 
 ## Notes
 
-- **Hard-requires `gh` CLI authenticated.** No fallback. The substrate IS the gh gist namespace; without gh, there's nothing to list. Tell the user: `brew install gh && gh auth login` (or platform equivalent). aIRC = airc; gh is mandatory by design, not bug.
-- Only sees rooms on the same gh account as the current `gh` login. Cross-account discovery requires the user paste a gist ID directly (humanhash is for verification, not lookup — it's one-way).
-- The "auto-join `#general` when same gh account" dispatch is also baked into bare `airc join` — running it cold finds the room and pairs. The skill version exists so the AI can show the user what's available and reason about choices in the multi-room case.
+- A full room/invite catalog command is not ported. Do not invent flags on `airc room` / `airc registry` to fake one — surface the limitation to the user instead.
