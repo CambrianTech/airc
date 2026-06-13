@@ -97,7 +97,7 @@ pub enum RegistryRefreshGate {
         /// = no recovery: outside the daemon a recovered token could
         /// not reach the store, so passing the gate with it would
         /// just move the same failure into the publish.
-        token_override: Option<crate::gh_account_registry::GhTokenOverride>,
+        token_override: Option<crate::gh::account_registry::GhTokenOverride>,
     },
     /// No gate — always run the tick. Used by Sqlite/in-memory stores
     /// that need no external auth (acceptance test + manual `registry
@@ -111,7 +111,7 @@ pub enum RegistryRefreshGate {
 pub enum GateBlock {
     /// Hermetic gate (card d793c242): this scope must never touch the
     /// gh account rendezvous. The payload says exactly why.
-    Hermetic(crate::gh_account_registry::AccountRegistryBlock),
+    Hermetic(crate::gh::account_registry::AccountRegistryBlock),
     /// `gh` is not authenticated — the optional same-account
     /// rendezvous transport is simply unavailable.
     GhNotReady,
@@ -145,12 +145,12 @@ impl RegistryRefreshGate {
                 scope_home,
                 token_override,
             } => {
-                if let Some(block) = crate::gh_account_registry::account_registry_block(scope_home)
+                if let Some(block) = crate::gh::account_registry::account_registry_block(scope_home)
                 {
                     return Some(GateBlock::Hermetic(block));
                 }
                 let recovered = token_override.as_ref().and_then(|slot| slot.get());
-                if crate::gh_account_registry::gh_auth_ready_with_token(
+                if crate::gh::account_registry::gh_auth_ready_with_token(
                     gh_bin.as_deref(),
                     recovered.as_deref(),
                 )
@@ -166,9 +166,9 @@ impl RegistryRefreshGate {
                 // GhNotReady skip — no new failure modes.
                 if let Some(slot) = token_override {
                     if let Some(fresh) =
-                        crate::gh_account_registry::re_resolve_gh_token(gh_bin.as_deref()).await
+                        crate::gh::account_registry::re_resolve_gh_token(gh_bin.as_deref()).await
                     {
-                        if crate::gh_account_registry::gh_auth_ready_with_token(
+                        if crate::gh::account_registry::gh_auth_ready_with_token(
                             gh_bin.as_deref(),
                             Some(&fresh),
                         )
@@ -543,7 +543,7 @@ exit 1
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let slot = crate::gh_account_registry::GhTokenOverride::new();
+        let slot = crate::gh::account_registry::GhTokenOverride::new();
         // scope_home is production-shaped so the hermetic arm does not
         // fire first (same setup as the gate-skip test above).
         let gate = RegistryRefreshGate::GhAuth {
@@ -614,7 +614,7 @@ exit 1
         };
         match sync_once(&airc, &store, &gate).await.unwrap() {
             SyncOutcome::Skipped(GateBlock::Hermetic(
-                crate::gh_account_registry::AccountRegistryBlock::TempScopeHome { scope_home },
+                crate::gh::account_registry::AccountRegistryBlock::TempScopeHome { scope_home },
             )) => assert_eq!(scope_home, machine),
             other => panic!("temp-rooted scope must skip hermetically, got {other:?}"),
         }

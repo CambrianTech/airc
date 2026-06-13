@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use airc_lib::gh_client::{
+use airc_lib::gh::client::{
     BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
     PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
 };
@@ -343,7 +343,7 @@ impl GhClient for ReqwestGhClient {
             .send_authed(reqwest::Method::GET, &runs_url, NO_BODY)
             .await?;
         let runs_bytes = runs_resp.bytes().await.map_err(map_reqwest_error)?;
-        let check_runs = airc_lib::gh_client::parse_check_runs(&runs_bytes)?;
+        let check_runs = airc_lib::gh::client::parse_check_runs(&runs_bytes)?;
 
         let state = pr_json
             .get("state")
@@ -491,7 +491,7 @@ impl GhClient for ReqwestGhClient {
             return Err(map_http_error_status(resp.status(), resp).await);
         }
         let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
-        airc_lib::gh_client::parse_check_runs(&bytes)
+        airc_lib::gh::client::parse_check_runs(&bytes)
     }
 }
 

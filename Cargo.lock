@@ -210,6 +210,7 @@ dependencies = [
  "base64",
  "bytes",
  "dashmap",
+ "fs2",
  "futures",
  "rtc",
  "rtc-media",

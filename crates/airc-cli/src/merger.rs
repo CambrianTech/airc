@@ -491,7 +491,7 @@ pub(crate) fn evaluate_gh_view(
                     let timed_out = policy.pending_timeout_ms > 0
                         && c.started_at
                             .as_deref()
-                            .and_then(airc_lib::gh_client::parse_iso_timestamp_ms)
+                            .and_then(airc_lib::gh::client::parse_iso_timestamp_ms)
                             .map(|started| {
                                 policy.now_ms.saturating_sub(started) > policy.pending_timeout_ms
                             })
@@ -974,7 +974,7 @@ mod tests {
                 {"name": "cargo test (windows-latest)", "status": "in_progress", "conclusion": null},
             ]
         });
-        let runs = airc_lib::gh_client::parse_check_runs(json.to_string().as_bytes())
+        let runs = airc_lib::gh::client::parse_check_runs(json.to_string().as_bytes())
             .expect("envelope parses");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].name.as_deref(), Some("cargo fmt --check"));
@@ -1129,7 +1129,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// 2026-05-29T03:29:46Z anchored in ms-since-epoch via the same
-    /// path airc_lib::gh_client::parse_iso_timestamp_ms uses.
+    /// path airc_lib::gh::client::parse_iso_timestamp_ms uses.
     /// Hand-resolving rather than calling the parser keeps the test
     /// honest about what the policy actually compares.
     const FIXED_STARTED_AT: &str = "2026-05-29T03:29:46Z";
