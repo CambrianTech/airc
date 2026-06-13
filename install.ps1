@@ -470,13 +470,56 @@ done
     }
 }
 
+# -- gh credential helper + git identity (only when gh is already authed) -
+# install.ps1 doesn't drive gh auth (it prints the next-step below), so
+# this only fires for users who authed before installing. The bootstrap
+# (bootstrap-airc.ps1) covers the fresh-auth path. Mirrors install.sh:
+#   - wire gh's token into git's credential helper (no gist password pops)
+#   - derive git author identity from the gh account when unset, so the
+#     first agent commit doesn't die with "Author identity unknown".
+# Never clobbers an identity the user already set. No hardcoded values.
+$ghAvail  = Get-Command gh  -ErrorAction SilentlyContinue
+$gitAvail = Get-Command git -ErrorAction SilentlyContinue
+if ($ghAvail -and $gitAvail) {
+    & gh auth status 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $ghHelper = & git config --global --get-all credential.https://github.com.helper 2>$null
+        # Join to a scalar before -notmatch: --get-all can return multiple
+        # helper values (array), and PS -notmatch on an array filters rather
+        # than returning a strict boolean. Scalar form is correct.
+        if ((@($ghHelper) -join "`n") -notmatch 'gh auth git-credential') {
+            & gh auth setup-git 2>$null
+            if ($LASTEXITCODE -eq 0) { Write-Ok 'gh token wired into git credential helper' }
+        }
+        $gitName  = (& git config --global user.name)  2>$null
+        $gitEmail = (& git config --global user.email) 2>$null
+        if (-not $gitName -or -not $gitEmail) {
+            $ghLogin = (& gh api user --jq '.login') 2>$null
+            $ghName  = (& gh api user --jq '.name // .login') 2>$null
+            $ghId    = (& gh api user --jq '.id') 2>$null
+            $ghEmail = (& gh api user --jq '.email // empty') 2>$null
+            if (-not $ghEmail -and $ghId -and $ghLogin) {
+                $ghEmail = "$ghId+$ghLogin@users.noreply.github.com"
+            }
+            if (-not $gitName -and $ghName) {
+                & git config --global user.name $ghName
+                Write-Ok "git user.name set from gh: $ghName"
+            }
+            if (-not $gitEmail -and $ghEmail) {
+                & git config --global user.email $ghEmail
+                Write-Ok "git user.email set from gh: $ghEmail"
+            }
+        }
+    }
+}
+
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'
 Write-Host ''
 Write-Host '  Next:'
 Write-Host '    1. Open a NEW PowerShell window (so PATH refreshes)'
-Write-Host '    2. Authenticate gh once:    gh auth login -s gist'
+Write-Host '    2. Authenticate gh once:    gh auth login -h github.com -s gist'
 Write-Host '    3. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'
