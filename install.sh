@@ -431,6 +431,37 @@ ensure_prereqs() {
       fi
     fi
   fi
+
+  # Git author identity. Agents in this substrate commit and open PRs,
+  # and a fresh machine has no global user.name/user.email — the first
+  # commit then dies with "Author identity unknown" (caught live on a
+  # clean Windows box 2026-06-13). Derive it from the authenticated gh
+  # account when unset; never clobber an identity the user already set.
+  # Email prefers the account's public email, falling back to the GitHub
+  # noreply alias (<id>+<login>@users.noreply.github.com), which always
+  # matches the account and avoids leaking a private address.
+  if command -v gh >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    _need_name=0; _need_email=0
+    if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
+    if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
+    if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
+      _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
+      _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+      _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
+      _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
+      if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
+        _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
+      fi
+      if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
+        git config --global user.name "$_gh_name"
+        info "git user.name set from gh: $_gh_name (override: git config --global user.name ...)"
+      fi
+      if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
+        git config --global user.email "$_gh_email"
+        info "git user.email set from gh: $_gh_email (override: git config --global user.email ...)"
+      fi
+    fi
+  fi
 }
 
 ensure_prereqs
