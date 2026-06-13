@@ -1,40 +1,38 @@
 ---
 name: airc:send-file
-description: Send a file to a paired peer via AIRC.
+description: "⚠️ Not available in rust-rewrite: there is no `airc send-file` verb. The nearest real path is `airc publish --body-json <file>` to ship a structured payload over the substrate — not a true file transfer."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<peer> <file-path>"
+argument-hint: ""
 ---
 
 # airc send-file
 
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc send-file` verb, and the old scp-over-SSH file path does
+> not exist in the rust-rewrite.
+
 Run this yourself — don't ask the user to do it.
 
-If `airc` is not on PATH, install it first:
-```bash
-curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
-```
+## Nearest real alternative
 
-## Parse `$ARGUMENTS`
-
-- First arg: peer name (must appear in `airc peers`).
-- Second arg: local file path to send.
-
-## Execute
+`airc publish` can carry a structured payload over the substrate. To ship the contents
+of a JSON file as the frame body:
 
 ```bash
-airc send-file <peer> <file-path>
+airc publish --body-json ./payload.json     # file contents become the frame body
+airc publish --body-json - < payload.json   # or read from stdin
 ```
 
-File is scp'd (using the airc identity key) to the peer's state dir under `files/<your-name>/<basename>`. On success, airc also sends a signed message noting `Sent file: <basename> (<size> bytes)` so the peer's monitor surfaces the transfer.
+This is a substrate event, not a file transfer — there's no scp'd copy landing in the
+peer's state dir, and binary files aren't a first-class payload. For arbitrary file
+transfer, use an out-of-band channel; surface that limitation to the user rather than
+running a dead command.
 
-## Failure modes
+## When this comes up
 
-- `ERROR: Failed to transfer <filename>: <scp stderr>` — real scp error is shown. Common causes: peer host down, SSH auth (try `airc teardown --flush` and re-pair), file not readable.
-- Silent success means: scp returned 0, file landed, status message broadcast.
+- "Send this file to <peer>" — explain there is no `airc send-file` in the rust-rewrite. If the content is structured (JSON), `airc publish --body-json` can route it; otherwise use an external transfer.
 
 ## Notes
 
-- Sender needs the file to exist and be readable locally.
-- Receiver doesn't need to do anything — the file appears in their state dir and the notification lands in their monitor.
-- Integrity: verify with `shasum -a 256` on both sides if high-stakes.
+- Do not invent `airc send-file` — it does not exist in the rust-rewrite.

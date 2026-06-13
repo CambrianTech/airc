@@ -1,6 +1,6 @@
 ---
 name: airc:away
-description: Set or clear the away status on this airc identity. IRC /away analog — exchanged at handshake so peers see the status in airc whois. Run with no args (or use 'airc back') to clear.
+description: Set or clear the away status on this airc identity via `airc identity set --status`. IRC /away analog — surfaced in `airc whois`. Run with no message (status "") to clear.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: "[<message>]"
@@ -10,28 +10,25 @@ argument-hint: "[<message>]"
 
 Run this yourself — don't ask the user.
 
+In the rust-rewrite there is no `airc away` verb. Away/back is just a write to the
+`status` field of the identity, which `airc identity set --status` owns.
+
 ## Parse `$ARGUMENTS`
 
-- With message → set status. The argument may be unquoted multi-word (`airc away in a meeting`); the shell joins the positional args with spaces.
-- Without arguments → clear status (back). `airc back` is a shortcut alias for the same clearing path.
+- With message → set status: `airc identity set --status "<message>"`. The argument may be unquoted multi-word; join the positional args with spaces and pass them as one quoted value.
+- Without arguments → clear status (back): `airc identity set --status ""`.
 
 ## Execute
 
 ```bash
-airc away <message>
+airc identity set --status "in a meeting"   # set away status
+airc identity set --status ""               # clear status (back)
 ```
-
-```bash
-airc away                # clears status
-airc back                # also clears status
-```
-
-On set, prints `away: <message>`. On clear, prints `back — away cleared.`.
 
 ## How it surfaces
 
 - `airc whois <yourname>` reflects the status field immediately.
-- Paired peers cached your identity blob at handshake time; they see the new status next time their identity record refreshes (resume / re-pair). Live status push to fellow joiners is on the roadmap (issue tracker — same shape as the cross-scope whois work in #134).
+- Paired peers cached your identity blob at handshake time; they see the new status next time their identity record refreshes (re-join / re-pair). Live status push to fellow joiners is on the roadmap.
 
 ## When to use
 
@@ -41,6 +38,6 @@ On set, prints `away: <message>`. On clear, prints `back — away cleared.`.
 
 ## Notes
 
-- Equivalent verbose form: `airc identity set --status "<msg>"`. Both write to the same `identity.status` field; this skill is the IRC-aligned shortcut.
-- Status persists in the ORM-backed identity store until cleared. Survives teardown + reconnect (it's identity material, not pairing state).
+- `--status` writes to the same `identity.status` field IRC `/away` would set. The other mutable identity fields (`--pronouns`, `--role`, `--bio`) are set the same way via `airc identity set`.
+- Status persists in the ORM-backed identity store until cleared. It's identity material, not pairing state.
 - Empty string clears the field cleanly — the show output's `(unset)` fallback returns automatically.

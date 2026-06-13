@@ -1,60 +1,47 @@
 ---
 name: airc:uninstall
-description: Fully remove airc from this machine — stops processes, deletes the clone, drops binary + skill files. Confirm with the user before running; this is destructive.
+description: "⚠️ Not available in rust-rewrite: there is no `airc uninstall` verb. Removal is manual (stop the daemon with `airc stop`, then delete the install dir + skill files by hand)."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "[--yes] [--purge]"
+argument-hint: ""
 ---
 
 # airc uninstall
 
-**Destructive — confirm with the user before running.** This removes airc itself; per-project `.airc/` state (identity keys, peer records, chat logs) is left alone unless the user explicitly asks for `--purge`.
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc uninstall` verb (and no `airc teardown --all`) in the
+> rust-rewrite. Removal is a manual sequence, not a single subcommand.
 
-## When to use
+**Destructive — confirm with the user before doing any of this.**
 
-- The user says "uninstall airc" / "remove airc" / "I'm done with airc."
-- The user is reinstalling from scratch and wants a clean slate first.
-- A botched install left a clone in a weird state, and `/repair` isn't enough.
+## Nearest real path (manual)
 
-## What it does
+1. Stop the running daemon for each scope you've joined:
+   ```bash
+   airc stop
+   ```
+   (`airc stop` only stops the current scope's daemon — repeat per scope/home.)
+2. Delete the install directory by hand (e.g. `~/.airc/src` or wherever the binary was
+   installed) and any `airc` shim on `PATH`.
+3. Remove airc-owned skill directories under `~/.claude/skills/` (and `~/.codex/skills/`) by hand.
+4. Per-project `.airc/` state dirs (identity keys, peer records, message logs) survive
+   unless you delete them manually — there is no `--purge` flag.
 
-```bash
-airc uninstall
-```
+None of this is automated by `airc` in the rust-rewrite; surface that to the user
+rather than running a dead command.
 
-Walks the full removal in order:
+## When this comes up
 
-1. `airc teardown --all` — stops every running airc process across all scopes on this machine
-2. Removes daemon registrations if present
-3. Removes stale POSIX forwarders and Windows shim files under `$BIN_DIR`
-4. Removes airc-owned skill directories under `~/.claude/skills/`
-5. Removes the clone dir (`~/.airc/src` or `$AIRC_DIR`)
-
-**Confirmation prompt:** asks the user to type `yes` to proceed. If you're invoking from an agent, pass `--yes` only after the user has explicitly confirmed.
-
-## Flags
-
-- `--yes` / `-y` — skip the confirmation prompt. **Only pass this after the user confirms in chat.** Required for non-interactive invocations.
-- `--purge` — also print the list of per-project `.airc/` state dirs the user would need to remove manually for a fully clean machine. Does NOT auto-delete them — those hold the user's identity keys, peer records, and chat history.
-
-## What it leaves alone
-
-- **Per-project `.airc/` state** — your identity keys, peer records, message logs in every dir you ran `airc join` from. Use `--purge` to get a list of them.
-- **`gh` auth, brew/apt-installed packages** — those aren't airc's to remove.
-- **Other agents' configs** (Codex, Cursor, opencode, Windsurf) — airc only owns its own integration files.
-
-## Read the result
-
-- `Uninstalled.` — full removal succeeded.
-- `Aborted.` — user declined the prompt; nothing changed.
-- `Non-interactive run: pass --yes to confirm uninstall.` — the script needed a TTY or `--yes`; you forgot the flag.
+- The user says "uninstall airc" / "remove airc". Walk the manual steps above; do not run `airc uninstall`.
 
 ## Reinstall
 
-After uninstall, the standard one-liner re-installs cleanly:
+The standard one-liner re-installs cleanly:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-Per-project `.airc/` dirs (if not purged) are picked up on the next `airc join` in that scope.
+## Notes
+
+- Do not invent `airc uninstall` / `airc teardown --all` — neither exists in the rust-rewrite.
