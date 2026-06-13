@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -10,7 +10,7 @@ fn airc() -> &'static str {
 
 #[test]
 fn transport_health_reports_route_snapshot_from_substrate() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
 
     let output = run_ok(workspace.path(), &["transport", "health"]);
 
@@ -25,7 +25,7 @@ fn transport_health_reports_route_snapshot_from_substrate() {
 
 #[test]
 fn transport_health_degraded_only_is_silent_when_routes_are_clean() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
 
     let output = run_ok(
         workspace.path(),
@@ -37,7 +37,7 @@ fn transport_health_degraded_only_is_silent_when_routes_are_clean() {
 
 #[test]
 fn transport_health_quiet_succeeds_when_routes_are_clean() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
 
     let output = run_raw(
         workspace.path(),

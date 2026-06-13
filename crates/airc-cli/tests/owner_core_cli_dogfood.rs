@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -58,7 +58,7 @@ fn any_frames_jsonl(dir: &Path) -> Option<PathBuf> {
 
 #[test]
 fn same_machine_round_trips_via_daemon_with_no_frames_jsonl() {
-    let account = TempDir::new().expect("account tempdir");
+    let account = common::daemon_tempdir();
 
     // One scope sends; another scope under the SAME $HOME reads it back —
     // they share the one machine daemon, so the message converges.

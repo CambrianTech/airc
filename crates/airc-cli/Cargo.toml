@@ -60,3 +60,9 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 temp-env = "0.3"
+
+# Card f122b5b5: the daemon-teardown guard (tests/common) needs
+# kill(2)/ESRCH probing to reap daemons the CLI auto-spawned for
+# temp homes.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

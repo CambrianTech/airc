@@ -28,8 +28,7 @@
 //! test daemons at throwaway dirs so they don't collide with the real
 //! machine daemon. Normal operation never sets it.
 
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The runtime directory for `airc` — where `airc-<hash>-v<N>.sock`
 /// files live. Created if absent.
@@ -77,42 +76,13 @@ fn resolve_runtime_dir(
     Ok(PathBuf::from(home).join(".airc").join("runtime"))
 }
 
-/// Project-derived socket path. The hash of the canonicalized project
-/// root is stable across runs, so every agent in the same project
-/// computes the same socket path and reaches the same daemon — no
-/// discovery indirection needed.
-///
-/// `project_root` is typically the git working tree (the parent of
-/// `.airc/`). The hash is 16 hex chars of SHA-256, collision-resistant
-/// at the scale of "projects on one machine."
-pub fn project_socket_path(project_root: &Path) -> std::io::Result<PathBuf> {
-    let dir = runtime_dir()?;
-    let key = project_key(project_root);
-    Ok(dir.join(format!(
-        "airc-{}-v{}.sock",
-        key,
-        airc_ipc::IPC_PROTOCOL_VERSION
-    )))
-}
-
-/// 16-char hex prefix of SHA-256(canonical(project_root)). Same scheme
-/// as `discovery::project_key` so the transition produces consistent
-/// keys; once discovery is removed this is the only definition.
-fn project_key(project_root: &Path) -> String {
-    let canon = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut h = Sha256::new();
-    h.update(canon.as_os_str().as_encoded_bytes());
-    let digest = h.finalize();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(16);
-    for b in &digest[..8] {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0xf) as usize] as char);
-    }
-    s
-}
+// NOTE (card f122b5b5): `project_socket_path` used to live here — a
+// project-root-hashed socket NAME placed in `runtime_dir()`. That
+// placement is exactly how hermetic temp-home test daemons planted
+// sockets under the PRODUCTION `~/.airc/runtime` (stale
+// `airc-10e8167b5d5b936d-v5.sock` observed live). Isolated scopes now
+// derive their socket from the daemon's own home in
+// `cli::resolve_socket_path`; nothing project-hashed lands here.
 
 #[cfg(test)]
 mod tests {
@@ -149,21 +119,6 @@ mod tests {
     }
 
     #[test]
-    fn project_key_is_stable_across_calls() {
-        let a = project_key(Path::new("/Users/joel/Development/airc"));
-        let b = project_key(Path::new("/Users/joel/Development/airc"));
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 16);
-    }
-
-    #[test]
-    fn project_key_distinguishes_paths() {
-        let a = project_key(Path::new("/Users/joel/Development/airc"));
-        let b = project_key(Path::new("/Users/joel/Development/continuum"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn runtime_dir_honors_airc_runtime_dir_env() {
         // Use a unique path to avoid colliding with other test runs
         let unique = std::env::temp_dir().join(format!(
@@ -193,39 +148,6 @@ mod tests {
                 Some(v) => std::env::set_var("AIRC_RUNTIME_DIR", v),
                 None => std::env::remove_var("AIRC_RUNTIME_DIR"),
             }
-        }
-        let _ = std::fs::remove_dir_all(&unique);
-    }
-
-    #[test]
-    fn project_socket_path_contains_hash_and_version() {
-        // Confirm the filename shape: airc-<16hex>-v<N>.sock
-        let unique = std::env::temp_dir().join(format!(
-            "airc-socket-shape-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        // SAFETY: env::set_var is unsafe in Rust 2024 due to inherent
-        // thread-safety concerns; tests run serially so this is OK.
-        unsafe {
-            std::env::set_var("AIRC_RUNTIME_DIR", &unique);
-        }
-        let pr = Path::new("/Users/joel/Development/airc");
-        let socket = project_socket_path(pr).expect("succeeds");
-        let name = socket.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("airc-"), "name starts with airc-: {name}");
-        assert!(name.ends_with(".sock"), "extension is .sock: {name}");
-        assert!(
-            name.contains(&format!("v{}", airc_ipc::IPC_PROTOCOL_VERSION)),
-            "version is embedded: {name}"
-        );
-        // SAFETY: env::set_var is unsafe in Rust 2024 due to inherent
-        // thread-safety concerns; tests run serially so this is OK.
-        unsafe {
-            std::env::remove_var("AIRC_RUNTIME_DIR");
         }
         let _ = std::fs::remove_dir_all(&unique);
     }

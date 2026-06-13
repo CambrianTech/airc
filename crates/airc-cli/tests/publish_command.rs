@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -15,7 +15,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn publish_emits_json_receipt_with_event_id_and_channel() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -55,7 +55,7 @@ fn publish_emits_json_receipt_with_event_id_and_channel() {
 
 #[test]
 fn publish_refuses_unsubscribed_room_with_clear_error() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -82,7 +82,7 @@ fn publish_refuses_unsubscribed_room_with_clear_error() {
 
 #[test]
 fn publish_requires_one_body_source() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);

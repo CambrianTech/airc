@@ -22,6 +22,7 @@
 //! - [`filter`]     — self-echo filtering for multi-tab consumers
 //! - [`headers`]    — envelope headers for routing/filtering without body parse
 //! - [`humanhash`]  — stable hash mnemonics for invite/client labels
+//! - [`temp_home`]  — temp-rooted scope-home detection (hermetic test daemons)
 //!
 //! Every public type a consumer needs is re-exported at the crate root so
 //! `use airc_core::Identity;` works without knowing the module split.
@@ -38,6 +39,7 @@ pub mod identity;
 pub mod ids;
 pub mod persona;
 pub mod receipt;
+pub mod temp_home;
 pub mod transcript;
 
 // Re-exports — the public API surface. Callers that want stable imports
@@ -55,4 +57,5 @@ pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
 pub use persona::{PersonaCapabilities, PersonaCapabilitiesError, PERSONA_CAPABILITIES_KEY};
 pub use receipt::{Receipt, ReceiptKind};
+pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};

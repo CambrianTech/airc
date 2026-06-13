@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -18,7 +18,7 @@ fn inbox_json_returns_count_events_cursor_shape() {
     // Just asserts the shape — the bare `airc init` flow may
     // emit lifecycle events (RoomJoined, presence beacons)
     // that land in inbox, so we don't pin a specific count.
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -50,7 +50,7 @@ fn inbox_json_returns_count_events_cursor_shape() {
 
 #[test]
 fn inbox_json_carries_events_plus_paging_cursor() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);

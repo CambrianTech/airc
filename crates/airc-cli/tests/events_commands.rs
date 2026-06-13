@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -11,7 +11,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn events_list_filters_by_kind_and_header_prefix() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -48,7 +48,7 @@ fn events_list_filters_by_kind_and_header_prefix() {
 
 #[test]
 fn events_list_json_emits_machine_readable_contract() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -102,7 +102,7 @@ fn events_list_json_emits_machine_readable_contract() {
 
 #[test]
 fn send_receipt_distinguishes_zero_paired_peers_without_lying_about_delivery() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);

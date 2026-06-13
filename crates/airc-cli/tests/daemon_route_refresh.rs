@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use airc_lib::{endpoints_to_json, Airc, PeerSpec, RouteEndpoint};
-use tempfile::TempDir;
+mod common;
 
 fn airc_bin() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -88,8 +88,8 @@ async fn daemon_dials_stored_endpoint_without_transport_health() {
 }
 
 async fn scenario() {
-    let tmp_alice = TempDir::new().expect("alice tempdir");
-    let tmp_bob = TempDir::new().expect("bob tempdir");
+    let tmp_alice = common::daemon_tempdir();
+    let tmp_bob = common::daemon_tempdir();
     let alice_home = tmp_alice.path().join(".airc");
     let bob_home = tmp_bob.path().join(".airc");
 

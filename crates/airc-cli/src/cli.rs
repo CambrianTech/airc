@@ -206,17 +206,12 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
     // SUN_LEN fallback root for deep-home cases (see machine_socket_path).
     // The OS per-user temp dir is short; never used for normal homes.
     let short_fallback = std::env::temp_dir();
-    let project_socket = home
-        .parent()
-        .map(|root| crate::runtime_dir::project_socket_path(root).ok())
-        .unwrap_or(None);
     let socket = resolve_socket_path(
         home,
         &machine_home,
         user_home.as_deref(),
         runtime_dir.as_deref(),
         Some(short_fallback.as_path()),
-        project_socket,
     );
     // runtime_dir() created ~/.airc/runtime, but the SUN_LEN fallback dir
     // (<temp>/airc) may not exist yet — ensure the chosen socket's parent
@@ -244,16 +239,12 @@ pub fn default_socket_path_in(home: &std::path::Path) -> PathBuf {
 ///   `$USERPROFILE`). `None` ⇒ treat every scope as isolated.
 /// - `runtime_dir`: result of [`crate::runtime_dir::runtime_dir`].
 ///   `None` ⇒ the legacy home-private fallback.
-/// - `project_socket`: result of
-///   [`crate::runtime_dir::project_socket_path`] for the scope's
-///   project root. Only consulted when the scope is isolated.
 fn resolve_socket_path(
     home: &std::path::Path,
     machine_home: &std::path::Path,
     user_home: Option<&std::path::Path>,
     runtime_dir: Option<&std::path::Path>,
     short_fallback_dir: Option<&std::path::Path>,
-    project_socket: Option<PathBuf>,
 ) -> PathBuf {
     // `machine_account_home(scope_home)` returns `$HOME/.airc` when
     // scope_home is under `$HOME`, otherwise returns scope_home
@@ -264,8 +255,8 @@ fn resolve_socket_path(
     //   (a) `home` IS literally `$HOME/.airc` — already
     //       machine-singular; share.
     //   (b) `home` is an isolated scope (CI temp dir, test root) —
-    //       use the per-project socket so parallel isolated scopes
-    //       don't collide.
+    //       derive the socket from the SCOPE HOME so parallel isolated
+    //       scopes don't collide and nothing lands under the user home.
     // Case (a) must be an EQUALITY check, not "machine_home under
     // user_home": on Windows `%TEMP%` lives under `%USERPROFILE%`, so
     // the prefix form classified temp-rooted isolated scopes as
@@ -301,10 +292,38 @@ fn resolve_socket_path(
             legacy_fallback,
         );
     }
-    // Isolated scope (CI temp, test root outside `$HOME`): per-project
-    // socket so multiple isolated tests can run in parallel without
-    // colliding on the same daemon.
-    project_socket.unwrap_or(legacy_fallback)
+    // Isolated scope (CI temp, test root outside `$HOME`): the socket
+    // derives from the DAEMON'S OWN HOME, never the user home — card
+    // f122b5b5. The prior form keyed the NAME by project-root hash but
+    // placed the FILE in `runtime_dir` = `~/.airc/runtime`, so every
+    // hermetic temp-home test daemon planted its socket (and stale
+    // remains: airc-10e8167b5d5b936d-v5.sock, observed live) under the
+    // PRODUCTION runtime dir. Same-home processes still rendezvous —
+    // they compute the same home-derived path — and parallel isolated
+    // scopes still can't collide (distinct homes ⇒ distinct paths).
+    //
+    // `legacy_fallback` IS `home/daemon-v<N>.sock` here (machine_home ==
+    // home for isolated scopes). Deep tempdir homes can overflow
+    // SUN_LEN, so fall back to the short OS temp dir with the home
+    // HASHED into the name — still derived from the daemon's home,
+    // still never under `~/.airc/runtime`.
+    if fits_socket_limit(&legacy_fallback) {
+        return legacy_fallback;
+    }
+    if let Some(short) = short_fallback_dir {
+        let candidate = short.join("airc").join(format!(
+            "airc-scope-{}-v{}.sock",
+            machine_account_key(home),
+            airc_ipc::IPC_PROTOCOL_VERSION
+        ));
+        if fits_socket_limit(&candidate) {
+            return candidate;
+        }
+    }
+    // Nothing shorter available — return the home-derived path and let
+    // bind surface a clear SUN_LEN error rather than silently landing
+    // in a shared directory.
+    legacy_fallback
 }
 
 /// `sockaddr_un.sun_path` is 104 bytes on macOS (incl. NUL) and 108 on
@@ -879,10 +898,6 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            // project_socket is irrelevant for machine-account scopes;
-            // pass a distinct value per call to assert we don't accidentally
-            // fall through to it.
-            Some(runtime_dir.join("airc-project-a-v0.sock")),
         );
         let socket_b = resolve_socket_path(
             &project_b,
@@ -890,7 +905,6 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            Some(runtime_dir.join("airc-project-b-v0.sock")),
         );
 
         assert_eq!(
@@ -916,7 +930,7 @@ mod tests {
     /// the real daemon. Pure path math, so this pins the Windows shape
     /// on every platform. With the b0a81c31 lib fix,
     /// `machine_account_home(temp_scope)` returns the scope itself, and
-    /// this function must then treat it as ISOLATED (per-project
+    /// this function must then treat it as ISOLATED (home-derived
     /// socket), never the machine-account socket.
     #[test]
     fn temp_rooted_scope_under_userprofile_never_resolves_the_machine_socket() {
@@ -927,7 +941,6 @@ mod tests {
         let temp_scope = user_home
             .join("AppData/Local/Temp/.tmpAbC123")
             .join("agent");
-        let project_socket = runtime_dir.join("airc-temp-scope-v0.sock");
 
         let socket = resolve_socket_path(
             &temp_scope,
@@ -937,15 +950,15 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            Some(project_socket.clone()),
         );
 
-        assert_eq!(
-            socket, project_socket,
+        assert!(
+            socket.starts_with(&temp_scope),
             "a temp-rooted scope under the user profile must stay \
-             isolated (per-project socket); resolving the machine \
+             isolated (home-derived socket); resolving the machine \
              socket here is how integration tests reached — and \
-             stopped — the production daemon (card b0a81c31 bite 3)"
+             stopped — the production daemon (card b0a81c31 bite 3); \
+             got {socket:?}"
         );
         // And the literal machine home keeps sharing (case (a) of the
         // clause this test tightened — equality, not prefix).
@@ -956,7 +969,6 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            Some(project_socket.clone()),
         );
         assert!(
             machine_socket.to_string_lossy().contains("airc-machine-"),
@@ -965,13 +977,14 @@ mod tests {
         );
     }
 
-    /// Card e51ab14e: scopes OUTSIDE the OS user account (CI temp
-    /// roots, isolated test trees) keep their per-project socket so
-    /// parallel test runs do not collide on the same daemon. This
-    /// preserves PR #1040's original guarantee for the case it was
-    /// solving for.
+    /// Card e51ab14e + f122b5b5: scopes OUTSIDE the OS user account
+    /// (CI temp roots, isolated test trees) get HOME-DERIVED sockets so
+    /// parallel test runs do not collide on the same daemon — and so
+    /// nothing they create lands under the user home. This preserves
+    /// PR #1040's isolation guarantee while moving the file out of
+    /// `~/.airc/runtime`.
     #[test]
-    fn isolated_scopes_outside_user_home_keep_per_project_sockets() {
+    fn isolated_scopes_outside_user_home_get_home_derived_sockets() {
         use super::resolve_socket_path;
         let user_home = std::path::PathBuf::from("/synthetic/user-home");
         let runtime_dir = std::path::PathBuf::from("/synthetic/runtime");
@@ -980,8 +993,6 @@ mod tests {
         // (production behaviour). Pass the same here.
         let scope_a = std::path::PathBuf::from("/synthetic/isolated/a/.airc");
         let scope_b = std::path::PathBuf::from("/synthetic/isolated/b/.airc");
-        let project_socket_a = runtime_dir.join("airc-isolated-a-v0.sock");
-        let project_socket_b = runtime_dir.join("airc-isolated-b-v0.sock");
 
         let socket_a = resolve_socket_path(
             &scope_a,
@@ -989,7 +1000,6 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            Some(project_socket_a.clone()),
         );
         let socket_b = resolve_socket_path(
             &scope_b,
@@ -997,18 +1007,59 @@ mod tests {
             Some(user_home.as_path()),
             Some(runtime_dir.as_path()),
             None,
-            Some(project_socket_b.clone()),
         );
 
         assert_ne!(
             socket_a, socket_b,
             "isolated scopes outside the OS user account must keep \
-             per-project sockets so parallel test runs don't collide; \
+             distinct sockets so parallel test runs don't collide; \
              got the same socket for two unrelated isolated roots: \
              {socket_a:?}"
         );
-        assert_eq!(socket_a, project_socket_a);
-        assert_eq!(socket_b, project_socket_b);
+        assert!(socket_a.starts_with(&scope_a), "home-derived: {socket_a:?}");
+        assert!(socket_b.starts_with(&scope_b), "home-derived: {socket_b:?}");
+    }
+
+    /// Card f122b5b5 PIN — the production-pollution bug. An EXPLICIT
+    /// temp home (a hermetic test daemon's `--home` under the OS temp
+    /// dir, with the operator's REAL user home + runtime dir in env)
+    /// must NEVER resolve a socket under the user's `~/.airc/runtime`.
+    /// The pre-fix code keyed the socket NAME by project-root hash but
+    /// placed the FILE in `runtime_dir`, which is how the stale
+    /// `airc-10e8167b5d5b936d-v5.sock` landed in the production
+    /// `~/.airc/runtime` (observed live, card body). Mutation: revert
+    /// the isolated branch to the runtime-dir placement → this fails.
+    #[test]
+    fn explicit_temp_home_never_places_socket_under_user_runtime_dir() {
+        use super::resolve_socket_path;
+        let user_home = std::path::PathBuf::from("/Users/operator");
+        let runtime_dir = user_home.join(".airc").join("runtime");
+        // The literal shape of a leaked daemon's home: tempfile tempdir
+        // under macOS's /var/folders, no HOME override.
+        let temp_home = std::path::PathBuf::from("/var/folders/8d/x/T/.tmpQwErTy/agent");
+
+        let socket = resolve_socket_path(
+            &temp_home,
+            &temp_home, // machine_account_home(temp) == temp (isolated)
+            Some(user_home.as_path()),
+            Some(runtime_dir.as_path()),
+            Some(std::path::Path::new("/tmp")),
+        );
+
+        assert!(
+            !socket.starts_with(&runtime_dir) && !socket.starts_with(&user_home),
+            "an explicit temp home must NEVER place its socket under the \
+             user home / production runtime dir (card f122b5b5), got {socket:?}"
+        );
+        assert!(
+            socket.starts_with(&temp_home) || socket.starts_with("/tmp"),
+            "the socket must derive from the daemon's own home (or the \
+             short temp fallback hashed from it), got {socket:?}"
+        );
+        assert!(
+            socket.as_os_str().len() < super::MAX_SOCKET_PATH_LEN,
+            "and it must still fit sockaddr_un: {socket:?}"
+        );
     }
 
     /// Card e51ab14e: when `runtime_dir` resolution fails (`$HOME`
@@ -1027,7 +1078,6 @@ mod tests {
             &project,
             &machine_home,
             Some(user_home.as_path()),
-            None,
             None,
             None,
         );
@@ -1062,7 +1112,6 @@ mod tests {
             Some(user_home.as_path()),
             Some(deep_runtime.as_path()),
             Some(short_fallback.as_path()),
-            None,
         );
 
         assert!(

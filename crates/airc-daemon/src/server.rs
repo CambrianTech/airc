@@ -14,7 +14,9 @@
 //! on Unix; no-op on Windows) and returns.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use futures::StreamExt;
@@ -76,11 +78,26 @@ impl From<std::io::Error> for DaemonError {
 
 /// Run the daemon: bind the IPC listener, serve connections until
 /// shutdown. Returns when the shutdown notifier fires (typically from
-/// a Stop request handler) or the listener errors.
+/// a Stop request handler), the temp-home idle watchdog trips (card
+/// f122b5b5), or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
     let _guard = DaemonBindGuard::acquire(&socket_path)?;
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
+
+    // Card f122b5b5: write `<home>/daemon.pid` once the bind guard is
+    // held (only the WINNING daemon for this socket writes), so test
+    // harnesses and operators have a portable kill handle for daemons
+    // they spawned. Removed on graceful exit by the guard below.
+    let _pid_file = PidFileGuard::write(&state.home);
+
+    // Card f122b5b5 belt-and-braces: a daemon whose home is temp-rooted
+    // (#1150 detection) is a hermetic test daemon — if its test runner
+    // dies without tearing it down (SIGKILL escapes every Drop guard),
+    // it must exit BY ITSELF once no client has been connected for the
+    // idle window. Production homes never start this watchdog.
+    let idle_tracker = IdleTracker::new();
+    let watchdog = spawn_temp_home_idle_watchdog(&state, &idle_tracker);
 
     // Keep ONE `Notified` future alive across loop iterations. `select!`
     // otherwise creates and drops a fresh `notified()` each turn, leaving
@@ -102,7 +119,11 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
             accept = listener.accept() => {
                 let stream = accept?;
                 let state = state.clone();
+                let connection = idle_tracker.connection_opened();
                 tokio::spawn(async move {
+                    // Held for the connection's whole life; dropping it
+                    // stamps the idle clock for the watchdog.
+                    let _connection = connection;
                     if let Err(error) = handle_connection(stream, state).await {
                         StderrJsonDiagnosticSink.emit(
                             DiagnosticEvent::error(
@@ -122,7 +143,170 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     // socket file; on Windows named pipes are GCd when handles
     // close, so the call is a no-op.
     listener.cleanup();
+    if let Some(watchdog) = watchdog {
+        watchdog.abort();
+    }
     Ok(())
+}
+
+/// Default idle window for the temp-home self-exit policy: five
+/// minutes without a single connected client. Long enough that a
+/// healthy test (bounded waits, card d2ba719c) never trips it;
+/// short enough that an orphaned daemon frees its RAM + event loop
+/// promptly instead of accumulating by the hundreds (card f122b5b5:
+/// 800+ leaked temp-home daemons killed by hand in one session).
+const TEMP_HOME_IDLE_EXIT_DEFAULT: Duration = Duration::from_secs(300);
+
+/// Env override for the idle window, in milliseconds
+/// (`AIRC_TEMP_HOME_IDLE_EXIT_MS`). Exists so the self-exit tests can
+/// run the policy in seconds, not minutes; a malformed value falls
+/// back to the default LOUDLY rather than disabling the policy.
+const TEMP_HOME_IDLE_EXIT_ENV: &str = "AIRC_TEMP_HOME_IDLE_EXIT_MS";
+
+fn temp_home_idle_exit_window() -> Duration {
+    let Some(raw) = std::env::var_os(TEMP_HOME_IDLE_EXIT_ENV) else {
+        return TEMP_HOME_IDLE_EXIT_DEFAULT;
+    };
+    match raw.to_str().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => {
+            eprintln!(
+                "airc daemon: ignoring malformed {TEMP_HOME_IDLE_EXIT_ENV}={raw:?} — \
+                 using default {TEMP_HOME_IDLE_EXIT_DEFAULT:?}"
+            );
+            TEMP_HOME_IDLE_EXIT_DEFAULT
+        }
+    }
+}
+
+/// Card f122b5b5: when the daemon's home is temp-rooted (#1150's
+/// detection — hermetic test/CI daemon, never production), spawn a
+/// watchdog that fires the shutdown notifier once no client has been
+/// connected for the idle window. Returns `None` for production homes
+/// — the policy cannot touch them by construction.
+fn spawn_temp_home_idle_watchdog(
+    state: &Arc<DaemonState>,
+    tracker: &Arc<IdleTracker>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !airc_core::scope_home_is_temp_rooted(&state.home) {
+        return None;
+    }
+    let window = temp_home_idle_exit_window();
+    eprintln!(
+        "airc daemon: temp-home idle self-exit policy ACTIVE (card f122b5b5) — home {} is \
+         temp-rooted; exiting after {window:?} with no connected client \
+         (override: {TEMP_HOME_IDLE_EXIT_ENV})",
+        state.home.display()
+    );
+    let state = state.clone();
+    let tracker = tracker.clone();
+    // Poll often enough that a test-configured sub-second window trips
+    // promptly, but never busier than 20Hz and never lazier than 5s.
+    let poll = (window / 10).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            let Some(idle) = tracker.idle_for() else {
+                continue; // a client is connected — never exit under it
+            };
+            if idle >= window {
+                eprintln!(
+                    "airc daemon: temp-home idle self-exit (card f122b5b5) — no client \
+                     connected for {idle:?} (window {window:?}) and home {} is temp-rooted; \
+                     shutting down",
+                    state.home.display()
+                );
+                state.shutdown.notify_waiters();
+                return;
+            }
+        }
+    }))
+}
+
+/// Tracks live connections + the instant the daemon last went idle,
+/// for the temp-home self-exit watchdog. Time is stored as millis
+/// elapsed since `start` so the hot paths stay lock-free atomics.
+struct IdleTracker {
+    start: Instant,
+    connections: AtomicUsize,
+    last_activity_ms: AtomicU64,
+}
+
+impl IdleTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            connections: AtomicUsize::new(0),
+            last_activity_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// Register a newly accepted connection. The returned guard MUST
+    /// live as long as the connection task — its Drop is what marks
+    /// the connection closed and stamps the idle clock.
+    fn connection_opened(self: &Arc<Self>) -> ConnectionGuard {
+        self.connections.fetch_add(1, Ordering::SeqCst);
+        ConnectionGuard(self.clone())
+    }
+
+    /// `Some(duration since the daemon last had a client)` when no
+    /// client is connected; `None` while any connection is live.
+    fn idle_for(&self) -> Option<Duration> {
+        if self.connections.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let last = Duration::from_millis(self.last_activity_ms.load(Ordering::SeqCst));
+        Some(self.start.elapsed().saturating_sub(last))
+    }
+
+    fn stamp_activity(&self) {
+        let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_activity_ms.store(elapsed_ms, Ordering::SeqCst);
+    }
+}
+
+/// Drop = connection closed: decrement the live count and stamp the
+/// idle clock so the watchdog's window starts from the LAST disconnect,
+/// not daemon start.
+struct ConnectionGuard(Arc<IdleTracker>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.stamp_activity();
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Card f122b5b5: `<home>/daemon.pid` — written while the daemon runs,
+/// removed on graceful exit. Best-effort and informational: readers
+/// (test teardown guards, operators) must verify liveness before
+/// trusting it. Failure to write is loud but non-fatal — a daemon that
+/// can't record its pid still serves.
+struct PidFileGuard {
+    path: PathBuf,
+}
+
+impl PidFileGuard {
+    fn write(home: &Path) -> Option<Self> {
+        let path = home.join("daemon.pid");
+        match std::fs::write(&path, format!("{}\n", std::process::id())) {
+            Ok(()) => Some(Self { path }),
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: could not write pid file {} ({error}) — teardown \
+                     guards will not find this daemon by pid",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 struct DaemonBindGuard {

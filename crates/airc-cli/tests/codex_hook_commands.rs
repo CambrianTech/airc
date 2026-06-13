@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
-use tempfile::TempDir;
+mod common;
 
 fn airc_core() -> &'static str {
     env!("CARGO_BIN_EXE_airc")
@@ -15,7 +15,7 @@ fn airc_core() -> &'static str {
 
 #[test]
 fn codex_hook_emits_context_and_advances_cursor() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -45,7 +45,7 @@ fn codex_hook_emits_context_and_advances_cursor() {
 
 #[test]
 fn codex_hook_excludes_self_echoes_but_still_advances_cursor() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -67,7 +67,7 @@ fn codex_hook_excludes_self_echoes_but_still_advances_cursor() {
 
 #[test]
 fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -87,7 +87,7 @@ fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
 
 #[test]
 fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -104,7 +104,7 @@ fn codex_hook_keeps_stamped_peer_events_when_runtime_client_is_unknown() {
 
 #[test]
 fn codex_hook_suggests_claimable_work_on_work_events() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -132,7 +132,7 @@ fn codex_hook_suggests_claimable_work_on_work_events() {
 
 #[test]
 fn codex_hook_suggests_availability_on_availability_events() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -162,7 +162,7 @@ fn codex_hook_suggests_availability_on_availability_events() {
 
 #[test]
 fn codex_hook_raw_mode_preserves_full_event_lines() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -186,7 +186,7 @@ fn codex_hook_raw_mode_preserves_full_event_lines() {
 
 #[test]
 fn codex_hook_poll_prints_plain_digest_and_advances_cursor() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -211,7 +211,7 @@ fn codex_hook_poll_prints_plain_digest_and_advances_cursor() {
 
 #[test]
 fn codex_hook_poll_filters_runtime_self_echoes() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -235,7 +235,7 @@ fn codex_hook_poll_filters_runtime_self_echoes() {
 
 #[test]
 fn codex_hook_poll_waits_for_one_new_event() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
@@ -265,7 +265,7 @@ fn codex_hook_poll_waits_for_one_new_event() {
 
 #[test]
 fn codex_hook_installer_replaces_existing_managed_hook() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");
@@ -311,7 +311,7 @@ fn codex_hook_installer_replaces_existing_managed_hook() {
 
 #[test]
 fn codex_hook_installer_replaces_existing_managed_hook_command() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");
@@ -351,7 +351,7 @@ fn codex_hook_installer_replaces_existing_managed_hook_command() {
 
 #[test]
 fn codex_hook_installer_adds_turn_contract_when_unset() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");
@@ -376,7 +376,7 @@ fn codex_hook_installer_adds_turn_contract_when_unset() {
 
 #[test]
 fn codex_hook_installer_preserves_custom_developer_instructions() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");
@@ -405,7 +405,7 @@ fn codex_hook_installer_preserves_custom_developer_instructions() {
 
 #[test]
 fn codex_hook_installer_removes_managed_filesystem_profile() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");
@@ -447,7 +447,7 @@ enabled = true
 
 #[test]
 fn codex_hook_uninstaller_removes_managed_hooks_only() {
-    let workspace = TempDir::new().expect("tempdir");
+    let workspace = common::daemon_tempdir();
     let home = workspace.path().join("airc");
     let codex_home = workspace.path().join("codex");
     std::fs::create_dir_all(&codex_home).expect("codex home");

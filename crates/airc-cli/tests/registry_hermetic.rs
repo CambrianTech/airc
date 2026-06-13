@@ -16,6 +16,8 @@
 //! ubuntu + macos, so the gate is pinned on both.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -117,7 +119,7 @@ fn sync_command(home: &Path, stub: &StubGh) -> Command {
 /// must record zero rendezvous calls.
 #[test]
 fn registry_sync_honors_disable_env_and_publishes_nothing() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = common::daemon_tempdir();
     let stub = StubGh::install(tmp.path());
     let home = tmp.path().join("scope/.airc");
     std::fs::create_dir_all(&home).expect("home");
@@ -153,7 +155,7 @@ fn registry_sync_honors_disable_env_and_publishes_nothing() {
 /// still refuse, loudly, with zero rendezvous calls.
 #[test]
 fn registry_sync_refuses_temp_home_even_without_env() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = common::daemon_tempdir();
     let stub = StubGh::install(tmp.path());
     let home = tmp.path().join("scope/.airc");
     std::fs::create_dir_all(&home).expect("home");
@@ -236,7 +238,7 @@ fn wait_for_log(home: &Path, needle: &str, budget: Duration) -> String {
 /// naming the env gate, and never touches gh.
 #[test]
 fn daemon_with_disable_env_never_runs_registry_loop() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = common::daemon_tempdir();
     let stub = StubGh::install(tmp.path());
     let home = tmp.path().join("scope/.airc");
     std::fs::create_dir_all(&home).expect("home");
@@ -265,7 +267,7 @@ fn daemon_with_disable_env_never_runs_registry_loop() {
 /// loop loudly.
 #[test]
 fn daemon_with_temp_home_never_runs_registry_loop() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = common::daemon_tempdir();
     let stub = StubGh::install(tmp.path());
     let home = tmp.path().join("scope/.airc");
     std::fs::create_dir_all(&home).expect("home");
