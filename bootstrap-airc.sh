@@ -72,6 +72,35 @@ if ! git config --global --get-all credential.https://github.com.helper 2>/dev/n
   gh auth setup-git 2>/dev/null && ok "gh token wired into git credential helper" || true
 fi
 
+# 3b. Git author identity. install.sh sets this too, but on the bootstrap
+# path install.sh runs BEFORE gh auth (non-TTY curl|bash), so its
+# identity block is skipped — and without this the first agent commit
+# dies with "Author identity unknown". Derive from the authenticated gh
+# account when unset; never clobber an identity the user already set.
+# Public email, else the <id>+<login> noreply alias. No hardcoded values.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  _need_name=0; _need_email=0
+  if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
+  if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
+  if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
+    _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
+    _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+    _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
+    _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
+    if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
+      _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
+    fi
+    if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
+      git config --global user.name "$_gh_name"
+      ok "git user.name set from gh: $_gh_name"
+    fi
+    if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
+      git config --global user.email "$_gh_email"
+      ok "git user.email set from gh: $_gh_email"
+    fi
+  fi
+fi
+
 # 4. join the room
 if [ -n "$MNEMONIC" ]; then
   step "Joining room via mnemonic / gist-id: $MNEMONIC"
