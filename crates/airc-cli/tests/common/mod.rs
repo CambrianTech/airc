@@ -53,11 +53,50 @@ impl Drop for DaemonTempDir {
     }
 }
 
-/// Walk `root` for `daemon.pid` files and reap the processes they
-/// name: SIGTERM, poll until gone (the daemon's graceful path removes
-/// its socket + pidfile), escalate to SIGKILL at the deadline. Pid 0 /
-/// our own pid are never signalled.
+/// Reap every airc daemon belonging to `root`: SIGTERM, poll until
+/// gone (the daemon's graceful path removes its socket + pidfile),
+/// escalate to SIGKILL at the deadline. Pid 0 / our own pid are never
+/// signalled.
+///
+/// TWO discovery sources, unioned, because a daemon's `daemon.pid`
+/// lands in `machine_account_home(home)` — which, depending on whether
+/// the spawning process had `HOME` pointed at the tempdir, may be
+/// `<root>/.airc`, `<scope>/.airc`, or the isolated scope itself. The
+/// pid-file walk catches the common cases, but a `ps`-scan for any
+/// `airc … daemon` whose `--home`/`--socket` argument lives under
+/// `root` is the belt-and-braces that catches the rest (the macOS-only
+/// isolated-`codex`-scope leak the CI guard found). Process scan is
+/// Unix-only; Windows relies on the pid-file walk + the daemon's own
+/// temp-home self-exit.
 pub fn reap_daemons_under(root: &Path) {
+    // A few bounded sweeps, because a daemon spawned by a DETACHED
+    // grandchild (`ensure_daemon_running` → `setsid`) can appear a beat
+    // AFTER the test body returns — on a loaded CI runner it may not
+    // exist yet at the first sweep (the macOS race the zero-leak guard
+    // caught). Re-scan a couple times with a short settle so a
+    // late-arriving daemon is still reaped. Stops early once a sweep
+    // finds nothing.
+    for sweep in 0..4 {
+        let mut pids = pids_from_pidfiles(root);
+        pids.extend(pids_from_process_scan(root));
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.is_empty() {
+            if sweep > 0 {
+                return; // a clean follow-up sweep — nothing late arrived
+            }
+        } else {
+            for pid in pids {
+                reap_pid(pid);
+            }
+        }
+        // Brief settle for a detached daemon mid-spawn to become visible.
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// `daemon.pid` files anywhere under `root`.
+fn pids_from_pidfiles(root: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -75,9 +114,47 @@ pub fn reap_daemons_under(root: &Path) {
             }
         }
     }
-    for pid in pids {
-        reap_pid(pid);
+    pids
+}
+
+/// Running `airc … daemon …` processes whose command line references a
+/// path under `root` (its `--home` or `--socket`). Catches daemons
+/// whose pid file landed outside the walked tree, or never got written.
+#[cfg(unix)]
+fn pids_from_process_scan(root: &Path) -> Vec<u32> {
+    let Some(root_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = match std::process::Command::new("ps")
+        .args(["-Ao", "pid=,args="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Vec::new(),
+    };
+    let me = std::process::id();
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let line = line.trim_start();
+        let Some((pid_str, args)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        // An airc daemon process whose args mention a path under root.
+        if !(args.contains("airc") && args.contains(" daemon") && args.contains(root_str)) {
+            continue;
+        }
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if pid != 0 && pid != me {
+                pids.push(pid);
+            }
+        }
     }
+    pids
+}
+
+#[cfg(not(unix))]
+fn pids_from_process_scan(_root: &Path) -> Vec<u32> {
+    Vec::new()
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
