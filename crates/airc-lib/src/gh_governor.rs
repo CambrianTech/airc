@@ -120,40 +120,74 @@ impl GhBudget {
         Ok((self.recent_count(now)?, max_requests_per_min()))
     }
 
-    /// Feed GitHub's OWN signal back into the governor: parse a gh
-    /// `--include` response (status line + headers) or any text carrying
-    /// `retry-after` / `x-ratelimit-remaining` / `x-ratelimit-reset` and,
-    /// when GitHub says we're out of quota, arm the shared backoff until
-    /// its reset. This is how the governor honors the real limit instead
-    /// of only its local 30/min guess.
+    /// Feed GitHub's OWN signal back into the governor — GitHub returns
+    /// BOTH limiters on (almost) every response, so a `gh api --include`
+    /// reply is the live source of truth, not our local guess:
+    ///
+    /// - **Primary** (`x-ratelimit-remaining` / `x-ratelimit-reset`,
+    ///   ~5000/hr): persisted as the per-machine quota snapshot and, when
+    ///   remaining drops to the safety floor, the shared backoff is armed
+    ///   until reset — so we stop *before* hitting zero rather than after.
+    /// - **Secondary** (`retry-after` on abuse/secondary limits): armed
+    ///   immediately for that many seconds.
+    ///
+    /// Call this on EVERY response (success included), so the snapshot
+    /// stays current across the machine's tabs/daemons.
     pub fn note_rate_limit(&self, response_text: &str) {
         let body = response_text.to_ascii_lowercase();
         if body.is_empty() {
             return;
         }
         let now = now_seconds();
-        let mut until = 0.0;
+
+        // Secondary limiter: honor retry-after verbatim.
         if let Some(retry) =
             header_value(&body, "retry-after").and_then(|v| v.trim().parse::<f64>().ok())
         {
-            until = now + retry.max(1.0);
-        } else {
-            let remaining = header_value(&body, "x-ratelimit-remaining");
-            let reset =
-                header_value(&body, "x-ratelimit-reset").and_then(|v| v.trim().parse::<f64>().ok());
-            if remaining.as_deref().map(str::trim) == Some("0") {
-                if let Some(reset) = reset {
-                    until = reset;
-                }
-            } else if body.contains("secondary rate limit")
-                || body.contains("rate limit exceeded")
-                || body.contains("abuse detection")
-            {
-                until = now + 60.0;
-            }
+            let _ = self.write_backoff(now + retry.max(1.0));
+            return;
         }
-        if until > now {
-            let _ = self.write_backoff(until);
+
+        // Primary limiter: persist the live remaining/reset and throttle
+        // at the floor (keep headroom) instead of waiting for 0.
+        let remaining = header_value(&body, "x-ratelimit-remaining")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let reset =
+            header_value(&body, "x-ratelimit-reset").and_then(|v| v.trim().parse::<f64>().ok());
+        if let (Some(remaining), Some(reset)) = (remaining, reset) {
+            self.write_quota(remaining, reset);
+            if remaining <= quota_floor() && reset > now {
+                let _ = self.write_backoff(reset);
+            }
+            return;
+        }
+
+        // No headers (gh ran without --include) — fall back to the
+        // prose signals gh prints when a limit is actually hit.
+        if body.contains("secondary rate limit")
+            || body.contains("rate limit exceeded")
+            || body.contains("abuse detection")
+        {
+            let _ = self.write_backoff(now + 60.0);
+        }
+    }
+
+    /// The most recent primary-quota snapshot read off GitHub's headers:
+    /// `(remaining, reset_epoch_secs)`. `None` until the first
+    /// header-bearing response. For `airc gh` / the churn harness.
+    pub fn quota_snapshot(&self) -> Option<(u64, f64)> {
+        let raw = fs::read_to_string(self.dir.join("quota")).ok()?;
+        let mut parts = raw.split_whitespace();
+        let remaining = parts.next()?.parse::<u64>().ok()?;
+        let reset = parts.next()?.parse::<f64>().ok()?;
+        Some((remaining, reset))
+    }
+
+    fn write_quota(&self, remaining: u64, reset: f64) {
+        let path = self.dir.join("quota");
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&tmp, format!("{remaining} {}", reset as i64)).is_ok() {
+            let _ = fs::rename(tmp, path);
         }
     }
 
@@ -258,6 +292,20 @@ fn max_requests_per_min() -> usize {
         .unwrap_or(DEFAULT_MAX_REQUESTS_PER_MIN)
 }
 
+/// Keep this many primary-limit requests in reserve. When GitHub's
+/// `x-ratelimit-remaining` falls to this floor the governor backs off
+/// until reset, so a misbehaving consumer can't burn the account's last
+/// requests out from under interactive `gh` use. Overridable via
+/// `AIRC_GH_QUOTA_FLOOR`.
+pub const DEFAULT_QUOTA_FLOOR: u64 = 50;
+
+fn quota_floor() -> u64 {
+    std::env::var("AIRC_GH_QUOTA_FLOOR")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_QUOTA_FLOOR)
+}
+
 /// `~/.airc/gh/` — the shared production state dir (same as the cli
 /// governor). Falls back to a temp `.airc` when no home env exists so the
 /// governor still functions headlessly rather than panicking.
@@ -358,6 +406,40 @@ mod tests {
             .unwrap();
         assert!(!denied.allowed(), "must respect GitHub's reset window");
         assert!(b.backoff_wait_secs(now_seconds()) > 0);
+    }
+
+    #[test]
+    fn note_rate_limit_throttles_at_the_floor_not_just_zero() {
+        // what this catches: the governor stops BEFORE exhausting
+        // GitHub's primary quota — at the safety floor, with the live
+        // remaining/reset recorded per-machine for every scope to see.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let b = budget(tmp.path());
+        std::env::set_var("AIRC_GH_QUOTA_FLOOR", "50");
+        let reset = now_seconds() + 600.0;
+        // 40 remaining is below the floor of 50 → back off until reset.
+        b.note_rate_limit(&format!(
+            "x-ratelimit-remaining: 40\nx-ratelimit-reset: {}\n",
+            reset as i64
+        ));
+        assert_eq!(b.quota_snapshot().map(|(r, _)| r), Some(40));
+        assert!(!b
+            .reserve(&["api".into(), "/x".into()], now_seconds())
+            .unwrap()
+            .allowed());
+        // Plenty of headroom → recorded, NOT throttled.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let b2 = budget(tmp2.path());
+        b2.note_rate_limit(&format!(
+            "x-ratelimit-remaining: 4900\nx-ratelimit-reset: {}\n",
+            reset as i64
+        ));
+        assert_eq!(b2.quota_snapshot().map(|(r, _)| r), Some(4900));
+        assert!(b2
+            .reserve(&["api".into(), "/x".into()], now_seconds())
+            .unwrap()
+            .allowed());
+        std::env::remove_var("AIRC_GH_QUOTA_FLOOR");
     }
 
     #[test]

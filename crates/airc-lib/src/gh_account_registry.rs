@@ -297,6 +297,13 @@ pub struct GhAccountRegistryStore {
     /// (a manual `registry sync` runs in the operator's live session,
     /// where env/keyring are already current).
     token_override: Option<GhTokenOverride>,
+    /// The single gh request governor. Every `gh_run` reserves against
+    /// this before spawning and feeds the response back through
+    /// `note_rate_limit`, so the registry loop — the biggest gh consumer
+    /// — can no longer spam GitHub around the counter. Defaults to the
+    /// shared account budget (`~/.airc/gh/`) so it coordinates with the
+    /// cli governor and every other scope; tests inject an isolated one.
+    budget: crate::gh_governor::GhBudget,
 }
 
 impl GhAccountRegistryStore {
@@ -318,12 +325,21 @@ impl GhAccountRegistryStore {
             store,
             scope_home: scope_home.into(),
             token_override: None,
+            budget: crate::gh_governor::GhBudget::account_default(),
         }
     }
 
     /// Override the `gh` binary path. Used in tests.
     pub fn with_bin(mut self, gh_bin: impl Into<PathBuf>) -> Self {
         self.gh_bin = gh_bin.into();
+        self
+    }
+
+    /// Inject an isolated gh budget (test-only): point the governor at a
+    /// throwaway dir so a test asserts the registry store's gh footprint
+    /// without touching the operator's real `~/.airc/gh/` counter.
+    pub fn with_budget(mut self, budget: crate::gh_governor::GhBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -390,6 +406,29 @@ impl GhAccountRegistryStore {
         args: &[&str],
         stdin: Option<&str>,
     ) -> Result<(bool, String, String), AccountRegistryError> {
+        // Single chokepoint: reserve against the governor before any gh
+        // spawn. A denial (local 60s budget blown, or GitHub's own
+        // rate-limit backoff active) skips the call — the refresh loop
+        // catches the error and waits for the next tick, which is the
+        // correct "don't spam gh" behavior, not a hard failure.
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        match self
+            .budget
+            .reserve(&owned, crate::gh_governor::now_seconds())
+        {
+            Ok(crate::gh_governor::Reservation::Denied {
+                retry_after_secs,
+                reason,
+            }) => {
+                return Err(AccountRegistryError::Adapter(format!(
+                    "gh governor: {reason}; retry in {retry_after_secs}s"
+                )));
+            }
+            // Allowed, or a governor I/O glitch: fail OPEN so a filesystem
+            // hiccup can't brick the mesh — the 60s budget + GitHub's
+            // headers remain the backstop.
+            Ok(crate::gh_governor::Reservation::Allowed) | Err(_) => {}
+        }
         let mut cmd = Command::new(&self.gh_bin);
         cmd.args(args);
         // Recovered-token override (card 1f2cbffa): a fresh token the
@@ -418,11 +457,18 @@ impl GhAccountRegistryStore {
         let output = child.wait_with_output().await.map_err(|error| {
             AccountRegistryError::Adapter(format!("wait gh {}: {error}", args.join(" ")))
         })?;
-        Ok((
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ))
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Feed GitHub's own signal back into the shared governor on EVERY
+        // response (success included): with `--include`, gh surfaces the
+        // `x-ratelimit-*` headers GitHub returns for all requests, so the
+        // governor keeps a live per-machine quota snapshot and throttles
+        // at the floor; on a limit response the `retry-after` /
+        // secondary-limit text arms the shared backoff until reset. Every
+        // scope on the machine then honors GitHub's real quota, not a guess.
+        self.budget.note_rate_limit(&stdout);
+        self.budget.note_rate_limit(&stderr);
+        Ok((output.status.success(), stdout, stderr))
     }
 
     /// List the authenticated account's registry gists (one per
