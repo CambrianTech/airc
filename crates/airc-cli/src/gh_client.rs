@@ -20,7 +20,7 @@
 //! `gh` CLI binary on PATH.
 //!
 //! The trait and value types are re-exported here from
-//! [`airc_lib::gh_client`] so existing crate-internal `use
+//! [`airc_lib::gh::client`] so existing crate-internal `use
 //! crate::gh_client::PrView` paths continue to work — the types
 //! remain a single source of truth in airc-lib; the CLI just
 //! pulls them in for its own consumers.
@@ -28,7 +28,7 @@
 use async_trait::async_trait;
 use tokio::process::Command;
 
-pub use airc_lib::gh_client::{
+pub use airc_lib::gh::client::{
     parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt,
     PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
 };
@@ -150,7 +150,7 @@ impl GhClient for ShellGhClient {
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
-        airc_lib::gh_client::parse_check_runs(&output.stdout)
+        airc_lib::gh::client::parse_check_runs(&output.stdout)
     }
 }
 

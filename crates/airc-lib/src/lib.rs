@@ -47,9 +47,7 @@ pub mod delivery_ack;
 pub mod diagnostic_event_sink;
 pub mod error;
 pub mod external_identity;
-pub mod gh_account_registry;
-pub mod gh_client;
-pub mod gh_governor;
+pub mod gh;
 pub mod join_context;
 mod lan;
 pub mod lane_coordination;
@@ -128,15 +126,16 @@ pub use external_identity::{
     BridgedMessage, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource,
     HEADER_BRIDGE_HANDLE, HEADER_BRIDGE_SOURCE,
 };
-pub use gh_account_registry::{
+pub use gh::account_registry::{
     account_registry_block, gh_auth_ready, gh_auth_ready_with_token, re_resolve_gh_token,
     writer_filename, writer_key, AccountRegistryBlock, GhAccountRegistryStore, GhTokenOverride,
     AIRC_DISABLE_ACCOUNT_REGISTRY_ENV, GH_AUTH_READY_TIMEOUT,
 };
-pub use gh_client::{
+pub use gh::client::{
     parse_pr_url, parse_pr_view, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
     PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
 };
+pub use gh::governor::{GhBudget, Reservation};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
 pub use lane_coordination::{
     LaneAction, LaneCoordinationEvent, LaneStatus, HEADER_COORD_KIND, HEADER_COORD_LANE_ID,

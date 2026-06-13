@@ -303,7 +303,7 @@ pub struct GhAccountRegistryStore {
     /// — can no longer spam GitHub around the counter. Defaults to the
     /// shared account budget (`~/.airc/gh/`) so it coordinates with the
     /// cli governor and every other scope; tests inject an isolated one.
-    budget: crate::gh_governor::GhBudget,
+    budget: crate::gh::governor::GhBudget,
 }
 
 impl GhAccountRegistryStore {
@@ -325,7 +325,7 @@ impl GhAccountRegistryStore {
             store,
             scope_home: scope_home.into(),
             token_override: None,
-            budget: crate::gh_governor::GhBudget::account_default(),
+            budget: crate::gh::governor::GhBudget::account_default(),
         }
     }
 
@@ -338,7 +338,7 @@ impl GhAccountRegistryStore {
     /// Inject an isolated gh budget (test-only): point the governor at a
     /// throwaway dir so a test asserts the registry store's gh footprint
     /// without touching the operator's real `~/.airc/gh/` counter.
-    pub fn with_budget(mut self, budget: crate::gh_governor::GhBudget) -> Self {
+    pub fn with_budget(mut self, budget: crate::gh::governor::GhBudget) -> Self {
         self.budget = budget;
         self
     }
@@ -414,9 +414,9 @@ impl GhAccountRegistryStore {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         match self
             .budget
-            .reserve(&owned, crate::gh_governor::now_seconds())
+            .reserve(&owned, crate::gh::governor::now_seconds())
         {
-            Ok(crate::gh_governor::Reservation::Denied {
+            Ok(crate::gh::governor::Reservation::Denied {
                 retry_after_secs,
                 reason,
             }) => {
@@ -427,7 +427,7 @@ impl GhAccountRegistryStore {
             // Allowed, or a governor I/O glitch: fail OPEN so a filesystem
             // hiccup can't brick the mesh — the 60s budget + GitHub's
             // headers remain the backstop.
-            Ok(crate::gh_governor::Reservation::Allowed) | Err(_) => {}
+            Ok(crate::gh::governor::Reservation::Allowed) | Err(_) => {}
         }
         let mut cmd = Command::new(&self.gh_bin);
         cmd.args(args);
