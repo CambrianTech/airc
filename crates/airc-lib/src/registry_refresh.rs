@@ -88,6 +88,16 @@ pub enum RegistryRefreshGate {
     GhAuth {
         gh_bin: Option<PathBuf>,
         scope_home: PathBuf,
+        /// Daemon-shared recovered-token slot (card 1f2cbffa). When
+        /// `Some`, a failed auth probe triggers ONE re-resolve +
+        /// re-probe per tick (`gh auth token` with the stale env
+        /// stripped — mirrors `ReqwestGhClient`'s #1147 401-refresh);
+        /// a recovered token lands in the slot so the store's gh
+        /// spawns use it too. `None` (manual `registry sync`, tests)
+        /// = no recovery: outside the daemon a recovered token could
+        /// not reach the store, so passing the gate with it would
+        /// just move the same failure into the publish.
+        token_override: Option<crate::gh_account_registry::GhTokenOverride>,
     },
     /// No gate — always run the tick. Used by Sqlite/in-memory stores
     /// that need no external auth (acceptance test + manual `registry
@@ -130,15 +140,51 @@ impl RegistryRefreshGate {
     /// endpoint refusal.
     pub async fn block(&self) -> Option<GateBlock> {
         match self {
-            RegistryRefreshGate::GhAuth { gh_bin, scope_home } => {
+            RegistryRefreshGate::GhAuth {
+                gh_bin,
+                scope_home,
+                token_override,
+            } => {
                 if let Some(block) = crate::gh_account_registry::account_registry_block(scope_home)
                 {
                     return Some(GateBlock::Hermetic(block));
                 }
-                if !crate::gh_account_registry::gh_auth_ready(gh_bin.as_deref()).await {
-                    return Some(GateBlock::GhNotReady);
+                let recovered = token_override.as_ref().and_then(|slot| slot.get());
+                if crate::gh_account_registry::gh_auth_ready_with_token(
+                    gh_bin.as_deref(),
+                    recovered.as_deref(),
+                )
+                .await
+                {
+                    return None;
                 }
-                None
+                // Stale-token recovery (card 1f2cbffa): the daemon's
+                // GH_TOKEN env is a spawn-time snapshot and tokens
+                // rotate mid-session, so before declaring the
+                // transport unavailable make ONE re-resolve + re-probe
+                // attempt. Failure falls through to the existing loud
+                // GhNotReady skip — no new failure modes.
+                if let Some(slot) = token_override {
+                    if let Some(fresh) =
+                        crate::gh_account_registry::re_resolve_gh_token(gh_bin.as_deref()).await
+                    {
+                        if crate::gh_account_registry::gh_auth_ready_with_token(
+                            gh_bin.as_deref(),
+                            Some(&fresh),
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "airc daemon: gh auth probe failed with the current token, but a \
+                                 re-resolved `gh auth token` passed (token rotated mid-session?) \
+                                 — continuing registry ticks with the fresh token"
+                            );
+                            slot.set(fresh);
+                            return None;
+                        }
+                    }
+                }
+                Some(GateBlock::GhNotReady)
             }
             RegistryRefreshGate::Always => None,
         }
@@ -448,6 +494,7 @@ mod tests {
         let gate = RegistryRefreshGate::GhAuth {
             gh_bin: Some(PathBuf::from("airc-nonexistent-gh-binary-for-gate-test")),
             scope_home: PathBuf::from("/machine/prod/.airc"),
+            token_override: None,
         };
         let outcome = sync_once(&airc, &store, &gate).await.unwrap();
         assert_eq!(
@@ -455,6 +502,93 @@ mod tests {
             SyncOutcome::Skipped(GateBlock::GhNotReady),
             "unready gate must skip with the gh-not-ready reason"
         );
+    }
+
+    // STALE-TOKEN RECOVERY (card 1f2cbffa item 4, mirrors #1147's
+    // 401-refresh): a daemon whose spawn-time GH_TOKEN snapshot went
+    // stale must NOT skip the tick — the gate makes ONE re-resolve
+    // (`gh auth token`, stale env stripped) + re-probe, and the
+    // recovered token lands in the shared slot for the store's gh
+    // spawns. The stub mirrors real gh: `auth status` passes only with
+    // the fresh token in GH_TOKEN; `auth token` echoes an env token
+    // when one is present (so only an env-stripped spawn reaches the
+    // keyring copy). The test process has no fresh token in ITS env —
+    // recovery is the only path to a pass. Mutation check: removing
+    // the re-resolve arm from `block()` makes the first assert see
+    // GhNotReady; removing `slot.set(fresh)` fails the second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_recovers_from_stale_daemon_token_with_one_re_resolve() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("gh");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "auth status")
+    [ "${GH_TOKEN-}" = "fresh-token" ] && exit 0
+    exit 1
+    ;;
+  "auth token")
+    if [ -n "${GH_TOKEN-}" ]; then printf '%s\n' "$GH_TOKEN"; exit 0; fi
+    if [ -n "${GITHUB_TOKEN-}" ]; then printf '%s\n' "$GITHUB_TOKEN"; exit 0; fi
+    printf 'fresh-token\n'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let slot = crate::gh_account_registry::GhTokenOverride::new();
+        // scope_home is production-shaped so the hermetic arm does not
+        // fire first (same setup as the gate-skip test above).
+        let gate = RegistryRefreshGate::GhAuth {
+            gh_bin: Some(bin),
+            scope_home: PathBuf::from("/machine/prod/.airc"),
+            token_override: Some(slot.clone()),
+        };
+
+        assert!(
+            gate.block().await.is_none(),
+            "a stale-token tick must recover via one re-resolve instead of skipping"
+        );
+        assert_eq!(
+            slot.get().as_deref(),
+            Some("fresh-token"),
+            "the recovered token must land in the shared slot so the store's gh spawns carry it"
+        );
+        // Next tick passes directly on the slot token (no fresh
+        // failure-then-recover cycle needed).
+        assert!(gate.block().await.is_none());
+    }
+
+    // Without a shared slot (manual `registry sync` — no daemon store
+    // to hand a recovered token to), the gate must NOT attempt
+    // recovery: a stale env still yields the plain GhNotReady skip.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_without_slot_skips_stale_token_without_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("gh");
+        // auth status always fails; auth token would "succeed" — but
+        // with no slot the gate must never even try it.
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"auth token\" ]; then echo t; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gate = RegistryRefreshGate::GhAuth {
+            gh_bin: Some(bin),
+            scope_home: PathBuf::from("/machine/prod/.airc"),
+            token_override: None,
+        };
+        assert_eq!(gate.block().await, Some(GateBlock::GhNotReady));
     }
 
     // HERMETIC GATE (card d793c242): a gh-gated scope whose home is
@@ -476,6 +610,7 @@ mod tests {
         let gate = RegistryRefreshGate::GhAuth {
             gh_bin: Some(PathBuf::from("airc-nonexistent-gh-binary-for-gate-test")),
             scope_home: machine.clone(),
+            token_override: None,
         };
         match sync_once(&airc, &store, &gate).await.unwrap() {
             SyncOutcome::Skipped(GateBlock::Hermetic(

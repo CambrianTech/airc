@@ -227,6 +227,61 @@ fn sanitize_writer_component(raw: &str) -> String {
     }
 }
 
+/// Shared fresh-token slot for a daemon's gh transport (card 1f2cbffa).
+///
+/// `GH_TOKEN` is injected into the daemon's environment ONCE at spawn
+/// (the CLI's `inject_gh_token`) because a detached daemon can't always
+/// reach the OS keyring. But gh tokens rotate mid-session (documented
+/// operational fact on the shared joelteply identity) and process env
+/// is immutable — so a long-lived daemon holding a rotated/revoked
+/// snapshot fails every registry tick until restart. When the gate's
+/// auth probe fails, it makes ONE recovery attempt per tick
+/// ([`re_resolve_gh_token`], mirroring `ReqwestGhClient`'s #1147
+/// 401-refresh); a recovered token lands here, and every subsequent gh
+/// spawn — the gate's `gh auth status` probe AND the store's
+/// publish/refresh commands — overrides the stale env copy with it via
+/// `cmd.env("GH_TOKEN", ...)`.
+#[derive(Clone, Default)]
+pub struct GhTokenOverride {
+    inner: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl GhTokenOverride {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the recovered token, surviving lock poisoning (a panicked
+    /// holder can't corrupt an `Option<String>` — either value is a
+    /// valid state; same posture as `ReqwestGhClient::cached_token`).
+    pub fn get(&self) -> Option<String> {
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Replace the recovered token.
+    pub fn set(&self, token: String) {
+        let mut guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(token);
+    }
+}
+
+// Manual Debug — the derived impl would print the live token through
+// any `{:?}` (RegistryRefreshGate derives Debug and carries this).
+// Tokens are NEVER logged; only whether one has been recovered.
+impl std::fmt::Debug for GhTokenOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GhTokenOverride")
+            .field("token", &self.get().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// gh-gist-backed account-registry store.
 #[derive(Clone)]
 pub struct GhAccountRegistryStore {
@@ -236,6 +291,12 @@ pub struct GhAccountRegistryStore {
     /// Required at construction so no gh-backed store can exist
     /// without a gate (no silent ungated path).
     scope_home: PathBuf,
+    /// Daemon-shared recovered-token slot (card 1f2cbffa). When
+    /// populated, every gh spawn carries it as `GH_TOKEN`, overriding
+    /// a stale spawn-time env snapshot. `None` outside the daemon loop
+    /// (a manual `registry sync` runs in the operator's live session,
+    /// where env/keyring are already current).
+    token_override: Option<GhTokenOverride>,
 }
 
 impl GhAccountRegistryStore {
@@ -256,12 +317,22 @@ impl GhAccountRegistryStore {
             ),
             store,
             scope_home: scope_home.into(),
+            token_override: None,
         }
     }
 
     /// Override the `gh` binary path. Used in tests.
     pub fn with_bin(mut self, gh_bin: impl Into<PathBuf>) -> Self {
         self.gh_bin = gh_bin.into();
+        self
+    }
+
+    /// Attach the daemon-shared recovered-token slot (card 1f2cbffa).
+    /// The daemon hands the SAME slot to its `RegistryRefreshGate`, so
+    /// a token the gate recovers after a stale-auth tick reaches this
+    /// store's gh spawns too.
+    pub fn with_token_override(mut self, token_override: GhTokenOverride) -> Self {
+        self.token_override = Some(token_override);
         self
     }
 
@@ -321,6 +392,12 @@ impl GhAccountRegistryStore {
     ) -> Result<(bool, String, String), AccountRegistryError> {
         let mut cmd = Command::new(&self.gh_bin);
         cmd.args(args);
+        // Recovered-token override (card 1f2cbffa): a fresh token the
+        // gate re-resolved after a stale-auth tick beats the daemon's
+        // immutable spawn-time `GH_TOKEN` env snapshot.
+        if let Some(token) = self.token_override.as_ref().and_then(GhTokenOverride::get) {
+            cmd.env("GH_TOKEN", token);
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         if stdin.is_some() {
@@ -661,37 +738,113 @@ fn gh_no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// Budget for the `gh auth status` probe in [`gh_auth_ready`] (and the
+/// `gh auth token` re-resolve in [`re_resolve_gh_token`]).
+///
+/// `gh auth status` is slower than it looks: gh's startup + an OS
+/// keyring lookup runs ~900ms on Windows (measured on bigmama:
+/// 881–950ms), well past the previous 750ms budget — so the gate timed
+/// out on EVERY tick and reported "not authenticated" despite valid
+/// auth, which is why same-account cross-machine discovery never
+/// published a beacon and peers could enrol but never route (the
+/// days-long keystone blocker, fixed in #1145). A genuinely
+/// unauthenticated `gh auth status` still fails fast (well under a
+/// second), so the wider budget only ever costs latency on the
+/// slow-but-authed path it exists to allow. 5s = the measured ~1s
+/// worst case with generous headroom for cold starts / loaded CI.
+pub const GH_AUTH_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Probe whether the local `gh` is authenticated against GitHub.
-/// Returns Ok(()) if `gh auth status` exits zero. Used by callers
-/// (e.g., `Airc::join_default_context`) to skip publish/refresh
-/// cleanly when the operator isn't logged in.
+/// Returns true if `gh auth status` exits zero within
+/// [`GH_AUTH_READY_TIMEOUT`]. Used by callers (e.g.,
+/// `Airc::join_default_context`) to skip publish/refresh cleanly when
+/// the operator isn't logged in.
 pub async fn gh_auth_ready(gh_bin: Option<&Path>) -> bool {
+    gh_auth_ready_with_token(gh_bin, None).await
+}
+
+/// Like [`gh_auth_ready`], but the probe carries an explicit
+/// `GH_TOKEN` (card 1f2cbffa): after a stale-token recovery the gate
+/// must re-probe with the FRESH token — gh prefers an env token over
+/// its keyring copy, so without the override the probe would keep
+/// failing on the daemon's immutable spawn-time snapshot.
+pub async fn gh_auth_ready_with_token(gh_bin: Option<&Path>, gh_token: Option<&str>) -> bool {
     let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
     let mut cmd = Command::new(bin);
     cmd.args(["auth", "status"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(token) = gh_token {
+        cmd.env("GH_TOKEN", token);
+    }
     gh_no_window(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
-    // `gh auth status` is slower than it looks: gh's startup + an OS
-    // keyring lookup runs ~900ms on Windows (measured on bigmama:
-    // 881-950ms), well past a 750ms budget — so the gate timed out on
-    // EVERY tick and reported "not authenticated" despite valid auth,
-    // which is why same-account cross-machine discovery never published
-    // a beacon and peers could enrol but never route (the days-long
-    // keystone blocker). A genuinely-unauthenticated `gh auth status`
-    // still fails fast (well under this), so the wider budget only ever
-    // costs latency on the slow-but-authed path it exists to allow.
-    match timeout(Duration::from_secs(5), child.wait()).await {
+    match timeout(GH_AUTH_READY_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) => status.success(),
         Ok(Err(_)) => false,
         Err(_) => {
             let _ = child.kill().await;
             false
         }
+    }
+}
+
+/// ONE stale-token recovery attempt for a long-lived daemon (card
+/// 1f2cbffa, mirroring `ReqwestGhClient`'s #1147 401-refresh): spawn
+/// `gh auth token` with `GH_TOKEN`/`GITHUB_TOKEN` REMOVED from the
+/// child env. gh prefers an env token over its keyring copy, so with
+/// the daemon's stale injected env in place `gh auth token` would just
+/// echo the stale token back — stripping the env is what makes the
+/// keyring copy (which usually outlives a rotated env snapshot)
+/// reachable at all.
+///
+/// The env re-read leg of #1147's chain (GH_TOKEN → GITHUB_TOKEN →
+/// spawn) is deliberately absent here: gh child processes already
+/// inherit the daemon's env token, so re-reading our own immutable
+/// process env can never change the probe outcome — that frozen
+/// snapshot IS the bug being recovered from.
+///
+/// A detached daemon may lack keychain access entirely (that is WHY
+/// spawn-time injection exists); then this returns `None` and the
+/// caller falls through to the existing loud skip diagnostic — one
+/// extra recovery attempt, no new failure modes.
+pub async fn re_resolve_gh_token(gh_bin: Option<&Path>) -> Option<String> {
+    let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
+    let mut cmd = Command::new(bin);
+    cmd.args(["auth", "token"])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    gh_no_window(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Bounded like the auth probe; a hung gh is killed, never awaited
+    // indefinitely (hazard d2ba719c — all waits bounded).
+    let status = match timeout(GH_AUTH_READY_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => return None,
+        Err(_) => {
+            let _ = child.kill().await;
+            return None;
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    // The child has exited; the pipe holds at most a token-sized line.
+    let mut buf = String::new();
+    use tokio::io::AsyncReadExt;
+    stdout.read_to_string(&mut buf).await.ok()?;
+    let token = buf.trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
 }
 
@@ -799,6 +952,7 @@ mod tests {
         const STUB_SCRIPT: &str = r#"#!/bin/sh
 S="__STATE__"
 printf '%s\n' "$*" >> "$S/calls.log"
+printf '%s\n' "${GH_TOKEN-unset}" >> "$S/token.log"
 case "$1" in
   auth)
     exit 0
@@ -875,6 +1029,14 @@ exit 0
 
             fn calls(&self) -> Vec<String> {
                 std::fs::read_to_string(self.state.join("calls.log"))
+                    .map(|log| log.lines().map(str::to_string).collect())
+                    .unwrap_or_default()
+            }
+
+            /// The `GH_TOKEN` each gh spawn carried (`unset` when absent),
+            /// one line per call — the card-1f2cbffa recovered-token pin.
+            fn tokens(&self) -> Vec<String> {
+                std::fs::read_to_string(self.state.join("token.log"))
                     .map(|log| log.lines().map(str::to_string).collect())
                     .unwrap_or_default()
             }
@@ -1191,6 +1353,160 @@ exit 0
                 merged_a.endpoints, peer_a.endpoints,
                 "peer A's dialable endpoints must survive the merge"
             );
+        }
+
+        // Card 1f2cbffa item 4: once the gate's stale-token recovery
+        // lands a fresh token in the shared slot, EVERY gh spawn the
+        // store makes must carry it as GH_TOKEN — otherwise recovery
+        // passes the gate and then the publish fails with the same
+        // stale spawn-time env snapshot. Mutation check: removing the
+        // `cmd.env("GH_TOKEN", …)` application in `gh_run` makes every
+        // token.log line read `unset` (or the host's ambient token),
+        // failing the assert.
+        #[tokio::test]
+        async fn store_gh_spawns_carry_the_recovered_token() {
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let slot = GhTokenOverride::new();
+            slot.set("tok-fresh-after-rotation".to_string());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc")
+                .await
+                .with_token_override(slot);
+
+            store.publish(&document(1_000, Vec::new())).await.unwrap();
+
+            let tokens = stub.tokens();
+            assert!(
+                !tokens.is_empty(),
+                "publish must have spawned gh at least once"
+            );
+            assert!(
+                tokens.iter().all(|t| t == "tok-fresh-after-rotation"),
+                "every gh spawn must carry the recovered token, got: {tokens:?}"
+            );
+        }
+    }
+
+    // gh-auth gate stub tests (card 1f2cbffa item 1, upstreamed from
+    // the #1145 post-merge audit's throwaway evidence). cfg(unix): the
+    // stub is a shell script; hosted ubuntu + macos legs run these
+    // (precedent: #1150).
+    #[cfg(unix)]
+    mod gh_auth_gate_stub {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        fn install_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let bin = dir.join(name);
+            std::fs::write(&bin, body).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        }
+
+        // THE #1145 PIN: a gh that takes ~1s to answer but IS
+        // authenticated must pass the gate. This is the measured
+        // 881–950ms Windows `gh auth status` class that the previous
+        // 750ms budget timed out on EVERY tick, breaking same-account
+        // cross-machine discovery for days. Mutation check (verified
+        // in the audit): shrink GH_AUTH_READY_TIMEOUT to 750ms and
+        // this fails in ~0.76s.
+        #[tokio::test]
+        async fn gate_allows_slow_but_authed_gh_900ms_class() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = install_stub(dir.path(), "gh", "#!/bin/sh\nsleep 1\nexit 0\n");
+            assert!(
+                gh_auth_ready(Some(&bin)).await,
+                "slow-but-authed gh (the measured Windows ~900ms class) must pass the gate"
+            );
+        }
+
+        // A genuinely-unauthenticated gh exits non-zero fast; the gate
+        // must report not-ready WITHOUT consuming the timeout budget
+        // (the budget exists only for the slow-but-authed path).
+        #[tokio::test]
+        async fn gate_fails_fast_for_unauthed_gh() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = install_stub(dir.path(), "gh", "#!/bin/sh\nexit 1\n");
+            let start = Instant::now();
+            assert!(
+                !gh_auth_ready(Some(&bin)).await,
+                "unauthed gh must fail the gate"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "unauthed gh must fail FAST, not burn the {GH_AUTH_READY_TIMEOUT:?} budget; took {:?}",
+                start.elapsed()
+            );
+        }
+
+        // A hung gh (stalled keyring, dead network) is KILLED at the
+        // deadline — the gate answers not-ready in ~GH_AUTH_READY_TIMEOUT,
+        // never the stub's 30s. `exec` makes the kill hit the sleep
+        // itself (no orphaned child outliving the test).
+        #[tokio::test]
+        async fn gate_kills_hung_gh_at_the_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = install_stub(dir.path(), "gh", "#!/bin/sh\nexec sleep 30\n");
+            let start = Instant::now();
+            assert!(
+                !gh_auth_ready(Some(&bin)).await,
+                "hung gh must fail the gate"
+            );
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= GH_AUTH_READY_TIMEOUT - Duration::from_millis(100),
+                "the gate must grant the full budget before giving up; took {elapsed:?}"
+            );
+            assert!(
+                elapsed < GH_AUTH_READY_TIMEOUT + Duration::from_secs(10),
+                "hung gh must be killed at the deadline, not awaited to completion; took {elapsed:?}"
+            );
+        }
+
+        // Card 1f2cbffa item 4: the recovery spawn strips the stale
+        // env so gh reads its keyring copy instead of echoing the
+        // injected token back. The stub mirrors real gh precedence
+        // (env token wins when present): if the test environment (or a
+        // mutation removing `env_remove`) leaks a GH_TOKEN/GITHUB_TOKEN
+        // into the spawn, the stub echoes THAT instead of the keyring
+        // copy and the assert bites.
+        #[tokio::test]
+        async fn re_resolve_strips_stale_env_and_reads_keyring_copy() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = install_stub(
+                dir.path(),
+                "gh",
+                r#"#!/bin/sh
+if [ "$1 $2" = "auth token" ]; then
+  if [ -n "${GH_TOKEN-}" ]; then printf '%s\n' "$GH_TOKEN"; exit 0; fi
+  if [ -n "${GITHUB_TOKEN-}" ]; then printf '%s\n' "$GITHUB_TOKEN"; exit 0; fi
+  printf 'fresh-keyring-token\n'
+  exit 0
+fi
+exit 1
+"#,
+            );
+            assert_eq!(
+                re_resolve_gh_token(Some(&bin)).await.as_deref(),
+                Some("fresh-keyring-token"),
+                "re-resolve must reach the keyring copy, never echo an env token"
+            );
+        }
+
+        // The keychain-less daemon case (the reason injection exists):
+        // `gh auth token` fails → the recovery attempt yields None and
+        // the caller falls through to the existing loud skip. No new
+        // failure modes.
+        #[tokio::test]
+        async fn re_resolve_returns_none_when_keyring_unreachable() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = install_stub(
+                dir.path(),
+                "gh",
+                "#!/bin/sh\necho 'keyring unavailable' >&2\nexit 1\n",
+            );
+            assert_eq!(re_resolve_gh_token(Some(&bin)).await, None);
         }
     }
 }

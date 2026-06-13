@@ -525,11 +525,21 @@ fn inject_gh_token(command: &mut Command) {
     command.env("GH_TOKEN", token);
 }
 
-/// `gh auth token` from the parent, robust to PATH-resolution quirks in
-/// a bash-descended process (where bare `gh` may not resolve the same as
-/// in an interactive shell). Tries `gh` on PATH first, then known
-/// install locations.
-fn resolve_gh_token() -> Option<String> {
+/// The operator's `AIRC_GH_BIN` override, if set non-empty (card
+/// 1f2cbffa, #1145 audit item 3). When present it is AUTHORITATIVE for
+/// every gh resolution in this process — token extraction, the
+/// daemon's gate + store, the manual `registry sync` gate.
+pub(crate) fn gh_bin_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("AIRC_GH_BIN")?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
+/// Known gh install locations, tried after bare `gh` on PATH. Only
+/// consulted when the operator has NOT set `AIRC_GH_BIN`.
+fn default_gh_candidates() -> Vec<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("gh")];
     #[cfg(windows)]
     {
@@ -546,6 +556,27 @@ fn resolve_gh_token() -> Option<String> {
         candidates.push(std::path::PathBuf::from("/usr/local/bin/gh"));
         candidates.push(std::path::PathBuf::from("/usr/bin/gh"));
     }
+    candidates
+}
+
+/// `gh auth token` from the parent, robust to PATH-resolution quirks in
+/// a bash-descended process (where bare `gh` may not resolve the same as
+/// in an interactive shell). Honors `AIRC_GH_BIN` (the override is the
+/// ONLY candidate — a broken override must fail loudly upstream, never
+/// silently swap to a different gh); otherwise tries `gh` on PATH, then
+/// known install locations.
+fn resolve_gh_token() -> Option<String> {
+    resolve_gh_token_with(gh_bin_override())
+}
+
+/// Env-free body of [`resolve_gh_token`] — `override_bin` is the
+/// operator's `AIRC_GH_BIN`, parameterized so tests can pin the
+/// override contract without racy process-env mutation.
+fn resolve_gh_token_with(override_bin: Option<std::path::PathBuf>) -> Option<String> {
+    let candidates = match override_bin {
+        Some(bin) => vec![bin],
+        None => default_gh_candidates(),
+    };
     for bin in candidates {
         let Ok(output) = std::process::Command::new(&bin)
             .args(["auth", "token"])
@@ -564,31 +595,43 @@ fn resolve_gh_token() -> Option<String> {
     None
 }
 
-/// First gh executable that actually responds (`gh --version` exits
-/// zero), trying PATH then known install locations. The daemon hands
-/// this explicit path to its account-registry gate + store so a
+/// The gh executable the daemon should use. `AIRC_GH_BIN` wins
+/// unconditionally when set (#1145 audit item 3: this used to be
+/// ignored here, and `run_daemon` then clobbered the store's
+/// env-honoring default via `.with_bin(...)`). Otherwise: the first
+/// candidate that actually responds (`gh --version` exits zero),
+/// trying PATH then known install locations. The daemon hands this
+/// explicit path to its account-registry gate + store so a
 /// bash-format / install-dir-less PATH can't make `Command::new("gh")`
 /// silently fail. Returns `None` if gh isn't installed — the daemon then
 /// degrades to bare `gh` (and the rendezvous skips cleanly if that too
 /// can't resolve).
 fn resolve_gh_bin() -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("gh")];
-    #[cfg(windows)]
-    {
-        candidates.push(std::path::PathBuf::from(
-            r"C:\Program Files\GitHub CLI\gh.exe",
-        ));
-        candidates.push(std::path::PathBuf::from(
-            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
-        ));
+    resolve_gh_bin_with(gh_bin_override())
+}
+
+/// Env-free body of [`resolve_gh_bin`] — `override_bin` is the
+/// operator's `AIRC_GH_BIN`, parameterized so tests can pin the
+/// override contract without racy process-env mutation.
+///
+/// The override is returned EVEN IF nothing exists at that path —
+/// with a loud stderr line, never a silent fallback to a PATH-resolved
+/// gh: an operator override that quietly stops applying is the worst
+/// failure shape (every subsequent gh spawn then fails loudly per
+/// tick, which is diagnosable; a wrong-but-working gh is not).
+fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if let Some(bin) = override_bin {
+        if !bin.exists() {
+            eprintln!(
+                "airc: AIRC_GH_BIN is set to {} but no file exists there — honoring the \
+                 override anyway (no silent fallback to a PATH-resolved gh); gh calls will \
+                 fail loudly until the path is fixed or the override unset",
+                bin.display()
+            );
+        }
+        return Some(bin);
     }
-    #[cfg(not(windows))]
-    {
-        candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/gh"));
-        candidates.push(std::path::PathBuf::from("/usr/local/bin/gh"));
-        candidates.push(std::path::PathBuf::from("/usr/bin/gh"));
-    }
-    for bin in candidates {
+    for bin in default_gh_candidates() {
         if let Ok(output) = std::process::Command::new(&bin).arg("--version").output() {
             if output.status.success() {
                 return Some(bin);
@@ -1258,14 +1301,22 @@ pub async fn run_daemon(
                 bin.display()
             );
         }
+        // Stale-token recovery slot (card 1f2cbffa): the SAME slot
+        // goes to the gate (which re-resolves on auth failure) and the
+        // store (whose gh spawns then carry the recovered token), so a
+        // mid-session token rotation no longer bricks the rendezvous
+        // until daemon restart.
+        let gh_token_override = airc_lib::GhTokenOverride::new();
         let store = match &gh_bin {
             Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home)
                 .with_bin(bin.clone()),
             None => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home),
-        };
+        }
+        .with_token_override(gh_token_override.clone());
         let gate = airc_lib::RegistryRefreshGate::GhAuth {
             gh_bin: gh_bin.clone(),
             scope_home: registry_home.clone(),
+            token_override: Some(gh_token_override),
         };
         airc_lib::run_registry_refresh_loop(
             airc,
@@ -2100,5 +2151,65 @@ mod tests {
     #[test]
     fn daemon_status_without_metadata_is_stale() {
         assert!(!daemon_status_is_current(&status(None, None)));
+    }
+
+    // Card 1f2cbffa item 3 (#1145 audit): AIRC_GH_BIN is the
+    // operator's authoritative gh override. `resolve_gh_bin` used to
+    // ignore it entirely, and `run_daemon` then clobbered the store's
+    // env-honoring default via `.with_bin(...)`. These pins drive the
+    // env-free `_with` body so no racy process-env mutation is needed.
+    #[test]
+    fn resolve_gh_bin_honors_airc_gh_bin_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let custom = dir.path().join("custom-gh");
+        std::fs::write(&custom, "").expect("write stub");
+        assert_eq!(
+            resolve_gh_bin_with(Some(custom.clone())),
+            Some(custom),
+            "an existing AIRC_GH_BIN must be returned verbatim, not a PATH-resolved gh"
+        );
+    }
+
+    // A broken override must surface loudly downstream (every gh
+    // spawn fails per tick), NEVER silently swap to a PATH gh the
+    // operator deliberately overrode away from. Mutation check:
+    // re-adding a PATH fallback for a missing override makes this
+    // return a real gh on any gh-installed machine and the assert
+    // fails.
+    #[test]
+    fn resolve_gh_bin_broken_override_never_falls_back_to_path() {
+        let missing = std::path::PathBuf::from("/nonexistent/airc-gh-override-pin-1f2cbffa/gh");
+        assert_eq!(
+            resolve_gh_bin_with(Some(missing.clone())),
+            Some(missing),
+            "a missing AIRC_GH_BIN must still be honored (loud failure downstream), \
+             never silently replaced by a PATH-resolved gh"
+        );
+    }
+
+    // Token extraction goes through the SAME override: with
+    // AIRC_GH_BIN set, only that binary is consulted.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_gh_token_uses_the_override_binary_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(&stub, "#!/bin/sh\nprintf 'override-token\\n'\nexit 0\n")
+            .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        assert_eq!(
+            resolve_gh_token_with(Some(stub)).as_deref(),
+            Some("override-token")
+        );
+        // Broken override: no silent fallback to a PATH gh's token.
+        assert_eq!(
+            resolve_gh_token_with(Some(std::path::PathBuf::from(
+                "/nonexistent/airc-gh-override-pin-1f2cbffa/gh"
+            ))),
+            None,
+            "a broken AIRC_GH_BIN must yield no token, never a PATH gh's token"
+        );
     }
 }
