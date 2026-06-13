@@ -181,18 +181,66 @@ jobs:
       - name: Rust quality guard
         run: bash test/rust_quality_guard.sh
 
+  # The REQUIRED `cargo test (ubuntu-latest)` context — pulled out of the
+  # matrix ON PURPOSE. A skipped MATRIX job reports a single check named
+  # with the unexpanded template `cargo test (${{ matrix.display }})`, so
+  # the required name `cargo test (ubuntu-latest)` would never appear on a
+  # skipped non-Rust PR and the merge queue refuses to ingest it
+  # ("Required status check cargo test (ubuntu-latest) is expected" —
+  # caught live 2026-06-13 on #1164). A NON-matrix job keeps its literal
+  # name even when skipped, so the required context is always satisfied:
+  # skipped (= passing) on non-Rust PRs, real result on Rust PRs /
+  # merge_group. ubuntu-latest is GitHub-hosted (no fork-PR self-hosted
+  # guard needed).
+  test-ubuntu:
+    name: cargo test (ubuntu-latest)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+      # Card f122b5b5 ZERO-LEAK GUARD (see matrix job for rationale).
+      - name: zero leaked temp-home daemons
+        shell: bash
+        run: |
+          leaked="$(ps -Ao pid=,args= \
+            | grep -E '(^|/)airc .* daemon' \
+            | grep -E -- '--home[ =](/private)?(/tmp|/var/folders|/var/tmp)/' \
+            || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::card f122b5b5 — temp-home airc daemons survived the test suite:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "zero leaked temp-home airc daemons after the suite (card f122b5b5)"
+
   test:
-    # Cross-platform matrix — the substrate must run on Linux, macOS,
-    # and Windows. Per grievance §4, claiming Windows support from
-    # install-only checks is not sufficient; runtime tests gated by
-    # `#[cfg(windows)]` (like the named-pipe IPC concurrent-bind test)
-    # only execute when the test job actually runs on Windows.
+    # Cross-platform matrix (macOS + self-hosted Windows; the ubuntu leg
+    # is the dedicated test-ubuntu job above). The substrate must run on
+    # Linux, macOS, and Windows; runtime tests gated by `#[cfg(windows)]`
+    # (like the named-pipe IPC concurrent-bind test) only execute on
+    # Windows.
     name: cargo test (${{ matrix.display }})
     # Gate as fmt/clippy: skip on non-Rust PRs (keeps the contended
     # self-hosted Windows leg free), run real on merge_group/push and
-    # Rust PRs. `cargo test (ubuntu-latest)` is a required context, so on
-    # a skipped non-Rust PR it reports skipped = satisfied, letting the
-    # queue ingest; merge_group then runs the real matrix on the candidate.
+    # Rust PRs. These legs are NOT required contexts (the required ubuntu
+    # leg is test-ubuntu), so the template-named skipped check here is
+    # harmless; merge_group still runs the real matrix on the candidate
+    # (the cross-platform merge-race guard).
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     runs-on: ${{ matrix.os }}
@@ -216,8 +264,13 @@ jobs:
         # Security: repo fork-PR approval policy is set to
         # all_external_contributors, so no fork code reaches the
         # self-hosted runner without a maintainer's explicit approval.
+        # ubuntu-latest is NOT here — it's the dedicated `test-ubuntu` job
+        # below. A SKIPPED matrix job reports ONE check named with the
+        # unexpanded template `cargo test (${{ matrix.display }})`, so the
+        # REQUIRED `cargo test (ubuntu-latest)` context would never appear
+        # on a skipped non-Rust PR. These two legs are NOT required, so
+        # their template-named skip is harmless.
         include:
-          - { os: ubuntu-latest, display: ubuntu-latest }
           - { os: macos-latest, display: macos-latest }
           - { os: [self-hosted, windows], display: windows-self-hosted }
     steps:
