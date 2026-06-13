@@ -1,0 +1,10 @@
+# Keep the docker build context small + reproducible: never ship build
+# artifacts, VCS, or local mesh state into the image build.
+target/
+**/target/
+.git/
+node_modules/
+**/*.log
+.airc/
+**/.airc/
+docker/
