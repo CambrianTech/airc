@@ -54,10 +54,8 @@ $BIN_TARGET    = if ($env:BIN_TARGET)    { $env:BIN_TARGET }    else { Join-Path
 $SKILLS_TARGET = if ($env:SKILLS_TARGET) { $env:SKILLS_TARGET } else { Join-Path $env:USERPROFILE '.claude\skills' }
 $REPO_URL      = 'https://github.com/CambrianTech/airc.git'
 
-# Channel persistence: same scheme as install.sh -- $CLONE_DIR/.channel
-# holds the user's release-channel preference (main / canary). Honored
-# by `airc update`.
-$DEFAULT_CHANNEL = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
+# Channel = the git branch of the install checkout (see "Clone or update"
+# below). git is the state manager; no separate channel file.
 
 function Write-Step($msg)  { Write-Host "  -> $msg" }
 function Write-Ok($msg)    { Write-Host "  + $msg" -ForegroundColor Green }
@@ -252,45 +250,44 @@ if (Test-MsvcToolchain) {
 Write-Host ''
 
 # -- Clone or update the airc source -------------------------------------
-# Pulls $DEFAULT_CHANNEL on first install. install.sh has a more elaborate
-# self-recovery path for non-channel branches; mirror the basic shape here
-# (git fetch, ff-pull, surface failures cleanly).
+# Channel = the checkout's CURRENT BRANCH. git is the state manager: a
+# canary user is simply on the `canary` branch, switching channels is
+# `git checkout <branch>`, and there is no hardcoded default or `.channel`
+# file. Parity with install.sh.
 if (Test-Path (Join-Path $CLONE_DIR '.git')) {
     Write-Step "Updating existing checkout at $CLONE_DIR"
+    # Fast-forward whatever branch is checked out; never switch branches.
     try {
-        & git -C $CLONE_DIR fetch --quiet origin
-        # If we're on the channel branch, ff-pull. Otherwise, leave the
-        # branch alone (user may be on a feature branch deliberately) and
-        # just print state.
         $current = (& git -C $CLONE_DIR rev-parse --abbrev-ref HEAD).Trim()
-        if ($current -eq $DEFAULT_CHANNEL) {
-            & git -C $CLONE_DIR pull --ff-only --quiet
+        if ([string]::IsNullOrEmpty($current) -or $current -eq 'HEAD') {
+            Write-Warn2 "$CLONE_DIR is in detached HEAD -- check out a channel branch, then re-run."
         } else {
-            Write-Warn2 "Not on '$DEFAULT_CHANNEL' (currently on '$current') -- skipping pull. Run 'airc update' to switch."
+            Write-Step "Channel = current branch '$current'"
+            & git -C $CLONE_DIR fetch --quiet origin $current
+            & git -C $CLONE_DIR pull --ff-only --quiet
         }
     } catch {
         Write-Warn2 "git pull skipped: $_"
     }
 } else {
-    Write-Step "Cloning airc source to $CLONE_DIR"
     New-Item -ItemType Directory -Force -Path (Split-Path $CLONE_DIR) | Out-Null
-    & git clone --quiet --branch $DEFAULT_CHANNEL $REPO_URL $CLONE_DIR
-    if ($LASTEXITCODE -ne 0) {
-        # Branch may not exist yet (e.g. user pulled from main) -- fall back
-        # to default branch + warn.
-        Write-Warn2 "Channel '$DEFAULT_CHANNEL' not found on origin; falling back to default branch."
+    # AIRC_CHANNEL=<branch> clones that branch (any branch, e.g. canary);
+    # unset → clone the remote's DEFAULT branch (git picks it).
+    if ($env:AIRC_CHANNEL) {
+        Write-Step "Cloning airc ($env:AIRC_CHANNEL) to $CLONE_DIR"
+        & git clone --quiet --branch $env:AIRC_CHANNEL $REPO_URL $CLONE_DIR
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Couldn't clone branch '$env:AIRC_CHANNEL' from $REPO_URL. Check the branch name + network."
+            exit 1
+        }
+    } else {
+        Write-Step "Cloning airc (remote default branch) to $CLONE_DIR"
         & git clone --quiet $REPO_URL $CLONE_DIR
         if ($LASTEXITCODE -ne 0) {
             Write-Fail "git clone failed. Check network + that $REPO_URL is reachable."
             exit 1
         }
     }
-}
-
-# Persist channel preference (parity with install.sh's .channel file)
-$channelFile = Join-Path $CLONE_DIR '.channel'
-if (-not (Test-Path $channelFile) -or (Get-Content $channelFile -Raw -ErrorAction SilentlyContinue).Trim() -ne $DEFAULT_CHANNEL) {
-    Set-Content -Path $channelFile -Value $DEFAULT_CHANNEL -NoNewline
 }
 
 # Record the install source so `airc update` can find it even when it's a

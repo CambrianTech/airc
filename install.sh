@@ -480,88 +480,64 @@ if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
     info "AIRC_INSTALL_NO_PULL=1 — using CLONE_DIR tree as-is, skipping branch-switch + pull"
   else
   info "Updating existing install"
-  # Recovery: if the install dir is on a non-channel branch (e.g. someone
-  # / some AI checked out a feature branch for testing and forgot to
-  # switch back), the ff-pull below fails with cryptic "Not possible to
-  # fast-forward". Worse, the user can't escape via `airc canary` if
-  # they're on a pre-channels binary — `canary` is an unknown command
-  # there. So install.sh itself takes responsibility: detect non-channel
-  # branches + auto-switch to the saved channel (or main) before pulling.
+  # Channel = the checkout's CURRENT BRANCH. git is the state manager:
+  # a canary user is simply on the `canary` branch; switching channels is
+  # `git checkout <branch>` in this repo — not a baked-in default and not
+  # a side-channel `.channel` file. We fast-forward whatever branch is
+  # checked out and NEVER silently switch to main (the old auto-switch
+  # clobbered feature/channel branches — that's why AIRC_INSTALL_NO_PULL
+  # above exists as the as-is escape; respecting the branch removes the
+  # footgun at the source).
   CURRENT_BRANCH=$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  SAVED_CHANNEL=""
-  [ -f "$CLONE_DIR/.channel" ] && SAVED_CHANNEL=$(tr -d '[:space:]' < "$CLONE_DIR/.channel")
-  TARGET_BRANCH="${SAVED_CHANNEL:-main}"
-  case "$CURRENT_BRANCH" in
-    main|canary)
-      # On a known channel — leave it alone unless the saved channel
-      # disagrees (e.g. user just `airc channel canary`'d but didn't
-      # update yet).
-      if [ -n "$SAVED_CHANNEL" ] && [ "$SAVED_CHANNEL" != "$CURRENT_BRANCH" ]; then
-        info "Saved channel '$SAVED_CHANNEL' differs from current branch '$CURRENT_BRANCH' — switching"
-        git -C "$CLONE_DIR" fetch --quiet origin "$SAVED_CHANNEL"
-        git -C "$CLONE_DIR" checkout -q "$SAVED_CHANNEL" \
-          || git -C "$CLONE_DIR" checkout -q -B "$SAVED_CHANNEL" "origin/$SAVED_CHANNEL"
-      fi
-      ;;
-    *)
-      info "Install dir on '$CURRENT_BRANCH' (not a known channel) — switching to '$TARGET_BRANCH'"
-      git -C "$CLONE_DIR" fetch --quiet origin "$TARGET_BRANCH" || {
-        echo "ERROR: Couldn't fetch origin/$TARGET_BRANCH. Network? gh auth?" >&2
-        exit 1
-      }
-      git -C "$CLONE_DIR" checkout -q "$TARGET_BRANCH" \
-        || git -C "$CLONE_DIR" checkout -q -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH" \
-        || {
-          cat >&2 <<EOF
-ERROR: Couldn't switch $CLONE_DIR to '$TARGET_BRANCH'.
-Recover manually:
-  cd $CLONE_DIR
-  git fetch origin
-  git status               # see why checkout was blocked
-  git stash                # if you have local edits worth keeping
-  git checkout $TARGET_BRANCH
-  git pull --ff-only
-  bash install.sh
+  if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "HEAD" ]; then
+    cat >&2 <<EOF
+ERROR: $CLONE_DIR is in detached HEAD — check out a channel branch first:
+  cd $CLONE_DIR && git checkout <branch> && bash install.sh
 EOF
-          exit 1
-        }
-      ;;
-  esac
+    exit 1
+  fi
+  info "Channel = current branch '$CURRENT_BRANCH'"
+  git -C "$CLONE_DIR" fetch --quiet origin "$CURRENT_BRANCH" || {
+    echo "ERROR: Couldn't fetch origin/$CURRENT_BRANCH. Network? gh auth?" >&2
+    exit 1
+  }
   if ! git -C "$CLONE_DIR" pull --ff-only --quiet 2>&1; then
     cat >&2 <<EOF
-ERROR: Couldn't fast-forward $CLONE_DIR (currently on $(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)).
+ERROR: Couldn't fast-forward $CLONE_DIR on '$CURRENT_BRANCH'.
 Likely cause: local edits or a divergent history.
 Recover with:
   cd $CLONE_DIR
   git status
   git stash               # if you have local edits worth keeping
   git fetch origin
-  git reset --hard origin/$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  git reset --hard origin/$CURRENT_BRANCH
   bash install.sh
 EOF
     exit 1
   fi
   fi  # AIRC_INSTALL_NO_PULL guard
 else
-  # First install. Honor AIRC_CHANNEL if set so users can land on canary
-  # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
-  # `airc canary && airc update` dance. Default to main (the release
-  # branch) when AIRC_CHANNEL is unset. Caught by QA 2026-04-28
-  # during the #191 release-gate fresh-install verification: env var was
-  # silently ignored, install landed on main.
-  CHANNEL_TARGET="${AIRC_CHANNEL:-main}"
-  case "$CHANNEL_TARGET" in
-    main|canary) ;;
-    *)
-      warn "AIRC_CHANNEL='$CHANNEL_TARGET' is not a known channel (main, canary). Defaulting to main."
-      CHANNEL_TARGET="main"
-      ;;
-  esac
-  info "Installing AIRC (channel: $CHANNEL_TARGET)"
-  git clone --quiet --branch "$CHANNEL_TARGET" "$REPO_URL" "$CLONE_DIR"
-  # Persist the channel choice so future `airc update` follows the same
-  # branch. Mirrors what `airc canary` / `airc main` write.
-  echo "$CHANNEL_TARGET" > "$CLONE_DIR/.channel"
+  # First install. The channel is just a git branch — git is the state
+  # manager, so there is NO hardcoded "main" and NO main|canary allowlist:
+  #   - AIRC_CHANNEL=<branch> clones that branch (any branch, e.g. canary),
+  #   - unset → clone the remote's DEFAULT branch (git picks it; when the
+  #     team flips the default, fresh installs follow without a code edit).
+  # Future updates then track whatever branch is checked out (see the
+  # update path above), and switching channels is `git checkout <branch>`.
+  if [ -n "${AIRC_CHANNEL:-}" ]; then
+    info "Installing AIRC (channel/branch: $AIRC_CHANNEL)"
+    git clone --quiet --branch "$AIRC_CHANNEL" "$REPO_URL" "$CLONE_DIR" || {
+      echo "ERROR: Couldn't clone branch '$AIRC_CHANNEL' from $REPO_URL." >&2
+      echo "  Check the branch name (AIRC_CHANNEL), network, and gh auth." >&2
+      exit 1
+    }
+  else
+    info "Installing AIRC (remote default branch)"
+    git clone --quiet "$REPO_URL" "$CLONE_DIR" || {
+      echo "ERROR: Couldn't clone $REPO_URL. Network? gh auth?" >&2
+      exit 1
+    }
+  fi
 fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
