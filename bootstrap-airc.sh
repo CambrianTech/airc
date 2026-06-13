@@ -47,16 +47,29 @@ else
   ok "airc already on PATH: $(command -v airc)"
 fi
 
-# 2. pre-flight (catches Tailscale-down, gh-missing, network-out, etc.)
-step "Pre-flight: airc doctor --connect"
-if ! airc doctor --connect; then
+# 2. pre-flight (live route/process state — catches daemon/route issues
+#    before join). The rust-rewrite `airc doctor` exposes `--health` for
+#    this; the old `--connect` flag no longer exists and made this
+#    pre-flight hard-fail on every fresh rust install. Fixed 2026-06-13.
+step "Pre-flight: airc doctor --health"
+if ! airc doctor --health; then
   die "Pre-flight failed. Fix the items above, then re-run this script."
 fi
 
-# 3. gh auth if needed
+# 3. gh auth if needed. Match install.sh's invocation exactly:
+#    -h github.com pins the host (avoids the interactive host picker),
+#    -s gist requests the scope the substrate needs. After a successful
+#    login, wire gh's token into git's credential helper so gist
+#    fetch/push (airc's rendezvous hot path) doesn't pop a password
+#    prompt on every op. Without setup-git, auth-after-install left the
+#    helper unwired — caught live on Windows 2026-06-13.
 if ! gh auth status >/dev/null 2>&1; then
   step "Authenticating gh (need 'gist' scope for room substrate)"
-  gh auth login -s gist
+  gh auth login -h github.com -s gist
+fi
+# Idempotent (no-op if already configured); safe to always run.
+if ! git config --global --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then
+  gh auth setup-git 2>/dev/null && ok "gh token wired into git credential helper" || true
 fi
 
 # 4. join the room
