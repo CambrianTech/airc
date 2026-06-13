@@ -382,6 +382,35 @@ impl Airc {
         }))
     }
 
+    /// Cursor of the newest transcript event on `channel` — via the
+    /// daemon's O(1) `room_tip` when attached, the local store's
+    /// indexed `latest_cursor` otherwise.
+    ///
+    /// Card 8428ae8c: this is THE channel-tip read for every consumer
+    /// surface (`latest_cursor`, `subscription_cursor`, the work-board
+    /// freshness probe). Daemon-attached scopes used to read the LOCAL
+    /// store here — a pre-existing inconsistency: under the owner-core
+    /// model the daemon's ORM is the transcript, and an attached
+    /// scope's local store can be empty or stale, so the local read
+    /// answered `None`/old for rooms with live daemon history. The
+    /// typed `room_tip` op (card a1562dbc) makes asking the daemon as
+    /// cheap as the local index, so attached instances now get the
+    /// daemon's view. No new IPC op is needed for the subscription
+    /// shape: a subscription cursor IS the tip of the subscription's
+    /// room, and the subscription set itself is local scope config.
+    pub(crate) async fn channel_latest_cursor(
+        &self,
+        channel: RoomId,
+    ) -> Result<Option<TranscriptCursor>, AircError> {
+        if self.is_daemon_attached() {
+            return self.daemon_latest_transcript_cursor(channel).await;
+        }
+        self.event_store()
+            .latest_cursor(Some(channel))
+            .await
+            .map_err(AircError::from)
+    }
+
     /// Live subscribe across `channels` via the daemon: open one IPC
     /// attach per channel, decode each into a `TranscriptEvent`, and
     /// merge them into a single [`EventStream`]. The attach tasks are

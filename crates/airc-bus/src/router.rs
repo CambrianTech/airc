@@ -681,6 +681,68 @@ impl EventRouter {
         self.inner.sink.head_cursor(channel).await
     }
 
+    /// **Card 8428ae8c.** The newest `limit` **durable** envelopes on
+    /// `channel`, in ascending total order — the "most recent N" leg of
+    /// the inbox path. Work is bounded by `limit` and the ring capacity,
+    /// NEVER by room depth: the previous shape
+    /// (`resume_from_cursor(channel, None)` + truncate) materialized the
+    /// entire room to answer N.
+    ///
+    /// Merge contract (mirrors [`Self::subscribe`]'s seam, reversed):
+    /// - the hot ring is authoritative for the recent tail — it may hold
+    ///   durables the sink lacks (write-behind lag), and eviction is
+    ///   oldest-first with §3.8 pinning (a durable is never evicted
+    ///   before it is persisted), so the ring's durables are exactly the
+    ///   channel's newest durables and everything older is in the sink;
+    /// - when the ring's durables don't cover `limit`, the remainder
+    ///   comes from ONE [`DurableSink::page_tail`] call for the events
+    ///   strictly before the ring's oldest retained cursor (`None` =
+    ///   channel tail when the ring is empty — fresh-start shape). The
+    ///   sink only ever holds durables, so no class filter is needed on
+    ///   that leg. A sink error propagates — it is never papered over
+    ///   with a full forward scan.
+    pub async fn durable_tail(
+        &self,
+        channel: RoomId,
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (mut tail, ring_oldest) = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            match map.get(&channel.0.as_u128()) {
+                Some(state) => (
+                    state
+                        .ring
+                        .replay_after(None)
+                        .into_iter()
+                        .filter(|env| env.delivery.is_durable())
+                        .collect::<Vec<_>>(),
+                    state.ring.oldest_cursor(),
+                ),
+                None => (Vec::new(), None),
+            }
+        }; // shard lock released before the sink await
+        if tail.len() >= limit {
+            // The ring alone covers N — zero store reads.
+            return Ok(tail.split_off(tail.len() - limit));
+        }
+        // Ring durables are the newest; top up with the sink tail older
+        // than anything the ring still retains. Sink rows strictly
+        // before `ring_oldest` cannot also be in the ring, so the two
+        // legs concatenate with no dup and no gap.
+        let older = self
+            .inner
+            .sink
+            .page_tail(channel, ring_oldest, limit - tail.len())
+            .await?;
+        let mut out: Vec<Arc<Envelope>> = older.into_iter().map(Arc::new).collect();
+        out.append(&mut tail);
+        Ok(out)
+    }
+
     /// Subscribe (§4 subscribe, §3.5 cursor contract).
     ///
     /// Returns a stream that yields **every** envelope on the filter strictly

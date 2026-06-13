@@ -180,6 +180,63 @@ impl DurableSink for SqliteDurableSink {
         rows.into_iter().map(from_model).collect()
     }
 
+    /// Card 8428ae8c: the reverse-paging leg of "most recent N". One
+    /// indexed query — `ORDER BY (epoch, counter, event_id) DESC
+    /// LIMIT n` rides the same composite
+    /// `(room_id, epoch, counter, event_id)` index as [`Self::page`]
+    /// (SQLite B-tree indexes serve both scan directions) — then the
+    /// page is reversed in memory so callers get ascending total
+    /// order. Cost is bounded by `limit`, never by channel depth.
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        // Same bind clamp as `page`: a huge limit means "the whole
+        // tail", never a `usize::MAX` sentinel reaching SQL.
+        let bounded = u64::try_from(limit)
+            .unwrap_or(u64::MAX)
+            .min(i64::MAX as u64);
+
+        let mut query =
+            bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
+
+        // Strictly before the cursor in generational order — the exact
+        // mirror of `page`'s strictly-after predicate:
+        //   epoch < c.epoch
+        //   OR (epoch == c.epoch AND counter < c.counter)
+        //   OR (epoch == c.epoch AND counter == c.counter
+        //       AND event_id < c.event_id).
+        if let Some(c) = before {
+            let epoch = c.seq.epoch as i64;
+            let counter = c.seq.counter as i64;
+            let event_id = c.event_id.as_uuid();
+            let strictly_before = Expr::col(bus_event::Column::Epoch)
+                .lt(epoch)
+                .or(Expr::col(bus_event::Column::Epoch)
+                    .eq(epoch)
+                    .and(Expr::col(bus_event::Column::Counter).lt(counter)))
+                .or(Expr::col(bus_event::Column::Epoch)
+                    .eq(epoch)
+                    .and(Expr::col(bus_event::Column::Counter).eq(counter))
+                    .and(Expr::col(bus_event::Column::EventId).lt(event_id)));
+            query = query.filter(strictly_before);
+        }
+
+        let rows = query
+            .order_by_desc(bus_event::Column::Epoch)
+            .order_by_desc(bus_event::Column::Counter)
+            .order_by_desc(bus_event::Column::EventId)
+            .limit(bounded)
+            .all(&self.db)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+
+        // DESC off the index, ascending to the caller.
+        rows.into_iter().rev().map(from_model).collect()
+    }
+
     /// Card 7d5b6a65: efficient head-cursor query for the
     /// `AttachRequest::from_now` path. The trait's default impl pages
     /// the entire channel to find the last cursor; the SQLite override
@@ -502,6 +559,72 @@ mod tests {
         let after = sink.page(ch, Some(lo.cursor()), 10).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].event_id, hi.event_id);
+    }
+
+    #[tokio::test]
+    async fn page_tail_returns_newest_n_ascending() {
+        // Card 8428ae8c: the reverse page returns the LAST n in
+        // ascending order — one DESC-indexed query, reversed in memory.
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0x7a11);
+        for c in 0..10u64 {
+            sink.append(&durable_at(ch, 1, c)).await.unwrap();
+        }
+
+        let tail = sink.page_tail(ch, None, 4).await.unwrap();
+        let counters: Vec<u64> = tail.iter().map(|e| e.seq.counter).collect();
+        assert_eq!(counters, vec![6, 7, 8, 9], "newest 4, ascending");
+
+        // n beyond the channel: the whole channel.
+        let all = sink.page_tail(ch, None, 100).await.unwrap();
+        let counters: Vec<u64> = all.iter().map(|e| e.seq.counter).collect();
+        assert_eq!(counters, (0..10).collect::<Vec<u64>>());
+
+        // Empty channel: empty tail.
+        assert!(sink
+            .page_tail(RoomId::from_u128(0xd0), None, 5)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Channel isolation: another channel's events never ride along.
+        let other = RoomId::from_u128(0x7a12);
+        sink.append(&durable_at(other, 1, 99)).await.unwrap();
+        let tail = sink.page_tail(ch, None, 100).await.unwrap();
+        assert_eq!(tail.len(), 10, "tail is per-channel");
+    }
+
+    #[tokio::test]
+    async fn page_tail_strictly_before_cursor_across_epochs() {
+        // The `before` bound mirrors `page`'s strictly-after predicate
+        // in generational order: epoch dominates counter, event_id
+        // tiebreaks — and the row AT the cursor is excluded.
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0xe9);
+        // Appended out of order on purpose; total order is
+        // (1,0) (1,1) (1,2) (2,0) (2,1).
+        sink.append(&durable_at(ch, 2, 1)).await.unwrap();
+        sink.append(&durable_at(ch, 1, 2)).await.unwrap();
+        sink.append(&durable_at(ch, 1, 0)).await.unwrap();
+        sink.append(&durable_at(ch, 2, 0)).await.unwrap();
+        sink.append(&durable_at(ch, 1, 1)).await.unwrap();
+
+        let before = durable_at(ch, 2, 0).cursor();
+        let tail = sink.page_tail(ch, Some(before), 2).await.unwrap();
+        let order: Vec<(u64, u64)> = tail.iter().map(|e| (e.seq.epoch, e.seq.counter)).collect();
+        assert_eq!(
+            order,
+            vec![(1, 1), (1, 2)],
+            "newest 2 strictly before (2,0): the cursor row is excluded, epoch dominates"
+        );
+
+        // A cursor before everything: empty tail.
+        let before = durable_at(ch, 1, 0).cursor();
+        assert!(sink
+            .page_tail(ch, Some(before), 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

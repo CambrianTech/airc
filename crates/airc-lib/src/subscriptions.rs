@@ -499,7 +499,10 @@ impl Airc {
         self.current_room().await
     }
 
-    /// Cursor of the newest event in a subscribed channel.
+    /// Cursor of the newest event in a subscribed channel — via the
+    /// daemon when attached (its ORM is the transcript; the local store
+    /// can be empty/stale on an attached scope), the local store
+    /// otherwise (card 8428ae8c).
     ///
     /// `None` means either the channel has no events yet or this
     /// scope is not subscribed to it. Use [`Self::is_subscribed`] when
@@ -512,11 +515,7 @@ impl Airc {
         let Some(subscription) = set.subscribed.get(channel) else {
             return Ok(None);
         };
-        Ok(self
-            .inner
-            .store
-            .latest_cursor(Some(subscription.room_id))
-            .await?)
+        self.channel_latest_cursor(subscription.room_id).await
     }
 
     pub(crate) async fn subscribed_event_filter(

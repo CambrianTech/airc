@@ -141,6 +141,15 @@ impl DurableSink for GatedSink {
         self.inner.head_cursor(channel).await
     }
 
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner.page_tail(channel, before, limit).await
+    }
+
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
         self.inner.contains(event_id).await
     }

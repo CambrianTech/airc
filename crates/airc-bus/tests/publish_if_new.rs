@@ -168,6 +168,15 @@ impl DurableSink for FlakyContainsSink {
         self.inner.head_cursor(channel).await
     }
 
+    async fn page_tail(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner.page_tail(channel, before, limit).await
+    }
+
     async fn contains(&self, event_id: EventId) -> Result<bool, BusError> {
         if self.fail_next_contains.swap(false, Ordering::SeqCst) {
             return Err(BusError::Sink("transient store outage".into()));
