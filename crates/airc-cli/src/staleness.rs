@@ -20,8 +20,8 @@
 //! the binary's compile-time commit is behind `origin/rust-rewrite`
 //! for paths under `crates/airc-*`. If so, print a banner on stderr:
 //!
-//!   ⚠ airc binary is N commits behind rust-rewrite — rebuild:
-//!     cd <repo_root> && cargo install --path crates/airc-cli --force
+//!   ⚠ airc binary is N commits behind rust-rewrite — run `airc update`
+//!     to rebuild and reinstall in place.
 //!
 //! Stderr (not stdout) keeps parseable command output clean. The
 //! banner is **always informational** — never blocks command
@@ -74,10 +74,15 @@ pub fn warn_if_stale() {
             return;
         }
         let label = if behind == 1 { "commit" } else { "commits" };
+        // Suggest `airc update`, NOT `cargo install --path` — the latter
+        // installs to ~/.cargo/bin/airc, a SECOND binary that shadows the
+        // install.sh-managed ~/.local/bin/airc and caused the stale-binary
+        // join failure documented above. `airc update` rebuilds and
+        // reinstalls IN PLACE (same location, + marker + skills), so it
+        // can't create a dual-binary split.
         eprintln!(
-            "⚠ airc binary is {behind} {label} behind rust-rewrite — rebuild:\n  \
-             cd {repo} && cargo install --path crates/airc-cli --force",
-            repo = repo_root.display(),
+            "⚠ airc binary is {behind} {label} behind rust-rewrite — \
+             run `airc update` to rebuild and reinstall in place."
         );
         // Don't update the cache when stale — every run reminds.
     }
