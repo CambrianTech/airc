@@ -122,6 +122,12 @@ pub struct StoredPeer {
     /// airc-lib, above this crate); `None` = identity-only enrolment
     /// — the route resolver gets no dial candidates from this record.
     pub endpoints_json: Option<String>,
+    /// Seam #3.2 (liveness): epoch-ms of the last contact we had with
+    /// this peer. Concrete, never `None`: a row whose stored column is
+    /// NULL (never touched since enrolment) reads back floored to
+    /// `added_at_ms`, so this is always a defensible "no later than"
+    /// recency floor the age-based eviction classifier can read.
+    pub last_seen_ms: u64,
 }
 
 impl StoredPeer {
