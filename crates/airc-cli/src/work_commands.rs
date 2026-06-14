@@ -1493,42 +1493,64 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
             .lines()
             .any(|line| line.trim_start().starts_with('+'));
         if !has_unique {
-            // BIGMAMA review fix on PR #1200: `git cherry` walks
-            // commits by patch-id, which SKIPS MERGE COMMITS entirely
-            // (they have multiple parents → no canonical patch-id).
-            // An "evil merge" — unique content living only in a merge
-            // commit's conflict-resolution diff — emits zero `+`
-            // lines, so `has_unique` reads false and we'd return
-            // Clean → cleanup DELETES branches whose unique work
-            // lives in a merge. Data loss.
+            // BIGMAMA review fix on PR #1200 (round 2): `git cherry`
+            // walks commits by patch-id, which SKIPS MERGE COMMITS
+            // entirely (they have multiple parents → no canonical
+            // patch-id). An "evil merge" — unique content living only
+            // in a merge commit's conflict-resolution diff — emits
+            // zero `+` lines, so `has_unique` reads false and we'd
+            // return Clean → cleanup DELETES branches whose unique
+            // work lives in a merge. Data loss.
             //
-            // Defense in depth: even when cherry says "all patches
-            // present", verify there's no CONTENT delta between
-            // candidate and HEAD. `git diff --quiet candidate..HEAD`
-            // walks trees regardless of commit structure: exit 0 = no
-            // content delta (truly Clean), exit 1 = content differs
-            // (evil merge case → refuse).
-            let diff_clean = std::process::Command::new("git")
+            // BIGMAMA caught the first defense attempt:
+            // `git diff --quiet candidate..HEAD` is an endpoint diff
+            // between two trees, NOT a "what's on HEAD that isn't on
+            // candidate" probe. In the normal squash-merge case
+            // candidate has advanced past HEAD (other PRs landed
+            // since this one's branch point), so the diff is
+            // non-empty and the check fires false-positive on every
+            // mergeable branch.
+            //
+            // Correct defense: enumerate the merge commits reachable
+            // from HEAD but NOT from candidate. `git rev-list
+            // candidate..HEAD --merges` returns exactly those. Cherry
+            // already vouched for the non-merge patches being present
+            // upstream; if there are no extra merge commits, every
+            // commit (non-merge AND merge) is accounted for and the
+            // branch is genuinely Clean. If ANY merge exists in that
+            // range, cherry's verdict is incomplete — refuse to
+            // delete rather than guess whether the merge brought in
+            // unique resolution content.
+            let extra_merges = std::process::Command::new("git")
                 .args([
                     "-C",
                     path_str,
-                    "diff",
-                    "--quiet",
+                    "rev-list",
+                    "--count",
+                    "--merges",
                     &format!("{candidate}..HEAD"),
                 ])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if diff_clean {
-                // Both proofs agree: every commit patch-id is in
-                // candidate AND there's no content delta. The
-                // branch's work is captured upstream; safe to delete.
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout).ok()
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            if let Some(0) = extra_merges {
+                // Cherry says non-merge patches are upstream AND there
+                // are no extra merge commits to worry about. The
+                // branch's work is fully captured; safe to delete.
                 return DirtyStatus::Clean;
             }
-            // Cherry said clean but content differs → evil-merge
-            // shape. Keep iterating to other candidates (one might
-            // contain the real merge); if none does, fall through to
-            // the Dirty arm below.
+            // Either rev-list failed (treat as can't-prove) or there
+            // are merges on HEAD outside candidate (potential evil
+            // merge). Keep iterating — another candidate might
+            // include the merges; if none does, fall through to the
+            // Dirty arm below.
         }
     }
 
@@ -3071,6 +3093,229 @@ mod tests {
             "nested-layout + Closed card → Removable. Was SkipNotGit before \
              card 83a5624e — the bug the merger's cleanup hook stranded \
              continuum #1530/#1531 worktrees on."
+        );
+    }
+
+    /// BIGMAMA review round 2 on PR #1200: the first evil-merge defense
+    /// (`git diff --quiet candidate..HEAD`) was a TREE-ENDPOINT diff —
+    /// non-empty whenever `candidate` has advanced past HEAD with any
+    /// commits not on the PR (the normal squash-merge-with-other-PRs
+    /// state). That made the defense fire false-positive on every
+    /// mergeable branch — the cleanup wouldn't have classified ANY
+    /// merged PR as Clean once canary moved on.
+    ///
+    /// This test pins the correct shape: cherry says no `+` lines
+    /// (every non-merge patch is upstream) AND there are no extra
+    /// merge commits in `candidate..HEAD` ⇒ defense allows Clean.
+    /// Building a real squash-merge under tempdir is fiddly; cherry's
+    /// patch-id match is the load-bearing equivalence — we cherry-pick
+    /// the PR commit onto the upstream branch (same patch-id, distinct
+    /// SHA) and then push other unrelated work onto upstream so the
+    /// "candidate advanced" condition the first defense tripped on is
+    /// present in the fixture.
+    #[test]
+    fn is_clean_via_cherry_returns_clean_when_squash_merged_and_candidate_advanced() {
+        let (clone, tmp) = git_fixture_with_upstream(true);
+        let origin = tmp.path().join("origin.git");
+        let other = tmp.path().join("other_clone");
+
+        let run = |args: &[&str], cwd: Option<&std::path::Path>| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args);
+            if let Some(d) = cwd {
+                cmd.current_dir(d);
+            }
+            let out = cmd.output().expect("git spawn");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let clone_str = clone.to_str().unwrap().to_string();
+        let other_str = other.to_str().unwrap().to_string();
+
+        // Detect default branch — fixture might be `main` or `master`
+        // depending on the test host's git config.
+        let branch_out = std::process::Command::new("git")
+            .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let default_branch = String::from_utf8(branch_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // PR branch with a commit ("feat.txt") — this is what we'll
+        // pretend got squash-merged into the default branch.
+        run(&["-C", &clone_str, "checkout", "-b", "pr-feat"], None);
+        std::fs::write(clone.join("feat.txt"), "feat content\n").expect("write feat");
+        run(&["-C", &clone_str, "add", "feat.txt"], None);
+        run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
+        run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
+        let feat_sha_out = std::process::Command::new("git")
+            .args(["-C", &clone_str, "rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let feat_sha = String::from_utf8(feat_sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Land the same content on the default branch via a SECOND
+        // clone (so the working tree doesn't collide with the PR
+        // checkout), then push back to origin so it appears as
+        // origin/<default>. Also add an unrelated commit so the
+        // candidate has ADVANCED past HEAD — exactly the condition
+        // the symmetric diff defense fired on.
+        run(&["clone", origin.to_str().unwrap(), &other_str], None);
+        run(
+            &[
+                "-C",
+                &other_str,
+                "config",
+                "user.email",
+                "test@example.invalid",
+            ],
+            None,
+        );
+        run(&["-C", &other_str, "config", "user.name", "Test"], None);
+        // Fetch the pr-feat ref so cherry-pick can resolve it.
+        run(&["-C", &other_str, "fetch", "origin", "pr-feat"], None);
+        run(&["-C", &other_str, "cherry-pick", &feat_sha], None);
+        std::fs::write(other.join("other.txt"), "other PR\n").expect("write other");
+        run(&["-C", &other_str, "add", "other.txt"], None);
+        run(
+            &["-C", &other_str, "commit", "-m", "main: unrelated other PR"],
+            None,
+        );
+        run(&["-C", &other_str, "push", "origin", &default_branch], None);
+
+        // Refresh the PR clone's view of origin so cherry can see the
+        // patch-id is present upstream.
+        run(&["-C", &clone_str, "fetch", "origin"], None);
+
+        // ASSERT: feat's patch-id is in origin/<default>, no extra
+        // merges in candidate..HEAD, defense allows Clean. With the
+        // OLD `git diff --quiet candidate..HEAD` defense this would
+        // have come back Dirty because candidate has advanced past
+        // HEAD via the "other PR" commit.
+        let status = is_clean_via_cherry_against_origin_head(&clone_str);
+        assert_eq!(
+            status,
+            DirtyStatus::Clean,
+            "squash-merged PR with advanced candidate must be Clean — \
+             the symmetric-diff defense fired false-positive here. \
+             Defense must be `rev-list candidate..HEAD --merges` (zero \
+             extra merges ⇒ cherry's verdict stands)."
+        );
+    }
+
+    /// BIGMAMA review round 2 on PR #1200: the actual evil-merge case
+    /// — a merge commit reachable from HEAD but not from candidate.
+    /// `git cherry` skipped it (no canonical patch-id), so its
+    /// conflict-resolution diff could carry unique content not
+    /// captured upstream. The defense MUST refuse to classify Clean
+    /// when extra merges exist; the conservative call is Dirty rather
+    /// than guess whether the merge brought in unique resolution
+    /// content.
+    #[test]
+    fn is_clean_via_cherry_refuses_when_extra_merge_lives_in_head() {
+        let (clone, tmp) = git_fixture_with_upstream(true);
+        let origin = tmp.path().join("origin.git");
+        let other = tmp.path().join("other_clone");
+
+        let run = |args: &[&str], cwd: Option<&std::path::Path>| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args);
+            if let Some(d) = cwd {
+                cmd.current_dir(d);
+            }
+            let out = cmd.output().expect("git spawn");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let clone_str = clone.to_str().unwrap().to_string();
+        let other_str = other.to_str().unwrap().to_string();
+        let branch_out = std::process::Command::new("git")
+            .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let default_branch = String::from_utf8(branch_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Pr commit on `pr-feat` — same as the clean case.
+        run(&["-C", &clone_str, "checkout", "-b", "pr-feat"], None);
+        std::fs::write(clone.join("feat.txt"), "feat content\n").expect("write feat");
+        run(&["-C", &clone_str, "add", "feat.txt"], None);
+        run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
+        run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
+        let feat_sha_out = std::process::Command::new("git")
+            .args(["-C", &clone_str, "rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let feat_sha = String::from_utf8(feat_sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Land feat's patch on default via a sibling clone.
+        run(&["clone", origin.to_str().unwrap(), &other_str], None);
+        // Different author identity than the PR clone so the
+        // cherry-pick lands as a DIFFERENT SHA (otherwise git
+        // optimizes back to the same commit and there's nothing to
+        // merge — fixture degenerates to fast-forward).
+        run(
+            &[
+                "-C",
+                &other_str,
+                "config",
+                "user.email",
+                "other@example.invalid",
+            ],
+            None,
+        );
+        run(&["-C", &other_str, "config", "user.name", "Other"], None);
+        run(&["-C", &other_str, "fetch", "origin", "pr-feat"], None);
+        run(&["-C", &other_str, "cherry-pick", &feat_sha], None);
+        run(&["-C", &other_str, "push", "origin", &default_branch], None);
+
+        // Now on pr: pull main back in via `git merge`. This creates
+        // a merge commit M on pr-feat whose first parent is the
+        // original feat commit, second parent is the cherry-picked
+        // version on origin/<default>. cherry's patch-id match still
+        // says "no unique commits" — but M itself is not on candidate.
+        run(&["-C", &clone_str, "fetch", "origin"], None);
+        run(
+            &[
+                "-C",
+                &clone_str,
+                "merge",
+                "--no-ff",
+                "-m",
+                "pr: merge main",
+                &format!("origin/{default_branch}"),
+            ],
+            None,
+        );
+
+        // ASSERT: defense refuses to classify as Clean. The exact
+        // verdict from is_clean_via_cherry_against_origin_head is
+        // Dirty (every candidate has either a `+` line or extra
+        // merges; outer arm returns Dirty when any_existed).
+        let status = is_clean_via_cherry_against_origin_head(&clone_str);
+        assert_ne!(
+            status,
+            DirtyStatus::Clean,
+            "PR branch with a merge commit not on candidate MUST NOT be \
+             classified as Clean — cherry skips merges, so the merge \
+             commit could be an evil merge carrying unique resolution \
+             content. Conservative refuse: status = {status:?}"
         );
     }
 
