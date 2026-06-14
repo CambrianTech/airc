@@ -258,6 +258,24 @@ pub async fn set_endpoints_json(
         .map_err(Into::into)
 }
 
+/// Seam #3.2 (liveness) — record fresh contact with an enrolled peer.
+/// Callers (beacon import, successful dial) pass the contact instant in
+/// epoch-ms; the store bumps `last_seen_ms` monotonically (an older
+/// timestamp is ignored, never rewinds recency). Returns `Ok(None)`
+/// when the peer isn't enrolled — recency without a trust anchor is
+/// meaningless, so no row is inserted.
+pub async fn touch_last_seen(
+    home: &Path,
+    peer_id: PeerId,
+    seen_at_ms: u64,
+) -> Result<Option<StoredPeer>, PeersStoreError> {
+    open_store(home)
+        .await?
+        .touch_peer_last_seen(peer_id, seen_at_ms)
+        .await
+        .map_err(Into::into)
+}
+
 /// Card 34942ec1 Sub-B — pure detection helper.
 ///
 /// Returns the trust tier that should apply when we observe a peer

@@ -202,12 +202,14 @@ impl SqliteEventStore {
                         value: row.tier.clone(),
                     }
                 })?;
+                let added_at_ms = i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?;
                 Ok(StoredPeer {
                     peer_id: PeerId::from_uuid(row.peer_id),
                     pubkey_b64: row.pubkey_b64,
-                    added_at_ms: i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?,
+                    added_at_ms,
                     tier,
                     endpoints_json: row.endpoints_json,
+                    last_seen_ms: stored_last_seen_ms(row.last_seen_ms, added_at_ms)?,
                 })
             })
             .collect()
@@ -252,6 +254,11 @@ impl SqliteEventStore {
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
             tier: Set(tier.as_wire_str().to_string()),
             endpoints_json: Set(None),
+            // Seam #3.2: a freshly enrolled peer was, by definition, just
+            // seen — seed last_seen to the enrolment instant rather than
+            // leaving it NULL, so a never-touched-again peer ages from
+            // enrolment forward without relying on the read-time floor.
+            last_seen_ms: Set(Some(u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?)),
         };
         let insert = peer_trust::Entity::insert(active)
             .on_conflict(
@@ -287,12 +294,14 @@ impl SqliteEventStore {
                 value: stored.tier.clone(),
             }
         })?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?;
         Ok(StoredPeer {
             peer_id,
             pubkey_b64: stored.pubkey_b64,
-            added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+            added_at_ms,
             tier: stored_tier,
             endpoints_json: stored.endpoints_json,
+            last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
         })
     }
 
@@ -316,13 +325,23 @@ impl SqliteEventStore {
             .as_ref()
             .and_then(|row| TrustTier::from_wire_str(&row.tier))
             .unwrap_or_else(TrustTier::default_for_new_peer);
-        let existing_endpoints = existing.and_then(|row| row.endpoints_json);
+        let existing_endpoints = existing.as_ref().and_then(|row| row.endpoints_json.clone());
+        // Seam #3.2: a rotation is the same machine with new key material,
+        // not new contact — preserve last_seen exactly like tier/endpoints
+        // (the conflict update below does NOT list LastSeenMs, so the
+        // stored value survives). For a fresh insert there is no prior
+        // contact, so seed it to the enrolment instant.
+        let existing_last_seen = existing.as_ref().and_then(|row| row.last_seen_ms);
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
             added_at_ms: Set(u64_to_i64("peer_trust.added_at_ms", added_at_ms)?),
             tier: Set(existing_tier.as_wire_str().to_string()),
             endpoints_json: Set(existing_endpoints.clone()),
+            last_seen_ms: Set(Some(match existing_last_seen {
+                Some(value) => value,
+                None => u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?,
+            })),
         };
         peer_trust::Entity::insert(active)
             .on_conflict(
@@ -338,6 +357,7 @@ impl SqliteEventStore {
             added_at_ms,
             tier: existing_tier,
             endpoints_json: existing_endpoints,
+            last_seen_ms: stored_last_seen_ms(existing_last_seen, added_at_ms)?,
         })
     }
 
@@ -363,12 +383,14 @@ impl SqliteEventStore {
                 value: stored.tier.clone(),
             }
         })?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?;
         Ok(Some(StoredPeer {
             peer_id,
             pubkey_b64: stored.pubkey_b64,
-            added_at_ms: i64_to_u64("peer_trust.added_at_ms", stored.added_at_ms)?,
+            added_at_ms,
             tier: removed_tier,
             endpoints_json: stored.endpoints_json,
+            last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
         }))
     }
 
@@ -402,12 +424,14 @@ impl SqliteEventStore {
         active.tier = Set(tier.as_wire_str().to_string());
         peer_trust::Entity::update(active).exec(&txn).await?;
         txn.commit().await?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?;
         Ok(Some(StoredPeer {
             peer_id,
             pubkey_b64: existing.pubkey_b64,
-            added_at_ms: i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?,
+            added_at_ms,
             tier,
             endpoints_json: existing.endpoints_json,
+            last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
         }))
     }
 
@@ -444,12 +468,65 @@ impl SqliteEventStore {
         active.endpoints_json = Set(endpoints_json.clone());
         peer_trust::Entity::update(active).exec(&txn).await?;
         txn.commit().await?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?;
         Ok(Some(StoredPeer {
             peer_id,
             pubkey_b64: existing.pubkey_b64,
-            added_at_ms: i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?,
+            added_at_ms,
             tier: stored_tier,
             endpoints_json,
+            last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+        }))
+    }
+
+    /// Seam #3.2 (liveness) — record fresh contact with an enrolled
+    /// peer. The beacon-import / successful-dial paths call this with
+    /// the contact instant; it bumps `last_seen_ms` so the age-based
+    /// eviction classifier (a follow-up slice) can tell a live friend
+    /// from a stale enrolment.
+    ///
+    /// Returns `Ok(None)` if the peer isn't enrolled — recency without
+    /// a trust anchor is meaningless (we only age peers we've recorded),
+    /// so no row is inserted. **Monotonic**: a touch carrying an OLDER
+    /// timestamp than the stored value is a no-op and the row is
+    /// returned unchanged. Clock skew between machines and out-of-order
+    /// beacon import must never rewind a peer's recency — that would
+    /// make a live peer look stale.
+    pub async fn touch_peer_last_seen(
+        &self,
+        peer_id: PeerId,
+        seen_at_ms: u64,
+    ) -> Result<Option<StoredPeer>, StoreError> {
+        let txn = self.db.begin().await?;
+        let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+        let stored_tier = TrustTier::from_wire_str(&existing.tier).ok_or_else(|| {
+            StoreError::InvalidStoredEnumString {
+                column: "peer_trust.tier",
+                value: existing.tier.clone(),
+            }
+        })?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?;
+        let current = stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?;
+        let next = current.max(seen_at_ms);
+        if next != current {
+            let mut active: peer_trust::ActiveModel = existing.clone().into();
+            active.last_seen_ms = Set(Some(u64_to_i64("peer_trust.last_seen_ms", next)?));
+            peer_trust::Entity::update(active).exec(&txn).await?;
+        }
+        txn.commit().await?;
+        Ok(Some(StoredPeer {
+            peer_id,
+            pubkey_b64: existing.pubkey_b64,
+            added_at_ms,
+            tier: stored_tier,
+            endpoints_json: existing.endpoints_json,
+            last_seen_ms: next,
         }))
     }
 
@@ -768,6 +845,18 @@ fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, StoreError> {
         field,
         value: value as i128,
     })
+}
+
+/// Seam #3.2 — resolve a stored `last_seen_ms` column into the concrete
+/// recency floor [`StoredPeer::last_seen_ms`] exposes. A NULL column
+/// (never touched since enrolment, incl. every pre-migration row) floors
+/// to `added_at_ms`: enrolment is the oldest defensible "we had contact"
+/// instant, so the peer never reads as older than it actually is.
+fn stored_last_seen_ms(column: Option<i64>, added_at_ms: u64) -> Result<u64, StoreError> {
+    match column {
+        Some(value) => i64_to_u64("peer_trust.last_seen_ms", value),
+        None => Ok(added_at_ms),
+    }
 }
 
 fn sqlite_file_url(path: &Path) -> String {
@@ -2143,6 +2232,124 @@ mod tests {
         let reloaded = store.load_peers().await.unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].tier, TrustTier::Friend);
+    }
+
+    // ---------------------------------------------------------------
+    // Seam #3.2 (IDENTITY-SCOPE-PEER-LIVENESS-MODEL) — last_seen_ms
+    // ---------------------------------------------------------------
+
+    /// what this catches: a fresh enrolment must seed `last_seen_ms` to
+    /// the enrolment instant, not leave it NULL/0. A 0 floor would make
+    /// every just-added peer read as maximally stale and the age-based
+    /// classifier would evict peers the instant they enrol.
+    #[tokio::test]
+    async fn add_peer_trust_seeds_last_seen_to_added_at() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x3201_0001);
+        let stored = store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 4242)
+            .await
+            .unwrap();
+        assert_eq!(stored.last_seen_ms, 4242, "enrolment seeds last_seen");
+
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].last_seen_ms, 4242, "durable, not just returned");
+    }
+
+    /// what this catches: `touch_peer_last_seen` must advance recency on
+    /// fresh contact AND must be monotonic — a touch carrying an OLDER
+    /// timestamp (clock skew, out-of-order beacon import) must NOT
+    /// rewind the stored value, which would make a live peer look stale.
+    #[tokio::test]
+    async fn touch_peer_last_seen_advances_and_is_monotonic() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x3201_0002);
+        store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 1000)
+            .await
+            .unwrap();
+
+        // Fresh contact advances.
+        let touched = store
+            .touch_peer_last_seen(peer_id, 5000)
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+        assert_eq!(touched.last_seen_ms, 5000);
+
+        // Older timestamp is ignored — recency never rewinds.
+        let stale = store
+            .touch_peer_last_seen(peer_id, 2000)
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+        assert_eq!(
+            stale.last_seen_ms, 5000,
+            "monotonic: older touch is a no-op"
+        );
+
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].last_seen_ms, 5000, "durable max, not last write");
+    }
+
+    /// what this catches: touching an un-enrolled peer must be a refused
+    /// no-op (Ok(None)), never an implicit insert — recency without a
+    /// trust anchor is meaningless (mirrors the endpoints contract).
+    #[tokio::test]
+    async fn touch_peer_last_seen_unknown_peer_returns_none_no_row_inserted() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x3201_0003);
+        let result = store.touch_peer_last_seen(peer_id, 9000).await.unwrap();
+        assert!(result.is_none());
+        assert!(store.load_peers().await.unwrap().is_empty());
+    }
+
+    /// what this catches: a key rotation must carry `last_seen_ms`
+    /// forward — rotating key material is not fresh contact, so it must
+    /// neither reset recency to the new added_at nor drop it. Same
+    /// preservation invariant as tier and endpoints across rotate.
+    #[tokio::test]
+    async fn replace_peer_trust_preserves_last_seen() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x3201_0004);
+        store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 1000)
+            .await
+            .unwrap();
+        store
+            .touch_peer_last_seen(peer_id, 7777)
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+
+        let rotated = store
+            .replace_peer_trust(peer_id, "BBBB".repeat(11), 9999)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated.last_seen_ms, 7777,
+            "rotation carries recency forward, not reset to new added_at"
+        );
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].last_seen_ms, 7777);
+    }
+
+    /// what this catches: the read-time floor. A stored NULL column
+    /// (every pre-migration row) must resolve to `added_at_ms`, never 0
+    /// — so a friend enrolled before this migration never reads as
+    /// instantly stale. Pure unit test of the floor helper; no IO.
+    #[test]
+    fn stored_last_seen_ms_floors_null_to_added_at() {
+        assert_eq!(
+            stored_last_seen_ms(None, 12345).unwrap(),
+            12345,
+            "NULL column floors to added_at"
+        );
+        assert_eq!(
+            stored_last_seen_ms(Some(20000), 12345).unwrap(),
+            20000,
+            "present column is honoured as-is"
+        );
     }
 
     #[test]

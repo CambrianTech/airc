@@ -23,6 +23,12 @@ pub struct Model {
     /// string here — store sits below lib in the dependency graph).
     /// NULL = identity-only enrolment, no dial candidates.
     pub endpoints_json: Option<String>,
+    /// Seam #3.2 (liveness): epoch-ms of the last time we had contact
+    /// with this peer (fresh beacon import, successful dial). NULL =
+    /// never touched since enrolment; the read layer floors it to
+    /// `added_at_ms` so a pre-migration row reads as last-seen-at-
+    /// enrolment rather than instantly stale.
+    pub last_seen_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
