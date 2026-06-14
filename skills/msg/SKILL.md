@@ -24,11 +24,12 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 The `@` prefix on the first arg is the DM trigger. Everything else is the message body.
 
-`airc msg` has **no `--room` flag** — it always posts to the current room. To target a
-different room, either switch the current room first with `airc room <name>` then
-`airc msg ...`, or use `airc publish --room <name> --body-text "..."` for one-shot
-routing that doesn't move the current-room pointer. Note: `airc publish --room` only
-routes to a room you are **already subscribed to** — it does not auto-join.
+`airc msg --room <name> <message>` — one-shot send to a subscribed room without
+changing the scope's current-room pointer (card a979e5c2 / seam #5). Without `--room`,
+`airc msg` defaults to the current room as before. `--room` only routes to a room
+you are **already subscribed to** — it does not auto-join. (Equivalent for the
+short-lived path: `airc send --room <name> <message>`. For a structured payload:
+`airc publish --room <name> --body-text "..."`.)
 
 ## Execute
 

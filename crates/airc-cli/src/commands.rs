@@ -855,6 +855,13 @@ pub async fn run_send(
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
+    // Card a979e5c2 reviewer NIT — symmetric with run_msg: keep the
+    // daemon's per-wire subscriber index aware of every subscribed
+    // room before the send goes out. Load-bearing in particular when
+    // `--room <name>` targets a room the daemon hasn't recently
+    // touched. Safe no-op when the index is already fresh.
+    let socket = crate::cli::default_socket_path_in(home);
+    sync_daemon_peers_for_current_rooms(home, socket).await?;
     // Card a979e5c2 (seam #5): `--room <name>` routes ONE message
     // to a subscribed-but-not-current room without mutating this
     // scope's default-room pointer. Same shape as `airc publish`.
