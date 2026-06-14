@@ -936,28 +936,8 @@ pub async fn run_cleanup(
             .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
         let repo = card.as_ref().map(|c| c.repo.to_string());
 
-        // Card 83a5624e: resolve <short>/ vs <short>/src/ BEFORE
-        // probing so the operator sees the actual git worktree path
-        // in the disposition table AND the force-remove loop targets
-        // the right directory.
-        let effective = resolve_worktree_path(&path);
-
-        // Probe for both uncommitted AND unpushed work — see
-        // `probe_dirty_status` for the WIP-outranks-hygiene contract.
-        let dirty_status = probe_dirty_status_at(&effective);
-
-        // Probe whether the worktree's branch still exists on origin.
-        // `gh pr merge --delete-branch` (the default merger path AND
-        // every manual merge that uses --delete-branch) removes the
-        // branch on origin AFTER merging the PR. That's the universal
-        // signal a worktree is dead: branch upstream is gone ⇒ either
-        // merged-and-deleted or abandoned. Combined with `Clean` dirty
-        // status, that's enough to remove regardless of the kanban
-        // projection's state — which often lags reality when a
-        // `gh pr merge` bypasses `airc work merge`.
-        let upstream_gone = probe_upstream_gone(&effective);
-
-        let disposition = classify_worktree(card_state.as_ref(), &dirty_status, upstream_gone);
+        let (effective, dirty_status, disposition) =
+            classify_worktree_path(&path, card_state.as_ref());
 
         classifications.push(WorktreeClassification {
             short,
@@ -965,7 +945,7 @@ pub async fn run_cleanup(
             card_state,
             pr_number,
             repo,
-            dirty_status: dirty_status.clone(),
+            dirty_status,
             disposition,
         });
     }
@@ -1142,6 +1122,26 @@ pub(crate) enum DirtyStatus {
 /// override an out-of-sync kanban state and remove — fixes the
 /// recurring disk-full crash where worktrees for already-merged
 /// PRs lingered because the projection hadn't observed the merge.
+/// BIGMAMA review on PR #1198: extract the per-worktree classification
+/// pipeline so the regression nets the PRODUCTION code path. Reverting
+/// `probe_upstream_gone(&effective)` → `&path` inside THIS function now
+/// makes the nested-layout test go red — which is what a regression net
+/// must actually guarantee.
+///
+/// Card 83a5624e: resolve `<short>/` vs `<short>/src/` BEFORE probing so
+/// the operator sees the actual git worktree path in the disposition
+/// table AND the force-remove loop targets the right directory.
+pub(crate) fn classify_worktree_path(
+    path: &std::path::Path,
+    card_state: Option<&CardState>,
+) -> (std::path::PathBuf, DirtyStatus, Disposition) {
+    let effective = resolve_worktree_path(path);
+    let dirty_status = probe_dirty_status_at(&effective);
+    let upstream_gone = probe_upstream_gone(&effective);
+    let disposition = classify_worktree(card_state, &dirty_status, upstream_gone);
+    (effective, dirty_status, disposition)
+}
+
 pub(crate) fn classify_worktree(
     card_state: Option<&airc_work::CardState>,
     dirty: &DirtyStatus,
@@ -2769,29 +2769,34 @@ mod tests {
 
     /// Regression test for BIGMAMA review on PR #1198: the production
     /// fix at `run_cleanup:958` was `probe_upstream_gone(&effective)`,
-    /// but ALL 269 tests pass if you revert that line back to
-    /// `probe_upstream_gone(&path)` — the regression isn't netted.
+    /// but the previous attempt at this test called probe_upstream_gone
+    /// directly with both `&effective` and `&parent` — reverting the
+    /// production line back to `&path` left the test green because
+    /// it never touched the production call site.
     ///
-    /// Net it here: build a `<parent>/src/` nested layout, delete the
-    /// tracking branch on the origin (the only condition under which
-    /// `probe_upstream_gone` returns true), and assert the probe
-    /// follows the resolve through the nested path. If a future
-    /// refactor passes the unresolved `<parent>/` again, this test
-    /// goes red because `git -C <parent>` is not a git tree.
+    /// Defense: drive through `classify_worktree_path` (the extracted
+    /// helper that wraps the same probes run_cleanup uses), feed it a
+    /// nested-layout worktree with a deleted upstream, and assert the
+    /// final disposition is `Removable`. `Removable` is only reachable
+    /// when `upstream_gone == true` — which requires the helper to
+    /// have correctly threaded the resolved `effective` path into
+    /// `probe_upstream_gone`. If a future refactor reverts the helper
+    /// to pass `&path`, the probe runs against the non-git `<parent>/`
+    /// container, returns false, and the disposition falls back to
+    /// SkipUnknownCard (no card) → this test goes red.
     #[test]
-    fn probe_upstream_gone_follows_nested_src_resolve() {
+    fn classify_worktree_path_emits_removable_on_nested_deleted_upstream() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("aabbccdd");
         std::fs::create_dir_all(&parent).expect("mkdir parent");
         let nested = parent.join("src");
 
-        // Standard nested layout: real clone under <parent>/src/.
         let (real_clone, real_tmp) = git_fixture_with_upstream(true);
         std::fs::rename(&real_clone, &nested).expect("rename real clone to nested");
 
-        // Detect default branch then delete the tracking ref on the
-        // origin — `probe_upstream_gone` returns true iff the remote
-        // ref no longer exists.
+        // Delete the upstream branch on origin — the universal "PR
+        // merged / branch abandoned" signal probe_upstream_gone keys
+        // off of.
         let branch_out = std::process::Command::new("git")
             .args(["-C", nested.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
@@ -2814,30 +2819,21 @@ mod tests {
             String::from_utf8_lossy(&del.stderr)
         );
 
-        // The load-bearing assertion: probe_upstream_gone given the
-        // <parent>/ container MUST resolve into <parent>/src/ to see
-        // the deleted upstream. With the bug present
-        // (probe_upstream_gone takes <parent>/ unresolved) this comes
-        // back false because `git -C <parent>` fails non-fatally and
-        // the function short-circuits.
-        //
-        // We probe the EFFECTIVE (resolved) path here — the contract
-        // the production fix enforces — so the test goes red if the
-        // production code stops passing &effective.
-        let effective = resolve_worktree_path(&parent);
-        assert!(
-            probe_upstream_gone(&effective),
-            "probe_upstream_gone(&effective) on a nested layout with deleted upstream must return true; \
-             the production fix at run_cleanup:958 routes through &effective and this test \
-             nets the regression if a future refactor reverts to &path"
-        );
-        // And the bug-shaped call: probe against the unresolved
-        // parent MUST come back false — that's the dial we're
-        // protecting against.
-        assert!(
-            !probe_upstream_gone(&parent),
-            "probe_upstream_gone(&parent) on a nested layout cannot see the deleted upstream; \
-             this asserts the bug shape so the regression is two-sided"
+        // Drive through the SAME helper run_cleanup uses. The card
+        // state is None (no projection match) — `upstream_gone`
+        // short-circuits to Removable BEFORE the card-state branch is
+        // even consulted, so the disposition signal IS the probe
+        // signal. Revert the helper to use unresolved `path` and this
+        // assertion fails because probe_upstream_gone(<parent>/) is
+        // false → falls through to SkipUnknownCard.
+        let (effective, dirty, disposition) = classify_worktree_path(&parent, None);
+        assert_eq!(
+            disposition,
+            Disposition::Removable,
+            "nested layout + deleted upstream MUST classify as Removable. \
+             effective={effective:?}, dirty={dirty:?}, disposition={disposition:?}. \
+             If this fails, classify_worktree_path stopped routing &effective \
+             to probe_upstream_gone — re-check the production fix."
         );
     }
 
