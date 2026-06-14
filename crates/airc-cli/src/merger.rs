@@ -125,14 +125,14 @@ async fn tick_once(
         .await?;
     let snapshot = board.snapshot();
 
-    // Card d5b7b07d: fetch the baseline (rust-rewrite HEAD's failing
-    // check names) ONCE per tick — every per-card gate consults the
-    // same snapshot. The set is small (handful of check names) and
+    // Card d5b7b07d: fetch the baseline (integration-branch HEAD's
+    // failing check names) ONCE per tick — every per-card gate consults
+    // the same snapshot. The set is small (handful of check names) and
     // the query is one REST call; cheap relative to per-PR pr_view.
     let baseline_failures = fetch_baseline_failures(gh).await;
     if !baseline_failures.is_empty() {
         eprintln!(
-            "airc-merger: baseline has {} failing check(s) on rust-rewrite — \
+            "airc-merger: baseline has {} failing check(s) on canary — \
              those won't block per-PR gates this tick",
             baseline_failures.len()
         );
@@ -354,8 +354,8 @@ pub(crate) async fn check_pr_gate(
     Ok(evaluate_gh_view(&view, baseline_failures, policy))
 }
 
-/// Fetch the rust-rewrite HEAD's check-run rollup and return the SET
-/// of names that are currently FAILURE on base. The merger calls this
+/// Fetch the integration branch (canary) HEAD's check-run rollup and
+/// return the SET of names that are currently FAILURE on base. Calls this
 /// once per tick; each per-card gate consults the same snapshot. On
 /// error (rate-limit, network), returns empty set — the gate
 /// degrades to "no allowance" rather than over-trusting.
@@ -364,8 +364,13 @@ pub(crate) async fn fetch_baseline_failures(
 ) -> std::collections::HashSet<String> {
     // Card 70e87d33 made the PR base per-repo. This baseline lookup is
     // airc-specific (the repo is hardcoded to CambrianTech/airc below),
-    // so it resolves to airc's integration branch, rust-rewrite.
-    let base_branch = "rust-rewrite";
+    // so it resolves to airc's integration branch — **canary** since the
+    // rust-rewrite→canary promotion (#1173) DELETED origin/rust-rewrite.
+    // A stale `rust-rewrite` here 422s on every merger tick (no commit
+    // for that SHA) and silently degrades the baseline-allowance gate to
+    // all-green-required. Same stale-base class as the airc-fetch-base
+    // hook bug (#1185).
+    let base_branch = "canary";
     let runs = match gh
         .branch_check_rollup(crate::gh_client::BranchCheckRollupArgs {
             repo: "CambrianTech/airc".to_string(),
