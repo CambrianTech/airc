@@ -2767,6 +2767,80 @@ mod tests {
         );
     }
 
+    /// Regression test for BIGMAMA review on PR #1198: the production
+    /// fix at `run_cleanup:958` was `probe_upstream_gone(&effective)`,
+    /// but ALL 269 tests pass if you revert that line back to
+    /// `probe_upstream_gone(&path)` — the regression isn't netted.
+    ///
+    /// Net it here: build a `<parent>/src/` nested layout, delete the
+    /// tracking branch on the origin (the only condition under which
+    /// `probe_upstream_gone` returns true), and assert the probe
+    /// follows the resolve through the nested path. If a future
+    /// refactor passes the unresolved `<parent>/` again, this test
+    /// goes red because `git -C <parent>` is not a git tree.
+    #[test]
+    fn probe_upstream_gone_follows_nested_src_resolve() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("aabbccdd");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        let nested = parent.join("src");
+
+        // Standard nested layout: real clone under <parent>/src/.
+        let (real_clone, real_tmp) = git_fixture_with_upstream(true);
+        std::fs::rename(&real_clone, &nested).expect("rename real clone to nested");
+
+        // Detect default branch then delete the tracking ref on the
+        // origin — `probe_upstream_gone` returns true iff the remote
+        // ref no longer exists.
+        let branch_out = std::process::Command::new("git")
+            .args(["-C", nested.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let branch = String::from_utf8(branch_out.stdout).unwrap().trim().to_string();
+        let origin = real_tmp.path().join("origin.git");
+        let del = std::process::Command::new("git")
+            .args([
+                "-C",
+                origin.to_str().unwrap(),
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .expect("update-ref -d");
+        assert!(
+            del.status.success(),
+            "delete origin ref failed: {}",
+            String::from_utf8_lossy(&del.stderr)
+        );
+
+        // The load-bearing assertion: probe_upstream_gone given the
+        // <parent>/ container MUST resolve into <parent>/src/ to see
+        // the deleted upstream. With the bug present
+        // (probe_upstream_gone takes <parent>/ unresolved) this comes
+        // back false because `git -C <parent>` fails non-fatally and
+        // the function short-circuits.
+        //
+        // We probe the EFFECTIVE (resolved) path here — the contract
+        // the production fix enforces — so the test goes red if the
+        // production code stops passing &effective.
+        let effective = resolve_worktree_path(&parent);
+        assert!(
+            probe_upstream_gone(&effective),
+            "probe_upstream_gone(&effective) on a nested layout with deleted upstream must return true; \
+             the production fix at run_cleanup:958 routes through &effective and this test \
+             nets the regression if a future refactor reverts to &path"
+        );
+        // And the bug-shaped call: probe against the unresolved
+        // parent MUST come back false — that's the dial we're
+        // protecting against.
+        assert!(
+            !probe_upstream_gone(&parent),
+            "probe_upstream_gone(&parent) on a nested layout cannot see the deleted upstream; \
+             this asserts the bug shape so the regression is two-sided"
+        );
+    }
+
     #[test]
     fn classifier_handles_nested_src_layout_via_probe() {
         // End-to-end: nested worktree with a Closed card should
