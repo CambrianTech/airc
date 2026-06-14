@@ -541,6 +541,23 @@ impl Airc {
                 peer.peer_spec.pubkey,
             )
             .await?;
+            // Seam #3.2 (liveness): a peer present in a freshly
+            // refreshed, stale-pruned registry document just published a
+            // beacon — that IS fresh contact. Record it so the age-based
+            // eviction classifier can tell a live peer from a stale
+            // enrolment. Use the beacon's OWN heartbeat instant (the
+            // peer's liveness assertion), not local `now_ms`: the touch
+            // is monotonic, so a clock-skewed or out-of-order beacon can
+            // only ever leave recency unchanged, never rewind it. The
+            // peer was enrolled two lines up, so this resolves to Some;
+            // we don't assert it (a best-effort liveness stamp, unlike
+            // the endpoints store below whose silent drop was a real bug).
+            airc_trust::touch_last_seen(
+                &self.inner.wire_root,
+                peer.peer_spec.peer_id,
+                peer.presence.heartbeat_at_ms,
+            )
+            .await?;
             // Card 625abe6d slice 1: persist the beacon's endpoints on
             // the trust record so route discovery can dial them after
             // a restart (the in-memory ImportedInviteTable fed below
@@ -813,6 +830,74 @@ mod tests {
             vec![RouteEndpoint::Relay {
                 url: "https://relay.example.test".to_string()
             }]
+        );
+    }
+
+    /// what this catches: seam #3.2 touch wiring. A peer present in a
+    /// freshly refreshed registry document just published a beacon, so
+    /// `import_account_registry_document` must `touch_last_seen` with
+    /// the beacon's OWN heartbeat instant — AND monotonically, so a
+    /// later out-of-order/stale beacon cannot rewind recency. Without
+    /// the wiring `last_seen` would never advance past enrolment and
+    /// the age-based eviction classifier would have nothing to read.
+    #[tokio::test]
+    async fn import_registry_touches_last_seen_from_beacon_heartbeat() {
+        let dir = tempdir().unwrap();
+        let machine_b = dir.path().join("machine-b/.airc");
+        std::fs::create_dir_all(&machine_b).unwrap();
+        let airc = Airc::open(&machine_b).await.unwrap();
+
+        let peer_id = PeerId::new();
+        let spec = peer_spec(peer_id);
+        // Heartbeat in the far future (year ~2286) so it is
+        // unambiguously newer than the real-clock enrolment `added_at`
+        // that `add` seeds — proving the touch ADVANCED last_seen to the
+        // beacon value, not the no-op monotonic floor.
+        let fresh_hb = 9_999_999_999_999u64;
+        let doc = |hb: u64| {
+            AccountRegistryDocument::new(
+                mesh(),
+                2_000,
+                vec![channel("general")],
+                vec![AccountPeerBeacon {
+                    presence: crate::coordinator::beacon_now(
+                        peer_id,
+                        machine_b.clone(),
+                        vec![channel("general")],
+                        123,
+                        hb,
+                    ),
+                    peer_spec: spec.clone(),
+                    endpoints: Vec::new(),
+                }],
+            )
+        };
+
+        airc.import_account_registry_document(doc(fresh_hb))
+            .await
+            .unwrap();
+        let after_fresh = airc_trust::load(&airc.inner.wire_root).await.unwrap();
+        let p = after_fresh
+            .iter()
+            .find(|p| p.peer_id == spec.peer_id)
+            .expect("peer enrolled on import");
+        assert_eq!(
+            p.last_seen_ms, fresh_hb,
+            "import must touch last_seen with the beacon heartbeat"
+        );
+
+        // A later import carrying an OLDER heartbeat must NOT rewind.
+        airc.import_account_registry_document(doc(1_000))
+            .await
+            .unwrap();
+        let after_stale = airc_trust::load(&airc.inner.wire_root).await.unwrap();
+        let p2 = after_stale
+            .iter()
+            .find(|p| p.peer_id == spec.peer_id)
+            .expect("peer still enrolled");
+        assert_eq!(
+            p2.last_seen_ms, fresh_hb,
+            "monotonic: an older/out-of-order beacon must not rewind recency"
         );
     }
 
