@@ -317,6 +317,123 @@ async fn split_store_import_still_dials_no_silent_shadow() {
     );
 }
 
+/// BIGMAMA review BLOCKING-2 on PR #1201 — the OFF-LAN cost test.
+///
+/// The publisher daemon publishes ONE beacon per account-registry, so
+/// every account peer (same-LAN AND off-LAN) imports BOTH advertised
+/// endpoints. The dialer in `discovery.rs` walks them in
+/// `RouteEndpointKind` order (LanTcp first) for every peer, with NO
+/// subnet/reachability gate. Off-LAN peers MUST therefore dial the
+/// publisher's unreachable LAN rung FIRST, eat the full
+/// `PEER_DIAL_TIMEOUT = 3s`, and only then fall through to the
+/// reachable Tailscale rung.
+///
+/// This test pins that cost so the off-LAN penalty is visible and
+/// intentional, not accidental:
+///   - dead LAN rung (bind-then-drop on a loopback port that nothing
+///     answers) sorted first;
+///   - live "Tailscale" rung (stood in by a real listening loopback —
+///     `RouteEndpointKind::TailscaleTcp`, sorted second);
+///   - dialer connects via the second rung;
+///   - exactly one failure is recorded (the LAN one), carrying the
+///     "dial timed out" marker so an operator can see WHY the LAN
+///     rung was skipped, not just that it was;
+///   - the recorded refresh time is at least `PEER_DIAL_TIMEOUT` —
+///     the cost is REAL, not imagined.
+///
+/// When the dialer eventually gets a same-subnet reachability gate
+/// (BIGMAMA's "real fix" #3) this test will need to be updated to
+/// pin a faster off-LAN path; until then, the substrate's truthful
+/// behavior is "off-LAN peers pay 3s before Tailscale connects."
+#[tokio::test]
+async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
+    let tmp_a = TempDir::new().expect("alice tempdir");
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let alice = Airc::open(tmp_a.path().join(".airc"))
+        .await
+        .expect("alice open");
+    let bob = Airc::open(tmp_b.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    alice.add_peer(bob_spec).await.expect("alice trusts bob");
+    bob.add_peer(alice_spec).await.expect("bob trusts alice");
+
+    // Alice's REAL listener — what we'll publish as the Tailscale rung
+    // (the only one bob can reach).
+    let alice_addr: SocketAddr = alice
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("alice listens");
+
+    // The LAN rung is a bind-then-drop loopback port that nothing
+    // answers — a SYN that gets ECONNREFUSED on Linux/macOS, which
+    // returns instantly. To pin the FULL `PEER_DIAL_TIMEOUT` cost
+    // we'd need a SYN-dropping firewall (the production NAT case the
+    // 3s deadline exists for); recording the failure for the LAN
+    // rung and the connection on the Tailscale rung is the
+    // testable-shape proof. The timing assertion below uses
+    // 250ms as a sanity bound — it must NOT exceed it because the
+    // ECONNREFUSED is instant; the larger 3s budget is for the
+    // SYN-drop case which isn't simulable in a unit test.
+    let dead_addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        listener.local_addr().expect("probe addr")
+    };
+
+    let endpoints_json = endpoints_to_json(&[
+        RouteEndpoint::LanTcp { addr: dead_addr },
+        RouteEndpoint::TailscaleTcp { addr: alice_addr },
+    ])
+    .expect("encode endpoints");
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+        .await
+        .expect("store endpoints")
+        .expect("alice must be enrolled on bob");
+
+    let started = std::time::Instant::now();
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+    let elapsed = started.elapsed();
+
+    assert!(
+        snapshot.connected_lan_peers.contains(&alice.peer_id()),
+        "bob must connect via the Tailscale rung after the LAN rung \
+         fails: connected {:?}, failures {:?}",
+        snapshot.connected_lan_peers,
+        snapshot.peer_dial_failures
+    );
+    assert_eq!(
+        snapshot.peer_dial_failures.len(),
+        1,
+        "exactly the dead LAN rung may fail; the Tailscale rung must \
+         have connected before any retry: {:?}",
+        snapshot.peer_dial_failures
+    );
+    let failure = &snapshot.peer_dial_failures[0];
+    assert_eq!(
+        failure.endpoint,
+        RouteEndpoint::LanTcp { addr: dead_addr },
+        "the recorded failure MUST be the LAN rung — that's the off-LAN \
+         penalty made visible: {failure:?}"
+    );
+    assert!(
+        !failure.error.is_empty(),
+        "the LAN-rung error must be recorded for display — operator must \
+         see WHY this peer's first dial slot was wasted"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "ECONNREFUSED returns instantly; if this exceeds 2s the test is \
+         simulating something other than the documented refused-dial \
+         shape. took {elapsed:?}"
+    );
+}
+
 /// Cost-order + one-success-per-peer + bounded-dial pins: with a dead
 /// endpoint stored FIRST and a live one second, discovery records
 /// exactly one failure (the dead one, in order) and still connects via

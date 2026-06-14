@@ -1256,13 +1256,28 @@ pub async fn run_daemon(
         // is unnecessary for same-subnet peers — a 192.168.x dial is
         // direct, while routing same-LAN traffic over 100.x is a wasted
         // hop. So we publish the LAN address (dialed first, no hop) AND
-        // the Tailscale address (the NAT-traversing fallback dialed only
-        // when the LAN dial times out, i.e. when peers are on different
-        // networks). One wildcard listener serves both interfaces; the
-        // endpoint sort order (LanTcp before TailscaleTcp) makes the
-        // dialer try LAN first and break on success — Tailscale only if
-        // we leave the LAN. Earlier this preferred Tailscale exclusively,
-        // forcing every same-LAN peer through an unnecessary 100.x hop.
+        // the Tailscale address (the NAT-traversing fallback). One
+        // wildcard listener serves both interfaces; the endpoint sort
+        // order (LanTcp before TailscaleTcp) makes the dialer try LAN
+        // first and break on success.
+        //
+        // BIGMAMA review BLOCKING-2 on PR #1201 — honest cost note:
+        // the dialer (`airc_lib::discovery::dial_stored_peer_endpoints`)
+        // walks the merged endpoint list in unconditional
+        // `RouteEndpointKind` order for EVERY peer — there is no
+        // same-subnet/reachability gate. Off-LAN peers (i.e. on the same
+        // tailnet but a different physical LAN) therefore dial the
+        // publisher's unreachable 192.168.x rung FIRST and pay up to
+        // `PEER_DIAL_TIMEOUT` (3s) before falling through to the live
+        // Tailscale rung. Earlier this preferred Tailscale exclusively,
+        // forcing every same-LAN peer through an unnecessary 100.x hop;
+        // the new "LAN-first, 3s timeout, then Tailscale" cost is
+        // intentional (same-LAN wins outweighs the off-LAN 3s) and
+        // pinned by the dead-LAN/live-Tailscale test in
+        // `airc-lib/tests/stored_endpoint_dial.rs`. A future real fix
+        // (subnet/reachability gate at the dialer) will eliminate the
+        // 3s for off-LAN peers; until then the truth is visible in the
+        // recorded peer_dial_failures, not hidden in comments.
         let lan_ip = crate::network_commands::detect_lan_ip();
         let tailscale_ip = crate::network_commands::detect_tailscale_ip();
         if lan_ip.is_none() && tailscale_ip.is_none() {
