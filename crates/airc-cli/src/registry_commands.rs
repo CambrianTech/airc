@@ -24,7 +24,7 @@ use std::path::Path;
 
 use airc_ipc::{DaemonClient, IpcRouteEndpoint};
 use airc_lib::{
-    machine_account_home, Airc, GateBlock, GhAccountRegistryStore, RegistryRefreshGate,
+    machine_account_home, Airc, GateBlock, GcAction, GhAccountRegistryStore, RegistryRefreshGate,
     RouteEndpoint, SyncOutcome,
 };
 use airc_store::SqliteEventStore;
@@ -145,7 +145,7 @@ pub async fn run_sync(
     // Gate FIRST (hermetic, then gh-auth): a blocked scope must hear
     // the gate's reason, not an endpoint refusal it can't act on.
     if let Some(block) = gate.block().await {
-        print_gate_skip(&block);
+        print_gate_skip("sync", &block);
         return Ok(());
     }
 
@@ -183,29 +183,81 @@ pub async fn run_sync(
         }
         // The gate re-checks inside sync_once; if it flipped between
         // our check and the tick, surface the reason the same way.
-        SyncOutcome::Skipped(block) => print_gate_skip(&block),
+        SyncOutcome::Skipped(block) => print_gate_skip("sync", &block),
     }
     Ok(())
 }
 
-fn print_gate_skip(block: &GateBlock) {
+fn print_gate_skip(verb: &str, block: &GateBlock) {
     match block {
         // HERMETIC GATE (card d793c242): this scope must not touch the
         // gh account rendezvous — say exactly why, loudly. The manual
         // verb honors the same gate as the daemon loop; there is no
         // CLI path around it (the gh store enforces it again inside).
         GateBlock::Hermetic(reason) => {
-            println!("registry sync REFUSED (hermetic gate): {reason}");
+            println!("registry {verb} REFUSED (hermetic gate): {reason}");
         }
         GateBlock::GhNotReady => {
             println!(
-                "registry sync skipped: `gh` is not authenticated. The account-mesh \
+                "registry {verb} skipped: `gh` is not authenticated. The account-mesh \
                  rendezvous is the same-account gist transport — sign in with `gh auth \
                  login` to enable zero-touch cross-machine discovery. (This is optional, \
                  like every airc transport; LAN/relay/Reticulum paths are unaffected.)"
             );
         }
     }
+}
+
+/// `airc registry gc` — prune junk registry gists on this account.
+/// Dry-run by default; `--apply` deletes. Cuts the per-convergence gh
+/// fetch cost back down to one gist per real machine.
+pub async fn run_gc(home: &Path, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = machine_account_home(home).join("events.sqlite");
+    let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let store = GhAccountRegistryStore::new(event_store, home);
+    let gate = RegistryRefreshGate::GhAuth {
+        gh_bin: crate::commands::gh_bin_override(),
+        scope_home: home.to_path_buf(),
+        token_override: None,
+    };
+    if let Some(block) = gate.block().await {
+        print_gate_skip("gc", &block);
+        return Ok(());
+    }
+
+    let report = store.gc(apply).await?;
+    for verdict in &report.verdicts {
+        let tag = match verdict.action {
+            GcAction::Delete => "DELETE",
+            GcAction::Keep => "keep  ",
+        };
+        let short = &verdict.id[..verdict.id.len().min(8)];
+        println!("  {tag}  {short}  {} — {}", verdict.filename, verdict.reason);
+    }
+    if report.applied {
+        println!(
+            "registry gc: deleted {} junk gist(s), kept {} real gist(s).",
+            report.deleted, report.kept
+        );
+        if report.deleted < report.to_delete {
+            println!(
+                "  ({} delete(s) failed — see errors above; re-run to retry.)",
+                report.to_delete - report.deleted
+            );
+        }
+    } else if report.to_delete == 0 {
+        println!(
+            "registry gc: clean — {} real gist(s), nothing to delete.",
+            report.kept
+        );
+    } else {
+        println!(
+            "registry gc (dry run): would delete {} junk gist(s), keep {} real gist(s). \
+             Re-run with --apply to delete.",
+            report.to_delete, report.kept
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

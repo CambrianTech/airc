@@ -29,4 +29,22 @@ pub enum RegistryAction {
         #[arg(long)]
         allow_endpointless: bool,
     },
+
+    /// Garbage-collect junk registry gists on this account so a
+    /// converging reader fetches one gist per real machine, not a swamp
+    /// of identity-less / legacy duplicates (each extra gist is a
+    /// per-tick gh fetch).
+    ///
+    /// Deletes only the PROVABLY-junk: `<hex>-unknown-user` gists
+    /// (identity-less CI / container publishers) and legacy
+    /// pre-writer-key `airc-account-mesh-registry.json` duplicates. A
+    /// real machine's `<host>-<user>` gist is never touched.
+    ///
+    /// Dry-run by default — prints the plan. Pass `--apply` to delete.
+    Gc {
+        /// Actually delete the junk gists. Without this flag, gc only
+        /// prints what it WOULD delete (dry run).
+        #[arg(long)]
+        apply: bool,
+    },
 }

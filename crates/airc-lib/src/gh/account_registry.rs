@@ -186,6 +186,114 @@ pub fn writer_filename() -> String {
     format!("airc-account-mesh-registry.{}.json", writer_key())
 }
 
+/// What [`classify_registry_gc`] decided for one own-account gist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcAction {
+    /// A real machine's gist (or an unrecognized file) — never deleted.
+    Keep,
+    /// Provable junk — safe to delete.
+    Delete,
+}
+
+/// One gist's gc verdict: id + filename + action + a human-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcVerdict {
+    pub id: String,
+    pub filename: String,
+    pub action: GcAction,
+    pub reason: String,
+}
+
+/// Outcome of [`GhAccountRegistryStore::gc`]: every gist's verdict plus
+/// counts. `deleted` is what was actually removed (0 in a dry run);
+/// `applied` says whether deletions were performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcReport {
+    pub verdicts: Vec<GcVerdict>,
+    pub kept: usize,
+    /// Number marked for deletion (the plan size, dry-run or not).
+    pub to_delete: usize,
+    /// Number actually deleted (== to_delete on a clean apply, 0 on dry run).
+    pub deleted: usize,
+    pub applied: bool,
+}
+
+/// Shape of a registry gist's first filename.
+enum RegistryFilename {
+    /// Legacy `airc-account-mesh-registry.json` (pre-writer-key).
+    Legacy,
+    /// `airc-account-mesh-registry.<key>.json` — `<key>` is `<host>-<user>`.
+    Keyed(String),
+    /// Anything else — not a recognized registry filename.
+    Other,
+}
+
+fn parse_registry_filename(filename: &str) -> RegistryFilename {
+    if filename == "airc-account-mesh-registry.json" {
+        return RegistryFilename::Legacy;
+    }
+    if let Some(stem) = filename.strip_suffix(".json") {
+        if let Some(key) = stem.strip_prefix("airc-account-mesh-registry.") {
+            if !key.is_empty() {
+                return RegistryFilename::Keyed(key.to_string());
+            }
+        }
+    }
+    RegistryFilename::Other
+}
+
+/// Pure, reader-side classification of own-account registry gists into
+/// keep vs delete. The conservative v1 policy deletes only the two
+/// PROVABLY-junk categories and keeps every real machine's gist:
+///
+/// - `airc-account-mesh-registry.<hex>-unknown-user.json` — an
+///   identity-less publisher (a CI runner or throwaway container with
+///   no resolvable host/user; cf the mesh-converge harness). A real
+///   desktop resolves a `<host>-<user>` key, so an `unknown-user` gist
+///   is never a real machine.
+/// - `airc-account-mesh-registry.json` — a LEGACY, pre-writer-key gist.
+///   The find-or-update scheme (card d793c242) keys gists by machine,
+///   so these unnamed ones are superseded duplicates; any live machine
+///   republishes under its `<host>-<user>` filename.
+/// - `airc-account-mesh-registry.<host>-<user>.json` — a real machine's
+///   gist. KEPT. (Deduping multiple gists for the SAME real key, and
+///   pruning gists whose beacons are all stale, are future opt-in
+///   passes — v1 never touches a real writer-keyed gist.)
+/// - anything unrecognized — KEPT (never delete a file we don't model).
+///
+/// Filename-only and side-effect-free, so the policy is unit-testable
+/// and mutation-verifiable without any gh I/O.
+pub fn classify_registry_gc(gists: &[(String, String)]) -> Vec<GcVerdict> {
+    gists
+        .iter()
+        .map(|(id, filename)| {
+            let (action, reason) = match parse_registry_filename(filename) {
+                RegistryFilename::Legacy => (
+                    GcAction::Delete,
+                    "legacy pre-writer-key gist (superseded duplicate)".to_string(),
+                ),
+                RegistryFilename::Keyed(key) if key.ends_with("-unknown-user") => (
+                    GcAction::Delete,
+                    format!("identity-less publisher ({key}) — never a real machine"),
+                ),
+                RegistryFilename::Keyed(key) => {
+                    (GcAction::Keep, format!("real machine gist ({key})"))
+                }
+                RegistryFilename::Other => (
+                    GcAction::Keep,
+                    "unrecognized filename — left untouched".to_string(),
+                ),
+            };
+            GcVerdict {
+                id: id.clone(),
+                filename: filename.clone(),
+                action,
+                reason,
+            }
+        })
+        .collect()
+}
+
 fn first_nonempty_env(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -530,6 +638,61 @@ impl GhAccountRegistryStore {
             return Ok(None);
         }
         Ok(serde_json::from_str(content.trim()).ok())
+    }
+
+    /// Garbage-collect this account's registry gists: delete the
+    /// provably-junk ones ([`classify_registry_gc`]) so a converging
+    /// reader fetches one gist per real machine instead of a swamp of
+    /// identity-less / legacy duplicates (each extra gist is a per-tick
+    /// gh fetch). Dry-run when `apply == false`: classify + report, no
+    /// deletes. Honors the hermetic gate — a hermetic scope must not
+    /// mutate the production rendezvous.
+    pub async fn gc(&self, apply: bool) -> Result<GcReport, AccountRegistryError> {
+        if let Some(block) = account_registry_block(&self.scope_home) {
+            return Err(AccountRegistryError::Adapter(format!(
+                "HERMETIC GATE: refusing account-registry gc — {block}"
+            )));
+        }
+        let entries = self.list_registry_gists().await?;
+        let pairs: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| (e.id.clone(), e.filename.clone()))
+            .collect();
+        let verdicts = classify_registry_gc(&pairs);
+        let kept = verdicts
+            .iter()
+            .filter(|v| v.action == GcAction::Keep)
+            .count();
+        let to_delete = verdicts.len() - kept;
+        let mut deleted = 0usize;
+        if apply {
+            for verdict in verdicts.iter().filter(|v| v.action == GcAction::Delete) {
+                if self.delete_gist(&verdict.id).await.is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(GcReport {
+            verdicts,
+            kept,
+            to_delete,
+            deleted,
+            applied: apply,
+        })
+    }
+
+    /// Delete one gist by id via `gh api --method DELETE /gists/<id>`.
+    async fn delete_gist(&self, id: &str) -> Result<(), AccountRegistryError> {
+        let (ok, _stdout, stderr) = self
+            .gh_run(&["api", "--method", "DELETE", &format!("/gists/{id}")], None)
+            .await?;
+        if ok {
+            Ok(())
+        } else {
+            Err(AccountRegistryError::Adapter(format!(
+                "gh api DELETE /gists/{id} failed: {stderr}"
+            )))
+        }
     }
 
     /// Probe the sentinel-recorded gist: `Found(filename)` when it
@@ -971,6 +1134,40 @@ mod tests {
         assert_eq!(filename, writer_filename());
     }
 
+    // what this catches: registry gc must delete ONLY the two provably-
+    // junk categories (identity-less `unknown-user` publishers + legacy
+    // pre-writer-key duplicates) and never a real machine's gist — the
+    // exact policy that cleaned 80 phantom gists off a real account.
+    // Mutation check: flipping any Keep<->Delete arm fails an assert.
+    #[test]
+    fn classify_registry_gc_deletes_only_provable_junk() {
+        let gists = vec![
+            ("real".to_string(), "airc-account-mesh-registry.bigmama-joelt.json".to_string()),
+            ("ci".to_string(), "airc-account-mesh-registry.05c0fc93ce40-unknown-user.json".to_string()),
+            ("legacy".to_string(), "airc-account-mesh-registry.json".to_string()),
+            ("weird".to_string(), "something-else.json".to_string()),
+        ];
+        let verdicts = classify_registry_gc(&gists);
+        let action_of = |id: &str| {
+            verdicts
+                .iter()
+                .find(|v| v.id == id)
+                .unwrap_or_else(|| panic!("missing verdict for {id}"))
+                .action
+                .clone()
+        };
+        assert_eq!(action_of("real"), GcAction::Keep, "real machine gist kept");
+        assert_eq!(action_of("ci"), GcAction::Delete, "unknown-user is junk");
+        assert_eq!(action_of("legacy"), GcAction::Delete, "legacy unnamed is junk");
+        assert_eq!(
+            action_of("weird"),
+            GcAction::Keep,
+            "unrecognized filename must NOT be deleted"
+        );
+        let to_delete = verdicts.iter().filter(|v| v.action == GcAction::Delete).count();
+        assert_eq!(to_delete, 2);
+    }
+
     // Hermetic gate inputs (env-set arm is pinned by the CLI
     // subprocess tests in crates/airc-cli/tests/registry_hermetic.rs,
     // where the env can be set without racing parallel tests).
@@ -1052,7 +1249,18 @@ case "$1" in
     fi
     ;;
   api)
-    path="$2"
+    # Two arg shapes: `api <path> [--jq expr]` (GET) and
+    # `api --method DELETE <path>` (delete).
+    if [ "$2" = "--method" ] || [ "$2" = "-X" ]; then
+      method="$3"; path="$4"
+    else
+      method="GET"; path="$2"
+    fi
+    if [ "$method" = "DELETE" ]; then
+      id="${path#/gists/}"
+      rm -f "$S/$id.filename" "$S/$id.content"
+      exit 0
+    fi
     if [ "$path" = "/gists?per_page=100" ]; then
       for f in "$S"/*.filename; do
         [ -e "$f" ] || continue
@@ -1193,6 +1401,55 @@ exit 0
             peers: Vec<AccountPeerBeacon>,
         ) -> AccountRegistryDocument {
             AccountRegistryDocument::new(mesh(), generated_at_ms, Vec::new(), peers)
+        }
+
+        // what this catches: `gc` dry-run reports the junk plan without
+        // deleting; `gc --apply` removes ONLY the junk (unknown-user +
+        // legacy) and leaves the real machine gist — the first-class
+        // version of the manual cleanup that cleared 80 phantom gists off
+        // a real account. Mutation check: dropping the apply delete-loop
+        // leaves all 3 gists and `deleted` == 0.
+        #[tokio::test]
+        async fn gc_deletes_only_junk_on_apply_not_dry_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
+
+            stub.seed_gist(
+                "real",
+                "airc-account-mesh-registry.bigmama-joelt.json",
+                &document(1, vec![]),
+            );
+            stub.seed_gist(
+                "ci",
+                "airc-account-mesh-registry.05c0fc93ce40-unknown-user.json",
+                &document(1, vec![]),
+            );
+            stub.seed_gist(
+                "legacy",
+                "airc-account-mesh-registry.json",
+                &document(1, vec![]),
+            );
+
+            // Dry run: plan only, nothing deleted, all 3 still present.
+            let dry = store.gc(false).await.unwrap();
+            assert_eq!(dry.to_delete, 2, "two junk gists planned for deletion");
+            assert_eq!(dry.kept, 1, "the real machine gist is kept");
+            assert_eq!(dry.deleted, 0, "dry run deletes nothing");
+            assert!(!dry.applied);
+            assert_eq!(store.list_registry_gists().await.unwrap().len(), 3);
+
+            // Apply: junk gone, real machine gist survives.
+            let applied = store.gc(true).await.unwrap();
+            assert_eq!(applied.deleted, 2);
+            assert_eq!(applied.kept, 1);
+            assert!(applied.applied);
+            let remaining = store.list_registry_gists().await.unwrap();
+            assert_eq!(remaining.len(), 1, "only the real machine gist remains");
+            assert_eq!(
+                remaining[0].filename,
+                "airc-account-mesh-registry.bigmama-joelt.json"
+            );
         }
 
         // Production-shaped home + env unset → publish goes through
