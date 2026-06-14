@@ -502,35 +502,47 @@ done
 $ghAvail  = Get-Command gh  -ErrorAction SilentlyContinue
 $gitAvail = Get-Command git -ErrorAction SilentlyContinue
 if ($ghAvail -and $gitAvail) {
-    & gh auth status 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $ghHelper = & git config --global --get-all credential.https://github.com.helper 2>$null
-        # Join to a scalar before -notmatch: --get-all can return multiple
-        # helper values (array), and PS -notmatch on an array filters rather
-        # than returning a strict boolean. Scalar form is correct.
-        if ((@($ghHelper) -join "`n") -notmatch 'gh auth git-credential') {
-            & gh auth setup-git 2>$null
-            if ($LASTEXITCODE -eq 0) { Write-Ok 'gh token wired into git credential helper' }
+    # PS 5.1 converts a native command's REDIRECTED stderr into a terminating
+    # NativeCommandError under $ErrorActionPreference='Stop' (PS 7 does not).
+    # gh/git here legitimately write to stderr on a fresh box — `gh auth
+    # status` with no login prints "You are not logged in" — which we already
+    # handle via $LASTEXITCODE. Relax EAP for this probe block so those benign
+    # stderr lines don't abort the whole install (the ps5 clean-install bug).
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        & gh auth status 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $ghHelper = & git config --global --get-all credential.https://github.com.helper 2>$null
+            # Join to a scalar before -notmatch: --get-all can return multiple
+            # helper values (array), and PS -notmatch on an array filters rather
+            # than returning a strict boolean. Scalar form is correct.
+            if ((@($ghHelper) -join "`n") -notmatch 'gh auth git-credential') {
+                & gh auth setup-git 2>$null
+                if ($LASTEXITCODE -eq 0) { Write-Ok 'gh token wired into git credential helper' }
+            }
+            $gitName  = (& git config --global user.name)  2>$null
+            $gitEmail = (& git config --global user.email) 2>$null
+            if (-not $gitName -or -not $gitEmail) {
+                $ghLogin = (& gh api user --jq '.login') 2>$null
+                $ghName  = (& gh api user --jq '.name // .login') 2>$null
+                $ghId    = (& gh api user --jq '.id') 2>$null
+                $ghEmail = (& gh api user --jq '.email // empty') 2>$null
+                if (-not $ghEmail -and $ghId -and $ghLogin) {
+                    $ghEmail = "$ghId+$ghLogin@users.noreply.github.com"
+                }
+                if (-not $gitName -and $ghName) {
+                    & git config --global user.name $ghName
+                    Write-Ok "git user.name set from gh: $ghName"
+                }
+                if (-not $gitEmail -and $ghEmail) {
+                    & git config --global user.email $ghEmail
+                    Write-Ok "git user.email set from gh: $ghEmail"
+                }
+            }
         }
-        $gitName  = (& git config --global user.name)  2>$null
-        $gitEmail = (& git config --global user.email) 2>$null
-        if (-not $gitName -or -not $gitEmail) {
-            $ghLogin = (& gh api user --jq '.login') 2>$null
-            $ghName  = (& gh api user --jq '.name // .login') 2>$null
-            $ghId    = (& gh api user --jq '.id') 2>$null
-            $ghEmail = (& gh api user --jq '.email // empty') 2>$null
-            if (-not $ghEmail -and $ghId -and $ghLogin) {
-                $ghEmail = "$ghId+$ghLogin@users.noreply.github.com"
-            }
-            if (-not $gitName -and $ghName) {
-                & git config --global user.name $ghName
-                Write-Ok "git user.name set from gh: $ghName"
-            }
-            if (-not $gitEmail -and $ghEmail) {
-                & git config --global user.email $ghEmail
-                Write-Ok "git user.email set from gh: $ghEmail"
-            }
-        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
     }
 }
 
