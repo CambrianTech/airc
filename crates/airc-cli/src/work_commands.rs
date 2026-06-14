@@ -955,7 +955,7 @@ pub async fn run_cleanup(
         // status, that's enough to remove regardless of the kanban
         // projection's state — which often lags reality when a
         // `gh pr merge` bypasses `airc work merge`.
-        let upstream_gone = probe_upstream_gone(&path);
+        let upstream_gone = probe_upstream_gone(&effective);
 
         let disposition = classify_worktree(card_state.as_ref(), &dirty_status, upstream_gone);
 
