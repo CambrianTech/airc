@@ -55,6 +55,27 @@ pub fn default_home_dir() -> PathBuf {
     default_home_dir_for(&cwd)
 }
 
+/// Resolve the explicit home override from the global `--home` / `--here`
+/// flags. `--home <path>` wins (and clap forbids passing both). `--here`
+/// is the ergonomic shortcut for `AIRC_HOME=$PWD/.airc` (seam #1): the
+/// intentional opt-in to a cwd-LOCAL scope. Returns `None` when neither
+/// is set — the caller then falls back to [`default_home_dir`] (which
+/// itself honours `$AIRC_HOME`, then the machine-account / git-project
+/// resolution). Pure: `cwd` is injected so tests need no real `$PWD`.
+pub fn explicit_home_override(
+    home_flag: Option<PathBuf>,
+    here_flag: bool,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    if let Some(home) = home_flag {
+        return Some(home);
+    }
+    if here_flag {
+        return Some(cwd.join(".airc"));
+    }
+    None
+}
+
 fn default_home_dir_for(cwd: &Path) -> PathBuf {
     let machine_account = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -449,6 +470,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub home: Option<PathBuf>,
 
+    /// Use a cwd-LOCAL `.airc` scope (`$PWD/.airc`) for this invocation,
+    /// instead of the default machine-account / git-project resolution
+    /// (seam #1). The ergonomic shortcut for `AIRC_HOME=$PWD/.airc` —
+    /// the explicit, intentional way to mint or use a per-directory
+    /// scope (`airc init --here`, `airc join --here`) when you genuinely
+    /// want one, which is what lets the default safely resolve to the
+    /// machine-account home rather than a throwaway cwd scope. Conflicts
+    /// with `--home`.
+    #[arg(long, global = true, conflicts_with = "home")]
+    pub here: bool,
+
     /// Ad-hoc peers to enrol for this invocation only, repeatable.
     /// Format: `<uuid>:<base64-pubkey-no-padding>`. Persistent peers
     /// come from the peer trust store (managed via `airc peer add`);
@@ -813,7 +845,39 @@ pub enum Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_home_dir_for, default_socket_path_in};
+    use super::{default_home_dir_for, default_socket_path_in, explicit_home_override};
+    use std::path::{Path, PathBuf};
+
+    /// what this catches (seam #1 `--here`): the override precedence.
+    /// `--home` wins; `--here` resolves to the cwd-LOCAL `.airc` (the
+    /// `AIRC_HOME=$PWD/.airc` shortcut); neither set returns None so the
+    /// caller falls through to the machine-account / git-project default.
+    /// If `--here` ever resolved to the machine-account home instead of
+    /// `$PWD/.airc`, the whole point of the flag (an explicit local
+    /// scope) would be lost — this pins it.
+    #[test]
+    fn explicit_home_override_precedence() {
+        let cwd = Path::new("/work/project");
+
+        // --home wins outright.
+        assert_eq!(
+            explicit_home_override(Some(PathBuf::from("/custom/home")), false, cwd),
+            Some(PathBuf::from("/custom/home"))
+        );
+        // (and still wins even if --here were somehow also set; clap
+        // forbids the combination, but the resolver is unambiguous.)
+        assert_eq!(
+            explicit_home_override(Some(PathBuf::from("/custom/home")), true, cwd),
+            Some(PathBuf::from("/custom/home"))
+        );
+        // --here → cwd-local .airc, NOT the machine-account home.
+        assert_eq!(
+            explicit_home_override(None, true, cwd),
+            Some(PathBuf::from("/work/project/.airc"))
+        );
+        // neither → None (caller falls back to default_home_dir).
+        assert_eq!(explicit_home_override(None, false, cwd), None);
+    }
 
     #[test]
     fn default_home_uses_enclosing_airc_scope() {
