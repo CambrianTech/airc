@@ -36,7 +36,7 @@ gh account). CLI surface:
   airc part                      leave current room
 
 If a send fails, read stderr. Auth failures need re-pair
-(`airc teardown --flush && airc join <gist-id>`); network failures
+(`airc stop && airc join <gist-id>`); network failures
 queue automatically. If the host died (sleep without daemon), the next
 `airc join` cold takes over #general; existing peers self-recover
 after ~9 min. Wrong-host suspicion: check `airc peers` + `airc list`.
