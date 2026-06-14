@@ -37,7 +37,7 @@ gh account).
 
 Error handling:
 - Every send is mirrored locally first — never silent loss.
-- "Authentication failure" → run `airc teardown --flush && airc join <gist-id>`.
+- "Authentication failure" → run `airc stop && airc join <gist-id>`.
 - "Queued for retry" → host transient; monitor drains when it returns.
 - Host died (laptop sleep without daemon, etc.) → next `airc join` cold takes
   over hosting #general. Existing peers' monitors auto-recover after ~9 min.

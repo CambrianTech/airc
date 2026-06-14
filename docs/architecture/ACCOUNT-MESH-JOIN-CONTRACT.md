@@ -116,7 +116,7 @@ two fresh project scopes run public airc join
 both scopes subscribe #general and their inferred project channel
 both scopes derive the same identity-namespaced #general RoomId
 both scopes use the same account-home #general wire
-airc teardown cleans the scope processes
+airc stop cleans the scope processes
 ```
 
 For AI agents specifically, a passing install is not enough. Claude must be

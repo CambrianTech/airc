@@ -37,7 +37,7 @@ gh account).
 
 Error classes (read stderr):
 - "Authentication failure — re-pair required" → exit 1. Run
-  `airc teardown --flush && airc join <gist-id>`. Don't retry.
+  `airc stop && airc join <gist-id>`. Don't retry.
 - "Network error reaching host — message queued for retry" → exit 0.
   Queued in pending.jsonl; monitor's flush loop drains on reconnect.
 - "Pending queue at cap" → exit 1. Host gone too long; re-pair or bump

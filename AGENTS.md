@@ -242,7 +242,7 @@ proceed. Atomic claim is the only arbiter; everything else is open.
 The agent stops only when:
 
 1. **Genuine completion** — the recipe / parent card is done.
-2. **Teardown** — `airc teardown`, session end, explicit instruction
+2. **Stop** — `airc stop`, session end, explicit instruction
    to stop.
 
 Things that are **not** stopping conditions:
