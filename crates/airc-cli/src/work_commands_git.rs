@@ -30,11 +30,17 @@ pub(crate) async fn spawn_claim_worktree(
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
     let short: String = card.card_id.to_string().chars().take(8).collect();
 
-    // Card 8a3082c4: skip worktree spawn entirely when the card is
-    // already linked to a PR — the work is by definition happening
-    // on the linked head branch elsewhere. See `worktree_skip_reason`
-    // for the rule + rationale.
-    if let Some(reason) = worktree_skip_reason(card) {
+    // Card 8a3082c4 + BIGMAMA review fix: skip worktree spawn when
+    // card is linked to a LIVE PR (Open/Draft/Ready). A Merged or
+    // Closed PR means the work shipped — operator wants a fresh
+    // worktree to do follow-up. Look up the merge_state from the
+    // projection so the gate is by liveness, not by presence.
+    let pr_merge_state = card.pull_request.as_ref().and_then(|pr| {
+        board
+            .pull_request(&pr.repo, pr.number)
+            .and_then(|record| record.merge_state)
+    });
+    if let Some(reason) = worktree_skip_reason(card, pr_merge_state) {
         println!("worktree:  skipped — {reason}");
         return Ok(());
     }
@@ -222,23 +228,37 @@ pub(crate) fn git_show_format(
 /// auto-spawned stray worktree on an already-PR'd card) AND making
 /// the rule testable on its own without an IPC daemon round-trip.
 ///
-/// Current rule: skip when `card.pull_request.is_some()`. The
-/// reasoning is that linking a PR is a positive statement that work
-/// is already underway on `pr.head` in some existing checkout — the
-/// auto-spawn would either create a different branch (wrong) or
-/// collide with the existing checkout (wrong). Future rules can
-/// extend this match without touching the call site.
-pub(crate) fn worktree_skip_reason(card: &airc_work::model::WorkCard) -> Option<String> {
-    if let Some(ref pr) = card.pull_request {
-        return Some(format!(
+/// Current rule: skip when `card.pull_request` is linked AND the PR
+/// is LIVE (`PrMergeState::{Open,Draft,Ready}`). A linked PR that's
+/// already `Merged` or `Closed` is dead work — the operator wants to
+/// claim a fresh worktree to start the follow-up, so DON'T skip.
+///
+/// BIGMAMA review on PR #1199: original rule gated on `is_some()`
+/// (PRESENCE), not state, so a card with a stale Merged PR linked
+/// would silently refuse the next spawn forever. The fix threads
+/// `PullRequestRecord.merge_state` from the projection through to
+/// the test, keeping the function pure (caller does the lookup).
+///
+/// `pr_merge_state == None` means "projection doesn't know" — we
+/// fall back to the conservative behavior (skip on presence) to
+/// avoid clobbering an unobserved in-flight PR.
+pub(crate) fn worktree_skip_reason(
+    card: &airc_work::model::WorkCard,
+    pr_merge_state: Option<airc_work::model::PrMergeState>,
+) -> Option<String> {
+    let pr = card.pull_request.as_ref()?;
+    use airc_work::model::PrMergeState::*;
+    match pr_merge_state {
+        Some(Merged) | Some(Closed) => None,
+        // Open, Draft, Ready, or unknown → conservative skip.
+        _ => Some(format!(
             "card already linked to PR #{number} on branch {head} ({repo}); \
              continue work in your existing checkout/worktree",
             number = pr.number,
             head = pr.head,
             repo = pr.repo,
-        ));
+        )),
     }
-    None
 }
 
 #[cfg(test)]
@@ -285,7 +305,8 @@ mod tests {
             head: BranchName::new("fix/rolling-log").expect("test head"),
             base: BranchName::new("canary").expect("test base"),
         }));
-        let reason = worktree_skip_reason(&card).expect("PR-linked card must skip");
+        let reason = worktree_skip_reason(&card, Some(airc_work::model::PrMergeState::Open))
+            .expect("live PR-linked card must skip");
         assert!(
             reason.contains("#1547"),
             "reason must cite PR number: {reason}"
@@ -300,6 +321,55 @@ mod tests {
         );
     }
 
+    /// BIGMAMA review fix: a Merged or Closed PR is dead work — the
+    /// operator wants a fresh worktree to start the follow-up. The
+    /// presence-only `is_some()` rule from PR #1199 incorrectly kept
+    /// skipping forever; this test pins the liveness gate.
+    #[test]
+    fn proceeds_when_linked_pr_is_merged() {
+        let card = card_with_pr(Some(PullRequestRef {
+            repo: RepoId::new("acme/widgets").expect("test repo"),
+            number: 1547,
+            head: BranchName::new("fix/rolling-log").expect("test head"),
+            base: BranchName::new("canary").expect("test base"),
+        }));
+        assert!(
+            worktree_skip_reason(&card, Some(airc_work::model::PrMergeState::Merged)).is_none(),
+            "Merged PR is dead work — fresh worktree allowed for follow-up"
+        );
+    }
+
+    #[test]
+    fn proceeds_when_linked_pr_is_closed() {
+        let card = card_with_pr(Some(PullRequestRef {
+            repo: RepoId::new("acme/widgets").expect("test repo"),
+            number: 1547,
+            head: BranchName::new("fix/rolling-log").expect("test head"),
+            base: BranchName::new("canary").expect("test base"),
+        }));
+        assert!(
+            worktree_skip_reason(&card, Some(airc_work::model::PrMergeState::Closed)).is_none(),
+            "Closed PR is dead work — fresh worktree allowed for follow-up"
+        );
+    }
+
+    /// `None` merge_state means the projection hasn't observed a PR
+    /// state yet. Conservative behavior: skip on presence so we don't
+    /// clobber an in-flight branch we just haven't indexed yet.
+    #[test]
+    fn skips_conservatively_when_pr_state_unknown() {
+        let card = card_with_pr(Some(PullRequestRef {
+            repo: RepoId::new("acme/widgets").expect("test repo"),
+            number: 1547,
+            head: BranchName::new("fix/rolling-log").expect("test head"),
+            base: BranchName::new("canary").expect("test base"),
+        }));
+        assert!(
+            worktree_skip_reason(&card, None).is_some(),
+            "unknown PR state must fall back to skip-on-presence"
+        );
+    }
+
     /// The normal-claim path. With no PR linked the substrate has no
     /// existing-checkout evidence; the worktree allocator should
     /// proceed (the function returns None so the caller falls
@@ -308,7 +378,7 @@ mod tests {
     fn proceeds_when_no_pull_request_linked() {
         let card = card_with_pr(None);
         assert!(
-            worktree_skip_reason(&card).is_none(),
+            worktree_skip_reason(&card, None).is_none(),
             "unlinked card must NOT short-circuit worktree spawn",
         );
     }
