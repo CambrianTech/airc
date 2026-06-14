@@ -1880,8 +1880,13 @@ pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std:
         println!("(no enroled peers — nothing to prune)");
         return Ok(());
     }
-    let enrolled_pairs: Vec<(airc_core::PeerId, airc_lib::TrustTier)> =
-        enrolled.iter().map(|p| (p.peer_id, p.tier)).collect();
+    // Seam #3.2: carry each peer's last_seen so the classifier can apply
+    // the staleness grace window (a recently-contacted peer absent from
+    // one registry snapshot is kept, not evicted as a ghost).
+    let enrolled_triples: Vec<(airc_core::PeerId, airc_lib::TrustTier, u64)> = enrolled
+        .iter()
+        .map(|p| (p.peer_id, p.tier, p.last_seen_ms))
+        .collect();
 
     // Authoritative live set: the fresh, stale-pruned account-registry
     // document (READ-ONLY — `live_registry_peer_ids` does not enrol).
@@ -1905,7 +1910,16 @@ pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std:
         }
     };
 
-    let verdicts = airc_lib::classify_peer_prune(&enrolled_pairs, &live_ids);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let verdicts = airc_lib::classify_peer_prune(
+        &enrolled_triples,
+        &live_ids,
+        now_ms,
+        airc_lib::DEFAULT_PEER_STALE_AFTER_MS,
+    );
     let mut to_evict = Vec::new();
     for verdict in &verdicts {
         match verdict.action {
@@ -1948,7 +1962,7 @@ pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std:
         if airc
             .remove_peer(
                 *peer_id,
-                "peer-prune: untrusted + absent from fresh registry",
+                "peer-prune: untrusted + absent from fresh registry + stale past last_seen TTL",
             )
             .await?
         {
