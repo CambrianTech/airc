@@ -269,8 +269,7 @@ mod tests {
         live_ids.insert(live_untrusted);
 
         let verdicts = classify_peer_prune(&enrolled, &live_ids);
-        let action_of =
-            |id: PeerId| verdicts.iter().find(|v| v.peer_id == id).unwrap().action;
+        let action_of = |id: PeerId| verdicts.iter().find(|v| v.peer_id == id).unwrap().action;
 
         assert_eq!(
             action_of(ghost),

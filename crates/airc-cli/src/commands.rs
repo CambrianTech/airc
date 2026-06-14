@@ -1841,9 +1841,7 @@ pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std:
     let db_path = airc_lib::machine_account_home(home).join("events.sqlite");
     let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
     let store = match resolve_gh_bin() {
-        Some(bin) => {
-            airc_lib::GhAccountRegistryStore::new(event_store, home).with_bin(bin)
-        }
+        Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, home).with_bin(bin),
         None => airc_lib::GhAccountRegistryStore::new(event_store, home),
     };
     let airc = Airc::open(home).await?;
