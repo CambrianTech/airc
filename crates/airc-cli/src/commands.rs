@@ -1251,36 +1251,67 @@ pub async fn run_daemon(
         // routable LAN (or a bind failure) still reaches the mesh by
         // dialing OUT to listening peers / relay — it just isn't
         // dialable itself, which we say plainly rather than swallow.
-        // Prefer the Tailscale endpoint over LAN. Every node on the same
-        // gh account is on the Tailscale mesh, so a 100.x address is
-        // dialable from ANY network and traverses NAT/firewalls, whereas a
-        // 192.168.x LAN address only works same-subnet and dies behind a
-        // firewall (the cross-machine keystone failure: nodes advertised
-        // LAN-only and could enrol each other but never connect). Fall back
-        // to LAN when Tailscale is down.
-        let advertise = crate::network_commands::detect_tailscale_ip()
-            .map(|ip| (ip, "Tailscale"))
-            .or_else(|| crate::network_commands::detect_lan_ip().map(|ip| (ip, "LAN")));
-        match advertise {
-            Some((ip, kind)) => match airc.listen_lan(std::net::SocketAddr::from((ip, 0))).await {
-                Ok(addr) => {
+        // Advertise BOTH the LAN and Tailscale addresses (the connection
+        // ladder: local → LAN → Tailscale → greater-grid P2P). Tailscale
+        // is unnecessary for same-subnet peers — a 192.168.x dial is
+        // direct, while routing same-LAN traffic over 100.x is a wasted
+        // hop. So we publish the LAN address (dialed first, no hop) AND
+        // the Tailscale address (the NAT-traversing fallback). One
+        // wildcard listener serves both interfaces; the endpoint sort
+        // order (LanTcp before TailscaleTcp) makes the dialer try LAN
+        // first and break on success.
+        //
+        // BIGMAMA review BLOCKING-2 on PR #1201 — honest cost note:
+        // the dialer (`airc_lib::discovery::dial_stored_peer_endpoints`)
+        // walks the merged endpoint list in unconditional
+        // `RouteEndpointKind` order for EVERY peer — there is no
+        // same-subnet/reachability gate. Off-LAN peers (i.e. on the same
+        // tailnet but a different physical LAN) therefore dial the
+        // publisher's unreachable 192.168.x rung FIRST and pay up to
+        // `PEER_DIAL_TIMEOUT` (3s) before falling through to the live
+        // Tailscale rung. Earlier this preferred Tailscale exclusively,
+        // forcing every same-LAN peer through an unnecessary 100.x hop;
+        // the new "LAN-first, 3s timeout, then Tailscale" cost is
+        // intentional (same-LAN wins outweighs the off-LAN 3s) and
+        // pinned by the dead-LAN/live-Tailscale test in
+        // `airc-lib/tests/stored_endpoint_dial.rs`. A future real fix
+        // (subnet/reachability gate at the dialer) will eliminate the
+        // 3s for off-LAN peers; until then the truth is visible in the
+        // recorded peer_dial_failures, not hidden in comments.
+        let lan_ip = crate::network_commands::detect_lan_ip();
+        let tailscale_ip = crate::network_commands::detect_tailscale_ip();
+        if lan_ip.is_none() && tailscale_ip.is_none() {
+            eprintln!(
+                "airc daemon: no routable LAN or Tailscale IPv4 detected — account beacon \
+                 carries no endpoint (outbound-dial / relay only)"
+            );
+        } else {
+            match airc.listen_lan_advertising(lan_ip, tailscale_ip).await {
+                Ok(endpoints) => {
+                    let summary = endpoints
+                        .iter()
+                        .map(|endpoint| match endpoint {
+                            airc_lib::RouteEndpoint::LanTcp { addr } => format!("LAN {addr}"),
+                            airc_lib::RouteEndpoint::TailscaleTcp { addr } => {
+                                format!("Tailscale {addr}")
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" + ");
                     eprintln!(
-                        "airc daemon: advertising {kind} endpoint {addr} in the account registry"
+                        "airc daemon: advertising {summary} in the account registry \
+                         (LAN dialed first; off-LAN peers fall through to Tailscale \
+                         after a ~3s LAN-rung timeout, once per session)"
                     );
                 }
                 Err(error) => {
                     eprintln!(
-                        "airc daemon: {kind} listener bind failed ({error}) — account beacon \
-                             carries no endpoint; this node reaches the mesh by dialing out / \
-                             relay but is not itself dialable"
+                        "airc daemon: LAN listener bind failed ({error}) — account beacon \
+                         carries no endpoint; this node reaches the mesh by dialing out / \
+                         relay but is not itself dialable"
                     );
                 }
-            },
-            None => {
-                eprintln!(
-                    "airc daemon: no Tailscale or routable LAN IPv4 detected — account beacon \
-                     carries no endpoint (outbound-dial / relay only)"
-                );
             }
         }
         // Card 4b6a0ffa (#33): record the endpoints this handle now
