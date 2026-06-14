@@ -232,7 +232,10 @@ pub async fn run_gc(home: &Path, apply: bool) -> Result<(), Box<dyn std::error::
             GcAction::Keep => "keep  ",
         };
         let short = &verdict.id[..verdict.id.len().min(8)];
-        println!("  {tag}  {short}  {} — {}", verdict.filename, verdict.reason);
+        println!(
+            "  {tag}  {short}  {} — {}",
+            verdict.filename, verdict.reason
+        );
     }
     if report.applied {
         println!(

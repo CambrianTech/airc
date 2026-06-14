@@ -700,7 +700,10 @@ impl GhAccountRegistryStore {
     /// Delete one gist by id via `gh api --method DELETE /gists/<id>`.
     async fn delete_gist(&self, id: &str) -> Result<(), AccountRegistryError> {
         let (ok, _stdout, stderr) = self
-            .gh_run(&["api", "--method", "DELETE", &format!("/gists/{id}")], None)
+            .gh_run(
+                &["api", "--method", "DELETE", &format!("/gists/{id}")],
+                None,
+            )
             .await?;
         if ok {
             Ok(())
@@ -1158,9 +1161,18 @@ mod tests {
     #[test]
     fn classify_registry_gc_deletes_only_provable_junk() {
         let gists = vec![
-            ("real".to_string(), "airc-account-mesh-registry.bigmama-joelt.json".to_string()),
-            ("ci".to_string(), "airc-account-mesh-registry.05c0fc93ce40-unknown-user.json".to_string()),
-            ("legacy".to_string(), "airc-account-mesh-registry.json".to_string()),
+            (
+                "real".to_string(),
+                "airc-account-mesh-registry.bigmama-joelt.json".to_string(),
+            ),
+            (
+                "ci".to_string(),
+                "airc-account-mesh-registry.05c0fc93ce40-unknown-user.json".to_string(),
+            ),
+            (
+                "legacy".to_string(),
+                "airc-account-mesh-registry.json".to_string(),
+            ),
             ("weird".to_string(), "something-else.json".to_string()),
         ];
         let verdicts = classify_registry_gc(&gists);
@@ -1174,13 +1186,20 @@ mod tests {
         };
         assert_eq!(action_of("real"), GcAction::Keep, "real machine gist kept");
         assert_eq!(action_of("ci"), GcAction::Delete, "unknown-user is junk");
-        assert_eq!(action_of("legacy"), GcAction::Delete, "legacy unnamed is junk");
+        assert_eq!(
+            action_of("legacy"),
+            GcAction::Delete,
+            "legacy unnamed is junk"
+        );
         assert_eq!(
             action_of("weird"),
             GcAction::Keep,
             "unrecognized filename must NOT be deleted"
         );
-        let to_delete = verdicts.iter().filter(|v| v.action == GcAction::Delete).count();
+        let to_delete = verdicts
+            .iter()
+            .filter(|v| v.action == GcAction::Delete)
+            .count();
         assert_eq!(to_delete, 2);
     }
 
