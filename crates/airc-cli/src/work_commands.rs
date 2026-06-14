@@ -1493,9 +1493,42 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
             .lines()
             .any(|line| line.trim_start().starts_with('+'));
         if !has_unique {
-            // This candidate already contains every patch on HEAD.
-            // The branch's work is captured upstream; safe to delete.
-            return DirtyStatus::Clean;
+            // BIGMAMA review fix on PR #1200: `git cherry` walks
+            // commits by patch-id, which SKIPS MERGE COMMITS entirely
+            // (they have multiple parents → no canonical patch-id).
+            // An "evil merge" — unique content living only in a merge
+            // commit's conflict-resolution diff — emits zero `+`
+            // lines, so `has_unique` reads false and we'd return
+            // Clean → cleanup DELETES branches whose unique work
+            // lives in a merge. Data loss.
+            //
+            // Defense in depth: even when cherry says "all patches
+            // present", verify there's no CONTENT delta between
+            // candidate and HEAD. `git diff --quiet candidate..HEAD`
+            // walks trees regardless of commit structure: exit 0 = no
+            // content delta (truly Clean), exit 1 = content differs
+            // (evil merge case → refuse).
+            let diff_clean = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    path_str,
+                    "diff",
+                    "--quiet",
+                    &format!("{candidate}..HEAD"),
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if diff_clean {
+                // Both proofs agree: every commit patch-id is in
+                // candidate AND there's no content delta. The
+                // branch's work is captured upstream; safe to delete.
+                return DirtyStatus::Clean;
+            }
+            // Cherry said clean but content differs → evil-merge
+            // shape. Keep iterating to other candidates (one might
+            // contain the real merge); if none does, fall through to
+            // the Dirty arm below.
         }
     }
 
