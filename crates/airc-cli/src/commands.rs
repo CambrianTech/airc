@@ -1874,7 +1874,25 @@ pub async fn run_peer_remove(
 /// unauthenticated, hermetic scope, unreachable rendezvous, or an empty
 /// registry), this prunes NOTHING — pruning against an unknown/empty live
 /// set would wrongly evict live peers.
-pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Seam #3.2 operator override for the peer-prune staleness grace
+/// window. Omit (`None`) → the 1h substrate default; an explicit value
+/// (incl. `0` = no grace, evict every absent untrusted peer) tunes how
+/// long an absent untrusted peer is kept before it ages out. A CLI flag,
+/// not an env var — substrate thresholds are explicit, not ambiently
+/// tuned. `saturating_mul` so an absurd hour count can't overflow.
+fn resolve_stale_after_ms(stale_after_hours: Option<u64>) -> u64 {
+    match stale_after_hours {
+        Some(hours) => hours.saturating_mul(3_600_000),
+        None => airc_lib::DEFAULT_PEER_STALE_AFTER_MS,
+    }
+}
+
+pub async fn run_peer_prune(
+    home: &Path,
+    apply: bool,
+    stale_after_hours: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stale_after_ms = resolve_stale_after_ms(stale_after_hours);
     let enrolled = airc_trust::load(home).await?;
     if enrolled.is_empty() {
         println!("(no enroled peers — nothing to prune)");
@@ -1914,12 +1932,17 @@ pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std:
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let verdicts = airc_lib::classify_peer_prune(
-        &enrolled_triples,
-        &live_ids,
-        now_ms,
-        airc_lib::DEFAULT_PEER_STALE_AFTER_MS,
+    println!(
+        "peer prune: staleness grace = {} hour(s){}",
+        stale_after_ms / 3_600_000,
+        if stale_after_hours.is_some() {
+            " (operator override)"
+        } else {
+            " (default)"
+        }
     );
+    let verdicts =
+        airc_lib::classify_peer_prune(&enrolled_triples, &live_ids, now_ms, stale_after_ms);
     let mut to_evict = Vec::new();
     for verdict in &verdicts {
         match verdict.action {
@@ -2298,6 +2321,31 @@ mod tests {
         assert!(
             lines.contains("1 peer(s) enroled"),
             "count reflects the trust store only, not the legacy file: {lines}"
+        );
+    }
+
+    /// what this catches: the peer-prune staleness override math.
+    /// `None` must resolve to the substrate default (not 0 — which would
+    /// silently disable the grace window); an explicit hour count must
+    /// convert to ms; `0` must mean no grace; and an absurd value must
+    /// saturate rather than overflow-panic.
+    #[test]
+    fn resolve_stale_after_ms_maps_override_hours() {
+        assert_eq!(
+            resolve_stale_after_ms(None),
+            airc_lib::DEFAULT_PEER_STALE_AFTER_MS,
+            "omitting the flag uses the substrate default"
+        );
+        assert_eq!(resolve_stale_after_ms(Some(2)), 7_200_000, "2h → ms");
+        assert_eq!(
+            resolve_stale_after_ms(Some(0)),
+            0,
+            "0 hours = no grace (evict every absent untrusted peer)"
+        );
+        assert_eq!(
+            resolve_stale_after_ms(Some(u64::MAX)),
+            u64::MAX,
+            "absurd hour count saturates, never overflow-panics"
         );
     }
 

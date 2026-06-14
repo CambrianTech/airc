@@ -1349,6 +1349,14 @@ pub enum PeerAction {
         /// only prints what it WOULD evict (dry run).
         #[arg(long)]
         apply: bool,
+        /// Staleness grace window, in hours: an untrusted peer absent
+        /// from the fresh registry is evicted only once its last_seen is
+        /// older than this. Recently-contacted peers inside the window
+        /// are kept (a momentary registry-snapshot lag is not death).
+        /// Omit for the 1-hour default; `0` evicts every absent untrusted
+        /// peer immediately (no grace).
+        #[arg(long)]
+        stale_after_hours: Option<u64>,
     },
 }
 
