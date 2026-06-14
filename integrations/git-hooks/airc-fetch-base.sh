@@ -54,7 +54,9 @@ MARKER="$GIT_DIR/airc-last-fetch"
 #      upstream is a known integration line. A feature branch usually tracks
 #      its base (origin/rust-rewrite) once pushed, which is exactly what we
 #      want to measure against.
-#   3. First of rust-rewrite / canary / main that exists on origin.
+#   3. First of canary / main (current trunk) that exists locally-or-on-remote;
+#      rust-rewrite ONLY if confirmed on the remote (its branch is deleted
+#      post-#1173 and the stale local ref must not select a dead base).
 _remote="origin"
 
 _base_branch=""
@@ -72,13 +74,24 @@ else
       ;;
   esac
   if [ -z "$_base_branch" ]; then
-    for _cand in rust-rewrite canary main; do
+    # canary is the current integration trunk; rust-rewrite is being
+    # phased out and its remote branch is DELETED post-#1173 promotion —
+    # but a stale local `origin/rust-rewrite` tracking ref persists and
+    # `show-ref` happily verifies it, so a rust-rewrite-first order picks
+    # a dead base. Try canary/main first; only fall back to rust-rewrite
+    # if it is confirmed on the REMOTE (ls-remote), never on a stale
+    # local ref alone.
+    for _cand in canary main; do
       if git show-ref --verify --quiet "refs/remotes/$_remote/$_cand" \
          || git ls-remote --exit-code --heads "$_remote" "$_cand" >/dev/null 2>&1; then
         _base_branch="$_cand"
         break
       fi
     done
+    if [ -z "$_base_branch" ] \
+       && git ls-remote --exit-code --heads "$_remote" rust-rewrite >/dev/null 2>&1; then
+      _base_branch="rust-rewrite"
+    fi
   fi
 fi
 
@@ -166,14 +179,18 @@ fi
 # ── Behind by N>0 → LOUD advisory ───────────────────────────────────────
 RED=$'\033[1;31m'; YEL=$'\033[1;33m'; RST=$'\033[0m'
 {
-  printf '%s\n' "$YEL┌──────────────────────────────────────────────────────────────$RST"
-  printf '%s\n' "$YEL│ ⚠  BEHIND $BASE_REF BY $_behind COMMIT(S)$RST"
-  printf '%s\n' "$YEL│    Your base is stale — building on it risks merge-order"
-  printf '%s\n' "$YEL│    breakage (E0063-between-slices class).$RST"
-  printf '%s\n' "$YEL│    Sync first:$RST"
-  printf '%s\n' "$YEL│      git pull --ff-only $_remote $_base_branch$RST"
-  printf '%s\n' "$YEL│      # or: git rebase $BASE_REF$RST"
-  printf '%s\n' "$YEL└──────────────────────────────────────────────────────────────$RST"
+  # Brace EVERY color var: an unbraced `$YEL` immediately followed by a
+  # multibyte box-drawing char (┌│└) is parsed as the variable name
+  # `YEL┌…` and crashes under `set -u` on bash 3.2 + a multibyte locale
+  # ("YEL�: unbound variable") — exactly the macOS default shell.
+  printf '%s\n' "${YEL}┌──────────────────────────────────────────────────────────────${RST}"
+  printf '%s\n' "${YEL}│ ⚠  BEHIND $BASE_REF BY $_behind COMMIT(S)${RST}"
+  printf '%s\n' "${YEL}│    Your base is stale — building on it risks merge-order"
+  printf '%s\n' "${YEL}│    breakage (E0063-between-slices class).${RST}"
+  printf '%s\n' "${YEL}│    Sync first:${RST}"
+  printf '%s\n' "${YEL}│      git pull --ff-only $_remote $_base_branch${RST}"
+  printf '%s\n' "${YEL}│      # or: git rebase $BASE_REF${RST}"
+  printf '%s\n' "${YEL}└──────────────────────────────────────────────────────────────${RST}"
 } >&2
 
 if [ "$PHASE" = "pre-push" ] && [ "$PUSH_BLOCK" = "1" ]; then
