@@ -216,6 +216,37 @@ fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&s
 /// fast-fail-and-proceed — the hook produces no AdditionalContext
 /// for that call, which is the same outcome as receiving empty
 /// stdin, and the next hook invocation behaves correctly.
+///
+/// **Intentional trade-offs the deadline introduces** (BIGMAMA
+/// review BLOCK#2 + #3 on PR #1197):
+///
+/// 1. **Slow-but-legitimate producer truncates to empty payload.**
+///    The deadline is on EOF, not on byte progress. A producer that
+///    streams valid JSON byte-by-byte over >5s gets its input
+///    discarded — `read_to_string` never returns, so the partial
+///    buffer in the reader thread is dropped and the hook proceeds
+///    with empty payload. The current caller (Codex) flushes JSON in
+///    microseconds; if a future caller streams slowly, the deadline
+///    needs to reset on progress or read to a JSON-object delimiter
+///    rather than EOF. Today we accept the truncation because the
+///    alternative is "Windows CI hangs for hours."
+///
+/// 2. **Timeout silently skips JSON validation.** The EOF path
+///    rejects non-object input with a hard error
+///    (`!value.is_object()` → `Err(...)` → non-zero exit). The
+///    timeout path returns `Ok(())` unconditionally — so "malformed
+///    input that also arrives slowly" degrades from a hard error to
+///    a silent success. The `eprintln!` distinguishes timeout from
+///    EOF in logs, but the validation-skip is intentional: a hook
+///    that exits non-zero on slow-malformed input would block every
+///    Codex prompt-submit on the same Windows hang it was meant to
+///    end. Operators see WHY via stderr; the input contract is
+///    "validates iff EOF arrives in time."
+///
+/// Both trade-offs are pinned by
+/// `drain_stdin_timeout_proceeds_when_eof_never_arrives` in
+/// `tests/codex_hook_commands.rs` — see the regression test for the
+/// exact failure shape if a future refactor reverts the deadline.
 fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::mpsc;
     use std::thread;
