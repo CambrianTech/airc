@@ -28,9 +28,31 @@ pub async fn run_peers(
     // pairing metadata; fully retiring them + migrating the handshake
     // flow onto the trust store (and dropping `prune-peers`) is the
     // remaining #2 work, tracked. One peer truth, one place.
+    //
+    // Output-shape contract change (Mac review of #1193): the rendered
+    // lines went from `name -> host [#room]` to
+    // `peer_id  pubkey  tier=…`. A grep across docs/skills/install
+    // scripts confirmed nothing parses the old shape, but humans with it
+    // memorised get a one-line stderr heads-up. stderr (not stdout) so a
+    // pipe consuming the peer list stays byte-for-byte unaffected.
+    eprintln!(
+        "note: `collaboration peers` now renders the canonical trust store \
+         (peer_id/pubkey/tier); the legacy name/host file view is retired. \
+         Prefer `airc peer list`."
+    );
     crate::commands::run_peer_list(home, false).await
 }
 
+/// Prune duplicate legacy `<home>/peers/*.json` records (newest wins
+/// per host).
+///
+/// Seam #2 ASYMMETRY (Mac review of #1193): this still reads/writes the
+/// **legacy file** surface, while [`run_peers`] above reads the trust
+/// store. That is a deliberate temporary fanout — three peer surfaces
+/// are briefly in flight (trust store + `handshake_commands.rs` file
+/// writer + this file reader). Retiring the file writer and dropping
+/// this command is the remaining seam #2 slice; do NOT build new
+/// behaviour on this path.
 pub fn run_prune_peers(
     default_home: &Path,
     args: CollaborationScopeArgs,
