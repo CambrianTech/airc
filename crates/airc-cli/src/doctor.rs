@@ -519,9 +519,15 @@ mod tests {
         // in the rust rewrite. `teardown`/`--flush` were legacy Python
         // verbs removed in the cutover; recommending them hands the user
         // a broken command (regression guard for that dead-verb drift).
-        assert!(fix.contains("airc join"), "fix must point at the regenerate step: {fix}");
+        assert!(
+            fix.contains("airc join"),
+            "fix must point at the regenerate step: {fix}"
+        );
         assert!(fix.contains("rm "), "fix must name the wipe step: {fix}");
-        assert!(!fix.contains("teardown"), "must not recommend the removed teardown verb: {fix}");
+        assert!(
+            !fix.contains("teardown"),
+            "must not recommend the removed teardown verb: {fix}"
+        );
     }
 
     #[tokio::test]
