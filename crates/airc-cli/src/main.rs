@@ -344,7 +344,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => legacy_envelope::unwrap_stdin(&sender_pub, &identity_dir),
         },
 
-        Command::Send { text } => commands::run_send(&home, parsed.peers, &text).await,
+        Command::Send { room, text } => {
+            commands::run_send(&home, parsed.peers, room.as_deref(), &text).await
+        }
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
 
@@ -372,8 +374,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
-        Command::Msg { socket, text } => {
-            commands::run_msg(&home, default_or(socket, &home), &text).await
+        Command::Msg { socket, room, text } => {
+            commands::run_msg(&home, default_or(socket, &home), room.as_deref(), &text).await
         }
         Command::Publish {
             room,
