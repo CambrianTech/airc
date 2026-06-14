@@ -9,15 +9,26 @@ fn airc() -> &'static str {
 }
 
 #[test]
-fn transport_health_reports_route_snapshot_from_substrate() {
+fn transport_health_reports_no_routes_on_fresh_scope() {
     let workspace = common::daemon_tempdir();
 
     let output = run_ok(workspace.path(), &["transport", "health"]);
 
-    // Same-machine delivery is the daemon's in-memory router, not a
-    // registered transport — so a fresh scope has zero healthy routes
-    // and no `local-fs` line until a cross-machine transport comes up.
-    assert!(output.contains("transport health: ok (0 route(s) healthy)"));
+    // Card 9cbe1101 (seam #6): a fresh scope's daemon has registered
+    // ZERO transports — same-machine delivery is the in-memory router,
+    // not a counted route. Before the verdict refactor this scope
+    // surfaced as `ok (0 route(s) healthy)`, which is the lie this PR
+    // killed. The honest verdict is `no-routes` — and it must NEVER
+    // render as `ok`, since `ok` paints a substrate-not-routing state
+    // as healthy to operators.
+    assert!(
+        output.contains("transport health: no-routes"),
+        "expected no-routes verdict, got: {output}"
+    );
+    assert!(
+        !output.contains("transport health: ok"),
+        "no-routes must not render as ok (the live-found seam-#6 lie): {output}"
+    );
     assert!(!output.contains("local-fs"));
     assert!(output.contains("endpoints: none"));
     assert!(output.contains("lan peers: none"));
@@ -36,7 +47,12 @@ fn transport_health_degraded_only_is_silent_when_routes_are_clean() {
 }
 
 #[test]
-fn transport_health_quiet_succeeds_when_routes_are_clean() {
+fn transport_health_quiet_fail_exits_nonzero_on_no_routes() {
+    // Card 9cbe1101 (seam #6): a fresh scope has no routes — the
+    // typed verdict is `NoRoutes`, which `is_failure() == true`, so
+    // `--fail` must exit nonzero. Before the verdict refactor this
+    // path returned success on 0 healthy routes — which is exactly
+    // the operator-misleading behavior we're killing.
     let workspace = common::daemon_tempdir();
 
     let output = run_raw(
@@ -44,7 +60,11 @@ fn transport_health_quiet_succeeds_when_routes_are_clean() {
         &["transport", "health", "--quiet", "--fail"],
     );
 
-    assert!(output.status.success());
+    assert!(
+        !output.status.success(),
+        "quiet+fail must exit nonzero when verdict is no-routes: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stdout.is_empty());
 }
 
