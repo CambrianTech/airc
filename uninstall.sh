@@ -7,7 +7,7 @@
 # Via the verb:    airc uninstall            (preferred; just exec's this script)
 #
 # What it removes:
-#   - running airc processes (via airc teardown --all, if airc is on PATH)
+#   - the running airc daemon (via airc stop, if airc is on PATH)
 #   - daemon (launchd / systemd-user / Task Scheduler) via airc daemon uninstall
 #   - stale POSIX forwarders and Windows shim files under $BIN_DIR
 #   - airc-owned skill directories under ~/.claude/skills/ and ~/.codex/skills/
@@ -62,7 +62,7 @@ This will remove airc from this machine:
   skill dirs        $SKILLS_TARGET/<airc-skills>/ + ~/.codex/skills/<airc-skills>/ (if Codex installed)
   install dir       $CLONE_DIR
   daemon            launchd / systemd-user / Task Scheduler unit (if installed)
-  running processes airc teardown --all (if airc is on PATH)
+  running daemon    airc stop (if airc is on PATH)
 
 It will NOT remove:
   per-project .airc/ state in every dir you ran 'airc join' from
@@ -84,11 +84,12 @@ if [ "$ASSUME_YES" != "1" ]; then
   fi
 fi
 
-# 1. Stop running processes. airc teardown --all walks every airc.pid file
-# under $HOME and reaps the processes; idempotent if nothing is running.
+# 1. Stop the running daemon. `airc stop` asks the default-home daemon to
+# shut down gracefully (removes its daemon.pid on exit); idempotent — a
+# no-op exit is consumed by the `if`, so it never aborts the uninstall.
 if command -v airc >/dev/null 2>&1; then
-  if airc teardown --all >/dev/null 2>&1; then
-    ok "Stopped running airc processes (airc teardown --all)"
+  if airc stop >/dev/null 2>&1; then
+    ok "Stopped the running airc daemon (airc stop)"
   fi
   # 2. Uninstall daemon. No-op if not installed; we don't gate on a status
   # check because `airc daemon uninstall` already handles the absent case.

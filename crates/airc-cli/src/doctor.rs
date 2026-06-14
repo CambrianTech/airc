@@ -175,7 +175,7 @@ async fn check_identity(home: &Path) -> Vec<Finding> {
             return vec![Finding::blocked(
                 "identity store",
                 format!("can't open events.sqlite: {error}"),
-                "check disk/permissions; if corrupted, `airc teardown --flush` and re-join (loses scope state)",
+                "check disk/permissions; if corrupted, `airc stop` then `rm <home>/events.sqlite` and `airc join` to rebuild (loses scope state)",
             )];
         }
     };
@@ -212,12 +212,12 @@ async fn check_identity(home: &Path) -> Vec<Finding> {
         (true, false, false) => vec![Finding::blocked(
             "identity",
             "key present but no ORM row and no legacy json — orphan key, no recovery without backup",
-            "`airc teardown --flush` to wipe (loses peer_id), then `airc join` to regenerate",
+            "`airc stop` then `rm <home>/identity.key` (loses peer_id), then `airc join` to regenerate",
         )],
         (false, true, _) => vec![Finding::blocked(
             "identity",
             "ORM row present but key file missing — can't sign without the secret",
-            "restore <home>/identity.key from backup, OR `airc teardown --flush` and re-join (loses peer_id)",
+            "restore <home>/identity.key from backup, OR `airc stop` + `rm -rf <home>` then `airc join` (loses peer_id)",
         )],
     }
 }
