@@ -750,8 +750,7 @@ impl AccountRegistryStore for GhAccountRegistryStore {
         let now_ms = time::now_ms().map_err(|error| {
             AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
         })?;
-        let pruned =
-            prune_stale_peers(&mut document.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
+        let pruned = prune_stale_peers(&mut document.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
         if pruned > 0 {
             StderrJsonDiagnosticSink.emit(
                 DiagnosticEvent::warn(
