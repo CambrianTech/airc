@@ -30,6 +30,23 @@ enum MonitorFrame {
     },
 }
 
+/// Receive-resilience (2026-06-14 disconnect): the first re-attach after
+/// a healthy stream drops waits this long. Short so a transient IPC blip
+/// or a fast daemon restart recovers near-instantly.
+const RECONNECT_INITIAL_BACKOFF_MS: u64 = 250;
+
+/// Cap on the reconnect backoff: a daemon that stays down is retried at
+/// most this often, so the monitor neither hammers a dead socket nor
+/// goes permanently dark.
+const RECONNECT_MAX_BACKOFF_MS: u64 = 5_000;
+
+/// One exponential-backoff step for the attach reconnect loop: double,
+/// capped at [`RECONNECT_MAX_BACKOFF_MS`]. `saturating_mul` so a runaway
+/// value can never overflow-panic.
+fn next_reconnect_backoff_ms(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_MAX_BACKOFF_MS)
+}
+
 pub(crate) async fn run(
     home: &Path,
     _my_name: &str,
@@ -64,34 +81,66 @@ pub(crate) async fn run(
         let tx = tx.clone();
         tokio::spawn(async move {
             let client = DaemonClient::new(socket);
-            let mut request = AttachRequest::new(channel, start);
-            if coalesce_backlog {
-                request = request.with_coalesced_backlog();
-            }
-            let mut stream = match client.attach(request).await {
-                Ok(stream) => stream,
-                Err(_) => return,
-            };
-            while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
-                match response {
-                    Response::Event { envelope } => match decode_wire_event(envelope) {
-                        Ok(event) => {
-                            if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err() {
+            // Receive-resilience (2026-06-14 disconnect): re-attach when the
+            // stream drops instead of giving up. The original was a single
+            // attach that died PERMANENTLY when its daemon was killed/
+            // restarted (cargo/test churn, idle self-exit), taking the whole
+            // live tail dark with no recovery. We now reconnect with bounded
+            // backoff and only stop when the consumer (the merge channel) is
+            // gone — then there is nothing left to feed. On reconnect we
+            // resume the LIVE tail; events that occurred during the gap are
+            // not replayed (cursor-resume is a follow-up). Same-scope daemon
+            // restarts reuse the deterministic socket path, so the re-attach
+            // lands on the respawned daemon; a cross-SCOPE flip is seam #1's
+            // domain, out of scope here.
+            let mut backoff_ms = RECONNECT_INITIAL_BACKOFF_MS;
+            loop {
+                let mut request = AttachRequest::new(channel, start);
+                if coalesce_backlog {
+                    request = request.with_coalesced_backlog();
+                }
+                if let Ok(mut stream) = client.attach(request).await {
+                    // A healthy attach resets the backoff so the next
+                    // transient blip recovers fast.
+                    backoff_ms = RECONNECT_INITIAL_BACKOFF_MS;
+                    while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
+                        match response {
+                            Response::Event { envelope } => match decode_wire_event(envelope) {
+                                Ok(event) => {
+                                    if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                // A single undecodable frame must not kill
+                                // the tail — drop the stream and re-attach.
+                                Err(_) => break,
+                            },
+                            Response::AttachCursorAdvanced { skipped, .. }
+                                if tx
+                                    .send(MonitorFrame::CatchUpSummary { channel, skipped })
+                                    .await
+                                    .is_err() =>
+                            {
                                 return;
                             }
+                            _ => {}
                         }
-                        Err(_) => return,
-                    },
-                    Response::AttachCursorAdvanced { skipped, .. }
-                        if tx
-                            .send(MonitorFrame::CatchUpSummary { channel, skipped })
-                            .await
-                            .is_err() =>
-                    {
-                        return;
                     }
-                    _ => {}
+                    // Stream ended (EOF / read error) — fall through to
+                    // reconnect.
                 }
+                // Consumer gone → nothing to feed → stop. Otherwise back off
+                // and re-attach (covers both attach-failed and stream-dropped).
+                if tx.is_closed() {
+                    return;
+                }
+                eprintln!(
+                    "airc: event stream for channel {} dropped — reconnecting in {}ms",
+                    channel.0, backoff_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = next_reconnect_backoff_ms(backoff_ms);
             }
         });
     }
@@ -201,6 +250,29 @@ mod tests {
     use airc_core::{Body, ClientId, EventId, Headers, PeerId, RoomId, TranscriptEvent};
 
     use super::*;
+
+    /// what this catches: the reconnect backoff must double from the
+    /// initial step and saturate at the cap — never overflow-panic and
+    /// never exceed the cap (which would let a dead daemon go un-retried
+    /// for an unbounded time, the exact "permanent dark" this card ends).
+    #[test]
+    fn reconnect_backoff_doubles_then_caps() {
+        assert_eq!(next_reconnect_backoff_ms(RECONNECT_INITIAL_BACKOFF_MS), 500);
+        assert_eq!(next_reconnect_backoff_ms(500), 1_000);
+        assert_eq!(next_reconnect_backoff_ms(2_000), 4_000);
+        // 4_000 * 2 = 8_000, capped to the 5_000 max.
+        assert_eq!(next_reconnect_backoff_ms(4_000), RECONNECT_MAX_BACKOFF_MS);
+        // At/above the cap it stays pinned.
+        assert_eq!(
+            next_reconnect_backoff_ms(RECONNECT_MAX_BACKOFF_MS),
+            RECONNECT_MAX_BACKOFF_MS
+        );
+        // Saturating: an absurd value can't overflow-panic.
+        assert_eq!(
+            next_reconnect_backoff_ms(u64::MAX),
+            RECONNECT_MAX_BACKOFF_MS
+        );
+    }
 
     #[test]
     fn body_text_reads_plain_chat_shape() {
