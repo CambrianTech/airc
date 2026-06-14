@@ -37,7 +37,10 @@ use crate::work_cli::WorkArgs;
 ///   1. `$AIRC_HOME` → explicit scope override.
 ///   2. First `.airc` ancestor when cwd is inside a scope.
 ///   3. Git project root `.airc` when cwd is inside a worktree.
-///   4. `./.airc` in the current working dir.
+///   4. Canonical machine-account home (`$HOME/.airc`) — a rootless cwd
+///      uses the user's real identity, never a throwaway `./.airc`
+///      scratch scope (seam #1). `./.airc` only as a last resort when no
+///      `$HOME`/`$USERPROFILE` exists.
 ///
 /// Account-wide state still lives under the canonical machine account
 /// home (`$HOME/.airc`) inside `airc-lib`; this default is the
@@ -100,9 +103,20 @@ fn default_home_dir_for_with(
     // the worktree's own (worktrees rarely contain their own `.airc`).
     // `git rev-parse --git-common-dir` points at the MAIN repo's
     // `.git/` for any worktree; its parent is the main working tree.
+    // Seam #1 (solidification doc): a cwd that is neither inside a git
+    // project NOR under an existing `.airc` scope must NOT mint a
+    // throwaway `cwd/.airc` scope. That scratch home gets its own
+    // identity, which then publishes a phantom beacon to the mesh — the
+    // observed `/tmp` `57059a56` ghost. Fall back to the canonical
+    // MACHINE-ACCOUNT home (the user's real identity) instead. Explicit
+    // cwd-scoping stays available via `$AIRC_HOME` (a future `--here`
+    // flag is the ergonomic shortcut; tracked as a follow-up). Only the
+    // truly-rootless case (no `$HOME`/`$USERPROFILE`) keeps the old
+    // cwd-local behavior as a last resort.
     git_main_working_tree_fn(cwd)
         .map(|root| root.join(".airc"))
         .or_else(|| git_toplevel(cwd).map(|root| root.join(".airc")))
+        .or_else(|| machine_account_home.map(|h| h.to_path_buf()))
         .unwrap_or_else(|| cwd.join(".airc"))
 }
 
@@ -887,6 +901,29 @@ mod tests {
         let stub = |_: &Path| -> Option<PathBuf> { None };
         let resolved = default_home_dir_for_with(&cwd, None, &stub);
         assert_eq!(resolved, cwd.join(".airc"));
+    }
+
+    // what this catches: seam #1 — a rootless cwd (no enclosing `.airc`,
+    // no git context) with a known machine-account home must resolve to
+    // that canonical home, NOT mint a throwaway `cwd/.airc` scratch scope
+    // (the `/tmp` `57059a56` phantom-beacon ghost). Mutation check:
+    // reverting the machine-account fallback resolves to cwd/.airc and
+    // this fails.
+    #[test]
+    fn default_home_rootless_cwd_uses_machine_account_not_throwaway() {
+        use super::default_home_dir_for_with;
+        use std::path::{Path, PathBuf};
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().join("nowhere"); // no .airc, no git
+        std::fs::create_dir_all(&cwd).unwrap();
+        let machine_account = PathBuf::from("/Users/test/.airc");
+        let stub = |_: &Path| -> Option<PathBuf> { None };
+        let resolved = default_home_dir_for_with(&cwd, Some(machine_account.as_path()), &stub);
+        assert_eq!(
+            resolved, machine_account,
+            "rootless cwd must use the canonical machine-account home, not a throwaway cwd/.airc"
+        );
+        assert_ne!(resolved, cwd.join(".airc"), "must NOT mint a scratch scope");
     }
 
     #[test]
