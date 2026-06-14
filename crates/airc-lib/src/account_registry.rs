@@ -531,6 +531,10 @@ impl Airc {
         document: AccountRegistryDocument,
     ) -> Result<(), AircError> {
         document.validate().map_err(AircError::AccountRegistry)?;
+        // Seam #3.2 (liveness): the wall-clock instant we are importing
+        // at — the upper bound for any peer's `last_seen`. See the clamp
+        // at the touch below.
+        let now_ms = crate::time::now_ms()?;
         for peer in document.peers {
             if peer.peer_id() == self.inner.identity.peer_id {
                 continue;
@@ -545,17 +549,26 @@ impl Airc {
             // refreshed, stale-pruned registry document just published a
             // beacon — that IS fresh contact. Record it so the age-based
             // eviction classifier can tell a live peer from a stale
-            // enrolment. Use the beacon's OWN heartbeat instant (the
-            // peer's liveness assertion), not local `now_ms`: the touch
-            // is monotonic, so a clock-skewed or out-of-order beacon can
-            // only ever leave recency unchanged, never rewind it. The
-            // peer was enrolled two lines up, so this resolves to Some;
-            // we don't assert it (a best-effort liveness stamp, unlike
-            // the endpoints store below whose silent drop was a real bug).
+            // enrolment.
+            //
+            // SECURITY CLAMP (sentinel BLOCK on #1195): `last_seen` means
+            // "when WE last had contact" — we cannot have had contact in
+            // the future. `heartbeat_at_ms` is the peer's OWN self-asserted
+            // timestamp, fully attacker-controlled; the store applies it
+            // monotonically with no upper bound. Without `.min(now_ms)` an
+            // untrusted peer (or a replayed/skewed beacon) could pin its
+            // own `last_seen` arbitrarily far ahead, and the age-based
+            // prune gate (peers.rs: keep when `now - last_seen < TTL`)
+            // would then NEVER evict it — the ghost-GC this whole spine
+            // exists for, defeated by a value the peer controls. Clamping
+            // to `now_ms` makes the most we'll ever record "received now",
+            // while the store's monotonic max still ignores stale/older
+            // beacons (no rewind). The peer was enrolled two lines up, so
+            // this resolves to Some; best-effort stamp, not asserted.
             airc_trust::touch_last_seen(
                 &self.inner.wire_root,
                 peer.peer_spec.peer_id,
-                peer.presence.heartbeat_at_ms,
+                peer.presence.heartbeat_at_ms.min(now_ms),
             )
             .await?;
             // Card 625abe6d slice 1: persist the beacon's endpoints on
@@ -833,15 +846,24 @@ mod tests {
         );
     }
 
-    /// what this catches: seam #3.2 touch wiring. A peer present in a
-    /// freshly refreshed registry document just published a beacon, so
-    /// `import_account_registry_document` must `touch_last_seen` with
-    /// the beacon's OWN heartbeat instant — AND monotonically, so a
-    /// later out-of-order/stale beacon cannot rewind recency. Without
-    /// the wiring `last_seen` would never advance past enrolment and
-    /// the age-based eviction classifier would have nothing to read.
+    /// what this catches: seam #3.2 touch wiring + the SECURITY CLAMP
+    /// (sentinel BLOCK on #1195). `import_account_registry_document`
+    /// stamps `last_seen` from the beacon — but `heartbeat_at_ms` is the
+    /// peer's OWN self-asserted, attacker-controlled value, and the store
+    /// applies it monotonically with no upper bound. Without
+    /// `.min(now_ms)` an untrusted peer could publish a FUTURE heartbeat,
+    /// pin its `last_seen` arbitrarily ahead, and the age-based prune gate
+    /// (`keep when now - last_seen < TTL`) would NEVER evict it — the
+    /// ghost-GC defeated by a value the peer controls.
+    ///
+    /// This test imports a year-2286 beacon and asserts: (1) the stored
+    /// `last_seen` is clamped to the import instant (never the future
+    /// value), and (2) end-to-end, the peer still EVICTS once `TTL` has
+    /// elapsed since import. If the clamp regresses, `last_seen` would be
+    /// the future value and the same `classify_peer_prune` call would
+    /// `Keep` it forever — so this assertion is the regression net.
     #[tokio::test]
-    async fn import_registry_touches_last_seen_from_beacon_heartbeat() {
+    async fn import_clamps_future_heartbeat_keeping_peer_evictable() {
         let dir = tempdir().unwrap();
         let machine_b = dir.path().join("machine-b/.airc");
         std::fs::create_dir_all(&machine_b).unwrap();
@@ -849,11 +871,6 @@ mod tests {
 
         let peer_id = PeerId::new();
         let spec = peer_spec(peer_id);
-        // Heartbeat in the far future (year ~2286) so it is
-        // unambiguously newer than the real-clock enrolment `added_at`
-        // that `add` seeds — proving the touch ADVANCED last_seen to the
-        // beacon value, not the no-op monotonic floor.
-        let fresh_hb = 9_999_999_999_999u64;
         let doc = |hb: u64| {
             AccountRegistryDocument::new(
                 mesh(),
@@ -873,30 +890,67 @@ mod tests {
             )
         };
 
-        airc.import_account_registry_document(doc(fresh_hb))
+        // Attacker-controlled heartbeat far in the future (year ~2286).
+        let future_hb = 9_999_999_999_999u64;
+        let before = crate::time::now_ms().unwrap();
+        airc.import_account_registry_document(doc(future_hb))
             .await
             .unwrap();
-        let after_fresh = airc_trust::load(&airc.inner.wire_root).await.unwrap();
-        let p = after_fresh
-            .iter()
+        let after = crate::time::now_ms().unwrap();
+
+        let p = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
             .find(|p| p.peer_id == spec.peer_id)
             .expect("peer enrolled on import");
-        assert_eq!(
-            p.last_seen_ms, fresh_hb,
-            "import must touch last_seen with the beacon heartbeat"
+        // CLAMP: never the future value; bounded by the import instant;
+        // still a recent stamp (proves the touch fired, not left at 0).
+        assert_ne!(
+            p.last_seen_ms, future_hb,
+            "a self-asserted future heartbeat must never be stored verbatim"
+        );
+        assert!(
+            p.last_seen_ms <= after,
+            "last_seen ({}) must be clamped to the import instant ({after})",
+            p.last_seen_ms
+        );
+        assert!(
+            p.last_seen_ms >= before,
+            "import must still stamp a recent last_seen ({} < {before})",
+            p.last_seen_ms
         );
 
-        // A later import carrying an OLDER heartbeat must NOT rewind.
+        // END-TO-END: once TTL has elapsed since import, the absent peer
+        // must EVICT. With the future value stored (clamp removed) the
+        // age would saturate to 0 and this would Keep forever.
+        let ttl = crate::DEFAULT_PEER_STALE_AFTER_MS;
+        let prune_now = after + ttl + 1;
+        let verdicts = crate::classify_peer_prune(
+            &[(spec.peer_id, crate::TrustTier::Untrusted, p.last_seen_ms)],
+            &std::collections::HashSet::new(),
+            prune_now,
+            ttl,
+        );
+        assert_eq!(
+            verdicts[0].action,
+            crate::PeerPruneAction::Evict,
+            "clamped peer must age out; an unclamped future stamp would Keep forever: {}",
+            verdicts[0].reason
+        );
+
+        // A later OLDER beacon must NOT rewind the clamped recency.
         airc.import_account_registry_document(doc(1_000))
             .await
             .unwrap();
-        let after_stale = airc_trust::load(&airc.inner.wire_root).await.unwrap();
-        let p2 = after_stale
-            .iter()
+        let p2 = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
             .find(|p| p.peer_id == spec.peer_id)
             .expect("peer still enrolled");
         assert_eq!(
-            p2.last_seen_ms, fresh_hb,
+            p2.last_seen_ms, p.last_seen_ms,
             "monotonic: an older/out-of-order beacon must not rewind recency"
         );
     }
