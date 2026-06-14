@@ -26,12 +26,44 @@ NET="airc-mesh-test"
 TOKEN="$(gh auth token 2>/dev/null)"
 [ -z "$TOKEN" ] && { echo "FAIL: no gh token (run: gh auth login)"; exit 1; }
 
+# Self-cleaning rendezvous hygiene. The test nodes are throwaway containers
+# with no stable host/user identity, so each `airc join` publishes a
+# `<hex>-unknown-user` account-registry gist to the operator's REAL gh
+# account — and the harness genuinely needs the real rendezvous to test
+# gist convergence, so we can't just disable the registry. Left behind they
+# pile up (80+ phantom gists were found polluting one real account, slowing
+# every subsequent convergence). Fix: snapshot the registry gists that exist
+# BEFORE the run and, on exit, delete only the NEW ones. An operator's real
+# machine gist is always in the snapshot, so it is never touched.
+reg_gist_ids() {
+  gh api --paginate '/gists?per_page=100' \
+    --jq '.[] | select(.files | keys[0] | startswith("airc-account-mesh-registry")) | .id' 2>/dev/null
+}
+SNAP_READY=0
+BEFORE_SNAP="$(mktemp)"
+
 cleanup() {
   for i in $(seq 1 "$N"); do docker rm -f "airc-node-$i" >/dev/null 2>&1; done
   docker network rm "$NET" >/dev/null 2>&1
+  # Delete ONLY registry gists this run created (current set minus the
+  # pre-run snapshot). Guarded by SNAP_READY so the initial cleanup (which
+  # runs BEFORE the snapshot is taken) can never delete a pre-existing gist.
+  if [ "$SNAP_READY" = 1 ]; then
+    local cleaned=0 gid
+    while IFS= read -r gid; do
+      [ -n "$gid" ] || continue
+      gh gist delete "$gid" --yes >/dev/null 2>&1 && cleaned=$((cleaned + 1))
+    done < <(reg_gist_ids | grep -vxF -f "$BEFORE_SNAP")
+    [ "$cleaned" -gt 0 ] && echo "  cleaned $cleaned throwaway test registry gist(s) from the account"
+    rm -f "$BEFORE_SNAP"
+  fi
 }
 trap cleanup EXIT
 cleanup
+# Snapshot the pre-existing registry gists, THEN arm gist cleanup so the
+# exit trap only ever removes what this run published.
+reg_gist_ids > "$BEFORE_SNAP"
+SNAP_READY=1
 
 echo "== bring up $N isolated nodes on one account =="
 docker network create "$NET" >/dev/null
