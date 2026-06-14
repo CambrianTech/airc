@@ -460,7 +460,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 quiet,
                 degraded_only,
                 fail,
-            } => transport_commands::run_health(&home, quiet, degraded_only, fail).await,
+                json,
+            } => transport_commands::run_health(&home, quiet, degraded_only, fail, json).await,
         },
 
         Command::Events(args) => match args.action {

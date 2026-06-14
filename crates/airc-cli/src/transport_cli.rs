@@ -21,5 +21,11 @@ pub enum TransportAction {
         /// Exit non-zero when degraded. Intended for scripts.
         #[arg(long)]
         fail: bool,
+
+        /// Emit a single line of structured JSON instead of prose.
+        /// Shape: `{"verdict": {"kind": "ok|degraded|no-routes", ...},
+        /// "endpoints": N, "lan_peers": N, "samples": [...]}`.
+        #[arg(long)]
+        json: bool,
     },
 }
