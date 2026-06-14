@@ -848,14 +848,36 @@ pub(crate) async fn attached_airc(home: &Path) -> Result<Airc, Box<dyn std::erro
 pub async fn run_send(
     home: &Path,
     peers: Vec<PeerSpec>,
+    room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
     }
-    let current = airc.current_room().await?;
-    airc.say_with_headers(text, runtime_headers()?).await?;
+    // Card a979e5c2 (seam #5): `--room <name>` routes ONE message
+    // to a subscribed-but-not-current room without mutating this
+    // scope's default-room pointer. Same shape as `airc publish`.
+    // Without `--room`, the historical "current room + runtime
+    // headers" path runs unchanged.
+    let (channel_name, channel_id) = match room {
+        Some(name) => {
+            let receipt = airc
+                .publish(
+                    airc_lib::PublishTarget::RoomByName(name.to_string()),
+                    airc_protocol::FrameKind::Message,
+                    airc_core::Body::text(text),
+                    runtime_headers()?,
+                )
+                .await?;
+            (receipt.channel_name, receipt.channel_id.to_string())
+        }
+        None => {
+            let current = airc.current_room().await?;
+            airc.say_with_headers(text, runtime_headers()?).await?;
+            (current.name, current.channel.to_string())
+        }
+    };
     let peer_count = airc.peers().await?.len();
     // `Airc::say` returned Ok — the frame is signed, persisted to the
     // local store, and written to the wire. Any scope tailing this
@@ -872,13 +894,11 @@ pub async fn run_send(
     // matches what actually happened.
     if peer_count == 0 {
         println!(
-            "sent to {} ({}). 0 paired remote peers; any scope tailing this channel on this machine will receive it.",
-            current.name, current.channel
+            "sent to {channel_name} ({channel_id}). 0 paired remote peers; any scope tailing this channel on this machine will receive it."
         );
     } else {
         println!(
-            "sent to {} ({}) — {peer_count} paired peer(s) + any local scope tailing this channel.",
-            current.name, current.channel
+            "sent to {channel_name} ({channel_id}) — {peer_count} paired peer(s) + any local scope tailing this channel."
         );
     }
     Ok(())
@@ -1514,25 +1534,45 @@ pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
 pub async fn run_msg(
     home: &Path,
     socket: PathBuf,
+    room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
-    let current = airc.current_room().await?;
-    airc.say_with_headers(text, runtime_headers()?).await?;
+    // Card a979e5c2 (seam #5): `--room <name>` routes ONE message
+    // to a subscribed-but-not-current room without mutating this
+    // scope's default-room pointer. Same shape as `airc publish`.
+    // Without `--room`, the historical "current room" path runs
+    // unchanged.
+    let (channel_name, channel_id) = match room {
+        Some(name) => {
+            let receipt = airc
+                .publish(
+                    airc_lib::PublishTarget::RoomByName(name.to_string()),
+                    airc_protocol::FrameKind::Message,
+                    airc_core::Body::text(text),
+                    runtime_headers()?,
+                )
+                .await?;
+            (receipt.channel_name, receipt.channel_id.to_string())
+        }
+        None => {
+            let current = airc.current_room().await?;
+            airc.say_with_headers(text, runtime_headers()?).await?;
+            (current.name, current.channel.to_string())
+        }
+    };
     let peer_count = airc.peers().await?.len();
     // See run_send for the rationale — same message-honesty fix
     // for the daemon-attached send path.
     if peer_count == 0 {
         println!(
-            "sent to {} ({}). 0 paired remote peers; any scope tailing this channel on this machine will receive it.",
-            current.name, current.channel
+            "sent to {channel_name} ({channel_id}). 0 paired remote peers; any scope tailing this channel on this machine will receive it."
         );
     } else {
         println!(
-            "sent to {} ({}) — {peer_count} paired peer(s) + any local scope tailing this channel.",
-            current.name, current.channel
+            "sent to {channel_name} ({channel_id}) — {peer_count} paired peer(s) + any local scope tailing this channel."
         );
     }
     Ok(())

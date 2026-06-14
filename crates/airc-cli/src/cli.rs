@@ -474,9 +474,17 @@ pub enum Command {
     /// Legacy envelope encryption helpers during Rust cutover.
     Envelope(EnvelopeArgs),
 
-    /// Send a single text Message frame to the default subscribed
-    /// room and exit. The default channel lives in the ORM store.
+    /// Send a single text Message frame to a subscribed room and
+    /// exit. With `--room`, sends to that room without mutating this
+    /// scope's default-room pointer (one-shot routing — same shape
+    /// as `airc publish --room`). Without `--room`, the default
+    /// channel lives in the ORM store.
     Send {
+        /// Channel name to route to. Must already be subscribed
+        /// (send does not auto-join). Defaults to the current room
+        /// when omitted.
+        #[arg(long)]
+        room: Option<String>,
         /// Message body.
         text: String,
     },
@@ -546,11 +554,20 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// Send a text message to the current room via the running
-    /// daemon (fast — no per-call substrate setup).
+    /// Send a text message to a subscribed room via the running
+    /// daemon (fast — no per-call substrate setup). With `--room`,
+    /// sends to that room without mutating this scope's
+    /// default-room pointer (one-shot routing — same shape as
+    /// `airc publish --room`). Without `--room`, defaults to the
+    /// current room.
     Msg {
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Channel name to route to. Must already be subscribed
+        /// (msg does not auto-join). Defaults to the current room
+        /// when omitted.
+        #[arg(long)]
+        room: Option<String>,
         /// Message body.
         text: String,
     },
