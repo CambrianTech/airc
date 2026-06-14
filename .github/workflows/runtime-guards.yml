@@ -17,6 +17,7 @@ on:
       - "test/public_installed_runtime_proof.sh"
       - "test/rust_cutover_guard.sh"
       - "test/rust_quality_guard.sh"
+      - "docker/mesh-converge.sh"
       - ".github/workflows/ci.yml"
       - ".github/workflows/runtime-guards.yml"
   push:
@@ -30,6 +31,7 @@ on:
       - "test/public_installed_runtime_proof.sh"
       - "test/rust_cutover_guard.sh"
       - "test/rust_quality_guard.sh"
+      - "docker/mesh-converge.sh"
       - ".github/workflows/ci.yml"
       - ".github/workflows/runtime-guards.yml"
 
@@ -40,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shell syntax
-        run: bash -n install.sh uninstall.sh
+        run: bash -n install.sh uninstall.sh docker/mesh-converge.sh
       - name: Rust cutover guards
         run: bash test/rust_cutover_guard.sh
       - name: Rust quality guards
