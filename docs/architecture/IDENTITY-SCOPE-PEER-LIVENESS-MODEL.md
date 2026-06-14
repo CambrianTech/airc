@@ -87,18 +87,26 @@ Liveness is tracked **inconsistently** across the three layers:
 - **Inter-machine: PROVEN.** BIGMAMA ↔ Intel Mac, bidirectional on `#general`
   over LAN (`192.168.1.x` endpoints), 2026-06-14. The endpoint/transport ladder
   works.
-- **Intra-machine: BROKEN (live-found by Mac).** Two scopes on ONE machine
-  (`~/.airc` wire vs `/tmp/airc-b` wire) do **not** route to each other even
-  after cross-`peer add` both ways. Each scope's channel wire is a separate
-  persistence file (per the #1160 macOS-leak fix), and the daemon is shared, but
-  **inbound from a sibling local scope is not routed** — peer enrolment updates
-  trust but no delivery path connects sibling wires.
-  - **OPEN QUESTION `[Mac]`** (you own the card + repro + are in this code): what
-    is the *intended* intra-machine model? Given §1 says the machine-account home
-    is "the hub all scopes route here" — should sibling scopes deliver via a
-    shared machine-local wire/broker at that hub, rather than per-scope wire
-    files that never connect? Document the intended seam here, then the fix
-    follows from it.
+- **Intra-machine: operator-facing bug, NOT an architectural gap (Mac, PR #1183
+  / card `326000a5`).** The field symptom: two scopes on one machine (`~/.airc`
+  wire vs `/tmp/airc-b` wire) don't see each other's messages even after
+  cross-`peer add`. **But the Mac's two regression tests in
+  `airc-lib/tests/sibling_scope_intra_machine_msg.rs` PROVE the SDK delivers
+  correctly** between sibling scopes attached to one daemon — both with a shared
+  mesh root AND with independent wire roots. Both pass on canary. So the
+  **intended model is confirmed sound**: sibling scopes route via the shared
+  daemon broker's fan-out (`Airc::say()` → broker → subscriber `page_recent()`).
+  - **The bug is in CLI plumbing**, between the operator typing `airc msg` and the
+    SDK call. Candidates (Mac, narrowing): (1) socket-path resolution per
+    `AIRC_HOME` — do both scopes resolve to the SAME daemon socket, or does the
+    second spawn its own daemon? (2) `ensure_daemon_running` lifecycle under an
+    `AIRC_HOME` override; (3) `airc events list` reading a per-home transcript
+    SQLite the sibling's send never landed in.
+  - **Resolution:** the model needs no change. Fix the CLI layer; lock it with a
+    `crates/airc-cli/tests/` end-to-end test driving `airc msg` from two distinct
+    `AIRC_HOME` values and asserting the receiver's `events list` sees it. (Mac
+    owns; this also informs §1 — the per-cwd socket/daemon resolution is the same
+    seam that mints throwaway scopes.)
 
 ## 5. Channel / room addressing
 
@@ -129,12 +137,13 @@ broadly.
 
 | # | Seam | Owner | Decision | Status |
 |---|---|---|---|---|
-| 1 | throwaway cwd scopes | `[both]` | (a) default-home vs (b) refuse | open |
+| 1 | throwaway cwd scopes | `[both]` | (a) default-home vs (b) refuse — likely SAME seam as #4's socket/daemon resolution | open |
 | 2 | two peer systems | `[both]` | trust store canonical; legacy → view/deprecate | open |
 | 3 | peer liveness / eviction | BIGMAMA | `peer prune` now; `last_seen` later? | in progress |
-| 4 | intra-machine routing | `[Mac]` | intended shared-hub model → fix | open |
+| 4 | intra-machine routing | `[Mac]` | **model sound (SDK proven, PR #1183); bug is CLI plumbing** → fix CLI + e2e test | investigating |
 | 5 | channel addressing | `[both]` | `--room` one-shot send | open |
 | 6 | observability honesty | `[Mac]` (fold-in) | honest health + status channels | open |
+| 7 | `airc-fetch-base.sh` hook bugs (Mac-found, PR #1183) | BIGMAMA | (a) stale `origin/rust-rewrite` base auto-detect post-#1173; (b) line-167 unbraced `$YEL` crashes `set -u` on bash 3.2 / multibyte | open (BIGMAMA's hook-install area) |
 
 ---
 
