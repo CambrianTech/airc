@@ -2041,11 +2041,25 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    if peers.is_empty() {
-        println!("(no enroled peers — use `airc peer add <spec>` to enrol)");
-        return Ok(());
+    for line in render_peer_list_lines(&peers, home) {
+        println!("{line}");
     }
-    for peer in &peers {
+    Ok(())
+}
+
+/// Pure human-render of the peer trust store — the lines `peer list`
+/// (and, via seam #2, `collaboration peers`) print. Extracted from
+/// [`run_peer_list`] so the output **shape** is a pinnable contract:
+/// the tier-aware line format and the trust-store-not-files source are
+/// asserted by unit tests, rather than only surfacing as a downstream
+/// script break. Reads exactly the [`airc_trust::load`] view — never a
+/// `<home>/peers/*.json` file — which is the entire point of seam #2.
+fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<String> {
+    if peers.is_empty() {
+        return vec!["(no enroled peers — use `airc peer add <spec>` to enrol)".to_string()];
+    }
+    let mut lines = Vec::with_capacity(peers.len() + 2);
+    for peer in peers {
         // Card 625abe6d slice 1: surface stored endpoints so the
         // operator can see what route discovery will dial. A record
         // with endpoint JSON this binary can't decode prints the
@@ -2057,16 +2071,20 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
                 Err(error) => format!("  endpoints=<undecodable: {error}>"),
             },
         };
-        println!(
+        lines.push(format!(
             "{}  {}  tier={}{endpoints}",
             peer.peer_id,
             peer.pubkey_b64,
             peer.tier.as_wire_str()
-        );
+        ));
     }
-    println!();
-    println!("{} peer(s) enroled at {}", peers.len(), home.display());
-    Ok(())
+    lines.push(String::new());
+    lines.push(format!(
+        "{} peer(s) enroled at {}",
+        peers.len(),
+        home.display()
+    ));
+    lines
 }
 
 /// `whois <peer>` — print the trust entry for an enrolled peer.
@@ -2186,6 +2204,99 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (seam #2): `collaboration peers` / `peer list`
+    /// render the canonical trust store with ALL tiers visible — an
+    /// Untrusted and a Friend peer both appear, each with its `tier=`
+    /// shape. Pins the output contract so a tier-filter regression or a
+    /// line-shape change breaks here, not a downstream script.
+    #[tokio::test]
+    async fn render_peer_list_shows_every_tier_from_trust_store() {
+        let home = tempfile::tempdir().expect("home");
+        let untrusted = PeerId::from_u128(0xa1);
+        let friend = PeerId::from_u128(0xf2);
+        airc_trust::add(home.path(), untrusted, [0xAA; 32])
+            .await
+            .expect("add untrusted");
+        airc_trust::add(home.path(), friend, [0xBB; 32])
+            .await
+            .expect("add friend");
+        airc_trust::set_tier(home.path(), friend, airc_store::TrustTier::Friend)
+            .await
+            .expect("set tier")
+            .expect("friend enrolled");
+
+        let peers = airc_trust::load(home.path()).await.expect("load");
+        let lines = render_peer_list_lines(&peers, home.path()).join("\n");
+
+        assert!(
+            lines.contains(&untrusted.to_string()),
+            "untrusted peer must render: {lines}"
+        );
+        assert!(
+            lines.contains(&friend.to_string()),
+            "friend peer must render: {lines}"
+        );
+        assert!(
+            lines.contains("tier=untrusted"),
+            "tier shape pinned: {lines}"
+        );
+        assert!(lines.contains("tier=friend"), "tier shape pinned: {lines}");
+        assert!(
+            lines.contains("2 peer(s) enroled"),
+            "summary count from trust store: {lines}"
+        );
+    }
+
+    /// what this catches (seam #2, the whole point): the render reads
+    /// the trust store, NEVER a legacy `<home>/peers/*.json` file. A
+    /// stray legacy record dropped in the same home must be invisible —
+    /// otherwise the two-peer-systems drift seam #2 closes is still open.
+    #[tokio::test]
+    async fn render_peer_list_ignores_legacy_peers_json_files() {
+        let home = tempfile::tempdir().expect("home");
+        let real = PeerId::from_u128(0x7e57);
+        airc_trust::add(home.path(), real, [0xCC; 32])
+            .await
+            .expect("add real");
+
+        // Legacy file-based record in the same home — the surface the
+        // old `collaboration peers` rendered. Must NOT leak into the view.
+        let peers_dir = home.path().join("peers");
+        std::fs::create_dir_all(&peers_dir).expect("peers dir");
+        std::fs::write(
+            peers_dir.join("ghost.json"),
+            r#"{"name":"ghost","host":"ghost@host","paired":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("write ghost");
+
+        let peers = airc_trust::load(home.path()).await.expect("load");
+        let lines = render_peer_list_lines(&peers, home.path()).join("\n");
+
+        assert!(
+            lines.contains(&real.to_string()),
+            "trust-store peer must render: {lines}"
+        );
+        assert!(
+            !lines.contains("ghost"),
+            "legacy peers/*.json must NOT appear in the trust-store view: {lines}"
+        );
+        assert!(
+            lines.contains("1 peer(s) enroled"),
+            "count reflects the trust store only, not the legacy file: {lines}"
+        );
+    }
+
+    /// what this catches: the empty-store render is the honest
+    /// onboarding hint, not a blank screen or a panic on no peers.
+    #[test]
+    fn render_peer_list_empty_is_onboarding_hint() {
+        let home = std::path::Path::new("/tmp/airc-empty");
+        let lines = render_peer_list_lines(&[], home);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no enroled peers"), "{:?}", lines);
+        assert!(lines[0].contains("airc peer add"), "{:?}", lines);
+    }
 
     /// Card bf7c30e2: the preflight error is self-diagnosing — it
     /// names the stores consulted (scope + machine), the union count,

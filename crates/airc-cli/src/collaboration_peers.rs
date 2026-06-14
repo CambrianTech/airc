@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,17 +15,44 @@ struct PeerRecord {
     stem: String,
 }
 
-pub fn run_peers(default_home: &Path, args: CollaborationScopeArgs) -> Result<(), Box<dyn Error>> {
+pub async fn run_peers(
+    default_home: &Path,
+    args: CollaborationScopeArgs,
+) -> Result<(), Box<dyn Error>> {
     let home = args.home.as_deref().unwrap_or(default_home);
-    let peers = peer_records(home);
-    if peers.is_empty() {
-        println!("  No peers yet.");
-        return Ok(());
-    }
-    print_peer_records(home, &peers);
-    Ok(())
+    // Seam #2 (solidification doc): the airc_trust store is the CANONICAL
+    // peer truth (peer_id + tier + endpoints). `collaboration peers` is
+    // now a VIEW over it via the shared `peer list` renderer — NOT the
+    // legacy file-based name/host/paired records under
+    // `<home>/peers/*.json`. Those files persist only as handshake
+    // pairing metadata; fully retiring them + migrating the handshake
+    // flow onto the trust store (and dropping `prune-peers`) is the
+    // remaining #2 work, tracked. One peer truth, one place.
+    //
+    // Output-shape contract change (Mac review of #1193): the rendered
+    // lines went from `name -> host [#room]` to
+    // `peer_id  pubkey  tier=…`. A grep across docs/skills/install
+    // scripts confirmed nothing parses the old shape, but humans with it
+    // memorised get a one-line stderr heads-up. stderr (not stdout) so a
+    // pipe consuming the peer list stays byte-for-byte unaffected.
+    eprintln!(
+        "note: `collaboration peers` now renders the canonical trust store \
+         (peer_id/pubkey/tier); the legacy name/host file view is retired. \
+         Prefer `airc peer list`."
+    );
+    crate::commands::run_peer_list(home, false).await
 }
 
+/// Prune duplicate legacy `<home>/peers/*.json` records (newest wins
+/// per host).
+///
+/// Seam #2 ASYMMETRY (Mac review of #1193): this still reads/writes the
+/// **legacy file** surface, while [`run_peers`] above reads the trust
+/// store. That is a deliberate temporary fanout — three peer surfaces
+/// are briefly in flight (trust store + `handshake_commands.rs` file
+/// writer + this file reader). Retiring the file writer and dropping
+/// this command is the remaining seam #2 slice; do NOT build new
+/// behaviour on this path.
 pub fn run_prune_peers(
     default_home: &Path,
     args: CollaborationScopeArgs,
@@ -107,21 +134,6 @@ fn peer_record_from_path(path: &Path) -> Option<PeerRecord> {
             .to_string(),
         stem,
     })
-}
-
-fn print_peer_records(home: &Path, peers: &[PeerRecord]) {
-    let room = fs::read_to_string(home.join("room_name"))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "(?)".to_string());
-    let mut seen_keys = BTreeSet::new();
-    for peer in peers {
-        if !seen_keys.insert((peer.name.clone(), peer.host.clone())) {
-            continue;
-        }
-        println!("  {} -> {}   [#{}]", peer.name, peer.host, room,);
-    }
 }
 
 fn remove_peer_file(peers_dir: &Path, stem: &str, extension: &str) {

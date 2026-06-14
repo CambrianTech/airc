@@ -220,7 +220,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             CollaborationAction::SendWarning(args) => {
                 collaboration_commands::run_send_warning(&home, args).await
             }
-            CollaborationAction::Peers(args) => collaboration_peers::run_peers(&home, args),
+            CollaborationAction::Peers(args) => collaboration_peers::run_peers(&home, args).await,
             CollaborationAction::PrunePeers(args) => {
                 collaboration_peers::run_prune_peers(&home, args)
             }
