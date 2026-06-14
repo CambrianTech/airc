@@ -150,8 +150,8 @@ impl GhBudget {
 
         // Primary limiter: persist the live remaining/reset and throttle
         // at the floor (keep headroom) instead of waiting for 0.
-        let remaining = header_value(&body, "x-ratelimit-remaining")
-            .and_then(|v| v.trim().parse::<u64>().ok());
+        let remaining =
+            header_value(&body, "x-ratelimit-remaining").and_then(|v| v.trim().parse::<u64>().ok());
         let reset =
             header_value(&body, "x-ratelimit-reset").and_then(|v| v.trim().parse::<f64>().ok());
         if let (Some(remaining), Some(reset)) = (remaining, reset) {

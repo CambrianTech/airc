@@ -156,6 +156,39 @@ pub fn merge_registry_documents(
     }
 }
 
+/// Default freshness horizon for reader-side beacon pruning: 10 minutes.
+///
+/// Deliberately MUCH longer than the local coordinator's 60s heartbeat
+/// TTL ([`crate::coordinator::DEFAULT_HEARTBEAT_TTL_MS`]). A peer's
+/// beacon reaches another machine only after a publish→gist→fetch hop,
+/// and the production registry-refresh loop runs on a ~120s cadence, so
+/// a perfectly live peer's freshest visible beacon is routinely a couple
+/// of minutes old purely from transport latency. The local TTL would
+/// false-drop those. This horizon is sized to prune only beacons whose
+/// publisher is genuinely gone (process dead for many minutes / the gist
+/// is days stale) while never evicting a live-but-laggy peer.
+pub const DEFAULT_PEER_FRESHNESS_TTL_MS: u64 = 600_000;
+
+/// Drop peers whose freshest beacon is staler than `ttl_ms` relative to
+/// `now_ms`, in place. Returns the number pruned.
+///
+/// This is the reader-side counterpart to the local coordinator's
+/// [`crate::coordinator::drain_stale_store`]: [`merge_registry_documents`]
+/// already keeps only the FRESHEST beacon per peer, but a peer whose
+/// freshest beacon is itself ancient (the publisher died and its gist
+/// never got cleaned) would still be enrolled and then dialed — the
+/// stale-route orphan path. Pruning here means the enrol set never
+/// contains a route we already know is dead.
+///
+/// Reuses [`PresenceBeacon::is_fresh`] so the freshness decision lives in
+/// exactly one place (saturating-sub guards future-dated clocks → a
+/// future-dated beacon is treated as fresh, never pruned).
+pub fn prune_stale_peers(peers: &mut Vec<AccountPeerBeacon>, now_ms: u64, ttl_ms: u64) -> usize {
+    let before = peers.len();
+    peers.retain(|peer| peer.presence.is_fresh(now_ms, ttl_ms));
+    before - peers.len()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRegistryDocument {
     pub schema_version: u16,
@@ -986,6 +1019,39 @@ mod tests {
         );
         let outcome = merge_registry_documents(vec![foreign], &mesh());
         assert!(outcome.document.is_none());
+    }
+
+    // what this catches: a dead daemon whose freshest surviving gist
+    // beacon is days old must be PRUNED from the enrol set, not dialed
+    // (the stale-route orphan path the merge alone never closed — it
+    // keeps freshest-per-peer but a peer's freshest can still be
+    // ancient). The user-flagged "make sure those aren't just old ones".
+    // Mutation check: dropping the `is_fresh` filter keeps the stale
+    // peer and returns 0 — both asserts fail.
+    #[test]
+    fn prune_drops_only_peers_staler_than_ttl() {
+        let now_ms = 1_000_000;
+        let ttl = DEFAULT_PEER_FRESHNESS_TTL_MS; // 600_000
+        let fresh = PeerId::new();
+        let stale = PeerId::new();
+        let future = PeerId::new();
+        let mut peers = vec![
+            // 100s old — well within the 10min horizon.
+            beacon_at(fresh, "/machine/a/.airc", now_ms - 100_000),
+            // 900s old — a dead publisher's lingering gist beacon.
+            beacon_at(stale, "/machine/b/.airc", now_ms - 900_000),
+            // future-dated clock skew — saturating-sub treats as fresh,
+            // never pruned (we don't punish a peer for our clock).
+            beacon_at(future, "/machine/c/.airc", now_ms + 50_000),
+        ];
+
+        let pruned = prune_stale_peers(&mut peers, now_ms, ttl);
+
+        assert_eq!(pruned, 1, "exactly the stale peer is pruned");
+        let kept: Vec<_> = peers.iter().map(|p| p.peer_id()).collect();
+        assert!(kept.contains(&fresh), "live-but-laggy peer kept");
+        assert!(kept.contains(&future), "future-dated peer kept");
+        assert!(!kept.contains(&stale), "dead-route peer dropped");
     }
 
     // Two SEPARATE machine accounts, same gh identity, bridged ONLY

@@ -73,8 +73,9 @@ use airc_diagnostics::{
 use airc_store::{SqliteEventStore, StoredAccountRegistryGistSentinel};
 
 use crate::account_registry::{
-    merge_registry_documents, scope_home_is_temp_rooted, AccountRegistryDocument,
-    AccountRegistryError, AccountRegistryStore,
+    merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted,
+    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
+    DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 use crate::subscriptions::MeshIdentity;
 use crate::time;
@@ -739,7 +740,30 @@ impl AccountRegistryStore for GhAccountRegistryStore {
                 .with_field("ignored_count", outcome.ignored_temp_beacons),
             );
         }
-        Ok(outcome.document)
+        // Freshness pass: even the freshest beacon per peer can be
+        // ancient (its publisher died; the gist was never cleaned).
+        // Prune those before enrol so we never dial a route we already
+        // know is dead — the stale-route orphan path.
+        let Some(mut document) = outcome.document else {
+            return Ok(None);
+        };
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
+        })?;
+        let pruned = prune_stale_peers(&mut document.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
+        if pruned > 0 {
+            StderrJsonDiagnosticSink.emit(
+                DiagnosticEvent::warn(
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::AccountRegistryStaleBeaconsPruned,
+                    "account-registry reader-merge pruned stale peer beacon(s): the freshest \
+                     beacon for each was older than the freshness TTL — dead routes, never enrolled",
+                )
+                .with_field("pruned_count", pruned)
+                .with_field("ttl_ms", DEFAULT_PEER_FRESHNESS_TTL_MS),
+            );
+        }
+        Ok(Some(document))
     }
 }
 
@@ -1125,6 +1149,15 @@ exit 0
             MeshIdentity::new("joelteply")
         }
 
+        /// Real wall-clock now, in ms. `refresh` prunes peers whose
+        /// freshest beacon is older than `DEFAULT_PEER_FRESHNESS_TTL_MS`
+        /// against this clock, so a beacon that must SURVIVE a refresh
+        /// has to carry a near-now heartbeat (a live peer). Tests anchor
+        /// surviving beacons at `now() - small_offset`.
+        fn now() -> u64 {
+            crate::time::now_ms().expect("system clock available in test")
+        }
+
         fn beacon(scope_home: &str, heartbeat_ms: u64, relay: &str) -> AccountPeerBeacon {
             let peer_id = PeerId::new();
             beacon_for(peer_id, scope_home, heartbeat_ms, relay)
@@ -1290,18 +1323,24 @@ exit 0
             let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
 
             let shared = PeerId::new();
+            // Both heartbeats are near-now (live peer): refresh prunes
+            // beacons older than the freshness TTL, so the peer must be
+            // fresh to survive — `fresh` is more recent than `stale` so
+            // the freshest-wins dedup is still exercised.
             let stale = beacon_for(
                 shared,
                 "/machine/a/.airc",
-                1_000,
+                now() - 5_000,
                 "https://stale.example.test",
             );
             let fresh = beacon_for(
                 shared,
                 "/machine/a/.airc",
-                5_000,
+                now() - 1_000,
                 "https://fresh.example.test",
             );
+            // Phantom is temp-scoped → dropped by the merge temp filter
+            // before prune, so its heartbeat is irrelevant.
             let phantom = beacon(
                 r"C:\Users\green\AppData\Local\Temp\tmp.YYavgmVUxz\.airc",
                 9_000,
@@ -1353,16 +1392,19 @@ exit 0
             let stub = StubGh::install(dir.path());
             let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
 
+            // Both live (near-now heartbeats) so neither is pruned by
+            // the refresh freshness pass — the test is about the UNION
+            // across writer gists, not freshness.
             let peer_a = beacon_for(
                 PeerId::new(),
                 "/machine/a/.airc",
-                1_000,
+                now() - 5_000,
                 "https://machine-a.example.test",
             );
             let peer_b = beacon_for(
                 PeerId::new(),
                 "/machine/b/.airc",
-                5_000,
+                now() - 1_000,
                 "https://machine-b.example.test",
             );
 
@@ -1398,6 +1440,57 @@ exit 0
             assert_eq!(
                 merged_a.endpoints, peer_a.endpoints,
                 "peer A's dialable endpoints must survive the merge"
+            );
+        }
+
+        // what this catches: refresh PRUNES a peer whose freshest
+        // surviving gist beacon is older than the freshness TTL (a dead
+        // publisher whose gist was never cleaned) while keeping a live
+        // peer — the stale-route orphan path. Mutation check: removing
+        // the prune wiring in `refresh` keeps the dead peer and the
+        // len/identity asserts fail.
+        #[tokio::test]
+        async fn refresh_prunes_stale_peer_keeping_live_one() {
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
+
+            let live = beacon_for(
+                PeerId::new(),
+                "/machine/live/.airc",
+                now() - 30_000, // 30s old — well inside the TTL
+                "https://live.example.test",
+            );
+            let dead = beacon_for(
+                PeerId::new(),
+                "/machine/dead/.airc",
+                // Older than DEFAULT_PEER_FRESHNESS_TTL_MS (10min) — a
+                // publisher that has been gone for an hour.
+                now() - (DEFAULT_PEER_FRESHNESS_TTL_MS + 3_600_000),
+                "https://dead.example.test",
+            );
+            stub.seed_gist(
+                "live-writer",
+                "airc-account-mesh-registry.live.json",
+                &document(2_000, vec![live.clone()]),
+            );
+            stub.seed_gist(
+                "dead-writer",
+                "airc-account-mesh-registry.dead.json",
+                &document(2_000, vec![dead.clone()]),
+            );
+
+            let merged = store
+                .refresh(&mesh())
+                .await
+                .unwrap()
+                .expect("documents must merge");
+
+            assert_eq!(merged.peers.len(), 1, "the dead-route peer is pruned");
+            assert_eq!(
+                merged.peers[0].peer_id(),
+                live.peer_id(),
+                "only the live peer is enrolled"
             );
         }
 
