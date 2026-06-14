@@ -508,6 +508,24 @@ impl Airc {
         Ok(Some(document))
     }
 
+    /// The peer_ids of LIVE peers in the current fresh account registry
+    /// (the merged, stale-pruned document). **READ-ONLY** — unlike
+    /// [`Self::refresh_account_registry`], this does NOT enrol/import, so
+    /// it is safe to call from a dry run. Returns `None` when no registry
+    /// document is available (empty account, gh gate, or no mesh match).
+    /// Used by `airc peer prune` as the authoritative "who is alive" set:
+    /// an enrolled peer absent from it is a dead-route candidate.
+    pub async fn live_registry_peer_ids(
+        &self,
+        store: &dyn AccountRegistryStore,
+    ) -> Result<Option<std::collections::HashSet<airc_core::PeerId>>, AircError> {
+        let identity = self.mesh_identity().await?;
+        let Some(document) = store.refresh(&identity).await? else {
+            return Ok(None);
+        };
+        Ok(Some(document.peers.iter().map(|p| p.peer_id()).collect()))
+    }
+
     pub async fn import_account_registry_document(
         &self,
         document: AccountRegistryDocument,

@@ -1,9 +1,11 @@
+use std::collections::HashSet;
+
 use airc_core::PeerId;
 use airc_trust as peers_store;
 
 use crate::error::AircError;
 use crate::registry::PeerSpec;
-use crate::Airc;
+use crate::{Airc, TrustTier};
 
 /// One row in `Airc::peers`. Mirrors the daemon's `PeerEntry`
 /// without forcing consumers to pull the daemon crate.
@@ -11,6 +13,73 @@ use crate::Airc;
 pub struct EnrolledPeer {
     pub peer_id: PeerId,
     pub pubkey_b64: String,
+}
+
+/// What [`classify_peer_prune`] decided for one enrolled peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPruneAction {
+    /// A real / trusted / live peer — never evicted.
+    Keep,
+    /// A dead enrolment — safe to remove from the trust store.
+    Evict,
+}
+
+/// One enrolled peer's prune verdict: id + tier + action + reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPruneVerdict {
+    pub peer_id: PeerId,
+    pub tier: TrustTier,
+    pub action: PeerPruneAction,
+    pub reason: String,
+}
+
+/// Pure classification for `airc peer prune`: which enrolled peers are
+/// dead trust-store entries. Evicts ONLY peers that are BOTH
+/// [`TrustTier::Untrusted`] AND **absent from `live_ids`** (the peer_ids
+/// present in the current fresh, stale-pruned account registry).
+///
+/// The tier guard is LOAD-BEARING: a trusted peer — e.g. a cross-grid
+/// friend who publishes to THEIR account and is therefore absent from
+/// yours — must NEVER be auto-evicted on absence alone. A live peer
+/// (present in the fresh registry) is always kept regardless of tier.
+/// This is the peer-store analog of `classify_registry_gc`; the trust
+/// store has no `last_seen`/TTL, so dead enrolments (the `172.18.0.x`
+/// Docker-ghost peers) never expire without this. Side-effect-free →
+/// unit-testable without touching the store.
+pub fn classify_peer_prune(
+    enrolled: &[(PeerId, TrustTier)],
+    live_ids: &HashSet<PeerId>,
+) -> Vec<PeerPruneVerdict> {
+    enrolled
+        .iter()
+        .map(|(peer_id, tier)| {
+            let (action, reason) = if live_ids.contains(peer_id) {
+                (
+                    PeerPruneAction::Keep,
+                    "live in the fresh account registry".to_string(),
+                )
+            } else if *tier == TrustTier::Untrusted {
+                (
+                    PeerPruneAction::Evict,
+                    "untrusted + absent from fresh registry (dead enrolment)".to_string(),
+                )
+            } else {
+                (
+                    PeerPruneAction::Keep,
+                    format!(
+                        "trusted ({}) — never auto-evicted on absence",
+                        tier.as_wire_str()
+                    ),
+                )
+            };
+            PeerPruneVerdict {
+                peer_id: *peer_id,
+                tier: *tier,
+                action,
+                reason,
+            }
+        })
+        .collect()
 }
 
 impl Airc {
@@ -173,6 +242,58 @@ impl Airc {
 mod tests {
     use crate::Airc;
     use tempfile::tempdir;
+
+    // what this catches: `peer prune` must evict ONLY peers that are
+    // Untrusted AND absent from the fresh registry, and must NEVER evict
+    // a trusted peer (a cross-grid Friend publishes to THEIR account so
+    // is absent from ours) or a live peer. Mutation check: dropping the
+    // tier guard evicts the Friend; dropping the live-set check evicts
+    // the live untrusted peer — both fail an assert.
+    #[test]
+    fn classify_peer_prune_evicts_only_untrusted_absent() {
+        use super::{classify_peer_prune, PeerPruneAction};
+        use crate::TrustTier;
+        use airc_core::PeerId;
+        use std::collections::HashSet;
+
+        let ghost = PeerId::new(); // untrusted + absent  → Evict
+        let live_untrusted = PeerId::new(); // untrusted but LIVE → Keep
+        let friend_absent = PeerId::new(); // trusted Friend + absent → Keep (cross-grid)
+
+        let enrolled = vec![
+            (live_untrusted, TrustTier::Untrusted),
+            (ghost, TrustTier::Untrusted),
+            (friend_absent, TrustTier::Friend),
+        ];
+        let mut live_ids = HashSet::new();
+        live_ids.insert(live_untrusted);
+
+        let verdicts = classify_peer_prune(&enrolled, &live_ids);
+        let action_of = |id: PeerId| verdicts.iter().find(|v| v.peer_id == id).unwrap().action;
+
+        assert_eq!(
+            action_of(ghost),
+            PeerPruneAction::Evict,
+            "untrusted + absent = dead enrolment"
+        );
+        assert_eq!(
+            action_of(live_untrusted),
+            PeerPruneAction::Keep,
+            "a LIVE peer is kept even if untrusted"
+        );
+        assert_eq!(
+            action_of(friend_absent),
+            PeerPruneAction::Keep,
+            "a trusted Friend is NEVER auto-evicted on absence (cross-grid protection)"
+        );
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| v.action == PeerPruneAction::Evict)
+                .count(),
+            1
+        );
+    }
 
     /// Regression for the account-registry auto-discovery keystone
     /// (card a134b370): the daemon's registry-refresh loop opens its

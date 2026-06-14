@@ -147,7 +147,7 @@ pub use mesh_identity::{
     resolve_with as resolve_mesh_identity_with, CachedIdentity, MeshIdentityError,
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
-pub use peers::EnrolledPeer;
+pub use peers::{classify_peer_prune, EnrolledPeer, PeerPruneAction, PeerPruneVerdict};
 pub use publish::{PublishReceipt, PublishTarget};
 pub use registry::{format_peer_spec, PeerSpec, PeerSpecError};
 pub use registry_refresh::{
