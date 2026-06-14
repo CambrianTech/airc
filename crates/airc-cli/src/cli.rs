@@ -1280,6 +1280,22 @@ pub enum PeerAction {
         #[arg(long)]
         json: bool,
     },
+    /// Evict DEAD trust-store enrolments — peers that are `untrusted`
+    /// AND absent from the current fresh account registry (e.g. the
+    /// `172.18.0.x` Docker-container ghosts that leak failed dials). The
+    /// peer-store analog of `registry gc`.
+    ///
+    /// NEVER touches trusted peers (a cross-grid Friend publishes to
+    /// THEIR account, so is absent from yours) or live peers. Dry-run by
+    /// default — prints the plan; pass `--apply` to evict. If a fresh
+    /// live set can't be established (gh unauth / unreachable / empty
+    /// registry), it prunes nothing rather than risk a live peer.
+    Prune {
+        /// Actually evict the dead enrolments. Without this flag, prune
+        /// only prints what it WOULD evict (dry run).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 /// CLI mirror of `airc_store::TrustTier`. Kept distinct so clap's

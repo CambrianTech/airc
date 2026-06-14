@@ -429,6 +429,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
             }
             PeerAction::List { json } => commands::run_peer_list(&home, json).await,
+            PeerAction::Prune { apply } => commands::run_peer_prune(&home, apply).await,
         },
 
         Command::Peers => commands::run_peer_list(&home, false).await,

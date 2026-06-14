@@ -1816,6 +1816,104 @@ pub async fn run_peer_remove(
     Ok(())
 }
 
+/// `peer prune` — evict DEAD trust-store enrolments (the peer-store
+/// analog of `registry gc`). Removes peers that are `Untrusted` AND
+/// absent from the current fresh account registry; trusted peers (incl.
+/// cross-grid Friends) and live peers are never touched. Dry-run by
+/// default; `--apply` performs the eviction with a forensic reason on
+/// the `PeerDeparted` event.
+///
+/// SAFETY: if a trustworthy fresh live-peer set cannot be established (gh
+/// unauthenticated, hermetic scope, unreachable rendezvous, or an empty
+/// registry), this prunes NOTHING — pruning against an unknown/empty live
+/// set would wrongly evict live peers.
+pub async fn run_peer_prune(home: &Path, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let enrolled = airc_trust::load(home).await?;
+    if enrolled.is_empty() {
+        println!("(no enroled peers — nothing to prune)");
+        return Ok(());
+    }
+    let enrolled_pairs: Vec<(airc_core::PeerId, airc_lib::TrustTier)> =
+        enrolled.iter().map(|p| (p.peer_id, p.tier)).collect();
+
+    // Authoritative live set: the fresh, stale-pruned account-registry
+    // document (READ-ONLY — `live_registry_peer_ids` does not enrol).
+    let db_path = airc_lib::machine_account_home(home).join("events.sqlite");
+    let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let store = match resolve_gh_bin() {
+        Some(bin) => {
+            airc_lib::GhAccountRegistryStore::new(event_store, home).with_bin(bin)
+        }
+        None => airc_lib::GhAccountRegistryStore::new(event_store, home),
+    };
+    let airc = Airc::open(home).await?;
+    let live_ids = match airc.live_registry_peer_ids(&store).await {
+        Ok(Some(ids)) if !ids.is_empty() => ids,
+        _ => {
+            println!(
+                "peer prune: could not establish a fresh live-peer set (gh not authenticated, \
+                 hermetic scope, unreachable rendezvous, or empty registry). Pruning NOTHING — \
+                 prune needs a trustworthy live set so it never evicts a live peer. Run `gh auth \
+                 login`, ensure the account rendezvous is reachable, then retry."
+            );
+            return Ok(());
+        }
+    };
+
+    let verdicts = airc_lib::classify_peer_prune(&enrolled_pairs, &live_ids);
+    let mut to_evict = Vec::new();
+    for verdict in &verdicts {
+        match verdict.action {
+            airc_lib::PeerPruneAction::Evict => {
+                println!(
+                    "  EVICT  {}  tier={}  — {}",
+                    verdict.peer_id,
+                    verdict.tier.as_wire_str(),
+                    verdict.reason
+                );
+                to_evict.push(verdict.peer_id);
+            }
+            airc_lib::PeerPruneAction::Keep => {
+                println!(
+                    "  keep   {}  tier={}  — {}",
+                    verdict.peer_id,
+                    verdict.tier.as_wire_str(),
+                    verdict.reason
+                );
+            }
+        }
+    }
+    let kept = verdicts.len() - to_evict.len();
+
+    if !apply {
+        if to_evict.is_empty() {
+            println!("peer prune: clean — {kept} live/trusted peer(s), no dead enrolments.");
+        } else {
+            println!(
+                "peer prune (dry run): would evict {} dead enrolment(s), keep {kept}. \
+                 Re-run with --apply to evict.",
+                to_evict.len()
+            );
+        }
+        return Ok(());
+    }
+
+    let mut evicted = 0usize;
+    for peer_id in &to_evict {
+        if airc
+            .remove_peer(
+                *peer_id,
+                "peer-prune: untrusted + absent from fresh registry",
+            )
+            .await?
+        {
+            evicted += 1;
+        }
+    }
+    println!("peer prune: evicted {evicted} dead enrolment(s), kept {kept}.");
+    Ok(())
+}
+
 /// Card 34942ec1 Sub-C: update an enrolled peer's tier without
 /// touching key material. Refuses for unknown peers (no implicit
 /// add — the operator should `peer add <spec> --tier=…` instead).
