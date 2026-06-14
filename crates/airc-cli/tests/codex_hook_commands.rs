@@ -1,10 +1,10 @@
 //! End-to-end coverage for `airc-core codex-hook ...`.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 mod common;
@@ -626,5 +626,118 @@ fn assert_source_command(command: &str) {
     assert!(
         !command.starts_with("airc-core "),
         "managed hook must not call legacy airc-core suffix, got {command:?}"
+    );
+}
+
+/// Regression for airc#1097 + BIGMAMA review BLOCK#1 on PR #1197:
+/// the original Windows hang was a 5+ hour deadlock because
+/// `read_to_string` waited forever for an EOF that never arrived
+/// (Stdio::piped() parent→daemon handle leak kept the pipe alive).
+/// The 5s deadline in `drain_stdin` (`hook.rs:224`) is the fix.
+///
+/// Every other test in this file writes to stdin and drops the pipe
+/// — EOF always arrives, so the new timeout branch
+/// (`hook.rs:233-246`) is *never executed* by the rest of the suite.
+/// That left the fix shipping unguarded: "a fix for a hang with no
+/// hang-regression test cannot prove it fixes the hang or guard
+/// against a future refactor reintroducing it."
+///
+/// This test pins the deadline behavior end-to-end:
+///   - spawn `codex-hook user-prompt-submit` with `Stdio::piped()`
+///     stdin and NEVER write or close it (the pipe-open-forever
+///     shape that hung Windows),
+///   - hold the stdin handle so it remains open during `child.wait()`
+///     — `wait_with_output` would close stdin on us (per std docs:
+///     "stdin handle will be closed before waiting"), defeating the
+///     test by delivering EOF before the deadline fires,
+///   - assert the child exits success() within the deadline budget
+///     (5s deadline + slop) instead of hanging,
+///   - assert the deadline-hit diagnostic is emitted on stderr so
+///     operators can see why the hook ran with empty payload.
+///
+/// If a future refactor reverts to unbounded `read_to_string`, this
+/// test hangs out to the test runner timeout — exactly the failure
+/// shape the original bug had on Windows CI. The 15s ceiling here is
+/// the canary: long enough to absorb spawn jitter on slow runners,
+/// short enough that a true regression is caught in the first failed
+/// run rather than after a 5-hour wait.
+#[test]
+fn drain_stdin_timeout_proceeds_when_eof_never_arrives() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+
+    let mut child = command_for_home(&home)
+        .args(["--home"])
+        .arg(&home)
+        .args(["codex-hook", "user-prompt-submit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("hook must spawn");
+
+    // Take ownership of stdin and HOLD it — we deliberately want the
+    // pipe to remain open with no data through the entire wait so the
+    // hook's `read_to_string` blocks indefinitely. Dropping it (or
+    // letting wait_with_output close it) would deliver EOF and the
+    // timeout branch we're testing would never run.
+    let stdin = child.stdin.take().expect("stdin pipe");
+
+    // Bound the wait ourselves: std::process::Child has no
+    // wait_timeout (and pulling a crate in for one test is
+    // disproportionate). Poll try_wait against a wall-clock budget
+    // so a deadline regression manifests as a *failed* test rather
+    // than a hung run that waits for the test runner's own timeout
+    // to kill it. The 15s budget = the 5s deadline + spawn jitter
+    // headroom; a true regression (read_to_string back to
+    // unbounded) means try_wait never observes exit and the kill
+    // path fires — the assertion message names the regression.
+    let timeout = Duration::from_secs(15);
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "hook did not exit within {timeout:?} — the \
+                         airc#1097 5s stdin deadline regressed. \
+                         read_to_string is back to blocking on an EOF \
+                         that never arrives."
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("try_wait error: {e}"),
+        }
+    };
+    let elapsed = started.elapsed();
+    drop(stdin);
+
+    let mut stderr_buf = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_buf);
+    }
+    let stderr_text = String::from_utf8_lossy(&stderr_buf);
+
+    assert!(
+        status.success(),
+        "hook must exit success on stdin timeout (airc#1097 regression): \
+         elapsed={elapsed:?} stderr={stderr_text}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "hook must complete inside the deadline budget (5s + slop). \
+         If this fails the deadline regressed and Windows CI will \
+         hang for hours again. Took {elapsed:?}; stderr={stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("stdin EOF not received") || stderr_text.contains("airc#1097"),
+        "hook must emit the deadline-hit diagnostic on stderr so an \
+         operator sees WHY the hook ran with empty payload: \
+         stderr={stderr_text}"
     );
 }

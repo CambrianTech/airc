@@ -191,9 +191,91 @@ fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&s
     event.client_id == airc.client_id()
 }
 
+/// Read Codex's hook JSON from stdin, with a hard deadline so a
+/// hung pipe never deadlocks the process.
+///
+/// **Why the deadline exists** (airc#1097). On the Windows CI
+/// runner, the codex_hook_commands tests hung for 5+ hours because
+/// `std::io::stdin().read_to_string` waited forever for an EOF that
+/// never arrived — most likely a Windows handle-inheritance leak
+/// from `Stdio::piped()` parent → grandchild daemon, where the
+/// daemon's inherited duplicate of the pipe-read handle kept the
+/// pipe alive after the parent closed its write end. Mac/Linux
+/// don't manifest the issue (~1s tests there).
+///
+/// The robust fix isn't a platform-specific handle-inheritance
+/// patch (untestable without a Windows machine, fragile across
+/// future cargo / std / Windows changes). It's to **stop relying
+/// on stdin-EOF as a liveness signal**: read with a deadline,
+/// proceed with empty payload if EOF doesn't arrive in time.
+/// Codex sends the JSON in microseconds in the happy path; 5s
+/// is far past any legitimate latency.
+///
+/// On Mac/Linux this changes nothing observable (EOF arrives
+/// well within the deadline). On Windows the deadlock becomes a
+/// fast-fail-and-proceed — the hook produces no AdditionalContext
+/// for that call, which is the same outcome as receiving empty
+/// stdin, and the next hook invocation behaves correctly.
+///
+/// **Intentional trade-offs the deadline introduces** (BIGMAMA
+/// review BLOCK#2 + #3 on PR #1197):
+///
+/// 1. **Slow-but-legitimate producer truncates to empty payload.**
+///    The deadline is on EOF, not on byte progress. A producer that
+///    streams valid JSON byte-by-byte over >5s gets its input
+///    discarded — `read_to_string` never returns, so the partial
+///    buffer in the reader thread is dropped and the hook proceeds
+///    with empty payload. The current caller (Codex) flushes JSON in
+///    microseconds; if a future caller streams slowly, the deadline
+///    needs to reset on progress or read to a JSON-object delimiter
+///    rather than EOF. Today we accept the truncation because the
+///    alternative is "Windows CI hangs for hours."
+///
+/// 2. **Timeout silently skips JSON validation.** The EOF path
+///    rejects non-object input with a hard error
+///    (`!value.is_object()` → `Err(...)` → non-zero exit). The
+///    timeout path returns `Ok(())` unconditionally — so "malformed
+///    input that also arrives slowly" degrades from a hard error to
+///    a silent success. The `eprintln!` distinguishes timeout from
+///    EOF in logs, but the validation-skip is intentional: a hook
+///    that exits non-zero on slow-malformed input would block every
+///    Codex prompt-submit on the same Windows hang it was meant to
+///    end. Operators see WHY via stderr; the input contract is
+///    "validates iff EOF arrives in time."
+///
+/// Both trade-offs are pinned by
+/// `drain_stdin_timeout_proceeds_when_eof_never_arrives` in
+/// `tests/codex_hook_commands.rs` — see the regression test for the
+/// exact failure shape if a future refactor reverts the deadline.
 fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
-    let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw)?;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const STDIN_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut raw = String::new();
+        let result = std::io::stdin().read_to_string(&mut raw).map(|_| raw);
+        let _ = tx.send(result);
+    });
+
+    let raw = match rx.recv_timeout(STDIN_READ_DEADLINE) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_timeout) => {
+            // Best-effort diagnostic; the orphan reader thread keeps
+            // its handle and will exit when the OS reclaims it after
+            // process exit.
+            eprintln!(
+                "airc codex-hook: stdin EOF not received within {STDIN_READ_DEADLINE:?}, \
+                 proceeding with empty payload (see airc#1097)"
+            );
+            return Ok(());
+        }
+    };
+
     if raw.trim().is_empty() {
         return Ok(());
     }
