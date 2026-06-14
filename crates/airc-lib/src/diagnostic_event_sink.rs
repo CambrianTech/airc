@@ -189,6 +189,9 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::AccountRegistryTempBeaconsIgnored => {
             "account_registry_temp_beacons_ignored"
         }
+        DiagnosticCode::AccountRegistryStaleBeaconsPruned => {
+            "account_registry_stale_beacons_pruned"
+        }
         DiagnosticCode::WireLostEmitFailed => "wire_lost_emit_failed",
         DiagnosticCode::MalformedReplayFrameSkipped => "malformed_replay_frame_skipped",
         DiagnosticCode::UnverifiableReplayFrameSkipped => "unverifiable_replay_frame_skipped",

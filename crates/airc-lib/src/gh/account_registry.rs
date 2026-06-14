@@ -73,8 +73,9 @@ use airc_diagnostics::{
 use airc_store::{SqliteEventStore, StoredAccountRegistryGistSentinel};
 
 use crate::account_registry::{
-    merge_registry_documents, scope_home_is_temp_rooted, AccountRegistryDocument,
-    AccountRegistryError, AccountRegistryStore,
+    merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted,
+    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore,
+    DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 use crate::subscriptions::MeshIdentity;
 use crate::time;
@@ -739,7 +740,31 @@ impl AccountRegistryStore for GhAccountRegistryStore {
                 .with_field("ignored_count", outcome.ignored_temp_beacons),
             );
         }
-        Ok(outcome.document)
+        // Freshness pass: even the freshest beacon per peer can be
+        // ancient (its publisher died; the gist was never cleaned).
+        // Prune those before enrol so we never dial a route we already
+        // know is dead — the stale-route orphan path.
+        let Some(mut document) = outcome.document else {
+            return Ok(None);
+        };
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
+        })?;
+        let pruned =
+            prune_stale_peers(&mut document.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
+        if pruned > 0 {
+            StderrJsonDiagnosticSink.emit(
+                DiagnosticEvent::warn(
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::AccountRegistryStaleBeaconsPruned,
+                    "account-registry reader-merge pruned stale peer beacon(s): the freshest \
+                     beacon for each was older than the freshness TTL — dead routes, never enrolled",
+                )
+                .with_field("pruned_count", pruned)
+                .with_field("ttl_ms", DEFAULT_PEER_FRESHNESS_TTL_MS),
+            );
+        }
+        Ok(Some(document))
     }
 }
 

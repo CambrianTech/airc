@@ -56,6 +56,11 @@ pub enum DiagnosticCode {
     /// temp-rooted (phantom hermetic-test peers in polluted documents).
     /// Carries the count, not the dump.
     AccountRegistryTempBeaconsIgnored,
+    /// Reader-merge pruned peers whose freshest beacon is older than the
+    /// freshness TTL — dead daemons whose only surviving gist beacon is
+    /// days old. Enrolling them would dial dead routes (the stale-route
+    /// orphan path). Carries the count, not the dump.
+    AccountRegistryStaleBeaconsPruned,
     WireLostEmitFailed,
     MalformedReplayFrameSkipped,
     UnverifiableReplayFrameSkipped,
