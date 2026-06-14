@@ -1301,7 +1301,8 @@ pub async fn run_daemon(
                         .join(" + ");
                     eprintln!(
                         "airc daemon: advertising {summary} in the account registry \
-                         (LAN dialed first, Tailscale only if peers leave the LAN)"
+                         (LAN dialed first; off-LAN peers fall through to Tailscale \
+                         after a ~3s LAN-rung timeout, once per session)"
                     );
                 }
                 Err(error) => {

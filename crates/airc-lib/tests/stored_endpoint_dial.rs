@@ -369,15 +369,19 @@ async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
         .expect("alice listens");
 
     // The LAN rung is a bind-then-drop loopback port that nothing
-    // answers — a SYN that gets ECONNREFUSED on Linux/macOS, which
-    // returns instantly. To pin the FULL `PEER_DIAL_TIMEOUT` cost
-    // we'd need a SYN-dropping firewall (the production NAT case the
-    // 3s deadline exists for); recording the failure for the LAN
-    // rung and the connection on the Tailscale rung is the
-    // testable-shape proof. The timing assertion below uses
-    // 250ms as a sanity bound — it must NOT exceed it because the
-    // ECONNREFUSED is instant; the larger 3s budget is for the
-    // SYN-drop case which isn't simulable in a unit test.
+    // answers. On Linux/macOS the kernel returns ECONNREFUSED
+    // instantly; on Windows the client retries SYN for ~2s before
+    // returning, so the closed-port shape is platform-sensitive.
+    // The four load-bearing asserts below (Tailscale-connects,
+    // exactly-one-LAN-failure, failure-is-LAN-rung, error-nonempty)
+    // are the actual proof of the dialer's rung-order contract; the
+    // wall-clock bound is sanity only — bounded by `PEER_DIAL_TIMEOUT`
+    // so it works on both kernels without papering over a stall.
+    // BIGMAMA review BLOCKING-fix on PR #1201: prior `< 2s` ceiling
+    // tripped on Windows-in-matrix CI (~2.03-2.05s deterministic);
+    // `< PEER_DIAL_TIMEOUT` is the correct universal bound — a dead
+    // rung that exceeds the per-dial deadline is a real failure
+    // we'd want surfaced.
     let dead_addr = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
         listener.local_addr().expect("probe addr")
@@ -426,11 +430,16 @@ async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
         "the LAN-rung error must be recorded for display — operator must \
          see WHY this peer's first dial slot was wasted"
     );
+    // Sanity bound: dial loop must complete within PEER_DIAL_TIMEOUT
+    // even with one rung dead. Universal across kernels — Linux/macOS
+    // refuse instantly; Windows SYN-retries for ~2s. A stall past
+    // this bound would mean a rung isn't honoring the per-dial
+    // deadline, which IS a real bug we'd want surfaced.
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "ECONNREFUSED returns instantly; if this exceeds 2s the test is \
-         simulating something other than the documented refused-dial \
-         shape. took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(3),
+        "off-LAN dial loop must complete within PEER_DIAL_TIMEOUT \
+         (3s) even with the LAN rung dead — anything past this means \
+         a rung isn't honoring the per-dial deadline. took {elapsed:?}"
     );
 }
 
