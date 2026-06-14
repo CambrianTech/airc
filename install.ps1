@@ -471,7 +471,22 @@ for phase in pre-commit pre-push; do
   echo "  + Git hook installed: $phase"
 done
 '@
-        & $bashExe --noprofile --norc -c $composer 'airc-githooks' $cloneForBash 2>&1 | ForEach-Object { Write-Host "  $_" }
+        # PS 5.1's native-arg passing shreds a multi-line string handed to
+        # `bash -c` (embedded newlines / `()` get mangled, so bash receives
+        # a truncated script → "unexpected EOF while looking for matching
+        # `)'"), which broke fresh installs on STOCK Windows (PowerShell 5.1
+        # is the default shell). PS 7 tolerated the -c form; 5.1 does not.
+        # Robust path: write the composer to a temp .sh (LF endings, no BOM)
+        # and run the FILE — the only argument bash gets is a clean path,
+        # which PS quotes correctly. `$1` is the clone dir (no $0 placeholder
+        # needed in file form: bash sets $0=<file>, $1=<first arg>).
+        $composerFile = Join-Path $env:TEMP ("airc-githooks-{0}.sh" -f ([System.Guid]::NewGuid().ToString('N')))
+        [System.IO.File]::WriteAllText($composerFile, ($composer -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        try {
+            & $bashExe --noprofile --norc $composerFile $cloneForBash 2>&1 | ForEach-Object { Write-Host "  $_" }
+        } finally {
+            Remove-Item -Force $composerFile -ErrorAction SilentlyContinue
+        }
         Write-Ok 'Git fetch-before-commit/push staleness guard wired'
     }
 }
