@@ -203,7 +203,12 @@ async fn async_main() -> ExitCode {
 }
 
 async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let home = parsed.home.clone().unwrap_or_else(cli::default_home_dir);
+    // Seam #1: `--home <path>` or `--here` (cwd-local scope) override the
+    // default machine-account / git-project resolution. `--here` is the
+    // ergonomic `AIRC_HOME=$PWD/.airc` shortcut.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = cli::explicit_home_override(parsed.home.clone(), parsed.here, &cwd)
+        .unwrap_or_else(cli::default_home_dir);
 
     match parsed.command {
         Command::Init { agent_name } => commands::run_init(&home, agent_name).await,
