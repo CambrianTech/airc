@@ -33,37 +33,50 @@ pub struct PeerPruneVerdict {
     pub reason: String,
 }
 
+/// Default staleness grace for [`classify_peer_prune`] — 1 hour. An
+/// Untrusted peer that is absent from the fresh registry but whose
+/// `last_seen_ms` is within this window is KEPT (recently-contacted;
+/// the registry snapshot may merely lag the last beacon we imported).
+/// A dead Docker-ghost peer never refreshes its beacon, so its
+/// `last_seen` stays at enrolment and it ages past this window quickly
+/// — generous enough to survive snapshot lag, short enough that ghosts
+/// don't linger. Seam #3.2 (the `last_seen_ms` column enables this).
+pub const DEFAULT_PEER_STALE_AFTER_MS: u64 = 3_600_000;
+
 /// Pure classification for `airc peer prune`: which enrolled peers are
-/// dead trust-store entries. Evicts ONLY peers that are BOTH
-/// [`TrustTier::Untrusted`] AND **absent from `live_ids`** (the peer_ids
-/// present in the current fresh, stale-pruned account registry).
+/// dead trust-store entries. Evicts ONLY peers that are ALL of
+/// [`TrustTier::Untrusted`], **absent from `live_ids`** (the peer_ids in
+/// the current fresh, stale-pruned account registry), AND **stale** —
+/// `now_ms - last_seen_ms >= stale_after_ms`.
 ///
 /// The tier guard is LOAD-BEARING: a trusted peer — e.g. a cross-grid
 /// friend who publishes to THEIR account and is therefore absent from
 /// yours — must NEVER be auto-evicted on absence alone. A live peer
 /// (present in the fresh registry) is always kept regardless of tier.
-/// This is the peer-store analog of `classify_registry_gc`; the trust
-/// store has no `last_seen`/TTL, so dead enrolments (the `172.18.0.x`
-/// Docker-ghost peers) never expire without this. Side-effect-free →
+///
+/// Seam #3.2 adds the staleness gate: before this, the trust store had
+/// no `last_seen`/TTL, so an Untrusted+absent peer was evicted the
+/// instant it dropped out of a registry snapshot — even one we'd
+/// imported a beacon from seconds earlier (snapshot lag looked like
+/// death). The `last_seen_ms` column closes that: a peer seen within
+/// `stale_after_ms` gets a grace window. Future `last_seen` (clock skew)
+/// reads as age 0 via saturating subtraction → kept. Side-effect-free →
 /// unit-testable without touching the store.
 pub fn classify_peer_prune(
-    enrolled: &[(PeerId, TrustTier)],
+    enrolled: &[(PeerId, TrustTier, u64)],
     live_ids: &HashSet<PeerId>,
+    now_ms: u64,
+    stale_after_ms: u64,
 ) -> Vec<PeerPruneVerdict> {
     enrolled
         .iter()
-        .map(|(peer_id, tier)| {
+        .map(|(peer_id, tier, last_seen_ms)| {
             let (action, reason) = if live_ids.contains(peer_id) {
                 (
                     PeerPruneAction::Keep,
                     "live in the fresh account registry".to_string(),
                 )
-            } else if *tier == TrustTier::Untrusted {
-                (
-                    PeerPruneAction::Evict,
-                    "untrusted + absent from fresh registry (dead enrolment)".to_string(),
-                )
-            } else {
+            } else if *tier != TrustTier::Untrusted {
                 (
                     PeerPruneAction::Keep,
                     format!(
@@ -71,6 +84,28 @@ pub fn classify_peer_prune(
                         tier.as_wire_str()
                     ),
                 )
+            } else {
+                // Untrusted + absent: evict only if ALSO stale past the
+                // grace window. `saturating_sub` makes a future last_seen
+                // (clock skew / not-yet-imported) read as age 0 → kept.
+                let age_ms = now_ms.saturating_sub(*last_seen_ms);
+                if age_ms >= stale_after_ms {
+                    (
+                        PeerPruneAction::Evict,
+                        format!(
+                            "untrusted + absent + last seen {age_ms}ms ago \
+                             (>= {stale_after_ms}ms TTL) — dead enrolment"
+                        ),
+                    )
+                } else {
+                    (
+                        PeerPruneAction::Keep,
+                        format!(
+                            "untrusted + absent but seen {age_ms}ms ago \
+                             (within {stale_after_ms}ms grace)"
+                        ),
+                    )
+                }
             };
             PeerPruneVerdict {
                 peer_id: *peer_id,
@@ -244,37 +279,41 @@ mod tests {
     use tempfile::tempdir;
 
     // what this catches: `peer prune` must evict ONLY peers that are
-    // Untrusted AND absent from the fresh registry, and must NEVER evict
-    // a trusted peer (a cross-grid Friend publishes to THEIR account so
-    // is absent from ours) or a live peer. Mutation check: dropping the
-    // tier guard evicts the Friend; dropping the live-set check evicts
-    // the live untrusted peer — both fail an assert.
+    // Untrusted AND absent from the fresh registry AND stale past the
+    // grace window; and must NEVER evict a trusted peer (a cross-grid
+    // Friend publishes to THEIR account so is absent from ours) or a
+    // live peer. Mutation check: dropping the tier guard evicts the
+    // Friend; dropping the live-set check evicts the live untrusted
+    // peer — both fail an assert. (Stale `last_seen` here so the
+    // staleness gate is satisfied; the grace window has its own test.)
     #[test]
     fn classify_peer_prune_evicts_only_untrusted_absent() {
-        use super::{classify_peer_prune, PeerPruneAction};
+        use super::{classify_peer_prune, PeerPruneAction, DEFAULT_PEER_STALE_AFTER_MS};
         use crate::TrustTier;
         use airc_core::PeerId;
         use std::collections::HashSet;
 
-        let ghost = PeerId::new(); // untrusted + absent  → Evict
+        let ghost = PeerId::new(); // untrusted + absent + stale → Evict
         let live_untrusted = PeerId::new(); // untrusted but LIVE → Keep
         let friend_absent = PeerId::new(); // trusted Friend + absent → Keep (cross-grid)
 
+        let now = 10_000_000_000u64;
+        // last_seen far in the past → past the grace window for all.
         let enrolled = vec![
-            (live_untrusted, TrustTier::Untrusted),
-            (ghost, TrustTier::Untrusted),
-            (friend_absent, TrustTier::Friend),
+            (live_untrusted, TrustTier::Untrusted, 0),
+            (ghost, TrustTier::Untrusted, 0),
+            (friend_absent, TrustTier::Friend, 0),
         ];
         let mut live_ids = HashSet::new();
         live_ids.insert(live_untrusted);
 
-        let verdicts = classify_peer_prune(&enrolled, &live_ids);
+        let verdicts = classify_peer_prune(&enrolled, &live_ids, now, DEFAULT_PEER_STALE_AFTER_MS);
         let action_of = |id: PeerId| verdicts.iter().find(|v| v.peer_id == id).unwrap().action;
 
         assert_eq!(
             action_of(ghost),
             PeerPruneAction::Evict,
-            "untrusted + absent = dead enrolment"
+            "untrusted + absent + stale = dead enrolment"
         );
         assert_eq!(
             action_of(live_untrusted),
@@ -292,6 +331,52 @@ mod tests {
                 .filter(|v| v.action == PeerPruneAction::Evict)
                 .count(),
             1
+        );
+    }
+
+    // what this catches (seam #3.2): the staleness grace window. An
+    // Untrusted, absent peer whose last_seen is WITHIN the TTL must be
+    // KEPT — it was recently contacted and its absence from one registry
+    // snapshot is likely lag, not death. The SAME peer once it ages past
+    // the TTL must Evict. A future last_seen (clock skew) reads as age 0
+    // → kept (no panic on saturating_sub).
+    #[test]
+    fn classify_peer_prune_grace_window_keeps_recently_seen() {
+        use super::{classify_peer_prune, PeerPruneAction};
+        use crate::TrustTier;
+        use airc_core::PeerId;
+        use std::collections::HashSet;
+
+        let recent = PeerId::new();
+        let skewed = PeerId::new();
+        let now = 1_000_000u64;
+        let ttl = 100_000u64;
+        let live_ids = HashSet::new(); // both absent
+
+        // recent: seen 50k ago (< 100k TTL) → Keep; skewed: last_seen in
+        // the future → age saturates to 0 → Keep.
+        let within = vec![
+            (recent, TrustTier::Untrusted, now - 50_000),
+            (skewed, TrustTier::Untrusted, now + 500_000),
+        ];
+        let verdicts = classify_peer_prune(&within, &live_ids, now, ttl);
+        for v in &verdicts {
+            assert_eq!(
+                v.action,
+                PeerPruneAction::Keep,
+                "within grace / future last_seen must be kept: {}",
+                v.reason
+            );
+        }
+
+        // Same recent peer, now aged past the TTL → Evict.
+        let aged = vec![(recent, TrustTier::Untrusted, now - 200_000)];
+        let verdicts = classify_peer_prune(&aged, &live_ids, now, ttl);
+        assert_eq!(
+            verdicts[0].action,
+            PeerPruneAction::Evict,
+            "untrusted + absent + aged past TTL must evict: {}",
+            verdicts[0].reason
         );
     }
 
