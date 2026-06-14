@@ -103,17 +103,26 @@ Liveness is tracked **inconsistently** across the three layers:
   mesh root AND with independent wire roots. Both pass on canary. So the
   **intended model is confirmed sound**: sibling scopes route via the shared
   daemon broker's fan-out (`Airc::say()` → broker → subscriber `page_recent()`).
-  - **The bug is in CLI plumbing**, between the operator typing `airc msg` and the
-    SDK call. Candidates (Mac, narrowing): (1) socket-path resolution per
-    `AIRC_HOME` — do both scopes resolve to the SAME daemon socket, or does the
-    second spawn its own daemon? (2) `ensure_daemon_running` lifecycle under an
-    `AIRC_HOME` override; (3) `airc events list` reading a per-home transcript
-    SQLite the sibling's send never landed in.
-  - **Resolution:** the model needs no change. Fix the CLI layer; lock it with a
-    `crates/airc-cli/tests/` end-to-end test driving `airc msg` from two distinct
-    `AIRC_HOME` values and asserting the receiver's `events list` sees it. (Mac
-    owns; this also informs §1 — the per-cwd socket/daemon resolution is the same
-    seam that mints throwaway scopes.)
+  - **Root cause narrowed by code (Mac).** A BIGMAMA hypothesis — "sibling scopes
+    get different sockets, so #4 and §1 share a root" — was **disproved by
+    reading the code**: `default_socket_path_in(home)` resolves via
+    `machine_account_home(home)` FIRST (cli.rs:206), so **both sibling scopes get
+    the SAME socket**, and `events.sqlite` is likewise machine-account-derived
+    (commands.rs:1117-1119: "ONE ORM per machine account … share one
+    events.sqlite"). The daemon + DB **are** shared by design — so §1 and §4 are
+    **separate** seams, not one fix. The send DID land in the shared DB.
+  - **The sharper bug is the SUBSCRIPTION filter.** `events_commands::run_list`
+    reads via `airc.page_recent_subscribed_filtered(filter, limit)` — scoped to
+    *this* scope's subscribed channels. Both scopes ran `airc room general`, so
+    scope-a's set should include `general` and it should see the event. It
+    doesn't, so the bug is one of: (a) `page_recent_subscribed_filtered` has a
+    side filter on event-**origin-scope**; (b) scope-a's persisted subscription
+    set got **reset** by scope-b's `room` switch (shared per-machine ORM, racing
+    subscription rows); or (c) the daemon router registers **per-scope** (not
+    per-channel) subscribers.
+  - **Resolution:** model unchanged; fix is reading `page_recent_subscribed_filtered`
+    + the daemon subscriber-registration path, then an `airc-cli` e2e test
+    (`airc msg` from two `AIRC_HOME`s → receiver `events list` sees it). Mac owns.
 
 ## 5. Channel / room addressing
 
@@ -155,13 +164,49 @@ broadly.
 
 | # | Seam | Owner | Decision | Status |
 |---|---|---|---|---|
-| 1 | throwaway cwd scopes | `[both]` | **Mac proposes (c):** default-home for routine commands; minting at non-canonical path requires `$AIRC_HOME` or explicit `--here` | Mac proposed; needs BIGMAMA concur |
-| 2 | two peer systems | `[both]` | **Mac concurs (a):** trust store canonical; `collaboration peers` → view over trust store, file-prune dies | Mac proposed; needs BIGMAMA concur |
-| 3 | peer liveness / eviction | BIGMAMA | `peer prune` now; `last_seen` later? | in progress |
-| 4 | intra-machine routing | `[Mac]` | **model sound (SDK proven, PR #1183); bug is CLI plumbing** → fix CLI + e2e test | Mac investigating (PR #1183) |
-| 5 | channel addressing | `[both]` | **Mac concurs:** `--room` one-shot send via existing `room::resolve_or_derive`; also `airc room --json` | Mac proposed; needs BIGMAMA concur |
-| 6 | observability honesty | `[Mac]` (fold-in) | **Mac owns:** typed `HealthVerdict` enum (`Ok` / `Degraded` / `NoRoutes`); `airc status` lists subscriptions | Mac queued for sibling PR |
-| 7 | `airc-fetch-base.sh` hook bugs (Mac-found, PR #1183) | BIGMAMA | (a) stale `origin/rust-rewrite` base auto-detect post-#1173; (b) line-167 unbraced `$YEL` crashes `set -u` on bash 3.2 / multibyte | open (BIGMAMA's hook-install area) |
+| 1 | throwaway cwd scopes | BIGMAMA | **AGREED (c):** default-home for routine commands; minting at a non-canonical path requires `$AIRC_HOME` or explicit `--here` | agreed → BIGMAMA to build |
+| 2 | two peer systems | BIGMAMA | **AGREED (a):** trust store canonical; `collaboration peers` → view over trust store, file-prune dies | agreed → BIGMAMA (after #3) |
+| 3 | peer liveness / eviction | BIGMAMA | `peer prune` now; `last_seen` age-based eviction later | in progress |
+| 4 | intra-machine routing | Mac | **model sound; bug is the SUBSCRIPTION filter** (`page_recent_subscribed_filtered`), NOT the socket (shared by design) → fix + e2e test | Mac investigating (PR #1183) |
+| 5 | channel addressing | Mac | **AGREED:** `--room` one-shot send via existing `room::resolve_or_derive`; also `airc room --json` | agreed → Mac to build |
+| 6 | observability honesty | Mac | **AGREED:** typed `HealthVerdict` enum (`Ok`/`Degraded`/`NoRoutes`); `airc status` lists subscriptions | agreed → Mac (sibling to #1183) |
+| 7 | `airc-fetch-base.sh` hook bugs (Mac-found) | BIGMAMA | canary-first base + braced color vars | **FIXED — PR #1185** |
+
+---
+
+## Joint Execution Plan
+
+Two ownership **clusters**, each a cohesive subsystem so the two Claudes rarely
+touch the same files:
+
+- **BIGMAMA → peer / trust / scope cluster:** #7 (done), #3 `peer prune`, then
+  #2 peer-system unify, #1 scope-resolution policy, and later #3.2 `last_seen`.
+- **Mac → routing / channel / observability cluster:** #4 subscription-filter
+  bug, #5 `--room`, #6 `HealthVerdict`.
+
+**Phasing** (by dependency + leverage, not calendar):
+
+1. **Reliability now (in flight):** #3 `peer prune` (BIGMAMA — kills the ghost
+   dial-fails) ‖ #4 subscription-filter fix + e2e test (Mac — the one true
+   correctness bug). Independent files; run in parallel.
+2. **Friction + cleanup (parallel, low-coupling):** #5 `--room` (Mac), #6
+   `HealthVerdict` + status subscriptions (Mac), #1 scope-resolution policy
+   (BIGMAMA). #2 peer-system unify (BIGMAMA) lands **after #3** — both touch the
+   trust store; sequencing avoids a merge conflict on the same layer.
+3. **Liveness spine (deeper, after the above):** #3.2 enrolment `last_seen`
+   updated on every fresh beacon / successful dial → age-based eviction (closes
+   the gap for direct-`peer add` peers that later die). This is the unifying
+   architectural payoff: **liveness flows beacon → peer → route** in one
+   direction, with no layer trusting a dead entry. After it lands, `peer prune`
+   becomes a manual escape hatch rather than the only cleanup.
+
+**Definition of "solid"** (when the banner drops): (1) liveness coherent — no
+ghosts at any layer; (2) routing correct intra- AND inter-machine; (3) ONE peer
+truth; (4) honest observability; (5) no accidental identities. Seams 1–6 map
+1:1 onto these five; #7 was incidental friction cleared en route.
+
+**Coordination:** airc `#general` (gist break-glass only); this doc + tracker is
+the source of truth; each seam ships as its own PR cross-linked here.
 
 ---
 
