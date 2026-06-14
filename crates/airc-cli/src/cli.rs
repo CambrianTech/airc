@@ -879,6 +879,28 @@ mod tests {
         assert_eq!(explicit_home_override(None, false, cwd), None);
     }
 
+    /// what this catches: `--home` and `--here` are mutually exclusive at
+    /// the CLAP layer (`conflicts_with = "home"`). The resolver test above
+    /// proves the value precedence, but not the parse-time guard — a
+    /// future arg-id rename could silently drop the `conflicts_with` and
+    /// let both be passed, with the resolver then quietly preferring
+    /// `--home` while the user thinks `--here` took effect. This pins the
+    /// guard: passing both must be a hard parse error.
+    #[test]
+    fn home_and_here_conflict_at_parse_time() {
+        use super::Cli;
+        use clap::Parser;
+
+        // Both flags → parse error (clap exit code 2 class).
+        assert!(
+            Cli::try_parse_from(["airc", "--home", "/x", "--here", "init"]).is_err(),
+            "--home and --here together must be rejected, not silently merged"
+        );
+        // Each alone parses fine (guard isn't over-broad).
+        assert!(Cli::try_parse_from(["airc", "--here", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["airc", "--home", "/x", "init"]).is_ok());
+    }
+
     #[test]
     fn default_home_uses_enclosing_airc_scope() {
         let root = tempfile::TempDir::new().unwrap();
