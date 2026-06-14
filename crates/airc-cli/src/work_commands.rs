@@ -2798,10 +2798,19 @@ mod tests {
         // merged / branch abandoned" signal probe_upstream_gone keys
         // off of.
         let branch_out = std::process::Command::new("git")
-            .args(["-C", nested.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+            .args([
+                "-C",
+                nested.to_str().unwrap(),
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+            ])
             .output()
             .expect("rev-parse");
-        let branch = String::from_utf8(branch_out.stdout).unwrap().trim().to_string();
+        let branch = String::from_utf8(branch_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         let origin = real_tmp.path().join("origin.git");
         let del = std::process::Command::new("git")
             .args([
