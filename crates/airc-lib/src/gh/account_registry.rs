@@ -658,7 +658,23 @@ impl GhAccountRegistryStore {
             .iter()
             .map(|e| (e.id.clone(), e.filename.clone()))
             .collect();
-        let verdicts = classify_registry_gc(&pairs);
+        // Self-guard: never delete THIS machine's own current gist,
+        // whatever its key shape. The classifier deletes
+        // `*-unknown-user` gists, and a real machine with every identity
+        // env (USER/LOGNAME/USERNAME) unset would publish exactly such a
+        // key — so force-Keep our own writer filename before any delete.
+        let self_filename = writer_filename();
+        let verdicts: Vec<GcVerdict> = classify_registry_gc(&pairs)
+            .into_iter()
+            .map(|mut verdict| {
+                if verdict.action == GcAction::Delete && verdict.filename == self_filename {
+                    verdict.action = GcAction::Keep;
+                    verdict.reason =
+                        "this machine's own current gist (never self-delete)".to_string();
+                }
+                verdict
+            })
+            .collect();
         let kept = verdicts
             .iter()
             .filter(|v| v.action == GcAction::Keep)
