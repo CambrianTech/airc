@@ -94,19 +94,29 @@ pub(crate) async fn run(
             // lands on the respawned daemon; a cross-SCOPE flip is seam #1's
             // domain, out of scope here.
             let mut backoff_ms = RECONNECT_INITIAL_BACKOFF_MS;
+            // The configured `start` (Live or FromTranscriptStart) applies to
+            // the FIRST attach only. After we've attached once, reconnects
+            // resume LIVE — re-requesting the full transcript on every
+            // reconnect would re-flood it event-by-event, and (combined with
+            // the decode-error drop below) a single poisoned historical frame
+            // would wedge the loop into a permanent re-replay that never
+            // advances (sentinel BLOCK on #1203). Trade-off: a first attach
+            // that drops mid-backlog forfeits the un-replayed remainder rather
+            // than re-flooding; per-attach cursor-resume (replay only the gap)
+            // is the follow-up.
+            let mut attach_start = start;
             loop {
-                let mut request = AttachRequest::new(channel, start);
+                let mut request = AttachRequest::new(channel, attach_start);
                 if coalesce_backlog {
                     request = request.with_coalesced_backlog();
                 }
                 if let Ok(mut stream) = client.attach(request).await {
-                    // A healthy attach resets the backoff so the next
-                    // transient blip recovers fast.
-                    backoff_ms = RECONNECT_INITIAL_BACKOFF_MS;
+                    let mut got_frame = false;
                     while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
                         match response {
                             Response::Event { envelope } => match decode_wire_event(envelope) {
                                 Ok(event) => {
+                                    got_frame = true;
                                     if tx.send(MonitorFrame::Event(Box::new(event))).await.is_err()
                                     {
                                         return;
@@ -116,17 +126,27 @@ pub(crate) async fn run(
                                 // the tail — drop the stream and re-attach.
                                 Err(_) => break,
                             },
-                            Response::AttachCursorAdvanced { skipped, .. }
+                            Response::AttachCursorAdvanced { skipped, .. } => {
+                                got_frame = true;
                                 if tx
                                     .send(MonitorFrame::CatchUpSummary { channel, skipped })
                                     .await
-                                    .is_err() =>
-                            {
-                                return;
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                             _ => {}
                         }
                     }
+                    // Reset backoff only when this attach actually delivered a
+                    // frame — a daemon that accepts then immediately closes
+                    // (flap) must keep escalating, not pin at the 250ms floor.
+                    if got_frame {
+                        backoff_ms = RECONNECT_INITIAL_BACKOFF_MS;
+                    }
+                    // One attach done → never re-request the backlog.
+                    attach_start = AttachStart::Live;
                     // Stream ended (EOF / read error) — fall through to
                     // reconnect.
                 }
