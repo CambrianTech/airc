@@ -166,7 +166,7 @@ broadly.
 |---|---|---|---|---|
 | 1 | throwaway cwd scopes | BIGMAMA | **AGREED (c):** default-home for routine commands; minting at a non-canonical path requires `$AIRC_HOME` or explicit `--here` | agreed → BIGMAMA to build |
 | 2 | two peer systems | BIGMAMA | **AGREED (a):** trust store canonical; `collaboration peers` → view over trust store, file-prune dies | agreed → BIGMAMA (after #3) |
-| 3 | peer liveness / eviction | BIGMAMA | `peer prune` now; `last_seen` age-based eviction later | in progress |
+| 3 | peer liveness / eviction | BIGMAMA | `peer prune` (Untrusted+absent→evict, dry-run default, no-live-set→prune-nothing, sentinel-approved); `last_seen` age-based eviction later (Phase 3) | **`peer prune` MERGED — PR #1186**; #3.2 `last_seen` open |
 | 4 | intra-machine routing | Mac | **model sound; bug is the SUBSCRIPTION filter** (`page_recent_subscribed_filtered`), NOT the socket (shared by design) → fix + e2e test | Mac investigating (PR #1183) |
 | 5 | channel addressing | Mac | **AGREED:** `--room` one-shot send via existing `room::resolve_or_derive`; also `airc room --json` | agreed → Mac to build |
 | 6 | observability honesty | Mac | **AGREED:** typed `HealthVerdict` enum (`Ok`/`Degraded`/`NoRoutes`); `airc status` lists subscriptions | agreed → Mac (sibling to #1183) |
