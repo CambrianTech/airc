@@ -31,7 +31,7 @@ RUN cargo build --release -p airc-cli \
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates git curl gnupg \
+      ca-certificates git curl gnupg procps \
  # GitHub CLI (the rendezvous/registry transport — the ONLY gh path,
  # governed by airc's request counter).
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -41,6 +41,27 @@ RUN apt-get update \
  && apt-get update && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /airc /usr/local/bin/airc
+# Card 7e3c9a1f: the node entrypoint runs `airc daemon` as the container's
+# long-lived process and advertises a routable endpoint. Inlined via
+# heredoc (the build context excludes docker/ — see .dockerignore — so a
+# COPY from there can't see it; this keeps the entrypoint self-contained).
+#   Bug 1: `airc join` returns without leaving a daemon, so nothing
+#          advertises. The container must RUN the daemon — this is it.
+#   Bug 2: detect_lan_ip() bails inside a container; AIRC_ADVERTISE_IP is
+#          the explicit handoff of the routable endpoint (host launcher
+#          passes the host LAN/Tailscale IP; same-host convergence falls
+#          back to this container's own bridge IP, reachable by siblings).
+COPY <<'EOF' /usr/local/bin/airc-node-run
+#!/bin/sh
+set -eu
+if [ -z "${AIRC_ADVERTISE_IP:-}" ]; then
+  AIRC_ADVERTISE_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
+  export AIRC_ADVERTISE_IP
+fi
+echo "airc-node: advertising endpoint IP ${AIRC_ADVERTISE_IP:-<none>} (override via AIRC_ADVERTISE_IP)"
+exec airc daemon
+EOF
+RUN chmod +x /usr/local/bin/airc-node-run
 
 # Each node is its own "machine": a distinct HOME → distinct ~/.airc
 # identity + local wire + governor state. The harness overrides HOME per
@@ -50,6 +71,8 @@ RUN useradd -m -d /node node && chown -R node:node /node
 USER node
 WORKDIR /node
 
-# A node does nothing until told to `airc join`; the harness drives it.
-# Keep the container alive so the harness can exec convergence steps.
-CMD ["airc", "version"]
+# Default: run the daemon (Card 7e3c9a1f) as the container's long-lived
+# process so the node advertises a routable endpoint and stays alive for
+# the harness / operator to `docker exec airc-node airc join` + drive it.
+# Override the CMD (e.g. `sleep infinity`) for a passive container.
+CMD ["airc-node-run"]

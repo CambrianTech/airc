@@ -1175,11 +1175,29 @@ pub async fn run_daemon(
         airc_lib::RoutedForwarderConfig::default(),
     );
 
+    // Card 7e3c9a1f: ONE daemon LAN handle, shared across the listener,
+    // the dialer (route refresh), and the forwarder. Accepted AND dialed
+    // connections then live on the SAME `LanTcpAdapter` connection map, so
+    // receive + delivery-ack + routed-forward all see the same peers.
+    // Previously the listener handle (registry task) and the route-refresh
+    // handle were SEPARATE `Airc::open`s with separate adapters: a
+    // connection accepted on the listener was invisible to the dialer
+    // handle, so reverse-direction room broadcast — forwarding/acking back
+    // over an inbound-accepted connection — failed with "lan-tcp adapter
+    // has no connected peers". The inbound sink and the forwarder link are
+    // installed ONCE here; the listener bind stays in the registry task
+    // (gated), the dial happens in route refresh — all on this one handle.
+    let daemon_airc = Airc::open(&state.home).await?;
+    daemon_airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
+        state.router.clone(),
+        state.coordinator_store.clone(),
+    )));
+    routed_forwarder.add_link(daemon_airc.clone()).await;
+
     // Card 625abe6d slice 2: the daemon, not the operator, keeps
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
-    let route_refresh_task =
-        spawn_route_refresh(home.to_path_buf(), state.clone(), routed_forwarder.clone());
+    let route_refresh_task = spawn_route_refresh(state.clone(), daemon_airc.clone());
 
     // KEYSTONE (card a134b370-10b1-49c6-aa42-e1a05446e887): spawn the
     // account-registry publish/refresh loop alongside the IPC accept
@@ -1197,7 +1215,10 @@ pub async fn run_daemon(
     // holds internally (same lost-wakeup discipline as `server::run`).
     let registry_state = state.clone();
     let registry_home = state.home.clone();
-    let registry_forwarder = routed_forwarder.clone();
+    // Card 7e3c9a1f: the registry task binds the LAN listener on the SHARED
+    // daemon handle (one adapter for accept + dial + forward) rather than
+    // opening its own — that split was the reverse-broadcast bug.
+    let registry_airc = daemon_airc.clone();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -1210,32 +1231,13 @@ pub async fn run_daemon(
             eprintln!("airc daemon: account-registry loop DISABLED — {block}");
             return;
         }
-        let airc = match Airc::open(&registry_home).await {
-            Ok(airc) => airc,
-            Err(error) => {
-                eprintln!(
-                    "airc daemon: account-registry loop disabled — could not open handle: {error}"
-                );
-                return;
-            }
-        };
-
-        // Card 4132f48c: this handle owns the daemon's LAN listener, so
-        // every inbound cross-machine frame is ingested HERE. Route it
-        // into the daemon's owner-core router — the transcript every
-        // attached scope reads — instead of this handle's private store
-        // (the store-split bug: durable in `~/.airc` events, invisible
-        // to every operator scope). Must be installed BEFORE the
-        // listener binds so no frame can race past it.
-        airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
-            registry_state.router.clone(),
-            registry_state.coordinator_store.clone(),
-        )));
-
-        // Card 1998f6cb: this handle's LAN connections (accepted by
-        // the listener below) are routes the forwarder may reuse for
-        // outbound traversal of router publishes.
-        registry_forwarder.add_link(airc.clone()).await;
+        // Card 7e3c9a1f: the SHARED daemon handle (opened in `run_daemon`).
+        // Its inbound sink (Card 4132f48c: inbound cross-machine frames
+        // ingest into the owner-core router, not a private store) and its
+        // forwarder link (Card 1998f6cb) are installed ONCE in `run_daemon`
+        // before this task spawns; the route-refresh loop dials on this
+        // same handle, so accept + dial connections share one adapter.
+        let airc = registry_airc;
 
         // Endpoint-in-beacon (the second half of same-account
         // auto-discovery): bind a LAN listener on THIS handle so its
@@ -1278,7 +1280,11 @@ pub async fn run_daemon(
         // (subnet/reachability gate at the dialer) will eliminate the
         // 3s for off-LAN peers; until then the truth is visible in the
         // recorded peer_dial_failures, not hidden in comments.
-        let lan_ip = crate::network_commands::detect_lan_ip();
+        // Card 7e3c9a1f: `advertise_lan_ip()` honors the `AIRC_ADVERTISE_IP`
+        // handoff (host launcher / container entrypoint) before host
+        // auto-detection — so a containerized node advertises a routable
+        // endpoint instead of nothing (detect_lan_ip bails in a container).
+        let lan_ip = crate::network_commands::advertise_lan_ip();
         let tailscale_ip = crate::network_commands::detect_tailscale_ip();
         if lan_ip.is_none() && tailscale_ip.is_none() {
             eprintln!(
@@ -1410,78 +1416,31 @@ pub async fn run_daemon(
 /// daemon restarts re-establish routes with zero operator action,
 /// instead of waiting for someone to run `airc transport health`.
 ///
-/// The `Airc` handle is opened lazily and then kept for the daemon's
-/// lifetime: LAN connections established by discovery dials live on
-/// the handle's adapter, so re-opening per tick would sever them on
-/// every refresh. Lazy-with-retry (rather than open-or-die at spawn)
-/// is the no-single-point-of-failure posture: a transient store
-/// failure at boot must neither take the IPC daemon down nor
-/// permanently disable route refresh — the open is retried, loudly,
-/// on every tick until it succeeds.
-fn spawn_route_refresh(
-    home: PathBuf,
-    state: Arc<DaemonState>,
-    forwarder: airc_lib::RoutedForwarder,
-) -> tokio::task::JoinHandle<()> {
+/// Card 7e3c9a1f: the route-refresh loop dials on the SHARED daemon
+/// handle (the same one that binds the listener and is registered with
+/// the forwarder). Accepted (inbound) and dialed (outbound) connections
+/// therefore live on ONE `LanTcpAdapter` connection map, so the
+/// forwarder and the delivery-ack path can reach a peer regardless of
+/// which side opened the link — the fix for reverse-direction room
+/// broadcast. The handle is kept for the daemon's lifetime: LAN
+/// connections live on its adapter, so re-opening per tick would sever
+/// them. Inbound sink + forwarder link are installed once in
+/// `run_daemon` before this spawns.
+fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let handle: tokio::sync::Mutex<Option<Airc>> = tokio::sync::Mutex::new(None);
-        let refresh_state = state.clone();
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&home, &handle, &refresh_state, &forwarder)
+            refresh_routes_once(&airc)
         })
         .await;
     })
 }
 
-/// One periodic route refresh: ensure the daemon's substrate handle
-/// is open, run discovery (which dials stored peer endpoints
-/// outbound, 3s-bounded each), and surface every failure through the
-/// daemon's diagnostic sink — loud, never silent. Failures never
-/// propagate: the loop's next tick is the retry path (self-heal
-/// doctrine, card 625abe6d).
-async fn refresh_routes_once(
-    home: &Path,
-    handle: &tokio::sync::Mutex<Option<Airc>>,
-    state: &Arc<DaemonState>,
-    forwarder: &airc_lib::RoutedForwarder,
-) {
-    let mut guard = handle.lock().await;
-    if guard.is_none() {
-        match Airc::open(home).await {
-            Ok(airc) => {
-                // Card 4132f48c: discovery dials open LAN connections
-                // whose inbound frames are ingested on THIS handle —
-                // same router bridge as the listener handle, so a frame
-                // arriving on either (or both — `publish_if_new` dedups
-                // by event_id) lands in the machine transcript scopes
-                // read.
-                airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
-                    state.router.clone(),
-                    state.coordinator_store.clone(),
-                )));
-                // Card 1998f6cb: the stored-endpoint dials this handle
-                // makes are routes the forwarder reuses for outbound
-                // traversal of router publishes.
-                forwarder.add_link(airc.clone()).await;
-                *guard = Some(airc)
-            }
-            Err(error) => {
-                StderrJsonDiagnosticSink.emit(
-                    DiagnosticEvent::error(
-                        DiagnosticComponent::Daemon,
-                        DiagnosticCode::RouteRefreshFailed,
-                        "route refresh could not open the substrate handle; retrying next interval",
-                    )
-                    .with_field("home", home.display())
-                    .with_field("error", error),
-                );
-                return;
-            }
-        }
-    }
-    let Some(airc) = guard.as_ref() else {
-        return;
-    };
+/// One periodic route refresh: run discovery on the shared daemon handle
+/// (which dials stored peer endpoints outbound, 3s-bounded each), and
+/// surface every failure through the diagnostic sink — loud, never
+/// silent. Failures never propagate: the loop's next tick is the retry
+/// path (self-heal doctrine, card 625abe6d).
+async fn refresh_routes_once(airc: &Airc) {
     match airc.refresh_route_discovery().await {
         Ok(snapshot) => {
             for failure in &snapshot.peer_dial_failures {

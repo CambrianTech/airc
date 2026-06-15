@@ -1004,15 +1004,34 @@ impl Airc {
     pub(crate) async fn sync_account_peer_registry(&self) -> Result<(), AircError> {
         let peers = load_peer_registries(&self.inner.home, &self.inner.wire_root).await?;
         for peer in peers {
-            self.inner
-                .registry
-                .enrol(
-                    peer.peer_id,
-                    0,
-                    peer.pubkey_bytes()
-                        .map_err(|e| AircError::Crypto(e.to_string()))?,
-                )
-                .map_err(|e| AircError::Crypto(e.to_string()))?;
+            // Card 7e3c9a1f: a single malformed peer record (bad base64,
+            // wrong pubkey length, invalid Ed25519 point — version skew or
+            // a poisoned store row) must NOT abort the whole sync and leave
+            // EVERY other peer un-enrolled. This runs on the daemon's
+            // route-refresh path (`refresh_route_discovery`) before dialing,
+            // so a `?`-propagated error would skip ALL dials for the tick.
+            // Match the per-peer tolerance the dialer already has: skip the
+            // bad record loudly, enrol the rest.
+            let pubkey = match peer.pubkey_bytes() {
+                Ok(pubkey) => pubkey,
+                Err(error) => {
+                    tracing::warn!(
+                        peer_id = %peer.peer_id,
+                        %error,
+                        "skipping peer with undecodable pubkey during verifier sync \
+                         (other peers still enrolled)"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self.inner.registry.enrol(peer.peer_id, 0, pubkey) {
+                tracing::warn!(
+                    peer_id = %peer.peer_id,
+                    %error,
+                    "skipping peer the verifier registry rejected during sync \
+                     (other peers still enrolled)"
+                );
+            }
         }
         Ok(())
     }
