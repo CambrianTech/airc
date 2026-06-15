@@ -36,13 +36,17 @@
 //! quarantined only for the peer it actually belongs to; a recycled
 //! address under a new `peer_id` starts with a clean slate.
 //!
-//! ## Skips are SURFACED, never silent
+//! ## Skips are SURFACED on their OWN channel, never silent
 //!
-//! When the dialer skips a quarantined endpoint it still records a
-//! [`crate::route::PeerDialFailure`] (with the remaining backoff) on the
-//! discovery snapshot, so `airc transport health` shows the operator that
-//! the endpoint is being intentionally backed off — not a clean,
-//! everything-fine list. Silent suppression would make the very tool used
+//! When the dialer skips a quarantined endpoint it records a
+//! [`crate::route::PeerDialSkip`] (with the remaining backoff) on the
+//! discovery snapshot's separate `peer_dial_skips` channel — NOT a
+//! [`crate::route::PeerDialFailure`]. `airc transport health` prints it as
+//! "dial backoff: …" distinct from "dial failed: …", so the operator sees
+//! the endpoint is intentionally backed off without it being miscounted or
+//! mislabelled as an attempted-and-failed dial (which would emit false
+//! `PeerDialFailed` warnings every refresh and inflate the failure count).
+//! Silent suppression — the opposite error — would make the very tool used
 //! to debug "two peers can't talk" lie during the window it matters most.
 //!
 //! ## Clock
