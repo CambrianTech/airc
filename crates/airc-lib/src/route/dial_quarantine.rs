@@ -107,7 +107,9 @@ impl QuarantineEntry {
     /// reads as not-yet-elapsed, never as a negative/extended window).
     fn remaining_ms(&self, now_ms: u64) -> Option<u64> {
         let elapsed = now_ms.saturating_sub(self.failed_at_ms);
-        self.backoff_ms.checked_sub(elapsed).filter(|left| *left > 0)
+        self.backoff_ms
+            .checked_sub(elapsed)
+            .filter(|left| *left > 0)
     }
 }
 
@@ -138,8 +140,9 @@ impl DialQuarantine {
         // an entry just before a re-failure could double its backoff,
         // resetting a persistently-dead corpse to the initial window every
         // cycle (it would never escalate to the cap).
-        self.entries
-            .retain(|_, entry| now_ms.saturating_sub(entry.failed_at_ms) <= QUARANTINE_RETENTION_MS);
+        self.entries.retain(|_, entry| {
+            now_ms.saturating_sub(entry.failed_at_ms) <= QUARANTINE_RETENTION_MS
+        });
         let backoff_ms = match self.entries.get(&key) {
             Some(prev) => prev.backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS),
             None => INITIAL_BACKOFF_MS,
@@ -166,7 +169,10 @@ mod tests {
     use super::*;
 
     fn key(port: u16) -> QuarantineKey {
-        (PeerId::from_u128(0xab), SocketAddr::from(([10, 0, 0, 2], port)))
+        (
+            PeerId::from_u128(0xab),
+            SocketAddr::from(([10, 0, 0, 2], port)),
+        )
     }
 
     // what this catches: a fresh, never-failed endpoint is NEVER
@@ -322,7 +328,8 @@ mod tests {
         let t = INITIAL_BACKOFF_MS + 1;
         q.record_failure(key(7717), t);
         assert!(
-            q.remaining_ms(&key(7717), t + INITIAL_BACKOFF_MS + 1).is_some(),
+            q.remaining_ms(&key(7717), t + INITIAL_BACKOFF_MS + 1)
+                .is_some(),
             "backoff doubled across the window boundary (not reset to INITIAL)"
         );
     }

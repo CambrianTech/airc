@@ -169,10 +169,7 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
 
     // First refresh: the dial is ATTEMPTED and fails → recorded as a
     // failure, nothing skipped.
-    let first = bob
-        .refresh_route_discovery()
-        .await
-        .expect("first refresh");
+    let first = bob.refresh_route_discovery().await.expect("first refresh");
     assert_eq!(
         first.peer_dial_failures.len(),
         1,
@@ -187,10 +184,7 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     // Second refresh, immediately (well within the backoff window): the
     // dead endpoint is now quarantined → SKIPPED, surfaced on the skips
     // channel, and NOT re-reported as a failed dial.
-    let second = bob
-        .refresh_route_discovery()
-        .await
-        .expect("second refresh");
+    let second = bob.refresh_route_discovery().await.expect("second refresh");
     assert!(
         second.peer_dial_failures.is_empty(),
         "a quarantined endpoint must NOT be reported as a failed dial: {:?}",
