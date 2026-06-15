@@ -1426,10 +1426,7 @@ pub async fn run_daemon(
 /// connections live on its adapter, so re-opening per tick would sever
 /// them. Inbound sink + forwarder link are installed once in
 /// `run_daemon` before this spawns.
-fn spawn_route_refresh(
-    state: Arc<DaemonState>,
-    airc: Airc,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
             refresh_routes_once(&airc)
