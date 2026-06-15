@@ -31,7 +31,7 @@ RUN cargo build --release -p airc-cli \
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates git curl gnupg \
+      ca-certificates git curl gnupg procps \
  # GitHub CLI (the rendezvous/registry transport — the ONLY gh path,
  # governed by airc's request counter).
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
