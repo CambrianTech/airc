@@ -26,12 +26,12 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual dispatch is BUILD + smoke-test + checksum ONLY — it never
+  # publishes. Publishing is gated to real `v*` tag pushes (a dispatch's
+  # ref is a branch, not a tag, so deriving a release tag from it would
+  # mislabel or fail the release). Dispatch is how you exercise the build
+  # matrix on the real runners without cutting a release.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build + smoke-test + checksum, but do NOT publish a Release"
-        type: boolean
-        default: true
 
 permissions:
   contents: write # create the Release + upload assets
@@ -105,7 +105,11 @@ jobs:
 
       - name: sign windows binary (Azure Trusted Signing)
         if: runner.os == 'Windows' && steps.winsign.outputs.available == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        # SHA-pinned (not @v0.5.1): this third-party action runs with the
+        # Azure signing client secret in scope, so a repointed mutable tag
+        # could exfiltrate the signing credential. Pin to the exact commit;
+        # bump deliberately. (v0.5.1 = 0d74250c.)
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -155,6 +159,9 @@ jobs:
           echo "$APPLE_SIGNING_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_SIGNING_CERT_PASSWORD" \
             -k "$keychain" -T /usr/bin/codesign
+          # Replaces the user search list with the temp keychain (codesign
+          # finds the imported identity here). Not restored — the runner is
+          # ephemeral and discarded after the job.
           security list-keychains -d user -s "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpass" "$keychain" >/dev/null
           codesign --force --timestamp --options runtime \
@@ -192,11 +199,15 @@ jobs:
           else
             tar -czf "$out" -C "$stage" "$bin"
           fi
-          # SHA-256 sidecar — the installer verifies this before running.
+          # SHA-256 sidecar in `sha256sum -c`-compatible form:
+          # "<hash>  <asset-basename>" (bare filename, not the temp path),
+          # so a verifier can run `sha256sum -c <asset>.sha256` from the
+          # download dir on any platform. The future installer / self-update
+          # (not yet built) will verify this before running the binary.
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+            ( cd "$RUNNER_TEMP" && sha256sum "$asset" > "$asset.sha256" )
           else
-            shasum -a 256 "$out" | awk '{print $1}' > "$out.sha256"
+            ( cd "$RUNNER_TEMP" && shasum -a 256 "$asset" > "$asset.sha256" )
           fi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
           echo "path=$out" >> "$GITHUB_OUTPUT"
@@ -214,10 +225,11 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
-    # Publish only on a real tag push, or a dispatch with dry_run explicitly
-    # off. A default (dry_run=true) dispatch builds + verifies and stops —
-    # so the pipeline can be exercised without cutting a release.
-    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
+    # Publish ONLY on a real `v*` tag push. A `workflow_dispatch` ref is a
+    # branch, not a tag, so deriving a release tag from `GITHUB_REF_NAME`
+    # there would mislabel the release or fail `--verify-tag` after a full
+    # signed build — dispatch is build/verify-only by design.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - name: download all artifacts
         uses: actions/download-artifact@v4
@@ -225,14 +237,39 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: verify ALL platform assets are present
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # fail-fast: false lets one matrix leg fail without aborting the
+          # others — good for seeing every failure, but it means publish
+          # must REFUSE to ship a release missing a platform (an installer
+          # then 404s for that platform's users). Assert all four + sidecars.
+          missing=0
+          for target in \
+            x86_64-unknown-linux-gnu:tar.gz \
+            aarch64-apple-darwin:tar.gz \
+            x86_64-apple-darwin:tar.gz \
+            x86_64-pc-windows-msvc:zip; do
+            triple="${target%:*}"; archive="${target#*:}"
+            asset="airc-${tag}-${triple}.${archive}"
+            for f in "$asset" "$asset.sha256"; do
+              if [ ! -f "dist/$f" ]; then
+                echo "::error::release is missing $f — refusing to publish an incomplete release"
+                missing=1
+              fi
+            done
+          done
+          test "$missing" -eq 0
+          echo "all platform assets present:"
+          ls -la dist
+
       - name: publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          echo "publishing release $tag with assets:"
-          ls -la dist
           gh release create "$tag" dist/* \
             --repo "${{ github.repository }}" \
             --title "$tag" \
