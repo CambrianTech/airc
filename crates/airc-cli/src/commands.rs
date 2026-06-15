@@ -1278,7 +1278,11 @@ pub async fn run_daemon(
         // (subnet/reachability gate at the dialer) will eliminate the
         // 3s for off-LAN peers; until then the truth is visible in the
         // recorded peer_dial_failures, not hidden in comments.
-        let lan_ip = crate::network_commands::detect_lan_ip();
+        // Card 7e3c9a1f: `advertise_lan_ip()` honors the `AIRC_ADVERTISE_IP`
+        // handoff (host launcher / container entrypoint) before host
+        // auto-detection — so a containerized node advertises a routable
+        // endpoint instead of nothing (detect_lan_ip bails in a container).
+        let lan_ip = crate::network_commands::advertise_lan_ip();
         let tailscale_ip = crate::network_commands::detect_tailscale_ip();
         if lan_ip.is_none() && tailscale_ip.is_none() {
             eprintln!(

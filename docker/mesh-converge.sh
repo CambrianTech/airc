@@ -68,14 +68,23 @@ SNAP_READY=1
 echo "== bring up $N isolated nodes on one account =="
 docker network create "$NET" >/dev/null
 for i in $(seq 1 "$N"); do
+  # Card 7e3c9a1f: NO `sleep infinity` override — the image's default CMD
+  # runs `airc daemon` (the node's long-lived process), which self-detects
+  # its container IP into AIRC_ADVERTISE_IP and advertises it. Without a
+  # running daemon advertising a routable endpoint, `registry sync` refuses
+  # to publish (endpoint-less #33 guard) and nodes never converge.
   docker run -d --name "airc-node-$i" --network "$NET" \
     -e GH_TOKEN="$TOKEN" -e HOME=/node \
     -e AIRC_GH_MAX_REQUESTS_PER_MIN=500 \
-    "$IMAGE" sleep infinity >/dev/null
-  echo "  node-$i up"
+    "$IMAGE" >/dev/null
+  echo "  node-$i up (daemon)"
 done
 
 run() { docker exec "airc-node-$1" sh -lc "$2" 2>&1; }
+
+# Give each daemon a moment to bind its listener + record the advertised
+# endpoint before we subscribe and publish.
+sleep 3
 
 echo "== each node: airc join, capture its OWN peer_id =="
 declare -a ID
