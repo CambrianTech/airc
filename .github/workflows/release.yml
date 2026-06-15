@@ -1,0 +1,240 @@
+name: release
+
+# Public release pipeline (ZERO-FRICTION-PATH unlock #1).
+#
+# Cross-builds the `airc` CLI for every supported platform on GitHub-HOSTED
+# runners — a PUBLIC project's releases must never depend on any one
+# operator's self-hosted machine — smoke-tests each binary, checksums it,
+# code-signs it WHEN a signing identity is configured, and publishes a
+# GitHub Release. The installer / self-update path downloads + verifies
+# these artifacts, so a first-time user on ANY platform never compiles and
+# never fights Smart App Control (a signed binary passes SAC).
+#
+# Signing is OPT-IN by secret presence:
+#   - Windows: Azure Trusted Signing (Microsoft-rooted → passes SAC) when
+#     the AZURE_* secrets are set. Without them the win-x64 artifact ships
+#     UNSIGNED — fine for SAC-off machines, and the installer surfaces the
+#     SAC fallback for SAC-on machines until the signing identity exists.
+#   - macOS: codesign + notarize when the APPLE_* secrets are set; without
+#     them the artifact is unsigned (Gatekeeper requires a one-time allow).
+#   - Linux: checksum-only (no platform signing gate).
+# Until those secrets exist the pipeline still produces verified, smoke-
+# tested, checksummed binaries for every platform — it just labels them
+# unsigned. The moment a secret lands, that platform's artifact is signed
+# with ZERO workflow changes.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + smoke-test + checksum, but do NOT publish a Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # create the Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: airc
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every target builds on its NATIVE runner, so the smoke-test below
+        # actually runs the artifact (no cross-exec). macos-latest is
+        # Apple-Silicon (arm64); macos-15-intel is the Intel (x64) runner
+        # (GitHub retired the old macos-13 Intel image).
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "", archive: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: "", archive: tar.gz }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, ext: "", archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe", archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: build airc-cli
+        run: cargo build --release --locked -p airc-cli --target ${{ matrix.target }}
+
+      # Trustworthy/reliable bar: a non-runnable artifact must NEVER reach a
+      # Release. Each binary runs natively on its own runner, so `version`
+      # is a real smoke-test of the published bytes.
+      - name: smoke-test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ matrix.ext }}"
+          test -f "$bin" || { echo "::error::built binary missing: $bin"; exit 1; }
+          "$bin" version || "$bin" --version
+
+      # --- Windows code-signing (Azure Trusted Signing) — gated on secrets.
+      - name: detect windows signing identity
+        id: winsign
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          if [ -n "${AZURE_TENANT_ID:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Azure Trusted Signing secrets configured — win-x64 artifact will be UNSIGNED (runs on SAC-off machines; installer surfaces the SAC fallback otherwise)"
+          fi
+
+      - name: sign windows binary (Azure Trusted Signing)
+        if: runner.os == 'Windows' && steps.winsign.outputs.available == 'true'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_CERT_PROFILE }}
+          files-folder: target/${{ matrix.target }}/release
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      # --- macOS code-signing + notarization — gated on secrets.
+      # Detect-step → output, NOT `if: env.X`/`if: secrets.X`: step-level
+      # `env` isn't available in that step's own `if`, and `secrets` in `if`
+      # is unreliable. Same pattern as the Windows detect above.
+      - name: detect macOS signing identity
+        id: macsign
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+        run: |
+          if [ -n "${APPLE_SIGNING_CERT_P12:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Apple signing secrets configured — mac artifact will be UNSIGNED (Gatekeeper needs a one-time allow)"
+          fi
+
+      - name: sign + notarize macOS binary
+        if: runner.os == 'macOS' && steps.macsign.outputs.available == 'true'
+        env:
+          APPLE_SIGNING_CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+          APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+          keychain="$RUNNER_TEMP/airc-signing.keychain-db"
+          kpass="$(openssl rand -hex 16)"
+          security create-keychain -p "$kpass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kpass" "$keychain"
+          echo "$APPLE_SIGNING_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_SIGNING_CERT_PASSWORD" \
+            -k "$keychain" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpass" "$keychain" >/dev/null
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+          # Notarize the binary (zipped, as notarytool requires an archive).
+          ditto -c -k "$bin" "$RUNNER_TEMP/notarize.zip"
+          printf '%s' "$APPLE_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary_key.p8"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary_key.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER" \
+            --wait
+          # CLI binaries can't be stapled (stapling targets app bundles/dmgs);
+          # notarization is recorded against the binary's hash, so a notarized
+          # binary passes Gatekeeper without a stapled ticket.
+
+      # Package: tar.gz on unix, zip on windows. Stage just the binary;
+      # license/readme can join later without changing the asset contract.
+      - name: package + checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-dev}"
+          bin="${{ env.BINARY_NAME }}${{ matrix.ext }}"
+          src="target/${{ matrix.target }}/release/$bin"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          cp "$src" "$stage/$bin"
+          asset="${{ env.BINARY_NAME }}-${version}-${{ matrix.target }}.${{ matrix.archive }}"
+          out="$RUNNER_TEMP/$asset"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            # PowerShell's Compress-Archive is always present on windows-latest.
+            powershell -Command "Compress-Archive -Path '$stage/$bin' -DestinationPath '$out' -Force"
+          else
+            tar -czf "$out" -C "$stage" "$bin"
+          fi
+          # SHA-256 sidecar — the installer verifies this before running.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+          else
+            shasum -a 256 "$out" | awk '{print $1}' > "$out.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: |
+            ${{ steps.package.outputs.path }}
+            ${{ steps.package.outputs.path }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Publish only on a real tag push, or a dispatch with dry_run explicitly
+    # off. A default (dry_run=true) dispatch builds + verifies and stops —
+    # so the pipeline can be exercised without cutting a release.
+    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          echo "publishing release $tag with assets:"
+          ls -la dist
+          gh release create "$tag" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "$tag" \
+            --generate-notes \
+            --verify-tag
