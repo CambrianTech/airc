@@ -160,7 +160,7 @@ pub use registry_refresh::{
 pub use room::Room;
 pub use route::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, PeerDialFailure,
-    RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
+    PeerDialSkip, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
     TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
     TransportKind, TransportResolver, TransportRole, TransportRoute,
 };

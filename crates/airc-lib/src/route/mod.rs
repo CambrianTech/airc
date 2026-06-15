@@ -15,7 +15,7 @@ pub mod resolver;
 pub(crate) mod execution;
 
 pub use dial_quarantine::{DialQuarantine, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS};
-pub use discovery::{PeerDialFailure, RouteDiscoverySnapshot};
+pub use discovery::{PeerDialFailure, PeerDialSkip, RouteDiscoverySnapshot};
 pub use health::{TransportHealthSample, TransportHealthState, TransportHealthTable};
 pub use invite::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, RouteEndpoint,

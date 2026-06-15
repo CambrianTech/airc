@@ -65,6 +65,10 @@ struct HealthReport {
     endpoints: usize,
     lan_peers: usize,
     dial_failures: usize,
+    /// Card 7e3c9a1f: endpoints SKIPPED this refresh because they are in
+    /// dial-failure backoff — counted separately from `dial_failures` (no
+    /// dial was attempted), so the failure count is not inflated by skips.
+    dial_backoff: usize,
 }
 
 pub async fn run_health(
@@ -90,6 +94,7 @@ pub async fn run_health(
             endpoints: snapshot.endpoints.len(),
             lan_peers: snapshot.connected_lan_peers.len(),
             dial_failures: snapshot.peer_dial_failures.len(),
+            dial_backoff: snapshot.peer_dial_skips.len(),
         };
         println!("{}", serde_json::to_string(&report)?);
         return if !fail || !verdict.is_failure() {
@@ -136,6 +141,18 @@ pub async fn run_health(
         println!(
             "dial failed: {} via {:?} — {}",
             failure.peer_id, failure.endpoint, failure.error
+        );
+    }
+    // Card 7e3c9a1f: endpoints in dial-failure backoff — shown as a
+    // DISTINCT state, never as "dial failed" (no dial was attempted this
+    // refresh). Surfaced so the operator sees the backoff is intentional,
+    // and re-dialed once the window elapses.
+    for skip in &snapshot.peer_dial_skips {
+        println!(
+            "dial backoff: {} via {:?} — skipped, ~{}s remaining after a prior failed dial",
+            skip.peer_id,
+            skip.endpoint,
+            skip.remaining_ms.div_ceil(1000)
         );
     }
 

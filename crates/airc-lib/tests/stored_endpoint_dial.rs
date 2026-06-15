@@ -129,6 +129,88 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
     );
 }
 
+/// Card 7e3c9a1f — a dead endpoint dialed once enters dial-failure
+/// backoff; the NEXT refresh within the window SKIPS it and surfaces it on
+/// the SEPARATE `peer_dial_skips` channel, NOT as a `peer_dial_failure`.
+///
+/// what this catches: the over-report regression an adversarial review
+/// found in the first quarantine cut — a skip must NOT be counted or
+/// labelled as an attempted-and-failed dial (which would emit false
+/// `PeerDialFailed` warnings every refresh and inflate `transport
+/// health`'s failure count), yet must still be VISIBLE (not the silent
+/// omission the review BLOCKED before that). Mutation checks: pushing the
+/// skip back onto `peer_dial_failures` fails the "failures empty" assert;
+/// dropping the skip entirely fails the "skips len == 1" assert.
+#[tokio::test]
+async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
+    let tmp_a = TempDir::new().expect("alice tempdir");
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let alice = Airc::open(tmp_a.path().join(".airc"))
+        .await
+        .expect("alice open");
+    let bob = Airc::open(tmp_b.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice spec");
+    bob.add_peer(alice_spec).await.expect("bob trusts alice");
+
+    // A loopback port that is definitely closed at dial time.
+    let closed_addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        listener.local_addr().expect("probe addr")
+    };
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: closed_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+        .await
+        .expect("store endpoints")
+        .expect("alice must be enrolled on bob");
+
+    // First refresh: the dial is ATTEMPTED and fails → recorded as a
+    // failure, nothing skipped.
+    let first = bob
+        .refresh_route_discovery()
+        .await
+        .expect("first refresh");
+    assert_eq!(
+        first.peer_dial_failures.len(),
+        1,
+        "first refresh attempts and fails the dial"
+    );
+    assert!(
+        first.peer_dial_skips.is_empty(),
+        "nothing is skipped on the first attempt: {:?}",
+        first.peer_dial_skips
+    );
+
+    // Second refresh, immediately (well within the backoff window): the
+    // dead endpoint is now quarantined → SKIPPED, surfaced on the skips
+    // channel, and NOT re-reported as a failed dial.
+    let second = bob
+        .refresh_route_discovery()
+        .await
+        .expect("second refresh");
+    assert!(
+        second.peer_dial_failures.is_empty(),
+        "a quarantined endpoint must NOT be reported as a failed dial: {:?}",
+        second.peer_dial_failures
+    );
+    assert_eq!(
+        second.peer_dial_skips.len(),
+        1,
+        "the backed-off endpoint is surfaced as a skip: {:?}",
+        second.peer_dial_skips
+    );
+    let skip = &second.peer_dial_skips[0];
+    assert_eq!(skip.peer_id, alice.peer_id());
+    assert_eq!(skip.endpoint, RouteEndpoint::LanTcp { addr: closed_addr });
+    assert!(
+        skip.remaining_ms > 0,
+        "the operator sees the remaining backoff"
+    );
+}
+
 /// The dual-advertise contract: `listen_lan_advertising` binds ONE
 /// wildcard listener and publishes BOTH the LAN and the Tailscale
 /// address under the same port, LAN sorted first. This is the daemon's

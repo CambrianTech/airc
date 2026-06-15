@@ -33,6 +33,22 @@ pub struct PeerDialFailure {
     pub error: String,
 }
 
+/// Card 7e3c9a1f — a stored peer endpoint that was NOT dialed this
+/// refresh because it is still inside its dial-failure backoff window.
+/// Distinct from [`PeerDialFailure`]: NO dial was attempted, so this must
+/// NOT be reported as "a dial failed" (which would emit false
+/// `PeerDialFailed` warnings every refresh and inflate the failure count).
+/// Surfaced as its own channel so `airc transport health` can show "in
+/// backoff" honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDialSkip {
+    pub peer_id: PeerId,
+    pub endpoint: RouteEndpoint,
+    /// Milliseconds of backoff remaining before this endpoint is dialed
+    /// again.
+    pub remaining_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDiscoverySnapshot {
     pub health: Vec<TransportHealthSample>,
@@ -40,8 +56,15 @@ pub struct RouteDiscoverySnapshot {
     pub connected_lan_peers: Vec<PeerId>,
     /// Card 625abe6d slice 1: outbound dial attempts to stored peer
     /// endpoints that failed this refresh. Empty when every stored
-    /// endpoint either connected or was already connected.
+    /// endpoint either connected or was already connected. A dial WAS
+    /// attempted for each entry (≠ [`Self::peer_dial_skips`]).
     pub peer_dial_failures: Vec<PeerDialFailure>,
+    /// Card 7e3c9a1f: endpoints SKIPPED this refresh because they are in
+    /// dial-failure backoff — no dial was attempted. Surfaced (not
+    /// silent) so the operator sees the backoff, but kept separate from
+    /// `peer_dial_failures` so it is never miscounted/mislabelled as a
+    /// failed dial.
+    pub peer_dial_skips: Vec<PeerDialSkip>,
 }
 
 impl Airc {
@@ -63,7 +86,7 @@ impl Airc {
     /// an inbound port. Dial failures are recorded on the snapshot,
     /// never swallowed.
     pub async fn refresh_route_discovery(&self) -> Result<RouteDiscoverySnapshot, AircError> {
-        let peer_dial_failures = self.dial_stored_peer_endpoints().await?;
+        let (peer_dial_failures, peer_dial_skips) = self.dial_stored_peer_endpoints().await?;
 
         let endpoints = self.route_endpoints()?;
         let lan_has_endpoint = endpoints
@@ -81,6 +104,7 @@ impl Airc {
             endpoints,
             connected_lan_peers,
             peer_dial_failures,
+            peer_dial_skips,
         })
     }
 
@@ -93,7 +117,9 @@ impl Airc {
     /// skew the operator must see), per the no-silent-fallback rule.
     /// CONNECTION failures are not errors — offline peers are a normal
     /// mesh state — but every failed attempt is returned for display.
-    async fn dial_stored_peer_endpoints(&self) -> Result<Vec<PeerDialFailure>, AircError> {
+    async fn dial_stored_peer_endpoints(
+        &self,
+    ) -> Result<(Vec<PeerDialFailure>, Vec<PeerDialSkip>), AircError> {
         // Both registries: the machine-account wire root (where
         // account-registry import writes) FIRST, then the scope's own
         // store (where the CLI's `peer add --endpoint` writes).
@@ -122,6 +148,10 @@ impl Airc {
         let connected: std::collections::HashSet<PeerId> =
             self.connected_lan_peers().await.into_iter().collect();
         let mut failures = Vec::new();
+        // Card 7e3c9a1f: endpoints skipped because they are in dial-failure
+        // backoff — surfaced on the snapshot SEPARATELY from `failures` so a
+        // skip is never mislabelled/counted as an attempted-and-failed dial.
+        let mut skips = Vec::new();
         // Card 7e3c9a1f: one wall-clock read for the whole refresh drives
         // the dial-failure backoff (skip endpoints still inside their
         // quarantine window, stamp new failures, clear on success).
@@ -201,22 +231,19 @@ impl Airc {
                 // is never quarantined unless it itself just failed, so
                 // this never blocks a genuinely reachable peer.
                 //
-                // The skip is SURFACED, not silent: a backed-off endpoint
-                // is still recorded as a `PeerDialFailure` so `airc
-                // transport health` shows the operator the endpoint is in
-                // backoff rather than a clean list — the no-silent-fallback
-                // doctrine (`stored_endpoint_dial.rs` pins that the
-                // operator must SEE why a dial slot was spent).
+                // The skip is SURFACED, not silent — but on the SEPARATE
+                // `peer_dial_skips` channel, NOT as a `PeerDialFailure`. No
+                // dial was attempted, so reporting it as a failure would
+                // emit false `PeerDialFailed` warnings every refresh and
+                // inflate `airc transport health`'s failure count. The
+                // operator still sees "in backoff" via the skips channel —
+                // honest, not a clean-list lie and not an over-report.
                 if let Some(remaining_ms) = self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
                 {
-                    failures.push(PeerDialFailure {
+                    skips.push(PeerDialSkip {
                         peer_id,
                         endpoint: endpoint.clone(),
-                        error: format!(
-                            "skipped: in dial backoff, ~{}s remaining after a prior failed \
-                             dial (re-dialed once the window elapses)",
-                            remaining_ms.div_ceil(1000)
-                        ),
+                        remaining_ms,
                     });
                     continue;
                 }
@@ -257,7 +284,7 @@ impl Airc {
                 }
             }
         }
-        Ok(failures)
+        Ok((failures, skips))
     }
 
     /// Snapshot the last known discovery state without mutating
@@ -268,6 +295,7 @@ impl Airc {
             endpoints: self.route_endpoints()?,
             connected_lan_peers: self.connected_lan_peers().await,
             peer_dial_failures: Vec::new(),
+            peer_dial_skips: Vec::new(),
         })
     }
 
