@@ -200,7 +200,24 @@ impl Airc {
                 // freshest (most likely live) endpoint is listed first and
                 // is never quarantined unless it itself just failed, so
                 // this never blocks a genuinely reachable peer.
-                if self.dial_quarantine_is_quarantined(&addr, now_ms) {
+                //
+                // The skip is SURFACED, not silent: a backed-off endpoint
+                // is still recorded as a `PeerDialFailure` so `airc
+                // transport health` shows the operator the endpoint is in
+                // backoff rather than a clean list — the no-silent-fallback
+                // doctrine (`stored_endpoint_dial.rs` pins that the
+                // operator must SEE why a dial slot was spent).
+                if let Some(remaining_ms) = self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
+                {
+                    failures.push(PeerDialFailure {
+                        peer_id,
+                        endpoint: endpoint.clone(),
+                        error: format!(
+                            "skipped: in dial backoff, ~{}s remaining after a prior failed \
+                             dial (re-dialed once the window elapses)",
+                            remaining_ms.div_ceil(1000)
+                        ),
+                    });
                     continue;
                 }
                 // #1120 sentinel blocking-2: connect_lan has no inner
@@ -214,11 +231,11 @@ impl Airc {
                         // Card 7e3c9a1f: a live connect lifts any prior
                         // quarantine so a flapped-but-recovered endpoint is
                         // immediately eligible again next refresh.
-                        self.dial_quarantine_record_success(&addr);
+                        self.dial_quarantine_record_success(peer_id, addr);
                         break;
                     }
                     Ok(Err(error)) => {
-                        self.dial_quarantine_record_failure(addr, now_ms);
+                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
                         failures.push(PeerDialFailure {
                             peer_id,
                             endpoint: endpoint.clone(),
@@ -226,7 +243,7 @@ impl Airc {
                         });
                     }
                     Err(_elapsed) => {
-                        self.dial_quarantine_record_failure(addr, now_ms);
+                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
                         failures.push(PeerDialFailure {
                             peer_id,
                             endpoint: endpoint.clone(),
@@ -254,36 +271,49 @@ impl Airc {
         })
     }
 
-    /// Card 7e3c9a1f: is `addr` still inside its dial-failure backoff
-    /// window? Brief lock, never held across an await.
-    fn dial_quarantine_is_quarantined(&self, addr: &std::net::SocketAddr, now_ms: u64) -> bool {
+    /// Card 7e3c9a1f: backoff remaining for `(peer_id, addr)`, or `None`
+    /// when not quarantined. Keyed per-peer so a recycled container IP
+    /// under a new peer is not shadow-banned by a dead peer's failure.
+    /// Brief lock, never held across an await.
+    fn dial_quarantine_remaining_ms(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+    ) -> Option<u64> {
         let guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.is_quarantined(addr, now_ms)
+        guard.remaining_ms(&(peer_id, addr), now_ms)
     }
 
-    /// Card 7e3c9a1f: stamp a failed dial to `addr` (starts/doubles the
-    /// backoff).
-    fn dial_quarantine_record_failure(&self, addr: std::net::SocketAddr, now_ms: u64) {
+    /// Card 7e3c9a1f: stamp a failed dial to `(peer_id, addr)` (starts /
+    /// doubles the backoff).
+    fn dial_quarantine_record_failure(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+    ) {
         let mut guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.record_failure(addr, now_ms);
+        guard.record_failure((peer_id, addr), now_ms);
     }
 
-    /// Card 7e3c9a1f: clear any quarantine on `addr` after a live connect.
-    fn dial_quarantine_record_success(&self, addr: &std::net::SocketAddr) {
+    /// Card 7e3c9a1f: clear any quarantine on `(peer_id, addr)` after a
+    /// live connect.
+    fn dial_quarantine_record_success(&self, peer_id: PeerId, addr: std::net::SocketAddr) {
         let mut guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.record_success(addr);
+        guard.record_success(&(peer_id, addr));
     }
 
     async fn connected_lan_peers(&self) -> Vec<PeerId> {
