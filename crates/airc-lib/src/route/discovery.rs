@@ -63,6 +63,21 @@ impl Airc {
     /// an inbound port. Dial failures are recorded on the snapshot,
     /// never swallowed.
     pub async fn refresh_route_discovery(&self) -> Result<RouteDiscoverySnapshot, AircError> {
+        // Card 7e3c9a1f: refresh this handle's in-memory verifier registry
+        // from the trust store BEFORE dialing. The daemon's route-refresh
+        // handle is opened ONCE at startup; peers that converge later (via
+        // the account-registry gist import) land in the trust STORE but
+        // not in this long-lived handle's `PeerKeyRegistry`. Dialing such a
+        // peer then fails the TLS handshake — "server cert pubkey is not
+        // enrolled" — so no connection forms and the RoutedForwarder has no
+        // link to deliver room broadcasts over. (`lan-send` sidesteps this
+        // by opening a fresh handle per call, which is why direct sends
+        // worked while room broadcast did not.) This is the same refresh
+        // the non-daemon send path already does in `send_frame_to_room`;
+        // the registry is a shared `Arc`, so the live LAN adapter's
+        // verifier sees the newly-enrolled pubkeys.
+        self.sync_account_peer_registry().await?;
+
         let peer_dial_failures = self.dial_stored_peer_endpoints().await?;
 
         let endpoints = self.route_endpoints()?;
