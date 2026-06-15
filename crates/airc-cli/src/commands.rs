@@ -386,7 +386,18 @@ pub async fn ensure_daemon_running(
     let daemon_pid = child.id();
 
     let client = DaemonClient::new(socket.clone());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Card 7e3c9a1f / #1210: a freshly-spawned daemon must BIND its IPC
+    // socket within this window or the CLI gives up, returns an error, and
+    // abandons the half-started daemon — which on a fresh/cold machine
+    // (first-ever run: SQLite migrations + identity gen + the substrate
+    // handle's own `Airc::open` migrations on the daemon's boot path) takes
+    // well over the old 5s. M5's repro: the daemon NEVER reached its bind
+    // before the 5s reap, so a persistent daemon never formed and every
+    // command re-spawned + re-hung. 20s comfortably covers a cold boot
+    // while still surfacing a genuinely dead daemon. (The deeper fix —
+    // binding the IPC listener BEFORE the heavy handle setup so readiness
+    // is near-instant regardless — is tracked as the #1210 follow-up.)
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if client
             .ping_with_timeout(Duration::from_millis(250))
