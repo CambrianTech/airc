@@ -231,6 +231,51 @@ _ensure_windows_msvc_toolchain() {
   fi
 }
 
+# macOS: cargo needs a working C toolchain to link (ring, candle, etc.). Two
+# failure modes seen on fresh/changed Macs:
+#   1. No Command Line Tools at all -> `xcode-select --install`.
+#   2. A full Xcode.app is the ACTIVE toolchain but its license isn't
+#      accepted -> cc fails with "You have not agreed to the Xcode license"
+#      and EVERY cargo + git op dies. Fix: switch to the (license-free) CLT,
+#      or accept the license.
+# We TELL the user before each privileged step (the sudo password prompt is
+# the "press enter to proceed"); never silently mutate their toolchain.
+_ensure_macos_build_toolchain() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+
+  # The real test: can cc actually compile + link? (Presence of xcode-select
+  # is not enough — the Xcode-license case has cc present but refusing.)
+  local probe rc
+  probe=$(printf 'int main(void){return 0;}' | cc -x c - -o /tmp/.airc-cc-probe 2>&1); rc=$?
+  rm -f /tmp/.airc-cc-probe 2>/dev/null
+  if [ "$rc" -eq 0 ]; then ok "macOS C toolchain OK (cc links)"; return 0; fi
+
+  local clt="/Library/Developer/CommandLineTools"
+  if printf '%s' "$probe" | grep -qi "agreed to the Xcode license"; then
+    warn "macOS C toolchain blocked: the active Xcode license isn't accepted — cargo + git can't run."
+    if [ -d "$clt" ]; then
+      info "Switching the active toolchain to the license-free Command Line Tools (asks for your password):"
+      info "  sudo xcode-select --switch $clt"
+      if sudo xcode-select --switch "$clt"; then ok "Toolchain switched to Command Line Tools — unblocked."
+      else fail "Run: sudo xcode-select --switch $clt   (or: sudo xcodebuild -license accept), then re-run install.sh."; fi
+    else
+      info "Accepting the Xcode license (asks for your password):"
+      info "  sudo xcodebuild -license accept"
+      if sudo xcodebuild -license accept; then ok "Xcode license accepted — unblocked."
+      else fail "Run: sudo xcodebuild -license accept, then re-run install.sh."; fi
+    fi
+  elif ! xcode-select -p >/dev/null 2>&1; then
+    info "Installing the Command Line Tools (cargo needs a C compiler) — accept the macOS dialog, then re-run:"
+    info "  xcode-select --install"
+    xcode-select --install 2>/dev/null || true
+    fail "Command Line Tools installing — finish the macOS dialog, then re-run install.sh."
+  else
+    fail "macOS C toolchain can't compile. cc said:
+$probe
+Try: xcode-select --install   OR   sudo xcode-select --switch $clt"
+  fi
+}
+
 ensure_prereqs() {
   [ "${AIRC_SKIP_PREREQS:-0}" = "1" ] && { info "AIRC_SKIP_PREREQS=1 -- skipping prereq install"; return 0; }
 
@@ -349,6 +394,7 @@ ensure_prereqs() {
   fi
 
   _ensure_windows_msvc_toolchain "$mgr"
+  _ensure_macos_build_toolchain
 
   # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
   # Identity gen + signing live in Rust, so system OpenSSL and Python
