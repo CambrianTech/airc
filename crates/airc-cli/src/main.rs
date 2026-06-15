@@ -857,6 +857,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // defaults to true; flipped to false by user only
                 // when they want event-by-event replay (audit case).
                 let live_only = from_now && !include_backlog;
+                // `my_name` is optional and unused by attach (the daemon
+                // owns identity); accepted for backward compat.
+                let my_name = my_name.unwrap_or_default();
                 monitor::run_attach(&home, &my_name, live_only, coalesce_backlog).await
             }
         },

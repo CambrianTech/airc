@@ -22,9 +22,12 @@ pub enum MonitorAction {
 
     /// Attach to the Rust event stream without owning transport.
     Attach {
-        /// Current local display name.
+        /// Current local display name. Optional and currently unused by
+        /// `attach` (the daemon already owns identity); accepted for
+        /// backward compatibility with callers that still pass it. A
+        /// fresh agent can simply run `airc monitor attach`.
         #[arg(long)]
-        my_name: String,
+        my_name: Option<String>,
         /// **Card 7d5b6a65.** Subscribe from the LIVE EDGE — only
         /// events published strictly after the attach call return.
         ///
@@ -51,4 +54,40 @@ pub enum MonitorAction {
         #[arg(long, default_value_t = true)]
         coalesce_backlog: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        action: MonitorAction,
+    }
+
+    // regression: `airc monitor attach` previously REQUIRED --my-name and
+    // then ignored it (unused in attach::run), failing fresh users with a
+    // clap exit-2. It must now parse with no flags. (audit F7)
+    #[test]
+    fn attach_parses_without_my_name() {
+        let cli = TestCli::try_parse_from(["airc", "attach"])
+            .expect("`airc monitor attach` must parse with no flags");
+        match cli.action {
+            MonitorAction::Attach { my_name, .. } => assert!(my_name.is_none()),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    // backward compat: callers that still pass --my-name keep working.
+    #[test]
+    fn attach_still_accepts_my_name() {
+        let cli = TestCli::try_parse_from(["airc", "attach", "--my-name", "M5"])
+            .expect("`airc monitor attach --my-name X` must still parse");
+        match cli.action {
+            MonitorAction::Attach { my_name, .. } => assert_eq!(my_name.as_deref(), Some("M5")),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
 }
