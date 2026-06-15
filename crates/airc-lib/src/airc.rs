@@ -166,6 +166,12 @@ pub(crate) struct AircInner {
     pub(crate) route_health: Arc<TransportHealthTable>,
     pub(crate) route_endpoints: Arc<RouteEndpointTable>,
     pub(crate) imported_invites: Arc<ImportedInviteTable>,
+    /// Card 7e3c9a1f: in-session backoff memory for endpoints whose dial
+    /// failed, so route discovery stops re-dialing dead corpses (each up
+    /// to `PEER_DIAL_TIMEOUT`) on every refresh. Shared across daemon
+    /// clones (like `live_tx`) so whichever handle dials, the quarantine
+    /// is unified. See [`crate::route::dial_quarantine`].
+    pub(crate) dial_quarantine: Arc<std::sync::Mutex<crate::route::DialQuarantine>>,
     pub(crate) lamport_clock: AtomicU64,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
@@ -428,6 +434,9 @@ impl Airc {
                 route_health: Arc::new(TransportHealthTable::local_default()),
                 route_endpoints: Arc::new(RouteEndpointTable::default()),
                 imported_invites: Arc::new(ImportedInviteTable::default()),
+                dial_quarantine: Arc::new(std::sync::Mutex::new(
+                    crate::route::DialQuarantine::default(),
+                )),
                 lamport_clock: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
@@ -911,6 +920,9 @@ impl Airc {
             route_health: Arc::new(TransportHealthTable::local_default()),
             route_endpoints: Arc::new(RouteEndpointTable::default()),
             imported_invites: Arc::new(ImportedInviteTable::default()),
+            // Share the quarantine across the daemon clone so dial-failure
+            // backoff is unified regardless of which handle runs discovery.
+            dial_quarantine: self.inner.dial_quarantine.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             lan_tcp: Mutex::new(None),
             lan_subscriber: Mutex::new(None),

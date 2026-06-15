@@ -33,6 +33,22 @@ pub struct PeerDialFailure {
     pub error: String,
 }
 
+/// Card 7e3c9a1f — a stored peer endpoint that was NOT dialed this
+/// refresh because it is still inside its dial-failure backoff window.
+/// Distinct from [`PeerDialFailure`]: NO dial was attempted, so this must
+/// NOT be reported as "a dial failed" (which would emit false
+/// `PeerDialFailed` warnings every refresh and inflate the failure count).
+/// Surfaced as its own channel so `airc transport health` can show "in
+/// backoff" honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDialSkip {
+    pub peer_id: PeerId,
+    pub endpoint: RouteEndpoint,
+    /// Milliseconds of backoff remaining before this endpoint is dialed
+    /// again.
+    pub remaining_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDiscoverySnapshot {
     pub health: Vec<TransportHealthSample>,
@@ -40,8 +56,15 @@ pub struct RouteDiscoverySnapshot {
     pub connected_lan_peers: Vec<PeerId>,
     /// Card 625abe6d slice 1: outbound dial attempts to stored peer
     /// endpoints that failed this refresh. Empty when every stored
-    /// endpoint either connected or was already connected.
+    /// endpoint either connected or was already connected. A dial WAS
+    /// attempted for each entry (≠ [`Self::peer_dial_skips`]).
     pub peer_dial_failures: Vec<PeerDialFailure>,
+    /// Card 7e3c9a1f: endpoints SKIPPED this refresh because they are in
+    /// dial-failure backoff — no dial was attempted. Surfaced (not
+    /// silent) so the operator sees the backoff, but kept separate from
+    /// `peer_dial_failures` so it is never miscounted/mislabelled as a
+    /// failed dial.
+    pub peer_dial_skips: Vec<PeerDialSkip>,
 }
 
 impl Airc {
@@ -78,7 +101,7 @@ impl Airc {
         // verifier sees the newly-enrolled pubkeys.
         self.sync_account_peer_registry().await?;
 
-        let peer_dial_failures = self.dial_stored_peer_endpoints().await?;
+        let (peer_dial_failures, peer_dial_skips) = self.dial_stored_peer_endpoints().await?;
 
         let endpoints = self.route_endpoints()?;
         let lan_has_endpoint = endpoints
@@ -96,6 +119,7 @@ impl Airc {
             endpoints,
             connected_lan_peers,
             peer_dial_failures,
+            peer_dial_skips,
         })
     }
 
@@ -108,7 +132,9 @@ impl Airc {
     /// skew the operator must see), per the no-silent-fallback rule.
     /// CONNECTION failures are not errors — offline peers are a normal
     /// mesh state — but every failed attempt is returned for display.
-    async fn dial_stored_peer_endpoints(&self) -> Result<Vec<PeerDialFailure>, AircError> {
+    async fn dial_stored_peer_endpoints(
+        &self,
+    ) -> Result<(Vec<PeerDialFailure>, Vec<PeerDialSkip>), AircError> {
         // Both registries: the machine-account wire root (where
         // account-registry import writes) FIRST, then the scope's own
         // store (where the CLI's `peer add --endpoint` writes).
@@ -137,6 +163,14 @@ impl Airc {
         let connected: std::collections::HashSet<PeerId> =
             self.connected_lan_peers().await.into_iter().collect();
         let mut failures = Vec::new();
+        // Card 7e3c9a1f: endpoints skipped because they are in dial-failure
+        // backoff — surfaced on the snapshot SEPARATELY from `failures` so a
+        // skip is never mislabelled/counted as an attempted-and-failed dial.
+        let mut skips = Vec::new();
+        // Card 7e3c9a1f: one wall-clock read for the whole refresh drives
+        // the dial-failure backoff (skip endpoints still inside their
+        // quarantine window, stamp new failures, clear on success).
+        let now_ms = crate::time::now_ms()?;
 
         // Merge endpoints per peer, preserving first-seen (wire-root)
         // order and dropping duplicates. A record whose endpoint JSON
@@ -202,6 +236,32 @@ impl Airc {
                     | RouteEndpoint::Reticulum { .. }
                     | RouteEndpoint::WebRtcSignaling { .. } => continue,
                 };
+                // Card 7e3c9a1f: skip endpoints still inside their
+                // dial-failure backoff window. A daemon that restarted on
+                // a new port leaves its old `addr` in every peer's trust
+                // store until the registry re-converges; without this
+                // skip each refresh re-pays PEER_DIAL_TIMEOUT on that
+                // corpse, starving the dial to the live endpoint. The
+                // freshest (most likely live) endpoint is listed first and
+                // is never quarantined unless it itself just failed, so
+                // this never blocks a genuinely reachable peer.
+                //
+                // The skip is SURFACED, not silent — but on the SEPARATE
+                // `peer_dial_skips` channel, NOT as a `PeerDialFailure`. No
+                // dial was attempted, so reporting it as a failure would
+                // emit false `PeerDialFailed` warnings every refresh and
+                // inflate `airc transport health`'s failure count. The
+                // operator still sees "in backoff" via the skips channel —
+                // honest, not a clean-list lie and not an over-report.
+                if let Some(remaining_ms) = self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
+                {
+                    skips.push(PeerDialSkip {
+                        peer_id,
+                        endpoint: endpoint.clone(),
+                        remaining_ms,
+                    });
+                    continue;
+                }
                 // #1120 sentinel blocking-2: connect_lan has no inner
                 // timeout, and a SYN-dropping firewall (the default
                 // posture of the NATs this card exists to cross) hangs
@@ -209,25 +269,37 @@ impl Airc {
                 // dial; a timeout is a recorded failure like any other.
                 match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id)).await
                 {
-                    Ok(Ok(())) => break,
-                    Ok(Err(error)) => failures.push(PeerDialFailure {
-                        peer_id,
-                        endpoint: endpoint.clone(),
-                        error: error.to_string(),
-                    }),
-                    Err(_elapsed) => failures.push(PeerDialFailure {
-                        peer_id,
-                        endpoint: endpoint.clone(),
-                        error: format!(
-                            "dial timed out after {}s (endpoint unreachable or \
-                             firewall drops SYN)",
-                            PEER_DIAL_TIMEOUT.as_secs()
-                        ),
-                    }),
+                    Ok(Ok(())) => {
+                        // Card 7e3c9a1f: a live connect lifts any prior
+                        // quarantine so a flapped-but-recovered endpoint is
+                        // immediately eligible again next refresh.
+                        self.dial_quarantine_record_success(peer_id, addr);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                        failures.push(PeerDialFailure {
+                            peer_id,
+                            endpoint: endpoint.clone(),
+                            error: error.to_string(),
+                        });
+                    }
+                    Err(_elapsed) => {
+                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                        failures.push(PeerDialFailure {
+                            peer_id,
+                            endpoint: endpoint.clone(),
+                            error: format!(
+                                "dial timed out after {}s (endpoint unreachable or \
+                                 firewall drops SYN)",
+                                PEER_DIAL_TIMEOUT.as_secs()
+                            ),
+                        });
+                    }
                 }
             }
         }
-        Ok(failures)
+        Ok((failures, skips))
     }
 
     /// Snapshot the last known discovery state without mutating
@@ -238,7 +310,53 @@ impl Airc {
             endpoints: self.route_endpoints()?,
             connected_lan_peers: self.connected_lan_peers().await,
             peer_dial_failures: Vec::new(),
+            peer_dial_skips: Vec::new(),
         })
+    }
+
+    /// Card 7e3c9a1f: backoff remaining for `(peer_id, addr)`, or `None`
+    /// when not quarantined. Keyed per-peer so a recycled container IP
+    /// under a new peer is not shadow-banned by a dead peer's failure.
+    /// Brief lock, never held across an await.
+    fn dial_quarantine_remaining_ms(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+    ) -> Option<u64> {
+        let guard = self
+            .inner
+            .dial_quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remaining_ms(&(peer_id, addr), now_ms)
+    }
+
+    /// Card 7e3c9a1f: stamp a failed dial to `(peer_id, addr)` (starts /
+    /// doubles the backoff).
+    fn dial_quarantine_record_failure(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+    ) {
+        let mut guard = self
+            .inner
+            .dial_quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.record_failure((peer_id, addr), now_ms);
+    }
+
+    /// Card 7e3c9a1f: clear any quarantine on `(peer_id, addr)` after a
+    /// live connect.
+    fn dial_quarantine_record_success(&self, peer_id: PeerId, addr: std::net::SocketAddr) {
+        let mut guard = self
+            .inner
+            .dial_quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.record_success(&(peer_id, addr));
     }
 
     async fn connected_lan_peers(&self) -> Vec<PeerId> {
