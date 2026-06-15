@@ -41,6 +41,49 @@ fn is_routable_lan_ipv4(ip: Ipv4Addr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified()
 }
 
+/// The IPv4 the daemon should ADVERTISE as its dialable LAN endpoint.
+///
+/// Card 7e3c9a1f — the container-reachability seam. `detect_lan_ip()`
+/// deliberately bails inside a container (its only "LAN" is the Docker
+/// bridge, unreachable from any other machine — the `172.18.x` ghost
+/// flood). But a containerized node still needs to advertise SOMETHING
+/// routable: on the same Docker network its bridge IP IS reachable by
+/// sibling containers, and for the real grid the HOST (where detection
+/// works) hands in the host's LAN/Tailscale endpoint. `AIRC_ADVERTISE_IP`
+/// is that explicit handoff — the launcher or the node entrypoint sets
+/// it; the daemon advertises it verbatim. Absent the override we fall
+/// back to host auto-detection, so non-container hosts are unchanged.
+///
+/// This is the "advertise the host endpoints you were given" half of the
+/// container fix — the route/dial layer is untouched; only the source of
+/// the advertised address changes.
+pub(crate) fn advertise_lan_ip() -> Option<Ipv4Addr> {
+    if let Some(ip) = env_advertise_ip() {
+        return Some(ip);
+    }
+    detect_lan_ip()
+}
+
+/// Parse `AIRC_ADVERTISE_IP` into an IPv4, or `None` when unset/blank.
+/// A SET-but-unparseable value is loud (no silent fallback): we warn and
+/// return `None` so the caller falls through to auto-detection rather
+/// than silently advertising garbage.
+fn env_advertise_ip() -> Option<Ipv4Addr> {
+    match std::env::var("AIRC_ADVERTISE_IP") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<Ipv4Addr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                eprintln!(
+                    "airc daemon: AIRC_ADVERTISE_IP='{raw}' is not a valid IPv4 address — \
+                     ignoring it and falling back to host auto-detection"
+                );
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
 /// True when this process is running inside an OCI container (Docker,
 /// Podman, containerd). Two cheap probes:
 ///   - `/.dockerenv` exists (Docker writes it on container start)
@@ -115,6 +158,31 @@ mod tests {
     /// dev macOS/Linux that has neither /.dockerenv nor a docker
     /// cgroup. (This test running green is itself the negative-case
     /// proof.)
+    // what this catches: the container-reachability seam — an explicit
+    // AIRC_ADVERTISE_IP handoff is advertised verbatim, BEFORE (and
+    // instead of) host auto-detection. Without this a containerized node
+    // (detect_lan_ip → None) advertises no endpoint and never converges.
+    #[test]
+    fn advertise_ip_env_override_is_honored() {
+        temp_env::with_var("AIRC_ADVERTISE_IP", Some("10.0.0.5"), || {
+            assert_eq!(advertise_lan_ip(), Some(Ipv4Addr::new(10, 0, 0, 5)));
+        });
+    }
+
+    // what this catches: a SET-but-garbage override is NOT advertised as a
+    // bogus endpoint (no silent fallthrough to a malformed addr); it is
+    // ignored so the caller auto-detects. Pins env_advertise_ip directly
+    // to stay hermetic (advertise_lan_ip's fallback hits the network).
+    #[test]
+    fn advertise_ip_invalid_or_blank_is_ignored() {
+        temp_env::with_var("AIRC_ADVERTISE_IP", Some("not-an-ip"), || {
+            assert_eq!(env_advertise_ip(), None);
+        });
+        temp_env::with_var("AIRC_ADVERTISE_IP", Some("   "), || {
+            assert_eq!(env_advertise_ip(), None);
+        });
+    }
+
     #[test]
     fn in_container_returns_false_on_real_host() {
         // The CI runners + dev hosts this test runs on are not OCI

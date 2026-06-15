@@ -77,9 +77,22 @@ struct ProcessRow {
 
 #[cfg(unix)]
 fn read_process(pid: u32) -> Result<Option<ProcessRow>, Box<dyn Error>> {
-    let output = Command::new("ps")
+    let output = match Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
-        .output()?;
+        .output()
+    {
+        Ok(output) => output,
+        // `ps` is not installed (slim containers ship without procps).
+        // Client-id detection is BEST-EFFORT — it tags a frame with the
+        // calling agent when discoverable, nothing more. A missing probe
+        // must degrade to "can't detect" (Ok(None)), NEVER propagate os
+        // error 2 up through runtime_headers() and break EVERY send/msg
+        // (the bug that left containerized nodes able to converge but
+        // unable to deliver a single frame). Genuinely unexpected `ps`
+        // failures still surface.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     if !output.status.success() {
         return Ok(None);
     }
@@ -151,6 +164,33 @@ mod tests {
                 );
             });
         });
+    }
+
+    // what this catches: client-id detection is best-effort — when `ps`
+    // is absent (slim containers ship without procps) current_client_id()
+    // must return Ok(None), NOT propagate os error 2. That ENOENT
+    // propagated through runtime_headers() and broke EVERY send/msg —
+    // containerized nodes converged but could not deliver a single frame.
+    // Empty PATH makes `ps` unresolvable on any runner, so this is
+    // deterministic regardless of whether the host has procps.
+    #[cfg(unix)]
+    #[test]
+    fn missing_ps_degrades_to_ok_not_os_error_2() {
+        temp_env::with_vars(
+            [
+                ("AIRC_CLIENT_ID", None::<&str>),
+                ("CODEX_THREAD_ID", None),
+                ("CLAUDE_CODE_SESSION_ID", None),
+                ("CLAUDE_SESSION_ID", None),
+                ("PATH", Some("")),
+            ],
+            || {
+                assert!(
+                    current_client_id().is_ok(),
+                    "ps-absent must degrade to Ok, never break the send path with os error 2"
+                );
+            },
+        );
     }
 
     #[test]
