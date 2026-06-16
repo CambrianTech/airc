@@ -126,6 +126,38 @@ impl DurableSink for SqliteDurableSink {
         }
     }
 
+    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the whole
+    /// batch = ONE transaction commit (vs one per event in `append`); fsync work
+    /// is amortized at WAL checkpoint under synchronous=NORMAL. Same
+    /// idempotent-on-`event_id` contract. SQLite executes a multi-VALUES insert
+    /// as one atomic statement, so on error nothing is committed and the caller
+    /// re-pins the whole batch (no partial-persist ambiguity — verified by
+    /// `append_batch_mixed_persists_every_new_event`).
+    async fn append_batch(&self, events: &[&Envelope]) -> Result<(), BusError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let actives = events
+            .iter()
+            .map(|e| to_active_model(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        let res = bus_event::Entity::insert_many(actives)
+            .on_conflict(
+                OnConflict::column(bus_event::Column::EventId)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            // Every row in the batch already existed (all conflicted) — the
+            // DO-NOTHING all-dupes path. Idempotent success, not an error.
+            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+            Err(err) => Err(BusError::Sink(err.to_string())),
+        }
+    }
+
     async fn page(
         &self,
         channel: RoomId,
@@ -703,5 +735,68 @@ mod tests {
                 delivery
             );
         }
+    }
+
+    /// THE load-bearing group-commit test (durability blocker): a batch that
+    /// MIXES a duplicate with new events must still persist EVERY new event.
+    /// This mechanically proves the one fact the write-behind group-commit
+    /// rests on — that `insert_many(...).on_conflict(do_nothing)` inserts the
+    /// new rows even when a conflicting row is present, and that mapping
+    /// `RecordNotInserted` → Ok cannot drop new events. If this failed, the
+    /// router would unpin un-persisted events = silent data loss.
+    #[tokio::test]
+    async fn append_batch_mixed_persists_every_new_event() {
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0xba7c8);
+        let a = durable_at(ch, 1, 0);
+        let b = durable_at(ch, 1, 1);
+        let c = durable_at(ch, 1, 2);
+
+        // A is already persisted; the batch re-includes it (duplicate) plus two
+        // genuinely-new events.
+        sink.append(&a).await.unwrap();
+        sink.append_batch(&[&a, &b, &c]).await.unwrap();
+
+        let page = sink.page(ch, None, 100).await.unwrap();
+        assert_eq!(
+            page.len(),
+            3,
+            "mixed batch must persist A(once)+B+C, not drop new rows"
+        );
+        assert_eq!(page[0], a);
+        assert_eq!(page[1], b);
+        assert_eq!(page[2], c);
+    }
+
+    /// All-duplicate batch is idempotent success (the `RecordNotInserted` arm):
+    /// re-appending already-persisted events neither errors nor double-stores.
+    #[tokio::test]
+    async fn append_batch_all_duplicates_is_idempotent_ok() {
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0xd00b);
+        let a = durable_at(ch, 1, 0);
+        let b = durable_at(ch, 1, 1);
+        sink.append(&a).await.unwrap();
+        sink.append(&b).await.unwrap();
+
+        sink.append_batch(&[&a, &b]).await.unwrap(); // all dupes → Ok, no dup rows
+
+        let page = sink.page(ch, None, 100).await.unwrap();
+        assert_eq!(page.len(), 2, "all-duplicate batch must not double-store");
+    }
+
+    /// All-new batch persists everything (the happy path) + empty batch no-ops.
+    #[tokio::test]
+    async fn append_batch_all_new_and_empty() {
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0xfeed);
+        sink.append_batch(&[]).await.unwrap(); // empty = no-op, no error
+        let a = durable_at(ch, 1, 0);
+        let b = durable_at(ch, 1, 1);
+        let c = durable_at(ch, 1, 2);
+        sink.append_batch(&[&a, &b, &c]).await.unwrap();
+
+        let page = sink.page(ch, None, 100).await.unwrap();
+        assert_eq!(page.len(), 3, "all-new batch persists every event");
     }
 }

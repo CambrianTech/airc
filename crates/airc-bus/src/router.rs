@@ -592,23 +592,46 @@ impl EventRouter {
     /// ring-pinned-until-persisted). For each durable item: `sink.append` then
     /// re-lock the shard and `mark_persisted` so the ring may evict it.
     async fn run_write_behind(inner: Arc<RouterInner>, mut rx: mpsc::Receiver<WriteBehindItem>) {
-        while let Some(item) = rx.recv().await {
+        // GROUP-COMMIT: when a burst is queued, drain everything immediately
+        // available (up to MAX_BATCH) and persist it in ONE durable commit, so
+        // a fsync-backed sink pays one fsync per batch instead of one per event.
+        // Under light load this collapses to single-item appends (recv blocks,
+        // try_recv finds nothing) — same latency as before; the win is purely
+        // under the burst contention the daemon-path bench measures.
+        const MAX_BATCH: usize = 64;
+        while let Some(first) = rx.recv().await {
+            let mut batch = Vec::with_capacity(MAX_BATCH);
+            batch.push(first);
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break, // queue drained (empty or closed)
+                }
+            }
+
             // append is the only point we touch the durable tier; no shard
-            // lock is held across it.
-            let appended = inner.sink.append(&item.env).await;
-            if appended.is_err() {
-                // Append failed: leave the ring entry pinned so the no-gap
-                // precondition still holds (the event is still in RAM). A real
-                // sink would retry; the in-memory test sink never fails.
+            // lock is held across it. The batch persists as a single multi-row
+            // INSERT (one atomic SQLite statement), so on error nothing is
+            // committed — the failure path below re-pins the whole batch.
+            let envs: Vec<&Envelope> = batch.iter().map(|i| i.env.as_ref()).collect();
+            if inner.sink.append_batch(&envs).await.is_err() {
+                // Batch append failed: leave EVERY ring entry pinned so the
+                // no-gap precondition still holds (events are still in RAM). A
+                // real sink would retry; the in-memory test sink never fails.
+                // (Same posture as the prior per-item failure path, applied to
+                // the whole batch since the insert is atomic.)
                 continue;
             }
-            // Confirmed persisted -> unpin in the ring.
+
+            // Confirmed persisted -> unpin each in its shard's ring.
             let n = inner.shards.len();
-            let idx = (item.env.channel.0.as_u128() % n as u128) as usize;
-            let shard = &inner.shards[idx];
-            let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(state) = map.get_mut(&item.env.channel.0.as_u128()) {
-                state.ring.mark_persisted(item.env.event_id);
+            for item in &batch {
+                let idx = (item.env.channel.0.as_u128() % n as u128) as usize;
+                let shard = &inner.shards[idx];
+                let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(state) = map.get_mut(&item.env.channel.0.as_u128()) {
+                    state.ring.mark_persisted(item.env.event_id);
+                }
             }
         }
     }

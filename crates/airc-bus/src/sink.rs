@@ -31,6 +31,26 @@ pub trait DurableSink: Send + Sync {
     /// entries pinned until persisted).
     async fn append(&self, e: &Envelope) -> Result<()>;
 
+    /// Persist a BATCH of `Durable` envelopes in ONE transaction commit
+    /// (group-commit): one commit for the whole batch instead of one per event,
+    /// so fsync work (amortized at WAL checkpoint under synchronous=NORMAL) is
+    /// paid once per batch rather than per event. Same
+    /// at-least-once / idempotent-on-`event_id` contract as [`append`]; on
+    /// success every event is visible to subsequent [`page`](DurableSink::page)
+    /// calls. The default loops [`append`] (correct, no group-commit) so
+    /// in-memory / non-fsync impls need not override; fsync-backed sinks SHOULD
+    /// override to commit the batch in one transaction. Empty slice = no-op.
+    ///
+    /// Failure is all-or-nothing from the caller's view: on `Err` the caller
+    /// (the write-behind task) leaves every batch entry pinned in the ring, so
+    /// the no-gap precondition (§3.8) holds and nothing is lost.
+    async fn append_batch(&self, events: &[&Envelope]) -> Result<()> {
+        for e in events {
+            self.append(e).await?;
+        }
+        Ok(())
+    }
+
     /// Return up to `limit` events on `channel` strictly *after*
     /// `from_cursor`, in total order. `from_cursor == None` means "from the
     /// beginning of the channel." This is the deep-replay leg of the cursor
