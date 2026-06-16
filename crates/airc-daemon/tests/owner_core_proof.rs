@@ -793,9 +793,19 @@ async fn attach_header_filter_scopes_subscription_router_side() {
 //
 // Two metrics, because durable publish is fire-and-forget (returns on enqueue):
 //  - per-publish latency distribution = CLIENT-observed latency (IPC + route +
-//    enqueue), what a persona feels when it say()s.
-//  - end-to-end wall (publish → write-behind persist → live delivery to a
-//    collector) = the throughput the group-commit drain actually moves.
+//    enqueue + per-call connection setup), what a persona feels when it say()s.
+//  - live-delivery wall (publish → IN-MEMORY fan-out → IPC delivery to a
+//    collector). NOTE: live fan-out happens synchronously inside publish,
+//    BEFORE the write-behind enqueue and independent of sink.append — so this
+//    number is the bus/IPC delivery ceiling and does NOT include durable
+//    persist. The group-commit / batch-insert optimization improves the
+//    write-behind PERSIST drain, which is OFF this path; measuring it needs a
+//    PERSIST-GATED metric (publish N, then poll the durable tier until all N
+//    are queryable from the sink, and time that). That persist-gated bench is
+//    the next increment, best landed alongside the group-commit change with the
+//    durable-tip API. This instrument measures publish latency + the
+//    one-room/many-rooms shard contrast, which it CAN point away from shards
+//    but cannot, by itself, positively confirm the single-writer as the cause.
 
 /// Sort + print a latency distribution; returns p95 for a collapse-guard assert.
 fn report_latency(label: &str, wall: std::time::Duration, mut lat_ns: Vec<u64>) -> u64 {
@@ -806,7 +816,8 @@ fn report_latency(label: &str, wall: std::time::Duration, mut lat_ns: Vec<u64>) 
     let (p50, p95, p99, max) = (pct(0.50), pct(0.95), pct(0.99), lat_ns[lat_ns.len() - 1]);
     eprintln!(
         "{label}: {total} msgs in {wall:?}\n  publish throughput {throughput} msg/sec\n  \
-         CLOSED-LOOP publish latency ns/op (incl. queue-wait behind in-flight publishers): \
+         publish latency ns/op (incl. shard-lock contention + per-publish connection \
+         setup under concurrency; EXCLUDES durable persist): \
          p50 {p50}  p95 {p95}  p99 {p99}  max {max}"
     );
     p95
@@ -847,9 +858,12 @@ async fn drive_publishers(
     (start.elapsed(), all)
 }
 
-/// 15 concurrent publishers → ONE room, with a collector measuring end-to-end
-/// delivery. This is the group-commit / single-writer target: all durable
-/// events funnel through the write-behind tier + single-writer store.
+/// 15 concurrent publishers → ONE room, with a collector measuring LIVE
+/// delivery (publish → in-memory fan-out → IPC). All publishes funnel through
+/// one shard. NOTE: live delivery does NOT include durable persist (fan-out is
+/// synchronous, pre-write-behind) — the group-commit target needs a
+/// persist-gated metric (see section header). This bench measures publish
+/// latency + the one-room shard-contention baseline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "perf bench: daemon concurrent publishers, one room; opt-in via `--ignored --test-threads=1`"]
 async fn bench_daemon_concurrent_publishers_one_room() {
@@ -886,8 +900,9 @@ async fn bench_daemon_concurrent_publishers_one_room() {
 
     let e2e_throughput = (TOTAL as u128 * 1_000_000_000 / e2e_wall.as_nanos().max(1)) as u64;
     eprintln!(
-        "daemon ONE-room end-to-end (publish→write-behind→deliver): {TOTAL} msgs delivered in \
-         {e2e_wall:?} → {e2e_throughput} msg/sec (this is what group-commit improves)"
+        "daemon ONE-room LIVE delivery (publish→in-memory fan-out→IPC; EXCLUDES durable persist): \
+         {TOTAL} msgs delivered in {e2e_wall:?} → {e2e_throughput} msg/sec (bus/IPC ceiling; \
+         group-commit improves the write-behind PERSIST drain, NOT this — see section header)"
     );
     let p95 = report_latency(
         "daemon ONE-room publish (15×40, single-writer + write-behind)",
@@ -905,9 +920,12 @@ async fn bench_daemon_concurrent_publishers_one_room() {
 
 /// 15 concurrent publishers → 15 DIFFERENT rooms (one each), so they hash to
 /// different router shards. Contrast with the one-room bench: if many-rooms is
-/// NOT meaningfully faster, the binding constraint is the single-writer store /
-/// write-behind (NOT shard contention) — exactly the group-commit target. This
-/// is the cross-shard parallelism measurement.
+/// meaningfully faster, shard-lock contention is a real factor on the publish
+/// path. If it is NOT faster, the publish bottleneck is elsewhere (NOT shards)
+/// — but note this bench can only point AWAY from shards; it cannot positively
+/// confirm the single-writer/write-behind as the cause, because durable persist
+/// is off the measured (live) publish path (that needs the persist-gated metric
+/// in the section header). This is the cross-shard parallelism measurement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "perf bench: daemon concurrent publishers, many rooms; opt-in via `--ignored --test-threads=1`"]
 async fn bench_daemon_publishers_many_rooms() {
