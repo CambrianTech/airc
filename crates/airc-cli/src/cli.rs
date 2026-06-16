@@ -756,6 +756,16 @@ pub enum Command {
     /// package version.)
     Version,
 
+    /// Print the resolved daemon IPC socket path for this scope and exit.
+    ///
+    /// The canonical answer to "where does my daemon bind?". Consumers
+    /// (Continuum's airc discovery) call this to locate the socket
+    /// without re-deriving airc's path convention or hand-setting an env
+    /// var — airc owns the path, callers ask for it. Resolves the path
+    /// only; does NOT require the daemon to be running (callers probe
+    /// liveness separately via `status`/`ping`).
+    IpcEndpoint,
+
     /// Fast-forward the installed source checkout and refresh the
     /// installed `airc` binary + skills from that source.
     #[command(visible_aliases = ["upgrade", "pull"])]
@@ -899,6 +909,25 @@ mod tests {
         // Each alone parses fine (guard isn't over-broad).
         assert!(Cli::try_parse_from(["airc", "--here", "init"]).is_ok());
         assert!(Cli::try_parse_from(["airc", "--home", "/x", "init"]).is_ok());
+    }
+
+    // what this catches: the `ipc-endpoint` subcommand silently vanishing
+    // or being renamed. Continuum's airc discovery shells out to exactly
+    // `airc ipc-endpoint` to locate the daemon socket; when this command
+    // was never shipped, discovery returned Unreachable and personas never
+    // spawned. This pins the kebab-case spelling to the contract.
+    #[test]
+    fn ipc_endpoint_subcommand_parses() {
+        use super::{Cli, Command};
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["airc", "ipc-endpoint"])
+            .expect("`airc ipc-endpoint` must parse — Continuum discovery depends on it");
+        assert!(
+            matches!(parsed.command, Command::IpcEndpoint),
+            "ipc-endpoint must map to Command::IpcEndpoint, got {:?}",
+            parsed.command
+        );
     }
 
     #[test]

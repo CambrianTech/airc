@@ -503,6 +503,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
+        Command::IpcEndpoint => {
+            // Resolve-only: print the canonical socket path airc would
+            // bind for this scope. No daemon required (callers probe
+            // liveness via `status`/`ping`). This is the contract
+            // Continuum's airc discovery depends on.
+            println!("{}", cli::default_socket_path_in(&home).display());
+            Ok(())
+        }
+
         Command::Update => update_commands::run_update(&home, cli::default_socket_path_in(&home)),
 
         Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
