@@ -261,13 +261,23 @@ async fn bench_chat_throughput_minimal_headers() {
 /// "many personas in one room" case + the low-latency-first mandate).
 ///
 /// The other benches publish SEQUENTIALLY — per-call cost, no contention.
-/// Production is N personas publishing into the SAME room concurrently, which
-/// all hash to one router shard: the realistic contention case. This spawns
-/// `PUBLISHERS` concurrent tasks on a multi-thread runtime and reports the
-/// per-op latency DISTRIBUTION (p50/p95/p99/max) + aggregate throughput — the
-/// metric "make it fast" actually cares about, which a mean ns/op hides. Read
-/// the truth off the printed distribution; the assertion is only a collapse-
-/// guard so a regression that 10×'d p95 trips CI.
+/// Production is N personas publishing into the SAME room concurrently. This
+/// spawns `PUBLISHERS` concurrent tasks on a multi-thread runtime and reports
+/// the per-op latency DISTRIBUTION (p50/p95/p99/max) + aggregate throughput —
+/// the metric "make it fast" actually cares about, which a mean ns/op hides.
+///
+/// WHAT'S ACTUALLY CONTENDED (read the numbers correctly): each `say()` does a
+/// store read (`current_room`) + write (`append_sent_frame`) against the shared
+/// single-writer SQLite connection (`max_connections(1)`) — so the binding
+/// constraint here is the **store connection + fsync**, NOT a router/room shard
+/// lock (there is no per-room lock on this path). The reported latencies are
+/// **closed-loop**: each op's time INCLUDES queue-wait behind the other in-
+/// flight publishers, i.e. TAIL LATENCY UNDER LOAD, not isolated service time.
+/// That makes this the instrument for the single-writer / batch-insert / fsync
+/// optimization (the known bottleneck), not for shard contention.
+///
+/// Read the truth off the printed distribution; the assertion is only a
+/// collapse-guard so a regression that 10×'d p95 trips CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "perf bench: concurrent publishers contend for one shard + fsync + TCP loopback; opt-in via `--ignored --test-threads=1`"]
 async fn bench_chat_concurrent_publishers_latency() {
@@ -281,7 +291,9 @@ async fn bench_chat_concurrent_publishers_latency() {
         airc.say(&format!("warmup {i}")).await.expect("warmup send");
     }
 
-    // 15 personas × 40 messages each = 600 concurrent publishes into one room.
+    // 15 personas × 40 messages each = 600 publishes into one room, 15 in
+    // flight at once. They serialize on the single-writer store connection (see
+    // fn doc) — that queueing is the point being measured.
     const PUBLISHERS: usize = 15;
     const PER_PUBLISHER: usize = 40;
 
@@ -320,8 +332,9 @@ async fn bench_chat_concurrent_publishers_latency() {
 
     eprintln!(
         "concurrent publishers: {PUBLISHERS} × {PER_PUBLISHER} = {total} msgs into ONE room \
-         in {wall:?}\n  throughput {throughput} msg/sec\n  latency ns/op: \
-         p50 {p50}  p95 {p95}  p99 {p99}  max {max}"
+         in {wall:?}\n  throughput {throughput} msg/sec\n  CLOSED-LOOP latency ns/op (incl. \
+         queue-wait behind {PUBLISHERS} in-flight on the single-writer store; tail-under-load, \
+         NOT service time): p50 {p50}  p95 {p95}  p99 {p99}  max {max}"
     );
 
     // Collapse-guard only (the printed distribution is the real signal). p95 at
