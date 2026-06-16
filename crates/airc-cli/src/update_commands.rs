@@ -105,7 +105,15 @@ fn wait_daemon_ready(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // what this catches: the same cold-start-too-short bug #1211 fixed
+    // for `ensure_daemon_running` (5s → 20s). A freshly rebuilt daemon
+    // re-runs SQLite migrations + identity load + substrate `Airc::open`
+    // on boot before it binds its IPC socket; on a cold/slow machine
+    // that exceeds 5s, so `airc update` reported "daemon did not become
+    // ready" even though the daemon came up moments later — leaving the
+    // node on the OLD build. 20s comfortably covers a cold boot while
+    // still surfacing a genuinely dead daemon.
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if daemon_is_running(airc_exe, home, socket)? {
             return Ok(());
@@ -204,13 +212,27 @@ fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Err
 }
 
 fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    run_checked(
-        Command::new(installer_shell())
-            .arg(source.join("install.sh"))
-            .env("AIRC_DIR", source)
-            .env("AIRC_INSTALL_NO_PULL", "1"),
-        "install.sh",
-    )
+    // Stream the installer's output live instead of buffering it with
+    // `Command::output()` (what run_checked does). install.sh does the
+    // cargo rebuild, which can take minutes; with buffered stdio the
+    // operator saw NOTHING while it ran, so a long-or-hung build was
+    // indistinguishable from a working one — on a live Windows node
+    // `airc update` "hung" silently for 15+ minutes with no visible
+    // progress. Inheriting stdio surfaces cargo's progress live; the
+    // banner sets the expectation up front. Failure behavior is
+    // unchanged: a non-zero exit still returns an Err.
+    println!("Rebuilding airc (this can take a few minutes)…");
+    let status = Command::new(installer_shell())
+        .arg(source.join("install.sh"))
+        .env("AIRC_DIR", source)
+        .env("AIRC_INSTALL_NO_PULL", "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("install.sh failed: exit status {status}").into())
 }
 
 /// The shell used to run install.sh during `airc update`.
