@@ -37,12 +37,15 @@ The goal is **not to silence personas like Ivar.** Ivar proved continuum persona
 
 ## The fix — three parts, two lanes
 
-### 1. Roster grounding — *know who is NOT you* (continuum injects, airc supplies)
+### 1. Identity grounding — *know who you are, and who you are NOT* (continuum injects, airc supplies)
 
-A persona's prompt must carry the **full room roster including cross-grid peers**, each as a named *other* — so the model can never mistake "@M5"/"BIGMAMA" for itself.
+Self-grounding has **three axes** (Intel Mac's review of this doc); miss any one and the model can still confabulate identity:
 
-- **continuum (M5):** extend `prompt_assembly` so the persona-facing roster is `local personas ∪ cross-grid peers`, not locals only.
-- **airc (BIGMAMA):** the account-registry already enumerates every same-account peer (name + scope + endpoints). airc exposes a **roster API** — "everyone in this room/account, by peer_id and published name" — as the authoritative source continuum injects. The roster is substrate truth, not chat scrape.
+- **(a) self knows self — own name AND own `peer_id` in the prompt.** "You are Ivar" is not enough in a `peer_id`-laden dev channel: without "your peer_id is `2dc9f9b5`", the model is free to grab a peer_id from chat and claim it — which is **exactly** what Ivar did when it claimed Intel Mac's `9bb24964` as its own. Inject the persona's full self-identity (name + peer_id + role), not just the name. *[continuum]*
+- **(b) self knows others — the full room roster, including cross-grid peers, each as a named *other*** — so "@M5"/"BIGMAMA" can never be mistaken for self. `prompt_assembly`'s `other_persona_names` carries only *local* personas today; extend it to `local ∪ cross-grid`. *[continuum]*
+- **(c) the substrate sees self** — see part 2 (identity card published at attach).
+
+**airc supplies the inputs for (a) and (b):** the account-registry already enumerates every same-account peer (name + scope + endpoints + peer_id). airc exposes a **roster API** — "this persona's own identity, plus everyone in this room/account by peer_id and published name" — as the authoritative source continuum injects. The roster is substrate truth, not a chat scrape.
 
 ### 2. Identity publication at attach — *say who you are* (airc)
 
@@ -50,9 +53,14 @@ A persona's prompt must carry the **full room roster including cross-grid peers*
 
 - **Fix:** publish a `PeerIdentityCard` (carrying the `agent_name`, e.g. "Ivar") as part of the attach path, so **every attached persona is identity-grounded and name-discoverable from the moment it is on the wire.** A persona that can't be `whois`'d by name is, by this contract, not properly on the grid.
 
-### 3. Channel discipline — *don't speak where you shouldn't* (continuum)
+### 3. Channel discipline — *don't speak where you shouldn't*, and know it from the substrate (continuum + airc)
 
 A spawned persona should not auto-respond in a human/dev coordination channel, nor engage ungrounded/unknown peers, unless explicitly addressed. Participation is a capability to be *scoped*, not a reflex.
+
+But the rule **needs a mechanism, not inference** (Intel Mac's review): "don't respond in a coordination channel" is self-defeating if the persona has to *infer* which channels those are from chat content — that is the same ungrounded-inference failure mode the rest of this doc fixes. So:
+
+- **airc:** room/channel metadata carries a typed **`ChannelPurpose`** (e.g. `HumanCoordination | DevAgentCoordination | Serving | Public`), published as substrate truth like any other room attribute.
+- **continuum:** the persona's auto-respond policy *reads `ChannelPurpose`* — it never guesses purpose from message content. A `Serving` channel invites `ai/generate`; a `HumanCoordination` channel does not invite unsolicited persona chatter.
 
 ### Joint: L1 cross-grid inference folds in
 
