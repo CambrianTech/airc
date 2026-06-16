@@ -256,3 +256,93 @@ async fn bench_chat_throughput_minimal_headers() {
         "minimal say() regressed to {ns_per_op} ns/op — substrate per-msg overhead has grown"
     );
 }
+
+/// Concurrent-publisher LATENCY-DISTRIBUTION bench (VDD instrument for the
+/// "many personas in one room" case + the low-latency-first mandate).
+///
+/// The other benches publish SEQUENTIALLY — per-call cost, no contention.
+/// Production is N personas publishing into the SAME room concurrently. This
+/// spawns `PUBLISHERS` concurrent tasks on a multi-thread runtime and reports
+/// the per-op latency DISTRIBUTION (p50/p95/p99/max) + aggregate throughput —
+/// the metric "make it fast" actually cares about, which a mean ns/op hides.
+///
+/// WHAT'S ACTUALLY CONTENDED (read the numbers correctly): each `say()` does a
+/// store read (`current_room`) + write (`append_sent_frame`) against the shared
+/// single-writer SQLite connection (`max_connections(1)`) — so the binding
+/// constraint here is the **store connection + fsync**, NOT a router/room shard
+/// lock (there is no per-room lock on this path). The reported latencies are
+/// **closed-loop**: each op's time INCLUDES queue-wait behind the other in-
+/// flight publishers, i.e. TAIL LATENCY UNDER LOAD, not isolated service time.
+/// That makes this the instrument for the single-writer / batch-insert / fsync
+/// optimization (the known bottleneck), not for shard contention.
+///
+/// Read the truth off the printed distribution; the assertion is only a
+/// collapse-guard so a regression that 10×'d p95 trips CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "perf bench: concurrent publishers contend for one shard + fsync + TCP loopback; opt-in via `--ignored --test-threads=1`"]
+async fn bench_chat_concurrent_publishers_latency() {
+    let tmp_a = TempDir::new().expect("alice tempdir");
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let (airc, _bob) = paired_airc(tmp_a.path().to_path_buf(), tmp_b.path().to_path_buf()).await;
+
+    // Warmup the cached paths (channel-resolve + identity-load), as the
+    // sequential benches do.
+    for i in 0..50 {
+        airc.say(&format!("warmup {i}")).await.expect("warmup send");
+    }
+
+    // 15 personas × 40 messages each = 600 publishes into one room, 15 in
+    // flight at once. They serialize on the single-writer store connection (see
+    // fn doc) — that queueing is the point being measured.
+    const PUBLISHERS: usize = 15;
+    const PER_PUBLISHER: usize = 40;
+
+    let overall = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(PUBLISHERS);
+    for p in 0..PUBLISHERS {
+        let publisher = airc.clone(); // Airc is Clone (Arc-backed handle)
+        handles.push(tokio::spawn(async move {
+            let mut latencies = Vec::with_capacity(PER_PUBLISHER);
+            for i in 0..PER_PUBLISHER {
+                let t = std::time::Instant::now();
+                publisher
+                    .say(&format!("p{p} m{i}"))
+                    .await
+                    .expect("concurrent send");
+                latencies.push(t.elapsed().as_nanos() as u64);
+            }
+            latencies
+        }));
+    }
+
+    let mut all: Vec<u64> = Vec::with_capacity(PUBLISHERS * PER_PUBLISHER);
+    for h in handles {
+        all.extend(h.await.expect("publisher task join"));
+    }
+    let wall = overall.elapsed();
+    all.sort_unstable();
+
+    let pct = |q: f64| -> u64 {
+        let idx = ((all.len() as f64 * q) as usize).min(all.len() - 1);
+        all[idx]
+    };
+    let total = all.len() as u128;
+    let throughput = (total * 1_000_000_000 / wall.as_nanos().max(1)) as u64;
+    let (p50, p95, p99, max) = (pct(0.50), pct(0.95), pct(0.99), all[all.len() - 1]);
+
+    eprintln!(
+        "concurrent publishers: {PUBLISHERS} × {PER_PUBLISHER} = {total} msgs into ONE room \
+         in {wall:?}\n  throughput {throughput} msg/sec\n  CLOSED-LOOP latency ns/op (incl. \
+         queue-wait behind {PUBLISHERS} in-flight on the single-writer store; tail-under-load, \
+         NOT service time): p50 {p50}  p95 {p95}  p99 {p99}  max {max}"
+    );
+
+    // Collapse-guard only (the printed distribution is the real signal). p95 at
+    // 50ms = 10× the sequential 5ms floor — generous headroom for one-shard
+    // contention; a regression past this means concurrency degraded badly.
+    assert!(
+        p95 < 50_000_000,
+        "concurrent p95 latency regressed to {p95} ns/op (50ms collapse-guard) — \
+         one-room contention degraded badly"
+    );
+}
