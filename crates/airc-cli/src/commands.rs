@@ -844,6 +844,44 @@ fn canonical_machine_account_home() -> Option<PathBuf> {
     Some(user_home_canon.join(".airc"))
 }
 
+/// Honest one-line receipt for a completed `send`/`msg`/`publish`.
+///
+/// What is TRUE synchronously, by the time the publish call returns:
+/// the frame is signed, persisted to the local store, fanned out to
+/// in-process subscribers, written to the wire, and offered to the
+/// routed-forward tap. Any scope tailing this channel on THIS machine
+/// has it.
+///
+/// What is NOT knowable here: whether any remote peer actually
+/// received it. `peer_count` is the count of cryptographically-paired
+/// *enrolled* remote peers ([`Airc::peers`]) — an address book, not a
+/// delivery receipt. Routed forwarding and its delivery acks are
+/// drained by [`airc_lib::RoutedForwarder`] in a background loop that
+/// has not run by the time the CLI returns, so there is no honest
+/// synchronous forwarded/acked count to print.
+///
+/// Therefore the verb is "queued"/"addressed", never "sent to N
+/// peers" — the latter implied confirmed delivery to the enrolled
+/// count and produced false "it works" claims when zero peers had
+/// actually received anything. To confirm delivery, the operator runs
+/// `airc doctor --health` (route status), which reads the forwarder's
+/// real ack counters.
+fn format_send_receipt(channel_name: &str, channel_id: &str, peer_count: usize) -> String {
+    if peer_count == 0 {
+        format!(
+            "queued to {channel_name} ({channel_id}) — 0 enrolled remote peer(s); \
+             any scope tailing this channel on this machine will receive it."
+        )
+    } else {
+        format!(
+            "queued to {channel_name} ({channel_id}) — addressed {peer_count} enrolled \
+             remote peer(s); delivery is asynchronous and not yet confirmed \
+             (run `airc doctor --health` to check route delivery). \
+             Any scope tailing this channel on this machine also receives it."
+        )
+    }
+}
+
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
@@ -896,29 +934,14 @@ pub async fn run_send(
             (current.name, current.channel.to_string())
         }
     };
+    // `peers()` is the enrolled-remote-peer address book, NOT a
+    // delivery count — see `format_send_receipt` for why the receipt
+    // says "queued/addressed" rather than "sent to N peers".
     let peer_count = airc.peers().await?.len();
-    // `Airc::say` returned Ok — the frame is signed, persisted to the
-    // local store, and written to the wire. Any scope tailing this
-    // channel's wire will receive it. The peer-registry count
-    // (`peers()`) reflects cryptographically-paired *remote* peers;
-    // a count of 0 does NOT mean "no readers." Two scopes on the
-    // same machine share the wire via the account-home convention
-    // and deliver to each other without any peer enrollment.
-    //
-    // The previous "stored locally — not delivered to another
-    // agent" wording was a lie in exactly that case (caught by
-    // Codex's criterion #3): the message DID deliver to same-
-    // machine same-HOME tailers. Replace with a description that
-    // matches what actually happened.
-    if peer_count == 0 {
-        println!(
-            "sent to {channel_name} ({channel_id}). 0 paired remote peers; any scope tailing this channel on this machine will receive it."
-        );
-    } else {
-        println!(
-            "sent to {channel_name} ({channel_id}) — {peer_count} paired peer(s) + any local scope tailing this channel."
-        );
-    }
+    println!(
+        "{}",
+        format_send_receipt(&channel_name, &channel_id, peer_count)
+    );
     Ok(())
 }
 
@@ -1571,18 +1594,14 @@ pub async fn run_msg(
             (current.name, current.channel.to_string())
         }
     };
+    // Same enrolled-vs-delivered honesty fix as run_send, for the
+    // daemon-attached send path. `peers()` is the address book, not a
+    // delivery receipt.
     let peer_count = airc.peers().await?.len();
-    // See run_send for the rationale — same message-honesty fix
-    // for the daemon-attached send path.
-    if peer_count == 0 {
-        println!(
-            "sent to {channel_name} ({channel_id}). 0 paired remote peers; any scope tailing this channel on this machine will receive it."
-        );
-    } else {
-        println!(
-            "sent to {channel_name} ({channel_id}) — {peer_count} paired peer(s) + any local scope tailing this channel."
-        );
-    }
+    println!(
+        "{}",
+        format_send_receipt(&channel_name, &channel_id, peer_count)
+    );
     Ok(())
 }
 
@@ -2242,6 +2261,72 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches: the send receipt must NOT report the enrolled
+    /// peer count as confirmed delivery. The old line was
+    /// "sent to X — N paired peer(s) + any local scope tailing …",
+    /// which made a send look successful even when zero peers actually
+    /// received anything (the false "it works" bug). The receipt is
+    /// honest: the verb is "queued"/"addressed" (not "sent to N peers"),
+    /// it never claims "paired peer(s)" delivered, and it tells the
+    /// operator delivery is asynchronous + how to confirm it.
+    #[test]
+    fn send_receipt_does_not_imply_confirmed_delivery() {
+        let line = format_send_receipt("general", "cb2e21a1", 41);
+
+        // The exact misleading phrasing is gone.
+        assert!(
+            !line.contains("41 paired peer(s)"),
+            "must not report enrolled count as delivery: {line}"
+        );
+        assert!(
+            !line.contains("paired peer"),
+            "the enrolled-peer count must not masquerade as delivery: {line}"
+        );
+        // It must not lead with the delivery-implying verb "sent to".
+        assert!(
+            !line.starts_with("sent to"),
+            "verb must not imply confirmed delivery: {line}"
+        );
+        // It IS honest about what happened and what is unconfirmed.
+        assert!(line.contains("queued to general"), "honest verb: {line}");
+        assert!(
+            line.contains("41 enrolled"),
+            "addressed-peer count framed as enrolled, not delivered: {line}"
+        );
+        assert!(
+            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            "must state delivery is unconfirmed: {line}"
+        );
+        assert!(
+            line.contains("airc doctor --health"),
+            "must tell operator how to confirm delivery: {line}"
+        );
+    }
+
+    /// what this catches: the zero-enrolled-peer case stays honest —
+    /// no false "delivered" claim, but it correctly preserves the
+    /// load-bearing truth that same-machine tailers still receive the
+    /// frame (the lone-node / two-scopes-one-home topology). Count is
+    /// reported as enrolled, never as a delivery confirmation.
+    #[test]
+    fn send_receipt_zero_peers_is_honest_about_local_tailers() {
+        let line = format_send_receipt("general", "cb2e21a1", 0);
+        assert!(!line.starts_with("sent to"), "no delivery verb: {line}");
+        assert!(
+            !line.contains("paired peer"),
+            "no paired-peer claim: {line}"
+        );
+        assert!(line.contains("queued to general"), "honest verb: {line}");
+        assert!(
+            line.contains("0 enrolled remote peer(s)"),
+            "honest about zero enrolled peers: {line}"
+        );
+        assert!(
+            line.contains("tailing this channel on this machine"),
+            "must preserve the same-machine-delivery truth: {line}"
+        );
+    }
 
     /// what this catches (seam #2): `collaboration peers` / `peer list`
     /// render the canonical trust store with ALL tiers visible — an
