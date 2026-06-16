@@ -1123,9 +1123,18 @@ impl Airc {
     /// follow-up slice. No-op when no local identity is persisted
     /// yet (e.g. fresh scope mid-bootstrap).
     async fn emit_peer_identity_card(&self, room_id: airc_core::RoomId) -> Result<(), AircError> {
+        // Read THIS scope's identity by its own agent_name, NOT the
+        // default-agent row. `load_local_identity()` resolves to
+        // DEFAULT_AGENT_NAME (sqlite.rs), so a named citizen (a persona
+        // / Hermes / OpenClaw agent opened via `open_as("Ivar")`, keyed
+        // under "Ivar") would otherwise publish the DEFAULT agent's
+        // identity — wrong/empty — never its own. That is the airc-side
+        // root of "whois: identity not published yet" for spawned
+        // citizens. For a default scope `agent_name()` == the default
+        // discriminator, so this is unchanged there.
         let local = self
             .event_store()
-            .load_local_identity()
+            .load_local_identity_by_agent_name(self.agent_name())
             .await
             .map_err(AircError::from)?;
         let Some(stored) = local else { return Ok(()) };
@@ -1140,6 +1149,72 @@ impl Airc {
         let body = airc_core::Body::Json(body_json);
         self.emit_lifecycle(airc_core::TranscriptKind::IdentityPublished, room_id, body)
             .await
+    }
+
+    /// Publish this scope's identity card to EVERY subscribed room, so
+    /// this peer is `whois`-able **by name** in every room it
+    /// participates in.
+    ///
+    /// ## Why this is public — the grid citizenship contract
+    ///
+    /// `join` / `current_room` already emit the card on their own path,
+    /// but [`attach_as`] (the transient-agent path that spawned
+    /// citizens use — continuum personas, Hermes agents, OpenClaw
+    /// assistants) does NOT: attach has no room context yet, and a
+    /// citizen that attaches and then subscribes + talks never publishes
+    /// its card. The result is a peer that others see as `whois:
+    /// identity not published yet` — an anonymous uuid. An *ungrounded*
+    /// citizen with no published identity is the failure mode that let a
+    /// persona confabulate being another peer (the "Ivar" incident; see
+    /// `docs/architecture/PERSONA-GROUNDEDNESS.md`).
+    ///
+    /// So any consumer that spawns an attached citizen MUST call this
+    /// after subscribing to its channels. It is idempotent — re-calling
+    /// refreshes the card.
+    ///
+    /// ## The agent-name floor
+    ///
+    /// `open_as` / `attach_as` set a runtime `agent_name` but NOT a
+    /// published [`Identity`] — those are distinct (the card name is set
+    /// via [`set_local_identity_card`]). A citizen that attached with
+    /// only a name therefore has nothing to publish, and would still be
+    /// anonymous. So this method **grounds by the agent-name as a
+    /// floor**: if no identity card is set yet, it seeds one from
+    /// `agent_name` so the published card is *named*. Richer identity
+    /// (pronouns/role) stays available via [`set_local_identity_card`];
+    /// this just guarantees no named citizen is ever anonymous on the
+    /// wire — the system-agnostic citizenship floor for personas, Hermes
+    /// agents, and OpenClaw assistants alike.
+    pub async fn publish_identity(&self) -> Result<(), AircError> {
+        let existing = self
+            .event_store()
+            .load_local_identity_by_agent_name(self.agent_name())
+            .await
+            .map_err(AircError::from)?;
+        // Seed from the agent-name floor when there is no published
+        // identity OR the published one is nameless — either way the
+        // citizen would otherwise be anonymous on the wire.
+        let needs_floor = match &existing {
+            None => true,
+            Some(stored) => stored.identity.name.trim().is_empty(),
+        };
+        if needs_floor && !self.agent_name().trim().is_empty() {
+            // Seed + broadcast from the agent-name floor (set_local_identity_card
+            // persists AND emits to every subscribed room).
+            let identity = airc_core::identity::Identity {
+                name: self.agent_name().to_string(),
+                ..Default::default()
+            };
+            return self.set_local_identity_card(identity).await;
+        }
+        // Identity already set (or no name to seed) — (re)emit to all
+        // subscribed rooms so a late-attaching/late-subscribing citizen
+        // is grounded everywhere it participates.
+        let set = subscriptions::load_or_init(self.event_store()).await?;
+        for subscription in set.subscribed.values() {
+            self.emit_peer_identity_card(subscription.room_id).await?;
+        }
+        Ok(())
     }
 
     /// Subscribe this scope to the default account context:
@@ -1743,5 +1818,42 @@ mod room_trust_policy_tests {
         let scope = dir.path().join("scope-home");
         std::fs::create_dir(&scope).unwrap();
         assert_eq!(super::machine_account_home(&scope), scope);
+    }
+}
+
+#[cfg(test)]
+mod publish_identity_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // what this catches: publish_identity grounds a citizen BY NAME via
+    // the agent-name floor. open_as sets a runtime agent_name but NOT a
+    // published Identity (distinct concepts), so without the floor a
+    // spawned persona/agent (continuum / Hermes / OpenClaw) stays
+    // anonymous on the wire — the "Ivar" grounding bug (whois: 'not
+    // published yet'). After publish_identity, the persisted identity
+    // card carries the agent name. Daemon-independent read so it pins
+    // the persistence guarantee, not the transcript path.
+    #[tokio::test]
+    async fn publish_identity_grounds_named_citizen_from_agent_name() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("ivar/.airc");
+        let airc = Airc::open_as(&home, "Ivar").await.expect("open as Ivar");
+        airc.join("general").await.expect("join a channel");
+
+        airc.publish_identity()
+            .await
+            .expect("publish_identity must succeed");
+
+        let stored = airc
+            .event_store()
+            .load_local_identity_by_agent_name("Ivar")
+            .await
+            .expect("store read")
+            .expect("publish_identity must persist a named identity via the agent-name floor");
+        assert_eq!(
+            stored.identity.name, "Ivar",
+            "the grounded citizen is named by its agent_name, not anonymous"
+        );
     }
 }
