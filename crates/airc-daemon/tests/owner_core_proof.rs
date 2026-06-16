@@ -780,3 +780,173 @@ async fn attach_header_filter_scopes_subscription_router_side() {
     }
     daemon.stop().await;
 }
+
+// ── Daemon-path throughput/latency instrument (VDD) ──────────────────────────
+//
+// The chat_throughput benches measure the airc-LIBRARY path (Airc::open →
+// synchronous append to a single-connection store). PRODUCTION runs through the
+// DAEMON: continuum-core attaches over IPC, publishes route through the 16-shard
+// router, durable events drain via the write-behind tier. These benches measure
+// THAT topology — the path the group-commit / batch-insert optimization will
+// improve. Written FIRST per the file's VDD discipline: instrument, then
+// optimize against the number.
+//
+// Two metrics, because durable publish is fire-and-forget (returns on enqueue):
+//  - per-publish latency distribution = CLIENT-observed latency (IPC + route +
+//    enqueue + per-call connection setup), what a persona feels when it say()s.
+//  - live-delivery wall (publish → IN-MEMORY fan-out → IPC delivery to a
+//    collector). NOTE: live fan-out happens synchronously inside publish,
+//    BEFORE the write-behind enqueue and independent of sink.append — so this
+//    number is the bus/IPC delivery ceiling and does NOT include durable
+//    persist. The group-commit / batch-insert optimization improves the
+//    write-behind PERSIST drain, which is OFF this path; measuring it needs a
+//    PERSIST-GATED metric (publish N, then poll the durable tier until all N
+//    are queryable from the sink, and time that). That persist-gated bench is
+//    the next increment, best landed alongside the group-commit change with the
+//    durable-tip API. This instrument measures publish latency + the
+//    one-room/many-rooms shard contrast, which it CAN point away from shards
+//    but cannot, by itself, positively confirm the single-writer as the cause.
+
+/// Sort + print a latency distribution; returns p95 for a collapse-guard assert.
+fn report_latency(label: &str, wall: std::time::Duration, mut lat_ns: Vec<u64>) -> u64 {
+    lat_ns.sort_unstable();
+    let pct = |q: f64| lat_ns[((lat_ns.len() as f64 * q) as usize).min(lat_ns.len() - 1)];
+    let total = lat_ns.len() as u128;
+    let throughput = (total * 1_000_000_000 / wall.as_nanos().max(1)) as u64;
+    let (p50, p95, p99, max) = (pct(0.50), pct(0.95), pct(0.99), lat_ns[lat_ns.len() - 1]);
+    eprintln!(
+        "{label}: {total} msgs in {wall:?}\n  publish throughput {throughput} msg/sec\n  \
+         publish latency ns/op (incl. shard-lock contention + per-publish connection \
+         setup under concurrency; EXCLUDES durable persist): \
+         p50 {p50}  p95 {p95}  p99 {p99}  max {max}"
+    );
+    p95
+}
+
+/// Spawn `publishers` concurrent DaemonClient tasks, each publishing
+/// `per_publisher` durable messages to `channel_for(p)`. Returns (wall covering
+/// all publishes, per-op publish latencies ns).
+async fn drive_publishers(
+    socket: PathBuf,
+    publishers: usize,
+    per_publisher: usize,
+    channel_for: impl Fn(usize) -> RoomId,
+) -> (std::time::Duration, Vec<u64>) {
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(publishers);
+    for p in 0..publishers {
+        let socket = socket.clone();
+        let channel = channel_for(p);
+        handles.push(tokio::spawn(async move {
+            let client = DaemonClient::new(socket);
+            let mut lat = Vec::with_capacity(per_publisher);
+            for i in 0..per_publisher {
+                let t = Instant::now();
+                client
+                    .publish(durable_text(channel, &format!("p{p} m{i}")))
+                    .await
+                    .expect("daemon publish");
+                lat.push(t.elapsed().as_nanos() as u64);
+            }
+            lat
+        }));
+    }
+    let mut all = Vec::with_capacity(publishers * per_publisher);
+    for h in handles {
+        all.extend(h.await.expect("publisher join"));
+    }
+    (start.elapsed(), all)
+}
+
+/// 15 concurrent publishers → ONE room, with a collector measuring LIVE
+/// delivery (publish → in-memory fan-out → IPC). All publishes funnel through
+/// one shard. NOTE: live delivery does NOT include durable persist (fan-out is
+/// synchronous, pre-write-behind) — the group-commit target needs a
+/// persist-gated metric (see section header). This bench measures publish
+/// latency + the one-room shard-contention baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "perf bench: daemon concurrent publishers, one room; opt-in via `--ignored --test-threads=1`"]
+async fn bench_daemon_concurrent_publishers_one_room() {
+    let daemon = start_daemon().await;
+    let channel = RoomId::new();
+    const PUBLISHERS: usize = 15;
+    const PER: usize = 40;
+    const TOTAL: usize = PUBLISHERS * PER;
+
+    // Collector attached + acked before any publish (no missed events); times
+    // the full publish → write-behind → live-delivery pipeline.
+    let ready = Arc::new(Barrier::new(2));
+    let collector = tokio::spawn(persona_collect(
+        daemon.socket.clone(),
+        channel,
+        TOTAL,
+        ready.clone(),
+    ));
+    ready.wait().await;
+
+    let start = Instant::now();
+    let (publish_wall, lat) =
+        drive_publishers(daemon.socket.clone(), PUBLISHERS, PER, |_| channel).await;
+    let got = tokio::time::timeout(Duration::from_secs(60), collector)
+        .await
+        .expect("collector did not finish within 60s")
+        .expect("collector join");
+    let e2e_wall = start.elapsed();
+    assert_eq!(
+        got.len(),
+        TOTAL,
+        "every durable message must be delivered end-to-end"
+    );
+
+    let e2e_throughput = (TOTAL as u128 * 1_000_000_000 / e2e_wall.as_nanos().max(1)) as u64;
+    eprintln!(
+        "daemon ONE-room LIVE delivery (publish→in-memory fan-out→IPC; EXCLUDES durable persist): \
+         {TOTAL} msgs delivered in {e2e_wall:?} → {e2e_throughput} msg/sec (bus/IPC ceiling; \
+         group-commit improves the write-behind PERSIST drain, NOT this — see section header)"
+    );
+    let p95 = report_latency(
+        "daemon ONE-room publish (15×40, single-writer + write-behind)",
+        publish_wall,
+        lat,
+    );
+
+    // Collapse-guard only; the printed distribution is the signal.
+    assert!(
+        p95 < 200_000_000,
+        "daemon one-room publish p95 regressed to {p95} ns/op (200ms collapse-guard)"
+    );
+    daemon.stop().await;
+}
+
+/// 15 concurrent publishers → 15 DIFFERENT rooms (one each), so they hash to
+/// different router shards. Contrast with the one-room bench: if many-rooms is
+/// meaningfully faster, shard-lock contention is a real factor on the publish
+/// path. If it is NOT faster, the publish bottleneck is elsewhere (NOT shards)
+/// — but note this bench can only point AWAY from shards; it cannot positively
+/// confirm the single-writer/write-behind as the cause, because durable persist
+/// is off the measured (live) publish path (that needs the persist-gated metric
+/// in the section header). This is the cross-shard parallelism measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "perf bench: daemon concurrent publishers, many rooms; opt-in via `--ignored --test-threads=1`"]
+async fn bench_daemon_publishers_many_rooms() {
+    let daemon = start_daemon().await;
+    const PUBLISHERS: usize = 15;
+    const PER: usize = 40;
+
+    // Each publisher gets its own room → different shard. Pre-mint the rooms so
+    // the closure is a pure index→RoomId map (RoomId::new() is not pure).
+    let rooms: Vec<RoomId> = (0..PUBLISHERS).map(|_| RoomId::new()).collect();
+    let rooms_for = move |p: usize| rooms[p];
+
+    let (wall, lat) = drive_publishers(daemon.socket.clone(), PUBLISHERS, PER, rooms_for).await;
+    let p95 = report_latency(
+        "daemon MANY-rooms publish (15 publishers × 15 shards × 40)",
+        wall,
+        lat,
+    );
+    assert!(
+        p95 < 200_000_000,
+        "daemon many-rooms publish p95 regressed to {p95} ns/op (200ms collapse-guard)"
+    );
+    daemon.stop().await;
+}
