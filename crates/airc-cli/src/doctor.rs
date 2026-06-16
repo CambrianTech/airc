@@ -110,6 +110,7 @@ pub async fn run(home: &Path, fix: bool, health: bool) -> Result<(), Box<dyn std
     findings.extend(check_recent_diagnostics(home).await);
 
     if health {
+        findings.extend(check_daemon_build(home).await);
         findings.extend(check_health(home).await);
     }
 
@@ -396,6 +397,95 @@ async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
     }
 }
 
+/// Outcome of comparing the RUNNING daemon's reported build against the
+/// installed binary's baked-in build. Pure data so the classification is
+/// unit-testable without a live daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonBuildState {
+    /// Can't compare: the installed binary has no baked-in build sha
+    /// (git unavailable at compile time), so we have no truth to check
+    /// the daemon against.
+    BinaryUnknown,
+    /// Can't compare: the daemon didn't report a build (older daemon, or
+    /// it was built without git). Surface as info, not a false alarm.
+    DaemonUnknown,
+    /// Daemon build matches the installed binary — no drift.
+    Match,
+    /// Daemon is running an OLDER build than the installed binary. The
+    /// `(daemon, installed)` short shas for the warning line.
+    Stale { daemon: String, installed: String },
+}
+
+/// Compare the running daemon's reported build commit against the
+/// installed binary's build commit. Both are full git SHAs (or `None` /
+/// `"unknown"` when unavailable). Pure: no IO, fully testable.
+fn classify_daemon_build(installed: &str, daemon: Option<&str>) -> DaemonBuildState {
+    if installed == "unknown" {
+        return DaemonBuildState::BinaryUnknown;
+    }
+    match daemon {
+        None => DaemonBuildState::DaemonUnknown,
+        Some(daemon) if daemon == installed => DaemonBuildState::Match,
+        Some(daemon) => DaemonBuildState::Stale {
+            daemon: short_sha(daemon),
+            installed: short_sha(installed),
+        },
+    }
+}
+
+/// 12-char short form for compact display, matching `airc status`'s
+/// `build:` rendering.
+fn short_sha(sha: &str) -> String {
+    sha[..sha.len().min(12)].to_string()
+}
+
+/// Stale-daemon check (only under `--health`). `check_binary_freshness`
+/// already catches "installed binary drifted from source"; this catches
+/// the NEXT link in the chain — the RUNNING daemon still serving an OLD
+/// build after `airc update` rebuilt the binary. A stale daemon answers
+/// IPC fine, so `check_daemon` reports `[ok]`; only its reported build
+/// reveals the drift. On a live node (BIGMAMA) this went undetected for
+/// hours — the daemon kept running a pre-#1211 build while the fix sat
+/// merged and the installed binary was current.
+async fn check_daemon_build(home: &Path) -> Vec<Finding> {
+    let socket = crate::cli::default_socket_path_in(home);
+    let client = DaemonClient::new(socket);
+    let status = match client
+        .status_with_timeout(std::time::Duration::from_millis(250))
+        .await
+    {
+        Ok(status) => status,
+        // Not running / unreachable is already reported by check_daemon;
+        // don't double up here.
+        Err(_) => return Vec::new(),
+    };
+
+    match classify_daemon_build(crate::build_info::COMMIT, status.build_commit.as_deref()) {
+        DaemonBuildState::BinaryUnknown => vec![Finding::info(
+            "daemon build",
+            "installed binary has no build sha (git unavailable at compile time); skipping stale-daemon check",
+        )],
+        DaemonBuildState::DaemonUnknown => vec![Finding::info(
+            "daemon build",
+            "running daemon didn't report a build; can't check for staleness",
+        )],
+        DaemonBuildState::Match => vec![Finding::ok(
+            "daemon build",
+            format!(
+                "running daemon matches installed binary ({})",
+                crate::build_info::COMMIT_SHORT
+            ),
+        )],
+        DaemonBuildState::Stale { daemon, installed } => vec![Finding::warn(
+            "daemon",
+            format!(
+                "running stale build {daemon}; installed binary is {installed}"
+            ),
+            "restart this scope with 'airc join' to pick it up",
+        )],
+    }
+}
+
 async fn check_health(home: &Path) -> Vec<Finding> {
     use airc_lib::{Airc, TransportHealthState};
 
@@ -539,5 +629,64 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, Status::Warn);
         assert!(findings[0].detail.contains("pre-#902"));
+    }
+
+    #[test]
+    fn daemon_build_stale_when_daemon_lags_binary() {
+        // what this catches: the exact undetected-stale-daemon bug — a
+        // running daemon on an OLD build after `airc update` rebuilt the
+        // installed binary. Must classify as Stale with both short shas
+        // so the operator sees which build to restart away from.
+        let state = classify_daemon_build(
+            "1111111111111111111111111111111111111111",
+            Some("2222222222222222222222222222222222222222"),
+        );
+        assert_eq!(
+            state,
+            DaemonBuildState::Stale {
+                daemon: "222222222222".to_string(),
+                installed: "111111111111".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_build_matches_when_equal() {
+        // what this catches: identical builds must NOT warn (no false
+        // alarm on a freshly-restarted, current daemon).
+        let sha = "abcdef1234567890abcdef1234567890abcdef12";
+        assert_eq!(
+            classify_daemon_build(sha, Some(sha)),
+            DaemonBuildState::Match
+        );
+    }
+
+    #[test]
+    fn daemon_build_binary_unknown_skips_check() {
+        // what this catches: a release-tarball binary (no baked-in sha)
+        // has no truth to compare against, so we skip rather than warn.
+        assert_eq!(
+            classify_daemon_build("unknown", Some("abc123")),
+            DaemonBuildState::BinaryUnknown
+        );
+    }
+
+    #[test]
+    fn daemon_build_daemon_unknown_is_info_not_warn() {
+        // what this catches: an older daemon that reports no build must
+        // be info (can't compare), never a stale warning.
+        assert_eq!(
+            classify_daemon_build("abcdef1234567890", None),
+            DaemonBuildState::DaemonUnknown
+        );
+    }
+
+    #[test]
+    fn short_sha_truncates_and_preserves_short_input() {
+        // what this catches: the 12-char display contract matches
+        // `airc status`'s `build:` rendering, and short inputs aren't
+        // over-sliced (no panic on a sub-12-char sha).
+        assert_eq!(short_sha("abcdef1234567890abcdef"), "abcdef123456");
+        assert_eq!(short_sha("abc123"), "abc123");
     }
 }
