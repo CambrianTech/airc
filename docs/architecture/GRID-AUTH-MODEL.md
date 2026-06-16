@@ -90,6 +90,24 @@ So the #1649 `ai/generate = Provisional` rule + a same-account membership attest
 - **Typed, not string-bashed:** capabilities reuse the registry's tag vocabulary; trust is `TrustTier`.
 - **Consumed by lib:** continuum / Hermes / OpenClaw call airc's `is_command_authorized` + present grants; they write **no crypto and no auth of their own.**
 
+## Extensibility — richer paradigms factor in later, *for free across every consumer*
+
+The structs above are deliberately the **minimal signed-grant shape**, so stronger credential and provenance paradigms slot in *without changing the grant model*. And because they live in airc's shared libs, the day each lands in airc-lib, **continuum / Hermes / OpenClaw inherit it with zero auth code of their own.** That is the entire reason auth lives in the substrate.
+
+### WebAuthn / passkeys (credential paradigm)
+
+Nothing in `SignedMeshMembership` / `SignedCapabilityGrant` assumes Ed25519 — they're signed by *a* key. Make verification credential-agnostic: a `Credential` enum (`Ed25519`, `WebAuthn`/passkey, …) behind one `verify(message, signature) -> bool` seam. The grant structs are unchanged; only the signing/verification backend pluralizes. Passkeys then become a **hardware-backed credential adapter under the same grants** — a human (or an operator approving a high-tier grant for a new machine) authorizes with a platform passkey, no new auth model.
+
+### forge-alloy Merkle chains (provenance / attestation)
+
+forge-alloy is the contract/attestation pillar — a **Merkle chain of custody** where *the attestation IS the invoice* and *reputation IS verification rate*. An auth grant is itself a signed attestation — the **same shape** forge-alloy already chains. So a `SignedCapabilityGrant` / `SignedMeshMembership` can be a **leaf in the forge-alloy Merkle chain**: every grant + revocation anchored, giving auditable provenance ("who granted what, when, in which chain") and tamper-evidence for free. **Auth and provenance converge on one signed-statement substrate**, not two parallel ones.
+
+### Multi-factor / threshold
+
+The single-owner-signature model generalizes to multi-sig: make the signature a *set* with a per-tier threshold policy (e.g. a Trusted grant needs one owner sig; minting an Owner-equivalent grant for a new machine needs two factors — a passkey **and** the owner key). The grant body is unchanged; the verification policy gains a threshold.
+
+The shape that welcomes all three: keep the grant **body** stable (subject, capabilities, mesh_identity, epoch, expiry) and let only the **proof** layer (credential type, signature set, Merkle anchor) grow.
+
 ## Open questions (for M5 + Joel — do NOT implement before answered)
 
 1. **Issuer key = account owner key:** how does a verifier learn the trusted owner pubkey for a `mesh_identity`? (Pinned at enroll? Published in the account-registry root, itself owner-signed?)
