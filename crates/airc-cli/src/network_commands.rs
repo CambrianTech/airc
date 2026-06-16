@@ -283,7 +283,12 @@ fn now_ms() -> u64 {
 pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
     let me = airc.peer_id();
-    let current = airc.current_room().await?;
+    // READ-ONLY: `default_room` (not `current_room`) — `current_room`
+    // lazily subscribes to #general + publishes a presence beacon on a
+    // fresh scope, which would make this "no mutation" inspection
+    // command mutate. `None` here = no default room subscribed yet.
+    // (#1217 cross-review, M5.)
+    let current = airc.peek_default_room().await?;
 
     // ONE machine-account store (§3.3) — the same events.sqlite the
     // daemon's coordinator writes beacons into. Reading it shows what
@@ -323,11 +328,14 @@ pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dy
             .unwrap_or_default()
     };
 
+    let room_display = match current.as_ref() {
+        Some(room) => format!("#{}", room.name),
+        None => "(none — run `airc join`)".to_string(),
+    };
     println!(
-        "mesh: {identity}    you: {me_short}    default room: #{room}",
+        "mesh: {identity}    you: {me_short}    default room: {room_display}",
         identity = identity.as_str(),
         me_short = short(&me.to_string()),
-        room = current.name,
     );
     println!();
 
@@ -397,11 +405,21 @@ pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dy
     // by default? This is the signal that was missing when BIGMAMA sent
     // into #cambriantech while every Mac was on #general.
     println!();
-    let convergence = convergence_status(&current.name, &other_live_channels);
+    let Some(room) = current.as_ref() else {
+        // No default room on this scope yet (read-only: we did NOT
+        // create one). Nothing to converge against until the operator
+        // joins a room.
+        println!(
+            "\u{2022} no default room on this scope yet — run `airc join` to pick one, \
+             then peers in it show as reachable."
+        );
+        return Ok(());
+    };
+    let convergence = convergence_status(&room.name, &other_live_channels);
     if convergence.reachable {
         println!(
-            "\u{2713} reachable: your default room #{room} has live peer(s) in it.",
-            room = current.name,
+            "\u{2713} reachable: your default room #{room_name} has live peer(s) in it.",
+            room_name = room.name,
         );
     } else if convergence.other_peer_count == 0 {
         println!(
@@ -410,8 +428,8 @@ pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dy
         );
     } else {
         println!(
-            "\u{26a0} CONVERGENCE: your default room #{room} has 0 OTHER reachable peers.",
-            room = current.name,
+            "\u{26a0} CONVERGENCE: your default room #{room_name} has 0 OTHER reachable peers.",
+            room_name = room.name,
         );
         println!(
             "   {count} live peer(s) are on: {rooms}",

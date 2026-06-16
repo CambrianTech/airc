@@ -1290,6 +1290,26 @@ impl Airc {
         Ok(room)
     }
 
+    /// Read-only peek at the default room: returns it if one is already
+    /// subscribed, or `None` on a fresh scope — WITHOUT the lazy
+    /// subscribe + `set_default` + `save` + `publish_presence` +
+    /// identity-card emit that [`current_room`] (and its alias
+    /// [`default_room`]) perform on first use.
+    ///
+    /// Inspection commands whose contract is "no mutation" (e.g. `airc
+    /// network`) MUST use this: merely *looking* at the mesh must never
+    /// create a subscription or publish a presence beacon as a side
+    /// effect. Regression for the #1217 cross-review (M5): `airc
+    /// network` on a fresh scope was silently subscribing to #general
+    /// and publishing a beacon via `current_room`, violating its own
+    /// read-only contract.
+    pub async fn peek_default_room(&self) -> Result<Option<Room>, AircError> {
+        let set = self.subscription_set().await?;
+        Ok(set
+            .default_subscription()
+            .map(|subscription| subscription.as_room()))
+    }
+
     pub(crate) fn event_store(&self) -> &dyn EventStore {
         self.inner.store.as_ref()
     }
