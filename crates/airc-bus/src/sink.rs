@@ -31,9 +31,10 @@ pub trait DurableSink: Send + Sync {
     /// entries pinned until persisted).
     async fn append(&self, e: &Envelope) -> Result<()>;
 
-    /// Persist a BATCH of `Durable` envelopes in ONE durable commit
-    /// (group-commit): a backing store that fsyncs per transaction pays a
-    /// single fsync for the whole batch instead of one per event. Same
+    /// Persist a BATCH of `Durable` envelopes in ONE transaction commit
+    /// (group-commit): one commit for the whole batch instead of one per event,
+    /// so fsync work (amortized at WAL checkpoint under synchronous=NORMAL) is
+    /// paid once per batch rather than per event. Same
     /// at-least-once / idempotent-on-`event_id` contract as [`append`]; on
     /// success every event is visible to subsequent [`page`](DurableSink::page)
     /// calls. The default loops [`append`] (correct, no group-commit) so

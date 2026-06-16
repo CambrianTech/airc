@@ -610,8 +610,9 @@ impl EventRouter {
             }
 
             // append is the only point we touch the durable tier; no shard
-            // lock is held across it. insert_many is atomic, so this is
-            // all-or-nothing.
+            // lock is held across it. The batch persists as a single multi-row
+            // INSERT (one atomic SQLite statement), so on error nothing is
+            // committed — the failure path below re-pins the whole batch.
             let envs: Vec<&Envelope> = batch.iter().map(|i| i.env.as_ref()).collect();
             if inner.sink.append_batch(&envs).await.is_err() {
                 // Batch append failed: leave EVERY ring entry pinned so the
