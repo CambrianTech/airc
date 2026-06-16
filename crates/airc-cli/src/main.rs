@@ -444,6 +444,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Peers => commands::run_peer_list(&home, false).await,
 
+        Command::Network { all } => network_commands::run_network(&home, all).await,
+
         Command::Whois { peer } => match peer {
             Some(peer) => commands::run_whois_peer(&home, &peer).await,
             None => identity_commands::run_show(&home).await,

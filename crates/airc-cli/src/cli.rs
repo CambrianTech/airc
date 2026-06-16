@@ -708,6 +708,21 @@ pub enum Command {
     /// kept as the low-friction human / agent coordination surface.
     Peers,
 
+    /// Show the live mesh at a glance: which peers are live, on which
+    /// channels, with what dialable endpoint — plus a loud warning when
+    /// your default room has 0 other reachable peers.
+    ///
+    /// Read-only over the daemon's coordinator beacon store + peer
+    /// trust store (no `gh` round-trip, no publish). Run `airc registry
+    /// sync` first if you want the freshest cross-machine beacons.
+    Network {
+        /// List every stale beacon individually. Default collapses them
+        /// to a one-line summary so the live set + convergence verdict
+        /// stay the headline.
+        #[arg(long, short)]
+        all: bool,
+    },
+
     /// Show identity information for self or an enrolled peer.
     ///
     /// With no target, prints this scope's identity card. With a peer
