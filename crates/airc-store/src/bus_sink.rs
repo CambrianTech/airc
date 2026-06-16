@@ -126,6 +126,36 @@ impl DurableSink for SqliteDurableSink {
         }
     }
 
+    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the whole
+    /// batch = ONE transaction = ONE fsync (vs one per event in `append`). Same
+    /// idempotent-on-`event_id` contract. SQLite executes a multi-VALUES insert
+    /// atomically, so on error nothing is committed and the caller re-pins the
+    /// whole batch (no partial-persist ambiguity).
+    async fn append_batch(&self, events: &[&Envelope]) -> Result<(), BusError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let actives = events
+            .iter()
+            .map(|e| to_active_model(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        let res = bus_event::Entity::insert_many(actives)
+            .on_conflict(
+                OnConflict::column(bus_event::Column::EventId)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            // Every row in the batch already existed (all conflicted) — the
+            // DO-NOTHING all-dupes path. Idempotent success, not an error.
+            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+            Err(err) => Err(BusError::Sink(err.to_string())),
+        }
+    }
+
     async fn page(
         &self,
         channel: RoomId,
