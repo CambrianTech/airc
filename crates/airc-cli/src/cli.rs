@@ -964,38 +964,38 @@ mod tests {
 
     #[test]
     fn default_home_uses_git_project_root_scope() {
-        let root = tempfile::TempDir::new().unwrap();
-        let repo = root.path().join("repo");
+        // Hermetic: STUB the git-main-working-tree resolver instead of
+        // shelling out to real `git` in a temp repo. The earlier version
+        // called the real `default_home_dir_for` (which shells `git
+        // rev-parse`), and that is environment-fragile under parallel
+        // unit tests + CI runners: git's dubious-ownership / safe.directory
+        // check can intermittently REFUSE a freshly-init'd temp repo (and
+        // a sibling test mutating the process-global `$HOME`/cwd can race
+        // git's config read), so `git_main_working_tree` returns None and
+        // `default_home_dir_for` falls back to the machine-account home —
+        // a non-deterministic red that blocked unrelated PRs (the #1230
+        // diagnostic assertion is what surfaced exactly this fallback).
+        //
+        // The mapping logic under test — "a resolved git main working
+        // tree ⇒ <tree>/.airc, NOT the machine-account home" — is what
+        // this pins, deterministically, via the same `..._with` stub seam
+        // the sibling default_home tests use. The git-shell integration
+        // itself is exercised in production + the daemon integration
+        // tests, not in a flaky parallel unit test.
+        use super::default_home_dir_for_with;
+        use std::path::{Path, PathBuf};
+        let repo = PathBuf::from("/Users/test/Development/myproj");
         let nested = repo.join("src").join("inner");
-        std::fs::create_dir_all(&nested).unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let actual = default_home_dir_for(&nested);
-        std::fs::create_dir_all(&actual).unwrap();
-        // Canonicalize `repo` (which ALWAYS exists) and append `.airc`,
-        // rather than canonicalizing the `.airc` dir directly. The old
-        // code did `expected.canonicalize().unwrap()` on `repo/.airc`,
-        // which only exists if `actual == repo/.airc`. When the
-        // git-toplevel walk intermittently fell back to `$HOME/.airc` on
-        // the macOS runner (git refusing the fresh temp repo — dubious
-        // ownership / timing), `actual` was created under $HOME, `repo/
-        // .airc` never existed, and `canonicalize()` panicked with an
-        // opaque `NotFound` instead of a CLEAR assertion. Canonicalizing
-        // `repo` (handles macOS `/var`→`/private/var` symlinks and the
-        // Windows verbatim `\\?\` prefix uniformly) makes a real
-        // mismatch a readable failure, not a flaky panic.
-        let expected = repo.canonicalize().unwrap().join(".airc");
-        let actual_canon = actual.canonicalize().unwrap();
+        let machine_account = PathBuf::from("/Users/test/.airc");
+        // No `.airc` ancestor of `nested`; the resolver must fall through
+        // to the git main working tree (stubbed) and scope to <repo>/.airc.
+        let stub = |_: &Path| -> Option<PathBuf> { Some(repo.clone()) };
+        let resolved = default_home_dir_for_with(&nested, Some(machine_account.as_path()), &stub);
         assert_eq!(
-            actual_canon, expected,
-            "git-project-root scope must resolve to <repo>/.airc; a \
-             <HOME>/.airc here means the git toplevel walk fell back to \
-             the machine-account home (git refused the temp repo?)"
+            resolved,
+            repo.join(".airc"),
+            "a resolved git main working tree must scope home to <tree>/.airc, \
+             not fall back to the machine-account home"
         );
     }
 
