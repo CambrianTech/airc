@@ -103,6 +103,20 @@ pub struct CapabilityQuery<'a> {
     /// Offers last seen more than this many ms before `now_ms` are aged
     /// out of results.
     pub ttl_ms: u64,
+    /// Peers reachable RIGHT NOW via a live transport adapter (LAN
+    /// connection, a recent direct frame) — the adapter-ladder liveness
+    /// signal. An entry whose `peer_id` is in this set is treated as LIVE
+    /// even if its offer `last_seen_ms` has aged past `ttl_ms`.
+    ///
+    /// Why: capability staleness keys off the rendezvous-beacon / re-advert
+    /// cadence, which is gh-gist-coupled and gh-auth-gated; when that path
+    /// flaps, a peer's offer ages out and routing DROPS it — orphaning a
+    /// node that is perfectly DELIVERABLE over LAN (delivery already uses
+    /// the tried-in-order adapter ladder; liveness must not ignore it).
+    /// `None` = no adapter signal available (preserves the prior
+    /// beacon-only behaviour). The gist beacon stays the rendezvous of
+    /// last resort for DISCOVERY, never the sole truth for LIVENESS.
+    pub reachable_peers: Option<&'a std::collections::HashSet<PeerId>>,
 }
 
 impl CapabilityRegistry {
@@ -182,7 +196,16 @@ impl CapabilityRegistry {
         let mut candidates: Vec<CapabilityCandidate> = self
             .entries
             .values()
-            .filter(|entry| !is_stale(entry.last_seen_ms, query.now_ms, query.ttl_ms))
+            // Live if the offer is fresh OR the peer is reachable right now
+            // via a live adapter (the adapter-ladder liveness OR). A
+            // LAN-connected peer is never dropped from routing just because
+            // its gh-gist-gated beacon/offer aged out.
+            .filter(|entry| {
+                !is_stale(entry.last_seen_ms, query.now_ms, query.ttl_ms)
+                    || query
+                        .reachable_peers
+                        .is_some_and(|live| live.contains(&entry.peer_id))
+            })
             .filter_map(|entry| {
                 let matched_tags = matched_tag_count(&entry.capabilities, query.required_tags);
                 // ALL required tags must be present. Empty required_tags
@@ -271,6 +294,7 @@ mod tests {
             required_tags: tags,
             now_ms,
             ttl_ms: DEFAULT_OFFER_TTL_MS,
+            reachable_peers: None,
         }
     }
 
@@ -319,6 +343,7 @@ mod tests {
             required_tags: &["code"],
             now_ms: 12_000,
             ttl_ms: 5_000,
+            reachable_peers: None,
         };
         let hit = registry.match_for(&q, |_| TrustTier::OwnMachine);
         assert_eq!(hit.len(), 1, "re-advert kept the node live");
@@ -336,6 +361,7 @@ mod tests {
             required_tags: &["code"],
             now_ms: 1_000 + DEFAULT_OFFER_TTL_MS + 1,
             ttl_ms: DEFAULT_OFFER_TTL_MS,
+            reachable_peers: None,
         };
         assert!(
             registry.match_for(&q, |_| TrustTier::OwnMachine).is_empty(),
@@ -343,6 +369,64 @@ mod tests {
         );
         // Entry still physically present until pruned (query-time ageing).
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn reachable_peer_matches_despite_stale_offer_adapter_ladder_rescue() {
+        // The orphaning fix: a peer whose offer has aged past ttl (its
+        // gh-gist-gated beacon/re-advert went stale) MUST still match when
+        // it is reachable RIGHT NOW via a live adapter — delivery would
+        // reach it over LAN, so routing must not drop it. Without the OR
+        // this peer ages out (proven by `ages_out_stale_entries_at_query_time`);
+        // with it in `reachable_peers`, it stays routable.
+        let mut registry = CapabilityRegistry::new();
+        let peer = PeerId::from_u128(42);
+        registry.ingest_offer(peer, caps("skylar", &["code"], "fable-5", 100_000), 1_000);
+
+        let now = 1_000 + DEFAULT_OFFER_TTL_MS + 1; // offer is stale at this clock
+        let reachable: std::collections::HashSet<PeerId> = std::iter::once(peer).collect();
+
+        // Beacon-only (reachable_peers: None) → aged out, as the sibling
+        // test pins. With the adapter-ladder set → rescued.
+        let stale_q = CapabilityQuery {
+            required_tags: &["code"],
+            now_ms: now,
+            ttl_ms: DEFAULT_OFFER_TTL_MS,
+            reachable_peers: None,
+        };
+        assert!(
+            registry
+                .match_for(&stale_q, |_| TrustTier::OwnMachine)
+                .is_empty(),
+            "control: a stale offer with no adapter signal still ages out"
+        );
+
+        let rescued_q = CapabilityQuery {
+            reachable_peers: Some(&reachable),
+            ..stale_q
+        };
+        let hit = registry.match_for(&rescued_q, |_| TrustTier::OwnMachine);
+        assert_eq!(
+            hit.len(),
+            1,
+            "a stale-offer peer that is LAN-reachable must still match (adapter-ladder rescue)"
+        );
+        assert_eq!(hit[0].peer_id, peer);
+
+        // And the rescue is targeted: a DIFFERENT reachable peer does not
+        // resurrect this stale one.
+        let other: std::collections::HashSet<PeerId> =
+            std::iter::once(PeerId::from_u128(99)).collect();
+        let other_q = CapabilityQuery {
+            reachable_peers: Some(&other),
+            ..stale_q
+        };
+        assert!(
+            registry
+                .match_for(&other_q, |_| TrustTier::OwnMachine)
+                .is_empty(),
+            "reachability of a different peer must not rescue this stale offer"
+        );
     }
 
     #[test]
