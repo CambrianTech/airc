@@ -15,7 +15,7 @@ Auth is therefore: **a single root of trust (the account owner's key) issuing si
 |---|---|---|
 | Ed25519 identity + signed events | `airc-identity` / `airc-core` | the crypto root — actions are attributable to a `peer_id` |
 | `MeshIdentity` | `airc-lib/mesh_identity.rs` | the account fence — "is this peer one of mine?" |
-| `TrustTier` (Untrusted/Provisional/Trusted/Owner) | `airc-trust` | the typed grant level |
+| `TrustTier` (`OwnMachine`/`OwnAccount`/`Friend`/`Untrusted`) | `airc-trust` | the typed grant level — `OwnAccount` literally means "same GH account, different machine" (the grid's separate `TrustLevel` enum — `Blocked`/`Provisional`/`Trusted`/`Owner` — is a distinct ACL type the bridge maps to/from) |
 | `PersonaCapabilities { capability_tags: Vec<String> }` | `airc-core/persona.rs` | what a node can do/serve |
 | `CapabilityRegistry` (match by tags, **rank by `trust_tier`**) | `airc-lib/capability_registry.rs` | routing already trust-gates capability |
 | `external_identity.rs` | `airc-lib` | binding an external-system assistant (Hermes/OpenClaw) to a grid identity |
@@ -36,7 +36,7 @@ pub struct MeshMembershipAttestation {
     pub subject: PeerId,
     pub subject_pubkey: PublicKey,   // bind to the KEY, not just the uuid (no id-spoof)
     pub mesh_identity: MeshIdentity, // the account this membership is within
-    pub default_tier: TrustTier,     // Provisional for a plain member; owner may attest higher
+    pub default_tier: TrustTier,     // OwnAccount for a plain same-account member; owner may attest higher
     pub issued_at_ms: u64,
     pub expires_at_ms: Option<u64>,  // optional, for key/membership rotation
 }
