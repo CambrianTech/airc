@@ -48,6 +48,7 @@ pub mod diagnostic_event_sink;
 pub mod error;
 pub mod external_identity;
 pub mod gh;
+pub mod grid_auth;
 pub mod join_context;
 mod lan;
 pub mod lane_coordination;
