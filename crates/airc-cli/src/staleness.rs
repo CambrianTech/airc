@@ -1,8 +1,8 @@
 //! Binary staleness warning — print a banner when this `airc` binary
-//! is older than `origin/rust-rewrite` tip for the airc crates.
+//! is older than `origin/canary` tip for the airc crates.
 //!
 //! Card f10c951e. The recurring failure mode: substrate fixes merge
-//! into rust-rewrite, but every agent's local `airc` binary lags
+//! into canary, but every agent's local `airc` binary lags
 //! behind because nothing tells them to rebuild. We've hit this
 //! repeatedly:
 //!
@@ -17,10 +17,10 @@
 //! ## What this prints
 //!
 //! On every CLI invocation (cheap; cached for 5 minutes), check if
-//! the binary's compile-time commit is behind `origin/rust-rewrite`
+//! the binary's compile-time commit is behind `origin/canary`
 //! for paths under `crates/airc-*`. If so, print a banner on stderr:
 //!
-//!   ⚠ airc binary is N commits behind rust-rewrite — run `airc update`
+//!   ⚠ airc binary is N commits behind canary — run `airc update`
 //!     to rebuild and reinstall in place.
 //!
 //! Stderr (not stdout) keeps parseable command output clean. The
@@ -32,8 +32,10 @@
 //!
 //!   - `build_info::is_unknown()` — release tarball / no git at
 //!     compile time, can't compare; silent
-//!   - cwd is not inside a git working tree; silent
-//!   - cwd's git working tree is not the airc repo; silent
+//!   - neither the install-source marker NOR cwd resolves to an airc
+//!     git working tree (e.g. a prebuilt-binary install with no source
+//!     checkout) — can't git-compare; silent (a future slice can fall
+//!     back to a GitHub-API tip comparison for source-less installs)
 //!   - check ran successfully in the last 5 minutes and was already
 //!     up-to-date; silent
 //!   - `git` shell-out failed; silent (no false positives)
@@ -81,8 +83,11 @@ pub fn warn_if_stale() {
         // reinstalls IN PLACE (same location, + marker + skills), so it
         // can't create a dual-binary split.
         eprintln!(
-            "⚠ airc binary is {behind} {label} behind rust-rewrite — \
-             run `airc update` to rebuild and reinstall in place."
+            "⚠ airc binary is {behind} {label} behind canary — run `airc update` \
+             to rebuild + reinstall in place. If `airc update` hangs on an old \
+             build (pre-#1218), do a one-time manual rebuild: \
+             cd \"$(cat ~/.airc/install-source)\" && git checkout canary && \
+             git pull && ./install.sh"
         );
         // Don't update the cache when stale — every run reminds.
     }
@@ -93,6 +98,18 @@ pub fn warn_if_stale() {
 ///   - cwd's git repo isn't airc (heuristic: a `crates/airc-cli/`
 ///     directory exists)
 fn airc_repo_root() -> Option<PathBuf> {
+    // Prefer the recorded install-source checkout so the staleness check
+    // works REGARDLESS OF CWD: a peer running `airc` from anywhere (not
+    // sitting inside the airc clone) still learns its binary is stale.
+    // This is the core of #1225 — the old cwd-only discovery was silent
+    // for every peer not in the repo, so stale binaries went unnoticed.
+    if let Ok(src) = crate::update_commands::install_source_dir() {
+        if src.join("crates/airc-cli").is_dir() {
+            return Some(src);
+        }
+    }
+    // Fallback: cwd-based discovery (a dev working inside a clone with no
+    // install-source marker set).
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -111,10 +128,21 @@ fn airc_repo_root() -> Option<PathBuf> {
     Some(root)
 }
 
-/// Count commits on `origin/rust-rewrite` that landed AFTER
+/// Count commits on `origin/canary` that landed AFTER
 /// `current_commit` and touch any `crates/airc-*` path. Returns None
 /// on git failure (silent — better than a false positive).
 fn count_commits_behind(repo_root: &Path, current_commit: &str) -> Option<usize> {
+    // Best-effort: refresh origin/canary so the count reflects the REAL
+    // remote tip, not a stale local ref (the old check compared to
+    // whatever origin/canary happened to be locally — useless if never
+    // fetched). The whole staleness check is cache-gated (CACHE_TTL), so
+    // this fetch runs at most once per TTL. Quiet + ignore failure
+    // (offline is fine — we just compare against the last-known tip).
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["fetch", "--quiet", "origin", "canary"])
+        .output();
     let paths = [
         "crates/airc-cli",
         "crates/airc-lib",
@@ -134,7 +162,7 @@ fn count_commits_behind(repo_root: &Path, current_commit: &str) -> Option<usize>
     let mut args: Vec<String> = vec![
         "rev-list".to_string(),
         "--count".to_string(),
-        format!("{current_commit}..origin/rust-rewrite"),
+        format!("{current_commit}..origin/canary"),
         "--".to_string(),
     ];
     for p in &paths {
