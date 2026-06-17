@@ -1,0 +1,65 @@
+# airc generate facility — the GPU generation server.
+#
+# llama.cpp server (chat/completions, NOT --embedding) on the RTX 5090, serving
+# a capable model over the OpenAI `/v1/chat/completions` endpoint. The
+# airc-generate-bridge advertises it as `ai/generate` so GPU-less personas lease
+# the model call over the grid (cognition stays local — "remote grid inference").
+#
+# Sibling to ../embedding-facility/docker-compose.yml; same llama.cpp CUDA image,
+# different mode (generation, not embedding) and a larger model.
+#
+# Validate standalone (Docker engine up):
+#   cd integrations/generate-facility
+#   docker compose up
+#   curl -s localhost:8081/v1/chat/completions -H 'content-type: application/json' \
+#     -d '{"messages":[{"role":"user","content":"say hi in 3 words"}],"max_tokens":16}' \
+#     | jq -r '.choices[0].message.content'
+#
+# The model + server are ADAPTERS: override GEN_HF_REPO / GEN_HF_FILE to serve a
+# different capable model. (Generation does NOT need the embedding facility's
+# one-vector-space lockstep — a persona routes by model_hint, and the bridge
+# refuses a turn whose model_hint it doesn't host.)
+
+services:
+  generator:
+    image: ${GEN_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: airc-generator
+    restart: unless-stopped
+    # The capable model the 5090 serves. Default is a real public coding model
+    # that fits the 5090's 32GB VRAM (Qwen2.5-Coder-32B-Instruct, Q4_K_M ~20GB);
+    # override GEN_HF_REPO/GEN_HF_FILE with the project's forged qwen3-coder once
+    # it's published. Pin a digest once Blackwell sm_120 is verified (same caveat
+    # as the embedding facility).
+    command: >
+      --hf-repo ${GEN_HF_REPO:-Qwen/Qwen2.5-Coder-32B-Instruct-GGUF}
+      --hf-file ${GEN_HF_FILE:-qwen2.5-coder-32b-instruct-q4_k_m.gguf}
+      --ctx-size ${GEN_CTX:-32768}
+      --host 0.0.0.0
+      --port 8081
+      --n-gpu-layers 99
+      --jinja
+    ports:
+      # Loopback only — the airc-generate-bridge (the sole client) runs on this
+      # host; the grid reaches generation via airc + the capability ACL, never an
+      # exposed HTTP port. Port 8081 (8080 is the embedding facility).
+      - "127.0.0.1:8081:8081"
+    volumes:
+      # Model cache on the 16TB foundry drive (HDD fine: sequential load, VRAM
+      # inference). Named-volume fallback for boxes without the drive.
+      - ${GEN_MODEL_CACHE:-llama-gen-cache}:/root/.cache/llama.cpp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 300s # large model load
+
+volumes:
+  llama-gen-cache:
