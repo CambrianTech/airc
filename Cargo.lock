@@ -47,6 +47,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "airc-acp-bridge"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "airc-lib",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "airc-blobs"
 version = "0.1.0"
 dependencies = [
