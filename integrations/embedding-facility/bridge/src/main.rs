@@ -7,17 +7,18 @@
 //! the facility architecture and the one-vector-space invariant.
 //!
 //! ## Slices
-//! - **Slice 2a (this file):** the citizen + capability-advertisement half.
-//!   Joins a room, grounds by name, advertises the `ai/embedding` capability
-//!   (re-advertised on a cadence so it never ages out of peers' registries —
-//!   the staleness-flap is a known routing P0), and answers an `/embed <text>`
-//!   PROBE by round-tripping through the local llama.cpp server. The probe is
-//!   the live smoke test (mirrors acp's `/acp-ping`); it exercises the whole
-//!   chain (airc → llama.cpp → reply) the moment the GPU server is up.
-//! - **Slice 2b:** typed `EmbeddingRequested`/`EmbeddingEmitted` nouns in the
-//!   consumer vocabulary + the command-bus request/reply path, so peers route
-//!   embeddings through the SAME `resolve_inference_target` spine that routes
-//!   turns — not the `/embed` probe string.
+//! - **Slice 2a:** the citizen + capability-advertisement half. Joins a room,
+//!   grounds by name, advertises the `ai/embedding` capability (re-advertised on
+//!   a cadence so it never ages out of peers' registries — the staleness-flap is
+//!   a known routing P0), and answers an `/embed <text>` PROBE by round-tripping
+//!   the local llama.cpp server (the live smoke, mirrors acp's `/acp-ping`).
+//! - **Slice 2b (this file, with 2a):** the MACHINE path. Answers a typed
+//!   `EmbeddingRequested` command-bus request (`consumer_shapes::continuum`) by
+//!   embedding via llama.cpp and replying `EmbeddingEmitted` — the same
+//!   request/reply carriage `TurnRequested`/`TurnEmitted` ride. This is what
+//!   slice 3's `GridEmbeddingProvider` drives via `request_embedding_remote`;
+//!   the `/embed` probe stays as the human smoke. Refuses (loud) a request for a
+//!   model it does not host — never embeds in the wrong vector space.
 //! - **Slice 3:** continuum's neural `EmbeddingProvider` grows a
 //!   `GridEmbeddingProvider` that embeds locally for the hot path and escalates
 //!   batch jobs to this facility via the capability registry.
@@ -29,7 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use airc_core::PersonaCapabilities;
 use airc_core::{PeerId, TranscriptEvent, TranscriptKind};
 use airc_lib::Airc;
-use consumer_shapes::continuum::{encode_capability_offer, CapabilityOffer};
+use consumer_shapes::continuum::{
+    decode_embedding_event, encode_capability_offer, reply_embedding_emitted, CapabilityOffer,
+    EmbeddingEmitted, EmbeddingEvent, HEADER_FORGE_AI_EMBEDDING_KIND,
+};
 use futures::StreamExt;
 
 /// How often to re-publish the capability offer. Kept well under the registry's
@@ -123,10 +127,10 @@ async fn advertise(airc: &Airc, offer: &CapabilityOffer) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// The citizen loop: re-advertise on a cadence, and for each inbound `/embed`
-/// probe from another peer, round-trip through the local llama.cpp server and
-/// post the result. Anything else is left alone (no chatty echo — the bridge
-/// answers only an explicit probe until slice 2b's typed request path lands).
+/// The citizen loop: re-advertise on a cadence, and for each inbound event
+/// either (a) answer a typed `EmbeddingRequested` command-bus request — the
+/// MACHINE path that slice 3's `GridEmbeddingProvider` drives — or (b) answer an
+/// `/embed <text>` human PROBE. Anything else is left alone (no chatty echo).
 async fn run_bridge(
     airc: &Airc,
     me: PeerId,
@@ -150,6 +154,12 @@ async fn run_bridge(
                 let Some(item) = item else { break }; // stream ended
                 match item {
                     Ok(event) => {
+                        // Machine path (slice 2b): typed command-bus embedding request.
+                        if is_embedding_request(&event, me) {
+                            handle_embedding_request(airc, &event, http, base_url, model).await;
+                            continue;
+                        }
+                        // Human path (slice 2a): the /embed live smoke probe.
                         let Some(text) = probe_input(&event, me) else { continue };
                         let reply = match llamacpp::embed(http, base_url, &[text.to_string()], Some(model)).await {
                             Ok(vectors) => format_probe_reply(&vectors, model),
@@ -163,6 +173,73 @@ async fn run_bridge(
         }
     }
     Ok(())
+}
+
+/// True iff this event is a typed embedding REQUEST from another peer. Cheap:
+/// keys off the projected `forge.ai.embedding.kind = requested` header, no body
+/// decode. (Our own posts and `emitted` replies are not requests.)
+fn is_embedding_request(event: &TranscriptEvent, me: PeerId) -> bool {
+    event.peer_id != me
+        && event
+            .headers
+            .get(HEADER_FORGE_AI_EMBEDDING_KIND)
+            .map(String::as_str)
+            == Some("requested")
+}
+
+/// Answer a typed `EmbeddingRequested`: decode, refuse loudly if it asks for a
+/// model we do not host (never embed in the wrong vector space), embed via
+/// llama.cpp, and reply `EmbeddingEmitted` correlating the command bus. Errors
+/// are logged, not propagated — one bad request must not kill the facility loop;
+/// the requester's `await_reply` deadlines loudly on a non-reply.
+async fn handle_embedding_request(
+    airc: &Airc,
+    event: &TranscriptEvent,
+    http: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+) {
+    let req = match decode_embedding_event(&event.headers, event.body.as_ref()) {
+        Ok(EmbeddingEvent::Requested(r)) => r,
+        Ok(EmbeddingEvent::Emitted(_)) => return, // we answer requests, not replies
+        Err(e) => {
+            eprintln!("airc-embedding-bridge: undecodable embedding request: {e}");
+            return;
+        }
+    };
+    if req.model != model {
+        // Routing should prevent this (the model-qualified capability tag), but
+        // refuse defensively rather than serve a wrong-space vector.
+        eprintln!(
+            "airc-embedding-bridge: refusing request {} for model '{}' — this facility serves '{}'",
+            req.request_id, req.model, model
+        );
+        return;
+    }
+    let vectors = match llamacpp::embed(http, base_url, &req.inputs, Some(model)).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "airc-embedding-bridge: embed failed for {}: {e}",
+                req.request_id
+            );
+            return;
+        }
+    };
+    let dim = vectors.first().map(|v| v.len() as u32).unwrap_or(0);
+    let emitted = EmbeddingEmitted {
+        request_id: req.request_id.clone(),
+        model: model.to_string(),
+        vectors,
+        dim,
+        emitted_at_ms: now_ms(),
+    };
+    if let Err(e) = reply_embedding_emitted(airc, &event.headers, &emitted).await {
+        eprintln!(
+            "airc-embedding-bridge: reply failed for {}: {e}",
+            req.request_id
+        );
+    }
 }
 
 /// Pure probe filter: returns the text to embed iff this event is a chat
@@ -313,5 +390,44 @@ mod tests {
             reply.contains("0.1000"),
             "reply previews leading components: {reply}"
         );
+    }
+
+    fn with_kind(peer: PeerId, kind: &str) -> TranscriptEvent {
+        let mut ev = msg(peer, "{}");
+        ev.headers
+            .insert(HEADER_FORGE_AI_EMBEDDING_KIND.to_string(), kind.to_string());
+        ev
+    }
+
+    #[test]
+    fn detects_typed_embedding_request_from_another_peer() {
+        // what this catches: the MACHINE path (slice 2b) must fire on a typed
+        // `requested` frame from another peer — that's the command-bus request
+        // slice 3's GridEmbeddingProvider sends.
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        assert!(is_embedding_request(&with_kind(other, "requested"), me));
+    }
+
+    #[test]
+    fn emitted_frame_is_not_a_request() {
+        // what this catches: the bridge answers REQUESTS, never replies — an
+        // `emitted` frame must not be treated as inbound work (would loop).
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        assert!(!is_embedding_request(&with_kind(other, "emitted"), me));
+    }
+
+    #[test]
+    fn own_embedding_request_is_ignored() {
+        let me = PeerId::from_u128(1);
+        assert!(!is_embedding_request(&with_kind(me, "requested"), me));
+    }
+
+    #[test]
+    fn plain_message_is_not_an_embedding_request() {
+        let me = PeerId::from_u128(1);
+        let other = PeerId::from_u128(2);
+        assert!(!is_embedding_request(&msg(other, "hello"), me));
     }
 }
