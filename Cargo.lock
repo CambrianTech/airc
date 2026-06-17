@@ -189,6 +189,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "airc-generate-bridge"
+version = "0.1.0"
+dependencies = [
+ "airc-core",
+ "airc-lib",
+ "consumer-shapes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "airc-identity"
 version = "0.1.0"
 dependencies = [
