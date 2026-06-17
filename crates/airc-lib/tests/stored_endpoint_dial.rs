@@ -588,3 +588,97 @@ async fn dial_walks_endpoints_in_stored_order_and_stops_on_success() {
         started.elapsed()
     );
 }
+
+/// Concurrency pin — peers are dialed CONCURRENTLY, so the refresh
+/// wall-clock is `~max(single-peer dial)`, NOT the SUM across peers.
+///
+/// what this catches: the serial-dial hang. The loop in
+/// `dial_stored_peer_endpoints` used to walk peers one at a time, each
+/// unreachable peer paying the full `PEER_DIAL_TIMEOUT` before the next
+/// was even attempted. On a real account with dozens of enrolled peers
+/// (41 on BIGMAMA, ~15 off-LAN), a cold refresh — before any endpoint
+/// is quarantined — serially burned ~45s, hanging `airc doctor
+/// --health` and every send-path refresh. A regression to serial
+/// dialing makes N tarpit peers take N×3s; this test bounds the whole
+/// refresh well under that.
+///
+/// Each "peer" advertises a TARPIT endpoint: a TCP listener that
+/// ACCEPTS the connection but never speaks TLS, so `connect_lan` blocks
+/// in the handshake until `PEER_DIAL_TIMEOUT` fires (a closed port would
+/// be refused instantly and prove nothing about concurrency). With
+/// N_TARPITS peers, serial = N×3s = 15s; concurrent ≈ 3s. The 9s bound
+/// is generous enough for a loaded CI runner yet still fails loudly if
+/// the dials ever go serial again.
+#[tokio::test]
+async fn peers_are_dialed_concurrently_not_serially() {
+    const N_TARPITS: usize = 5;
+
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let bob = Airc::open(tmp_b.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    // Hold the tarpit listeners + their accept tasks alive for the whole
+    // test: each accepts inbound TCP and parks the stream, never
+    // completing TLS, so the dialer's handshake stalls to the deadline.
+    let mut tarpits = Vec::new();
+    let mut peer_tmps = Vec::new();
+    for _ in 0..N_TARPITS {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("tarpit bind");
+        let addr = listener.local_addr().expect("tarpit addr");
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            // Accept and PARK every inbound stream — never speak TLS, so
+            // the dialer's handshake stalls to PEER_DIAL_TIMEOUT.
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        tarpits.push(handle);
+
+        // A real enrolled peer identity whose ONLY endpoint is the tarpit.
+        let tmp = TempDir::new().expect("peer tempdir");
+        let peer = Airc::open(tmp.path().join(".airc"))
+            .await
+            .expect("peer open");
+        let peer_spec: PeerSpec = peer.peer_spec().parse().expect("peer spec");
+        let peer_id = peer.peer_id();
+        bob.add_peer(peer_spec).await.expect("bob trusts peer");
+        let endpoints_json =
+            endpoints_to_json(&[RouteEndpoint::LanTcp { addr }]).expect("encode endpoints");
+        airc_trust::set_endpoints_json(bob.home(), peer_id, Some(endpoints_json))
+            .await
+            .expect("store endpoints")
+            .expect("peer must be enrolled on bob");
+        peer_tmps.push((tmp, peer));
+    }
+
+    let started = std::time::Instant::now();
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+    let elapsed = started.elapsed();
+
+    // Every tarpit dial must be recorded as a failure (none connects).
+    assert_eq!(
+        snapshot.peer_dial_failures.len(),
+        N_TARPITS,
+        "each tarpit peer must record one failed dial: {:?}",
+        snapshot.peer_dial_failures
+    );
+    // The load-bearing assert: concurrent, not serial. Serial would be
+    // N_TARPITS × PEER_DIAL_TIMEOUT (15s); concurrent is ~3s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(9),
+        "{N_TARPITS} tarpit peers must be dialed CONCURRENTLY (~3s), not \
+         serially ({N_TARPITS}×3s=15s); took {elapsed:?} — the serial-dial \
+         hang has regressed"
+    );
+
+    for handle in tarpits {
+        handle.abort();
+    }
+}
