@@ -5,6 +5,7 @@
 //! to make normal local/LAN operation work.
 
 use airc_core::PeerId;
+use futures::stream::StreamExt;
 
 use crate::error::AircError;
 use crate::route::health::TransportHealthSample;
@@ -20,6 +21,20 @@ use crate::Airc;
 /// poisoned registry document could plant tarpit endpoints
 /// deliberately (#1120 sentinel blocking-2).
 const PEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Max peers dialed CONCURRENTLY in one route refresh. Per-peer dials
+/// are independent, so the refresh wall-clock is `~max(single-peer
+/// cost)` rather than the SUM of every unreachable peer's
+/// `PEER_DIAL_TIMEOUT` — the serial sum hung `doctor --health` (and
+/// any send-path refresh) for tens of seconds on a real account with
+/// dozens of enrolled peers (41 on BIGMAMA: ~15 offline × 3s ≈ 45s).
+/// Bounded so a large grid does not open hundreds of sockets at once.
+const DIAL_CONCURRENCY: usize = 16;
+
+/// One peer's route-dial result: the endpoints that failed to dial and
+/// the endpoints skipped for being in backoff. Named so the concurrent
+/// collection below doesn't trip clippy's `type_complexity` gate.
+type PeerDialOutcome = (Vec<PeerDialFailure>, Vec<PeerDialSkip>);
 
 /// Card 625abe6d slice 1 — a stored peer endpoint that could not be
 /// dialed during discovery. Surfaced on the snapshot (and printed by
@@ -132,9 +147,7 @@ impl Airc {
     /// skew the operator must see), per the no-silent-fallback rule.
     /// CONNECTION failures are not errors — offline peers are a normal
     /// mesh state — but every failed attempt is returned for display.
-    async fn dial_stored_peer_endpoints(
-        &self,
-    ) -> Result<(Vec<PeerDialFailure>, Vec<PeerDialSkip>), AircError> {
+    async fn dial_stored_peer_endpoints(&self) -> Result<PeerDialOutcome, AircError> {
         // Both registries: the machine-account wire root (where
         // account-registry import writes) FIRST, then the scope's own
         // store (where the CLI's `peer add --endpoint` writes).
@@ -214,92 +227,132 @@ impl Airc {
             }
         }
 
-        for peer_id in order {
-            let Some(endpoints) = merged.get(&peer_id) else {
-                continue;
+        // Per-peer dial work in first-seen (wire-root) order. Each
+        // peer's endpoints are walked in stored (cost) order, breaking
+        // on the first connect — that INNER walk stays serial (the
+        // cost-order + stop-on-success contract the stored_endpoint_dial
+        // tests pin). What is now CONCURRENT is ACROSS peers: dialing
+        // peer B must not wait on peer A's 3s timeout (see
+        // DIAL_CONCURRENCY — the serial-sum hang this fixes).
+        let dial_list: Vec<(PeerId, Vec<RouteEndpoint>)> = order
+            .into_iter()
+            .filter_map(|peer_id| merged.remove(&peer_id).map(|eps| (peer_id, eps)))
+            .collect();
+
+        // Dial peers concurrently (bounded), then merge results in the
+        // original peer order so operator display stays stable. `&self`
+        // is shared immutably across the dials; connect_lan clones an
+        // Arc adapter and every mutation (quarantine map, transport
+        // health) sits behind its own brief lock, so concurrent dials to
+        // distinct peers do not race.
+        let mut dialed: Vec<(usize, PeerDialOutcome)> =
+            futures::stream::iter(dial_list.into_iter().enumerate())
+                .map(|(idx, (peer_id, endpoints))| async move {
+                    (idx, self.dial_one_peer(peer_id, endpoints, now_ms).await)
+                })
+                .buffer_unordered(DIAL_CONCURRENCY)
+                .collect()
+                .await;
+        dialed.sort_by_key(|(idx, _)| *idx);
+        for (_, (peer_failures, peer_skips)) in dialed {
+            failures.extend(peer_failures);
+            skips.extend(peer_skips);
+        }
+        Ok((failures, skips))
+    }
+
+    /// Dial ONE peer's stored endpoints in cost order, breaking on the
+    /// first connect. Returns this peer's dial failures + quarantine
+    /// skips. Extracted from `dial_stored_peer_endpoints` so the
+    /// per-peer dials run concurrently; the inner endpoint walk here
+    /// stays serial because cost-order + stop-on-first-success is the
+    /// pinned contract.
+    async fn dial_one_peer(
+        &self,
+        peer_id: PeerId,
+        endpoints: Vec<RouteEndpoint>,
+        now_ms: u64,
+    ) -> PeerDialOutcome {
+        let mut failures = Vec::new();
+        let mut skips = Vec::new();
+        for endpoint in &endpoints {
+            let addr = match endpoint {
+                RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => *addr,
+                // Relay/UDP/WebRTC/Reticulum dialing lands in later
+                // slices; recording them as failures here would be noise
+                // about unimplemented transports, not signal about
+                // unreachable peers. Variants enumerated, not wildcarded,
+                // per the production no-silent-fallback clippy gate: a
+                // FUTURE endpoint variant must force this match to be
+                // revisited, not silently fall into "skip" (the wildcard
+                // slipped past #1120's review because the merge-push CI
+                // run was hand-cancelled — caught by the #1121 sentinel).
+                RouteEndpoint::Udp { .. }
+                | RouteEndpoint::Relay { .. }
+                | RouteEndpoint::Reticulum { .. }
+                | RouteEndpoint::WebRtcSignaling { .. } => continue,
             };
-            for endpoint in endpoints {
-                let addr = match endpoint {
-                    RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => *addr,
-                    // Relay/UDP/WebRTC/Reticulum dialing lands in later
-                    // slices; recording them as failures here would be
-                    // noise about unimplemented transports, not signal
-                    // about unreachable peers. Variants enumerated, not
-                    // wildcarded, per the production no-silent-fallback
-                    // clippy gate: a FUTURE endpoint variant must force
-                    // this match to be revisited, not silently fall into
-                    // "skip" (the wildcard slipped past #1120's review
-                    // because the merge-push CI run was hand-cancelled —
-                    // caught by the #1121 sentinel).
-                    RouteEndpoint::Udp { .. }
-                    | RouteEndpoint::Relay { .. }
-                    | RouteEndpoint::Reticulum { .. }
-                    | RouteEndpoint::WebRtcSignaling { .. } => continue,
-                };
-                // Card 7e3c9a1f: skip endpoints still inside their
-                // dial-failure backoff window. A daemon that restarted on
-                // a new port leaves its old `addr` in every peer's trust
-                // store until the registry re-converges; without this
-                // skip each refresh re-pays PEER_DIAL_TIMEOUT on that
-                // corpse, starving the dial to the live endpoint. The
-                // freshest (most likely live) endpoint is listed first and
-                // is never quarantined unless it itself just failed, so
-                // this never blocks a genuinely reachable peer.
-                //
-                // The skip is SURFACED, not silent — but on the SEPARATE
-                // `peer_dial_skips` channel, NOT as a `PeerDialFailure`. No
-                // dial was attempted, so reporting it as a failure would
-                // emit false `PeerDialFailed` warnings every refresh and
-                // inflate `airc transport health`'s failure count. The
-                // operator still sees "in backoff" via the skips channel —
-                // honest, not a clean-list lie and not an over-report.
-                if let Some(remaining_ms) = self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
-                {
-                    skips.push(PeerDialSkip {
+            // Card 7e3c9a1f: skip endpoints still inside their dial-
+            // failure backoff window. A daemon that restarted on a new
+            // port leaves its old `addr` in every peer's trust store
+            // until the registry re-converges; without this skip each
+            // refresh re-pays PEER_DIAL_TIMEOUT on that corpse, starving
+            // the dial to the live endpoint. The freshest (most likely
+            // live) endpoint is listed first and is never quarantined
+            // unless it itself just failed, so this never blocks a
+            // genuinely reachable peer.
+            //
+            // The skip is SURFACED, not silent — but on the SEPARATE
+            // `peer_dial_skips` channel, NOT as a `PeerDialFailure`. No
+            // dial was attempted, so reporting it as a failure would emit
+            // false `PeerDialFailed` warnings every refresh and inflate
+            // `airc transport health`'s failure count. The operator still
+            // sees "in backoff" via the skips channel — honest, not a
+            // clean-list lie and not an over-report.
+            if let Some(remaining_ms) = self.dial_quarantine_remaining_ms(peer_id, addr, now_ms) {
+                skips.push(PeerDialSkip {
+                    peer_id,
+                    endpoint: endpoint.clone(),
+                    remaining_ms,
+                });
+                continue;
+            }
+            // #1120 sentinel blocking-2: connect_lan has no inner
+            // timeout, and a SYN-dropping firewall (the default posture
+            // of the NATs this card exists to cross) hangs the OS connect
+            // for ~21-130s per endpoint. Bound every dial; a timeout is a
+            // recorded failure like any other.
+            match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id)).await {
+                Ok(Ok(())) => {
+                    // Card 7e3c9a1f: a live connect lifts any prior
+                    // quarantine so a flapped-but-recovered endpoint is
+                    // immediately eligible again next refresh.
+                    self.dial_quarantine_record_success(peer_id, addr);
+                    break;
+                }
+                Ok(Err(error)) => {
+                    self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                    failures.push(PeerDialFailure {
                         peer_id,
                         endpoint: endpoint.clone(),
-                        remaining_ms,
+                        error: error.to_string(),
                     });
-                    continue;
                 }
-                // #1120 sentinel blocking-2: connect_lan has no inner
-                // timeout, and a SYN-dropping firewall (the default
-                // posture of the NATs this card exists to cross) hangs
-                // the OS connect for ~21-130s per endpoint. Bound every
-                // dial; a timeout is a recorded failure like any other.
-                match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id)).await
-                {
-                    Ok(Ok(())) => {
-                        // Card 7e3c9a1f: a live connect lifts any prior
-                        // quarantine so a flapped-but-recovered endpoint is
-                        // immediately eligible again next refresh.
-                        self.dial_quarantine_record_success(peer_id, addr);
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
-                        failures.push(PeerDialFailure {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            error: error.to_string(),
-                        });
-                    }
-                    Err(_elapsed) => {
-                        self.dial_quarantine_record_failure(peer_id, addr, now_ms);
-                        failures.push(PeerDialFailure {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            error: format!(
-                                "dial timed out after {}s (endpoint unreachable or \
-                                 firewall drops SYN)",
-                                PEER_DIAL_TIMEOUT.as_secs()
-                            ),
-                        });
-                    }
+                Err(_elapsed) => {
+                    self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                    failures.push(PeerDialFailure {
+                        peer_id,
+                        endpoint: endpoint.clone(),
+                        error: format!(
+                            "dial timed out after {}s (endpoint unreachable or \
+                             firewall drops SYN)",
+                            PEER_DIAL_TIMEOUT.as_secs()
+                        ),
+                    });
                 }
             }
         }
-        Ok((failures, skips))
+        (failures, skips)
     }
 
     /// Snapshot the last known discovery state without mutating
