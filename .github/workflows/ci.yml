@@ -6,9 +6,10 @@ name: ci
 #   clean-install-macos   macos install.sh + airc doctor + smoke test
 #   clean-install-windows windows install.ps1 + airc doctor (PS-side)
 #
-# Plus on canary/main only (skipped on PR): integration-suite runs the
-# full test/integration.sh on ubuntu — the most thorough gate, but
-# expensive (real gh-gist scenarios + ~5min runtime).
+# Integration coverage now lives in the Rust suite: the per-crate
+# `crates/*/tests/` integration tests run under the `cargo test` jobs on
+# every PR + push. The old bash `test/integration.sh` gate was deleted
+# in the Rust cutover (#1173, demolition #864); its job is gone too.
 #
 # The clean-install jobs are the "guarantee installs work from zero"
 # gate Joel asked for (2026-04-28). They run on a stock runner image
@@ -219,29 +220,3 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           & "$env:AIRC_DIR\install.ps1"
-
-  integration-suite:
-    # Heavy gate: the full test/integration.sh, including scenarios that
-    # hit real gh-gists. Runs on canary/main pushes, NOT on PRs (rate
-    # limits + flaky network). When canary→main bundle PRs come up, this
-    # already-green status on the canary tip is the signal that cross-
-    # branch validation passed.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Stage + install (real install path)
-        run: |
-          mkdir -p $HOME/.airc/src
-          cp -r . $HOME/.airc/src/
-          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc/src bash install.sh
-
-      - name: Run integration suite
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          # Tests that need real gists self-skip without gh auth. The
-          # remaining ~85% of the suite covers the local-only scenarios
-          # that catch the lion's share of regressions.
-          bash test/integration.sh

@@ -101,24 +101,37 @@ fn events_list_json_emits_machine_readable_contract() {
 }
 
 #[test]
-fn send_receipt_distinguishes_zero_paired_peers_without_lying_about_delivery() {
+fn send_receipt_distinguishes_zero_enrolled_peers_without_lying_about_delivery() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
     let output = run_ok(&home, &["send", "wire-only send"]);
 
-    // With zero paired remote peers, the message IS still delivered
+    // With zero enrolled remote peers, the message IS still delivered
     // to any same-machine scope tailing the channel (post-#857
-    // cross-process broadcast fix). The receipt must not lie about
-    // non-delivery.
+    // cross-process broadcast fix). The receipt must be HONEST: it must
+    // not imply confirmed remote delivery, and it must not claim
+    // non-delivery either (local tailers still receive it). This mirrors
+    // the canonical `format_send_receipt` invariants unit-tested in
+    // `commands.rs` — the verb is "queued to" (not the old delivery-
+    // implying "sent to"), the count is framed as "enrolled" (not
+    // "paired"), and the local-tailer fan-out is surfaced.
     assert!(
-        output.contains("sent to"),
-        "receipt must lead with 'sent to' — not the old 'stored locally' wording, got: {output}"
+        output.contains("queued to"),
+        "receipt must use the honest verb 'queued to' — not the old delivery-implying 'sent to', got: {output}"
     );
     assert!(
-        output.contains("0 paired remote peers"),
-        "receipt must surface zero-paired-remote-peers without claiming non-delivery, got: {output}"
+        output.contains("0 enrolled remote peer(s)"),
+        "receipt must surface zero enrolled remote peers without claiming non-delivery, got: {output}"
+    );
+    assert!(
+        !output.contains("sent to"),
+        "receipt must NOT imply confirmed delivery via 'sent to', got: {output}"
+    );
+    assert!(
+        output.contains("tailing this channel on this machine"),
+        "receipt must surface that same-machine tailers still receive it, got: {output}"
     );
     assert!(
         !output.contains("not delivered"),
