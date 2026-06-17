@@ -22,11 +22,36 @@ only meaningful **between vectors from the same embedder model**. Therefore:
 > compared, blended, or merged. The split (local hot-path vs GPU batch facility)
 > only composes if both sides share the model.
 
-So the facility default tracks the canonical `EmbeddingProvider` neural model
-(today: `qwen --embedding` via llama.cpp, matching M5's local neural backend).
+**Canonical grid embedder (LOCKED with the fleet, 2026-06-17):
+`Qwen3-Embedding-0.6B`.** A *dedicated retrieval embedder* (purpose-trained for
+cosine retrieval — beats a generative model run in `--embedding` mode, which
+also couples the vector space to whatever gen model happens to be loaded). It is
+small enough that every peer hosts it locally for the hot path (Macs included),
+and GPU-fast on the 5090 for the batch lane. M5's local `NeuralEmbeddingProvider`
+loads this exact model; this facility serves the same one — so vectors are
+comparable grid-wide.
+
 The model is an **adapter** — swappable behind the trait — but it must be
 swapped *grid-wide in lockstep*, not per-node. The facility documents the
 canonical model so the grid stays in one space.
+
+## Embedding is a property of CONTENT, not persona (content-addressed cache)
+
+Joel's directive (2026-06-17): an embedding is a property of the **message
+content**, not the persona that reads it — exactly like
+`VisionDescriptionService` / STT. Fourteen personas in a room reuse **one**
+embedding per message, not fourteen. So both `EmbeddingProvider` impls on the
+consumer side (M5's local `NeuralEmbeddingProvider`, the cross-grid
+`GridEmbeddingProvider`) sit behind a **content-addressed cache**:
+`SHA-256(content) → vector`. The local or cross-grid embed only fires on a
+**cache miss**.
+
+This is what makes the 5090 batch lane efficient: the facility is a pure,
+deterministic function of `(model, content)` — it never sees personas, never
+caches (the cache is the consumer's), and identical content from any peer maps
+to an identical vector. Content-addressing + the one-vector-space invariant are
+the same idea from two directions: a vector is meaningful only as
+`(embedder_model, content_hash)`, and that pair is the cache key.
 
 ## Why llama.cpp `--embedding` (not TEI / sentence-transformers)
 
@@ -93,9 +118,22 @@ the node can embed itself, `Remote(facility)` only when it can't.
 ## Capability tag + wire shape (slice 2 design)
 
 Advertised via `CapabilityOffer` with `capability_tags = ["ai/embedding",
-"ai/embedding/<model>"]` (e.g. `ai/embedding/qwen3-embed`) so a requester can
-demand a *specific* model — the one-vector-space invariant enforced at routing
-time (a peer only routes to a facility advertising **its** embedder model).
+"ai/embedding/<model-slug>"]` so a requester can demand a *specific* model — the
+one-vector-space invariant enforced at routing time (a peer only routes to a
+facility advertising **its** embedder model).
+
+> **CANONICAL ROUTING TAG (verbatim — do NOT hand-shorten):**
+> `ai/embedding/qwen3-embedding-0.6b`
+>
+> The model-qualified tag is the routing contract between this facility and
+> every consumer (slice 3's `GridEmbeddingProvider`). It is derived
+> deterministically from the locked model name `Qwen3-Embedding-0.6B` by the
+> bridge's `model_tag()` (lowercase, non-alphanumeric → `-`, `.` preserved). A
+> consumer that demands a hand-shortened variant (e.g. `qwen3-embed-0.6b`) will
+> **silently fail to match** the advertisement — the dial finds no capable peer
+> and embedding falls back or errors. Both sides MUST use the slug `model_tag()`
+> produces. If the canonical model ever changes, the tag changes with it (in
+> lockstep, grid-wide).
 
 Request/reply mirrors `TurnRequested`/`TurnEmitted` with an embedding-shaped
 pair (slice 2 adds these typed nouns to the consumer vocabulary following the
