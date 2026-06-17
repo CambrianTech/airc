@@ -753,3 +753,230 @@ pub fn activity_event_filter(activity_id: &str) -> EventFilter {
         ]),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Embedding service shape — the `ai/embedding` capability (BigMama 5090 facility)
+// ---------------------------------------------------------------------------
+//
+// `EmbeddingRequested` / `EmbeddingEmitted` are the request/reply pair for the
+// `ai/embedding` capability, riding the SAME command-bus carriage as
+// `TurnRequested`/`TurnEmitted`: a consumer (`GridEmbeddingProvider`, slice 3)
+// calls [`request_embedding_remote`] against a facility candidate; the bridge
+// (`integrations/embedding-facility`) answers with [`reply_embedding_emitted`].
+// Distinct wire family from persona events (an embedding is a property of
+// CONTENT, not a persona), so it gets its own body hint, not a `PersonaEvent`
+// variant — same reasoning as `CapabilityOffer`.
+//
+// Wire body hint: `forge.ai.embedding.v1`. The **model slug** is projected to a
+// header so a responder filters by vector-space identity without decoding the
+// body. That slug is the SAME identity used three ways — "identity is the
+// model, transport is the policy": the routing URI fragment
+// (`ai/embedding/<slug>`), the cache `provider_id` (`<slug>`), and this
+// envelope header all carry the model, never the transport. Locking them to one
+// derived slug is what keeps a locally-embedded vector and a grid-embedded one
+// in the same space + the same cache entry.
+
+/// Body hint for the embedding request/reply family. Versioned independently of
+/// the persona-event + capability-offer hints (distinct wire shape → own `v1`).
+pub const BODY_HINT_FORGE_AI_EMBEDDING: &str = "forge.ai.embedding.v1";
+
+/// Header projecting the event variant (`requested` | `emitted`) for a cheap
+/// filter without decoding the body.
+pub const HEADER_FORGE_AI_EMBEDDING_KIND: &str = "forge.ai.embedding.kind";
+
+/// Header projecting the embedder **model slug** — the vector-space identity.
+/// A responder filters/refuses by this without decoding; it is the same slug as
+/// the routing URI fragment and the cache `provider_id`.
+pub const HEADER_FORGE_AI_EMBEDDING_MODEL: &str = "forge.ai.embedding.model";
+
+/// Header projecting the request id so a reply correlates at the application
+/// layer too (the substrate also stamps `airc.correlation_id`; this is the
+/// human/debug-visible echo).
+pub const HEADER_FORGE_AI_EMBEDDING_REQUEST_ID: &str = "forge.ai.embedding.request_id";
+
+/// The embedding request/reply family. Mirrors [`PersonaEvent`]'s shape (tagged
+/// enum + typed noun structs + header projection) for a different domain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmbeddingEvent {
+    /// A request to embed one or more inputs in a specific model's space.
+    Requested(EmbeddingRequested),
+    /// The vectors produced for a prior [`EmbeddingRequested`].
+    Emitted(EmbeddingEmitted),
+}
+
+/// Ask a facility to embed `inputs` in `model`'s vector space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingRequested {
+    /// Correlates the reply at the application layer.
+    pub request_id: String,
+    /// The embedder model slug — the vector-space identity. A responder that
+    /// does not host this model MUST refuse (loud), never embed in another
+    /// space. Same slug as the routing URI fragment + cache `provider_id`.
+    pub model: String,
+    /// One or more inputs to embed; the reply carries one vector per input,
+    /// positionally aligned.
+    pub inputs: Vec<String>,
+    pub requested_at_ms: u64,
+}
+
+/// The vectors a facility produced for an [`EmbeddingRequested`]. (No `Eq`: it
+/// carries `f32` vectors.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingEmitted {
+    /// Echoes the request's `request_id`.
+    pub request_id: String,
+    /// The model the vectors are in — MUST equal the request's `model`. The
+    /// consumer checks this before caching, so a space mismatch is caught, not
+    /// silently mis-keyed.
+    pub model: String,
+    /// One vector per input, in input order.
+    pub vectors: Vec<Vec<f32>>,
+    /// Vector dimension (redundant with `vectors[..].len()` but explicit on the
+    /// wire so a consumer validates without inspecting every row).
+    pub dim: u32,
+    pub emitted_at_ms: u64,
+}
+
+impl EmbeddingEvent {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Requested(e) => &e.request_id,
+            Self::Emitted(e) => &e.request_id,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            Self::Requested(e) => &e.model,
+            Self::Emitted(e) => &e.model,
+        }
+    }
+
+    fn variant_kind(&self) -> &'static str {
+        match self {
+            Self::Requested(_) => "requested",
+            Self::Emitted(_) => "emitted",
+        }
+    }
+}
+
+/// Encode an [`EmbeddingEvent`] to `(Headers, Body)`. Projects body hint, kind,
+/// model slug, and request id as headers — same pattern as
+/// [`encode_persona_event`].
+pub fn encode_embedding_event(
+    event: &EmbeddingEvent,
+) -> Result<(Headers, Body), PersonaCodecError> {
+    let mut headers = Headers::new();
+    headers.insert(
+        HEADER_FORGE_BODY_HINT.to_string(),
+        BODY_HINT_FORGE_AI_EMBEDDING.to_string(),
+    );
+    headers.insert(
+        HEADER_FORGE_AI_EMBEDDING_KIND.to_string(),
+        event.variant_kind().to_string(),
+    );
+    headers.insert(
+        HEADER_FORGE_AI_EMBEDDING_MODEL.to_string(),
+        event.model().to_string(),
+    );
+    headers.insert(
+        HEADER_FORGE_AI_EMBEDDING_REQUEST_ID.to_string(),
+        event.request_id().to_string(),
+    );
+    let body = Body::Json(serde_json::to_value(event)?);
+    Ok((headers, body))
+}
+
+/// Decode an [`EmbeddingEvent`] off headers + body. Loud on a body-hint
+/// mismatch (an embedding frame mis-read as something else would drop a reply).
+pub fn decode_embedding_event(
+    headers: &Headers,
+    body: Option<&Body>,
+) -> Result<EmbeddingEvent, PersonaCodecError> {
+    match headers.get(HEADER_FORGE_BODY_HINT) {
+        Some(value) if value == BODY_HINT_FORGE_AI_EMBEDDING => {}
+        actual => {
+            return Err(PersonaCodecError::BodyHintMismatch {
+                actual: actual.cloned(),
+                expected: BODY_HINT_FORGE_AI_EMBEDDING,
+            });
+        }
+    }
+    let body = body.ok_or(PersonaCodecError::MissingBody)?;
+    let Body::Json(value) = body else {
+        return Err(PersonaCodecError::NonJsonBody);
+    };
+    Ok(serde_json::from_value(value.clone())?)
+}
+
+/// A consumer-side filter admitting any embedding event (e.g. the facility
+/// bridge subscribing only to embedding traffic).
+pub fn any_embedding_event_filter() -> EventFilter {
+    EventFilter {
+        channel: None,
+        channels: HashSet::new(),
+        kinds: BTreeSet::new(),
+        headers_filter: HeaderFilter::Exact {
+            key: HEADER_FORGE_BODY_HINT.to_string(),
+            value: BODY_HINT_FORGE_AI_EMBEDDING.to_string(),
+        },
+    }
+}
+
+/// Send an [`EmbeddingRequested`] through the command-bus request path. Await
+/// with [`Airc::await_reply`] — it resolves with the responder's
+/// [`EmbeddingEmitted`] (see [`request_embedding_remote`] for the typed
+/// convenience), or errors `AircError::CommandDeadline` on timeout.
+pub async fn request_embedding(
+    airc: &Airc,
+    target: MentionTarget,
+    request: &EmbeddingRequested,
+    deadline: Duration,
+) -> Result<PendingCommand, PersonaTurnError> {
+    let (headers, body) = encode_embedding_event(&EmbeddingEvent::Requested(request.clone()))?;
+    Ok(airc.request(target, headers, body, deadline).await?)
+}
+
+/// Reply to an [`EmbeddingRequested`] with an [`EmbeddingEmitted`], echoing the
+/// request's correlation so the requester's [`Airc::await_reply`] resolves.
+pub async fn reply_embedding_emitted(
+    airc: &Airc,
+    request_headers: &Headers,
+    emitted: &EmbeddingEmitted,
+) -> Result<(), PersonaTurnError> {
+    let address = turn_reply_address(request_headers)?;
+    let (headers, body) = encode_embedding_event(&EmbeddingEvent::Emitted(emitted.clone()))?;
+    airc.reply(address.reply_to, address.correlation_id, headers, body)
+        .await?;
+    Ok(())
+}
+
+/// Run the cross-grid embedding request/reply against a facility candidate and
+/// await its [`EmbeddingEmitted`] within `deadline`. The embedding-domain twin
+/// of [`request_inference_remote`]; this is what slice 3's `GridEmbeddingProvider`
+/// calls on a cache miss it routes to the grid.
+pub async fn request_embedding_remote(
+    airc: &Airc,
+    candidate: &CapabilityCandidate,
+    request: &EmbeddingRequested,
+    deadline: Duration,
+) -> Result<EmbeddingEmitted, PersonaTurnError> {
+    let pending = request_embedding(
+        airc,
+        MentionTarget::Peer(candidate.peer_id),
+        request,
+        deadline,
+    )
+    .await?;
+    let reply = airc.await_reply(pending).await?;
+    match decode_embedding_event(&reply.headers, reply.body.as_ref())? {
+        EmbeddingEvent::Emitted(emitted) => Ok(emitted),
+        EmbeddingEvent::Requested(_) => Err(PersonaTurnError::Codec(
+            PersonaCodecError::UnexpectedReplyVariant {
+                actual: "requested",
+                expected: "emitted",
+            },
+        )),
+    }
+}
