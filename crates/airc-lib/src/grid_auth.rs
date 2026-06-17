@@ -108,6 +108,13 @@ pub struct CapabilityGrant {
     /// Monotonic per grantee — latest epoch wins. A revocation is a
     /// higher-epoch grant with empty `capabilities` (no separate
     /// revocation channel to keep in sync).
+    ///
+    /// DEFER (consumer integration slice; #1224 review finding 4):
+    /// epoch/revocation is CONSUMER-SIDE state — [`SignedCapabilityGrant::verify`]
+    /// does NOT track max-epoch-per-grantee. The consumer MUST persist the
+    /// latest epoch it has accepted per grantee and reject a grant whose
+    /// `epoch` is lower (a replayed/superseded grant). The verifier is
+    /// stateless by design; the anti-replay state lives with the consumer.
     pub epoch: u64,
 }
 
@@ -123,82 +130,121 @@ pub struct SignedCapabilityGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantVerdict {
     Valid,
-    /// Signature did not verify for the proof's credential.
-    BadSignature,
     /// The issuer pubkey is not the trusted account-owner key.
     UntrustedIssuer,
+    /// Signature did not verify for the proof's credential.
+    BadSignature,
+    /// The presenting peer's key is not the subject/grantee the grant is
+    /// bound to — a stolen grant cannot ride another peer's identity.
+    KeyMismatch,
+    /// The grant is for a different mesh than the verifier's own grid.
+    WrongMesh,
     /// `now_ms` is at/after `expires_at_ms`.
     Expired,
+    /// The body could not be serialized to its canonical signed bytes —
+    /// fail-CLOSED (we never verify a signature over empty bytes).
+    EncodingFailed,
 }
 
-/// Deterministic bytes the signature is computed/verified over. serde_json
-/// for slice 1; a canonical encoding (sorted keys / CBOR) is finalized
-/// with the real ed25519 verifier slice, where it is load-bearing.
-fn signing_bytes<T: Serialize>(body: &T) -> Vec<u8> {
-    serde_json::to_vec(body).unwrap_or_default()
+/// What a verifier checks a grant AGAINST: its own clock, the key of the
+/// peer presenting the grant, its own mesh, the credential verifier, and
+/// the trusted account-owner key. Bundling these keeps the two `verify`
+/// entry points honest — a consumer cannot forget to pass the presenting
+/// key or the expected mesh (the consumer-traps #1224 review flagged).
+pub struct VerifyContext<'a> {
+    pub now_ms: u64,
+    /// The public key of the peer PRESENTING this grant (e.g. the airc
+    /// peer making the request). Cross-checked against the grant's bound
+    /// subject/grantee key.
+    pub presenting_pubkey: &'a [u8],
+    /// The verifier's OWN mesh identity. The grant must be scoped to it.
+    pub expected_mesh: &'a MeshIdentity,
+    pub verifier: &'a dyn GrantVerifier,
+    /// The trusted account-owner key (the single root of trust).
+    pub trusted_issuer_pubkey: &'a [u8],
 }
 
-/// Shared verdict logic for any signed grant: trusted issuer, not
-/// expired, signature valid. Generic over the body so both grant kinds
-/// reuse exactly one decision path.
+/// Deterministic bytes the signature is computed/verified over. `None`
+/// on a serialization failure — the caller treats that as a REJECT
+/// (fail-closed), NEVER a verify over empty bytes (which would be
+/// fail-open). serde_json for slice 1; a canonical encoding (sorted keys
+/// / CBOR) is finalized with the real ed25519 verifier slice.
+///
+/// SIGNED-BYTE INVARIANT: the signature is over the serde_json of the
+/// body, whose field order == struct declaration order. NEVER reorder
+/// the fields of a signed body ([`CapabilityGrant`] /
+/// [`MeshMembershipAttestation`]) — it changes the signed bytes and
+/// invalidates every existing signature.
+fn signing_bytes<T: Serialize>(body: &T) -> Option<Vec<u8>> {
+    serde_json::to_vec(body).ok()
+}
+
+/// The ONE decision path for any signed grant. Order is
+/// issuer → signature → key-binding → mesh → expiry: issuer-pin first
+/// (so a wrong-issuer grant reports `UntrustedIssuer` for audit, not
+/// `BadSignature`); signature before any body field is trusted; then the
+/// bindings the #1224 review flagged as consumer-traps are enforced HERE
+/// so a consumer cannot skip them.
 fn verify_signed<T: Serialize>(
     body: &T,
     proof: &GrantProof,
-    now_ms: u64,
+    bound_pubkey: &[u8],
+    body_mesh: &MeshIdentity,
     expires_at_ms: Option<u64>,
-    verifier: &dyn GrantVerifier,
-    trusted_issuer_pubkey: &[u8],
+    ctx: &VerifyContext<'_>,
 ) -> GrantVerdict {
-    if proof.issuer_pubkey != trusted_issuer_pubkey {
+    if proof.issuer_pubkey != ctx.trusted_issuer_pubkey {
         return GrantVerdict::UntrustedIssuer;
     }
+    let Some(bytes) = signing_bytes(body) else {
+        return GrantVerdict::EncodingFailed;
+    };
+    if !ctx.verifier.verify_signature(&bytes, proof) {
+        return GrantVerdict::BadSignature;
+    }
+    // The signature is authentic — body fields are now trustworthy.
+    if ctx.presenting_pubkey != bound_pubkey {
+        return GrantVerdict::KeyMismatch;
+    }
+    if body_mesh != ctx.expected_mesh {
+        return GrantVerdict::WrongMesh;
+    }
     if let Some(exp) = expires_at_ms {
-        if now_ms >= exp {
+        if ctx.now_ms >= exp {
             return GrantVerdict::Expired;
         }
-    }
-    if !verifier.verify_signature(&signing_bytes(body), proof) {
-        return GrantVerdict::BadSignature;
     }
     GrantVerdict::Valid
 }
 
 impl SignedMeshMembership {
-    /// Verify this membership against the trusted account-owner key.
-    /// `Valid` ⇒ the caller may grant `attestation.default_tier` to the
-    /// subject (the `mesh_identity → TrustTier` bridge, no manual step).
-    pub fn verify(
-        &self,
-        now_ms: u64,
-        verifier: &dyn GrantVerifier,
-        trusted_issuer_pubkey: &[u8],
-    ) -> GrantVerdict {
+    /// Verify this membership against `ctx`. `Valid` ⇒ the caller may
+    /// grant `attestation.default_tier` to the subject (the
+    /// `mesh_identity → TrustTier` bridge, no manual step). Enforces that
+    /// the presenter IS the attested subject and the mesh matches.
+    pub fn verify(&self, ctx: &VerifyContext<'_>) -> GrantVerdict {
         verify_signed(
             &self.attestation,
             &self.proof,
-            now_ms,
+            &self.attestation.subject_pubkey,
+            &self.attestation.mesh_identity,
             self.attestation.expires_at_ms,
-            verifier,
-            trusted_issuer_pubkey,
+            ctx,
         )
     }
 }
 
 impl SignedCapabilityGrant {
-    /// Verify this grant against the trusted account-owner key.
-    pub fn verify(
-        &self,
-        now_ms: u64,
-        verifier: &dyn GrantVerifier,
-        trusted_issuer_pubkey: &[u8],
-    ) -> GrantVerdict {
+    /// Verify this grant against `ctx` (issuer → signature → key → mesh →
+    /// expiry). On `Valid`, [`Self::grants`] tells what it confers.
+    pub fn verify(&self, ctx: &VerifyContext<'_>) -> GrantVerdict {
         verify_signed(
             &self.grant,
             &self.proof,
-            now_ms,
+            &self.grant.grantee_pubkey,
+            &self.grant.granted_in,
             self.grant.expires_at_ms,
-            verifier,
-            trusted_issuer_pubkey,
+            ctx,
         )
     }
 
@@ -215,8 +261,9 @@ mod tests {
     use uuid::Uuid;
 
     /// Stub verifier: returns a fixed result, so the grant LOGIC (issuer,
-    /// expiry, capability) is tested without a real signature. The real
-    /// ed25519 verifier is a later slice; this proves the seam + policy.
+    /// key, mesh, expiry, capability) is tested without a real signature.
+    /// The real ed25519 verifier is a later slice; this proves the seam +
+    /// policy.
     struct StubVerifier {
         valid: bool,
     }
@@ -230,13 +277,17 @@ mod tests {
         PeerId::from_uuid(Uuid::from_u128(n))
     }
 
+    const OWNER: &[u8] = &[1, 1, 1];
+    const GRANTEE_KEY: &[u8] = &[2, 2, 2]; // matches `grant()`'s grantee_pubkey
+    const MESH: &str = "joelteply"; // matches `grant()`'s granted_in
+
     fn grant(caps: &[&str], expires_at_ms: Option<u64>, issuer: Vec<u8>) -> SignedCapabilityGrant {
         SignedCapabilityGrant {
             grant: CapabilityGrant {
                 grantee: peer(2),
-                grantee_pubkey: vec![2, 2, 2],
+                grantee_pubkey: GRANTEE_KEY.to_vec(),
                 capabilities: caps.iter().map(|c| c.to_string()).collect(),
-                granted_in: MeshIdentity::new("joelteply"),
+                granted_in: MeshIdentity::new(MESH),
                 issued_at_ms: 1_000,
                 expires_at_ms,
                 epoch: 1,
@@ -249,76 +300,124 @@ mod tests {
         }
     }
 
-    const OWNER: &[u8] = &[1, 1, 1];
+    /// Build a verify context. The referents (mesh, stub) must outlive
+    /// the returned borrow — callers hold them as locals.
+    fn ctx<'a>(
+        now_ms: u64,
+        presenting: &'a [u8],
+        mesh: &'a MeshIdentity,
+        stub: &'a StubVerifier,
+    ) -> VerifyContext<'a> {
+        VerifyContext {
+            now_ms,
+            presenting_pubkey: presenting,
+            expected_mesh: mesh,
+            verifier: stub,
+            trusted_issuer_pubkey: OWNER,
+        }
+    }
 
-    // what this catches: a valid grant from the trusted owner, not
-    // expired, with a good signature, verifies AND confers exactly its
-    // capability tags.
+    // what this catches: a valid grant from the trusted owner — presented
+    // by the bound key, in the right mesh, unexpired, good signature —
+    // verifies AND confers exactly its capability tags.
     #[test]
     fn valid_grant_verifies_and_confers_capability() {
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: true });
         let g = grant(&["ai/generate"], None, OWNER.to_vec());
         assert_eq!(
-            g.verify(2_000, &StubVerifier { valid: true }, OWNER),
+            g.verify(&ctx(2_000, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::Valid
         );
         assert!(g.grants("ai/generate"));
         assert!(!g.grants("data/delete"), "grant confers only its own tags");
     }
 
-    // what this catches: a grant signed by a key that is NOT the trusted
-    // owner is rejected BEFORE the signature is even checked — issuer
-    // pinning is the first gate.
+    // what this catches (review finding 6): issuer-pinning precedes the
+    // signature check — a grant signed by a NON-owner key, even with a
+    // valid-per-stub signature, reports UntrustedIssuer (not BadSignature)
+    // for audit fidelity. A refactor reordering the gates breaks this.
     #[test]
-    fn untrusted_issuer_is_rejected() {
+    fn issuer_pin_precedes_signature() {
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: true });
         let g = grant(&["ai/generate"], None, vec![7, 7, 7]); // not OWNER
         assert_eq!(
-            g.verify(2_000, &StubVerifier { valid: true }, OWNER),
+            g.verify(&ctx(2_000, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::UntrustedIssuer
         );
     }
 
-    // what this catches: an expired grant is rejected even with a valid
-    // signature from the trusted owner (now_ms >= expires_at_ms).
+    // what this catches (review finding 3): a STOLEN grant cannot ride
+    // another peer's identity — verify() enforces that the PRESENTING key
+    // is the grant's bound grantee key. Without this, the key-binding is a
+    // consumer-trap (only safe if every consumer remembers to cross-check).
+    #[test]
+    fn key_mismatch_rejects_a_stolen_grant() {
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: true });
+        let g = grant(&["ai/generate"], None, OWNER.to_vec());
+        // Presented by a key that is NOT the bound grantee.
+        assert_eq!(
+            g.verify(&ctx(2_000, &[9, 9, 9], &mesh, &stub)),
+            GrantVerdict::KeyMismatch
+        );
+    }
+
+    // what this catches (review finding 2): a grant scoped to one grid is
+    // rejected when presented in another — verify() enforces granted_in ==
+    // the verifier's mesh. Otherwise mesh-scoping is a consumer-trap.
+    #[test]
+    fn wrong_mesh_rejects_a_grant_for_another_grid() {
+        let (mesh, stub) = (MeshIdentity::new("toby"), StubVerifier { valid: true });
+        let g = grant(&["ai/generate"], None, OWNER.to_vec()); // granted_in joelteply
+        assert_eq!(
+            g.verify(&ctx(2_000, GRANTEE_KEY, &mesh, &stub)),
+            GrantVerdict::WrongMesh
+        );
+    }
+
+    // what this catches: an expired grant is rejected even when everything
+    // else passes (now_ms >= expires_at_ms; before expiry is Valid).
     #[test]
     fn expired_grant_is_rejected() {
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: true });
         let g = grant(&["ai/generate"], Some(1_500), OWNER.to_vec());
         assert_eq!(
-            g.verify(2_000, &StubVerifier { valid: true }, OWNER),
+            g.verify(&ctx(2_000, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::Expired
         );
-        // exactly at expiry is expired (>=).
         assert_eq!(
-            g.verify(1_500, &StubVerifier { valid: true }, OWNER),
+            g.verify(&ctx(1_500, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::Expired
         );
-        // before expiry is fine.
         assert_eq!(
-            g.verify(1_499, &StubVerifier { valid: true }, OWNER),
+            g.verify(&ctx(1_499, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::Valid
         );
     }
 
-    // what this catches: a bad signature is rejected (the credential
-    // seam's verdict propagates) — even from the trusted issuer, unexpired.
+    // what this catches: a bad signature is rejected (the credential seam's
+    // verdict propagates) — even from the trusted issuer, unexpired, right
+    // key + mesh.
     #[test]
     fn bad_signature_is_rejected() {
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: false });
         let g = grant(&["ai/generate"], None, OWNER.to_vec());
         assert_eq!(
-            g.verify(2_000, &StubVerifier { valid: false }, OWNER),
+            g.verify(&ctx(2_000, GRANTEE_KEY, &mesh, &stub)),
             GrantVerdict::BadSignature
         );
     }
 
-    // what this catches: the same verdict path is reused for membership
-    // attestations (the mesh_identity -> TrustTier bridge), so the
-    // default_tier is only honored on a Valid verdict.
+    // what this catches: membership attestations reuse the same verdict
+    // path (issuer/sig/key/mesh/expiry), enforcing the presenter IS the
+    // attested subject — so default_tier is only honored on Valid.
     #[test]
     fn mesh_membership_uses_the_same_verdict_path() {
+        const SUBJECT_KEY: &[u8] = &[3, 3, 3];
         let m = SignedMeshMembership {
             attestation: MeshMembershipAttestation {
                 subject: peer(3),
-                subject_pubkey: vec![3, 3, 3],
-                mesh_identity: MeshIdentity::new("joelteply"),
+                subject_pubkey: SUBJECT_KEY.to_vec(),
+                mesh_identity: MeshIdentity::new(MESH),
                 default_tier: TrustTier::OwnAccount,
                 issued_at_ms: 1_000,
                 expires_at_ms: Some(5_000),
@@ -329,13 +428,21 @@ mod tests {
                 signature: vec![9, 9, 9],
             },
         };
+        let (mesh, stub) = (MeshIdentity::new(MESH), StubVerifier { valid: true });
         assert_eq!(
-            m.verify(2_000, &StubVerifier { valid: true }, OWNER),
+            m.verify(&ctx(2_000, SUBJECT_KEY, &mesh, &stub)),
             GrantVerdict::Valid
         );
+        // wrong issuer -> UntrustedIssuer
+        let bad = VerifyContext {
+            trusted_issuer_pubkey: &[7, 7, 7],
+            ..ctx(2_000, SUBJECT_KEY, &mesh, &stub)
+        };
+        assert_eq!(m.verify(&bad), GrantVerdict::UntrustedIssuer);
+        // wrong presenter -> KeyMismatch (the anti-impersonation binding)
         assert_eq!(
-            m.verify(2_000, &StubVerifier { valid: true }, &[7, 7, 7]),
-            GrantVerdict::UntrustedIssuer
+            m.verify(&ctx(2_000, &[9, 9, 9], &mesh, &stub)),
+            GrantVerdict::KeyMismatch
         );
         assert_eq!(m.attestation.default_tier, TrustTier::OwnAccount);
     }
