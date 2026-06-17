@@ -29,6 +29,7 @@
 
 pub mod attachment;
 pub mod body;
+pub mod channel_purpose;
 pub mod cursor;
 pub mod datetime;
 pub mod doctrine;
