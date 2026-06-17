@@ -99,9 +99,10 @@ the node can embed itself, `Remote(facility)` only when it can't.
 
 - **Slice 1 — the GPU server (this dir, `docker-compose.yml`):** llama.cpp
   `--embedding` in CUDA Docker on the 5090, serving the canonical embedding
-  GGUF. Validatable standalone: `docker compose up`, then
-  `curl -s localhost:8080/v1/embeddings -d '{"input":"hello"}'` returns a
-  vector. No airc yet — proves the GPU embedding endpoint on Blackwell.
+  GGUF. One-command live smoke: **`./smoke.sh`** (compose up → wait for
+  `/health` → POST `/v1/embeddings` → assert a non-empty vector + report its
+  dim). Proves the GPU embedding endpoint on Blackwell (sm_120) — the one piece
+  `cargo test` + `docker compose config` cannot cover. No airc yet.
 - **Slice 2 — the airc bridge:** a Rust bin (mirrors `integrations/acp`) that
   joins the grid, advertises the `ai/embedding` capability tag (the
   `CapabilityOffer` path), and on each `EmbeddingRequested` frame POSTs to the
