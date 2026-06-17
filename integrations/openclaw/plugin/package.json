@@ -1,0 +1,66 @@
+{
+  "name": "@cambriantech/openclaw-airc",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin that bridges an airc mesh grid room via the airc CLI",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts",
+    "./api.js": "./api.ts",
+    "./runtime-api.js": "./runtime-api.ts"
+  },
+  "files": [
+    "index.ts",
+    "api.ts",
+    "runtime-api.ts",
+    "channel-plugin-api.ts",
+    "openclaw.plugin.json",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.8"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.0",
+    "openclaw": "2026.6.8",
+    "typescript": "5.9.2"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.6.8",
+      "minGatewayVersion": "2026.6.8"
+    },
+    "build": {
+      "openclawVersion": "2026.6.8",
+      "pluginSdkVersion": "2026.6.8"
+    },
+    "channel": {
+      "id": "airc",
+      "label": "airc",
+      "selectionLabel": "airc",
+      "detailLabel": "airc grid citizen",
+      "docsPath": "/channels/airc",
+      "docsLabel": "airc",
+      "blurb": "participate on an airc mesh grid as a citizen",
+      "systemImage": "bubble.left.and.bubble.right",
+      "markdownCapable": true,
+      "preferSessionLookupForAnnounceTarget": true,
+      "order": 92,
+      "commands": {
+        "nativeCommandsAutoEnabled": false,
+        "nativeSkillsAutoEnabled": false
+      }
+    }
+  }
+}
