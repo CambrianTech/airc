@@ -183,6 +183,35 @@ pub struct AgentLiveness {
     pub coordination: CoordinationSignal,
 }
 
+/// One present member of a room: liveness (presence) joined with the
+/// peer's published display name. Returned by [`Airc::room_roster`].
+///
+/// This is the SINGLE airc-side call a roster consumer (continuum's
+/// `RoomRosterSource`, the persona-groundedness "[Present in this room]"
+/// injection) needs: `active_agents` presence + the `IdentityPublished`
+/// name-join done HERE, so the consumer makes ONE call and never parses
+/// identity events or runs a second scan itself. airc owns presence +
+/// the identity join; the consumer owns what it does with the roster.
+///
+/// `display_name` is `None` when the peer is present (heartbeating) but
+/// has not published an identity card in the scanned window — an honest
+/// "present but unnamed", not an omission. `self` is INCLUDED (a roster
+/// lists everyone present); a caller rendering "who else is here" drops
+/// its own `peer_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMember {
+    pub peer_id: PeerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub runtime: String,
+    /// Self-reported availability from the latest heartbeat's
+    /// coordination signal. `None` = the runtime didn't report it
+    /// (treat as unknown, not "unavailable").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AgentAvailabilityState>,
+    pub last_seen_ms: u64,
+}
+
 /// Handle to a running heartbeat emit task. Dropping or calling
 /// [`HeartbeatTask::stop`] aborts the task.
 pub struct HeartbeatTask {
@@ -475,6 +504,84 @@ impl Airc {
             )
         });
         Ok(alive)
+    }
+
+    /// The room's present membership: [`Self::active_agents`] presence
+    /// JOINED with each peer's published display name, in ONE call.
+    ///
+    /// This is the airc-side roster the persona-groundedness consumer
+    /// (continuum `RoomRosterSource`) needs so it does NOT parse
+    /// `IdentityPublished` itself or run a second transcript scan: airc
+    /// owns presence + the identity name-join; the consumer owns the
+    /// prompt injection. `within`/`window` are forwarded to
+    /// `active_agents` (liveness cutoff + page size); the name-join
+    /// reuses the SAME recent page, so the whole roster is two reads of
+    /// one window, not a scan per member.
+    ///
+    /// Ordering mirrors `active_agents` (stable by peer + client_id).
+    /// `self` is included — a roster lists everyone present; a caller
+    /// rendering "who else is here" filters its own `peer_id`.
+    pub async fn room_roster(
+        &self,
+        within: Duration,
+        window: usize,
+    ) -> Result<Vec<RoomMember>, AircError> {
+        let live = self.active_agents(within, window).await?;
+        let names = self.peer_display_names(window).await?;
+        Ok(live
+            .into_iter()
+            .map(|liveness| RoomMember {
+                display_name: names.get(&liveness.peer).cloned(),
+                peer_id: liveness.peer,
+                runtime: liveness.runtime,
+                availability: liveness.coordination.availability,
+                last_seen_ms: liveness.last_seen_ms,
+            })
+            .collect())
+    }
+
+    /// Build `peer_id → newest published display name` from the
+    /// `IdentityPublished` cards in the recent `window`, in ONE scan
+    /// (last-writer-wins by `emitted_at_ms`). The batch analogue of
+    /// [`Self::peer_alias`] — the roster needs every present peer's
+    /// name, so resolving them one `peer_alias` call at a time would be
+    /// a scan per member. Empty-named cards are skipped (an unnamed peer
+    /// surfaces as `display_name: None`, not an empty string).
+    async fn peer_display_names(
+        &self,
+        window: usize,
+    ) -> Result<std::collections::HashMap<PeerId, String>, AircError> {
+        let events = self.page_recent(window).await?;
+        let mut newest: std::collections::HashMap<PeerId, (u64, String)> =
+            std::collections::HashMap::new();
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::IdentityPublished {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
+            else {
+                continue;
+            };
+            if card.identity.name.is_empty() {
+                continue;
+            }
+            newest
+                .entry(card.peer_id)
+                .and_modify(|existing| {
+                    if card.emitted_at_ms >= existing.0 {
+                        *existing = (card.emitted_at_ms, card.identity.name.clone());
+                    }
+                })
+                .or_insert((card.emitted_at_ms, card.identity.name));
+        }
+        Ok(newest
+            .into_iter()
+            .map(|(peer, (_, name))| (peer, name))
+            .collect())
     }
 }
 
