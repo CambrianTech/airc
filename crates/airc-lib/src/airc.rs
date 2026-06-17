@@ -622,6 +622,14 @@ impl Airc {
         &self,
     ) -> Result<Option<airc_core::doctrine::RoomDoctrinePublished>, AircError> {
         let events = self.page_recent(200).await?;
+        // True LWW by `published_at_ms` — NOT first-match. `page_recent`
+        // is not guaranteed newest-first (proven by the channel_purpose
+        // LWW test), so returning the first matching event surfaces a
+        // STALE doctrine after a republish — a consumer (continuum's
+        // RoomDoctrineSource) would then inject yesterday's rules. Scan
+        // all candidates and keep the highest timestamp (ties broken by
+        // later-in-page, the durable-log order).
+        let mut latest: Option<airc_core::doctrine::RoomDoctrinePublished> = None;
         for event in events {
             if event.kind != airc_core::TranscriptKind::DoctrinePublished {
                 continue;
@@ -634,9 +642,14 @@ impl Airc {
             else {
                 continue;
             };
-            return Ok(Some(card));
+            if latest
+                .as_ref()
+                .is_none_or(|current| card.published_at_ms >= current.published_at_ms)
+            {
+                latest = Some(card);
+            }
         }
-        Ok(None)
+        Ok(latest)
     }
 
     /// Publish the room operating doctrine — card a9767579 (slice 2/4
