@@ -1,0 +1,12 @@
+{
+  "id": "airc",
+  "activation": {
+    "onStartup": false
+  },
+  "channels": ["airc"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
