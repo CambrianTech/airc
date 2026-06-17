@@ -514,7 +514,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Command::Update => update_commands::run_update(&home, cli::default_socket_path_in(&home)),
+        Command::Update { auto } => {
+            let socket = cli::default_socket_path_in(&home);
+            if auto {
+                update_commands::run_update_auto(&home, socket)
+            } else {
+                update_commands::run_update(&home, socket)
+            }
+        }
 
         Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
 

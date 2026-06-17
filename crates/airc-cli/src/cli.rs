@@ -784,7 +784,14 @@ pub enum Command {
     /// Fast-forward the installed source checkout and refresh the
     /// installed `airc` binary + skills from that source.
     #[command(visible_aliases = ["upgrade", "pull"])]
-    Update,
+    Update {
+        /// Self-update with a smoke-test and rollback: back up the live
+        /// binary, rebuild, verify the new binary runs + reports the
+        /// pulled SHA, and roll back to the backup if it doesn't. Safe to
+        /// run unattended (e.g. when a peer detects it's stale).
+        #[arg(long)]
+        auto: bool,
+    },
 
     /// Self-diagnose the airc install + scope state.
     ///

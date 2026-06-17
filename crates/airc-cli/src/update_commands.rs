@@ -58,6 +58,157 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// `airc update --auto` — self-update with a smoke-test and rollback.
+///
+/// The safe sibling of [`run_update`]: it backs up the live binary,
+/// rebuilds, runs the new binary through a smoke-test, and ROLLS BACK to
+/// the backup if the new build is broken. So an auto-update can never
+/// leave a peer with a binary that compiles-but-doesn't-run.
+///
+/// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
+/// → else back up the installed binary to `airc.prev`, rebuild in place,
+/// smoke-test (the new binary's `version` reports the pulled SHA), and on
+/// failure restore `airc.prev`.
+///
+/// Platform note: on Windows the live `airc.exe` is locked while this
+/// process runs, so the in-place reinstall (and thus the swap) inherits
+/// the same constraint as `run_update` — most valuable on the macOS /
+/// Linux grid nodes today. The rollback path is a no-op there because no
+/// swap occurred.
+pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let source = install_source_dir()?;
+    validate_source_checkout(&source)?;
+    let airc_exe = env::current_exe()?;
+    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
+
+    let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" || branch.is_empty() {
+        return Err(format!(
+            "install source is detached at {}; check out a branch before auto-updating",
+            source.display()
+        )
+        .into());
+    }
+    let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+
+    if daemon_was_running {
+        stop_daemon(&airc_exe, home, &socket)?;
+    }
+    run_checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["fetch", "--quiet", "origin", &branch]),
+        "git fetch",
+    )?;
+    run_checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["pull", "--ff-only", "--quiet"]),
+        "git pull --ff-only",
+    )?;
+    let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+
+    if before == after {
+        println!("Already at {after} — nothing to auto-update.");
+        if daemon_was_running {
+            restart_daemon(&airc_exe, home, &socket)?;
+            wait_daemon_ready(&airc_exe, home, &socket)?;
+        }
+        return Ok(());
+    }
+
+    // Back up the live binary BEFORE the rebuild — this is the rollback
+    // anchor. Copying a running exe for read is allowed on every platform.
+    let prev = airc_exe.with_file_name("airc.prev");
+    std::fs::copy(&airc_exe, &prev).map_err(|e| {
+        format!(
+            "could not back up the current binary to {}: {e}",
+            prev.display()
+        )
+    })?;
+
+    let installed = run_installer(&source);
+
+    // Smoke-test: the new binary must RUN and report the SHA we pulled —
+    // a build that compiled but is broken (or didn't actually replace the
+    // binary) fails here and triggers rollback.
+    let smoke_ok = installed.is_ok() && smoke_test_new_binary(&airc_exe, &after);
+
+    if smoke_ok {
+        println!(
+            "Auto-updated: {before} -> {after} (smoke-test passed; backup at {}).",
+            prev.display()
+        );
+        if daemon_was_running {
+            restart_daemon(&airc_exe, home, &socket)?;
+            wait_daemon_ready(&airc_exe, home, &socket)?;
+        }
+        Ok(())
+    } else {
+        eprintln!("⚠ new build did not pass the smoke-test — ROLLING BACK to the previous binary.");
+        // Restore the known-good binary. (No-op-safe on Windows where the
+        // reinstall couldn't replace the locked live exe in the first place.)
+        if let Err(e) = std::fs::copy(&prev, &airc_exe) {
+            return Err(format!(
+                "auto-update FAILED and rollback ALSO failed ({e}); \
+                 your previous binary is at {} — restore it manually",
+                prev.display()
+            )
+            .into());
+        }
+        if daemon_was_running {
+            // Restart on the rolled-back (known-good) binary.
+            let _ = restart_daemon(&airc_exe, home, &socket);
+            let _ = wait_daemon_ready(&airc_exe, home, &socket);
+        }
+        Err(format!(
+            "auto-update rolled back: the {after} build failed the smoke-test; \
+             restored the previous binary ({before})"
+        )
+        .into())
+    }
+}
+
+/// Run the freshly-installed binary's `version` and confirm it reports
+/// the `expected_short` SHA we just pulled — proof the new binary RUNS
+/// and is the build we intended. Any failure (won't run, wrong/old SHA,
+/// unparseable) returns false → the caller rolls back.
+fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
+    let Ok(output) = Command::new(airc_exe).arg("version").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_build_sha(&stdout) {
+        Some(sha) => smoke_sha_matches(&sha, expected_short),
+        None => false,
+    }
+}
+
+/// Parse the build SHA from `airc version` output (the token after the
+/// `build:` label). Pure — unit-tested.
+fn parse_build_sha(version_stdout: &str) -> Option<String> {
+    for line in version_stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("build:") {
+            return rest.split_whitespace().next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Whether the installed binary's SHA matches the pulled short SHA.
+/// Tolerant of differing short-SHA lengths (git `--short` vs the version
+/// banner's 12-char form) via a prefix match either direction.
+fn smoke_sha_matches(installed_sha: &str, expected_short: &str) -> bool {
+    !installed_sha.is_empty()
+        && !expected_short.is_empty()
+        && (installed_sha.starts_with(expected_short) || expected_short.starts_with(installed_sha))
+}
+
 fn daemon_is_running(
     airc_exe: &Path,
     home: &Path,
@@ -475,5 +626,30 @@ mod tests {
                 "/tmp/airc.sock"
             ]
         );
+    }
+
+    // what this catches: the smoke-test parses the build SHA from real
+    // `airc version` output (the `build:` line), so a successful rebuild
+    // can be verified to actually BE the build we pulled.
+    #[test]
+    fn parse_build_sha_reads_the_version_banner() {
+        let out =
+            "  airc 0.1.0\n  install: /home/u/.local/bin/airc\n  build:   9cc678fc0203 on canary\n";
+        assert_eq!(parse_build_sha(out).as_deref(), Some("9cc678fc0203"));
+        assert_eq!(parse_build_sha("no build line here"), None);
+    }
+
+    // what this catches: the SHA match tolerates the differing short-SHA
+    // lengths (git --short ~7 chars vs the 12-char version banner) via a
+    // prefix match either direction — and rejects a mismatch (the
+    // rollback trigger) and empties.
+    #[test]
+    fn smoke_sha_matches_tolerates_short_sha_lengths() {
+        assert!(smoke_sha_matches("9cc678fc0203", "9cc678f")); // banner longer
+        assert!(smoke_sha_matches("9cc678f", "9cc678fc0203")); // pulled longer
+        assert!(smoke_sha_matches("abcd1234", "abcd1234"));
+        assert!(!smoke_sha_matches("9cc678fc0203", "deadbeef")); // mismatch -> rollback
+        assert!(!smoke_sha_matches("", "9cc678f"));
+        assert!(!smoke_sha_matches("9cc678f", ""));
     }
 }
