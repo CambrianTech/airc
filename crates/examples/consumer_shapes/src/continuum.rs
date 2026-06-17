@@ -566,6 +566,12 @@ pub fn select_candidate_for_turn(
         required_tags: &required,
         now_ms,
         ttl_ms,
+        // A real continuum consumer passes the adapter-ladder-reachable
+        // peer set here (connected_lan_peers + recent direct frames) so a
+        // LAN-reachable peer is never dropped from routing on a stale
+        // beacon; this example has no live route state, so None (the prior
+        // beacon-only behaviour).
+        reachable_peers: None,
     };
     registry.match_for(&query, trust_of).into_iter().next()
 }
