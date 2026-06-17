@@ -85,7 +85,7 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use agent_heartbeat::{
-    AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask,
+    AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::{machine_account_home, Airc};
