@@ -21,6 +21,7 @@ members = [
     "crates/examples/consumer_shapes",
     "crates/examples/persona_spawn_smoke",
     "integrations/acp",
+    "integrations/embedding-facility/bridge",
 ]
 resolver = "2"
 

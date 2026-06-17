@@ -1,0 +1,71 @@
+# airc embedding facility — slice 1: the GPU embedding server.
+#
+# llama.cpp `--embedding` in CUDA Docker on the RTX 5090. Serves the CANONICAL
+# grid embedding model (see README "one vector space" invariant) over an
+# OpenAI-compatible `/v1/embeddings` endpoint.
+#
+# Validate standalone (no airc yet):
+#   cd integrations/embedding-facility
+#   docker compose up            # first run pulls the GGUF to the model cache
+#   curl -s localhost:8080/v1/embeddings \
+#        -H 'content-type: application/json' \
+#        -d '{"input":"hello grid"}' | jq '.data[0].embedding | length'
+#   # → prints the vector dimension (e.g. 1024). Facility proven on Blackwell.
+#
+# The model + server are ADAPTERS: override EMBED_HF_REPO / EMBED_HF_FILE to
+# move the whole facility to another embedder, but do it GRID-WIDE in lockstep
+# (the one-vector-space invariant) — never per-node.
+
+services:
+  embedder:
+    # Official llama.cpp CUDA server image. Tracks new GPU arches fast and
+    # builds CUDA kernels for the installed toolkit — the path most likely to
+    # carry Blackwell (sm_120) support for the 5090. If this image lacks sm_120
+    # kernels, the documented fallback is a from-source build against CUDA 12.8+
+    # (see README); pin a known-good digest here once Blackwell is verified.
+    image: ${EMBED_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: airc-embedder
+    restart: unless-stopped
+    # The canonical grid embedder. Qwen3-Embedding-0.6B: a DEDICATED retrieval
+    # embedder (not a generative model in embedding mode) — small enough to also
+    # run on every peer's CPU/Mac for the local hot path, GPU-accelerated here
+    # for batch. Same family as the qwen generation stack. Proposed grid default;
+    # ratify with the fleet before locking (it constrains every node's local
+    # EmbeddingProvider — that IS the one-vector-space decision).
+    command: >
+      --hf-repo ${EMBED_HF_REPO:-Qwen/Qwen3-Embedding-0.6B-GGUF}
+      --hf-file ${EMBED_HF_FILE:-Qwen3-Embedding-0.6B-Q8_0.gguf}
+      --embedding
+      --pooling ${EMBED_POOLING:-last}
+      --ubatch-size ${EMBED_UBATCH:-8192}
+      --ctx-size ${EMBED_CTX:-8192}
+      --host 0.0.0.0
+      --port 8080
+      --n-gpu-layers 99
+    ports:
+      # Bind to loopback only: the airc bridge (slice 2) is the sole client and
+      # runs on this host. The grid reaches embeddings via airc + the capability
+      # ACL, NOT via an exposed HTTP port. Do not publish 0.0.0.0:8080.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Model cache on the 16TB foundry drive (HDD is fine — model load is
+      # sequential; inference runs from VRAM). Falls back to a named volume if
+      # the drive isn't mounted, so the compose is portable to any CUDA box.
+      - ${EMBED_MODEL_CACHE:-llama-model-cache}:/root/.cache/llama.cpp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # /health is llama.cpp's readiness endpoint (200 once the model is loaded).
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+
+volumes:
+  llama-model-cache:
