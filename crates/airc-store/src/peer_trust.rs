@@ -26,7 +26,11 @@ use crate::StoreError;
 /// a code refactor. The [`Self::ALL_VARIANTS`] round-trip test
 /// catches a forgotten arm. Snake_case matches the convention used
 /// for [`TranscriptKind`] across the codebase.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+// Serialize/Deserialize is additive — the canonical wire form for
+// peer-trust persistence remains `as_wire_str` (used explicitly there);
+// these derives only enable serde for NEW embedders (e.g. signed grid-auth
+// grants), which carry the tier as a typed field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TrustTier {
     /// Peer is co-located on the same physical machine as us —
     /// reachable via UDS sibling, shares filesystem, identity-key
