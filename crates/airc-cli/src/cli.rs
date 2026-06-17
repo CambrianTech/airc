@@ -976,11 +976,26 @@ mod tests {
         assert!(status.success());
 
         let actual = default_home_dir_for(&nested);
-        let expected = repo.join(".airc");
         std::fs::create_dir_all(&actual).unwrap();
+        // Canonicalize `repo` (which ALWAYS exists) and append `.airc`,
+        // rather than canonicalizing the `.airc` dir directly. The old
+        // code did `expected.canonicalize().unwrap()` on `repo/.airc`,
+        // which only exists if `actual == repo/.airc`. When the
+        // git-toplevel walk intermittently fell back to `$HOME/.airc` on
+        // the macOS runner (git refusing the fresh temp repo — dubious
+        // ownership / timing), `actual` was created under $HOME, `repo/
+        // .airc` never existed, and `canonicalize()` panicked with an
+        // opaque `NotFound` instead of a CLEAR assertion. Canonicalizing
+        // `repo` (handles macOS `/var`→`/private/var` symlinks and the
+        // Windows verbatim `\\?\` prefix uniformly) makes a real
+        // mismatch a readable failure, not a flaky panic.
+        let expected = repo.canonicalize().unwrap().join(".airc");
+        let actual_canon = actual.canonicalize().unwrap();
         assert_eq!(
-            actual.canonicalize().unwrap(),
-            expected.canonicalize().unwrap()
+            actual_canon, expected,
+            "git-project-root scope must resolve to <repo>/.airc; a \
+             <HOME>/.airc here means the git toplevel walk fell back to \
+             the machine-account home (git refused the temp repo?)"
         );
     }
 
