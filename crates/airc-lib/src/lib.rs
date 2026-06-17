@@ -202,6 +202,7 @@ pub use work_subscription::{
 // just to type the common return values.
 pub use airc_core::{
     body::Body,
+    channel_purpose::{ChannelPurpose, ChannelPurposeEvent, ChannelPurposePublished},
     headers::{HeaderFilter, Headers},
     transcript::MentionTarget,
     ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,

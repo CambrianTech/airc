@@ -103,6 +103,15 @@ pub enum TranscriptKind {
     /// case `category="doctrine"`; the legacy `DoctrinePublished`
     /// remains for back-compat replay.
     WallPostPublished,
+    /// A peer published the room's TYPED purpose — the coarse kind
+    /// (Chat / Coordination / Game / …) a citizen calibrates
+    /// participation to WITHOUT parsing doctrine prose. Body: serialized
+    /// `airc_core::channel_purpose::ChannelPurposeEvent::ChannelPurposePublished`,
+    /// kind="channel_purpose_published", carrying { room_id, purpose,
+    /// published_by, published_at_ms }. Projections take the latest per
+    /// room_id (LWW on published_at_ms). Complementary to
+    /// `DoctrinePublished` (typed kind here; free-form rules there).
+    ChannelPurposePublished,
 }
 
 impl TranscriptKind {
@@ -122,6 +131,7 @@ impl TranscriptKind {
                 | TranscriptKind::IdentityPublished
                 | TranscriptKind::DoctrinePublished
                 | TranscriptKind::WallPostPublished
+                | TranscriptKind::ChannelPurposePublished
         )
     }
 
@@ -160,6 +170,7 @@ impl TranscriptKind {
             TranscriptKind::IdentityPublished => "identity_published",
             TranscriptKind::DoctrinePublished => "doctrine_published",
             TranscriptKind::WallPostPublished => "wall_post_published",
+            TranscriptKind::ChannelPurposePublished => "channel_purpose_published",
         }
     }
 
@@ -184,6 +195,7 @@ impl TranscriptKind {
             "identity_published" => TranscriptKind::IdentityPublished,
             "doctrine_published" => TranscriptKind::DoctrinePublished,
             "wall_post_published" => TranscriptKind::WallPostPublished,
+            "channel_purpose_published" => TranscriptKind::ChannelPurposePublished,
             _ => return None,
         })
     }
@@ -210,6 +222,7 @@ impl TranscriptKind {
         TranscriptKind::IdentityPublished,
         TranscriptKind::DoctrinePublished,
         TranscriptKind::WallPostPublished,
+        TranscriptKind::ChannelPurposePublished,
     ];
 }
 

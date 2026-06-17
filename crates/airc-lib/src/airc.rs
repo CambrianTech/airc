@@ -678,6 +678,83 @@ impl Airc {
         .await
     }
 
+    /// The current room's TYPED purpose (latest published, LWW), or
+    /// `None` if no purpose has been published in the recent window.
+    ///
+    /// The single airc-side read continuum's `RoomPurposeSource`
+    /// consumes (M5 groundedness, 2026-06-16): the typed coarse kind
+    /// drives the persona's participation/should-respond gate
+    /// DETERMINISTICALLY (a `Coordination` room tightens auto-respond
+    /// without the model parsing prose — the structural fix for
+    /// Ivar-style over-talking) and a compact grounding line. Same
+    /// scan-recent + LWW shape as [`Self::room_doctrine`]; purpose and
+    /// doctrine are complementary (typed kind here, free-form rules
+    /// there).
+    pub async fn channel_purpose(
+        &self,
+    ) -> Result<Option<airc_core::channel_purpose::ChannelPurpose>, AircError> {
+        let events = self.page_recent(200).await?;
+        // True LWW by `published_at_ms` — NOT first-match. `page_recent`
+        // is not guaranteed newest-first, so returning the first matching
+        // event would surface a STALE purpose after a republish. Scan all
+        // candidates and keep the highest timestamp (ties broken by
+        // later-in-page, the durable-log order).
+        let mut latest: Option<(u64, airc_core::channel_purpose::ChannelPurpose)> = None;
+        for event in events {
+            if event.kind != airc_core::TranscriptKind::ChannelPurposePublished {
+                continue;
+            }
+            let Some(airc_core::Body::Json(value)) = event.body else {
+                continue;
+            };
+            let Ok(airc_core::channel_purpose::ChannelPurposeEvent::ChannelPurposePublished(
+                published,
+            )) = serde_json::from_value::<airc_core::channel_purpose::ChannelPurposeEvent>(value)
+            else {
+                continue;
+            };
+            if latest
+                .as_ref()
+                .is_none_or(|(ts, _)| published.published_at_ms >= *ts)
+            {
+                latest = Some((published.published_at_ms, published.purpose));
+            }
+        }
+        Ok(latest.map(|(_, purpose)| purpose))
+    }
+
+    /// Publish the current room's TYPED purpose — the coarse kind a
+    /// citizen calibrates participation to. Emits a
+    /// `TranscriptKind::ChannelPurposePublished` lifecycle event
+    /// carrying a serialized
+    /// `ChannelPurposeEvent::ChannelPurposePublished`; every attaching
+    /// agent's subscribe stream surfaces it. Authority is flat (any
+    /// peer may publish); projections take latest by `published_at_ms`.
+    /// Complementary to [`Self::publish_room_doctrine`] — purpose is the
+    /// typed kind, doctrine is the free-form rules.
+    pub async fn publish_channel_purpose(
+        &self,
+        purpose: airc_core::channel_purpose::ChannelPurpose,
+    ) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        let event = airc_core::channel_purpose::ChannelPurposeEvent::ChannelPurposePublished(
+            airc_core::channel_purpose::ChannelPurposePublished {
+                room_id: room.channel,
+                purpose,
+                published_by: self.inner.identity.peer_id,
+                published_at_ms: time::now_ms()?,
+            },
+        );
+        let body_json = serde_json::to_value(&event)
+            .map_err(|e| AircError::Crypto(format!("channel purpose event serialize: {e}")))?;
+        self.emit_lifecycle(
+            airc_core::TranscriptKind::ChannelPurposePublished,
+            room.channel,
+            airc_core::Body::Json(body_json),
+        )
+        .await
+    }
+
     /// Card b4742d9c: pin a wall post in the current room.
     ///
     /// The wall is the room's living document — multiple typed posts
