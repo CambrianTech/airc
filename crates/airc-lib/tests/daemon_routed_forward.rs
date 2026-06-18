@@ -38,13 +38,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use airc_core::{Body, EventId};
+use airc_core::{Body, EventId, PeerId};
 use airc_diagnostics::{DiagnosticCode, MemoryDiagnosticSink};
 use airc_lib::{
     Airc, InboundDeliveryVerdict, InboundFrameSink, PeerSpec, RoutedForwarder,
     RoutedForwarderConfig, RouterInboundBridge,
 };
 use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair};
+use airc_relay::{RelayServer, RelayServerConfig};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::LanTcpAdapter;
 use async_trait::async_trait;
@@ -502,4 +503,97 @@ async fn saturated_forward_queue_and_unconfirmed_forwards_are_loud() {
 
     // And nothing was ever confirmed: the ack vocabulary stayed truthful.
     assert_eq!(a.forwarder.confirmed_count(), 0);
+}
+
+/// #1247 slice 3 — a room send traverses a RELAY, not LAN. This is the
+/// cross-subnet path (#1243): A and B that cannot dial each other directly
+/// both reach one relay, and a send on A appears in B's transcript via the
+/// relay's fan-out. Loop termination is the SAME `publish_if_new` dedup the
+/// LAN flood uses — exactly once at B, no echo doubling at the source even
+/// though B re-floods the frame back through the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_room_send_traverses_relay() {
+    let a = boot_linked(RoutedForwarderConfig::default()).await;
+    let b = boot_linked(RoutedForwarderConfig::default()).await;
+
+    // A and B never LAN-link (the cross-subnet case); their only shared
+    // reachability is the relay. They still trust each other so B can
+    // verify A's end-to-end-signed frame — the relay never re-signs.
+    common::trust(&a.gateway, &b.gateway).await;
+
+    // In-process relay that allowlists both gateways; each gateway pins the
+    // relay's identity, then connects to it.
+    let relay_peer = PeerId::from_u128(0x5e1a3);
+    let relay_keypair = PeerKeypair::generate();
+    let a_spec: PeerSpec = a.gateway.peer_spec().parse().expect("a gateway spec");
+    let b_spec: PeerSpec = b.gateway.peer_spec().parse().expect("b gateway spec");
+    let server_registry = Arc::new(PeerKeyRegistry::new());
+    server_registry
+        .enrol(a_spec.peer_id, 1, a_spec.pubkey)
+        .expect("relay enrols gateway A");
+    server_registry
+        .enrol(b_spec.peer_id, 1, b_spec.pubkey)
+        .expect("relay enrols gateway B");
+    let server = RelayServer::start(RelayServerConfig {
+        peer_id: relay_peer,
+        keypair: relay_keypair.clone(),
+        registry: server_registry,
+        bind: "127.0.0.1:0".parse().unwrap(),
+    })
+    .await
+    .expect("relay starts");
+    let relay_addr = server.local_addr();
+
+    for gw in [&a.gateway, &b.gateway] {
+        gw.add_peer(PeerSpec {
+            peer_id: relay_peer,
+            pubkey: relay_keypair.public_bytes(),
+        })
+        .await
+        .expect("gateway trusts relay");
+        gw.connect_relay(relay_addr, relay_peer)
+            .await
+            .expect("gateway connects relay");
+    }
+
+    // Both gateways must be REGISTERED at the relay before A sends, or the
+    // relay has no one to fan B's copy to (the round_trip registration
+    // race). Poll the server's connected set.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let connected = server.connected_peers().await;
+        if connected.contains(&a_spec.peer_id) && connected.contains(&b_spec.peer_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay never registered both gateways: {connected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let op_a = a.machine.attach("op-a").await;
+    op_a.join(ROOM).await.expect("op-a joins");
+    let op_b = b.machine.attach("op-b").await;
+    op_b.join(ROOM).await.expect("op-b joins");
+
+    let id = op_a
+        .say("room message A→B over the relay")
+        .await
+        .expect("op-a says");
+    assert_eq!(
+        wait_for_copies(&op_b, id).await,
+        1,
+        "A's room send must reach B exactly once via the relay"
+    );
+    // No echo doubling at the source despite B re-flooding back through the
+    // relay — the publish_if_new dedup terminates it.
+    let recent_a = op_a.page_recent(64).await.expect("page op-a");
+    assert_eq!(
+        copies_in(&recent_a, id),
+        1,
+        "exactly one copy at the source — the relay round-trip must not echo"
+    );
+
+    server.shutdown();
 }

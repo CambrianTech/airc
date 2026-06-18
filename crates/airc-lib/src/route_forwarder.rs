@@ -79,6 +79,7 @@ use airc_protocol::{
     DeliveryOutcome, Envelope as ProtoEnvelope, Frame, FrameKind, Signature, UndeliverableReason,
     DELIVERY_ACK_REQUEST, HEADER_AIRC_DELIVERY_ACK,
 };
+use airc_transport::transport::Transport;
 use airc_transport::LanTcpAdapter;
 use tokio::sync::mpsc;
 
@@ -231,6 +232,13 @@ struct PeerItem {
 /// minus the item's origin), spawning workers on demand.
 async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardItem>) {
     let mut workers: HashMap<PeerId, mpsc::Sender<PeerItem>> = HashMap::new();
+    // #1247 slice 3: the relay tier. A connected relay is a SINGLE pipe
+    // (it fans out by target), not a per-peer link, so it gets ONE worker
+    // — lazily spawned the first time a relay is actually connected, so a
+    // LAN-only daemon pays nothing. Kept off the drain's hot path for the
+    // same reason the per-peer workers are: relay I/O must never stall the
+    // tap drain.
+    let mut relay_worker: Option<mpsc::Sender<Arc<Envelope>>> = None;
     while let Some(item) = rx.recv().await {
         let Some(inner) = inner.upgrade() else {
             return;
@@ -288,7 +296,140 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
                 }
             }
         }
+
+        // #1247 slice 3 — relay tier. After the per-peer LAN fan-out, hand
+        // the SAME durable envelope to the relay worker ONCE per item when a
+        // relay is connected: the relay is a single pipe that fans out by
+        // target, not a per-peer link. Loop termination is the existing
+        // `publish_if_new` dedup upstream (a frame that returns via the
+        // relay is a `Duplicate` and never re-reaches this tap), so the
+        // relay tier needs NO new loop logic — it's the LAN forwarder's
+        // terminating flood, one tier up. The worker is lazily spawned the
+        // first time a relay is actually connected, so a LAN-only daemon
+        // pays nothing, and relay I/O stays off the drain's hot path.
+        if any_relay_connected(&inner).await {
+            if relay_worker.is_none() {
+                relay_worker = Some(spawn_relay_worker(Arc::downgrade(&inner), &inner.config));
+            }
+            let send_result = relay_worker
+                .as_ref()
+                .map(|queue| queue.try_send(Arc::clone(&item.env)));
+            match send_result {
+                None | Some(Ok(())) => {}
+                Some(Err(mpsc::error::TrySendError::Full(_))) => emit(
+                    &inner,
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::RoutedForwardQueueSaturated,
+                        "relay forward queue is FULL — durable event is delivered \
+                         locally but will NOT be forwarded over the relay",
+                    )
+                    .with_field("event_id", item.env.event_id)
+                    .with_field("channel", item.env.channel),
+                ),
+                Some(Err(mpsc::error::TrySendError::Closed(_))) => {
+                    // Worker exited (only at teardown); respawn once + retry.
+                    let queue = spawn_relay_worker(Arc::downgrade(&inner), &inner.config);
+                    let retry = queue.try_send(Arc::clone(&item.env));
+                    relay_worker = Some(queue);
+                    if retry.is_err() {
+                        emit(
+                            &inner,
+                            DiagnosticEvent::error(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::RoutedForwardFailed,
+                                "relay forward worker unavailable — durable event \
+                                 will NOT be forwarded over the relay",
+                            )
+                            .with_field("event_id", item.env.event_id),
+                        );
+                    }
+                }
+            }
+        }
     }
+}
+
+/// One relay worker drains envelopes and forwards each over every
+/// connected relay. Single worker (not per-peer): a relay is one pipe
+/// that fans out by target. Mirrors [`spawn_peer_worker`]'s shape so relay
+/// sends never block the tap drain.
+fn spawn_relay_worker(
+    inner: Weak<ForwarderInner>,
+    config: &RoutedForwarderConfig,
+) -> mpsc::Sender<Arc<Envelope>> {
+    let (tx, mut rx) = mpsc::channel::<Arc<Envelope>>(config.peer_queue_capacity.max(1));
+    tokio::spawn(async move {
+        while let Some(env) = rx.recv().await {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            forward_one_to_relay(&inner, env).await;
+        }
+    });
+    tx
+}
+
+/// Forward one durable envelope over every connected relay link. The relay
+/// fans out to its peers by target, so this is ONE send per relay (never
+/// per peer). Loop termination lives upstream in `publish_if_new` (a frame
+/// that returns via the relay is a `Duplicate` and never re-reaches the
+/// tap), so this path carries no per-frame loop bookkeeping.
+async fn forward_one_to_relay(inner: &ForwarderInner, env: Arc<Envelope>) {
+    let links = inner.links.read().await.clone();
+    for link in &links {
+        let relay = link.inner.relay.lock().await.clone();
+        let Some(relay) = relay else { continue };
+        let frame = match build_forward_frame(link, &env, false) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return, // machine-local kind — no wire FrameKind
+            Err(reason) => {
+                emit(
+                    inner,
+                    DiagnosticEvent::warn(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::RoutedForwardFailed,
+                        "durable event could not be projected onto the wire frame \
+                         shape for relay — it will stay machine-local",
+                    )
+                    .with_field("event_id", env.event_id)
+                    .with_field("channel", env.channel)
+                    .with_field("error", reason),
+                );
+                return;
+            }
+        };
+        match relay.send(frame).await {
+            Ok(()) => {
+                inner.forwarded.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(error) => emit(
+                inner,
+                DiagnosticEvent::error(
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::RoutedForwardFailed,
+                    "relay send failed — durable event delivered locally but NOT \
+                     forwarded over this relay",
+                )
+                .with_field("event_id", env.event_id)
+                .with_field("channel", env.channel)
+                .with_field("error", format!("{error}")),
+            ),
+        }
+    }
+}
+
+/// Whether any registered link currently holds a connected relay adapter.
+/// Cheap pre-check so the relay worker is spawned + fed only when a relay
+/// exists (a LAN-only daemon never pays for the relay tier).
+async fn any_relay_connected(inner: &ForwarderInner) -> bool {
+    let links = inner.links.read().await.clone();
+    for link in &links {
+        if link.inner.relay.lock().await.is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Snapshot of currently-connected LAN peers across all registered
@@ -358,7 +499,7 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
             last_failure = "no live LAN connection to peer".to_string();
             continue;
         };
-        let frame = match build_forward_frame(&link, &env) {
+        let frame = match build_forward_frame(&link, &env, true) {
             Ok(Some(frame)) => frame,
             Ok(None) => return, // unmappable kind — machine-local by design
             Err(reason) => {
@@ -481,7 +622,18 @@ async fn wait_for_ack(
 /// `Ok(None)` = this envelope kind is machine-local by design
 /// (Command / CommandResult / Signal / StreamChunk — RPC shapes with
 /// no wire `FrameKind`).
-fn build_forward_frame(link: &Airc, env: &Envelope) -> Result<Option<Frame>, String> {
+///
+/// `request_ack` stamps the [`HEADER_AIRC_DELIVERY_ACK`] header. The LAN
+/// forwarder sets it (it awaits the typed ack to confirm delivery); the
+/// relay tier does NOT — a relay send is fire-and-forget today, and the
+/// remote can't route a LAN ack back over the relay anyway (it would emit
+/// a spurious `delivery_ack_send_failed`). Relay delivery confirmation
+/// lands with the relay's durable mailbox (#1247 slice 9).
+fn build_forward_frame(
+    link: &Airc,
+    env: &Envelope,
+    request_ack: bool,
+) -> Result<Option<Frame>, String> {
     let kind = match env.kind {
         Kind::Message => FrameKind::Message,
         Kind::Event => FrameKind::Event,
@@ -499,10 +651,12 @@ fn build_forward_frame(link: &Airc, env: &Envelope) -> Result<Option<Frame>, Str
         )
     };
     let mut headers = env.headers.clone();
-    headers.insert(
-        HEADER_AIRC_DELIVERY_ACK.to_string(),
-        DELIVERY_ACK_REQUEST.to_string(),
-    );
+    if request_ack {
+        headers.insert(
+            HEADER_AIRC_DELIVERY_ACK.to_string(),
+            DELIVERY_ACK_REQUEST.to_string(),
+        );
+    }
     let mut frame = Frame {
         kind,
         envelope: ProtoEnvelope {
