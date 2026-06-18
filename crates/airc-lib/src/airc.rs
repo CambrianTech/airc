@@ -177,6 +177,11 @@ pub(crate) struct AircInner {
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     pub(crate) relay: Mutex<Option<RelayAdapter>>,
     pub(crate) relay_subscriber: Mutex<Option<FrameSubscriber>>,
+    /// When this node has promoted itself to ALSO be a relay
+    /// (`Airc::become_relay`, #1247 slice 4), the running relay server is
+    /// held here so it stays alive for the node's lifetime. `None` = this
+    /// node is a relay CLIENT only (the common case).
+    pub(crate) relay_server: Mutex<Option<airc_relay::RelayServer>>,
     pub(crate) udp: Mutex<Option<UdpAdapter>>,
     pub(crate) udp_subscriber: Mutex<Option<FrameSubscriber>>,
     /// Per-peer WebRTC DataChannel adapters, keyed by the remote
@@ -442,6 +447,7 @@ impl Airc {
                 lan_subscriber: Mutex::new(None),
                 relay: Mutex::new(None),
                 relay_subscriber: Mutex::new(None),
+                relay_server: Mutex::new(None),
                 udp: Mutex::new(None),
                 udp_subscriber: Mutex::new(None),
                 webrtc_channels: Mutex::new(HashMap::new()),
@@ -1018,6 +1024,7 @@ impl Airc {
             lan_subscriber: Mutex::new(None),
             relay: Mutex::new(None),
             relay_subscriber: Mutex::new(None),
+            relay_server: Mutex::new(None),
             udp: Mutex::new(None),
             udp_subscriber: Mutex::new(None),
             webrtc_channels: Mutex::new(HashMap::new()),

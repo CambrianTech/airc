@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 
 use airc_core::PeerId;
+use airc_relay::{RelayServer, RelayServerConfig};
 use airc_transport::relay::{RelayAdapter, RelayClientConfig};
 
 use crate::error::AircError;
@@ -53,6 +54,74 @@ impl Airc {
         }
         self.ensure_relay_subscriber().await?;
         self.upsert_relay_health(relay_addr, relay_peer)?;
+        Ok(())
+    }
+
+    /// Promote this node to ALSO be a relay: bind a relay listener on
+    /// `bind_addr` (port 0 = OS-assigned) serving this node's enrolled
+    /// peers, and advertise the relay endpoint (peer-id-bearing, so it's
+    /// pinnable) on this node's route table — which flows into the gist
+    /// directory, so peers that import this node's card connect through it
+    /// (discovery → [`Airc::connect_relay`], #1247 slice 2).
+    ///
+    /// This is the "be a relay" half of self-election (#1247 slice 4): a
+    /// node that can bind a reachable listener can host the relay the
+    /// cross-subnet mesh needs. Reachability is EMPIRICAL — promoting
+    /// yourself just binds + advertises; whether peers actually reach you
+    /// decides whether your relay matters (an unreachable self-elected
+    /// relay accumulates no connections and its gist entry goes stale).
+    /// The election TRIGGER (when to call this) lives in the daemon's
+    /// route-refresh loop; this is the mechanism it invokes.
+    ///
+    /// Idempotent: a node already relaying re-advertises and returns its
+    /// existing bound address.
+    pub async fn become_relay(&self, bind_addr: SocketAddr) -> Result<SocketAddr, AircError> {
+        // Fast path: already relaying — re-advertise (idempotent) + return.
+        {
+            let guard = self.inner.relay_server.lock().await;
+            if let Some(server) = guard.as_ref() {
+                let addr = server.local_addr();
+                drop(guard);
+                self.advertise_self_relay(addr)?;
+                return Ok(addr);
+            }
+        }
+        // Bind a fresh relay server OUTSIDE the lock (no await under the
+        // guard), serving exactly this node's enrolled peers.
+        let server = RelayServer::start(RelayServerConfig {
+            peer_id: self.inner.identity.peer_id,
+            keypair: self.inner.identity.keypair.clone(),
+            registry: self.inner.registry.clone(),
+            bind: bind_addr,
+        })
+        .await
+        .map_err(|error| AircError::Transport(error.to_string()))?;
+        let addr = server.local_addr();
+        // Install — unless a concurrent caller won the race, in which case
+        // shut ours down and adopt the winner's address (one relay/node).
+        let final_addr = {
+            let mut guard = self.inner.relay_server.lock().await;
+            match guard.as_ref() {
+                Some(existing) => {
+                    let existing_addr = existing.local_addr();
+                    server.shutdown();
+                    existing_addr
+                }
+                None => {
+                    *guard = Some(server);
+                    addr
+                }
+            }
+        };
+        self.advertise_self_relay(final_addr)?;
+        Ok(final_addr)
+    }
+
+    /// Record THIS node's own relay endpoint (peer-id-bearing) on the
+    /// route table so it propagates into the gist directory. Distinct from
+    /// `upsert_relay_health`, which marks a relay this node is a CLIENT of.
+    fn advertise_self_relay(&self, addr: SocketAddr) -> Result<(), AircError> {
+        self.upsert_route_endpoint(RouteEndpoint::relay(self.inner.identity.peer_id, addr))?;
         Ok(())
     }
 
