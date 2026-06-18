@@ -1526,7 +1526,10 @@ async fn refresh_routes_once(
     // happens exactly once per tick.
     let lan_ip = crate::network_commands::advertise_lan_ip();
     let tailscale_ip = crate::network_commands::detect_tailscale_ip();
-    match airc.refresh_advertised_endpoints(lan_ip, tailscale_ip).await {
+    match airc
+        .refresh_advertised_endpoints(lan_ip, tailscale_ip)
+        .await
+    {
         Ok(true) => {
             // Changed → nudge the registry loop to republish the corrected
             // card NOW (edge-triggered; steady-state stays on cadence, so
@@ -1549,7 +1552,9 @@ async fn refresh_routes_once(
         }
         Ok(false) => {}
         Err(error) => {
-            eprintln!("airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick");
+            eprintln!(
+                "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
+            );
         }
     }
     match airc.refresh_route_discovery().await {
