@@ -117,16 +117,22 @@ pub enum PersonaAgentError {
         detail: String,
     },
     /// Any airc-lib operation (open, add_peer, join, send, subscribe).
-    Airc(AircError),
-    /// The PersonaCapabilities identity write/read failed.
-    Capabilities(PersonaCapabilitiesError),
+    /// Boxed: these foreign error enums are large, and an unboxed
+    /// variant makes every `Result<_, PersonaAgentError>` on the hot
+    /// path carry that whole size (clippy `result_large_err`). The cold
+    /// error path can afford one allocation; the happy path stays small.
+    Airc(Box<AircError>),
+    /// The PersonaCapabilities identity write/read failed. Boxed (see
+    /// [`Self::Airc`]).
+    Capabilities(Box<PersonaCapabilitiesError>),
     /// A persona event failed to encode/decode. The subscription
     /// filter admits only `forge.persona.event.v1` bodies, so a
     /// decode failure here means a malformed event — surfaced, never
-    /// skipped silently.
-    Codec(PersonaCodecError),
-    /// The trust-store tier pin failed at the store layer.
-    Trust(PeersStoreError),
+    /// skipped silently. Boxed (see [`Self::Airc`]).
+    Codec(Box<PersonaCodecError>),
+    /// The trust-store tier pin failed at the store layer. Boxed (see
+    /// [`Self::Airc`]).
+    Trust(Box<PeersStoreError>),
     /// `airc_trust::set_tier` reported the parent is not enrolled —
     /// a structural bug in the spawn sequence (enrol precedes pin).
     ParentNotEnrolled { parent: PeerId },
@@ -173,10 +179,12 @@ impl fmt::Display for PersonaAgentError {
 impl Error for PersonaAgentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Airc(source) => Some(source),
-            Self::Capabilities(source) => Some(source),
-            Self::Codec(source) => Some(source),
-            Self::Trust(source) => Some(source),
+            // `&**source` derefs the Box to the concrete error, which
+            // coerces to `&dyn Error` (a `&Box<E>` does not).
+            Self::Airc(source) => Some(&**source),
+            Self::Capabilities(source) => Some(&**source),
+            Self::Codec(source) => Some(&**source),
+            Self::Trust(source) => Some(&**source),
             Self::Clock(source) => Some(source),
             Self::MissingEnv { .. }
             | Self::BadEnv { .. }
@@ -189,25 +197,25 @@ impl Error for PersonaAgentError {
 
 impl From<AircError> for PersonaAgentError {
     fn from(source: AircError) -> Self {
-        Self::Airc(source)
+        Self::Airc(Box::new(source))
     }
 }
 
 impl From<PersonaCapabilitiesError> for PersonaAgentError {
     fn from(source: PersonaCapabilitiesError) -> Self {
-        Self::Capabilities(source)
+        Self::Capabilities(Box::new(source))
     }
 }
 
 impl From<PersonaCodecError> for PersonaAgentError {
     fn from(source: PersonaCodecError) -> Self {
-        Self::Codec(source)
+        Self::Codec(Box::new(source))
     }
 }
 
 impl From<PeersStoreError> for PersonaAgentError {
     fn from(source: PeersStoreError) -> Self {
-        Self::Trust(source)
+        Self::Trust(Box::new(source))
     }
 }
 
