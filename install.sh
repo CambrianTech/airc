@@ -66,8 +66,8 @@ _to_bash_path() {
 #
 # Required: git, gh, ssh-keygen, cargo (to build the Rust substrate CLI).
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
-# Deliberately not required: openssl or Python. Identity, signing, hooks,
-# config, and message parsing are Rust-owned.
+# Everything else — identity, signing, hooks, config, message parsing,
+# JSON handling — is Rust-owned, so there are no other runtime prereqs.
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -327,8 +327,8 @@ ensure_prereqs() {
   fi
 
   local missing=() pkgs=() unmappable=()
-  # jq, openssl, and Python are not install prereqs. JSON handling,
-  # Ed25519 identity/signing, hooks, and config mutation are Rust-owned.
+  # The full prereq set is exactly these four. JSON handling, Ed25519
+  # identity/signing, hooks, and config mutation are all Rust-owned.
   for cmd in git gh ssh-keygen cargo; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
@@ -396,11 +396,10 @@ ensure_prereqs() {
   _ensure_windows_msvc_toolchain "$mgr"
   _ensure_macos_build_toolchain
 
-  # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
-  # Identity gen + signing live in Rust, so system OpenSSL and Python
-  # package state are irrelevant to airc install correctness.
+  # Identity gen + signing live in Rust — there is no crypto bootstrap to
+  # do here; system package state is irrelevant to airc install correctness.
 
-  # Post-3c: sshd setup + Tailscale install fully removed from install.
+  # sshd setup + Tailscale install are not part of install.
   # Cross-network messaging is owned by Rust transports/discovery, while
   # GitHub remains rendezvous/control-plane only. The earlier sshd-on-
   # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +

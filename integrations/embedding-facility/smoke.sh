@@ -61,17 +61,13 @@ resp="$(curl -fsS "${BASE}/v1/embeddings" \
   || fail "POST /v1/embeddings failed"
 
 # Assert a non-empty numeric embedding came back, and report its dimension.
-dim=""
-if command -v python3 >/dev/null 2>&1; then
-  dim="$(printf '%s' "$resp" | python3 -c \
-    'import sys,json; d=json.load(sys.stdin)["data"][0]["embedding"]; assert d and all(isinstance(x,(int,float)) for x in d); print(len(d))' \
-    2>/dev/null)" || fail "response had no valid embedding array: ${resp:0:200}"
-else
-  # No python3: heuristic check that an embedding array with numbers is present.
-  printf '%s' "$resp" | grep -Eq '"embedding"[[:space:]]*:[[:space:]]*\[[[:space:]]*-?[0-9]' \
-    || fail "response had no embedding array: ${resp:0:200}"
-  dim="(install python3 for exact dim)"
-fi
+# Pure sed/tr/grep — no Python runtime (the repo is Rust-cutover; the guard
+# forbids a Python dependency on the live path). Pull the first embedding
+# array out of the JSON and count its numeric elements.
+emb="$(printf '%s' "$resp" | sed -n 's/.*"embedding"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p')"
+printf '%s' "$emb" | grep -Eq '\-?[0-9]' \
+  || fail "response had no embedding array: ${resp:0:200}"
+dim="$(printf '%s' "$emb" | tr ',' '\n' | grep -Ec '\-?[0-9]')"
 
 log "OK — embedding returned. dim=${dim}. The 5090 facility GPU half is PROVEN on this box. 🚀"
 log "advertise it on the grid:  cargo run -p airc-embedding-bridge   (needs a running airc daemon)"

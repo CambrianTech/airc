@@ -103,13 +103,13 @@ function Test-WingetAvailable {
         Write-Host '    # chocolatey (recommended for Server):'
         Write-Host '    Set-ExecutionPolicy Bypass -Scope Process -Force'
         Write-Host "    iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
-        Write-Host '    choco install -y python git gh jq'
+        Write-Host '    choco install -y git gh rust'
         Write-Host ''
         Write-Host '    # OR scoop (user-scope, no admin needed):'
         Write-Host "    iwr -useb https://get.scoop.sh | iex"
-        Write-Host '    scoop install python git gh jq'
+        Write-Host '    scoop install git gh rust'
         Write-Host ''
-        Write-Host '  After installing python, git, gh, jq manually, re-run this script;'
+        Write-Host '  After installing git, gh, rust manually, re-run this script;'
         Write-Host '  it will detect them and skip winget.'
     } else {
         Write-Host '  winget ships with App Installer (Microsoft Store). Install or update it:'
@@ -125,12 +125,12 @@ function Test-WingetAvailable {
 
 # -- Install one winget package, idempotent ------------------------------
 # Test-Cmd: a callable that returns $true when the package is already
-# usable (e.g. {Get-Command python} or a custom probe). Skips winget on
+# usable (e.g. {Get-Command cargo} or a custom probe). Skips winget on
 # hits -- saves the 30s+ download/install round trip.
 function Install-IfMissing {
     param(
         [string]$Name,        # human label for messages
-        [string]$WingetId,    # winget package id (e.g. Python.Python.3.12)
+        [string]$WingetId,    # winget package id (e.g. Rustlang.Rustup)
         [scriptblock]$TestCmd # returns truthy when already installed
     )
     if (& $TestCmd) {
@@ -181,8 +181,8 @@ Test-WingetAvailable
 
 Install-IfMissing -Name 'Git for Windows'    -WingetId 'Git.Git'             -TestCmd { Get-Command git -ErrorAction SilentlyContinue }
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
-# Python + jq dropped as prereqs (parity with install.sh, issue #341):
-# identity, signing, hooks, config, and JSON handling are Rust-owned.
+# git + gh are the only non-Rust prereqs (plus the Rust toolchain below).
+# Identity, signing, hooks, config, and JSON handling are all Rust-owned.
 
 # -- Rust toolchain ------------------------------------------------------
 # airc IS a Rust binary; cargo is a hard prereq. install.sh auto-installs
