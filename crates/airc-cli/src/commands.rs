@@ -1456,6 +1456,7 @@ pub async fn run_daemon(
             store,
             gate,
             airc_lib::RegistryRefreshConfig::default(),
+            &registry_state.endpoint_resync,
             registry_state.shutdown.notified(),
         )
         .await;
@@ -1497,9 +1498,10 @@ pub async fn run_daemon(
 /// `run_daemon` before this spawns.
 fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
     let connected = state.connected_lan_peers.clone();
+    let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&airc, &connected)
+            refresh_routes_once(&airc, &connected, &endpoint_resync)
         })
         .await;
     })
@@ -1510,7 +1512,51 @@ fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::Join
 /// surface every failure through the diagnostic sink — loud, never
 /// silent. Failures never propagate: the loop's next tick is the retry
 /// path (self-heal doctrine, card 625abe6d).
-async fn refresh_routes_once(airc: &Airc, connected_lan_peers: &std::sync::atomic::AtomicUsize) {
+async fn refresh_routes_once(
+    airc: &Airc,
+    connected_lan_peers: &std::sync::atomic::AtomicUsize,
+    endpoint_resync: &tokio::sync::Notify,
+) {
+    // Adaptable-router reflex: re-detect this node's own routable LAN +
+    // Tailscale IPv4 every tick (cheap, local — no network) and re-advertise
+    // if it moved (router swap, DHCP renew, Tailscale toggle). Without this
+    // the endpoint computed once at daemon start is frozen, so a node that
+    // changes IP keeps advertising a stale, undialable address until it is
+    // manually restarted. Reused below for relay self-election so detection
+    // happens exactly once per tick.
+    let lan_ip = crate::network_commands::advertise_lan_ip();
+    let tailscale_ip = crate::network_commands::detect_tailscale_ip();
+    match airc
+        .refresh_advertised_endpoints(lan_ip, tailscale_ip)
+        .await
+    {
+        Ok(true) => {
+            // Changed → nudge the registry loop to republish the corrected
+            // card NOW (edge-triggered; steady-state stays on cadence, so
+            // no spam). Loud: a reachability-affecting change is not silent.
+            let summary = airc
+                .route_endpoints()
+                .map(|endpoints| {
+                    endpoints
+                        .iter()
+                        .map(|endpoint| format!("{endpoint:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                })
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            eprintln!(
+                "airc daemon: advertised endpoint changed (LAN/Tailscale IP moved) — \
+                 now advertising [{summary}]; resyncing the account-registry card"
+            );
+            endpoint_resync.notify_one();
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
+            );
+        }
+    }
     match airc.refresh_route_discovery().await {
         Ok(snapshot) => {
             // Publish the live LAN-peer count for `Status` to report —
@@ -1552,11 +1598,10 @@ async fn refresh_routes_once(airc: &Airc, connected_lan_peers: &std::sync::atomi
             if snapshot.should_self_elect_as_relay(enrolled) {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
-                // dial a wildcard. Same detection the LAN-listener
-                // advertisement uses. With neither IP, we'd be an
-                // un-dialable relay, so stay a client + say why (loud).
-                let lan_ip = crate::network_commands::advertise_lan_ip();
-                let tailscale_ip = crate::network_commands::detect_tailscale_ip();
+                // dial a wildcard. Reuses the IPs detected once at the top
+                // of this tick (same source the endpoint self-heal uses).
+                // With neither IP, we'd be an un-dialable relay, so stay a
+                // client + say why (loud).
                 if lan_ip.is_none() && tailscale_ip.is_none() {
                     eprintln!(
                         "airc daemon: would self-elect as a relay (no reachable peer/relay, \

@@ -4,7 +4,7 @@
 //! methods; they do not own socket setup, adapter state, route health,
 //! or frame ingestion.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use airc_core::PeerId;
 use airc_transport::LanTcpAdapter;
@@ -77,6 +77,96 @@ impl Airc {
         Ok(advertised)
     }
 
+    /// Re-evaluate the dialable endpoints this daemon advertises against
+    /// the CURRENTLY detected LAN / Tailscale IPv4, and apply any change
+    /// in place — the self-heal for a roaming / router-swap / DHCP-renew /
+    /// Tailscale-toggle network change. Without this the endpoint computed
+    /// once at daemon start is frozen, so a node that changes IP keeps
+    /// advertising a stale, undialable address until it is manually
+    /// restarted (the bug this fixes).
+    ///
+    /// The wildcard `0.0.0.0` listener bound by [`Self::listen_lan_advertising`]
+    /// accepts on whatever interfaces the host currently has, so an IP
+    /// change needs NO rebind — rebinding would sever live connections
+    /// (the adapter holds ONE listener for accept + dial + forward). Only
+    /// the ADVERTISED address must follow the new IP, so we reuse the
+    /// already-bound port and upsert / withdraw the `LanTcp` /
+    /// `TailscaleTcp` endpoints to match `lan_ip` / `tailscale_ip`.
+    ///
+    /// Returns `true` iff the advertised set changed — the caller resyncs
+    /// the account-registry card ONLY then (no change ⇒ no gist write ⇒ no
+    /// spam). Edge case: if no listener is bound yet (the daemon started
+    /// with no routable IP) and an IP has since appeared, this binds once
+    /// via [`Self::listen_lan_advertising`].
+    pub async fn refresh_advertised_endpoints(
+        &self,
+        lan_ip: Option<Ipv4Addr>,
+        tailscale_ip: Option<Ipv4Addr>,
+    ) -> Result<bool, AircError> {
+        let current = self.route_endpoints()?;
+        // `if let` (not a `_ =>` match) so the production no-silent-fallback
+        // gate's `wildcard_enum_match_arm` deny stays satisfied without
+        // enumerating every other RouteEndpoint variant.
+        let current_lan = current.iter().find_map(|endpoint| {
+            if let RouteEndpoint::LanTcp { addr } = endpoint {
+                Some(*addr)
+            } else {
+                None
+            }
+        });
+        let current_tailscale = current.iter().find_map(|endpoint| {
+            if let RouteEndpoint::TailscaleTcp { addr } = endpoint {
+                Some(*addr)
+            } else {
+                None
+            }
+        });
+
+        // The one wildcard listener's port is shared by both rungs. If
+        // neither rung is advertised, no listener is bound yet.
+        let Some(port) = current_lan.or(current_tailscale).map(|addr| addr.port()) else {
+            if lan_ip.is_some() || tailscale_ip.is_some() {
+                let advertised = self.listen_lan_advertising(lan_ip, tailscale_ip).await?;
+                return Ok(!advertised.is_empty());
+            }
+            return Ok(false);
+        };
+
+        let mut changed = false;
+
+        // LAN rung: upsert on IP change/appearance, withdraw on disappearance.
+        match (lan_ip, current_lan) {
+            (Some(ip), current) if current.map(|addr| addr.ip()) != Some(IpAddr::V4(ip)) => {
+                self.upsert_route_endpoint(RouteEndpoint::LanTcp {
+                    addr: SocketAddr::from((ip, port)),
+                })?;
+                changed = true;
+            }
+            (None, Some(_)) => {
+                self.inner.route_endpoints.remove_lan();
+                changed = true;
+            }
+            _ => {}
+        }
+
+        // Tailscale rung: same diff, so toggling Tailscale on/off heals too.
+        match (tailscale_ip, current_tailscale) {
+            (Some(ip), current) if current.map(|addr| addr.ip()) != Some(IpAddr::V4(ip)) => {
+                self.upsert_route_endpoint(RouteEndpoint::TailscaleTcp {
+                    addr: SocketAddr::from((ip, port)),
+                })?;
+                changed = true;
+            }
+            (None, Some(_)) => {
+                self.inner.route_endpoints.remove_tailscale();
+                changed = true;
+            }
+            _ => {}
+        }
+
+        Ok(changed)
+    }
+
     /// Connect to a TLS-pinned LAN peer and make LAN-TCP the active
     /// direct route for subsequent sends on this handle.
     pub async fn connect_lan(
@@ -107,5 +197,122 @@ impl Airc {
         .map_err(|error| AircError::Transport(error.to_string()))?;
         *guard = Some(adapter.clone());
         Ok(adapter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Network-change self-heal: `refresh_advertised_endpoints` must
+    //! follow this node's LAN/Tailscale IP without a rebind, and report a
+    //! change ONLY when the advertised set actually moved (so the caller
+    //! resyncs the gist card edge-triggered, never on every tick).
+    use super::*;
+    use crate::route::RouteEndpoint;
+    use tempfile::tempdir;
+
+    async fn test_airc() -> (tempfile::TempDir, Airc) {
+        let dir = tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            dir.path().join("machine/.airc"),
+            dir.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        (dir, airc)
+    }
+
+    fn lan_addr(endpoints: &[RouteEndpoint]) -> Option<SocketAddr> {
+        endpoints.iter().find_map(|e| match e {
+            RouteEndpoint::LanTcp { addr } => Some(*addr),
+            _ => None,
+        })
+    }
+    fn tailscale_addr(endpoints: &[RouteEndpoint]) -> Option<SocketAddr> {
+        endpoints.iter().find_map(|e| match e {
+            RouteEndpoint::TailscaleTcp { addr } => Some(*addr),
+            _ => None,
+        })
+    }
+
+    // what this catches: the frozen-endpoint bug — a node whose LAN IP
+    // moved kept advertising the stale address. The new IP must replace
+    // the old on the SAME port, and the call must report `changed`.
+    #[tokio::test]
+    async fn lan_ip_change_readvertises_same_port_and_reports_changed() {
+        let (_dir, airc) = test_airc().await;
+        // Seed an already-advertised LAN endpoint on a known port.
+        airc.upsert_route_endpoint(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(10, 0, 1, 16), 7777)),
+        })
+        .unwrap();
+
+        let changed = airc
+            .refresh_advertised_endpoints(Some(Ipv4Addr::new(192, 168, 1, 232)), None)
+            .await
+            .unwrap();
+
+        assert!(changed, "an IP move must be reported as a change");
+        let endpoints = airc.route_endpoints().unwrap();
+        assert_eq!(
+            lan_addr(&endpoints),
+            Some(SocketAddr::from((Ipv4Addr::new(192, 168, 1, 232), 7777))),
+            "new IP must be advertised on the SAME bound port (no rebind)"
+        );
+    }
+
+    // what this catches: spam. A tick where nothing moved must NOT report
+    // a change, or the registry loop would rewrite the gist every tick.
+    #[tokio::test]
+    async fn unchanged_ip_reports_no_change() {
+        let (_dir, airc) = test_airc().await;
+        airc.upsert_route_endpoint(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(10, 0, 1, 16), 7777)),
+        })
+        .unwrap();
+
+        let changed = airc
+            .refresh_advertised_endpoints(Some(Ipv4Addr::new(10, 0, 1, 16)), None)
+            .await
+            .unwrap();
+        assert!(!changed, "same IP ⇒ no change ⇒ no resync (no spam)");
+    }
+
+    // what this catches: Tailscale toggle. Turning Tailscale on adds the
+    // rung on the same port; turning it off withdraws it — both reported.
+    #[tokio::test]
+    async fn tailscale_toggle_adds_then_withdraws() {
+        let (_dir, airc) = test_airc().await;
+        airc.upsert_route_endpoint(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 232), 7777)),
+        })
+        .unwrap();
+
+        // Tailscale comes up.
+        let changed = airc
+            .refresh_advertised_endpoints(
+                Some(Ipv4Addr::new(192, 168, 1, 232)),
+                Some(Ipv4Addr::new(100, 79, 156, 3)),
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+        let endpoints = airc.route_endpoints().unwrap();
+        assert_eq!(
+            tailscale_addr(&endpoints),
+            Some(SocketAddr::from((Ipv4Addr::new(100, 79, 156, 3), 7777))),
+            "Tailscale rung shares the one wildcard port"
+        );
+
+        // Tailscale goes away → withdrawn.
+        let changed = airc
+            .refresh_advertised_endpoints(Some(Ipv4Addr::new(192, 168, 1, 232)), None)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            tailscale_addr(&airc.route_endpoints().unwrap()),
+            None,
+            "Tailscale off must withdraw the stale rung"
+        );
     }
 }

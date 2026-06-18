@@ -75,6 +75,16 @@ pub struct DaemonState {
     /// counter each tick — exactly the wiring split used for
     /// `route_endpoints`. `0` until the first refresh completes.
     pub connected_lan_peers: Arc<AtomicUsize>,
+    /// Edge-triggered resync nudge for the account-registry loop. The
+    /// route-refresh loop detects this node's own LAN/Tailscale IP
+    /// changing (router swap, DHCP renew, Tailscale toggle) and, ONLY when
+    /// the advertised endpoint actually changed, notifies this so the
+    /// registry loop republishes the corrected gist card immediately
+    /// instead of waiting up to a full cadence. No change ⇒ no notify ⇒ no
+    /// extra gist write (no spam). Shared like `connected_lan_peers`: the
+    /// airc-lib-owning host loops hold the `Airc` handle, this crate does
+    /// not depend on airc-lib.
+    pub endpoint_resync: Arc<Notify>,
 }
 
 impl DaemonState {
@@ -119,6 +129,7 @@ impl DaemonState {
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
             connected_lan_peers: Arc::new(AtomicUsize::new(0)),
+            endpoint_resync: Arc::new(Notify::new()),
         })
     }
 
