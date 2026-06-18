@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -63,6 +64,17 @@ pub struct DaemonState {
     /// endpoints instead of an endpoint-less beacon. Empty = this
     /// daemon is not dialable (no listener bound).
     pub route_endpoints: RwLock<Vec<IpcRouteEndpoint>>,
+    /// Count of remote peers the daemon's routing handle currently holds
+    /// a live LAN connection to — the set room broadcast actually fans
+    /// out to. Reported via `Status` so a client can tell whether a room
+    /// send can reach anyone (vs. the enrolled-peer "address book" count,
+    /// which says nothing about live reach). The concrete connection
+    /// state lives on an `airc-lib` `Airc` handle, and this crate must
+    /// not depend on `airc-lib` (same boundary as the route-refresh
+    /// closure), so the host's route-refresh loop writes this shared
+    /// counter each tick — exactly the wiring split used for
+    /// `route_endpoints`. `0` until the first refresh completes.
+    pub connected_lan_peers: Arc<AtomicUsize>,
 }
 
 impl DaemonState {
@@ -106,6 +118,7 @@ impl DaemonState {
             shutdown: Notify::new(),
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
+            connected_lan_peers: Arc::new(AtomicUsize::new(0)),
         })
     }
 

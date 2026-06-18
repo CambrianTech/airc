@@ -866,16 +866,41 @@ fn canonical_machine_account_home() -> Option<PathBuf> {
 /// actually received anything. To confirm delivery, the operator runs
 /// `airc doctor --health` (route status), which reads the forwarder's
 /// real ack counters.
-fn format_send_receipt(channel_name: &str, channel_id: &str, peer_count: usize) -> String {
-    if peer_count == 0 {
+///
+/// `connected_lan_peers` (from `Status`, refreshed by the daemon's
+/// route-refresh loop) is the set room broadcast can ACTUALLY reach
+/// right now — the forwarder fans out only over live LAN connections.
+/// When it is `0` while peers are enrolled, the send reached NO remote
+/// machine, and the receipt says so LOUDLY: enrolling a peer is an
+/// address-book entry, not a live route, and a silently-zero connected
+/// set is exactly how a fully-broken fan-out masqueraded as a healthy
+/// channel (issue #1243 — the loopback-only legibility trap).
+fn format_send_receipt(
+    channel_name: &str,
+    channel_id: &str,
+    enrolled_peers: usize,
+    connected_lan_peers: usize,
+) -> String {
+    if enrolled_peers == 0 {
         format!(
             "queued to {channel_name} ({channel_id}) — 0 enrolled remote peer(s); \
              any scope tailing this channel on this machine will receive it."
         )
+    } else if connected_lan_peers == 0 {
+        // LOUD: enrolled peers exist but the daemon holds no live LAN
+        // connection, so room broadcast forwarded to nobody. This is the
+        // signal whose absence let a broken fan-out read as success.
+        format!(
+            "queued to {channel_name} ({channel_id}) — ⚠ reached 0 of {enrolled_peers} \
+             enrolled remote peer(s): NONE are currently connected, so no remote machine \
+             received this (run `airc doctor --health` to see why the routes are down). \
+             Any scope tailing this channel on this machine still has it."
+        )
     } else {
         format!(
-            "queued to {channel_name} ({channel_id}) — addressed {peer_count} enrolled \
-             remote peer(s); delivery is asynchronous and not yet confirmed \
+            "queued to {channel_name} ({channel_id}) — addressed {enrolled_peers} enrolled \
+             remote peer(s), {connected_lan_peers} currently connected; delivery is \
+             asynchronous and not yet confirmed \
              (run `airc doctor --health` to check route delivery). \
              Any scope tailing this channel on this machine also receives it."
         )
@@ -938,9 +963,19 @@ pub async fn run_send(
     // delivery count — see `format_send_receipt` for why the receipt
     // says "queued/addressed" rather than "sent to N peers".
     let peer_count = airc.peers().await?.len();
+    // Ask the daemon how many of those peers it currently holds a LIVE
+    // LAN connection to — the set room broadcast can actually reach.
+    // A cheap Status round-trip; on any failure we fall back to 0,
+    // which the receipt frames as "none currently connected" rather
+    // than inventing reach the daemon can't confirm.
+    let connected_lan_peers = DaemonClient::new(crate::cli::default_socket_path_in(home))
+        .status()
+        .await
+        .map(|status| status.connected_lan_peers)
+        .unwrap_or(0);
     println!(
         "{}",
-        format_send_receipt(&channel_name, &channel_id, peer_count)
+        format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
     Ok(())
 }
@@ -1461,9 +1496,10 @@ pub async fn run_daemon(
 /// them. Inbound sink + forwarder link are installed once in
 /// `run_daemon` before this spawns.
 fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
+    let connected = state.connected_lan_peers.clone();
     tokio::spawn(async move {
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&airc)
+            refresh_routes_once(&airc, &connected)
         })
         .await;
     })
@@ -1474,9 +1510,18 @@ fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::Join
 /// surface every failure through the diagnostic sink — loud, never
 /// silent. Failures never propagate: the loop's next tick is the retry
 /// path (self-heal doctrine, card 625abe6d).
-async fn refresh_routes_once(airc: &Airc) {
+async fn refresh_routes_once(airc: &Airc, connected_lan_peers: &std::sync::atomic::AtomicUsize) {
     match airc.refresh_route_discovery().await {
         Ok(snapshot) => {
+            // Publish the live LAN-peer count for `Status` to report —
+            // the set room broadcast actually fans out to. This is the
+            // ONLY writer (the daemon crate can't reach the airc-lib
+            // handle that owns the connections), refreshed every tick so
+            // `airc send` can warn loudly when a broadcast reaches no one.
+            connected_lan_peers.store(
+                snapshot.connected_lan_peers.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             for failure in &snapshot.peer_dial_failures {
                 StderrJsonDiagnosticSink.emit(
                     DiagnosticEvent::warn(
@@ -1596,11 +1641,17 @@ pub async fn run_msg(
     };
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
-    // delivery receipt.
+    // delivery receipt; the daemon's live-connection count (Status) is
+    // the set room broadcast can actually reach.
     let peer_count = airc.peers().await?.len();
+    let connected_lan_peers = DaemonClient::new(crate::cli::default_socket_path_in(home))
+        .status()
+        .await
+        .map(|status| status.connected_lan_peers)
+        .unwrap_or(0);
     println!(
         "{}",
-        format_send_receipt(&channel_name, &channel_id, peer_count)
+        format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
     Ok(())
 }
@@ -2272,7 +2323,8 @@ mod tests {
     /// operator delivery is asynchronous + how to confirm it.
     #[test]
     fn send_receipt_does_not_imply_confirmed_delivery() {
-        let line = format_send_receipt("general", "cb2e21a1", 41);
+        // 41 enrolled, all currently connected → the healthy branch.
+        let line = format_send_receipt("general", "cb2e21a1", 41, 41);
 
         // The exact misleading phrasing is gone.
         assert!(
@@ -2311,7 +2363,7 @@ mod tests {
     /// reported as enrolled, never as a delivery confirmation.
     #[test]
     fn send_receipt_zero_peers_is_honest_about_local_tailers() {
-        let line = format_send_receipt("general", "cb2e21a1", 0);
+        let line = format_send_receipt("general", "cb2e21a1", 0, 0);
         assert!(!line.starts_with("sent to"), "no delivery verb: {line}");
         assert!(
             !line.contains("paired peer"),
@@ -2325,6 +2377,53 @@ mod tests {
         assert!(
             line.contains("tailing this channel on this machine"),
             "must preserve the same-machine-delivery truth: {line}"
+        );
+    }
+
+    /// what this catches (issue #1243 — the legibility trap): enrolled
+    /// peers exist but the daemon holds ZERO live LAN connections, so
+    /// room broadcast forwarded to nobody. The receipt must say so
+    /// LOUDLY (not report the enrolled "address book" count as if it
+    /// were reach) — the silent-success of this exact case let a fully
+    /// broken fan-out masquerade as a healthy channel for an hour.
+    #[test]
+    fn send_receipt_warns_loudly_when_no_peer_is_connected() {
+        let line = format_send_receipt("general", "cb2e21a1", 42, 0);
+        assert!(line.contains("queued to general"), "honest verb: {line}");
+        // It must NOT frame 42 enrolled as if 42 received it.
+        assert!(
+            line.contains("reached 0 of 42"),
+            "must surface that 0 of 42 enrolled peers were reached: {line}"
+        );
+        assert!(
+            line.contains("NONE are currently connected"),
+            "must name the broken-route cause, not imply delivery: {line}"
+        );
+        assert!(
+            line.contains("airc doctor --health"),
+            "must point the operator at the route diagnostic: {line}"
+        );
+        // The same-machine truth is preserved even when remotes are dark.
+        assert!(
+            line.contains("tailing this channel on this machine"),
+            "local tailers still receive it: {line}"
+        );
+    }
+
+    /// what this catches: the healthy branch reports BOTH counts —
+    /// enrolled (address book) and the live-connected subset — without
+    /// claiming confirmed delivery. Distinguishes "addressed N, M
+    /// connected" from the loud zero-connected case above.
+    #[test]
+    fn send_receipt_reports_connected_subset_when_routes_are_up() {
+        let line = format_send_receipt("general", "cb2e21a1", 42, 3);
+        assert!(
+            line.contains("42 enrolled") && line.contains("3 currently connected"),
+            "must report enrolled total and live-connected subset: {line}"
+        );
+        assert!(
+            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            "still does not claim confirmed delivery: {line}"
         );
     }
 
@@ -2531,6 +2630,7 @@ mod tests {
             build_commit: commit.map(str::to_string),
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
+            connected_lan_peers: 0,
         }
     }
 
