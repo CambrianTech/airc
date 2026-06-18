@@ -95,6 +95,18 @@ pub struct StatusResponse {
     /// only; lifecycle decisions use protocol + build metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<String>,
+    /// Count of remote peers this daemon currently holds a LIVE LAN
+    /// connection to — the set room broadcast actually fans out to
+    /// (`RoutedForwarder` forwards only over `connected_peers()`),
+    /// refreshed by the daemon's route-refresh loop. `0` while
+    /// enrolled peers exist means a room send reaches NO remote peer:
+    /// the signal `airc send` surfaces so a broken fan-out can't
+    /// masquerade as success (the enrolled-peer "address book" count
+    /// alone hid this). `#[serde(default)]`: a daemon predating this
+    /// field decodes as `0` — treated as "unknown / none", which the
+    /// receipt frames honestly rather than as confirmed reach.
+    #[serde(default)]
+    pub connected_lan_peers: usize,
 }
 
 /// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
@@ -238,6 +250,7 @@ mod tests {
             build_commit: Some("abc123".to_string()),
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
+            connected_lan_peers: 2,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
@@ -259,7 +272,27 @@ mod tests {
                 build_commit: None,
                 build_branch: None,
                 executable: None,
+                connected_lan_peers: 0,
             })
+        );
+    }
+
+    /// A daemon predating the `connected_lan_peers` field (it carries
+    /// the metadata fields but not the connection count) must decode as
+    /// `0` — "unknown / none", never a crash. Pins the `#[serde(default)]`
+    /// back-compat contract so a newer CLI can read an older daemon.
+    #[test]
+    fn status_defaults_connected_lan_peers_for_pre_field_daemon() {
+        let decoded: Response = serde_json::from_str(
+            r#"{"kind":"status","peer_id":"07e7ad58-ba56-4535-b4e5-a161a110e487","uptime_seconds":42,"ipc_protocol_version":3}"#,
+        )
+        .unwrap();
+        let Response::Status(status) = decoded else {
+            panic!("expected status response");
+        };
+        assert_eq!(
+            status.connected_lan_peers, 0,
+            "a daemon without the field must decode as 0 connected peers, not error"
         );
     }
 
