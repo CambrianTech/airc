@@ -155,6 +155,19 @@ impl RouteEndpointTable {
         endpoints.sort_by_key(|endpoint| RouteEndpointKind::from(endpoint));
         endpoints
     }
+
+    /// Withdraw the advertised LAN endpoint (network-change self-heal:
+    /// the host lost its routable LAN IP). Idempotent — a no-op if none
+    /// is advertised.
+    pub(crate) fn remove_lan(&self) {
+        self.endpoints.remove(&RouteEndpointKind::LanTcp);
+    }
+
+    /// Withdraw the advertised Tailscale endpoint (e.g. Tailscale was
+    /// turned off). Idempotent.
+    pub(crate) fn remove_tailscale(&self) {
+        self.endpoints.remove(&RouteEndpointKind::TailscaleTcp);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -287,6 +287,7 @@ pub async fn run_loop<S>(
     store: S,
     gate: RegistryRefreshGate,
     config: RegistryRefreshConfig,
+    resync: &tokio::sync::Notify,
     shutdown: impl Future<Output = ()>,
 ) where
     S: AccountRegistryStore,
@@ -303,29 +304,49 @@ pub async fn run_loop<S>(
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
+            // Edge-triggered resync: the route-refresh loop detected this
+            // node's advertised endpoint change (IP move / Tailscale
+            // toggle) and nudged us to republish the corrected card NOW,
+            // rather than waiting up to a full cadence. Only fires on an
+            // actual change, so it adds no steady-state gist writes (no
+            // spam). `Notify` stores one permit if the nudge lands during
+            // a tick, so the wakeup is never lost.
+            _ = resync.notified() => {
+                gated_tick(&gate, &airc, &store, &sink).await;
+            }
             _ = ticker.tick() => {
-                if let Some(block) = gate.block().await {
-                    let code = match &block {
-                        GateBlock::Hermetic(_) => DiagnosticCode::AccountRegistryHermeticSkip,
-                        GateBlock::GhNotReady => DiagnosticCode::AccountRegistryPublishFailed,
-                    };
-                    sink.emit(
-                        DiagnosticEvent::warn(
-                            DiagnosticComponent::Daemon,
-                            code,
-                            format!("account registry tick skipped: {block}"),
-                        ),
-                    );
-                    continue;
-                }
-                // run_tick already emits typed diagnostics on failure;
-                // the loop deliberately swallows the Err and keeps
-                // ticking (self-heal: a transient gh failure must not
-                // kill discovery for the daemon's lifetime).
-                let _ = run_tick(&airc, &store, &sink).await;
+                gated_tick(&gate, &airc, &store, &sink).await;
             }
         }
     }
+}
+
+/// One gated publish/refresh tick: skip LOUDLY if the transport gate
+/// blocks, else run the tick. `run_tick` already emits typed diagnostics
+/// on failure; callers deliberately swallow the `Err` and keep ticking
+/// (self-heal: a transient gh failure must not kill discovery for the
+/// daemon's lifetime).
+async fn gated_tick<S>(
+    gate: &RegistryRefreshGate,
+    airc: &Airc,
+    store: &S,
+    sink: &StderrJsonDiagnosticSink,
+) where
+    S: AccountRegistryStore,
+{
+    if let Some(block) = gate.block().await {
+        let code = match &block {
+            GateBlock::Hermetic(_) => DiagnosticCode::AccountRegistryHermeticSkip,
+            GateBlock::GhNotReady => DiagnosticCode::AccountRegistryPublishFailed,
+        };
+        sink.emit(DiagnosticEvent::warn(
+            DiagnosticComponent::Daemon,
+            code,
+            format!("account registry tick skipped: {block}"),
+        ));
+        return;
+    }
+    let _ = run_tick(airc, store, sink).await;
 }
 
 #[cfg(test)]
@@ -640,11 +661,13 @@ exit 1
             cadence: Duration::from_secs(3600),
         };
         let handle = tokio::spawn(async move {
+            let resync = tokio::sync::Notify::new();
             run_loop(
                 airc,
                 store,
                 RegistryRefreshGate::Always,
                 config,
+                &resync,
                 async move {
                     let _ = rx.await;
                 },
