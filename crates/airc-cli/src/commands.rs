@@ -1550,18 +1550,38 @@ async fn refresh_routes_once(airc: &Airc, connected_lan_peers: &std::sync::atomi
             // durable pointer stays valid across restarts.
             let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
             if snapshot.should_self_elect_as_relay(enrolled) {
-                match airc
-                    .become_relay(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
-                    .await
-                {
-                    Ok(addr) => eprintln!(
-                        "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
-                         self-elected as a relay on {addr} and advertised it (#1247)"
-                    ),
-                    Err(error) => eprintln!(
-                        "airc daemon: relay self-election failed ({error}); \
-                         retrying next interval"
-                    ),
+                // Slice 4c: advertise the relay under our ROUTABLE IP(s)
+                // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
+                // dial a wildcard. Same detection the LAN-listener
+                // advertisement uses. With neither IP, we'd be an
+                // un-dialable relay, so stay a client + say why (loud).
+                let lan_ip = crate::network_commands::advertise_lan_ip();
+                let tailscale_ip = crate::network_commands::detect_tailscale_ip();
+                if lan_ip.is_none() && tailscale_ip.is_none() {
+                    eprintln!(
+                        "airc daemon: would self-elect as a relay (no reachable peer/relay, \
+                         enrolled={enrolled}) but no routable LAN/Tailscale IPv4 to advertise \
+                         — staying a client (open a routable interface to host a relay)"
+                    );
+                } else {
+                    match airc
+                        .become_relay(
+                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                            lan_ip,
+                            tailscale_ip,
+                        )
+                        .await
+                    {
+                        Ok(addr) => eprintln!(
+                            "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                             self-elected as a relay (listening {addr}) and advertised it on \
+                             this node's routable IP(s) (#1247)"
+                        ),
+                        Err(error) => eprintln!(
+                            "airc daemon: relay self-election failed ({error}); \
+                             retrying next interval"
+                        ),
+                    }
                 }
             }
         }

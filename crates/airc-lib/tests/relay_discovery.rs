@@ -16,7 +16,7 @@
 //!   - a successful connect yields a Healthy `Relay` transport in the
 //!     route-health snapshot.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use airc_core::PeerId;
@@ -134,9 +134,15 @@ async fn a_node_becomes_a_relay_and_a_client_discovers_it() {
         .await
         .expect("client trusts relay node");
 
-    // The relay node promotes itself.
+    // The relay node promotes itself, advertising under loopback (the
+    // routable address for this same-machine test; in production the daemon
+    // passes the node's detected LAN/Tailscale IPs).
     let relay_addr = relay_node
-        .become_relay("127.0.0.1:0".parse().unwrap())
+        .become_relay(
+            "127.0.0.1:0".parse().unwrap(),
+            Some(Ipv4Addr::LOCALHOST),
+            None,
+        )
         .await
         .expect("relay node becomes a relay");
 

@@ -5,7 +5,7 @@
 //! and frame ingestion; consumers only provide the relay endpoint and
 //! pinned relay identity.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use airc_core::PeerId;
 use airc_relay::{RelayServer, RelayServerConfig};
@@ -75,14 +75,24 @@ impl Airc {
     ///
     /// Idempotent: a node already relaying re-advertises and returns its
     /// existing bound address.
-    pub async fn become_relay(&self, bind_addr: SocketAddr) -> Result<SocketAddr, AircError> {
+    /// `bind_addr` is where the relay LISTENS (typically `0.0.0.0:0` — all
+    /// interfaces, OS-assigned port). `lan_ip` / `tailscale_ip` are the
+    /// ROUTABLE addresses this node advertises the relay under (the caller
+    /// detects them, exactly as for [`Airc::listen_lan_advertising`]); the
+    /// wildcard bind address is NEVER advertised, since peers can't dial it.
+    pub async fn become_relay(
+        &self,
+        bind_addr: SocketAddr,
+        lan_ip: Option<Ipv4Addr>,
+        tailscale_ip: Option<Ipv4Addr>,
+    ) -> Result<SocketAddr, AircError> {
         // Fast path: already relaying — re-advertise (idempotent) + return.
         {
             let guard = self.inner.relay_server.lock().await;
             if let Some(server) = guard.as_ref() {
                 let addr = server.local_addr();
                 drop(guard);
-                self.advertise_self_relay(addr)?;
+                self.advertise_self_relay(addr.port(), lan_ip, tailscale_ip)?;
                 return Ok(addr);
             }
         }
@@ -113,15 +123,33 @@ impl Airc {
                 }
             }
         };
-        self.advertise_self_relay(final_addr)?;
+        self.advertise_self_relay(final_addr.port(), lan_ip, tailscale_ip)?;
         Ok(final_addr)
     }
 
-    /// Record THIS node's own relay endpoint (peer-id-bearing) on the
-    /// route table so it propagates into the gist directory. Distinct from
-    /// `upsert_relay_health`, which marks a relay this node is a CLIENT of.
-    fn advertise_self_relay(&self, addr: SocketAddr) -> Result<(), AircError> {
-        self.upsert_route_endpoint(RouteEndpoint::relay(self.inner.identity.peer_id, addr))?;
+    /// Advertise THIS node's relay under each ROUTABLE address it owns —
+    /// its LAN IP and/or its Tailscale IP — NEVER the wildcard `0.0.0.0`
+    /// bind, which peers can't dial (#1247 slice 4c). Mirrors
+    /// [`Airc::listen_lan_advertising`]: bind all interfaces once, publish
+    /// the specific dialable IPs; the dialer tries whichever it can reach
+    /// (same-subnet → LAN IP; cross-subnet → Tailscale). With NEITHER IP
+    /// known (e.g. a container with no routable address) the relay runs but
+    /// advertises nothing — an un-dialable relay is useless, so we never
+    /// publish a dead `0.0.0.0` endpoint. Distinct from `upsert_relay_health`,
+    /// which marks a relay this node is a CLIENT of.
+    fn advertise_self_relay(
+        &self,
+        port: u16,
+        lan_ip: Option<Ipv4Addr>,
+        tailscale_ip: Option<Ipv4Addr>,
+    ) -> Result<(), AircError> {
+        let me = self.inner.identity.peer_id;
+        if let Some(ip) = lan_ip {
+            self.upsert_route_endpoint(RouteEndpoint::relay(me, SocketAddr::from((ip, port))))?;
+        }
+        if let Some(ip) = tailscale_ip {
+            self.upsert_route_endpoint(RouteEndpoint::relay(me, SocketAddr::from((ip, port))))?;
+        }
         Ok(())
     }
 
