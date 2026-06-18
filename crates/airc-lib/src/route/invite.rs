@@ -83,6 +83,37 @@ impl RouteEndpoint {
             )),
         }
     }
+
+    /// Build a relay endpoint whose URL carries BOTH the relay's dialable
+    /// address AND its pinned peer id — `airc-relay://<peer>@<addr>`. A
+    /// peer importing this endpoint can then dial AND authenticate the
+    /// relay (the mTLS pin in `connect_relay`) with no separate
+    /// out-of-band credential exchange — closing the gap that left
+    /// `Relay { url }` un-connectable from discovery (#1247 slice 1).
+    pub fn relay(relay_peer: PeerId, relay_addr: SocketAddr) -> Self {
+        RouteEndpoint::Relay {
+            url: format!("airc-relay://{relay_peer}@{relay_addr}"),
+        }
+    }
+
+    /// If this is a relay endpoint whose URL carries a pinned peer id and
+    /// a dialable address, return the `(peer, addr)` pair
+    /// [`Airc::connect_relay`](crate::Airc::connect_relay) needs.
+    ///
+    /// `None` for a non-relay endpoint OR a relay URL missing either half
+    /// (e.g. a legacy `airc-relay://<addr>` with no peer id) — discovery
+    /// surfaces that as "relay advertised but not connectable" rather
+    /// than dialing an unauthenticated relay.
+    pub fn connectable_relay(&self) -> Option<(PeerId, SocketAddr)> {
+        let RouteEndpoint::Relay { url } = self else {
+            return None;
+        };
+        let rest = url.strip_prefix("airc-relay://")?;
+        let (peer, addr) = rest.rsplit_once('@')?;
+        let peer = PeerId::from_uuid(uuid::Uuid::parse_str(peer).ok()?);
+        let addr = addr.parse::<SocketAddr>().ok()?;
+        Some((peer, addr))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +299,45 @@ mod tests {
         assert!(json.contains("lan_tcp"));
         assert!(json.contains("127.0.0.1:7474"));
         assert!(!json.contains("message"));
+    }
+
+    /// what this catches (#1247 slice 1): a relay endpoint built with a
+    /// pinned peer id round-trips back to the exact `(peer, addr)` pair
+    /// `connect_relay` needs — so a relay advertised through the gist is
+    /// dialable AND pinnable with no out-of-band credential exchange.
+    #[test]
+    fn relay_endpoint_carries_peer_id_and_round_trips() {
+        let relay_peer = PeerId::new();
+        let relay_addr = SocketAddr::from(([10, 0, 1, 16], 65458));
+        let endpoint = RouteEndpoint::relay(relay_peer, relay_addr);
+
+        let (peer, addr) = endpoint
+            .connectable_relay()
+            .expect("relay endpoint with a peer id must be connectable");
+        assert_eq!(peer, relay_peer);
+        assert_eq!(addr, relay_addr);
+
+        // Survives JSON (the gist/trust-store boundary).
+        let json = endpoints_to_json(std::slice::from_ref(&endpoint)).expect("json");
+        let back = endpoints_from_json(&json).expect("decode");
+        assert_eq!(back[0].connectable_relay(), Some((relay_peer, relay_addr)));
+    }
+
+    /// what this catches: a legacy `airc-relay://<addr>` URL (no peer id)
+    /// is NOT connectable — discovery must surface "advertised but not
+    /// pinnable" rather than dial an unauthenticated relay. Likewise a
+    /// non-relay endpoint yields `None`.
+    #[test]
+    fn relay_without_peer_id_or_non_relay_is_not_connectable() {
+        let legacy = RouteEndpoint::Relay {
+            url: "airc-relay://10.0.1.16:65458".to_string(),
+        };
+        assert_eq!(legacy.connectable_relay(), None);
+
+        let lan = RouteEndpoint::LanTcp {
+            addr: SocketAddr::from(([127, 0, 0, 1], 7474)),
+        };
+        assert_eq!(lan.connectable_relay(), None);
     }
 
     #[test]

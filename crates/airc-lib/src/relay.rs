@@ -29,7 +29,7 @@ impl Airc {
             if guard.is_some() {
                 drop(guard);
                 self.ensure_relay_subscriber().await?;
-                self.upsert_relay_health(relay_addr)?;
+                self.upsert_relay_health(relay_addr, relay_peer)?;
                 return Ok(());
             }
         }
@@ -52,11 +52,15 @@ impl Airc {
             }
         }
         self.ensure_relay_subscriber().await?;
-        self.upsert_relay_health(relay_addr)?;
+        self.upsert_relay_health(relay_addr, relay_peer)?;
         Ok(())
     }
 
-    fn upsert_relay_health(&self, relay_addr: SocketAddr) -> Result<(), AircError> {
+    fn upsert_relay_health(
+        &self,
+        relay_addr: SocketAddr,
+        relay_peer: PeerId,
+    ) -> Result<(), AircError> {
         self.upsert_transport_health(TransportHealthSample {
             kind: TransportKind::Relay,
             role: TransportRole::Relay,
@@ -64,9 +68,13 @@ impl Airc {
             rtt_ms: None,
             success_ppm: None,
         })?;
-        self.upsert_route_endpoint(RouteEndpoint::Relay {
-            url: format!("airc-relay://{relay_addr}"),
-        })?;
+        // Record the relay endpoint with its peer id baked into the URL
+        // (`airc-relay://<peer>@<addr>`) so when this is advertised through
+        // the gist rendezvous, an importing peer can both dial AND pin the
+        // relay (mTLS) with no out-of-band credential exchange — the
+        // self-electing-relay model (#1247). A bare `airc-relay://<addr>`
+        // would be advertised un-connectable.
+        self.upsert_route_endpoint(RouteEndpoint::relay(relay_peer, relay_addr))?;
         Ok(())
     }
 
