@@ -773,16 +773,29 @@ _setup_windows_firewall() {
     ok "Windows Firewall: airc inbound already allowed"
     return 0
   fi
-  info "Windows Firewall: allowing airc inbound (one UAC prompt — so LAN peers can reach this node)…"
+  # Tell the user WHAT we're about to do and WHY before the UAC prompt pops —
+  # same spirit as an app asking for notification permission. Then it's an
+  # informed click, not a mystery elevation request.
+  info ""
+  info "Windows Firewall — one-time setup (needs your approval):"
+  info "  WHAT: add a single rule allowing inbound TCP to this airc binary."
+  info "  WHY:  Windows blocks inbound connections from unknown programs by"
+  info "        default, so other machines on your LAN can't reach this node"
+  info "        until the rule exists. This is the airc grid's front door."
+  info "  HOW:  Windows will show ONE UAC prompt — click Yes to allow it."
+  info "        (Updates stay silent afterward; nothing to re-approve.)"
   powershell.exe -NoProfile -Command \
     "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
     >/dev/null 2>&1 || true
   if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
-    ok "Windows Firewall: airc inbound allowed"
+    ok "Windows Firewall: airc inbound allowed — LAN peers can now reach this node."
   else
-    warn "Windows Firewall rule not set (elevation declined?). airc inbound may be blocked. \
-Re-run setup, or as admin: powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
+    warn "Windows Firewall rule was NOT set (UAC declined or cancelled)."
+    warn "  ⚠️  LAN connectivity will NOT work — other machines can't reach this"
+    warn "      node inbound, so the grid can't form over your local network."
+    warn "  Fix it any time by re-running setup, or as admin:"
+    warn "      powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
   fi
 }
 
