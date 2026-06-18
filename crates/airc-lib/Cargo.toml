@@ -33,6 +33,10 @@ airc-wire = { path = "../airc-wire" }
 airc-store = { path = "../airc-store" }
 airc-trust = { path = "../airc-trust" }
 airc-transport = { path = "../airc-transport" }
+# Promoted from dev-dep: a node can ALSO BE a relay (`Airc::become_relay`,
+# #1247 slice 4 self-election). No cycle — airc-relay depends only on
+# core/protocol/transport, never on airc-lib.
+airc-relay = { path = "../airc-relay" }
 airc-work = { path = "../airc-work" }
 airc-work-store = { path = "../airc-work-store" }
 
@@ -62,7 +66,6 @@ mock = []
 
 [dev-dependencies]
 airc-daemon = { path = "../airc-daemon" }
-airc-relay = { path = "../airc-relay" }
 airc-protocol = { path = "../airc-protocol" }
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

@@ -101,3 +101,75 @@ async fn discovery_connects_stored_relay_endpoint_and_marks_it_healthy() {
 
     server.shutdown();
 }
+
+/// #1247 slice 4 — self-election mechanism: a NODE promotes itself to a
+/// relay (`become_relay`), advertises its own peer-id-bearing relay
+/// endpoint, and a client that imports that endpoint (as it would from the
+/// gist directory) discovers + connects to it. Proves the advertise →
+/// discover → connect loop with a node-as-relay (no standalone server),
+/// which is what the daemon's election trigger will drive.
+#[tokio::test]
+async fn a_node_becomes_a_relay_and_a_client_discovers_it() {
+    use airc_lib::{TransportHealthState, TransportKind};
+
+    let tmp_r = TempDir::new().expect("relay-node tempdir");
+    let relay_node = Airc::open(tmp_r.path().join(".airc"))
+        .await
+        .expect("relay node open");
+    let tmp_c = TempDir::new().expect("client tempdir");
+    let client = Airc::open(tmp_c.path().join(".airc"))
+        .await
+        .expect("client open");
+
+    // Mutual trust: the relay node allowlists the client (its relay server
+    // serves enrolled peers), and the client pins the relay node.
+    let relay_spec: PeerSpec = relay_node.peer_spec().parse().expect("relay spec");
+    let client_spec: PeerSpec = client.peer_spec().parse().expect("client spec");
+    relay_node
+        .add_peer(client_spec)
+        .await
+        .expect("relay node trusts client");
+    client
+        .add_peer(relay_spec)
+        .await
+        .expect("client trusts relay node");
+
+    // The relay node promotes itself.
+    let relay_addr = relay_node
+        .become_relay("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("relay node becomes a relay");
+
+    // It advertised its OWN connectable relay endpoint.
+    let advertised = relay_node.route_endpoints().expect("relay endpoints");
+    assert!(
+        advertised
+            .iter()
+            .any(|e| e.connectable_relay() == Some((relay_node.peer_id(), relay_addr))),
+        "a self-elected relay must advertise its own connectable endpoint; got: {advertised:?}"
+    );
+
+    // The client imports that endpoint (the gist-directory path) and
+    // discovery connects to the node-hosted relay.
+    let endpoints_json =
+        endpoints_to_json(&[RouteEndpoint::relay(relay_node.peer_id(), relay_addr)])
+            .expect("encode");
+    airc_trust::set_endpoints_json(client.home(), relay_node.peer_id(), Some(endpoints_json))
+        .await
+        .expect("store relay endpoint")
+        .expect("relay node enrolled on client");
+
+    let snapshot = client
+        .refresh_route_discovery()
+        .await
+        .expect("client discovery refresh");
+    assert!(
+        snapshot
+            .health
+            .iter()
+            .any(|h| h.kind == TransportKind::Relay && h.state == TransportHealthState::Healthy),
+        "client must discover + connect the node-hosted relay (Relay Healthy); \
+         health: {:?}",
+        snapshot.health
+    );
+}
