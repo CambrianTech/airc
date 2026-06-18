@@ -66,8 +66,8 @@ _to_bash_path() {
 #
 # Required: git, gh, ssh-keygen, cargo (to build the Rust substrate CLI).
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
-# Deliberately not required: openssl or Python. Identity, signing, hooks,
-# config, and message parsing are Rust-owned.
+# Everything else — identity, signing, hooks, config, message parsing,
+# JSON handling — is Rust-owned, so there are no other runtime prereqs.
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -327,8 +327,8 @@ ensure_prereqs() {
   fi
 
   local missing=() pkgs=() unmappable=()
-  # jq, openssl, and Python are not install prereqs. JSON handling,
-  # Ed25519 identity/signing, hooks, and config mutation are Rust-owned.
+  # The full prereq set is exactly these four. JSON handling, Ed25519
+  # identity/signing, hooks, and config mutation are all Rust-owned.
   for cmd in git gh ssh-keygen cargo; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
@@ -396,11 +396,10 @@ ensure_prereqs() {
   _ensure_windows_msvc_toolchain "$mgr"
   _ensure_macos_build_toolchain
 
-  # Issue #341 follow-up: openssl/Python crypto bootstrap removed.
-  # Identity gen + signing live in Rust, so system OpenSSL and Python
-  # package state are irrelevant to airc install correctness.
+  # Identity gen + signing live in Rust — there is no crypto bootstrap to
+  # do here; system package state is irrelevant to airc install correctness.
 
-  # Post-3c: sshd setup + Tailscale install fully removed from install.
+  # sshd setup + Tailscale install are not part of install.
   # Cross-network messaging is owned by Rust transports/discovery, while
   # GitHub remains rendezvous/control-plane only. The earlier sshd-on-
   # by-default block (with sudo/UAC prompt + AIRC_SKIP_SSHD escape +
@@ -773,16 +772,29 @@ _setup_windows_firewall() {
     ok "Windows Firewall: airc inbound already allowed"
     return 0
   fi
-  info "Windows Firewall: allowing airc inbound (one UAC prompt — so LAN peers can reach this node)…"
+  # Tell the user WHAT we're about to do and WHY before the UAC prompt pops —
+  # same spirit as an app asking for notification permission. Then it's an
+  # informed click, not a mystery elevation request.
+  info ""
+  info "Windows Firewall — one-time setup (needs your approval):"
+  info "  WHAT: add a single rule allowing inbound TCP to this airc binary."
+  info "  WHY:  Windows blocks inbound connections from unknown programs by"
+  info "        default, so other machines on your LAN can't reach this node"
+  info "        until the rule exists. This is the airc grid's front door."
+  info "  HOW:  Windows will show ONE UAC prompt — click Yes to allow it."
+  info "        (Updates stay silent afterward; nothing to re-approve.)"
   powershell.exe -NoProfile -Command \
     "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
     >/dev/null 2>&1 || true
   if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
-    ok "Windows Firewall: airc inbound allowed"
+    ok "Windows Firewall: airc inbound allowed — LAN peers can now reach this node."
   else
-    warn "Windows Firewall rule not set (elevation declined?). airc inbound may be blocked. \
-Re-run setup, or as admin: powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
+    warn "Windows Firewall rule was NOT set (UAC declined or cancelled)."
+    warn "  ⚠️  LAN connectivity will NOT work — other machines can't reach this"
+    warn "      node inbound, so the grid can't form over your local network."
+    warn "  Fix it any time by re-running setup, or as admin:"
+    warn "      powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
   fi
 }
 

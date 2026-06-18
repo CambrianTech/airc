@@ -58,17 +58,12 @@ resp="$(curl -fsS "${BASE}/v1/chat/completions" \
   -d '{"messages":[{"role":"user","content":"Reply with exactly: grid online"}],"max_tokens":16,"temperature":0}')" \
   || fail "POST /v1/chat/completions failed"
 
-# Assert a non-empty assistant message came back, and echo it.
-text=""
-if command -v python3 >/dev/null 2>&1; then
-  text="$(printf '%s' "$resp" | python3 -c \
-    'import sys,json; c=json.load(sys.stdin)["choices"][0]["message"]["content"]; assert c.strip(); print(c.strip())' \
-    2>/dev/null)" || fail "response had no completion content: ${resp:0:200}"
-else
-  printf '%s' "$resp" | grep -Eq '"content"[[:space:]]*:[[:space:]]*"[^"]' \
-    || fail "response had no completion content: ${resp:0:200}"
-  text="(install python3 to echo the text)"
-fi
+# Assert a non-empty assistant message came back, and echo it. Pure sed/grep —
+# no Python runtime (Rust-cutover guard forbids a Python dependency on the
+# live path). Pull the first "content":"..." string out of the JSON.
+text="$(printf '%s' "$resp" | sed -n 's/.*"content"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+[ -n "$text" ] \
+  || fail "response had no completion content: ${resp:0:200}"
 
 log "OK — completion returned: \"${text}\". The 5090 generate facility GPU half is PROVEN. 🚀"
 log "advertise it on the grid:  cargo run -p airc-generate-bridge   (needs a running airc daemon)"
