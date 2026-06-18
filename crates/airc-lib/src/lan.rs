@@ -104,13 +104,22 @@ impl Airc {
         tailscale_ip: Option<Ipv4Addr>,
     ) -> Result<bool, AircError> {
         let current = self.route_endpoints()?;
-        let current_lan = current.iter().find_map(|endpoint| match endpoint {
-            RouteEndpoint::LanTcp { addr } => Some(*addr),
-            _ => None,
+        // `if let` (not a `_ =>` match) so the production no-silent-fallback
+        // gate's `wildcard_enum_match_arm` deny stays satisfied without
+        // enumerating every other RouteEndpoint variant.
+        let current_lan = current.iter().find_map(|endpoint| {
+            if let RouteEndpoint::LanTcp { addr } = endpoint {
+                Some(*addr)
+            } else {
+                None
+            }
         });
-        let current_tailscale = current.iter().find_map(|endpoint| match endpoint {
-            RouteEndpoint::TailscaleTcp { addr } => Some(*addr),
-            _ => None,
+        let current_tailscale = current.iter().find_map(|endpoint| {
+            if let RouteEndpoint::TailscaleTcp { addr } = endpoint {
+                Some(*addr)
+            } else {
+                None
+            }
         });
 
         // The one wildcard listener's port is shared by both rungs. If
