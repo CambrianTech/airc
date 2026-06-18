@@ -8,7 +8,7 @@ use airc_core::PeerId;
 use futures::stream::StreamExt;
 
 use crate::error::AircError;
-use crate::route::health::TransportHealthSample;
+use crate::route::health::{TransportHealthSample, TransportHealthState};
 use crate::route::invite::RouteEndpoint;
 use crate::route::policy::TransportKind;
 use crate::Airc;
@@ -80,6 +80,29 @@ pub struct RouteDiscoverySnapshot {
     /// `peer_dial_failures` so it is never miscounted/mislabelled as a
     /// failed dial.
     pub peer_dial_skips: Vec<PeerDialSkip>,
+}
+
+impl RouteDiscoverySnapshot {
+    /// #1247 slice 4b — the relay self-election DECISION (pure, so the
+    /// daemon's trigger is unit-tested independent of the loop).
+    ///
+    /// A node should promote itself to a relay when it knows peers exist
+    /// but can reach NONE of them right now: no live relay route AND no
+    /// directly-connected LAN peer. That's an isolated node that could be
+    /// a meeting point for other isolated peers.
+    ///
+    /// The rule stays deliberately simple because slice 4a made
+    /// reachability EMPIRICAL — a wrong "yes" is harmless (an unreachable
+    /// self-elected relay accumulates no connections and its gist entry
+    /// goes stale), so there's no need to predict our own reachability.
+    /// `become_relay` is idempotent, so re-evaluating "yes" every refresh
+    /// just re-advertises.
+    pub fn should_self_elect_as_relay(&self, enrolled_peers: usize) -> bool {
+        let has_live_relay = self.health.iter().any(|sample| {
+            sample.kind == TransportKind::Relay && sample.state == TransportHealthState::Healthy
+        });
+        enrolled_peers > 0 && self.connected_lan_peers.is_empty() && !has_live_relay
+    }
 }
 
 impl Airc {
@@ -482,5 +505,54 @@ impl Airc {
             Some(adapter) => adapter.connected_peers().await,
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(
+        health: Vec<TransportHealthSample>,
+        connected_lan_peers: Vec<PeerId>,
+    ) -> RouteDiscoverySnapshot {
+        RouteDiscoverySnapshot {
+            health,
+            endpoints: Vec::new(),
+            connected_lan_peers,
+            peer_dial_failures: Vec::new(),
+            peer_dial_skips: Vec::new(),
+        }
+    }
+
+    /// what this catches (#1247 slice 4b): a node that knows peers exist
+    /// but can reach NONE of them (no relay, no LAN peer) self-elects as a
+    /// relay — the isolated-node-becomes-a-meeting-point case.
+    #[test]
+    fn isolated_node_with_enrolled_peers_self_elects() {
+        assert!(snapshot(Vec::new(), Vec::new()).should_self_elect_as_relay(2));
+    }
+
+    /// A directly-connected LAN peer means the node can already reach the
+    /// mesh — no need to become a relay.
+    #[test]
+    fn a_connected_lan_peer_means_no_election() {
+        assert!(!snapshot(Vec::new(), vec![PeerId::new()]).should_self_elect_as_relay(2));
+    }
+
+    /// A live relay route means the node already has a meeting point —
+    /// don't elect a competing one.
+    #[test]
+    fn a_live_relay_means_no_election() {
+        let health = vec![TransportHealthSample::healthy_direct(TransportKind::Relay)];
+        assert!(!snapshot(health, Vec::new()).should_self_elect_as_relay(2));
+    }
+
+    /// Grid-of-one: no enrolled peers = no mesh to join = nothing to
+    /// relay for. Never elect (else every fresh, peerless node spins up a
+    /// pointless relay).
+    #[test]
+    fn grid_of_one_never_elects() {
+        assert!(!snapshot(Vec::new(), Vec::new()).should_self_elect_as_relay(0));
     }
 }
