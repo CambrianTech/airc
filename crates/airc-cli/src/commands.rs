@@ -1534,6 +1534,36 @@ async fn refresh_routes_once(airc: &Airc, connected_lan_peers: &std::sync::atomi
                     .with_field("error", &failure.error),
                 );
             }
+
+            // #1247 slice 4b — relay self-election. When this node can
+            // reach no peer directly AND has no live relay yet, but knows
+            // enrolled peers exist, it promotes itself to a relay (the
+            // "be a relay" mechanism is `Airc::become_relay`, slice 4a).
+            // The next account-registry publish carries the advertised
+            // relay endpoint into the gist, so reachable peers discover +
+            // connect to it (slices 2-3). Idempotent + empirical: a node
+            // already relaying just re-advertises, and an unreachable
+            // self-elected relay is harmlessly ignored (no connections →
+            // stale gist entry), so no need to predict our own
+            // reachability. Binds all interfaces on an OS-assigned port —
+            // the gist advertises whatever port the OS gave, so the
+            // durable pointer stays valid across restarts.
+            let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
+            if snapshot.should_self_elect_as_relay(enrolled) {
+                match airc
+                    .become_relay(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+                    .await
+                {
+                    Ok(addr) => eprintln!(
+                        "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                         self-elected as a relay on {addr} and advertised it (#1247)"
+                    ),
+                    Err(error) => eprintln!(
+                        "airc daemon: relay self-election failed ({error}); \
+                         retrying next interval"
+                    ),
+                }
+            }
         }
         Err(error) => {
             StderrJsonDiagnosticSink.emit(
