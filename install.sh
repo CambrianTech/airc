@@ -732,6 +732,26 @@ ensure_cargo_recent() {
 
 # Build the Rust binary and place it on PATH as `airc`. No shell
 # wrapper, no .shim/.cmd/.ps1 trampolines — the Rust binary is the
+# Resolve cargo's ACTUAL target directory rather than assuming
+# "$CLONE_DIR/target". Cargo honors `CARGO_TARGET_DIR` AND a `[build]
+# target-dir` in `~/.cargo/config.toml` / `.cargo/config.toml`, which a
+# shared-build-cache setup commonly redirects (disk discipline). When it
+# does, the binary lands outside `$CLONE_DIR/target`, and the old
+# hard-coded path made `airc update` build successfully then "lose" the
+# binary and bail. `cargo metadata` reports the resolved dir (same
+# precedence the build used), so we always look where the binary actually
+# is. JSON backslash-escapes / Windows backslashes are normalized to
+# forward slashes so the path is usable in this (MSYS/git-bash) shell;
+# falls back to the historical default if `cargo metadata` is unavailable.
+_airc_target_dir() {
+  local dir
+  dir="$( (cd "$CLONE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null) \
+          | grep -o '"target_directory":"[^"]*"' | head -1 \
+          | sed 's/^"target_directory":"//; s/"$//' )"
+  dir="$(printf '%s' "$dir" | sed 's#\\\\#/#g; s#\\#/#g')"
+  if [ -n "$dir" ]; then printf '%s\n' "$dir"; else printf '%s\n' "$CLONE_DIR/target"; fi
+}
+
 # user surface. Copy the built binary into BIN_DIR so PATH never points
 # at mutable target artifacts inside the source checkout.
 _install_airc_binary() {
@@ -744,16 +764,19 @@ _install_airc_binary() {
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
   mkdir -p "$BIN_DIR"
 
+  # Where cargo ACTUALLY put it (honors CARGO_TARGET_DIR + cargo config),
+  # not the assumed "$CLONE_DIR/target" — see `_airc_target_dir`.
+  local target_dir; target_dir="$(_airc_target_dir)"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      local built="$CLONE_DIR/target/release/airc.exe"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      local built="$target_dir/release/airc.exe"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       cp -f "$built" "$BIN_DIR/airc.exe"
       ok "Installed airc: $BIN_DIR/airc.exe"
       ;;
     *)
-      local built="$CLONE_DIR/target/release/airc"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+      local built="$target_dir/release/airc"
+      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       local tmp="$BIN_DIR/.airc.tmp.$$"
       cp -f "$built" "$tmp"
       chmod +x "$tmp"
@@ -1003,10 +1026,11 @@ _install_airc_codex_hooks() {
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
   local _airc=""
-  if [ -x "$CLONE_DIR/target/release/airc" ]; then
-    _airc="$CLONE_DIR/target/release/airc"
-  elif [ -x "$CLONE_DIR/target/debug/airc" ]; then
-    _airc="$CLONE_DIR/target/debug/airc"
+  local _tdir; _tdir="$(_airc_target_dir)"
+  if [ -x "$_tdir/release/airc" ]; then
+    _airc="$_tdir/release/airc"
+  elif [ -x "$_tdir/debug/airc" ]; then
+    _airc="$_tdir/debug/airc"
   elif command -v airc >/dev/null 2>&1; then
     _airc=$(command -v airc)
   else
