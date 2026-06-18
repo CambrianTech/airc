@@ -754,6 +754,38 @@ _airc_target_dir() {
 
 # user surface. Copy the built binary into BIN_DIR so PATH never points
 # at mutable target artifacts inside the source checkout.
+# Windows-only: make airc reachable INBOUND without code-signing. Defender
+# blocks unknown programs' inbound by default, and repeated `airc daemon`
+# binds leave contradictory auto-created rules (a Block beats an Allow), so
+# inbound silently dies. We install ONE canonical inbound-allow rule for the
+# binary. Changing firewall rules requires elevation (signing wouldn't help —
+# firewall != SmartScreen), so we CHECK first (read-only, no prompt) and only
+# UAC-prompt when a fix is actually needed — every later update stays silent.
+_setup_windows_firewall() {
+  local ps1="$CLONE_DIR/windows/firewall-allow.ps1"
+  [ -f "$ps1" ] || return 0   # tolerate older checkouts
+  local airc_win ps1_win
+  airc_win="$(_to_win_path "$BIN_DIR/airc.exe")"
+  ps1_win="$(_to_win_path "$ps1")"
+  # Read-only state check — no admin, no prompt.
+  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
+    ok "Windows Firewall: airc inbound already allowed"
+    return 0
+  fi
+  info "Windows Firewall: allowing airc inbound (one UAC prompt — so LAN peers can reach this node)…"
+  powershell.exe -NoProfile -Command \
+    "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
+    >/dev/null 2>&1 || true
+  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
+    ok "Windows Firewall: airc inbound allowed"
+  else
+    warn "Windows Firewall rule not set (elevation declined?). airc inbound may be blocked. \
+Re-run setup, or as admin: powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
+  fi
+}
+
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   if ! command -v cargo >/dev/null 2>&1; then
@@ -773,6 +805,9 @@ _install_airc_binary() {
       [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       cp -f "$built" "$BIN_DIR/airc.exe"
       ok "Installed airc: $BIN_DIR/airc.exe"
+      # Reachable-inbound on a typical Windows box (idempotent; prompts for
+      # elevation only when the firewall rule is missing/broken).
+      _setup_windows_firewall
       ;;
     *)
       local built="$target_dir/release/airc"
