@@ -30,6 +30,7 @@ pub mod media;
 pub mod policy;
 pub mod rtc_signal;
 pub mod session;
+pub mod session_manager;
 pub mod signature;
 pub mod subscription;
 pub mod transcript_conv;
@@ -58,6 +59,7 @@ pub use media::MediaRef;
 pub use policy::{AlwaysLift, LiftPolicy, NeverLift, SizeThresholdPolicy};
 pub use rtc_signal::{WebRtcSignal, WebRtcSignalKind, WEBRTC_SIGNAL_BODY_HINT};
 pub use session::{SealedFrame, SessionError, SessionRole, StreamSession};
+pub use session_manager::{SessionManager, SessionManagerError};
 pub use signature::{
     verify, KeyError, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy,
 };
