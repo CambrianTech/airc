@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use airc_core::transcript::TranscriptKind;
-use airc_core::{HeaderFilter, RoomId, TranscriptEvent};
+use airc_core::{ClientId, HeaderFilter, PeerId, RoomId, SelfFilter, TranscriptEvent};
 use futures::stream::Stream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -122,6 +122,25 @@ pub struct EventFilter {
     pub channels: HashSet<RoomId>,
     pub kinds: BTreeSet<TranscriptKind>,
     pub headers_filter: HeaderFilter,
+    /// DISPLAY-only suppression of the receiver's own broadcasts. `None`
+    /// (the default) shows everything — so RAG, Continuum, and any other
+    /// consumer that does not opt in is completely unaffected. Only a live
+    /// display feed (e.g. `airc join`) sets this, and only to stop
+    /// rendering its own sends back at itself. Suppression is purely a
+    /// view concern: events are durably stored BEFORE any filter runs, and
+    /// `page_recent` (the persona-RAG path) applies no `EventFilter` at
+    /// all, so a persona always retains its own turns in recall.
+    pub self_echo: Option<SelfEcho>,
+}
+
+/// Receiver identity + policy for hiding the receiver's own events from a
+/// display feed. See [`EventFilter::self_echo`] — display-only, never a
+/// persistence or RAG concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfEcho {
+    pub peer_id: PeerId,
+    pub client_id: ClientId,
+    pub filter: SelfFilter,
 }
 
 impl Default for EventFilter {
@@ -131,6 +150,7 @@ impl Default for EventFilter {
             channels: HashSet::new(),
             kinds: BTreeSet::new(),
             headers_filter: HeaderFilter::Any,
+            self_echo: None,
         }
     }
 }
@@ -138,6 +158,25 @@ impl Default for EventFilter {
 impl EventFilter {
     pub fn current_room() -> Self {
         Self::default()
+    }
+
+    /// Opt this (display) feed into suppressing the receiver's own
+    /// broadcasts. Use [`SelfFilter::ExcludeSamePeer`] for an agent's own
+    /// live feed (hide all of my sends regardless of which CLI process
+    /// emitted them) or [`SelfFilter::ExcludeSameClient`] to keep cross-tab
+    /// visibility. Builder so existing call sites are untouched.
+    pub fn excluding_self_echo(
+        mut self,
+        peer_id: PeerId,
+        client_id: ClientId,
+        filter: SelfFilter,
+    ) -> Self {
+        self.self_echo = Some(SelfEcho {
+            peer_id,
+            client_id,
+            filter,
+        });
+        self
     }
 
     pub fn matches(&self, event: &TranscriptEvent) -> bool {
@@ -151,6 +190,11 @@ impl EventFilter {
         }
         if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
             return false;
+        }
+        if let Some(se) = self.self_echo {
+            if event.is_self_echo(&se.peer_id, &se.client_id, se.filter) {
+                return false;
+            }
         }
         self.headers_filter.matches(&event.headers)
     }
@@ -183,7 +227,7 @@ impl Stream for FilteredEventStream {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::HashSet;
 
     use airc_core::{Body, ClientId, EventId, Headers, MentionTarget, PeerId};
 
@@ -207,18 +251,58 @@ mod tests {
         }
     }
 
+    fn event_from(room_id: RoomId, peer: PeerId, client: ClientId) -> TranscriptEvent {
+        let mut ev = event(room_id, TranscriptKind::Message);
+        ev.peer_id = peer;
+        ev.client_id = client;
+        ev
+    }
+
     #[test]
     fn event_filter_uses_channel_membership_set() {
         let admitted = RoomId::from_u128(0x01);
         let other = RoomId::from_u128(0x02);
         let filter = EventFilter {
-            channel: None,
             channels: HashSet::from([admitted]),
-            kinds: BTreeSet::new(),
-            headers_filter: HeaderFilter::Any,
+            ..EventFilter::default()
         };
 
         assert!(filter.matches(&event(admitted, TranscriptKind::Message)));
         assert!(!filter.matches(&event(other, TranscriptKind::Message)));
+    }
+
+    // what this catches: the DISPLAY-only self-echo suppression. An agent's
+    // `airc join` feed must not render its own broadcasts back at it (the
+    // Monitor-echo noise), but must still show peers — and the default filter
+    // (no self_echo) must keep showing everything so RAG/Continuum are
+    // unaffected. Regression here = either the agent sees its own sends again
+    // or a default consumer silently loses events.
+    #[test]
+    fn self_echo_filter_hides_own_peer_only_when_opted_in() {
+        let room = RoomId::from_u128(0x10);
+        let me = PeerId::from_u128(0xaaaa);
+        let my_join_client = ClientId::from_u128(0x1);
+        let my_msg_client = ClientId::from_u128(0x2); // separate `airc msg` process
+        let peer = PeerId::from_u128(0xbbbb);
+        let peer_client = ClientId::from_u128(0x3);
+
+        let my_send = event_from(room, me, my_msg_client);
+        let peer_send = event_from(room, peer, peer_client);
+
+        // Default filter: shows everything, including our own send (so RAG and
+        // any non-opted-in consumer is untouched).
+        let default = EventFilter::default();
+        assert!(default.matches(&my_send));
+        assert!(default.matches(&peer_send));
+
+        // Agent feed: ExcludeSamePeer hides our own send even though it came
+        // from a DIFFERENT client id than the join feed, and still shows peers.
+        let agent_feed = EventFilter::default().excluding_self_echo(
+            me,
+            my_join_client,
+            SelfFilter::ExcludeSamePeer,
+        );
+        assert!(!agent_feed.matches(&my_send), "own broadcast must be hidden");
+        assert!(agent_feed.matches(&peer_send), "peer messages stay visible");
     }
 }
