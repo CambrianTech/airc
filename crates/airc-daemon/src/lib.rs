@@ -32,6 +32,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod auto_update;
 pub mod handlers;
 pub mod route_refresh;
 pub mod server;
