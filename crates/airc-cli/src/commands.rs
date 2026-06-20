@@ -1268,6 +1268,30 @@ pub async fn run_daemon(
     // the accept loop blocks; it exits on the same shutdown notifier.
     let route_refresh_task = spawn_route_refresh(state.clone(), daemon_airc.clone());
 
+    // #1268: autonomous self-update — keep the node on current canary with no
+    // human in the loop (the version-drift pain we just lived: stale binaries,
+    // peers that can't speak the current protocol). The dangerous half (fetch +
+    // smoke-test + rollback-safe `airc update --auto`, spawned detached) lives
+    // in `airc_daemon::auto_update`; the daemon supplies only the MESH-IDLE
+    // predicate so an update never restarts mid-work. Idle = zero live LAN peer
+    // connections: with no connection there is definitionally no in-flight mesh
+    // work to drop, and control-plane reconnect after a restart is cheap +
+    // self-healing. (Refinement TODO: once stream-plane sessions are tracked in
+    // daemon connection-state, gate on "no active TRANSFER" so a connected-but-
+    // quiet node can still update.) Exits on the shared shutdown notifier.
+    let auto_update_task = {
+        let daemon_state = state.clone();
+        tokio::spawn(async move {
+            airc_daemon::auto_update::run(&daemon_state.shutdown, || {
+                daemon_state
+                    .connected_lan_peers
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+            })
+            .await;
+        })
+    };
+
     // KEYSTONE (card a134b370-10b1-49c6-aa42-e1a05446e887): spawn the
     // account-registry publish/refresh loop alongside the IPC accept
     // loop. THIS is what makes two machines on the same gh account
@@ -1468,6 +1492,10 @@ pub async fn run_daemon(
     // path, where Stop never fired (same abort discipline as
     // `HeartbeatTask::stop`).
     route_refresh_task.abort();
+    // #1268: the auto-update loop also exits on the shared shutdown notifier;
+    // abort is the same listener-error backstop. (The detached updater it may
+    // have spawned is independent and intentionally outlives this process.)
+    auto_update_task.abort();
     // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
     // waiter was woken by the same `notify_waiters()`. Await its clean
     // exit so the process doesn't drop an in-flight gist write
