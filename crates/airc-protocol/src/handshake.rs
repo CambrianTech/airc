@@ -50,6 +50,9 @@ pub enum HandshakeError {
     /// signature gate already blocks an external MITM, but reject it outright
     /// rather than key a session off a predictable secret.
     WeakEphemeral,
+    /// Deriving the [`StreamSession`] keys failed (HKDF) — unreachable for the
+    /// fixed key size, propagated rather than panicked (no-panic gate).
+    KeyDerivation,
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -63,6 +66,7 @@ impl std::fmt::Display for HandshakeError {
                     "handshake ECDH produced a non-contributory shared secret"
                 )
             }
+            HandshakeError::KeyDerivation => write!(f, "handshake session key derivation failed"),
         }
     }
 }
@@ -234,7 +238,8 @@ pub fn respond(
     let eph_pub = PublicKey::from(&secret).to_bytes();
     let shared = checked_shared(secret, &init.eph_pub)?;
     let transcript = transcript(&init.eph_pub, &eph_pub, init.peer_id, my_peer_id);
-    let session = StreamSession::derive(&shared, &transcript, SessionRole::Responder);
+    let session = StreamSession::derive(&shared, &transcript, SessionRole::Responder)
+        .map_err(|_| HandshakeError::KeyDerivation)?;
 
     let sig = keypair.sign_bytes(&resp_signed_bytes(
         &eph_pub,
@@ -271,11 +276,8 @@ impl PendingHandshake {
 
         let shared = checked_shared(self.secret, &resp.eph_pub)?;
         let transcript = transcript(&self.eph_pub, &resp.eph_pub, self.my_peer_id, resp.peer_id);
-        Ok(StreamSession::derive(
-            &shared,
-            &transcript,
-            SessionRole::Initiator,
-        ))
+        StreamSession::derive(&shared, &transcript, SessionRole::Initiator)
+            .map_err(|_| HandshakeError::KeyDerivation)
     }
 }
 

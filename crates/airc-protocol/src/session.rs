@@ -51,6 +51,11 @@ pub enum SessionError {
     /// The send counter is exhausted (2^64 frames). The session MUST be
     /// re-handshaked; sealing further would reuse a nonce.
     CounterExhausted,
+    /// HKDF key derivation failed. Unreachable for our fixed 32-byte output
+    /// (HKDF only errors when the output exceeds 255×HashLen), but surfaced as a
+    /// Result rather than a panic so the production no-`expect`/`unwrap` gate
+    /// holds and a future larger-output change can't silently panic.
+    KeyDerivation,
 }
 
 impl std::fmt::Display for SessionError {
@@ -61,6 +66,7 @@ impl std::fmt::Display for SessionError {
             SessionError::CounterExhausted => {
                 write!(f, "stream-session send counter exhausted (rekey required)")
             }
+            SessionError::KeyDerivation => write!(f, "stream-session HKDF key derivation failed"),
         }
     }
 }
@@ -143,20 +149,24 @@ impl StreamSession {
     /// the keys to the specific handshake (the ephemeral pubkeys + peer ids) so
     /// a key can't be lifted to a different session. Both peers pass the SAME
     /// `shared`/`transcript`; opposite [`SessionRole`]s pick mirrored keys.
-    pub fn derive(shared: &[u8; 32], transcript: &[u8], role: SessionRole) -> Self {
+    pub fn derive(
+        shared: &[u8; 32],
+        transcript: &[u8],
+        role: SessionRole,
+    ) -> Result<Self, SessionError> {
         let hk = Hkdf::<Sha256>::new(Some(transcript), shared);
-        let key_i2r = expand_key(&hk, b"airc stream v1 i2r");
-        let key_r2i = expand_key(&hk, b"airc stream v1 r2i");
+        let key_i2r = expand_key(&hk, b"airc stream v1 i2r")?;
+        let key_r2i = expand_key(&hk, b"airc stream v1 r2i")?;
         let (seal_bytes, open_bytes) = match role {
             SessionRole::Initiator => (key_i2r, key_r2i),
             SessionRole::Responder => (key_r2i, key_i2r),
         };
-        StreamSession {
+        Ok(StreamSession {
             seal_key: ChaCha20Poly1305::new(Key::from_slice(&seal_bytes)),
             open_key: ChaCha20Poly1305::new(Key::from_slice(&open_bytes)),
             seal_ctr: 0,
             replay: ReplayWindow::default(),
-        }
+        })
     }
 
     /// Seal `plaintext` (authenticating `aad` too) into the next frame. The
@@ -211,12 +221,14 @@ impl StreamSession {
     }
 }
 
-fn expand_key(hk: &Hkdf<Sha256>, info: &[u8]) -> [u8; 32] {
+fn expand_key(hk: &Hkdf<Sha256>, info: &[u8]) -> Result<[u8; 32], SessionError> {
     let mut okm = [0u8; 32];
-    // expand only fails for absurd output lengths (>255*32); 32 bytes is safe.
+    // HKDF-Expand only errors when the output exceeds 255×HashLen; 32 bytes is
+    // one SHA-256 block, so this is unreachable — but propagate rather than
+    // `expect`, to satisfy the production no-panic clippy gate.
     hk.expand(info, &mut okm)
-        .expect("HKDF expand of 32 bytes is infallible");
-    okm
+        .map_err(|_| SessionError::KeyDerivation)?;
+    Ok(okm)
 }
 
 /// 96-bit nonce from a 64-bit counter: 4 zero bytes ++ big-endian counter.
@@ -236,8 +248,8 @@ mod tests {
         let shared = [7u8; 32];
         let transcript = b"test-handshake-transcript";
         (
-            StreamSession::derive(&shared, transcript, SessionRole::Initiator),
-            StreamSession::derive(&shared, transcript, SessionRole::Responder),
+            StreamSession::derive(&shared, transcript, SessionRole::Initiator).unwrap(),
+            StreamSession::derive(&shared, transcript, SessionRole::Responder).unwrap(),
         )
     }
 
@@ -334,8 +346,10 @@ mod tests {
     #[test]
     fn transcript_binds_keys() {
         let shared = [9u8; 32];
-        let mut a = StreamSession::derive(&shared, b"transcript-1", SessionRole::Initiator);
-        let mut b = StreamSession::derive(&shared, b"transcript-2", SessionRole::Responder);
+        let mut a =
+            StreamSession::derive(&shared, b"transcript-1", SessionRole::Initiator).unwrap();
+        let mut b =
+            StreamSession::derive(&shared, b"transcript-2", SessionRole::Responder).unwrap();
         let f = a.seal(b"", b"payload").unwrap();
         assert_eq!(b.open(&f, b""), Err(SessionError::AeadFailed));
     }
