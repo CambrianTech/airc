@@ -57,7 +57,7 @@ async fn next_msg(stream: &mut EventStream, self_peer: PeerId) -> SessionMsg {
         if event.peer_id == self_peer {
             continue; // our own broadcast echo
         }
-        if event.headers.get(STREAM_HEADER).is_none() {
+        if !event.headers.contains_key(STREAM_HEADER) {
             continue; // ambient airc traffic (presence/lifecycle)
         }
         let text = event
