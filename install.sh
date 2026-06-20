@@ -276,9 +276,33 @@ Try: xcode-select --install   OR   sudo xcode-select --switch $clt"
   fi
 }
 
+# macOS: Homebrew — and the cargo it installs — live under /opt/homebrew/bin
+# (Apple Silicon) or /usr/local/bin (Intel). A NON-INTERACTIVE shell does NOT
+# get that prefix on PATH, because the `brew shellenv` line that adds it lives
+# in an interactive-only profile (~/.zprofile). That's exactly the `airc update`
+# -> spawned install.sh case, and a fresh login/automation shell: brew + cargo
+# are installed but invisible, so detect_pkgmgr reports "brew-missing" and the
+# build dies at the "cargo is required" probe. Source brew's env from the
+# well-known prefixes so the rest of the script (and the cargo build) see the
+# toolchain. Idempotent + cheap; no-op off macOS, when brew is already on PATH,
+# or when brew is genuinely absent (the installer path still handles that).
+ensure_brew_on_path() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  command -v brew >/dev/null 2>&1 && return 0
+  local brew_bin
+  for brew_bin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$brew_bin" ]; then
+      eval "$("$brew_bin" shellenv)"
+      return 0
+    fi
+  done
+  return 0
+}
+
 ensure_prereqs() {
   [ "${AIRC_SKIP_PREREQS:-0}" = "1" ] && { info "AIRC_SKIP_PREREQS=1 -- skipping prereq install"; return 0; }
 
+  ensure_brew_on_path
   local mgr; mgr=$(detect_pkgmgr)
   if [ "$mgr" = "unknown" ] || [ "$mgr" = "brew-missing" ]; then
     if [ "$mgr" = "brew-missing" ]; then
@@ -800,6 +824,9 @@ _setup_windows_firewall() {
 
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
+  # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
+  # the build still needs cargo on PATH. On macOS that means sourcing brew env.
+  ensure_brew_on_path
   if ! command -v cargo >/dev/null 2>&1; then
     fail "cargo is required to build airc. Install Rust, then re-run install.sh."
   fi
