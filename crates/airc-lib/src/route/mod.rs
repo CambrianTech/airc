@@ -21,6 +21,7 @@ pub use invite::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, RouteEndpoint,
 };
 pub use policy::{
-    RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind, TransportRole,
+    crypto_mode, CryptoMode, RouteClass, RouteDecision, RoutePolicy, TransportCandidate,
+    TransportKind, TransportRole,
 };
 pub use resolver::{TransportResolver, TransportRoute};
