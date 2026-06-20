@@ -56,6 +56,13 @@ pub const HEADER_AIRC_CORRELATION_ID: &str = "airc.correlation_id";
 /// matching handlers without parsing the body.
 pub const HEADER_AIRC_COMMAND_KIND: &str = "airc.command_kind";
 
+/// Media projection of `Envelope.media`. Header-only surfaces (transcript
+/// metadata, legacy adapters) that cannot read the structured `media` field
+/// rely on this; the value is the JSON-serialized `Vec<MediaRef>`. The
+/// authoritative field is `Envelope.media` — this is the projection onto the
+/// headers/metadata map, mirroring [`HEADER_AIRC_REPLY_TO`].
+pub const HEADER_AIRC_MEDIA: &str = "airc.media";
+
 // ---------------------------------------------------------------------------
 // Body-encryption convention — card 1224aac2 slice 2
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ use airc_core::transcript::{TranscriptEvent, TranscriptKind};
 use serde_json::Value as JsonValue;
 
 use crate::envelope::{Frame, FrameKind};
+use crate::headers_keys::{HEADER_AIRC_MEDIA, HEADER_AIRC_REPLY_TO};
 
 impl Frame {
     /// Convert this frame into a `TranscriptEvent` for durable storage.
@@ -47,13 +48,13 @@ impl Frame {
         let mut metadata = serde_json::Map::new();
         if let Some(reply_to) = envelope.reply_to {
             metadata.insert(
-                "airc.reply_to".to_string(),
+                HEADER_AIRC_REPLY_TO.to_string(),
                 serde_json::to_value(reply_to).unwrap_or(JsonValue::Null),
             );
         }
         if !envelope.media.is_empty() {
             metadata.insert(
-                "airc.media".to_string(),
+                HEADER_AIRC_MEDIA.to_string(),
                 serde_json::to_value(&envelope.media).unwrap_or(JsonValue::Null),
             );
         }
@@ -153,7 +154,7 @@ mod tests {
         let event = frame.into_transcript_event();
         let recovered: Option<EventId> = event
             .metadata
-            .get("airc.reply_to")
+            .get(HEADER_AIRC_REPLY_TO)
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         assert_eq!(recovered, Some(reply_target));
     }
