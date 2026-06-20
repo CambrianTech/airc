@@ -273,12 +273,16 @@ name = "airc-protocol"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "chacha20poly1305",
  "ciborium",
  "dashmap",
  "ed25519-dalek",
+ "hkdf",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
+ "x25519-dalek",
 ]
 
 [[package]]
