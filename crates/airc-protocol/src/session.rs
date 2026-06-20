@@ -26,6 +26,7 @@
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 /// Which side of the handshake this peer is. Selects which derived key seals
@@ -69,7 +70,7 @@ impl std::error::Error for SessionError {}
 /// A sealed frame: the monotonic counter (the AEAD nonce, sent in the clear —
 /// it's not secret, only unique) + the ciphertext (which includes the 16-byte
 /// Poly1305 tag).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedFrame {
     pub counter: u64,
     pub ciphertext: Vec<u8>,
