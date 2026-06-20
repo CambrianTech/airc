@@ -36,6 +36,17 @@ const DIAL_CONCURRENCY: usize = 16;
 /// collection below doesn't trip clippy's `type_complexity` gate.
 type PeerDialOutcome = (Vec<PeerDialFailure>, Vec<PeerDialSkip>);
 
+/// #10: is this enrolled peer a GHOST — no fresh contact within the freshness
+/// TTL? A live peer's registry beacon refreshes `last_seen_ms` every cycle, so
+/// a peer past the TTL is a dead container / abandoned scope whose stale
+/// endpoint we should NOT keep dialing. Uses the same TTL as the registry's
+/// liveness definition (one source of truth) and saturating-subs so a future
+/// `last_seen` (clock skew, already clamped on import) reads as fresh, never
+/// underflows.
+fn is_ghost_peer(now_ms: u64, last_seen_ms: u64) -> bool {
+    now_ms.saturating_sub(last_seen_ms) > crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS
+}
+
 /// Card 625abe6d slice 1 — a stored peer endpoint that could not be
 /// dialed during discovery. Surfaced on the snapshot (and printed by
 /// `airc transport health`) instead of being swallowed: an offline
@@ -80,6 +91,13 @@ pub struct RouteDiscoverySnapshot {
     /// `peer_dial_failures` so it is never miscounted/mislabelled as a
     /// failed dial.
     pub peer_dial_skips: Vec<PeerDialSkip>,
+    /// #10: count of enrolled peers SKIPPED entirely this refresh because we
+    /// haven't had fresh contact with them (no beacon within the freshness
+    /// TTL) — dead Docker containers and abandoned self-scopes that linger in
+    /// the trust store with stale endpoints. We don't dial them (each would
+    /// burn a `PEER_DIAL_TIMEOUT` and bury live peers in failure noise), and a
+    /// single count is surfaced rather than one skip per ghost (anti-spam).
+    pub ghost_peers_skipped: usize,
 }
 
 impl RouteDiscoverySnapshot {
@@ -139,7 +157,8 @@ impl Airc {
         // verifier sees the newly-enrolled pubkeys.
         self.sync_account_peer_registry().await?;
 
-        let (peer_dial_failures, peer_dial_skips) = self.dial_stored_peer_endpoints().await?;
+        let (peer_dial_failures, peer_dial_skips, ghost_peers_skipped) =
+            self.dial_stored_peer_endpoints().await?;
 
         let endpoints = self.route_endpoints()?;
         let lan_has_endpoint = endpoints
@@ -158,6 +177,7 @@ impl Airc {
             connected_lan_peers,
             peer_dial_failures,
             peer_dial_skips,
+            ghost_peers_skipped,
         })
     }
 
@@ -170,7 +190,9 @@ impl Airc {
     /// skew the operator must see), per the no-silent-fallback rule.
     /// CONNECTION failures are not errors — offline peers are a normal
     /// mesh state — but every failed attempt is returned for display.
-    async fn dial_stored_peer_endpoints(&self) -> Result<PeerDialOutcome, AircError> {
+    async fn dial_stored_peer_endpoints(
+        &self,
+    ) -> Result<(Vec<PeerDialFailure>, Vec<PeerDialSkip>, usize), AircError> {
         // Both registries: the machine-account wire root (where
         // account-registry import writes) FIRST, then the scope's own
         // store (where the CLI's `peer add --endpoint` writes).
@@ -217,8 +239,23 @@ impl Airc {
         let mut order: Vec<PeerId> = Vec::new();
         let mut merged: std::collections::HashMap<PeerId, Vec<RouteEndpoint>> =
             std::collections::HashMap::new();
+        let mut ghost_peers_skipped = 0usize;
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
+                continue;
+            }
+            // #10: skip GHOSTS — enrolled peers we haven't had fresh contact
+            // with (no beacon within the freshness TTL). A live peer's registry
+            // beacon refreshes `last_seen_ms` every cycle, so this never skips a
+            // reachable peer; but dead containers / abandoned self-scopes keep a
+            // stale endpoint forever, and dialing each one burns a
+            // PEER_DIAL_TIMEOUT and drowns the live peers in failure noise. A
+            // connected peer is already skipped above; a freshly-enrolled peer
+            // has `last_seen_ms` floored to `added_at_ms`, so fresh adds dial
+            // normally. Same TTL as the registry's liveness definition (one
+            // source of truth).
+            if is_ghost_peer(now_ms, peer.last_seen_ms) {
+                ghost_peers_skipped += 1;
                 continue;
             }
             let Some(json) = peer.endpoints_json.as_deref() else {
@@ -281,7 +318,7 @@ impl Airc {
             failures.extend(peer_failures);
             skips.extend(peer_skips);
         }
-        Ok((failures, skips))
+        Ok((failures, skips, ghost_peers_skipped))
     }
 
     /// Dial ONE peer's stored endpoints in cost order, breaking on the
@@ -451,6 +488,7 @@ impl Airc {
             connected_lan_peers: self.connected_lan_peers().await,
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
+            ghost_peers_skipped: 0,
         })
     }
 
@@ -512,6 +550,30 @@ impl Airc {
 mod tests {
     use super::*;
 
+    // what this catches (#10): the ghost boundary. A peer with fresh contact
+    // (beacon within the TTL) must remain dialable; one past the TTL must be
+    // classified a ghost and skipped — so the dialer stops burning timeouts on
+    // dead containers/scopes. A flipped comparison or a future-skewed last_seen
+    // underflow would regress here.
+    #[test]
+    fn ghost_classification_respects_freshness_ttl() {
+        let ttl = crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS;
+        let now = 10 * ttl; // comfortably past any boundary arithmetic
+        assert!(!is_ghost_peer(now, now), "just-seen peer is live");
+        assert!(
+            !is_ghost_peer(now, now - ttl),
+            "seen exactly at the TTL edge is still live (boundary is strictly greater)"
+        );
+        assert!(
+            is_ghost_peer(now, now - ttl - 1),
+            "seen past the TTL is a ghost"
+        );
+        assert!(
+            !is_ghost_peer(now, now + 5_000),
+            "a future last_seen (clamped on import; skew) must read fresh, never underflow"
+        );
+    }
+
     fn snapshot(
         health: Vec<TransportHealthSample>,
         connected_lan_peers: Vec<PeerId>,
@@ -522,6 +584,7 @@ mod tests {
             connected_lan_peers,
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
+            ghost_peers_skipped: 0,
         }
     }
 
