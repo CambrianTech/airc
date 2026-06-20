@@ -23,11 +23,13 @@ pub mod assertion;
 pub mod canonical;
 pub mod delivery_ack;
 pub mod envelope;
+pub mod handshake;
 pub mod headers_keys;
 pub mod keypair;
 pub mod media;
 pub mod policy;
 pub mod rtc_signal;
+pub mod session;
 pub mod signature;
 pub mod subscription;
 pub mod transcript_conv;
@@ -42,6 +44,9 @@ pub use delivery_ack::{
     DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE, HEADER_AIRC_DELIVERY_ACK,
 };
 pub use envelope::{ChannelId, Envelope, Frame, FrameKind};
+pub use handshake::{
+    initiate, respond, HandshakeError, HandshakeInit, HandshakeResp, PendingHandshake,
+};
 pub use headers_keys::{
     HEADER_AIRC_BODY_ENC_AAD, HEADER_AIRC_BODY_ENC_KEY_ID, HEADER_AIRC_BODY_ENC_SCHEME,
     HEADER_AIRC_CLIENT, HEADER_AIRC_COMMAND_KIND, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
@@ -52,6 +57,7 @@ pub use keypair::PeerKeypair;
 pub use media::MediaRef;
 pub use policy::{AlwaysLift, LiftPolicy, NeverLift, SizeThresholdPolicy};
 pub use rtc_signal::{WebRtcSignal, WebRtcSignalKind, WEBRTC_SIGNAL_BODY_HINT};
+pub use session::{SealedFrame, SessionError, SessionRole, StreamSession};
 pub use signature::{
     verify, KeyError, PeerKeyRegistry, Signature, VerificationError, VerificationPolicy,
 };
