@@ -52,10 +52,22 @@ impl Airc {
         tailscale_ip: Option<Ipv4Addr>,
     ) -> Result<Vec<RouteEndpoint>, AircError> {
         let adapter = self.lan_adapter().await?;
-        let actual = adapter
-            .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        // Bind a STABLE port derived from our identity so the advertised
+        // endpoint survives daemon restarts. An ephemeral `:0` re-rolls the
+        // port every restart, staling every peer's stored endpoint for us —
+        // the root of the cross-machine auto-connect churn (#8). Fall back to
+        // an OS-assigned port only if the preferred one is already taken.
+        let preferred = stable_lan_port(self.inner.identity.peer_id);
+        let actual = match adapter
+            .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
             .await
-            .map_err(|error| AircError::Transport(error.to_string()))?;
+        {
+            Ok(addr) => addr,
+            Err(_preferred_taken) => adapter
+                .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        };
         self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         let port = actual.port();
@@ -200,6 +212,23 @@ impl Airc {
     }
 }
 
+/// A stable LAN listener port derived from this peer's identity (#8).
+///
+/// An ephemeral `0.0.0.0:0` bind re-rolls the port on every daemon restart,
+/// so every peer's STORED endpoint for this node goes stale the moment it
+/// restarts — the root cause of the cross-machine auto-connect churn (a peer
+/// keeps dialing the dead old port until the registry re-converges). Deriving
+/// the port from the (stable, persisted) peer_id makes the advertised
+/// endpoint survive restarts. The range is the IANA dynamic/private band
+/// (49152..=65535); two scopes on one machine have different peer_ids →
+/// different ports (no self-collision), and the caller falls back to an
+/// ephemeral port if this one is already taken.
+fn stable_lan_port(peer_id: PeerId) -> u16 {
+    const DYNAMIC_BASE: u128 = 49152; // first IANA dynamic/private port
+    const DYNAMIC_SPAN: u128 = 65536 - DYNAMIC_BASE; // 16384 ports
+    (DYNAMIC_BASE + (peer_id.as_uuid().as_u128() % DYNAMIC_SPAN)) as u16
+}
+
 #[cfg(test)]
 mod tests {
     //! Network-change self-heal: `refresh_advertised_endpoints` must
@@ -209,6 +238,32 @@ mod tests {
     use super::*;
     use crate::route::RouteEndpoint;
     use tempfile::tempdir;
+
+    // what this catches: the ephemeral-port churn regression. The advertised
+    // port MUST be stable across restarts (same identity → same port) and in
+    // the IANA dynamic range; two identities must (almost always) differ so
+    // co-located scopes don't collide.
+    #[test]
+    fn stable_lan_port_is_deterministic_per_identity_and_in_range() {
+        let a = PeerId::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+        let b = PeerId::from_u128(0x111e8400_e29b_41d4_a716_4466554400ff);
+        assert_eq!(
+            stable_lan_port(a),
+            stable_lan_port(a),
+            "same identity must derive the same port across restarts"
+        );
+        assert_ne!(
+            stable_lan_port(a),
+            stable_lan_port(b),
+            "distinct identities should derive distinct ports (no co-located self-collision)"
+        );
+        for id in [a, b] {
+            assert!(
+                (49152..=65535).contains(&stable_lan_port(id)),
+                "port must be in the IANA dynamic/private range"
+            );
+        }
+    }
 
     async fn test_airc() -> (tempfile::TempDir, Airc) {
         let dir = tempdir().unwrap();
