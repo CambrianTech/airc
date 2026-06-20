@@ -235,7 +235,9 @@ impl Transport for LanTcpAdapter {
         // than being silently dropped by the write loop after the
         // caller already saw Ok. Grievance §9: `send()` must mean
         // something measurable.
-        let payload = serde_json::to_vec(&frame)?;
+        let __send_start = std::time::Instant::now();
+        let payload =
+            airc_diagnostics::timing::timed("lan.serialize", || serde_json::to_vec(&frame))?;
         if payload.len() > MAX_FRAME_BYTES as usize {
             return Err(LanTcpError::FrameTooLarge {
                 announced: u32::try_from(payload.len()).unwrap_or(u32::MAX),
@@ -285,12 +287,21 @@ impl Transport for LanTcpAdapter {
         // dropped sender (write loop hit a dead socket) resolves to Err
         // and counts as non-delivery.
         let mut delivered_any = false;
+        let __flush_start = std::time::Instant::now();
         for flushed_rx in pending {
             match flushed_rx.await {
                 Ok(()) => delivered_any = true,
                 Err(_dropped) => last_error = Some(LanTcpError::NoActivePeers),
             }
         }
+        airc_diagnostics::timing::record(
+            "lan.flush_ack",
+            __flush_start.elapsed().as_nanos() as u64,
+        );
+        airc_diagnostics::timing::record(
+            "lan.send_total",
+            __send_start.elapsed().as_nanos() as u64,
+        );
         if delivered_any {
             Ok(())
         } else {

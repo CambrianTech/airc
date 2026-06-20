@@ -105,10 +105,11 @@ where
     async fn send(&self, mut frame: Frame) -> Result<(), Self::Error> {
         // Sign over the canonical bytes of the envelope (excluding the
         // signature field itself per signature.rs's contract).
-        let signature = self
-            .keypair
-            .sign_envelope(&frame.envelope, self.self_peer_id, self.key_id)
-            .map_err(SignedError::Sign)?;
+        let signature = airc_diagnostics::timing::timed("transport.sign", || {
+            self.keypair
+                .sign_envelope(&frame.envelope, self.self_peer_id, self.key_id)
+        })
+        .map_err(SignedError::Sign)?;
         frame.envelope.signature = signature;
         self.inner.send(frame).await.map_err(SignedError::Inner)
     }

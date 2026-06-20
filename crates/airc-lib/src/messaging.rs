@@ -107,7 +107,10 @@ impl Airc {
                 .daemon_send_frame(room, kind, target, body, headers)
                 .await;
         }
-        self.sync_account_peer_registry().await?;
+        // Debounced: the verifier registry is for INBOUND verification and
+        // rarely changes between sends; loading it from disk per outbound
+        // message was ~95% of send latency (profiled). Sync at most once/sec.
+        self.sync_account_peer_registry_debounced().await?;
         let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
@@ -129,12 +132,14 @@ impl Airc {
                 signature: Signature::Unsigned,
             },
         };
-        frame.envelope.signature = self
-            .inner
-            .identity
-            .keypair
-            .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
-            .map_err(|error| AircError::Crypto(error.to_string()))?;
+        frame.envelope.signature = airc_diagnostics::timing::timed("airc.sign", || {
+            self.inner.identity.keypair.sign_envelope(
+                &frame.envelope,
+                self.inner.identity.peer_id,
+                0,
+            )
+        })
+        .map_err(|error| AircError::Crypto(error.to_string()))?;
         // Deliver-first, persist-then-transport. `append_sent_frame`
         // persists to the local ORM (durability source of truth) and
         // fans out to in-process subscribers via `live_tx`;
@@ -150,8 +155,15 @@ impl Airc {
         // event_id in the broadcast ring BEFORE the wire write, so the
         // wire subscriber's later re-read of the same frame still skips
         // a duplicate fan-out.
+        let __t_append = std::time::Instant::now();
         self.append_sent_frame(frame.clone()).await?;
+        airc_diagnostics::timing::record(
+            "airc.append_sent",
+            __t_append.elapsed().as_nanos() as u64,
+        );
+        let __t_route = std::time::Instant::now();
         self.execute_send_route(route.kind, room, frame).await?;
+        airc_diagnostics::timing::record("airc.exec_route", __t_route.elapsed().as_nanos() as u64);
         Ok(SendFrameResult {
             event_id,
             lamport,

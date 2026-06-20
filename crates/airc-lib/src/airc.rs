@@ -173,6 +173,9 @@ pub(crate) struct AircInner {
     /// is unified. See [`crate::route::dial_quarantine`].
     pub(crate) dial_quarantine: Arc<std::sync::Mutex<crate::route::DialQuarantine>>,
     pub(crate) lamport_clock: AtomicU64,
+    /// Epoch-ms of the last send-path peer-registry sync. Debounces the
+    /// per-send disk load (see `sync_account_peer_registry_debounced`).
+    pub(crate) peer_sync_last_ms: AtomicU64,
     pub(crate) lan_tcp: Mutex<Option<LanTcpAdapter>>,
     pub(crate) lan_subscriber: Mutex<Option<FrameSubscriber>>,
     pub(crate) relay: Mutex<Option<RelayAdapter>>,
@@ -443,6 +446,7 @@ impl Airc {
                     crate::route::DialQuarantine::default(),
                 )),
                 lamport_clock: AtomicU64::new(0),
+                peer_sync_last_ms: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
                 lan_subscriber: Mutex::new(None),
                 relay: Mutex::new(None),
@@ -1020,6 +1024,7 @@ impl Airc {
             // backoff is unified regardless of which handle runs discovery.
             dial_quarantine: self.inner.dial_quarantine.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
+            peer_sync_last_ms: AtomicU64::new(0),
             lan_tcp: Mutex::new(None),
             lan_subscriber: Mutex::new(None),
             relay: Mutex::new(None),
@@ -1108,6 +1113,31 @@ impl Airc {
         }
         let cached = mesh_identity::resolve(self.coordinator_store()).await?;
         Ok(cached.as_mesh_identity())
+    }
+
+    /// Send-path peer-registry sync, DEBOUNCED. `sync_account_peer_registry`
+    /// loads the peer registry from disk on every call; on the hot outbound
+    /// send path that per-message disk load dominated latency (~1ms/send,
+    /// profiled via the LAN latency bench — it was ~95% of `request()`'s send
+    /// leg, vs ~52µs for the actual transport). The verifier registry (peer
+    /// pubkeys, used for INBOUND verification) does not change between most
+    /// sends, so loading it per outbound message is wasted I/O on the critical
+    /// path. Debounce to at most once per `MIN_SYNC_INTERVAL_MS`: a burst of
+    /// sends pays the disk load once. Freshness for a newly-trusted peer stays
+    /// bounded by the interval, and the route-refresh tick still calls the
+    /// undebounced `sync_account_peer_registry` directly.
+    pub(crate) async fn sync_account_peer_registry_debounced(&self) -> Result<(), AircError> {
+        const MIN_SYNC_INTERVAL_MS: u64 = 1_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.inner.peer_sync_last_ms.load(Ordering::Relaxed);
+        if now != 0 && now.saturating_sub(last) < MIN_SYNC_INTERVAL_MS {
+            return Ok(()); // recently synced — skip the per-send disk load
+        }
+        self.inner.peer_sync_last_ms.store(now, Ordering::Relaxed);
+        self.sync_account_peer_registry().await
     }
 
     pub(crate) async fn sync_account_peer_registry(&self) -> Result<(), AircError> {

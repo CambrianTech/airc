@@ -10,6 +10,7 @@
 //! for to interrogate the running substrate.
 
 pub mod probe;
+pub mod timing;
 
 use std::collections::BTreeMap;
 use std::io::Write;

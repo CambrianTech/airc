@@ -177,7 +177,9 @@ impl Airc {
     ) -> Result<PendingCommand, AircError> {
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
+        let __t_sub = std::time::Instant::now();
         let reply_stream = self.subscribe().await?;
+        airc_diagnostics::timing::record("airc.req.subscribe", __t_sub.elapsed().as_nanos() as u64);
 
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
@@ -189,8 +191,13 @@ impl Airc {
         );
         headers.insert(HEADER_AIRC_DEADLINE.into(), deadline_at_ms.to_string());
 
+        let __t_send = std::time::Instant::now();
         self.send_frame_to(airc_protocol::FrameKind::Message, target, body, headers)
             .await?;
+        airc_diagnostics::timing::record(
+            "airc.req.send_frame",
+            __t_send.elapsed().as_nanos() as u64,
+        );
 
         Ok(PendingCommand {
             correlation_id,
