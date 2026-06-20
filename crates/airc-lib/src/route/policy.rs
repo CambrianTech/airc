@@ -185,9 +185,70 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
     }
 }
 
+/// How a frame's authenticity is protected on a given transport — the two-plane
+/// split from `docs/stream-plane-crypto.md` ("sign the handle, not the frame").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CryptoMode {
+    /// Per-frame Ed25519 signature (`SignedTransport`). Relay-survivable,
+    /// audit-able authenticity for control/message frames at moderate rate;
+    /// the default and the only mode that survives re-emission by an
+    /// intermediary.
+    PerFrameSign,
+    /// Symmetric AEAD under a per-peer session keyed by an Ed25519-authenticated
+    /// X25519 handshake (`airc_protocol::handshake` + `StreamSession`). Pay the
+    /// asymmetric cost ONCE at the handshake; each frame after is ~ns, not
+    /// ~113µs. For the packet-rate stream transports only.
+    SessionAead,
+}
+
+/// Crypto mode for a transport. ONLY the connection-oriented, packet-rate
+/// stream transports (`Udp`, `WebRtcDataChannel`) carry a session and use AEAD;
+/// everything else signs per frame. Conservative by construction: any transport
+/// not explicitly a stream transport keeps the relay-survivable per-frame
+/// signature (so adding a transport never silently downgrades its authenticity).
+pub fn crypto_mode(transport: TransportKind) -> CryptoMode {
+    match transport {
+        TransportKind::Udp | TransportKind::WebRtcDataChannel => CryptoMode::SessionAead,
+        TransportKind::LanTcp
+        | TransportKind::Tailscale
+        | TransportKind::Reticulum
+        | TransportKind::Relay
+        | TransportKind::Ssh
+        | TransportKind::GhGist => CryptoMode::PerFrameSign,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: the two-plane crypto split — ONLY the packet-rate
+    // stream transports use a session; every other transport keeps per-frame
+    // Ed25519 (the relay-survivable default). A regression that flipped a
+    // control transport to SessionAead would silently drop its re-emission
+    // authenticity guarantee.
+    #[test]
+    fn crypto_mode_is_session_aead_only_for_stream_transports() {
+        assert_eq!(crypto_mode(TransportKind::Udp), CryptoMode::SessionAead);
+        assert_eq!(
+            crypto_mode(TransportKind::WebRtcDataChannel),
+            CryptoMode::SessionAead
+        );
+        for control in [
+            TransportKind::LanTcp,
+            TransportKind::Tailscale,
+            TransportKind::Reticulum,
+            TransportKind::Relay,
+            TransportKind::Ssh,
+            TransportKind::GhGist,
+        ] {
+            assert_eq!(
+                crypto_mode(control),
+                CryptoMode::PerFrameSign,
+                "{control:?} must keep per-frame signing"
+            );
+        }
+    }
 
     fn candidate(kind: TransportKind, role: TransportRole) -> TransportCandidate {
         TransportCandidate {

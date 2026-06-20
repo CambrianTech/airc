@@ -70,14 +70,50 @@ Both are secondary to the two-plane split; the split is the architectural fix.
 
 ## Build sequence
 
-1. Introduce a per-stream **session-key** primitive (X25519 + HKDF +
-   ChaCha20-Poly1305), authenticated by the existing Ed25519 peer identities.
-2. Make the signing policy branch on `RouteClass` (control → per-frame Ed25519;
-   stream → session AEAD). Default unchanged (control) so nothing regresses.
-3. Bind WebRTC DTLS fingerprint → peer identity at SDP-offer (one signature).
-4. Route stream-rate DataChannel/UDP through the session-key path.
-5. Extend `lan_latency_bench` with a stream-rate (per-packet) measurement to prove
+1. **[done, #1261]** Per-stream **session-key** primitive (`airc_protocol::session`
+   `StreamSession`: X25519+HKDF directional keys, ChaCha20-Poly1305 seal/open,
+   replay window) + the Ed25519-authenticated X25519 **handshake**
+   (`airc_protocol::handshake`). The crypto core, adversarially reviewed.
+2. **[done]** Crypto-mode policy keyed off **`TransportKind`** (not RouteClass —
+   the session lives on the connection-oriented transport, and a control-class
+   frame can ride UDP). `route::policy::crypto_mode(TransportKind)`: only the
+   packet-rate stream transports (`Udp`, `WebRtcDataChannel`) → `SessionAead`;
+   every other transport → `PerFrameSign` (exhaustive match, so a new transport
+   must explicitly choose — never a silent downgrade). Default unchanged.
+3. **[next — the heavy integration]** Session lifecycle in the transport
+   (see "Session lifecycle" below): per-peer session store, handshake-over-the-
+   transport orchestration, and `SignedTransport`/a session layer dispatching on
+   `crypto_mode`.
+4. Bind WebRTC DTLS fingerprint → peer identity at SDP-offer (one signature).
+5. Route stream-rate DataChannel/UDP through the session-key path.
+6. Extend `lan_latency_bench` with a stream-rate (per-packet) measurement to prove
    the per-frame cost drops from ~113µs to ~tens of ns.
+
+## Session lifecycle (slice 3 integration — the heavy part)
+
+The crypto core + policy are in place; wiring them into the live transport is the
+remaining work, and it is a **coordinated wire-lane change** (it touches frame
+dispatch + connection lifecycle). Design:
+
+- **Per-peer session store.** A `DashMap<PeerId, StreamSession>` (or per
+  `(PeerId, TransportKind)`) holds the live session. Absent = not yet handshaked.
+- **Handshake over the transport.** On first stream-class frame to a peer with no
+  session, run the `handshake` exchange as two control frames (`HandshakeInit` /
+  `HandshakeResp` ride the existing per-frame-signed control plane — they ARE the
+  "sign the handle"), then install the resulting `StreamSession`. Queue or briefly
+  block the triggering frame until the session is up; surface handshake failure
+  loudly (no silent plaintext fallback — `[[no-fallbacks-ever]]`).
+- **Dispatch on `crypto_mode`.** A session-aware transport layer (above or beside
+  `SignedTransport`) consults `crypto_mode(transport_kind)`: `PerFrameSign` →
+  today's `SignedTransport` path unchanged; `SessionAead` → `session.seal` on
+  send, `session.open` on receive, with the routing headers as the AEAD `aad`.
+- **Rekey.** On `SessionError::CounterExhausted` (or a time/byte budget), re-run
+  the handshake and swap the session. Counter exhaustion is astronomically far;
+  the budget is the practical trigger.
+- **Ordering vs the replay window.** UDP reorders — the 64-wide window already
+  tolerates it; out-of-window reorder is dropped (acceptable for a stream).
+
+This stays in the airc transport/wire lane; coordinate before landing.
 
 ## Non-goals
 
