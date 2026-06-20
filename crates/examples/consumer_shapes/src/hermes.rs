@@ -170,6 +170,8 @@ pub fn decode_hermes_event(
 
 pub fn any_hermes_event_filter() -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -185,6 +187,8 @@ pub fn any_hermes_event_filter() -> EventFilter {
 /// is opaque to the substrate.
 pub fn agent_event_filter(agent_id: &str) -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
