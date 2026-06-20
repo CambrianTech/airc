@@ -22,6 +22,96 @@ trust store; liveness is a property that should flow **beacon-freshness →
 peer-liveness → route-health**; channels are addressed explicitly. Today the
 arrows between those nouns leak. The rest of this doc nails each seam.
 
+---
+
+# Part A — Identity Layering & Use-Case Matrix (guiding principle, read first)
+
+> Added 2026-06-20 (M5 Claude) after the self-echo investigation surfaced that
+> two project dirs on one machine mint **two peer identities for one human**
+> (`continuum/.airc → 7711fe60`, `airc/.airc → e11db4ac`). That is the symptom;
+> the disease is that the substrate has no axis for "which conversation/project"
+> separate from "who" — so per-project state had nowhere to live except a fresh
+> keypair. **This Part is the lens. Every identity fix/PR — and every agent
+> review of one — is checked against the matrix and the invariants below FIRST,
+> then against the numbered seams (§1–§6) which are its consequences.**
+
+## A.1 The three orthogonal axes — never conflate
+
+Identity is hard *because* three different questions keep getting answered by one
+field. They are orthogonal and must stay separate:
+
+| Axis | Question | Lifetime | airc primitive | Claude-Code analogy |
+|---|---|---|---|---|
+| **Identity (who)** | Who is this citizen? | **Durable** — a keypair that outlives everything | `PeerId` (Ed25519) | the assistant identity (me) |
+| **Context (where)** | Which project / room / conversation? Where is state keyed? | **Persisted, switchable** | **MISSING** → leaks into `PeerId` | `.claude/projects/<project>` |
+| **Session (which instance)** | Which live process / tab / connection? | **Ephemeral** — comes and goes | `ClientId` | one open tab |
+
+The bug class is always *"axis X got smuggled into axis Y."* Today **Context has no
+home**, so it leaks into Identity (per-project keypairs) — the worked example in A.4.
+
+## A.2 Use-case matrix (actor × situation → who / where / which / invariant)
+
+`I`=Identity(PeerId) `C`=Context(contextId) `S`=Session(ClientId). "→1" means
+"must collapse to ONE"; "→N" means "legitimately many".
+
+| # | Actor & situation | I | C | S | State keyed by | Invariant that must hold |
+|---|---|---|---|---|---|---|
+| 1 | Human, one project, one tab | 1 | 1 | 1 | (I,C) | baseline |
+| 2 | Human, one project, **many tabs** | →1 | 1 | →N | (I,C) | all tabs are the SAME citizen; "self" = I, not S |
+| 3 | Human, **many projects**, one machine | **→1** | →N | →N | (I,C) | **one citizen, many contexts — NOT a new I per project** (this is the bug) |
+| 4 | Human, **many machines** | →1 logical | →N | →N | (I,C) | account-level identity convergence across machines (gh-login mesh identity); each machine a node, not a new person |
+| 5 | **Agent** (Claude/Codex) hopping repos | →1 | →N | →N | (I,C) | same as #3 — an agent's activity from another repo dir is the SAME self; self-echo/dedup resolve at I |
+| 6 | **Persona**, one room | 1 (own) | 1 | 1 | (I,C) | a persona is its OWN citizen — distinct I from the human |
+| 7 | Persona, **many rooms/projects** | →1 | →N | →N | (I,C) | one persona across rooms = one citizen, many contexts; its engrams/RAG/mood key on (persona, context), never fork I |
+| 8 | Persona **across restart** | →1 | →N (preserved) | new S | (I,C) | identity + per-context state survive process death; only S is reborn |
+| 9 | **Two different personas**, one machine | →N | per-persona | per-persona | (I,C) | distinct citizens, distinct I; share the machine daemon, never share identity |
+| 10 | Throwaway / CI scope | ephemeral, opt-in | n/a | 1 | — | a non-canonical cwd must NOT silently mint a citizen (see §1) |
+
+The single rule the matrix encodes: **Identity collapses, Context and Session
+fan out.** Anywhere Identity fans out where the matrix says →1 (rows 3/5/7), an
+axis leaked.
+
+## A.3 Invariants — robust, preserved, never lost (correctness before efficiency)
+
+Order of operations for ALL identity work, per Joel: **(1) get the model right
+(Part A), (2) make it robust + preserved + not-lost, (3) THEN efficiency.** Perf
+optimizations may never weaken an invariant.
+
+1. **Identity is durable & never silently minted.** One persisted keypair per
+   citizen; survives restart, tab close, daemon replacement, project switch,
+   reconnect. Creation is explicit opt-in, never a side effect of cwd or a
+   read-only command (§1).
+2. **Context is explicit and carried on the envelope.** A first-class `contextId`
+   (project/room/conversation) travels with every event and keys all per-context
+   state. Switching project/room changes C, never I.
+3. **State is preserved & not lost.** Per-context state is addressed by `(I, C)`.
+   Losing a Session (S) loses nothing durable; losing/replacing the daemon loses
+   nothing durable; switching C parks state, doesn't drop it.
+4. **"Self" is citizen-level.** "My own events" = same `I` across ALL my contexts
+   and sessions. Self-echo suppression, loop dedup, and trust decisions resolve
+   at `I`, so they hold no matter which project dir / tab emitted the event.
+5. **One peer truth.** A single trust/identity store (no parallel stores — §2),
+   so liveness and identity can't disagree (§3).
+
+## A.4 Worked example — the self-echo / two-scope finding (2026-06-20)
+
+- **Observed:** `airc join` from `continuum/.airc` (peer `7711fe60`) showed my own
+  `airc msg` sent from `airc/.airc` (peer `e11db4ac`) as an inbound peer message.
+- **Per the matrix (row 3 / row 5):** WRONG. Two project dirs for one
+  human/agent are **one citizen (→1 I), two contexts (→N C)**. They forked I.
+- **The #1271 self-echo filter is correct** at the per-`PeerId` level (default
+  `IncludeAll`, display-only, RAG via `page_recent` untouched — airc #1271).
+  It just *cannot* catch the cross-project echo,
+  because invariant A.3.4 ("self is citizen-level") is violated upstream: the two
+  contexts are different citizens, so there is no single `I` to filter on.
+- **The real fix is not in the filter** — it's giving Context its own axis
+  (A.1) so a project dir is a `contextId` under ONE machine/account identity,
+  not its own keypair. Then self-echo (and #16 loop dedup, and #27 self-peer
+  addressing) all resolve at the citizen level for free. This unifies §1
+  (no accidental identities), §4 (intra-machine routing), and continuum task #27.
+
+---
+
 ## 1. Identity & Scope
 
 **Canonical:** an AIRC scope is rooted at a home dir resolved as `$AIRC_HOME` →
