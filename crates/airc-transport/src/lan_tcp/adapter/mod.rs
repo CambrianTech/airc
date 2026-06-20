@@ -115,7 +115,18 @@ impl LanTcpAdapter {
             *listening = true;
         }
 
-        let listener = TcpListener::bind(bind_addr).await?;
+        let listener = match TcpListener::bind(bind_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // Bind failed (e.g. the caller's preferred stable port is
+                // already taken). We are NOT listening, so clear the flag we
+                // optimistically set above — otherwise the adapter is wedged
+                // `listening=true` and a retry on a fallback port wrongly
+                // returns `AlreadyListening`.
+                *self.inner.listening.lock().await = false;
+                return Err(error.into());
+            }
+        };
         let actual = listener.local_addr()?;
         let inner = self.inner.clone();
 
