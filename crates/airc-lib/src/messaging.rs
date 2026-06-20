@@ -155,15 +155,12 @@ impl Airc {
         // event_id in the broadcast ring BEFORE the wire write, so the
         // wire subscriber's later re-read of the same frame still skips
         // a duplicate fan-out.
-        let __t_append = std::time::Instant::now();
+        let __append = airc_diagnostics::timing::start();
         self.append_sent_frame(frame.clone()).await?;
-        airc_diagnostics::timing::record(
-            "airc.append_sent",
-            __t_append.elapsed().as_nanos() as u64,
-        );
-        let __t_route = std::time::Instant::now();
+        __append.stop("airc.append_sent");
+        let __route = airc_diagnostics::timing::start();
         self.execute_send_route(route.kind, room, frame).await?;
-        airc_diagnostics::timing::record("airc.exec_route", __t_route.elapsed().as_nanos() as u64);
+        __route.stop("airc.exec_route");
         Ok(SendFrameResult {
             event_id,
             lamport,

@@ -84,6 +84,34 @@ pub fn timed<T>(seam: &'static str, f: impl FnOnce() -> T) -> T {
     value
 }
 
+/// Scoped timer for an `.await` span (where a closure doesn't fit). Captures
+/// the start `Instant` ONLY when recording is enabled — so a disabled hot path
+/// pays a single relaxed atomic load and no `clock_gettime`. Record on `stop`:
+///
+/// ```ignore
+/// let span = timing::start();
+/// do_the_await().await?;
+/// span.stop("airc.append_sent");
+/// ```
+#[must_use]
+pub fn start() -> ScopedTimer {
+    ScopedTimer(is_enabled().then(Instant::now))
+}
+
+/// Returned by [`start`]; call [`ScopedTimer::stop`] after the measured span.
+pub struct ScopedTimer(Option<Instant>);
+
+impl ScopedTimer {
+    /// Record the elapsed time under `seam`. No-op if timing was disabled when
+    /// [`start`] was called (no `Instant` was captured).
+    #[inline]
+    pub fn stop(self, seam: &'static str) {
+        if let Some(start) = self.0 {
+            record(seam, start.elapsed().as_nanos() as u64);
+        }
+    }
+}
+
 /// Snapshot every seam (sorted by name).
 pub fn snapshot() -> Vec<(&'static str, SeamStat)> {
     registry()
