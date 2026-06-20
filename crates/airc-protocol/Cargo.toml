@@ -16,3 +16,8 @@ ciborium = "0.2"
 dashmap = "6"
 ed25519-dalek = "2"
 rand = "0.8"
+# Stream-plane crypto (sign the handle, not the frame): per-stream symmetric
+# session keying so high-rate frames use AEAD, not per-frame Ed25519.
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
