@@ -6,7 +6,7 @@
 //! `airc-store` so each attach starts at "new since last seen" instead
 //! of replaying the full transcript.
 
-use airc_core::TranscriptEvent;
+use airc_core::{SelfFilter, TranscriptEvent};
 use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::stream::StreamExt;
 use std::sync::Arc;
@@ -15,7 +15,17 @@ const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
 pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EventFilter::default();
+    // Suppress our OWN broadcasts from the live feed. `airc msg` and this
+    // `airc join` are separate processes that share one peer identity but
+    // have distinct client ids, so ExcludeSameClient would still echo our
+    // sends back — ExcludeSamePeer hides everything from our identity, which
+    // is what an agent's own feed wants. Display-only: the events are still
+    // stored and still reach RAG via `page_recent` (which applies no filter).
+    let filter = EventFilter::default().excluding_self_echo(
+        airc.peer_id(),
+        airc.client_id(),
+        SelfFilter::ExcludeSamePeer,
+    );
     let consumer_id = consumer_id()?;
     print_catch_up(airc, filter.clone(), &consumer_id).await?;
     println!();
