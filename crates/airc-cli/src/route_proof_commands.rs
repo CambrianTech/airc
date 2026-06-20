@@ -7,7 +7,8 @@ use airc_lib::{
     Airc, PeerSpec, TransportHealthSample, TransportHealthState, TransportKind, TransportRole,
 };
 use airc_protocol::{
-    PeerKeyRegistry, PeerKeypair, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_REPLY_TO,
+    PeerKeyRegistry, PeerKeypair, HEADER_AIRC_COMMAND_KIND, HEADER_AIRC_CORRELATION_ID,
+    HEADER_AIRC_REPLY_TO, HEADER_FORGE_BODY_HINT,
 };
 use airc_relay::{RelayServer, RelayServerConfig};
 use futures::StreamExt;
@@ -214,7 +215,7 @@ fn spawn_reply_handler(
             let correlation_id = Uuid::parse_str(correlation)?;
             let reply_to_peer = PeerId::from_uuid(Uuid::parse_str(reply_to)?);
             let mut headers = Headers::new();
-            headers.insert("forge.body_hint".into(), result_hint.into());
+            headers.insert(HEADER_FORGE_BODY_HINT.into(), result_hint.into());
             responder
                 .reply(
                     reply_to_peer,
@@ -245,7 +246,7 @@ async fn issue_ping(
     body: &str,
 ) -> Result<ProofReply, Box<dyn std::error::Error>> {
     let mut headers = Headers::new();
-    headers.insert("airc.command_kind".into(), command_kind.into());
+    headers.insert(HEADER_AIRC_COMMAND_KIND.into(), command_kind.into());
     let pending = requester
         .request(MentionTarget::All, headers, Body::text(body), timeout)
         .await?;
