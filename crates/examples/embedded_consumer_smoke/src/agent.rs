@@ -87,6 +87,9 @@ impl AgentConsumer {
                 key: HEADER_AGENT_KIND.to_string(),
                 value: AGENT_KIND_PROMPT.to_string(),
             },
+            // #1271 added EventFilter.self_echo; consumers want to see
+            // everything (None = no self-echo suppression) — see stream.rs.
+            self_echo: None,
         };
         Ok(AgentInbox {
             owner: self.clone(),
@@ -109,6 +112,9 @@ impl AgentConsumer {
                 key: HEADER_AGENT_KIND.to_string(),
                 value: AGENT_KIND_PROMPT.to_string(),
             },
+            // #1271 added EventFilter.self_echo; consumers want to see
+            // everything (None = no self-echo suppression) — see stream.rs.
+            self_echo: None,
         };
         Ok(self
             .airc

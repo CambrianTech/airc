@@ -302,7 +302,10 @@ mod tests {
             my_join_client,
             SelfFilter::ExcludeSamePeer,
         );
-        assert!(!agent_feed.matches(&my_send), "own broadcast must be hidden");
+        assert!(
+            !agent_feed.matches(&my_send),
+            "own broadcast must be hidden"
+        );
         assert!(agent_feed.matches(&peer_send), "peer messages stay visible");
     }
 }

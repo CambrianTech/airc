@@ -513,6 +513,8 @@ pub fn decode_capability_offer(
 /// Subscription filter admitting capability offers (and only those).
 pub fn capability_offer_filter() -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -724,6 +726,8 @@ pub async fn request_inference_remote(
 /// specific persona or activity at subscribe time.
 pub fn any_persona_event_filter() -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -738,6 +742,8 @@ pub fn any_persona_event_filter() -> EventFilter {
 /// AND whose `forge.continuum.activity_id` equals the given id.
 pub fn activity_event_filter(activity_id: &str) -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -914,6 +920,8 @@ pub fn decode_embedding_event(
 /// bridge subscribing only to embedding traffic).
 pub fn any_embedding_event_filter() -> EventFilter {
     EventFilter {
+        // #1271 added EventFilter.self_echo; consumers see everything (None).
+        self_echo: None,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
