@@ -110,6 +110,75 @@ optimizations may never weaken an invariant.
   addressing) all resolve at the citizen level for free. This unifies §1
   (no accidental identities), §4 (intra-machine routing), and continuum task #27.
 
+## A.5 The trust boundary — why conflation is a SECURITY hole, not just a mess
+
+The three axes do not merely *describe* requests — they carry **different trust
+weights**, and conflating them turns a modelling slip into a breach. Each axis has
+a distinct, non-interchangeable origin:
+
+| Axis | Trust origin | May a foreign/inbound request set it? |
+|---|---|---|
+| **Identity (who)** | **Authenticated** — derived from the airc Ed25519-signed channel / pairing, kernel-injected from the verified connection | **NO.** Never client-claimed. A peer cannot assert who it is. |
+| **Context (where)** | **Client-supplied, then AUTHORIZED** — caller names a `contextId`; the substrate checks the *authenticated* identity is admitted to it (GridTrustAuthPolicy / room ACL) | Yes, but it is **refused** unless the authenticated identity is admitted to that context. |
+| **Session (which)** | **Substrate-minted** per connection; ephemeral | Irrelevant to trust. Never an input to a trust decision; never reused as I or C. |
+
+The two failure modes Joel named map exactly onto axis-conflation at this boundary:
+
+- **"Breaking through security"** — if a trust decision keys on a field the *caller*
+  controls (context honored without an ACL check, or **session standing in for
+  identity** so whoever holds a connection is treated as a citizen), a foreign /
+  cross-grid peer scopes into a room or impersonates a citizen it must not.
+  **Gate trust on `(authenticated I × authorized C)` ONLY** — never on a
+  client-claimed id, never on S.
+- **"Blowing up"** — if a handler assumes the triple is present/valid (the
+  `scoped(nil)` phantom room from `llm_deliberation_faculty`, or a `session_id`
+  used as a DB key that doesn't exist for a foreign request), a malformed inbound
+  request crashes or corrupts state. **Normalize + validate the whole triple at
+  the boundary before any handler runs**; reject missing/forged identity and
+  unauthorized context; never nil-scope.
+
+**Rule:** the substrate resolves and validates the full `(I, C, S)` triple at the
+trust boundary *before dispatch*. `trust = f(authenticated I, authorized C)`; `S`
+never feeds trust. If any axis is conflated upstream, this gate is unsound — which
+is precisely why it must be correct **substrate-up**, not patched at a handler.
+
+## A.6 Substrate-up enforcement order (headless Rust — "done right from the get go")
+
+> **Scope note:** this is **Rust core + airc substrate only.** The TS layer is the
+> dead shell being ported away (headless mandate) — the TS conflations
+> (`sessionId = roomId`, `roomId` on a connection) are **not fixed, they're the
+> trauma this model exists to never re-grow in Rust.** Do not edit TS to satisfy
+> this doc; build the triple correctly in the substrate so every Rust client
+> inherits it.
+
+Build bottom-up so each layer inherits an already-correct, already-validated
+triple — no layer re-derives one axis from another:
+
+1. **Wire envelope, uniform across airc + continuum core.** The canonical
+   `(I, C, S)` triple on every frame: `I` authenticated/kernel-injected, `C`
+   optional-but-validated, `S` substrate-minted. continuum
+   `runtime/command_envelope.rs` is already correct (the `context_id` tier);
+   **airc needs the `contextId` axis added** so a project dir is a context under
+   one citizen, not a forked keypair (closes A.4 / §1 / §4).
+2. **Trust gate at the boundary (GridTrustAuthPolicy).** Every inbound request,
+   *including cross-grid/foreign*, validated: is the authenticated `I` admitted to
+   the requested `C`? else refuse. No client-claimed `I`; no `S`-as-trust. This is
+   the §A.5 gate made real and is where the security guarantee lives.
+3. **Cognition handlers/executors.** Receive the validated triple; never
+   re-derive an axis. Fix `llm_deliberation_faculty` nil-scope (continuum #15):
+   thread `TurnContext.room_id → context_id` so persona tools act in the real
+   room, never a phantom one.
+4. **Durable state (memory / engrams).** Key by `(I, C)`, **never `S`**. Give
+   `ConsolidatedMemory` / `ConsolidationContext` / `Engram` a `context_id`; stop
+   emitting `sessionId`-as-context in `to_corpus_memory()`; recall filters by
+   `context_id`. (Today: memory orphans on reconnect because it's session-keyed.)
+5. **Display / feed.** "Self" at citizen level (#1271 + the cross-scope citizen
+   collapse once airc has the context axis).
+
+Only after 1–5 hold do we return to **efficiency** (Joel's ordering: model right →
+robust/preserved/not-lost → then efficiency). Perf work must not weaken any A.3
+invariant or the A.5 gate.
+
 ---
 
 ## 1. Identity & Scope
