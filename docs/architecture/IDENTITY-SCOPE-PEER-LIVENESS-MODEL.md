@@ -81,6 +81,17 @@ optimizations may never weaken an invariant.
    citizen; survives restart, tab close, daemon replacement, project switch,
    reconnect. Creation is explicit opt-in, never a side effect of cwd or a
    read-only command (§1).
+   - **Purist resolution (Joel, 2026-06-20 — "in with the new, out with the
+     old; this is just us"):** the operator citizen's identity resolves from the
+     **machine-account home** (`machine_account_home(scope)`), the SAME root the
+     daemon, socket, and `events.sqlite` already resolve to — so **one identity
+     per citizen per machine**, and a project dir is purely a **context**, never
+     an identity boundary. **Per-scope `identity.key` minting is deleted, not
+     migrated** — no compat shim, no "promote the right forked key" logic; any
+     existing per-scope/stale keys are simply abandoned. (Greenfield: no external
+     users to migrate.) Scopes OUTSIDE `$HOME` (CI/temp) stay their own boundary,
+     as today. Personas are **separate citizens** with their own keypairs, owned
+     by the core — never derived from a scope dir.
 2. **Context is explicit and carried on the envelope.** A first-class `contextId`
    (project/room/conversation) travels with every event and keys all per-context
    state. Switching project/room changes C, never I.
@@ -154,12 +165,19 @@ is precisely why it must be correct **substrate-up**, not patched at a handler.
 Build bottom-up so each layer inherits an already-correct, already-validated
 triple — no layer re-derives one axis from another:
 
-1. **Wire envelope, uniform across airc + continuum core.** The canonical
-   `(I, C, S)` triple on every frame: `I` authenticated/kernel-injected, `C`
-   optional-but-validated, `S` substrate-minted. continuum
-   `runtime/command_envelope.rs` is already correct (the `context_id` tier);
-   **airc needs the `contextId` axis added** so a project dir is a context under
-   one citizen, not a forked keypair (closes A.4 / §1 / §4).
+1. **Identity from the machine-account home + uniform `(I, C, S)` wire envelope.**
+   Two halves, both purist (no migration — A.3.1):
+   - **Resolve the operator identity from `machine_account_home(scope)`**, the
+     same root the daemon/socket/`events.sqlite` already use. Delete per-scope
+     `identity.key` minting outright. Result: one citizen per machine; a project
+     dir is a context, not a forked keypair (closes A.4 / §1 / §4). Existing
+     forked/stale keys are abandoned, not migrated.
+   - **The canonical `(I, C, S)` triple on every frame:** `I`
+     authenticated/kernel-injected, `C` optional-but-validated, `S`
+     substrate-minted. continuum `runtime/command_envelope.rs` already has the
+     `context_id` tier; airc carries the room as `room_id` on `TranscriptEvent`
+     already, so the work here is the identity-resolution half + making the
+     context tier first-class/uniform.
 2. **Trust gate at the boundary (GridTrustAuthPolicy).** Every inbound request,
    *including cross-grid/foreign*, validated: is the authenticated `I` admitted to
    the requested `C`? else refuse. No client-claimed `I`; no `S`-as-trust. This is
