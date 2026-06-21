@@ -53,7 +53,8 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    Inner, Outbound, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
+    InboundObserver, Inner, Outbound, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES,
+    SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
@@ -83,8 +84,21 @@ impl LanTcpAdapter {
                 listening: Mutex::new(false),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
+                on_inbound: std::sync::Mutex::new(None),
             }),
         })
+    }
+
+    /// #9: register an observer called once per AUTHENTICATED inbound
+    /// connection with `(peer_id, source_ip)`. The airc-lib layer uses this
+    /// to LEARN a peer's real address from the fact that it reached us — a
+    /// peer whose published endpoint went stale is still dialable at the IP
+    /// it connected from (combined with its stable advertised port). Idempotent
+    /// set-once; a later call replaces the observer.
+    pub fn set_inbound_observer(&self, observer: InboundObserver) {
+        if let Ok(mut guard) = self.inner.on_inbound.lock() {
+            *guard = Some(observer);
+        }
     }
 
     /// Snapshot of currently-connected peers. Useful for diagnostics
@@ -135,7 +149,7 @@ impl LanTcpAdapter {
             // per-connection task. The accept loop runs until the
             // listener errors (e.g. the adapter drops the OS socket).
             loop {
-                let (tcp_stream, _peer_addr) = match listener.accept().await {
+                let (tcp_stream, peer_addr) = match listener.accept().await {
                     Ok(pair) => pair,
                     Err(_error) => return,
                 };
@@ -144,7 +158,10 @@ impl LanTcpAdapter {
                 tokio::spawn(async move {
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            let _ = handle_server_connection(inner_for_conn, tls_stream).await;
+                            // #9: pass the source addr so the connection handler
+                            // can learn this peer's real IP once authenticated.
+                            let _ = handle_server_connection(inner_for_conn, tls_stream, peer_addr)
+                                .await;
                         }
                         Err(_error) => {
                             // Handshake rejected (e.g. unenrolled

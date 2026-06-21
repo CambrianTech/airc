@@ -47,6 +47,34 @@ fn is_ghost_peer(now_ms: u64, last_seen_ms: u64) -> bool {
     now_ms.saturating_sub(last_seen_ms) > crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS
 }
 
+/// #9: build the LEARNED dial candidates for a peer — its known-reachable
+/// `learned_ip` paired with each STABLE port the peer already advertises (#8).
+/// A peer that connected to us proved it's reachable at `learned_ip`, so even
+/// if its PUBLISHED endpoint's IP went stale, `(learned_ip, advertised_port)`
+/// is its real listener. Returns only NEW candidates (not already in
+/// `existing`), de-duplicated, so a learned IP that already matches a stored
+/// endpoint adds nothing.
+fn learned_lan_candidates(
+    existing: &[RouteEndpoint],
+    learned_ip: std::net::IpAddr,
+) -> Vec<RouteEndpoint> {
+    let mut candidates = Vec::new();
+    for endpoint in existing {
+        // The peer's advertised port (LAN or Tailscale rung — same wildcard
+        // listener under #8). `if let` (not `_ =>`) keeps the no-silent-fallback
+        // gate's wildcard_enum_match_arm satisfied.
+        if let RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } = endpoint {
+            let candidate = RouteEndpoint::LanTcp {
+                addr: std::net::SocketAddr::from((learned_ip, addr.port())),
+            };
+            if !existing.contains(&candidate) && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
 /// Card 625abe6d slice 1 — a stored peer endpoint that could not be
 /// dialed during discovery. Surfaced on the snapshot (and printed by
 /// `airc transport health`) instead of being swallowed: an offline
@@ -283,6 +311,30 @@ impl Airc {
             for endpoint in endpoints {
                 if !slot.contains(&endpoint) {
                     slot.push(endpoint);
+                }
+            }
+        }
+
+        // #9: prepend each peer's LEARNED real IP (harvested from an
+        // authenticated inbound — see `AircInner::learned_ips`) as a PREFERRED
+        // candidate, paired with the peer's STABLE advertised port (#8). A peer
+        // that connected to us proved it's reachable at that IP, so trying
+        // (learned_ip, stable_port) FIRST recovers a peer whose published
+        // endpoint went stale (moved networks / pre-#8 record) before paying
+        // dial timeouts on the dead rungs. Skipped when the candidate already
+        // matches a stored endpoint (no new info). No security change: the IP
+        // came from an enrolled peer's authenticated handshake, and the dial
+        // still pins to the expected peer_id.
+        if let Ok(learned) = self.inner.learned_ips.lock() {
+            for (peer_id, eps) in merged.iter_mut() {
+                let Some(learned_ip) = learned.get(peer_id).copied() else {
+                    continue;
+                };
+                // Preferred-first: the learned IP is known-reachable, so try it
+                // before the (possibly stale) published rungs. `.rev()` keeps the
+                // candidates' relative (port) order once all are front-inserted.
+                for candidate in learned_lan_candidates(eps, learned_ip).into_iter().rev() {
+                    eps.insert(0, candidate);
                 }
             }
         }
@@ -549,6 +601,39 @@ impl Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (#9): the learn-live-address candidate builder. A peer
+    // that connected to us teaches its real IP; we must produce
+    // (learned_ip, advertised_port) as a NEW candidate so a peer whose
+    // published IP went stale is still dialable — but add nothing when the
+    // learned IP already matches a stored endpoint (no churn).
+    #[test]
+    fn learned_candidates_pair_learned_ip_with_advertised_ports() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let stale = RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(10, 0, 1, 16), 50000)),
+        };
+        let learned = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 232));
+
+        // Stale published IP + a learned IP → one candidate on the same port.
+        let cands = learned_lan_candidates(&[stale.clone()], learned);
+        assert_eq!(
+            cands,
+            vec![RouteEndpoint::LanTcp {
+                addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 232), 50000)),
+            }],
+            "learned IP must pair with the peer's advertised (stable) port"
+        );
+
+        // Learned IP already matches the stored endpoint → nothing to add.
+        let already = RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 232), 50000)),
+        };
+        assert!(
+            learned_lan_candidates(&[already], learned).is_empty(),
+            "no new candidate when the learned IP already matches a stored endpoint"
+        );
+    }
 
     // what this catches (#10): the ghost boundary. A peer with fresh contact
     // (beacon within the TTL) must remain dialable; one past the TTL must be
