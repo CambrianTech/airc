@@ -207,6 +207,17 @@ impl Airc {
             self.inner.registry.clone(),
         )
         .map_err(|error| AircError::Transport(error.to_string()))?;
+        // #9: learn each authenticated inbound peer's real IP. A peer that
+        // dialed us proved it's reachable at that source IP; the dial path
+        // pairs it with the peer's stable advertised port so a peer whose
+        // published endpoint went stale is still dialable. Registered once,
+        // on first adapter creation.
+        let learned_ips = self.inner.learned_ips.clone();
+        adapter.set_inbound_observer(std::sync::Arc::new(move |peer_id, ip| {
+            if let Ok(mut map) = learned_ips.lock() {
+                map.insert(peer_id, ip);
+            }
+        }));
         *guard = Some(adapter.clone());
         Ok(adapter)
     }

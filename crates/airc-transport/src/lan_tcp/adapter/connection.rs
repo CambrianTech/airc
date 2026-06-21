@@ -30,9 +30,21 @@ use crate::lan_tcp::cert::extract_ed25519_pubkey;
 pub(super) async fn handle_server_connection(
     inner: Arc<Inner>,
     tls_stream: ServerTlsStream<TcpStream>,
+    peer_addr: std::net::SocketAddr,
 ) -> Result<(), LanTcpError> {
     let peer_id = resolve_peer_from_server_stream(&inner, &tls_stream)
         .ok_or(LanTcpError::PeerNotInRegistry)?;
+    // #9: the peer just proved (via the authenticated handshake) it's
+    // reachable at `peer_addr.ip()`. Report it to the learn-observer if one
+    // is registered — the layer above pairs this real IP with the peer's
+    // stable advertised port so a peer whose published endpoint went stale is
+    // still dialable. The source PORT is the peer's ephemeral outbound port,
+    // NOT its listener, so we surface only the IP. Lock is brief + never held
+    // across an await.
+    let observer = inner.on_inbound.lock().ok().and_then(|guard| guard.clone());
+    if let Some(observer) = observer {
+        observer(peer_id, peer_addr.ip());
+    }
     let (read_half, write_half) = tokio::io::split(tls_stream);
     install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
     Ok(())

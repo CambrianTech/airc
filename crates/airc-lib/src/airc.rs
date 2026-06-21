@@ -172,6 +172,16 @@ pub(crate) struct AircInner {
     /// clones (like `live_tx`) so whichever handle dials, the quarantine
     /// is unified. See [`crate::route::dial_quarantine`].
     pub(crate) dial_quarantine: Arc<std::sync::Mutex<crate::route::DialQuarantine>>,
+    /// #9: in-session learned real IPs per peer, harvested from AUTHENTICATED
+    /// inbound connections (a peer that dialed us proved it's reachable at that
+    /// source IP — on a LAN, symmetric). The dial path pairs a learned IP with
+    /// the peer's STABLE advertised port (#8) so a peer whose PUBLISHED endpoint
+    /// went stale (moved networks, pre-#8 record) is still dialable. In-memory
+    /// only — re-learned from the next inbound each session, no persistence.
+    /// Shared across daemon clones like `dial_quarantine` so whichever handle
+    /// accepts the inbound, every handle's dialer sees the learned IP.
+    pub(crate) learned_ips:
+        Arc<std::sync::Mutex<std::collections::HashMap<PeerId, std::net::IpAddr>>>,
     pub(crate) lamport_clock: AtomicU64,
     /// Epoch-ms of the last send-path peer-registry sync. Debounces the
     /// per-send disk load (see `sync_account_peer_registry_debounced`).
@@ -445,6 +455,7 @@ impl Airc {
                 dial_quarantine: Arc::new(std::sync::Mutex::new(
                     crate::route::DialQuarantine::default(),
                 )),
+                learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
@@ -1023,6 +1034,9 @@ impl Airc {
             // Share the quarantine across the daemon clone so dial-failure
             // backoff is unified regardless of which handle runs discovery.
             dial_quarantine: self.inner.dial_quarantine.clone(),
+            // #9: share the learned-IP map across the daemon clone so an
+            // inbound learned on any handle informs every handle's dialer.
+            learned_ips: self.inner.learned_ips.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             peer_sync_last_ms: AtomicU64::new(0),
             lan_tcp: Mutex::new(None),

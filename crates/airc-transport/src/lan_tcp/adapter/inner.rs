@@ -77,4 +77,20 @@ pub(super) struct Inner {
     pub(super) listening: Mutex<bool>,
     pub(super) subscribers: Mutex<Vec<SubscriberHandle>>,
     pub(super) next_sub_id: AtomicU64,
+    /// #9: optional observer invoked once per AUTHENTICATED inbound
+    /// connection with `(peer_id, source_ip)`. Purely transport-level
+    /// reachability info — a peer that dialed us proves it's reachable at
+    /// that source IP (on a LAN, symmetric). The airc-lib layer uses it to
+    /// LEARN a peer's real address (combined with its stable advertised
+    /// port) so a peer whose published endpoint went stale is still
+    /// dialable. Generic: the pipe reports who connected from where; it has
+    /// no idea what the layer above does with it. `std::sync::Mutex` —
+    /// set-once at adapter wiring, read briefly on each accept, never held
+    /// across an await.
+    pub(super) on_inbound: std::sync::Mutex<Option<InboundObserver>>,
 }
+
+/// #9: callback the airc-lib layer registers to learn `(peer_id, source_ip)`
+/// from authenticated inbound connections. `Send + Sync` so the accept loop
+/// can invoke it from any connection task.
+pub(super) type InboundObserver = std::sync::Arc<dyn Fn(PeerId, std::net::IpAddr) + Send + Sync>;
