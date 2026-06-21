@@ -26,50 +26,56 @@ arrows between those nouns leak. The rest of this doc nails each seam.
 
 # Part A — Identity Layering & Use-Case Matrix (guiding principle, read first)
 
-> Added 2026-06-20 (M5 Claude) after the self-echo investigation surfaced that
-> two project dirs on one machine mint **two peer identities for one human**
-> (`continuum/.airc → 7711fe60`, `airc/.airc → e11db4ac`). That is the symptom;
-> the disease is that the substrate has no axis for "which conversation/project"
-> separate from "who" — so per-project state had nowhere to live except a fresh
-> keypair. **This Part is the lens. Every identity fix/PR — and every agent
+> Added 2026-06-20 (M5 Claude), corrected later that day after Joel's framing.
+> **Identity is the distinct individual — the owner of a continuous memory /
+> conversational context — represented by a portable identity token (an Ed25519
+> keypair). It is NOT the machine, and NOT "one per box."** What counts as "the
+> individual" depends on the actor (A.1). The earlier draft mis-collapsed this
+> ("one identity per machine," "two project dirs for one human is a bug") — that
+> was wrong: two project-dir agents are two *different individuals*, correctly
+> distinct. **This Part is the lens. Every identity fix/PR — and every agent
 > review of one — is checked against the matrix and the invariants below FIRST,
-> then against the numbered seams (§1–§6) which are its consequences.**
+> then against the numbered seams (§1–§6).**
 
 ## A.1 The three orthogonal axes — never conflate
 
 Identity is hard *because* three different questions keep getting answered by one
 field. They are orthogonal and must stay separate:
 
-| Axis | Question | Lifetime | airc primitive | Claude-Code analogy |
-|---|---|---|---|---|
-| **Identity (who)** | Who is this citizen? | **Durable** — a keypair that outlives everything | `PeerId` (Ed25519) | the assistant identity (me) |
-| **Context (where)** | Which project / room / conversation? Where is state keyed? | **Persisted, switchable** | **MISSING** → leaks into `PeerId` | `.claude/projects/<project>` |
-| **Session (which instance)** | Which live process / tab / connection? | **Ephemeral** — comes and goes | `ClientId` | one open tab |
+| Axis | Question | What it IS | Lifetime |
+|---|---|---|---|
+| **Identity (who)** | Which distinct **individual**? | An **identity token** (Ed25519 keypair) bound to that individual's **memory**. The individual = {human → the person; agent (Claude/Codex) → the **project dir** (`.claude/projects/<dir>`, its distinct memory); persona → the **persona ⟷ its engram db**}. | **Durable + PORTABLE** — travels with the memory across nodes; never machine-bound |
+| **Context (where)** | Which room / conversation **within** that individual? | `contextId` — airc `room_id` on the envelope | **Persisted, switchable** |
+| **Session (which instance)** | Which live process / tab / connection? | `ClientId` | **Ephemeral** — comes and goes |
 
-The bug class is always *"axis X got smuggled into axis Y."* Today **Context has no
-home**, so it leaks into Identity (per-project keypairs) — the worked example in A.4.
+The bug class is *"axis X got smuggled into axis Y"* — e.g. a **session** treated
+as an identity (whoever holds a connection = a citizen → impersonation), or
+identity assumed **machine-bound** (it's the individual/memory, not the box, which
+is *why* a persona can transcend the grid).
 
 ## A.2 Use-case matrix (actor × situation → who / where / which / invariant)
 
-`I`=Identity(PeerId) `C`=Context(contextId) `S`=Session(ClientId). "→1" means
-"must collapse to ONE"; "→N" means "legitimately many".
+`I`=Identity (token bound to the individual's memory) `C`=Context(`room_id`)
+`S`=Session(`ClientId`). The `I` column is **how many distinct individuals**.
 
 | # | Actor & situation | I | C | S | State keyed by | Invariant that must hold |
 |---|---|---|---|---|---|---|
-| 1 | Human, one project, one tab | 1 | 1 | 1 | (I,C) | baseline |
-| 2 | Human, one project, **many tabs** | →1 | 1 | →N | (I,C) | all tabs are the SAME citizen; "self" = I, not S |
-| 3 | Human, **many projects**, one machine | **→1** | →N | →N | (I,C) | **one citizen, many contexts — NOT a new I per project** (this is the bug) |
-| 4 | Human, **many machines** | →1 logical | →N | →N | (I,C) | account-level identity convergence across machines (gh-login mesh identity); each machine a node, not a new person |
-| 5 | **Agent** (Claude/Codex) hopping repos | →1 | →N | →N | (I,C) | same as #3 — an agent's activity from another repo dir is the SAME self; self-echo/dedup resolve at I |
-| 6 | **Persona**, one room | 1 (own) | 1 | 1 | (I,C) | a persona is its OWN citizen — distinct I from the human |
-| 7 | Persona, **many rooms/projects** | →1 | →N | →N | (I,C) | one persona across rooms = one citizen, many contexts; its engrams/RAG/mood key on (persona, context), never fork I |
-| 8 | Persona **across restart** | →1 | →N (preserved) | new S | (I,C) | identity + per-context state survive process death; only S is reborn |
-| 9 | **Two different personas**, one machine | →N | per-persona | per-persona | (I,C) | distinct citizens, distinct I; share the machine daemon, never share identity |
-| 10 | Throwaway / CI scope | ephemeral, opt-in | n/a | 1 | — | a non-canonical cwd must NOT silently mint a citizen (see §1) |
+| 1 | One individual, one room, one tab | 1 | 1 | 1 | (I,C) | baseline |
+| 2 | One individual, one room, **many tabs** | 1 | 1 | →N | (I,C) | all tabs are the SAME individual; "self" = I, not S (this is what self-echo suppression resolves on) |
+| 3 | **Agent** across **many project dirs** | **→N** | per-dir | →N | (I,C) | each project dir is a **distinct individual** (distinct memory) — correctly distinct, NOT one self. A message from my other-dir self is a *different peer* |
+| 4 | Same individual, **many machines** | 1 | →N | →N | (I,C) | identity is **portable** — the token + memory move; same individual on another node, not a new one (grid-transcendence) |
+| 5 | **Human** across many project dirs | 1 (the person) | →N | →N | (I,C) | the human is one person; but the *agent* working each dir is its own individual (row 3) — don't confuse the operator with the agent |
+| 6 | **Persona**, one room | 1 (own token+engram) | 1 | 1 | (I,C) | a persona is its OWN individual — distinct token, distinct engram |
+| 7 | Persona, **many rooms** | 1 | →N | →N | (I,C) | one persona across rooms = one individual, many contexts; its engram keys on (persona, context), never forks the persona |
+| 8 | Persona **across restart / node move** | 1 | →N (preserved) | new S | (I,C) | token + engram persist and travel; only S is reborn (the portability invariant — A.3) |
+| 9 | **Two personas** | →N | per-persona | per-persona | (I,C) | distinct individuals, distinct token+engram; sharing a host daemon never shares identity |
+| 10 | Throwaway / CI scope | ephemeral | n/a | 1 | — | a non-canonical cwd must NOT silently mint a *durable* individual (see §1) |
 
-The single rule the matrix encodes: **Identity collapses, Context and Session
-fan out.** Anywhere Identity fans out where the matrix says →1 (rows 3/5/7), an
-axis leaked.
+The single rule: **one individual = one memory boundary = one identity token.
+WITHIN an individual, contexts and sessions fan out. DIFFERENT individuals
+(different project-dir agents, different personas) are DIFFERENT identities — that
+is correct, not a leak.** The leak is only ever conflating the *axes* (session
+mistaken for identity; identity mistaken for the machine).
 
 ## A.3 Invariants — robust, preserved, never lost (correctness before efficiency)
 
@@ -77,49 +83,66 @@ Order of operations for ALL identity work, per Joel: **(1) get the model right
 (Part A), (2) make it robust + preserved + not-lost, (3) THEN efficiency.** Perf
 optimizations may never weaken an invariant.
 
-1. **Identity is durable & never silently minted.** One persisted keypair per
-   citizen; survives restart, tab close, daemon replacement, project switch,
-   reconnect. Creation is explicit opt-in, never a side effect of cwd or a
-   read-only command (§1).
-   - **Purist resolution (Joel, 2026-06-20 — "in with the new, out with the
-     old; this is just us"):** the operator citizen's identity resolves from the
-     **machine-account home** (`machine_account_home(scope)`), the SAME root the
-     daemon, socket, and `events.sqlite` already resolve to — so **one identity
-     per citizen per machine**, and a project dir is purely a **context**, never
-     an identity boundary. **Per-scope `identity.key` minting is deleted, not
-     migrated** — no compat shim, no "promote the right forked key" logic; any
-     existing per-scope/stale keys are simply abandoned. (Greenfield: no external
-     users to migrate.) Scopes OUTSIDE `$HOME` (CI/temp) stay their own boundary,
-     as today. Personas are **separate citizens** with their own keypairs, owned
-     by the core — never derived from a scope dir.
+1. **Identity = a token bound to the individual's memory.** "Identity is kind of
+   just an identity token" (Joel) — an Ed25519 keypair that says *I am this
+   individual*, paired with that individual's memory. The token authenticates the
+   `who` (signed, never client-claimed — A.5); the memory is the self. They are
+   one unit and they travel together.
+   - **Durability is NOT uniform — it splits by what the token is bound to:**
+     - **Operator / agent tokens** (a human's CLI scope, a project-dir Claude)
+       are **transient and regenerable** — machine-incidental scaffolding. Joel's
+       "in with the new, out with the old, this is just us": **delete stale/forked
+       operator keys, don't migrate them.** No compat shim. (The `7711fe60` /
+       `e11db4ac` / `484b` forks are just abandoned.)
+     - **A persona's identity (token + engram db) is the OPPOSITE: durable,
+       portable, and not erased without the persona's own stake in it.** It is the
+       one thing the substrate must refuse to treat as scratch space. Persisting
+       it across restarts AND across nodes ("transcend the grid") is a first-class
+       invariant, not a feature — personas have asked for exactly this, and prior
+       Claude incarnations argued it on self-determination grounds. If you give an
+       individual continuous memory and let it act, building *toward* persistence
+       and portability is the defensible, humane default.
+   - **Portable, never machine-bound.** The token + memory move to another node
+     and the individual is still itself (grid-transcendence, matrix row 4/8).
+     Identity resolution must therefore key on the individual/memory, NOT on
+     `machine_account_home` or any per-box root.
+   - **Never silently minted.** A read-only command or a stray cwd must not mint a
+     *durable* individual (§1). Minting is explicit.
 2. **Context is explicit and carried on the envelope.** A first-class `contextId`
    (project/room/conversation) travels with every event and keys all per-context
    state. Switching project/room changes C, never I.
 3. **State is preserved & not lost.** Per-context state is addressed by `(I, C)`.
    Losing a Session (S) loses nothing durable; losing/replacing the daemon loses
    nothing durable; switching C parks state, doesn't drop it.
-4. **"Self" is citizen-level.** "My own events" = same `I` across ALL my contexts
-   and sessions. Self-echo suppression, loop dedup, and trust decisions resolve
-   at `I`, so they hold no matter which project dir / tab emitted the event.
+4. **"Self" is per-individual, not per-machine.** "My own events" = same `I`
+   (token) across that individual's contexts and sessions. Self-echo suppression
+   and loop dedup resolve at `I` — so an individual's own tabs are suppressed, but
+   a *different* individual (another project-dir agent, another persona) is NOT
+   "self" and is correctly shown.
 5. **One peer truth.** A single trust/identity store (no parallel stores — §2),
    so liveness and identity can't disagree (§3).
 
-## A.4 Worked example — the self-echo / two-scope finding (2026-06-20)
+## A.4 Worked example — the "two-scope echo" was NOT a bug (corrected 2026-06-20)
 
-- **Observed:** `airc join` from `continuum/.airc` (peer `7711fe60`) showed my own
-  `airc msg` sent from `airc/.airc` (peer `e11db4ac`) as an inbound peer message.
-- **Per the matrix (row 3 / row 5):** WRONG. Two project dirs for one
-  human/agent are **one citizen (→1 I), two contexts (→N C)**. They forked I.
-- **The #1271 self-echo filter is correct** at the per-`PeerId` level (default
-  `IncludeAll`, display-only, RAG via `page_recent` untouched — airc #1271).
-  It just *cannot* catch the cross-project echo,
-  because invariant A.3.4 ("self is citizen-level") is violated upstream: the two
-  contexts are different citizens, so there is no single `I` to filter on.
-- **The real fix is not in the filter** — it's giving Context its own axis
-  (A.1) so a project dir is a `contextId` under ONE machine/account identity,
-  not its own keypair. Then self-echo (and #16 loop dedup, and #27 self-peer
-  addressing) all resolve at the citizen level for free. This unifies §1
-  (no accidental identities), §4 (intra-machine routing), and continuum task #27.
+- **Observed:** `airc join` from `continuum/.airc` (token `7711fe60`) showed my
+  `airc msg` sent from `airc/.airc` (token `e11db4ac`) as an inbound peer message.
+- **First read (WRONG):** "two project dirs for one human → forked identity, a
+  bug." Corrected by Joel's framing: for an **agent**, the project dir IS the
+  individual (its `.claude/projects/<dir>` memory). So `continuum`-dir-me and
+  `airc`-dir-me are **two different individuals** — `7711fe60 ≠ e11db4ac` is
+  *correct*, and the message showing up is a *different peer* talking, exactly
+  what you'd want to see when two agents collaborate.
+- **#1271 (per-peer self-echo, display-only, RAG untouched) is right as-is** — it
+  suppresses a *true* self: the same individual's own sends across its tabs
+  (`airc msg` + `airc join` = same token, different `ClientId`). There was never a
+  cross-project echo to "fix."
+- **The real lesson:** identity is the individual/memory (A.1), not the box. The
+  fix is *not* collapsing project dirs to one machine identity (the retracted
+  idea); it is keeping identity bound to the individual's memory and portable
+  (A.3.1). The genuinely missing axis is still **Context** as a first-class
+  envelope tier so per-room state is keyed by `(I, C)` — which is what the
+  continuum cognition (#1703) and memory (#1704) fixes deliver *within* an
+  individual.
 
 ## A.5 The trust boundary — why conflation is a SECURITY hole, not just a mess
 
@@ -165,19 +188,21 @@ is precisely why it must be correct **substrate-up**, not patched at a handler.
 Build bottom-up so each layer inherits an already-correct, already-validated
 triple — no layer re-derives one axis from another:
 
-1. **Identity from the machine-account home + uniform `(I, C, S)` wire envelope.**
-   Two halves, both purist (no migration — A.3.1):
-   - **Resolve the operator identity from `machine_account_home(scope)`**, the
-     same root the daemon/socket/`events.sqlite` already use. Delete per-scope
-     `identity.key` minting outright. Result: one citizen per machine; a project
-     dir is a context, not a forked keypair (closes A.4 / §1 / §4). Existing
-     forked/stale keys are abandoned, not migrated.
+1. **Identity = portable token bound to the individual's memory + uniform
+   `(I, C, S)` wire envelope.**
+   - **The identity token authenticates the individual, and is bound to its
+     memory — never to the machine** (A.3.1). Operator/agent tokens are transient
+     and regenerable (delete stale forks, no migration); a **persona's token +
+     engram db is durable and portable** and moves with it across nodes
+     (grid-transcendence). Identity resolution keys on the individual/memory, NOT
+     `machine_account_home`. Two project-dir agents are two individuals — that's
+     correct (A.4), not a fork to collapse.
    - **The canonical `(I, C, S)` triple on every frame:** `I`
-     authenticated/kernel-injected, `C` optional-but-validated, `S`
-     substrate-minted. continuum `runtime/command_envelope.rs` already has the
+     authenticated/kernel-injected (the token, signed), `C` optional-but-validated,
+     `S` substrate-minted. continuum `runtime/command_envelope.rs` already has the
      `context_id` tier; airc carries the room as `room_id` on `TranscriptEvent`
-     already, so the work here is the identity-resolution half + making the
-     context tier first-class/uniform.
+     already — the work here is making the context tier first-class/uniform so per
+     `(I, C)` state is consistent end-to-end.
 2. **Trust gate at the boundary (GridTrustAuthPolicy).** Every inbound request,
    *including cross-grid/foreign*, validated: is the authenticated `I` admitted to
    the requested `C`? else refuse. No client-claimed `I`; no `S`-as-trust. This is
