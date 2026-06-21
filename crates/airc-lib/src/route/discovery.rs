@@ -616,7 +616,7 @@ mod tests {
         let learned = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 232));
 
         // Stale published IP + a learned IP → one candidate on the same port.
-        let cands = learned_lan_candidates(&[stale.clone()], learned);
+        let cands = learned_lan_candidates(std::slice::from_ref(&stale), learned);
         assert_eq!(
             cands,
             vec![RouteEndpoint::LanTcp {
