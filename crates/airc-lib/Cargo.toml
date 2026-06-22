@@ -68,6 +68,7 @@ mock = []
 airc-daemon = { path = "../airc-daemon" }
 airc-protocol = { path = "../airc-protocol" }
 bytes = "1"
+ed25519-dalek = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tempfile = "3"
 temp-env = "0.3"

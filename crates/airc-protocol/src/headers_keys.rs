@@ -104,6 +104,15 @@ pub const HEADER_AIRC_BODY_ENC_KEY_ID: &str = "airc.body.enc.key_id";
 /// AAD on decrypt or authentication will fail closed.
 pub const HEADER_AIRC_BODY_ENC_AAD: &str = "airc.body.enc.aad";
 
+/// A base64-encoded, serialized `airc_lib::grid_auth::SignedCapabilityGrant` —
+/// the owner-signed capability the caller PRESENTS so a receiving node can
+/// authorize the command against it (the contracted-grid auth gate): verify the
+/// signature + key-binding + mesh + expiry, then check `grant.grants(command)`.
+/// Substrate-owned (`airc.*`) because it's a cross-cutting authorization concern,
+/// not a per-consumer routing label. Opaque to the substrate; the receiver
+/// decodes + verifies. See airc-lib `grid_auth`.
+pub const HEADER_AIRC_CAPABILITY_GRANT: &str = "airc.capability_grant";
+
 #[cfg(test)]
 mod tests {
     use super::*;
