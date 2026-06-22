@@ -987,6 +987,22 @@ impl Airc {
         )
     }
 
+    /// Issue (sign) a capability grant with THIS node's identity key — the node is
+    /// the owner/issuer delegating a capability to `grant.grantee`. The raw key
+    /// never leaves airc (same contract as [`sign_assertion`]); a verifier
+    /// authorizes the result by pinning this node's
+    /// [`peer_public_key`](Self::peer_public_key) as its `trusted_issuer_pubkey`.
+    /// The grant body is the caller's to compose (grantee + grantee key +
+    /// capabilities + mesh + expiry + epoch); this only signs it. Fallible solely
+    /// on body serialization (a programmer error in practice), surfaced rather than
+    /// swallowed — fail-closed.
+    pub fn sign_grant(
+        &self,
+        grant: crate::grid_auth::CapabilityGrant,
+    ) -> Result<crate::grid_auth::SignedCapabilityGrant, serde_json::Error> {
+        crate::grid_auth::SignedCapabilityGrant::sign(&self.inner.identity.keypair, grant)
+    }
+
     pub fn is_daemon_attached(&self) -> bool {
         self.inner.daemon_client.is_some()
     }
