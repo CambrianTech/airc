@@ -23,6 +23,7 @@
 //! issuer-key distribution. Those are security policy, not foundation.
 
 use airc_core::PeerId;
+use airc_protocol::PeerKeypair;
 use airc_store::peer_trust::TrustTier;
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +236,40 @@ impl SignedMeshMembership {
 }
 
 impl SignedCapabilityGrant {
+    /// Issue a grant: sign a [`CapabilityGrant`] body with the owner's keypair
+    /// (the account root of trust). The caller builds the body — it IS the unit
+    /// being signed — then this wraps it with the signature. A verifier
+    /// authorizes the result by pinning `owner_keypair.public_bytes()` as its
+    /// `trusted_issuer_pubkey`. Signs the SAME canonical bytes
+    /// [`verify`](Self::verify) checks (`serde_json` of the body), so sign and
+    /// verify can never drift. Pure: the clock (`grant.issued_at_ms`) is a body
+    /// field the caller fills, so issuance stays IO/clock-free like the rest of
+    /// `grid_auth`.
+    ///
+    /// `grant.epoch` is monotonic per grantee — re-issue with all capabilities +
+    /// a higher epoch to update; revoke by issuing a higher epoch with empty
+    /// `capabilities`.
+    ///
+    /// Fallible by design: the body is plain serde structs that serialize in
+    /// practice, but the error is SURFACED (`Err`), never swallowed or signed
+    /// over fallback bytes — fail-closed, the mirror of [`verify`](Self::verify)
+    /// treating an encoding failure as `EncodingFailed` rather than verifying an
+    /// empty message.
+    pub fn sign(
+        owner_keypair: &PeerKeypair,
+        grant: CapabilityGrant,
+    ) -> Result<Self, serde_json::Error> {
+        let bytes = serde_json::to_vec(&grant)?;
+        Ok(Self {
+            grant,
+            proof: GrantProof {
+                credential: CredentialKind::Ed25519,
+                issuer_pubkey: owner_keypair.public_bytes().to_vec(),
+                signature: owner_keypair.sign_bytes(&bytes).to_vec(),
+            },
+        })
+    }
+
     /// Verify this grant against `ctx` (issuer → signature → key → mesh →
     /// expiry). On `Valid`, [`Self::grants`] tells what it confers.
     pub fn verify(&self, ctx: &VerifyContext<'_>) -> GrantVerdict {
@@ -445,5 +480,77 @@ mod tests {
             GrantVerdict::KeyMismatch
         );
         assert_eq!(m.attestation.default_tier, TrustTier::OwnAccount);
+    }
+
+    /// Real ed25519 verifier — reconstructs the issuer's `VerifyingKey` from
+    /// `proof.issuer_pubkey` and checks the signature over the canonical body
+    /// bytes. Used by the round-trip test below so `sign()` is exercised
+    /// against actual crypto, not the stub.
+    struct RealVerifier;
+    impl GrantVerifier for RealVerifier {
+        fn verify_signature(&self, message: &[u8], proof: &GrantProof) -> bool {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let Ok(key_bytes): Result<[u8; 32], _> = proof.issuer_pubkey.as_slice().try_into()
+            else {
+                return false;
+            };
+            let Ok(vk) = VerifyingKey::from_bytes(&key_bytes) else {
+                return false;
+            };
+            let Ok(sig_bytes): Result<[u8; 64], _> = proof.signature.as_slice().try_into() else {
+                return false;
+            };
+            vk.verify(message, &Signature::from_bytes(&sig_bytes))
+                .is_ok()
+        }
+    }
+
+    // what this catches: SignedCapabilityGrant::sign() signs the SAME canonical
+    // bytes verify() checks — a real owner keypair signs a grant, and a real
+    // ed25519 verifier (issuer pinned to that keypair's public key) returns
+    // Valid + confers the capability. If sign() ever serializes a different
+    // body than signing_bytes(), or the issuer/grantee key wiring drifts, this
+    // round-trip breaks where the stub-verifier tests cannot see it.
+    #[test]
+    fn signed_grant_round_trips_with_real_ed25519() {
+        use airc_protocol::PeerKeypair;
+
+        let owner = PeerKeypair::generate();
+        let issuer_pubkey = owner.public_bytes();
+        let grantee_pubkey = PeerKeypair::generate().public_bytes().to_vec();
+
+        let g = SignedCapabilityGrant::sign(
+            &owner,
+            CapabilityGrant {
+                grantee: peer(42),
+                grantee_pubkey: grantee_pubkey.clone(),
+                capabilities: vec!["ai/generate".to_string()],
+                granted_in: MeshIdentity::new(MESH),
+                issued_at_ms: 1_000,
+                expires_at_ms: Some(5_000),
+                epoch: 7,
+            },
+        )
+        .expect("sign grant");
+
+        // The proof carries the owner's real key + a real signature.
+        assert_eq!(g.proof.issuer_pubkey, issuer_pubkey.to_vec());
+        assert_eq!(g.proof.signature.len(), 64);
+
+        let (mesh, verifier) = (MeshIdentity::new(MESH), RealVerifier);
+        let ctx = VerifyContext {
+            now_ms: 2_000,
+            presenting_pubkey: &grantee_pubkey,
+            expected_mesh: &mesh,
+            verifier: &verifier,
+            trusted_issuer_pubkey: &issuer_pubkey,
+        };
+        assert_eq!(g.verify(&ctx), GrantVerdict::Valid);
+        assert!(g.grants("ai/generate"));
+
+        // Tamper with the body after signing -> the same real verifier rejects.
+        let mut tampered = g;
+        tampered.grant.capabilities = vec!["data/delete".to_string()];
+        assert_eq!(tampered.verify(&ctx), GrantVerdict::BadSignature);
     }
 }

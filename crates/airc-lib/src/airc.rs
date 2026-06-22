@@ -563,6 +563,19 @@ impl Airc {
         self.inner.identity.peer_id
     }
 
+    /// The enrolled ed25519 public key of `peer_id` (current key, `key_id = 0`),
+    /// or `None` if the peer isn't enrolled in this scope's key registry. The
+    /// capability-grant gate uses this as the PRESENTING key: the receiver
+    /// cross-checks it against the grant's bound `grantee_pubkey` so a stolen grant
+    /// can't ride another peer's identity. Sourced from the same registry that
+    /// signature-verifies inbound envelopes, so it's the authenticated key.
+    pub fn peer_public_key(&self, peer_id: PeerId) -> Option<[u8; 32]> {
+        self.inner
+            .registry
+            .lookup(peer_id, 0)
+            .map(|vk| vk.to_bytes())
+    }
+
     /// Return the per-session client identifier.
     pub fn client_id(&self) -> ClientId {
         self.inner.identity.client_id

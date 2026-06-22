@@ -251,6 +251,7 @@ dependencies = [
  "base64",
  "bytes",
  "dashmap",
+ "ed25519-dalek",
  "fs2",
  "futures",
  "rtc",
