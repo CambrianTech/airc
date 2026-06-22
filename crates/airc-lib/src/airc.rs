@@ -1129,7 +1129,12 @@ impl Airc {
     /// rooms when the coordinator path differs from the scope path —
     /// e.g. on Windows, where `machine_account_home` collapses temp
     /// homes that live under `USERPROFILE` onto one coordinator store.
-    pub(crate) async fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
+    ///
+    /// Public so a consumer can pin this node's own mesh as the expected mesh
+    /// when verifying a presented `grid_auth::SignedCapabilityGrant` (a grant is
+    /// rejected `WrongMesh` if it was scoped to a different grid). The authoritative
+    /// local-mesh accessor — read it once at boot, not on the hot path.
+    pub async fn mesh_identity(&self) -> Result<MeshIdentity, AircError> {
         if mesh_identity::load_cached(self.coordinator_store())
             .await?
             .is_none()
