@@ -6,7 +6,4 @@
 # b69f's Windows QA on #430 surfaced these as the remaining 1/7.
 daemon.err
 install-elevated.ps1
-__pycache__/
-*.pyc
-.venv
-.venv-dev
+target

@@ -1,0 +1,49 @@
+[package]
+name = "airc-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Long-running daemon runtime: IPC accept loop + per-wire substrate
+# state. The typed IPC contract/client live in `airc-ipc`; this crate
+# only hosts the daemon process and dispatches requests.
+#
+# Split out from `airc-cli` per the operating doc's needed crate
+# layout (grievance §5: CLI/Daemon Accumulating Policy → airc-cli
+# is the client, airc-daemon is the runtime).
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-bus = { path = "../airc-bus" }
+airc-core = { path = "../airc-core" }
+airc-diagnostics = { path = "../airc-diagnostics" }
+airc-identity = { path = "../airc-identity" }
+airc-ipc = { path = "../airc-ipc" }
+airc-protocol = { path = "../airc-protocol" }
+airc-store = { path = "../airc-store" }
+airc-transport = { path = "../airc-transport" }
+airc-trust = { path = "../airc-trust" }
+airc-wire = { path = "../airc-wire" }
+
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+fs2 = "0.4"
+uuid = { version = "1", features = ["v4", "v5"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+# airc-work supplies the WorkEvent codec for the daemon's
+# cross-IPC propagation proof (`work_event_propagation_proof.rs`,
+# card 28c89065 invariant (c)). Dev-only: the daemon itself stays
+# work-domain agnostic — payloads are opaque to the router.
+airc-work = { path = "../airc-work" }
+tempfile = "3"
+# `start_paused` time-control for the route_refresh scheduling tests
+# (card 625abe6d slice 2) — dev-only; the daemon itself runs on the
+# real clock.
+tokio = { version = "1", features = ["test-util"] }

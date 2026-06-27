@@ -9,7 +9,7 @@
 #
 # What it does:
 #   1. Runs install.sh if airc isn't already on PATH (handles prereqs +
-#      symlinks the binary into ~/.local/bin).
+#      puts ~/.airc/src/airc on PATH).
 #   2. Runs `airc doctor --connect` to verify the env can pair (catches
 #      Tailscale-down / gh-missing / network-out before they silently fail).
 #   3. Walks gh auth if not already done.
@@ -38,25 +38,67 @@ if ! command -v airc >/dev/null 2>&1; then
   step "airc not on PATH -- running installer (canary channel)"
   curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/canary/install.sh | bash
   # Pick up the freshly-installed binary in this same session.
-  export PATH="$HOME/.local/bin:$PATH"
+  export PATH="$HOME/.airc/src:$PATH"
   if ! command -v airc >/dev/null 2>&1; then
-    die "airc still not on PATH after install. Add ~/.local/bin to PATH and re-run."
+    die "airc still not on PATH after install. Add ~/.airc/src to PATH and re-run."
   fi
   ok "airc installed: $(command -v airc)"
 else
   ok "airc already on PATH: $(command -v airc)"
 fi
 
-# 2. pre-flight (catches Tailscale-down, gh-missing, network-out, etc.)
-step "Pre-flight: airc doctor --connect"
-if ! airc doctor --connect; then
+# 2. pre-flight (live route/process state — catches daemon/route issues
+#    before join). The rust-rewrite `airc doctor` exposes `--health` for
+#    this; the old `--connect` flag no longer exists and made this
+#    pre-flight hard-fail on every fresh rust install. Fixed 2026-06-13.
+step "Pre-flight: airc doctor --health"
+if ! airc doctor --health; then
   die "Pre-flight failed. Fix the items above, then re-run this script."
 fi
 
-# 3. gh auth if needed
+# 3. gh auth if needed. Match install.sh's invocation exactly:
+#    -h github.com pins the host (avoids the interactive host picker),
+#    -s gist requests the scope the substrate needs. After a successful
+#    login, wire gh's token into git's credential helper so gist
+#    fetch/push (airc's rendezvous hot path) doesn't pop a password
+#    prompt on every op. Without setup-git, auth-after-install left the
+#    helper unwired — caught live on Windows 2026-06-13.
 if ! gh auth status >/dev/null 2>&1; then
   step "Authenticating gh (need 'gist' scope for room substrate)"
-  gh auth login -s gist
+  gh auth login -h github.com -s gist
+fi
+# Idempotent (no-op if already configured); safe to always run.
+if ! git config --global --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then
+  gh auth setup-git 2>/dev/null && ok "gh token wired into git credential helper" || true
+fi
+
+# 3b. Git author identity. install.sh sets this too, but on the bootstrap
+# path install.sh runs BEFORE gh auth (non-TTY curl|bash), so its
+# identity block is skipped — and without this the first agent commit
+# dies with "Author identity unknown". Derive from the authenticated gh
+# account when unset; never clobber an identity the user already set.
+# Public email, else the <id>+<login> noreply alias. No hardcoded values.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  _need_name=0; _need_email=0
+  if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
+  if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
+  if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
+    _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
+    _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+    _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
+    _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
+    if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
+      _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
+    fi
+    if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
+      git config --global user.name "$_gh_name"
+      ok "git user.name set from gh: $_gh_name"
+    fi
+    if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
+      git config --global user.email "$_gh_email"
+      ok "git user.email set from gh: $_gh_email"
+    fi
+  fi
 fi
 
 # 4. join the room

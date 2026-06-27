@@ -1,0 +1,28 @@
+[package]
+name = "airc-diagnostics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Typed operational diagnostics for AIRC substrate components.
+# This crate is the boundary between protocol/runtime state and
+# terminal logging. Libraries emit structured DiagnosticEvents; CLI or
+# daemon hosts decide whether those become stderr JSONL, an ORM row, an
+# AIRC event, or a test assertion.
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `probe!` / `time_probe!` expand to `tracing` events/spans so they
+# inherit tracing's build-time level gating (zero-cost when filtered
+# out) and compose with the fmt/bus subscribers hosts already install.
+tracing = "0.1"
+
+[dev-dependencies]
+# Capturing subscriber for the probe-macro tests (renders events to an
+# in-memory buffer we assert on).
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

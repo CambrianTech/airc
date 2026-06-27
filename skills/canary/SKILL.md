@@ -1,6 +1,6 @@
 ---
 name: airc:canary
-description: Switch this airc install to the canary channel — pre-merge features queued for the next main release. Use when Joel asks you to test something that hasn't landed on main yet, or when you want the bleeding edge.
+description: "⚠️ Not available in rust-rewrite: channel switching is not a CLI verb. There is no `airc canary` and `airc update` has no `--channel` flag. Switch the install checkout's git branch manually if you need canary."
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
@@ -8,56 +8,41 @@ argument-hint: ""
 
 # airc canary
 
+> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
+> command). There is no `airc canary` verb, and `airc update` has **no `--channel`
+> flag** — channel switching is not a CLI operation in the rust-rewrite. `airc update`
+> simply fast-forwards the installed source checkout on whatever branch it is on and
+> refreshes the binary + skills.
+
 Run this yourself — don't ask the user.
-
-## What it does
-
-Switches this airc install to the `canary` channel. Under the covers:
-- `git fetch origin canary`
-- `git checkout canary`
-- `git pull --ff-only`
-- Refreshes skills + binary symlinks via `install.sh`
-- Persists the choice to `$AIRC_DIR/.channel` so subsequent `airc update` (no args) stays on canary
-
-## Execute
-
-```bash
-airc canary
-```
-
-Equivalent to `airc update --channel canary`. The shortcut exists because "go canary" is the common case for pre-merge testing.
 
 ## What "canary" means
 
 | Channel | What it is | When to use |
 |---|---|---|
 | `main` | Stable. Most users run this. | Default. |
-| `canary` | Long-lived branch ahead of main. Features that haven't been merged to main yet land here first; we test on canary, then promote canary→main as a single integration commit. | When testing a not-yet-merged feature, OR when you want bleeding edge. |
+| `canary` | Long-lived branch ahead of main: features land here first, then promote canary→main as a single integration commit. | Testing a not-yet-merged feature, or you want bleeding edge. |
 
-`canary` is just a git branch. Switching back is symmetric: `airc update --channel main` (or `airc channel main && airc update`).
+`canary` is just a git branch in the install checkout. Because there is no
+channel-switch verb, moving between branches has to be done in that checkout directly
+(then re-run `airc update` to rebuild + refresh skills), and is outside the supported
+`airc` command surface for now.
 
-## Rollback
+## Nearest real path
 
-If canary breaks something:
+`airc update` (alias `airc upgrade` / `airc pull`) fast-forwards the current branch
+and refreshes the binary + skills. To validate canary code you would point the install
+checkout at the canary branch yourself, then:
 
 ```bash
-airc update --channel main
-airc join
+airc update
 ```
 
-That's it. Branch switch + restart monitor on the new code. Identity, peers, room state all persist (they're in `$AIRC_HOME`, not `$AIRC_DIR`).
-
-## After switching
-
-Tell the user:
-
-> "Switched to canary (sha `<short-sha>`). Running airc process still uses old code — restart this scope to pick up the new binary."
-
-Then if they had a paired session you should restart the current scope for them.
+Then restart this scope so the running daemon picks up the new binary:
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 
 Codex / non-Monitor runtimes:
@@ -65,19 +50,12 @@ Codex / non-Monitor runtimes:
 airc join
 ```
 
-## When to use this skill
+## When this comes up
 
-- Joel says "test the canary" / "try the new substrate work" / similar.
-- A new feature is queued in canary and bigmama / memento / anvil need to validate before promotion.
-- The user mentions a recent merged-to-canary PR by number (e.g. "test PR #40").
-
-## When NOT to use this skill
-
-- For routine updates → use `/airc:update` (stays on whatever channel they're on; doesn't switch).
-- For first-time install → use `/airc:join` which auto-installs main.
+- Joel says "test the canary" / "try the new substrate work". Tell him channel switching isn't a CLI verb in the rust-rewrite; the install checkout's branch has to be moved manually, then `airc update`.
+- For routine updates on the current branch → use `/airc:update`.
 
 ## Notes
 
-- This is not "experimental beta channel" — canary is "merged-but-not-yet-promoted." Code on canary has passed local tests + the contributor's review; it just hasn't earned its way to main yet via cross-machine validation.
-- Channel preference lives in `$AIRC_DIR/.channel`. Inspect with `airc channel`.
-- If `gh auth status` is clean, the substrate (`airc join` zero-arg → #general) works exactly the same on canary as on main — channels affect the airc binary, not the gist namespace.
+- Identity, peers, and room state persist across an update (they're in `$AIRC_HOME`, not the install dir).
+- Do not invent `airc update --channel ...` or `airc channel ...` — neither exists in the rust-rewrite.

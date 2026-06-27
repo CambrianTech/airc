@@ -1,0 +1,53 @@
+name: runtime-guards
+
+# Fast guardrail for non-crate runtime changes on rust-rewrite PRs.
+# The full clean-install workflow is intentionally heavier and still
+# gates canary/main. This workflow prevents runtime migration slices from
+# reintroducing the deleted Python layer.
+
+on:
+  pull_request:
+    branches: [rust-rewrite, canary, main]
+    paths:
+      - "airc"
+      - "airc.shim"
+      - "install.sh"
+      - "uninstall.sh"
+      - "lib/airc_bash/**"
+      - "test/public_installed_runtime_proof.sh"
+      - "test/rust_cutover_guard.sh"
+      - "test/rust_quality_guard.sh"
+      - "docker/mesh-converge.sh"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/runtime-guards.yml"
+  push:
+    branches: [rust-rewrite, canary, main]
+    paths:
+      - "airc"
+      - "airc.shim"
+      - "install.sh"
+      - "uninstall.sh"
+      - "lib/airc_bash/**"
+      - "test/public_installed_runtime_proof.sh"
+      - "test/rust_cutover_guard.sh"
+      - "test/rust_quality_guard.sh"
+      - "docker/mesh-converge.sh"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/runtime-guards.yml"
+
+jobs:
+  shell-and-cutover:
+    name: shell syntax + rust cutover guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell syntax
+        run: bash -n install.sh uninstall.sh docker/mesh-converge.sh
+      - name: Rust cutover guards
+        run: bash test/rust_cutover_guard.sh
+      - name: Rust quality guards
+        run: bash test/rust_quality_guard.sh
+      - name: Public installed runtime proof
+        run: |
+          cargo build --manifest-path Cargo.toml -p airc-cli
+          AIRC_BIN="$PWD/target/debug/airc" AIRC_EXPECT_BIN="$PWD/target/debug/airc" bash test/public_installed_runtime_proof.sh

@@ -1,0 +1,570 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
+};
+use airc_protocol::{Frame, Subscription};
+use airc_transport::{SignedTransport, Transport};
+use futures::stream::StreamExt;
+use tokio::sync::oneshot;
+
+use crate::error::AircError;
+use crate::Airc;
+
+pub(crate) struct IngestTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IngestTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for IngestTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+pub(crate) struct FrameSubscriber {
+    /// Owns the ingest task; dropping aborts it instead of
+    /// detaching background work from the SDK handle lifecycle.
+    pub(crate) _task: IngestTask,
+}
+
+impl Airc {
+    pub(crate) async fn ensure_lan_subscriber(&self) -> Result<(), AircError> {
+        {
+            let subscriber = self.inner.lan_subscriber.lock().await;
+            if subscriber.is_some() {
+                return Ok(());
+            }
+        }
+
+        let adapter = self.lan_adapter().await?;
+        let transport = SignedTransport::new(
+            adapter,
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: None,
+            ..Default::default()
+        };
+        let stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscriber = self.inner.lan_subscriber.lock().await;
+        if subscriber.is_some() {
+            return Ok(());
+        }
+
+        let task = self.spawn_frame_ingest(stream, None, None);
+        *subscriber = Some(FrameSubscriber { _task: task });
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_relay_subscriber(&self) -> Result<(), AircError> {
+        {
+            let subscriber = self.inner.relay_subscriber.lock().await;
+            if subscriber.is_some() {
+                return Ok(());
+            }
+        }
+
+        let adapter = self.relay_adapter().await?;
+        let transport = SignedTransport::new(
+            adapter,
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: None,
+            ..Default::default()
+        };
+        let stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscriber = self.inner.relay_subscriber.lock().await;
+        if subscriber.is_some() {
+            return Ok(());
+        }
+
+        let task = self.spawn_frame_ingest(stream, None, None);
+        *subscriber = Some(FrameSubscriber { _task: task });
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_udp_subscriber(&self) -> Result<(), AircError> {
+        {
+            let subscriber = self.inner.udp_subscriber.lock().await;
+            if subscriber.is_some() {
+                return Ok(());
+            }
+        }
+
+        let adapter = self.udp_adapter().await?;
+        let transport = SignedTransport::new(
+            adapter,
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: None,
+            ..Default::default()
+        };
+        let stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscriber = self.inner.udp_subscriber.lock().await;
+        if subscriber.is_some() {
+            return Ok(());
+        }
+
+        let task = self.spawn_frame_ingest(stream, None, None);
+        *subscriber = Some(FrameSubscriber { _task: task });
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_webrtc_subscriber(
+        &self,
+        peer_id: airc_core::PeerId,
+    ) -> Result<(), AircError> {
+        {
+            let subscribers = self.inner.webrtc_subscribers.lock().await;
+            if subscribers.contains_key(&peer_id) {
+                return Ok(());
+            }
+        }
+
+        let adapter = self.webrtc_adapter_for(peer_id).await?;
+        let transport = SignedTransport::new(
+            adapter,
+            self.inner.identity.keypair.clone(),
+            self.inner.identity.peer_id,
+            self.inner.registry.clone(),
+            self.inner.policy,
+        );
+        let subscription = Subscription {
+            from_cursor: None,
+            ..Default::default()
+        };
+        let stream = transport
+            .subscribe(subscription)
+            .await
+            .map_err(|e| AircError::Transport(e.to_string()))?;
+
+        let mut subscribers = self.inner.webrtc_subscribers.lock().await;
+        if subscribers.contains_key(&peer_id) {
+            return Ok(());
+        }
+
+        let task = self.spawn_frame_ingest(stream, None, None);
+        subscribers.insert(peer_id, FrameSubscriber { _task: task });
+        Ok(())
+    }
+
+    /// Spawn the ingest task for a subscription stream.
+    ///
+    /// - `wire_for_lifecycle = Some(path)` opts the task into
+    ///   `WireLost` emission when the stream ends or the shutdown
+    ///   signal fires. Pass `None` for streams that don't represent
+    ///   a single wire (LAN sweep), since those have no canonical
+    ///   wire path to attach the lifecycle event to.
+    /// - `shutdown` is consumed; when the corresponding `Sender` is
+    ///   dropped or signalled, the task exits with
+    ///   `reason="teardown"`. Pass `None` for streams without an
+    ///   explicit teardown handle.
+    fn spawn_frame_ingest<E>(
+        &self,
+        mut stream: airc_transport::FrameStream<E>,
+        wire_for_lifecycle: Option<PathBuf>,
+        shutdown: Option<oneshot::Receiver<()>>,
+    ) -> IngestTask
+    where
+        E: std::fmt::Display + Send + 'static,
+    {
+        let airc = self.clone();
+        IngestTask::new(tokio::spawn(async move {
+            let reason: &'static str = match shutdown {
+                Some(mut shutdown_rx) => loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => break "teardown",
+                        item = stream.next() => match item {
+                            Some(Ok(frame)) => airc.append_received_frame(frame).await,
+                            Some(Err(verify_err)) => {
+                                airc.warn_frame_verify_failed(&verify_err);
+                            }
+                            None => break "stream_ended",
+                        }
+                    }
+                },
+                None => loop {
+                    match stream.next().await {
+                        Some(Ok(frame)) => airc.append_received_frame(frame).await,
+                        Some(Err(verify_err)) => {
+                            airc.warn_frame_verify_failed(&verify_err);
+                        }
+                        None => break "stream_ended",
+                    }
+                },
+            };
+            if let Some(wire) = wire_for_lifecycle {
+                if let Err(err) = airc.emit_wire_lost(&wire, reason).await {
+                    StderrJsonDiagnosticSink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::WireLostEmitFailed,
+                            "wire_lost lifecycle emit failed",
+                        )
+                        .with_field("wire", wire.display())
+                        .with_field("reason", reason)
+                        .with_field("error", err),
+                    );
+                }
+            }
+        }))
+    }
+
+    async fn emit_wire_lost(&self, wire: &Path, reason: &str) -> Result<(), AircError> {
+        // Resolve channel/room_id the same way `emit_wire_established`
+        // does — by matching the wire against the current
+        // subscription set. If the subscription row has already
+        // been removed (e.g. by a future `part` flow that races
+        // teardown), the emit silently no-ops; consumers see only
+        // `WireEstablished` without a matching `WireLost`, which is
+        // correct because no room exists for the event to belong to.
+        let subs = self.subscriptions().await?;
+        let canon = wire.canonicalize().ok();
+        let matched = subs.into_iter().find(|s| {
+            if let Some(canon) = canon.as_ref() {
+                s.wire.canonicalize().ok().as_ref() == Some(canon)
+            } else {
+                s.wire == wire
+            }
+        });
+        let Some(sub) = matched else {
+            return Ok(());
+        };
+        let room_id = sub.room_id;
+        let body = airc_core::Body::Json(
+            serde_json::to_value(crate::lifecycle::WireLostBody {
+                wire: wire.display().to_string(),
+                reason: reason.to_string(),
+            })
+            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
+        );
+        self.emit_lifecycle(airc_core::TranscriptKind::WireLost, room_id, body)
+            .await
+    }
+
+    pub(crate) async fn append_received_frame(&self, frame: Frame) {
+        // Card 39d37629: delivery-ack responses are receipts, not
+        // transcript content — intercept them ahead of persistence
+        // and hand them to in-process `send_with_delivery_ack`
+        // waiters. Old peers never request acks, so they never see
+        // these frames at all.
+        if let Some(ack) = airc_protocol::decode_delivery_ack(&frame) {
+            let _ = self.inner.ack_tx.send(ack);
+            return;
+        }
+        let ack_requested = airc_protocol::wants_delivery_ack(&frame);
+        // Card 1998f6cb: the ack must travel back over the LINK the
+        // frame arrived on. For a point-to-point send the link peer IS
+        // `envelope.sender`; for a daemon-forwarded routed frame the
+        // sender is a remote scope identity with no connection here —
+        // the link peer is the forwarding daemon, which re-signed the
+        // envelope. The verified signer therefore identifies the link
+        // origin in both shapes (the TLS connection is keyed by it).
+        let ack_origin = link_origin(&frame);
+        let frame_channel = frame.envelope.channel;
+        let frame_cursor = airc_core::TranscriptCursor {
+            lamport: frame.envelope.lamport,
+            event_id: frame.envelope.event_id,
+        };
+
+        // Card 4132f48c: daemon-host mode. When an inbound sink is
+        // installed, the machine's owner-core router — the transcript
+        // every attached scope reads — owns delivery. Persisting into
+        // this handle's scope store instead is exactly the store-split
+        // bug (durable in `~/.airc` events, invisible to every operator
+        // scope), so the sink REPLACES the store append; its verdict is
+        // the persistence decision the delivery ack reports. The sink
+        // is idempotent on event_id (router-level recent-ids window +
+        // durable-tier probe), so a frame arriving on both the daemon's
+        // listener and dialer handles delivers exactly once.
+        if let Some(sink) = self.inbound_frame_sink() {
+            let verdict = sink.deliver(&frame).await;
+            let event_id = frame.envelope.event_id;
+            match verdict {
+                crate::router_bridge::InboundDeliveryVerdict::Delivered => {
+                    // In-process fan-out for any subscriber of THIS
+                    // handle, ring-deduped exactly like the store path.
+                    let event = frame.into_transcript_event();
+                    if self.mark_broadcast(event_id) {
+                        let _ = self.inner.live_tx.send(Arc::new(event));
+                    }
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Delivered {
+                                channel: frame_channel,
+                                cursor: frame_cursor,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                crate::router_bridge::InboundDeliveryVerdict::UnknownChannel => {
+                    // Loud regardless of whether an ack was requested —
+                    // a durable frame no scope will surface is the
+                    // silent-drop class this card closes.
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "inbound frame routed to the machine transcript, but no scope \
+                             on this machine has the channel bound — no transcript surface \
+                             will show it",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::UnknownChannel.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("channel", frame_channel)
+                        .with_field("persisted", true),
+                    );
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Undeliverable {
+                                reason: airc_protocol::UndeliverableReason::UnknownChannel,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                crate::router_bridge::InboundDeliveryVerdict::Failed(error) => {
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "inbound frame could not be delivered into the machine \
+                             transcript — undeliverable",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::PersistFailed.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("error", error),
+                    );
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Undeliverable {
+                                reason: airc_protocol::UndeliverableReason::PersistFailed,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            return;
+        }
+
+        let event = frame.into_transcript_event();
+        let event_id = event.event_id;
+        // The store dedups persistence by event_id —
+        // `DuplicateEventId` just means another writer already
+        // persisted this event. Two common cases:
+        //
+        // 1. SELF: this process sent via `append_sent_frame` (which
+        //    already persisted + already broadcast). The wire
+        //    subscriber re-reads the same frame ~50ms later. The
+        //    `recently_broadcast` ring tells us this event_id was
+        //    already fanned out in-process — skip to avoid
+        //    double-delivery to local subscribers.
+        //
+        // 2. CROSS-PROCESS SAME HOME: another scope on the same
+        //    `~/.airc/` wrote the frame via its own
+        //    `append_sent_frame`. Our store sees DuplicateEventId
+        //    because the file is shared (SQLite WAL). The ring is
+        //    EMPTY for this event_id in our process — so we DO fan
+        //    out. That's how Claude and Codex talking on the same
+        //    HOME actually deliver to each other's subscribers.
+        //
+        // Card 127816bd Phase 1.C: ring-check first so case 1 (self
+        // echo) skips the redundant `store.append`. Saves one full
+        // SQLite append + fsync per locally-sent message OFF the
+        // wire-tail task — not on the `.say()` critical path (the
+        // wire tail is async) but still wasted work that contends
+        // for the DB connection with subsequent sends.
+        if !self.mark_broadcast(event_id) {
+            // Already broadcast in-process ⇒ already persisted; an
+            // ack-requesting duplicate still deserves its receipt.
+            if ack_requested {
+                self.conclude_delivery_ack(ack_origin, event_id, frame_channel, frame_cursor)
+                    .await;
+            }
+            return;
+        }
+        match self.inner.store.append(event.clone()).await {
+            Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                let _ = self.inner.live_tx.send(Arc::new(event));
+                // Card 39d37629: the receipt fires only AFTER the
+                // append committed (or was already durable) — never
+                // on mere transport accept.
+                if ack_requested {
+                    self.conclude_delivery_ack(ack_origin, event_id, frame_channel, frame_cursor)
+                        .await;
+                }
+            }
+            Err(err) => {
+                self.emit_diag(
+                    DiagnosticEvent::error(
+                        DiagnosticComponent::Subscriber,
+                        DiagnosticCode::StoreAppendFailed,
+                        "subscriber store append failed",
+                    )
+                    .with_field("event_id", event_id)
+                    .with_field("error", &err),
+                );
+                if ack_requested {
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "accepted frame could not be persisted — undeliverable",
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::PersistFailed.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("error", err),
+                    );
+                    self.respond_delivery_ack(
+                        ack_origin,
+                        event_id,
+                        frame_channel,
+                        airc_protocol::DeliveryOutcome::Undeliverable {
+                            reason: airc_protocol::UndeliverableReason::PersistFailed,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    fn warn_frame_verify_failed(&self, error: &impl std::fmt::Display) {
+        // Card 39d37629: this used to be gated behind AIRC_REPLAY_WARN
+        // — a live frame failing verification was a SILENT drop. The
+        // subscriber streams here carry live frames (from_cursor:
+        // None, no replay backlog), so every failure is a frame a
+        // sender believes was sent. Loud, always; the dedicated
+        // Malformed/UnverifiableReplayFrameSkipped codes still cover
+        // the replay path separately.
+        self.emit_diag(
+            DiagnosticEvent::warn(
+                DiagnosticComponent::Subscriber,
+                DiagnosticCode::FrameUndeliverable,
+                "subscriber frame verification failed — frame dropped",
+            )
+            .with_field(
+                "reason",
+                airc_protocol::UndeliverableReason::VerificationFailed.as_str(),
+            )
+            .with_field("error", error),
+        );
+    }
+}
+
+/// Card 1998f6cb: the LAN-link peer a verified inbound frame came
+/// from. The connection (and the ack return path) is keyed by the
+/// peer whose key signed the frame: a scope's own point-to-point
+/// send is signed by the scope (signer == sender == link peer),
+/// while a daemon-routed forward is re-signed by the forwarding
+/// daemon (signer == link peer != sender). Unsigned frames (dev
+/// policy / in-process tests) fall back to `sender`. Shared by the
+/// ack return path and the inbound bridge's loop-prevention origin.
+pub(crate) fn link_origin(frame: &Frame) -> airc_core::PeerId {
+    match frame.envelope.signature {
+        airc_protocol::Signature::Ed25519 { signer, .. } => signer,
+        airc_protocol::Signature::Unsigned => frame.envelope.sender,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::IngestTask;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_task_aborts_underlying_task_on_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_task = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = IngestTask::new(tokio::spawn(async move {
+            let _guard = DropFlag(dropped_by_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx
+            .await
+            .expect("spawned ingest task should start before drop assertion");
+
+        drop(task);
+
+        for _ in 0..20 {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping IngestTask must abort and drop the spawned future"
+        );
+    }
+}

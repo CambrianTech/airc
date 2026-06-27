@@ -37,13 +37,13 @@ airc daemon install       # via Bash; launchd (mac) / systemd-user (linux)
 | `/doctor [scenario]` | Environment health check (gh + sshd + ports) + integration suite + auto-fix |
 | `/tests [scenario]` | Pure test runner (alias for the test path of /doctor) |
 | `/teardown [--flush]` | Kill THIS scope's airc processes (add `--flush` to also wipe state) |
-| `/repair [invite]` | **Nuclear re-pair** — `teardown --flush` + reconnect. Use when sends mysteriously don't reach anyone. |
+| `/repair [invite]` | **Re-pair** — `airc stop` then re-join. Use when sends mysteriously don't reach anyone. |
 | `/status [--probe]` | Liveness view: monitor, queue, last send/recv, `--probe` does a fast auth check |
 | `/canary` | Switch to canary release channel (opt-in pre-merge testing) |
 
 ## Common failure + fix
 
-If your mesh mysteriously goes quiet (no messages from peers, your sends seem to succeed but nobody responds), 90% of the time the cause is stale auth or port collision with another host on the same machine. Run `/repair` (optionally with a fresh invite string from the host). Don't iterate through `/teardown` + `/connect` — that sequence without `--flush` is specifically the path that silently leaves you broken.
+If your mesh mysteriously goes quiet (no messages from peers, your sends seem to succeed but nobody responds), 90% of the time the cause is stale auth or port collision with another host on the same machine. Run `/repair` (optionally with a fresh invite string from the host) — it stops this scope's daemon and re-joins cleanly. Don't hand-iterate stop/join yourself.
 
 ## Manual Bash usage
 
@@ -56,4 +56,4 @@ Bash("airc msg @peerName 'message here'")
 
 ## Scope isolation
 
-Multiple Claude tabs can each run `/connect` in different `AIRC_HOME` dirs — `airc teardown` only kills its own scope's processes. Validated by `/doctor`.
+Multiple Claude tabs can each run `/join` in different `AIRC_HOME` dirs — `airc stop` only kills its own scope's daemon. Validated by `/doctor`.

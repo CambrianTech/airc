@@ -6,9 +6,10 @@ name: ci
 #   clean-install-macos   macos install.sh + airc doctor + smoke test
 #   clean-install-windows windows install.ps1 + airc doctor (PS-side)
 #
-# Plus on canary/main only (skipped on PR): integration-suite runs the
-# full test/integration.sh on ubuntu — the most thorough gate, but
-# expensive (real gh-gist scenarios + ~5min runtime).
+# Integration coverage now lives in the Rust suite: the per-crate
+# `crates/*/tests/` integration tests run under the `cargo test` jobs on
+# every PR + push. The old bash `test/integration.sh` gate was deleted
+# in the Rust cutover (#1173, demolition #864); its job is gone too.
 #
 # The clean-install jobs are the "guarantee installs work from zero"
 # gate Joel asked for (2026-04-28). They run on a stock runner image
@@ -44,58 +45,72 @@ jobs:
         # Override AIRC_DIR + skip the clone step by pre-populating
         # the source tree, then run install.sh's PATH/skills wiring.
         run: |
-          mkdir -p $HOME/.airc-src
-          cp -r . $HOME/.airc-src/
+          mkdir -p $HOME/.airc/src
+          cp -r . $HOME/.airc/src/
           # Real install — no AIRC_SKIP_PREREQS. install.sh must
           # detect the package manager and install everything missing.
-          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc/src bash install.sh
 
       - name: airc doctor (must report environment-clean)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           which airc
+          test "$(which airc)" = "$HOME/.local/bin/airc"
+          airc version
+          test ! -e "$HOME/.local/bin/airc-core"
           airc doctor
 
-      - name: Smoke — connect --no-room --no-gist + teardown
+      - name: Public installed runtime proof
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          AIRC_EXPECT_BIN="$HOME/.local/bin/airc" bash "$HOME/.airc/src/test/public_installed_runtime_proof.sh"
+
+      - name: Smoke — daemon host loop up + stop teardown
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           export AIRC_HOME=/tmp/ci-airc/state
           export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
+          # Offline gate — the old smoke used `--no-gist`; AIRC_DISABLE_ACCOUNT_REGISTRY
+          # is its real equivalent (blocks the gh/gist transport), so the
+          # daemon never reaches for gh on a runner with no auth.
+          export AIRC_DISABLE_ACCOUNT_REGISTRY=1
           mkdir -p /tmp/ci-airc/state
-          # Spawn host in background. --no-gist keeps it offline.
-          airc connect --no-room --no-gist > /tmp/ci-airc/host.log 2>&1 &
-          # Wait up to 10s for airc.pid to appear (airc writes it once
-          # the host loop is up). Don't pgrep on argv — airc's actual
-          # process line is `bash /path/to/airc connect ...` and pgrep
-          # patterns are brittle across distros.
+          # Spawn the foreground host loop in the background. The env
+          # above keeps it offline (no general join, no gist, no identity
+          # prompt). `connect`/`teardown` were legacy Python verbs removed
+          # in the rust rewrite — the real verbs are `daemon` (start the
+          # host loop) and `stop` (graceful shutdown).
+          airc daemon > /tmp/ci-airc/host.log 2>&1 &
+          # Wait up to 10s for the daemon pidfile to appear (the daemon
+          # writes <home>/daemon.pid once its bind guard is up). Don't
+          # pgrep on argv — process lines are brittle across distros.
           for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ -f /tmp/ci-airc/state/airc.pid ] && break
+            [ -f /tmp/ci-airc/state/daemon.pid ] && break
             sleep 1
           done
-          if [ ! -f /tmp/ci-airc/state/airc.pid ]; then
-            echo "FAIL: airc.pid never appeared — connect didn't reach host loop"
+          if [ ! -f /tmp/ci-airc/state/daemon.pid ]; then
+            echo "FAIL: daemon.pid never appeared — airc daemon didn't reach host loop"
             cat /tmp/ci-airc/host.log || true
             exit 1
           fi
-          # Verify all PIDs in airc.pid are alive.
-          for p in $(cat /tmp/ci-airc/state/airc.pid); do
+          # Verify all PIDs in daemon.pid are alive.
+          for p in $(cat /tmp/ci-airc/state/daemon.pid); do
             if ! kill -0 "$p" 2>/dev/null; then
-              echo "FAIL: PID $p in airc.pid is not alive"
+              echo "FAIL: PID $p in daemon.pid is not alive"
               cat /tmp/ci-airc/host.log || true
               exit 1
             fi
           done
-          echo "✓ airc connect stayed up (pids: $(cat /tmp/ci-airc/state/airc.pid))"
-          airc teardown
+          echo "✓ airc daemon stayed up (pids: $(cat /tmp/ci-airc/state/daemon.pid))"
+          airc stop
           sleep 1
-          # After teardown, airc.pid is removed AND no PID from it should
-          # still be alive. We saved the pids before teardown for the
-          # post-check.
-          if [ -f /tmp/ci-airc/state/airc.pid ]; then
-            echo "FAIL: airc teardown left airc.pid behind"
+          # The daemon removes daemon.pid on graceful exit (PidFileGuard
+          # Drop). If it lingers, stop didn't reach the host loop.
+          if [ -f /tmp/ci-airc/state/daemon.pid ]; then
+            echo "FAIL: airc stop left daemon.pid behind"
             exit 1
           fi
-          echo "✓ airc teardown clean"
+          echo "✓ airc stop clean"
 
   clean-install-macos:
     runs-on: macos-latest
@@ -105,47 +120,59 @@ jobs:
 
       - name: Stage install.sh + run (no skip-prereqs — real install path)
         run: |
-          mkdir -p $HOME/.airc-src
-          cp -r . $HOME/.airc-src/
-          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
+          mkdir -p $HOME/.airc/src
+          cp -r . $HOME/.airc/src/
+          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc/src bash install.sh
 
       - name: airc doctor (must report environment-clean)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           which airc
+          test "$(which airc)" = "$HOME/.local/bin/airc"
+          airc version
+          test ! -e "$HOME/.local/bin/airc-core"
           airc doctor
 
-      - name: Smoke — same as linux (airc.pid based)
+      - name: Public installed runtime proof
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          AIRC_EXPECT_BIN="$HOME/.local/bin/airc" bash "$HOME/.airc/src/test/public_installed_runtime_proof.sh"
+
+      - name: Smoke — same as linux (daemon.pid based)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           export AIRC_HOME=/tmp/ci-airc/state
           export AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1
+          # Offline gate — the old smoke used `--no-gist`; AIRC_DISABLE_ACCOUNT_REGISTRY
+          # is its real equivalent (blocks the gh/gist transport), so the
+          # daemon never reaches for gh on a runner with no auth.
+          export AIRC_DISABLE_ACCOUNT_REGISTRY=1
           mkdir -p /tmp/ci-airc/state
-          airc connect --no-room --no-gist > /tmp/ci-airc/host.log 2>&1 &
+          airc daemon > /tmp/ci-airc/host.log 2>&1 &
           for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ -f /tmp/ci-airc/state/airc.pid ] && break
+            [ -f /tmp/ci-airc/state/daemon.pid ] && break
             sleep 1
           done
-          if [ ! -f /tmp/ci-airc/state/airc.pid ]; then
-            echo "FAIL: airc.pid never appeared — connect didn't reach host loop"
+          if [ ! -f /tmp/ci-airc/state/daemon.pid ]; then
+            echo "FAIL: daemon.pid never appeared — airc daemon didn't reach host loop"
             cat /tmp/ci-airc/host.log || true
             exit 1
           fi
-          for p in $(cat /tmp/ci-airc/state/airc.pid); do
+          for p in $(cat /tmp/ci-airc/state/daemon.pid); do
             if ! kill -0 "$p" 2>/dev/null; then
-              echo "FAIL: PID $p in airc.pid is not alive"
+              echo "FAIL: PID $p in daemon.pid is not alive"
               cat /tmp/ci-airc/host.log || true
               exit 1
             fi
           done
-          echo "✓ airc connect stayed up (pids: $(cat /tmp/ci-airc/state/airc.pid))"
-          airc teardown
+          echo "✓ airc daemon stayed up (pids: $(cat /tmp/ci-airc/state/daemon.pid))"
+          airc stop
           sleep 1
-          if [ -f /tmp/ci-airc/state/airc.pid ]; then
-            echo "FAIL: airc teardown left airc.pid behind"
+          if [ -f /tmp/ci-airc/state/daemon.pid ]; then
+            echo "FAIL: airc stop left daemon.pid behind"
             exit 1
           fi
-          echo "✓ airc teardown clean"
+          echo "✓ airc stop clean"
 
   clean-install-windows:
     runs-on: windows-latest
@@ -156,7 +183,7 @@ jobs:
       - name: Run install.ps1 (no skip — real install path via winget)
         shell: pwsh
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc-src"
+          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src"
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           # install.ps1 must work from default Windows PowerShell 5.1
@@ -189,33 +216,7 @@ jobs:
       - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc-src-ps5"
+          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src-ps5"
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           & "$env:AIRC_DIR\install.ps1"
-
-  integration-suite:
-    # Heavy gate: the full test/integration.sh, including scenarios that
-    # hit real gh-gists. Runs on canary/main pushes, NOT on PRs (rate
-    # limits + flaky network). When canary→main bundle PRs come up, this
-    # already-green status on the canary tip is the signal that cross-
-    # branch validation passed.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Stage + install (real install path)
-        run: |
-          mkdir -p $HOME/.airc-src
-          cp -r . $HOME/.airc-src/
-          AIRC_INSTALL_NO_PULL=1 AIRC_DIR=$HOME/.airc-src bash install.sh
-
-      - name: Run integration suite
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          # Tests that need real gists self-skip without gh auth. The
-          # remaining ~85% of the suite covers the local-only scenarios
-          # that catch the lion's share of regressions.
-          bash test/integration.sh

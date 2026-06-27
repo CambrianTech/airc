@@ -1,0 +1,86 @@
+name: auto-close-queue-cards
+
+# Auto-close airc-queue cards when their PR merges into canary.
+#
+# Why this exists (airc#576):
+#   GitHub's native "Closes #N" only triggers an issue auto-close when the
+#   PR merges into the DEFAULT branch (main). Our protected workflow
+#   (enforce-canary-staging.yml) requires PRs land in canary FIRST, then
+#   canary→main is promoted as a single integration commit later. That gap
+#   between canary-merge and main-promote leaves queue cards open for
+#   days — they look idle, get nudged, accumulate noise.
+#
+#   Codex called this out as the litter pattern: airc#571, airc#567, and
+#   continuum#1125 all sat open after their PR merged into canary and
+#   needed manual `gh issue close` cleanup.
+#
+# What it does:
+#   On PR merge into canary, parses the PR body for explicit queue-card
+#   closing refs (Closes/Fixes/Resolves #N, or owner/repo#N with the same
+#   closing keywords), verifies each is an airc-queue-card-v1 envelope,
+#   sets status=merged with a status-log line citing this PR + merge SHA,
+#   then closes the issue. Plain mentions ("Refs #N", "See #N") do not
+#   close cards; they may point at follow-up implementation work.
+#
+#   Runs `airc queue close-merged` from the checkout — no install
+#   step required because the `./airc` dispatcher works from a clone
+#   when gh + bash + the AIRC implementation binary are present (all on
+#   ubuntu-latest).
+#
+# Scope:
+#   - Same-repo only. Cross-repo refs (e.g. airc PR closing
+#     continuum#1130) are detected and reported in the workflow log
+#     but NOT closed — workflow GITHUB_TOKEN is repo-scoped. Cross-repo
+#     auto-close is a follow-up that needs an org-scoped token.
+#   - Idempotent. Already-merged cards skip silently. Cards without
+#     an envelope (loose #N references to non-queue issues) skip
+#     silently. Manual `gh issue close` remains the fallback.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [canary]
+
+# Multiple PRs may close in quick succession; run them serially so
+# status-log entries don't race on the same card (different PRs ideally
+# touch different cards, but a defensive serialize costs nothing).
+concurrency:
+  group: auto-close-queue-cards
+  cancel-in-progress: false
+
+jobs:
+  close-cards:
+    # Only fire on actual merge (not on close-without-merge).
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read
+
+    steps:
+      - name: Checkout (for the airc dispatcher)
+        uses: actions/checkout@v4
+
+      - name: Verify environment (gh + bash)
+        run: |
+          set -euo pipefail
+          which gh bash
+          gh --version | head -1
+          bash --version | head -1
+
+      - name: Run airc queue close-merged
+        env:
+          # gh uses GH_TOKEN; the workflow's GITHUB_TOKEN has issues:write
+          # (granted via the permissions block above) on THIS repo only.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Source identity: the actor field on status-log entries names
+          # the github-actions bot so the audit trail is clear that the
+          # card was closed by automation, not a person/AI.
+          ./airc queue close-merged \
+            "${{ github.event.pull_request.html_url }}" \
+            --merge-sha "${{ github.event.pull_request.merge_commit_sha }}" \
+            --actor "github-actions[airc#576]"

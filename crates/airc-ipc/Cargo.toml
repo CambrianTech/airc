@@ -1,0 +1,28 @@
+[package]
+name = "airc-ipc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Shared local IPC contract for the AIRC daemon. This crate owns the
+# typed request/response enums, length-framed codec, cross-platform
+# local IPC transport, and client. The daemon runtime depends on it;
+# consumer libraries can depend on it without importing daemon state.
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
+
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }

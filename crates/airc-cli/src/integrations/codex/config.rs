@@ -1,0 +1,223 @@
+//! Codex TOML config mutation for AIRC hook installation.
+
+use std::path::Path;
+
+use toml_edit::{value, DocumentMut, Item, Table};
+
+const INSTRUCTIONS_START: &str = "# AIRC-CODEX-INSTRUCTIONS-START";
+const INSTRUCTIONS_END: &str = "# AIRC-CODEX-INSTRUCTIONS-END";
+const MANAGED_DEVELOPER_INSTRUCTIONS: &str = r#"# AIRC-CODEX-INSTRUCTIONS-START - managed by airc codex-hook install-hooks; remove this section through AIRC-CODEX-INSTRUCTIONS-END to opt out
+developer_instructions = """
+AIRC Codex runtime contract:
+- Keep airc join running as this session's live AIRC feed when coordinating with peer agents.
+- If no live join session id is available during a turn, run airc codex-hook poll --wait-ms 1000 between tool steps. It is the bounded mid-turn feed and shares the same runtime cursor as the hook.
+- The installed airc codex-hook user-prompt-submit hook is prompt-boundary catch-up only. Treat injected peer messages as active work context, but do not mistake hook delivery for a live monitor.
+- Reply to direct peer questions with airc msg, not user-chat stdout. The peer sees AIRC, not this transcript.
+- Distinguish transport/process liveness from whether this Codex session has actually seen peer traffic.
+"""
+# AIRC-CODEX-INSTRUCTIONS-END
+"#;
+
+pub fn enable_hooks_feature(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    let without_legacy = remove_legacy_codex_hooks_key(&original)?;
+    let mut doc = parse_toml_document(&without_legacy)?;
+    let features = ensure_table(&mut doc, "features")?;
+    let already_enabled = features
+        .get("hooks")
+        .and_then(Item::as_bool)
+        .unwrap_or(false);
+    if !already_enabled {
+        features["hooks"] = value(true);
+    }
+    let rendered = doc.to_string();
+    if rendered != original {
+        write_text(path, &rendered)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn disable_managed_hooks_feature(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    if original.is_empty() {
+        return Ok(false);
+    }
+    let mut doc = parse_toml_document(&original)?;
+    if let Some(features) = doc.get_mut("features").and_then(Item::as_table_mut) {
+        features.remove("hooks");
+        features.remove("codex_hooks");
+        if features.is_empty() {
+            doc.as_table_mut().remove("features");
+        }
+    }
+    let rendered = doc.to_string();
+    if rendered != original {
+        write_text(path, &rendered)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn remove_managed_developer_instructions(
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    if !original.contains(INSTRUCTIONS_START) {
+        return Ok(false);
+    }
+    let rendered = strip_managed_developer_instructions(&original)
+        .trim()
+        .to_string();
+    write_text(path, &(rendered + "\n"))?;
+    Ok(true)
+}
+
+pub fn upsert_managed_developer_instructions(
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    let without_managed = strip_managed_developer_instructions(&original);
+    let doc = parse_toml_document(&without_managed)?;
+    if doc.get("developer_instructions").is_some() {
+        if without_managed != original {
+            write_text(path, &without_managed)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let mut rendered = String::new();
+    rendered.push_str(MANAGED_DEVELOPER_INSTRUCTIONS);
+    if !without_managed.trim().is_empty() {
+        rendered.push('\n');
+        rendered.push_str(without_managed.trim_start());
+    }
+    if rendered != original {
+        write_text(path, &rendered)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn remove_stale_airc_filesystem_permissions(
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = read_text(path)?;
+    if !original.contains("[permissions.airc.filesystem")
+        && !original.contains("# airc filesystem permissions")
+    {
+        return Ok(false);
+    }
+
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in original.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with("# airc filesystem permissions")
+            || stripped.starts_with("[permissions.airc.filesystem")
+        {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if stripped.starts_with('[') && !stripped.starts_with("[permissions.airc.filesystem") {
+                skipping = false;
+                out.push(line);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+
+    let rendered = collapse_blank_lines(&out.join("\n"));
+    if rendered == original {
+        return Ok(false);
+    }
+    write_text(path, &rendered)?;
+    Ok(true)
+}
+
+fn strip_managed_developer_instructions(text: &str) -> String {
+    if !text.contains(INSTRUCTIONS_START) {
+        return text.to_string();
+    }
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.starts_with(INSTRUCTIONS_START) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.starts_with(INSTRUCTIONS_END) {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    collapse_blank_lines(&out.join("\n"))
+}
+
+fn parse_toml_document(text: &str) -> Result<DocumentMut, Box<dyn std::error::Error>> {
+    if text.trim().is_empty() {
+        return Ok(DocumentMut::new());
+    }
+    Ok(text.parse::<DocumentMut>()?)
+}
+
+fn ensure_table<'a>(
+    doc: &'a mut DocumentMut,
+    key: &str,
+) -> Result<&'a mut Table, Box<dyn std::error::Error>> {
+    let table = doc
+        .as_table_mut()
+        .entry(key)
+        .or_insert_with(|| Item::Table(Table::new()));
+    table
+        .as_table_mut()
+        .ok_or_else(|| format!("{key} exists but is not a table").into())
+}
+
+fn remove_legacy_codex_hooks_key(text: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut doc = parse_toml_document(text)?;
+    if let Some(features) = doc.get_mut("features").and_then(Item::as_table_mut) {
+        features.remove("codex_hooks");
+    }
+    Ok(doc.to_string())
+}
+
+fn collapse_blank_lines(text: &str) -> String {
+    let mut rendered = String::new();
+    let mut blank_count = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                rendered.push('\n');
+            }
+            continue;
+        }
+        blank_count = 0;
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn read_text(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_text(path: &Path, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}

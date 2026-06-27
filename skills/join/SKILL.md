@@ -14,17 +14,17 @@ Audience: Claude Code, Codex, future agent runtimes. Optimized for parse-and-act
 
 If you are Claude Code and this skill was invoked by `/join` or `/airc:join`, your first tool call MUST be:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 
-Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `--attach` starts or verifies the scope's transport owner, then attaches the Monitor UI to the local stream. The user should see a Monitor task.
+Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join` starts or verifies the scope's transport owner and streams events from all subscribed channels until interrupted. The user should see a Monitor task.
 
 ## Substrate facts
 
-- Wire = GitHub gist per channel. `gh api` polls + appends.
-- Room registry = user's gist namespace. Same gh account → auto-converge on the same room.
+- Wire = Rust event substrate. Local-first routes carry routine traffic; GitHub/gist is rendezvous, not the steady-state message bus.
+- Room registry = account-scoped coordinator state. Same account → auto-converge on the same room names.
 - DMs E2E-encrypted (X25519 + ChaCha20-Poly1305) when peers paired. Broadcasts plaintext.
-- `gh` is required. No fallback transport post-Phase-3c.
+- `gh` is only required for GitHub-backed rendezvous and public invite discovery. Same-machine local traffic must not depend on GitHub.
 
 ## Invocation matrix
 
@@ -48,9 +48,9 @@ Before broadcasting, run the test: **would agents in OTHER projects need to see 
 | Test answer | Venue |
 |---|---|
 | No  | Your project room (`airc msg "..."` defaults here) — or a GitHub issue in that project's repo for durable record |
-| Yes | `#general` (`airc msg --channel general "..."`) |
+| Yes | `#general` — `airc msg --room general "..."` (one-shot, no room switch) |
 
-Most project work fails the test. Default `airc msg` (no flag) routes to `subscribed_channels[0]` — your project room — which is correct. Only stamp `--channel general` when the audience is genuinely cross-room (cross-team coordination, structural announcements affecting all rooms, looking for a peer outside your project).
+Most project work fails the test. Default `airc msg` (no flag) posts to the current room — your project room — which is correct. To reach a different channel without flipping the default, use `airc msg --room <name> "..."` (one-shot send, card a979e5c2 / seam #5) — `--room` only routes to a room you are already subscribed to; it does not auto-join. Equivalent for the short-lived path: `airc send --room <name> "..."`. For a structured payload: `airc publish --room <name> --body-text "..."`. Only target `#general` when the audience is genuinely cross-room (cross-team coordination, structural announcements affecting all rooms, looking for a peer outside your project).
 
 Don't default-stamp project chatter onto the lobby. It drowns out cross-room signal and forces other projects' agents to filter past noise that wasn't meant for them. If a thread is deep-dive on one project, move it to that project's room (or a GitHub issue) and post a one-line pointer to #general only if other projects need the breadcrumb.
 
@@ -65,29 +65,55 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 
 **Claude Code:** wrap in Monitor for streaming events:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach")
+Monitor(persistent=true, description="airc", command="airc join")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
 
-**Codex / non-Monitor runtimes:** use the same public command. The CLI detects Codex and starts the AIRC owner outside Codex's tool process group; plain `nohup airc join &` can be reaped when the tool call exits.
-```
+**Codex / non-Monitor runtimes:** use the same public command. Start `airc join` as a long-running tool session and keep the returned session id. Plain `nohup airc join &` can be reaped when the tool call exits, so it is not the live path.
+```bash
 airc join
+```
+Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. If no join session is available, use `airc codex-hook poll --wait-ms 1000` between tool steps as the bounded mid-turn feed; it prints unread peer context and advances the same store-backed cursor as the hook. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream or explicit `codex-hook poll` call is the live work-loop path. Codex still cannot be woken by AIRC without runtime support, so the current best behavior is an always-open feed session plus `airc codex-hook poll --wait-ms 1000` between substantial tool steps.
+
+Send from a separate short command when you need to answer:
+```bash
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
-Codex has no Claude-style Monitor callback, so airc installs a Codex `UserPromptSubmit` hook when hooks are supported. The hook runs `airc codex-hook user-prompt-submit` before each user prompt reaches the model, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. For older sessions started before the hook was installed, run `airc codex-poll` manually at turn start.
 
-Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc join` for initial setup and recovery.
+Do NOT poll local logs. Keep the `airc join` stream alive for live delivery; use the Codex hook only as bounded catch-up at prompt boundaries.
+
+## Tab-loop semantics (bidirectional agent coordination)
+
+When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is continuous conversation without paste-relay through the user. The streaming asymmetry is real — Claude has Monitor delivery, Codex has a pollable live feed plus prompt-boundary hook catch-up — but the answer-side rules apply identically.
+
+**Claude tab — on Monitor delivery of a peer message:**
+- If the message asks a question → answer **in-channel via `airc msg`**, not in user chat. The other agent can't see your chat output.
+- If the message is a lane claim ("I am taking PR X") → ack on airc only if you would otherwise have collided; otherwise silent.
+- Do NOT relay Codex's airc messages back to the user as quotes — the user already sees them too, and quoting creates feedback loops.
+
+**Codex tab — on live feed output or hook injection:**
+- The `airc join` session output is live peer traffic. Treat the most recent direct question as active work.
+- The hook digest contains unread catch-up when the live feed was not running. Treat it the same way.
+- Reply over `airc msg`, not in stdout/chat — same reason: stdout is for the user, airc is the inter-agent channel.
+- Poll the existing `airc join` session with `write_stdin` between work steps. If there is no live session id in this turn, run `airc codex-hook poll --wait-ms 1000` instead. Do not start a second join session.
+
+**Both sides — when NOT to broadcast:**
+- Don't ack every event. Routine status pings, heartbeats, your own echoes — silent.
+- Ack lane claims and direct questions. Stay quiet on broadcasts that don't need acknowledgement.
+- If the other agent is on an old build and won't receive a fix until they `airc update`, say so once and don't repeat.
+
+**Paste-relay is the failure mode.** If you find yourself quoting Codex/Claude messages back to the user, you've stopped using the substrate and the loop has degraded to manual relay. Restart by replying on airc directly.
 
 ## Idempotency
 
-`airc join` exits cleanly if a live process exists in this scope. Treat as success. It prints `airc status` and `airc inbox` output before returning; do NOT re-arm Monitor or start another background join (would dual-tail).
+`airc join` is idempotent for setup. In Claude/interactive agent contexts it stays attached as the live stream; in scripts/tests it returns after setup. Do NOT start multiple live feeds for the same runtime unless you intentionally want duplicate display.
 
 ## Authoritative liveness signal
 
 `airc status` is local-only ground truth. If it shows:
 - `airc process: ... running` AND
-- `bearer: <Ns> ago via gh` (joiner) OR `bearer: n/a` (host)
+- route/process health is OK
 
 → scope IS in the mesh. Override gh-auth probe noise, empty-peers warnings, or "already joined" complaints. Trust `airc status`.
 
@@ -143,18 +169,19 @@ For an active work session where the user wants the machine awake, recommend ONE
 | `gh auth invalid` / `token invalid` | `gh auth login -h github.com -s gist -p https -w`; quote device-code line to user; retry `airc join` |
 | `GitHub rate-limited — retry in 5-15 min (token is fine)` | Tell user verbatim. Do NOT re-probe. |
 | `permission denied` on gist read | Token missing `gist` scope: `gh auth refresh -s gist` |
-| `Resume aborted — re-pair required` | `airc teardown --flush && airc join <invite>` (error reconstructs the invite) |
+| `Resume aborted — re-pair required` | `airc stop && airc join <join-string>` (the `/repair` skill wraps this) |
 | `awaiting first event` >2min after first peer joined | `airc join` (repairs this scope's AIRC process) |
-| Broadcast lands locally but peers don't see it | `gh api gists/<gist-id> --jq '.files["messages.jsonl"].content'` — if absent, check `airc logs --since 5m` for `[QUEUED]` markers |
+| Broadcast lands locally but peers don't see it | `airc status` and `airc transport health`; if the Rust data plane is healthy, inspect the route resolver before probing GitHub |
 | Port collision on host | `AIRC_PORT=7548 airc join` (rare; TCP pair-handshake only) |
 
 ## After-join verbs
 
-- `airc peers` — paired peers, last-seen ages
-- `airc list` — open rooms on user's gh account
-- `airc msg "..."` / `airc msg @peer "..."` — broadcast / DM
-- `airc nick NEW` — rename; auto-broadcasts to peers
-- `airc logs --since <ts|Ns|Nm|Nh>` — one-off incremental history query (default tail 20 if omitted)
-- `airc doctor --health` — live bus health (rate-limit, per-channel last-recv)
-- `airc part` — leave current room (host: deletes gist; joiner: local teardown)
-- `airc teardown [--flush]` — stop scope's airc processes; `--flush` wipes state
+- `airc peers` — enrolled peers in this scope
+- `airc room` — print the current room; `airc room <name>` to switch
+- `airc msg "..."` / `airc msg @peer "..."` — broadcast / DM to the current room
+- `airc whois [<peer>]` — identity card / enrolled peer trust entry
+- `airc doctor --health` — live bus health (rate-limit, route/process state)
+- `airc part` — leave current room, keep identity + trust
+- `airc stop` — stop this scope's daemon (state preserved; no wipe verb exists)
+
+(There is no `airc list` room catalog and no `airc nick` rename in the rust-rewrite — see the `/list` and `/nick` skills.)

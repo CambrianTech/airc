@@ -1,0 +1,25 @@
+[package]
+name = "airc-trust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Durable peer trust contract. Owns peer enrollment, removal, and
+# signed rotation on top of the ORM store. Kept out of `airc-daemon`
+# so consumers can manage peer trust without depending on daemon
+# runtime state.
+
+[lints]
+workspace = true
+
+[dependencies]
+airc-core = { path = "../airc-core" }
+airc-protocol = { path = "../airc-protocol" }
+airc-store = { path = "../airc-store" }
+
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
