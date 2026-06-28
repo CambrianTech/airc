@@ -65,6 +65,7 @@ pub mod route;
 pub mod route_forwarder;
 pub mod router_bridge;
 mod stream;
+pub mod stream_chunk;
 pub mod subscriptions;
 pub mod task_negotiation;
 mod time;
@@ -116,6 +117,11 @@ pub use daemon::decode_wire_event;
 pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
+};
+pub use stream_chunk::{
+    StreamChunk, StreamPayload, HEADER_STREAM_FINAL, HEADER_STREAM_ID, HEADER_STREAM_KIND,
+    HEADER_STREAM_SEQ, STREAM_KIND_AUDIO_PCM, STREAM_KIND_MOTOR_CMD, STREAM_KIND_TEXT_REASONING,
+    STREAM_KIND_TEXT_TOKEN, STREAM_KIND_VIDEO_FRAME,
 };
 // Observability macros live in the substrate (airc-diagnostics) so
 // every consumer reaches for them downward: `airc_lib::probe!` /
