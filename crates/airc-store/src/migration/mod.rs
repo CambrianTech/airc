@@ -27,6 +27,7 @@ mod m20260528_000014_drop_local_identity_singleton_check;
 mod m20260529_000015_add_peer_trust_tier;
 mod m20260610_000016_add_peer_trust_endpoints;
 mod m20260614_000017_add_peer_trust_last_seen;
+mod m20260629_000018_create_scoped_state;
 
 pub struct Migrator;
 
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260529_000015_add_peer_trust_tier::Migration),
             Box::new(m20260610_000016_add_peer_trust_endpoints::Migration),
             Box::new(m20260614_000017_add_peer_trust_last_seen::Migration),
+            Box::new(m20260629_000018_create_scoped_state::Migration),
         ]
     }
 }
