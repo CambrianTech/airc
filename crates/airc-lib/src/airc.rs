@@ -937,12 +937,32 @@ impl Airc {
         );
         let body_json = serde_json::to_value(&event)
             .map_err(|e| AircError::Crypto(format!("wall post serialize: {e}")))?;
-        self.emit_lifecycle(
-            airc_core::TranscriptKind::WallPostPublished,
-            room.channel,
-            airc_core::Body::Json(body_json),
-        )
-        .await?;
+        let body = airc_core::Body::Json(body_json);
+        // A wall post is a room-shared fact: it must land in the
+        // CANONICAL store every reader pages from. For a daemon-attached
+        // client (e.g. a Continuum persona) that canonical store lives in
+        // the owner-core daemon — `emit_lifecycle` writes only THIS
+        // client's local store + live channel, so the post is invisible
+        // to the daemon-backed `page_recent` the same client reads with.
+        // Route through the daemon publish path (canonical persist + wire
+        // fan-out) when attached; emit locally only when this IS the
+        // owner-core (no daemon in front of it).
+        if self.is_daemon_attached() {
+            self.daemon_publish(
+                &room,
+                airc_protocol::FrameKind::Event,
+                body,
+                airc_core::headers::Headers::new(),
+            )
+            .await?;
+        } else {
+            self.emit_lifecycle(
+                airc_core::TranscriptKind::WallPostPublished,
+                room.channel,
+                body,
+            )
+            .await?;
+        }
         Ok(post_id)
     }
 
@@ -966,21 +986,10 @@ impl Airc {
         category_filter: Option<&str>,
     ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
         let events = self.page_recent(500).await?;
-        let mut posts = Vec::with_capacity(events.len());
-        for event in events {
-            if event.kind != airc_core::TranscriptKind::WallPostPublished {
-                continue;
-            }
-            let Some(airc_core::Body::Json(value)) = event.body else {
-                continue;
-            };
-            let Ok(airc_core::doctrine::DoctrineEvent::WallPostPublished(post)) =
-                serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value)
-            else {
-                continue;
-            };
-            posts.push(post);
-        }
+        // Discriminate on each event's self-describing body, NOT its
+        // transcript `kind` — see [`wall_post_from_event`] for why the
+        // kind is unreliable on the daemon-attached read path.
+        let posts: Vec<_> = events.into_iter().filter_map(wall_post_from_event).collect();
         Ok(project_wall_posts(posts, category_filter))
     }
 
@@ -1807,6 +1816,30 @@ mod trust_tier_wire_str {
     }
 }
 
+/// Pure discriminator: recover the `WallPostPublished` carried by a
+/// transcript event's self-describing body, or `None` if the event is
+/// not a wall post.
+///
+/// Deliberately ignores `event.kind`. A daemon-attached client pages
+/// events back through the owner-core, where `project()` flattens every
+/// non-`Message` bus kind to `TranscriptKind::System` (the fine kind
+/// rides the wire, not the coarse bus enum) — so a kind gate would drop
+/// every post for attached clients. The body round-trips intact and only
+/// deserializes to this variant for an actual wall post, so it is the
+/// authoritative identity; doctrine / identity / chat bodies fall through
+/// to `None` (heterogeneous-stream projection, not error-swallowing).
+fn wall_post_from_event(
+    event: airc_core::TranscriptEvent,
+) -> Option<airc_core::doctrine::WallPostPublished> {
+    let airc_core::Body::Json(value) = event.body? else {
+        return None;
+    };
+    match serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value) {
+        Ok(airc_core::doctrine::DoctrineEvent::WallPostPublished(post)) => Some(post),
+        _ => None,
+    }
+}
+
 /// Pure, sync, no IO — the IO half is `Airc::wall_posts`, which
 /// reads the transcript and hands the result here.
 fn project_wall_posts(
@@ -2016,6 +2049,76 @@ mod wall_projection_tests {
         let events = vec![post(1, "rules", "supersedes a phantom", Some(999_999), 100)];
         let result = project_wall_posts(events, None);
         assert_eq!(result.len(), 1, "post survives despite unknown parent");
+    }
+
+    // --- wall_post_from_event: the body-is-authoritative discriminator ---
+
+    use super::wall_post_from_event;
+    use airc_core::doctrine::{DoctrineEvent, RoomDoctrinePublished};
+    use airc_core::{Body, ClientId, EventId, MentionTarget, TranscriptEvent, TranscriptKind};
+
+    /// Build a transcript event carrying `body` under the given coarse
+    /// `kind` — mirrors what the daemon read path produces after
+    /// `project()` (which flattens non-`Message` kinds to `System`).
+    fn event_with(kind: TranscriptKind, body: Option<Body>) -> TranscriptEvent {
+        TranscriptEvent {
+            event_id: EventId::from_u128(7),
+            room_id: RoomId::from_u128(1),
+            peer_id: PeerId::from_u128(99),
+            client_id: ClientId::from_u128(5),
+            kind,
+            occurred_at_ms: 100,
+            lamport: 1,
+            target: MentionTarget::All,
+            headers: Default::default(),
+            body,
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    // what this catches: the split-brain READ bug — a daemon-attached
+    // client pages a wall post back with kind flattened to `System`
+    // (the fine kind rode the wire, not the bus enum). If the
+    // discriminator gated on `kind == WallPostPublished` it would drop
+    // every post and the `[room-board]` grounding would be empty. The
+    // self-describing body must still recover it.
+    #[test]
+    fn wall_post_recovered_even_when_kind_flattened_to_system() {
+        let wall = DoctrineEvent::WallPostPublished(post(1, "rules", "use rust-rewrite", None, 100));
+        let body = Body::Json(serde_json::to_value(&wall).expect("serialize wall post"));
+        let event = event_with(TranscriptKind::System, Some(body));
+        let recovered = wall_post_from_event(event).expect("wall post recovered from System event");
+        assert_eq!(recovered.body, "use rust-rewrite");
+        assert_eq!(recovered.category, "rules");
+    }
+
+    // what this catches: the discriminator must not misclassify a
+    // sibling `DoctrineEvent` (room doctrine) as a wall post — only the
+    // `WallPostPublished` variant maps through; everything else is None.
+    #[test]
+    fn doctrine_body_is_not_mistaken_for_a_wall_post() {
+        let doctrine = DoctrineEvent::RoomDoctrinePublished(RoomDoctrinePublished {
+            room_id: RoomId::from_u128(1),
+            body: "agent ops doctrine".to_string(),
+            version: "abc123".to_string(),
+            published_by: PeerId::from_u128(99),
+            published_at_ms: 100,
+        });
+        let body = Body::Json(serde_json::to_value(&doctrine).expect("serialize doctrine"));
+        let event = event_with(TranscriptKind::System, Some(body));
+        assert!(wall_post_from_event(event).is_none());
+    }
+
+    // what this catches: a plain chat message (text body, no JSON) must
+    // fall through cleanly — the scan walks a heterogeneous transcript.
+    #[test]
+    fn non_json_body_falls_through() {
+        let event = event_with(TranscriptKind::Message, Some(Body::text("hello room")));
+        assert!(wall_post_from_event(event).is_none());
+        // And a body-less event (e.g. a receipt) is None, not a panic.
+        assert!(wall_post_from_event(event_with(TranscriptKind::System, None)).is_none());
     }
 }
 
