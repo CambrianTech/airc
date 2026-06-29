@@ -33,13 +33,14 @@ use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSe
 use crate::beacon::StoredBeacon;
 use crate::entities::{
     account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
-    peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, subscription,
+    peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
 };
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer, TrustTier};
 use crate::refresh_lock::StoredRefreshLockOutcome;
+use crate::scoped_state::StoredScopedState;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
@@ -833,6 +834,20 @@ fn identity_from_row(row: &local_identity::Model) -> Identity {
     }
 }
 
+/// Map a `scoped_state` row into its DTO. No numeric coercion — the
+/// DTO mirrors the columns' i64 storage so the u64/i64 dance the
+/// time-based tables need does not apply here.
+fn scoped_state_row_to_stored(row: scoped_state::Model) -> StoredScopedState {
+    StoredScopedState {
+        scope_key: row.scope_key,
+        key: row.key,
+        value_json: row.value_json,
+        version: row.version,
+        updated_at_ms: row.updated_at_ms,
+        updated_by: row.updated_by,
+    }
+}
+
 fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidStoredValue {
         field,
@@ -1121,6 +1136,68 @@ impl EventStore for SqliteEventStore {
                     ])
                     .to_owned(),
             )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_scoped_state(
+        &self,
+        scope_key: &str,
+        key: &str,
+    ) -> Result<Option<StoredScopedState>, StoreError> {
+        let row = scoped_state::Entity::find_by_id((scope_key.to_string(), key.to_string()))
+            .one(&self.db)
+            .await?;
+        Ok(row.map(scoped_state_row_to_stored))
+    }
+
+    async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError> {
+        let active = scoped_state::ActiveModel {
+            scope_key: ActiveValue::Set(entry.scope_key),
+            key: ActiveValue::Set(entry.key),
+            value_json: ActiveValue::Set(entry.value_json),
+            version: ActiveValue::Set(entry.version),
+            updated_at_ms: ActiveValue::Set(entry.updated_at_ms),
+            updated_by: ActiveValue::Set(entry.updated_by),
+        };
+        scoped_state::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([
+                    scoped_state::Column::ScopeKey,
+                    scoped_state::Column::Key,
+                ])
+                .update_columns([
+                    scoped_state::Column::ValueJson,
+                    scoped_state::Column::Version,
+                    scoped_state::Column::UpdatedAtMs,
+                    scoped_state::Column::UpdatedBy,
+                ])
+                .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_scoped_state(
+        &self,
+        scope_key: &str,
+    ) -> Result<Vec<StoredScopedState>, StoreError> {
+        let rows = scoped_state::Entity::find()
+            .filter(scoped_state::Column::ScopeKey.eq(scope_key))
+            .order_by_asc(scoped_state::Column::Key)
+            .all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(scoped_state_row_to_stored).collect())
+    }
+
+    async fn delete_scoped_state(
+        &self,
+        scope_key: &str,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        scoped_state::Entity::delete_by_id((scope_key.to_string(), key.to_string()))
             .exec(&self.db)
             .await?;
         Ok(())
@@ -1959,6 +2036,89 @@ mod tests {
             reopened.load_mesh_identity("default").await.unwrap(),
             Some(second)
         );
+    }
+
+    // what this catches: the generic scoped-state store's full
+    // round-trip on real SQLite — set upserts on the (scope_key, key)
+    // composite PK (second write wins), get reads it back, list filters
+    // to one scope and returns rows key-ascending, and delete is
+    // idempotent. Regresses the wiring of migration #18 + the
+    // OnConflict::columns([ScopeKey, Key]) upsert.
+    #[tokio::test]
+    async fn scoped_state_upserts_lists_and_deletes() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let room = "room:general";
+
+        // Missing key reads as None.
+        assert!(store.get_scoped_state(room, "plan").await.unwrap().is_none());
+
+        // First write, then an upsert of the SAME (scope_key, key).
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "plan".to_string(),
+                value_json: r#"{"v":1}"#.to_string(),
+                version: 1,
+                updated_at_ms: 100,
+                updated_by: Some("peer:a".to_string()),
+            })
+            .await
+            .unwrap();
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "plan".to_string(),
+                value_json: r#"{"v":2}"#.to_string(),
+                version: 2,
+                updated_at_ms: 200,
+                updated_by: Some("peer:b".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let got = store.get_scoped_state(room, "plan").await.unwrap().unwrap();
+        assert_eq!(got.value_json, r#"{"v":2}"#, "upsert: second write wins");
+        assert_eq!(got.version, 2);
+        assert_eq!(got.updated_by.as_deref(), Some("peer:b"));
+
+        // A second key in the same scope, plus a key in a DIFFERENT
+        // scope that list must NOT return.
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "instructions".to_string(),
+                value_json: "\"be terse\"".to_string(),
+                version: 1,
+                updated_at_ms: 150,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: "user:peer-a".to_string(),
+                key: "prefs".to_string(),
+                value_json: "{}".to_string(),
+                version: 1,
+                updated_at_ms: 50,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+
+        let listed = store.list_scoped_state(room).await.unwrap();
+        let keys: Vec<&str> = listed.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["instructions", "plan"],
+            "list is scope-isolated and key-ascending"
+        );
+
+        // Delete is idempotent — deleting twice is not an error.
+        store.delete_scoped_state(room, "plan").await.unwrap();
+        store.delete_scoped_state(room, "plan").await.unwrap();
+        assert!(store.get_scoped_state(room, "plan").await.unwrap().is_none());
+        assert_eq!(store.list_scoped_state(room).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
