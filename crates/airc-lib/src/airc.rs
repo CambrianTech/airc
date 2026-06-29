@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use airc_core::{ClientId, PeerId, TranscriptEvent};
+use airc_core::{ClientId, PeerId, ScopeRef, ScopedStateEntry, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
 use airc_store::peer_trust::TrustTier;
-use airc_store::{EventStore, SqliteEventStore};
+use airc_store::{EventStore, SqliteEventStore, StoredScopedState};
 use airc_transport::{udp::UdpAdapter, LanTcpAdapter, RelayAdapter};
 use airc_trust as peers_store;
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,25 @@ pub fn machine_account_home(scope_home: &Path) -> PathBuf {
         }
     }
     scope_home.to_path_buf()
+}
+
+/// Bridge the persistence DTO ([`StoredScopedState`]) to the domain view
+/// ([`ScopedStateEntry`]). The only non-trivial field is `updated_by`:
+/// the store keeps it as an opaque string, so a value that does not parse
+/// as a peer UUID degrades to `None` (provenance lost, not a hard error)
+/// — `updated_by` is advisory metadata, never load-bearing for the value.
+fn stored_to_entry(s: StoredScopedState) -> ScopedStateEntry {
+    ScopedStateEntry {
+        scope_key: s.scope_key,
+        key: s.key,
+        value_json: s.value_json,
+        version: s.version,
+        updated_at_ms: s.updated_at_ms,
+        updated_by: s
+            .updated_by
+            .and_then(|raw| uuid::Uuid::parse_str(&raw).ok())
+            .map(PeerId::from_uuid),
+    }
 }
 
 pub(crate) async fn load_peer_registries(
@@ -608,6 +627,84 @@ impl Airc {
             self.emit_peer_identity_card(subscription.room_id).await?;
         }
         Ok(())
+    }
+
+    /// Read one private scoped-state value, or `None` if unset.
+    ///
+    /// Scoped state ([`airc_core::scoped_state`]) is the peer-private
+    /// sibling of the room wall: high-churn `key → JSON` a peer keeps for
+    /// itself (prefs, "where was I last" / the tool-menu cursor, widget UI
+    /// state). Unlike [`Self::set_local_identity_card`] and the wall, it
+    /// never broadcasts — a consumer (continuum's WallSource) reads it on
+    /// demand and composes it with the shared wall into one grounding
+    /// surface. Shared room documents (plan / instructions / recipe)
+    /// belong on the wall (`publish_wall_post`), not here.
+    pub async fn get_scoped_state(
+        &self,
+        scope: ScopeRef,
+        key: &str,
+    ) -> Result<Option<ScopedStateEntry>, AircError> {
+        let stored = self
+            .event_store()
+            .get_scoped_state(&scope.scope_key(), key)
+            .await
+            .map_err(AircError::from)?;
+        Ok(stored.map(stored_to_entry))
+    }
+
+    /// Write one private scoped-state value (last-write-wins).
+    ///
+    /// The lib stamps the write time and records THIS peer as the author;
+    /// the caller owns the LWW `version` counter (the store records it
+    /// verbatim and never arbitrates). No broadcast — see
+    /// [`Self::get_scoped_state`].
+    pub async fn set_scoped_state(
+        &self,
+        scope: ScopeRef,
+        key: impl Into<String>,
+        value_json: impl Into<String>,
+        version: i64,
+    ) -> Result<(), AircError> {
+        let entry = StoredScopedState {
+            scope_key: scope.scope_key(),
+            key: key.into(),
+            value_json: value_json.into(),
+            version,
+            updated_at_ms: crate::time::now_ms()? as i64,
+            updated_by: Some(self.peer_id().to_string()),
+        };
+        self.event_store()
+            .set_scoped_state(entry)
+            .await
+            .map_err(AircError::from)
+    }
+
+    /// List every key under a scope — the composite-PK leftmost-prefix
+    /// range scan. Lets a consumer pull all of a peer's room-scoped state
+    /// at once (e.g. WallSource hydrating its grounding layer for a turn).
+    pub async fn list_scoped_state(
+        &self,
+        scope: ScopeRef,
+    ) -> Result<Vec<ScopedStateEntry>, AircError> {
+        let stored = self
+            .event_store()
+            .list_scoped_state(&scope.scope_key())
+            .await
+            .map_err(AircError::from)?;
+        Ok(stored.into_iter().map(stored_to_entry).collect())
+    }
+
+    /// Delete one scoped-state key. Idempotent — deleting an absent key
+    /// is not an error (the store's delete is unconditional).
+    pub async fn delete_scoped_state(
+        &self,
+        scope: ScopeRef,
+        key: &str,
+    ) -> Result<(), AircError> {
+        self.event_store()
+            .delete_scoped_state(&scope.scope_key(), key)
+            .await
+            .map_err(AircError::from)
     }
 
     /// Richer roster lookup — return the full `PeerIdentityCard` if
@@ -2030,5 +2127,72 @@ mod publish_identity_tests {
             stored.identity.name, "Ivar",
             "the grounded citizen is named by its agent_name, not anonymous"
         );
+    }
+}
+
+#[cfg(test)]
+mod scoped_state_tests {
+    use super::*;
+    use airc_core::RoomId;
+    use tempfile::tempdir;
+
+    // what this catches: the full private scoped-state round trip through
+    // the airc-lib facade — set stamps THIS peer + a write time, get reads
+    // it back, list range-scans the scope, delete removes it (and is
+    // idempotent). A regression in the StoredScopedState<->ScopedStateEntry
+    // bridge (e.g. dropping updated_by or mis-encoding the scope_key) shows
+    // up here, not just in the store unit tests.
+    #[tokio::test]
+    async fn scoped_state_round_trips_through_airc_facade() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("ivar/.airc");
+        let airc = Airc::open_as(&home, "Ivar").await.expect("open as Ivar");
+        let scope = ScopeRef::UserInRoom(airc.peer_id(), RoomId::from_u128(0x5151));
+
+        // unset key reads as None — no silent default.
+        assert!(airc
+            .get_scoped_state(scope, "tool.mode")
+            .await
+            .expect("get")
+            .is_none());
+
+        airc.set_scoped_state(scope, "tool.mode", "\"code\"", 1)
+            .await
+            .expect("set");
+
+        let got = airc
+            .get_scoped_state(scope, "tool.mode")
+            .await
+            .expect("get")
+            .expect("value present after set");
+        assert_eq!(got.value_json, "\"code\"");
+        assert_eq!(got.version, 1);
+        assert_eq!(
+            got.updated_by,
+            Some(airc.peer_id()),
+            "the lib stamps the writing peer as provenance"
+        );
+        assert!(got.updated_at_ms > 0, "the lib stamps a write time");
+        assert_eq!(got.scope(), Some(scope), "scope_key recovers the typed scope");
+
+        // a second key under the same scope, then list sees both.
+        airc.set_scoped_state(scope, "notes", "\"wip\"", 1)
+            .await
+            .expect("set notes");
+        let listed = airc.list_scoped_state(scope).await.expect("list");
+        assert_eq!(listed.len(), 2, "range scan returns every key under the scope");
+
+        airc.delete_scoped_state(scope, "tool.mode")
+            .await
+            .expect("delete");
+        assert!(airc
+            .get_scoped_state(scope, "tool.mode")
+            .await
+            .expect("get")
+            .is_none());
+        // idempotent: deleting an absent key is not an error.
+        airc.delete_scoped_state(scope, "tool.mode")
+            .await
+            .expect("delete is idempotent");
     }
 }
