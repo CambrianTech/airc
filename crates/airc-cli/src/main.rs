@@ -78,6 +78,8 @@ mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
 mod staleness;
+mod state_cli;
+mod state_commands;
 mod transport_cli;
 mod transport_commands;
 mod update_commands;
@@ -117,6 +119,7 @@ use monitor::MonitorAction;
 use pending_cli::PendingAction;
 use queue_card_cli::QueueCardAction;
 use route_cli::RouteAction;
+use state_cli::StateAction;
 use transport_cli::TransportAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
@@ -335,6 +338,22 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             IdentityAction::ContinuumHandle => identity_commands::run_continuum_handle(&home).await,
             IdentityAction::PushContinuum { handle } => {
                 identity_commands::run_push_continuum(&home, &handle).await
+            }
+        },
+
+        Command::State(args) => match args.action {
+            StateAction::Get { key, in_room } => {
+                state_commands::run_get(&home, &key, in_room).await
+            }
+            StateAction::Set {
+                key,
+                value,
+                version,
+                in_room,
+            } => state_commands::run_set(&home, &key, &value, version, in_room).await,
+            StateAction::List { in_room } => state_commands::run_list(&home, in_room).await,
+            StateAction::Delete { key, in_room } => {
+                state_commands::run_delete(&home, &key, in_room).await
             }
         },
 
