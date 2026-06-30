@@ -50,13 +50,11 @@ use crate::{coordinator, time};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
 
-/// `scoped_state` key, under [`ScopeRef::User`], holding a peer's latest
-/// observed `Identity` card (serialized) — the durable per-peer identity
-/// index that `peer_alias` / `peer_identity_card` / `room_roster` read so a
-/// name survives its `IdentityPublished` card scrolling out of the recent
-/// transcript window. LWW by the card's `emitted_at_ms` (stored as the
-/// scoped-state `version`).
-const PEER_IDENTITY_STATE_KEY: &str = "identity.card";
+/// The durable per-peer identity-index key — single source of truth in
+/// [`airc_core::PEER_IDENTITY_STATE_KEY`], shared with the daemon's IPC
+/// `PeerIdentityCard` handler so an attached client and the daemon address
+/// the same `scoped_state` row.
+use airc_core::PEER_IDENTITY_STATE_KEY;
 
 /// Capacity of the live broadcast channel. Each consumer that calls
 /// [`Airc::subscribe`] gets its own receiver; lagged receivers see
@@ -723,6 +721,17 @@ impl Airc {
         &self,
         peer_id: PeerId,
     ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
+        // Card 8428ae8c shape: the identity index is owner-core shared state,
+        // like the transcript tip. An attached scope's LOCAL store only ever
+        // holds its own card (foreign peers' cards are observed by the daemon
+        // off the wire into the DAEMON's index, never streamed into an
+        // attached client's store), so reading locally answers `None` for
+        // every peer but self. Route to the daemon's authoritative index —
+        // the same `is_daemon_attached()` branch `channel_latest_cursor` uses
+        // for `room_tip`.
+        if self.is_daemon_attached() {
+            return self.daemon_peer_identity_card(peer_id).await;
+        }
         let Some(entry) = self
             .get_scoped_state(ScopeRef::User(peer_id), PEER_IDENTITY_STATE_KEY)
             .await?
@@ -1056,17 +1065,18 @@ impl Airc {
     /// `airc whois <peer>` (card 20066c49), continuum `RoomRosterSource`
     /// via [`Self::room_roster`].
     pub async fn peer_alias(&self, peer_id: PeerId) -> Result<Option<String>, AircError> {
-        let Some(entry) = self
-            .get_scoped_state(ScopeRef::User(peer_id), PEER_IDENTITY_STATE_KEY)
-            .await?
-        else {
+        // Delegate to the single daemon-aware identity-index read so an
+        // attached scope resolves names from the daemon's index too (a local
+        // read would answer `None` for every foreign peer — see
+        // [`Self::peer_identity_card`]). An empty published `name` is an
+        // honest "unknown", not an empty display string.
+        let Some(card) = self.peer_identity_card(peer_id).await? else {
             return Ok(None);
         };
-        let identity: airc_core::identity::Identity = serde_json::from_str(&entry.value_json)?;
-        if identity.name.is_empty() {
+        if card.identity.name.is_empty() {
             return Ok(None);
         }
-        Ok(Some(identity.name))
+        Ok(Some(card.identity.name))
     }
 
     /// Persist an observed peer identity card into the durable per-peer

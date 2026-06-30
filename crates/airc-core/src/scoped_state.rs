@@ -38,6 +38,22 @@ use uuid::Uuid;
 
 use crate::{PeerId, RoomId};
 
+/// The well-known `scoped_state` key, under [`ScopeRef::User`], holding a
+/// peer's latest published identity card (serialized [`crate::identity::Identity`]
+/// JSON, LWW-versioned by the card's `emitted_at_ms`). The durable per-peer
+/// identity index `peer_alias` / `peer_identity_card` / `room_roster` resolve
+/// names from.
+///
+/// This is the ONE shared exception to the "scoped state is private/local"
+/// rule above: a peer's identity card is observed off the broadcast
+/// `IdentityPublished` event and is globally meaningful (every peer resolves
+/// the same name for `User(peer)`). It lives here, next to [`ScopeRef`], as the
+/// single source of truth shared by the writer (airc-lib's observe chokepoints)
+/// and every reader, including the daemon's IPC `PeerIdentityCard` handler —
+/// which serves an attached client's read out of the daemon's own index
+/// (the local store of an attached scope never sees foreign peers' cards).
+pub const PEER_IDENTITY_STATE_KEY: &str = "identity.card";
+
 /// What a piece of scoped state is attached to.
 ///
 /// The typed handle consumers pass to airc-lib; encodes to / decodes

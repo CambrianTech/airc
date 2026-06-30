@@ -122,6 +122,11 @@ pub enum IdentityAction {
 
     /// Update local identity fields in the ORM store.
     Set {
+        /// Display name peers see in the roster (resolves `display_name` /
+        /// `peer_alias`). Set this on a long-lived identity that was
+        /// created before the agent_name nick-seed and shows a blank name.
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         pronouns: Option<String>,
         #[arg(long)]
