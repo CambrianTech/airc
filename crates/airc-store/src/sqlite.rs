@@ -1163,17 +1163,14 @@ impl EventStore for SqliteEventStore {
         };
         scoped_state::Entity::insert(active)
             .on_conflict(
-                OnConflict::columns([
-                    scoped_state::Column::ScopeKey,
-                    scoped_state::Column::Key,
-                ])
-                .update_columns([
-                    scoped_state::Column::ValueJson,
-                    scoped_state::Column::Version,
-                    scoped_state::Column::UpdatedAtMs,
-                    scoped_state::Column::UpdatedBy,
-                ])
-                .to_owned(),
+                OnConflict::columns([scoped_state::Column::ScopeKey, scoped_state::Column::Key])
+                    .update_columns([
+                        scoped_state::Column::ValueJson,
+                        scoped_state::Column::Version,
+                        scoped_state::Column::UpdatedAtMs,
+                        scoped_state::Column::UpdatedBy,
+                    ])
+                    .to_owned(),
             )
             .exec(&self.db)
             .await?;
@@ -1192,11 +1189,7 @@ impl EventStore for SqliteEventStore {
         Ok(rows.into_iter().map(scoped_state_row_to_stored).collect())
     }
 
-    async fn delete_scoped_state(
-        &self,
-        scope_key: &str,
-        key: &str,
-    ) -> Result<(), StoreError> {
+    async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError> {
         scoped_state::Entity::delete_by_id((scope_key.to_string(), key.to_string()))
             .exec(&self.db)
             .await?;
@@ -2050,7 +2043,11 @@ mod tests {
         let room = "room:general";
 
         // Missing key reads as None.
-        assert!(store.get_scoped_state(room, "plan").await.unwrap().is_none());
+        assert!(store
+            .get_scoped_state(room, "plan")
+            .await
+            .unwrap()
+            .is_none());
 
         // First write, then an upsert of the SAME (scope_key, key).
         store
@@ -2117,7 +2114,11 @@ mod tests {
         // Delete is idempotent — deleting twice is not an error.
         store.delete_scoped_state(room, "plan").await.unwrap();
         store.delete_scoped_state(room, "plan").await.unwrap();
-        assert!(store.get_scoped_state(room, "plan").await.unwrap().is_none());
+        assert!(store
+            .get_scoped_state(room, "plan")
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(store.list_scoped_state(room).await.unwrap().len(), 1);
     }
 

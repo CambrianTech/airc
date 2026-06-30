@@ -15,14 +15,16 @@ use std::sync::Arc;
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
 use airc_bus::{Clock, Seq, SystemClock};
+use airc_core::scoped_state::{ScopeRef, PEER_IDENTITY_STATE_KEY};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
+    PeerIdentityCardRequest, PublishRequest, RemovePeerRequest, Request, RoomTipRequest,
+    SendRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RouteEndpointsResponse, StatusResponse,
+    InboxResponse, IpcIdentityCard, PeerEntry, PeerIdentityCardResponse, PeersResponse,
+    PublishResponse, Response, RoomTipResponse, RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -53,6 +55,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::RoomTip(tip) => handle_room_tip(state, tip).await,
+        Request::PeerIdentityCard(req) => handle_peer_identity_card(state, req).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
         },
@@ -274,6 +277,37 @@ async fn handle_room_tip(state: Arc<DaemonState>, request: RoomTipRequest) -> Re
         }),
         Err(error) => Response::Error {
             message: format!("room_tip: {error}"),
+        },
+    }
+}
+
+/// Resolve one peer's durable identity card from the daemon's owner-core
+/// identity index (`scoped_state`, `user:<peer>` / `identity.card`). The
+/// identity analog of [`handle_room_tip`]: an attached client's local
+/// store never observes foreign peers' cards (they are indexed here, off
+/// the broadcast `IdentityPublished` event), so name resolution
+/// (`peer_alias` / `peer_identity_card` / `room_roster`) reads the
+/// daemon's index over IPC instead of replaying the room. A store error
+/// is surfaced loudly; an absent row is an honest `card: None`, not an
+/// error.
+async fn handle_peer_identity_card(
+    state: Arc<DaemonState>,
+    request: PeerIdentityCardRequest,
+) -> Response {
+    let scope_key = ScopeRef::User(request.peer_id).scope_key();
+    match state
+        .coordinator_store
+        .get_scoped_state(&scope_key, PEER_IDENTITY_STATE_KEY)
+        .await
+    {
+        Ok(stored) => Response::PeerIdentityCard(PeerIdentityCardResponse {
+            card: stored.map(|row| IpcIdentityCard {
+                value_json: row.value_json,
+                version: row.version,
+            }),
+        }),
+        Err(error) => Response::Error {
+            message: format!("peer_identity_card: {error}"),
         },
     }
 }

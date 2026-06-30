@@ -514,9 +514,15 @@ impl Airc {
     /// `IdentityPublished` itself or run a second transcript scan: airc
     /// owns presence + the identity name-join; the consumer owns the
     /// prompt injection. `within`/`window` are forwarded to
-    /// `active_agents` (liveness cutoff + page size); the name-join
-    /// reuses the SAME recent page, so the whole roster is two reads of
-    /// one window, not a scan per member.
+    /// `active_agents` (liveness cutoff + page size).
+    ///
+    /// The name-join reads the DURABLE per-peer identity index via the
+    /// canonical [`Self::peer_alias`] resolver (one indexed `scoped_state`
+    /// read per present peer), NOT a recent-transcript rescan. This is the
+    /// fix for roster-name decay: a peer's once-per-join `IdentityPublished`
+    /// card scrolls out of any bounded transcript window in a busy room, so
+    /// the old scan returned `None` for every name; the durable index
+    /// retains the name for as long as the peer has ever announced one.
     ///
     /// Ordering mirrors `active_agents` (stable by peer + client_id).
     /// `self` is included — a roster lists everyone present; a caller
@@ -527,61 +533,17 @@ impl Airc {
         window: usize,
     ) -> Result<Vec<RoomMember>, AircError> {
         let live = self.active_agents(within, window).await?;
-        let names = self.peer_display_names(window).await?;
-        Ok(live
-            .into_iter()
-            .map(|liveness| RoomMember {
-                display_name: names.get(&liveness.peer).cloned(),
+        let mut members = Vec::with_capacity(live.len());
+        for liveness in live {
+            members.push(RoomMember {
+                display_name: self.peer_alias(liveness.peer).await?,
                 peer_id: liveness.peer,
                 runtime: liveness.runtime,
                 availability: liveness.coordination.availability,
                 last_seen_ms: liveness.last_seen_ms,
-            })
-            .collect())
-    }
-
-    /// Build `peer_id → newest published display name` from the
-    /// `IdentityPublished` cards in the recent `window`, in ONE scan
-    /// (last-writer-wins by `emitted_at_ms`). The batch analogue of
-    /// [`Self::peer_alias`] — the roster needs every present peer's
-    /// name, so resolving them one `peer_alias` call at a time would be
-    /// a scan per member. Empty-named cards are skipped (an unnamed peer
-    /// surfaces as `display_name: None`, not an empty string).
-    async fn peer_display_names(
-        &self,
-        window: usize,
-    ) -> Result<std::collections::HashMap<PeerId, String>, AircError> {
-        let events = self.page_recent(window).await?;
-        let mut newest: std::collections::HashMap<PeerId, (u64, String)> =
-            std::collections::HashMap::new();
-        for event in events {
-            if event.kind != airc_core::TranscriptKind::IdentityPublished {
-                continue;
-            }
-            let Some(airc_core::Body::Json(value)) = event.body else {
-                continue;
-            };
-            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
-                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
-            else {
-                continue;
-            };
-            if card.identity.name.is_empty() {
-                continue;
-            }
-            newest
-                .entry(card.peer_id)
-                .and_modify(|existing| {
-                    if card.emitted_at_ms >= existing.0 {
-                        *existing = (card.emitted_at_ms, card.identity.name.clone());
-                    }
-                })
-                .or_insert((card.emitted_at_ms, card.identity.name));
+            });
         }
-        Ok(newest
-            .into_iter()
-            .map(|(peer, (_, name))| (peer, name))
-            .collect())
+        Ok(members)
     }
 }
 

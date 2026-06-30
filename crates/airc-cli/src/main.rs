@@ -323,11 +323,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => identity_commands::run_write_work_session(&session_file, &name, &transport_name),
             IdentityAction::Show => identity_commands::run_show(&home).await,
             IdentityAction::Set {
+                name,
                 pronouns,
                 role,
                 bio,
                 status,
-            } => identity_commands::run_set(&home, pronouns, role, bio, status).await,
+            } => identity_commands::run_set(&home, name, pronouns, role, bio, status).await,
             IdentityAction::Link { platform, handle } => {
                 identity_commands::run_link(&home, &platform, &handle).await
             }

@@ -166,8 +166,7 @@ pub trait EventStore: Send + Sync {
 
     /// Delete one scoped-state row by `(scope_key, key)`. Deleting a
     /// missing row is not an error (idempotent).
-    async fn delete_scoped_state(&self, scope_key: &str, key: &str)
-        -> Result<(), StoreError>;
+    async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError>;
 
     /// Load the caller's own account-mesh beacon for `mesh_identity`,
     /// if present.

@@ -21,7 +21,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(ScopedState::ScopeKey).string().not_null())
                     .col(ColumnDef::new(ScopedState::Key).string().not_null())
                     .col(ColumnDef::new(ScopedState::ValueJson).text().not_null())
-                    .col(ColumnDef::new(ScopedState::Version).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(ScopedState::Version)
+                            .big_integer()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ScopedState::UpdatedAtMs)
                             .big_integer()

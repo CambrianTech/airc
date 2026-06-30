@@ -139,6 +139,14 @@ impl Airc {
         let persist_result = self.inner.store.append(event.clone()).await;
         match persist_result {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                // Self-originated lifecycle events never traverse
+                // `append_received_frame` (inbound) or `append_sent_frame`
+                // (message sends) — this is the ONLY path that persists our
+                // own `IdentityPublished` card. Observe it here so the
+                // durable per-peer identity index carries this peer's own
+                // name (otherwise `peer_alias(self)` / the roster would
+                // never resolve us). No-op for non-identity lifecycle kinds.
+                self.observe_identity_event(&event).await;
                 if self.mark_broadcast(event_id) {
                     let _ = self.inner.live_tx.send(std::sync::Arc::new(event));
                 }

@@ -50,6 +50,12 @@ use crate::{coordinator, time};
 
 const EVENTS_DB_FILENAME: &str = "events.sqlite";
 
+/// The durable per-peer identity-index key — single source of truth in
+/// [`airc_core::PEER_IDENTITY_STATE_KEY`], shared with the daemon's IPC
+/// `PeerIdentityCard` handler so an attached client and the daemon address
+/// the same `scoped_state` row.
+use airc_core::PEER_IDENTITY_STATE_KEY;
+
 /// Capacity of the live broadcast channel. Each consumer that calls
 /// [`Airc::subscribe`] gets its own receiver; lagged receivers see
 /// `BroadcastStreamRecvError::Lagged(n)` rather than silently miss
@@ -696,11 +702,7 @@ impl Airc {
 
     /// Delete one scoped-state key. Idempotent — deleting an absent key
     /// is not an error (the store's delete is unconditional).
-    pub async fn delete_scoped_state(
-        &self,
-        scope: ScopeRef,
-        key: &str,
-    ) -> Result<(), AircError> {
+    pub async fn delete_scoped_state(&self, scope: ScopeRef, key: &str) -> Result<(), AircError> {
         self.event_store()
             .delete_scoped_state(&scope.scope_key(), key)
             .await
@@ -708,33 +710,44 @@ impl Airc {
     }
 
     /// Richer roster lookup — return the full `PeerIdentityCard` if
-    /// `peer_id` has published one in the current room's recent
-    /// window. Powers `airc whois <peer>` (card 20066c49) and any
-    /// future caller that needs more than just the display name.
-    /// Same scan window + on-demand model as [`Self::peer_alias`].
+    /// `peer_id` has ever published one. Powers `airc whois <peer>` (card
+    /// 20066c49) and any future caller that needs more than just the
+    /// display name. Reads the same DURABLE per-peer identity index as
+    /// [`Self::peer_alias`] (`scoped_state`, [`ScopeRef::User`]), so the
+    /// card survives its `IdentityPublished` event scrolling out of the
+    /// recent transcript window. The card is reconstructed from the indexed
+    /// `Identity` plus the LWW `version` (the original `emitted_at_ms`).
     pub async fn peer_identity_card(
         &self,
         peer_id: PeerId,
     ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
-        let events = self.page_recent(200).await?;
-        for event in events {
-            if event.kind != airc_core::TranscriptKind::IdentityPublished {
-                continue;
-            }
-            if event.peer_id != peer_id {
-                continue;
-            }
-            let Some(airc_core::Body::Json(value)) = event.body else {
-                continue;
-            };
-            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
-                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
-            else {
-                continue;
-            };
-            return Ok(Some(card));
+        // Card 8428ae8c shape: the identity index is owner-core shared state,
+        // like the transcript tip. An attached scope's LOCAL store only ever
+        // holds its own card (foreign peers' cards are observed by the daemon
+        // off the wire into the DAEMON's index, never streamed into an
+        // attached client's store), so reading locally answers `None` for
+        // every peer but self. Route to the daemon's authoritative index —
+        // the same `is_daemon_attached()` branch `channel_latest_cursor` uses
+        // for `room_tip`.
+        if self.is_daemon_attached() {
+            return self.daemon_peer_identity_card(peer_id).await;
         }
-        Ok(None)
+        // Daemon-less scope: read the index from `coordinator_store`, the
+        // same machine-account store [`Self::record_peer_identity_card`]
+        // writes to. (When attached, the branch above routes to the
+        // daemon's index over IPC.)
+        let Some(entry) = self
+            .get_coordinator_scoped_state(ScopeRef::User(peer_id), PEER_IDENTITY_STATE_KEY)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let identity: airc_core::identity::Identity = serde_json::from_str(&entry.value_json)?;
+        Ok(Some(airc_core::identity::PeerIdentityCard {
+            peer_id,
+            identity,
+            emitted_at_ms: entry.version as u64,
+        }))
     }
 
     /// Look up the latest doctrine published for the current room
@@ -989,7 +1002,10 @@ impl Airc {
         // Discriminate on each event's self-describing body, NOT its
         // transcript `kind` — see [`wall_post_from_event`] for why the
         // kind is unreliable on the daemon-attached read path.
-        let posts: Vec<_> = events.into_iter().filter_map(wall_post_from_event).collect();
+        let posts: Vec<_> = events
+            .into_iter()
+            .filter_map(wall_post_from_event)
+            .collect();
         Ok(project_wall_posts(posts, category_filter))
     }
 
@@ -1032,47 +1048,151 @@ impl Airc {
             .and_then(|post| serde_json::from_str(&post.body).ok()))
     }
 
-    /// MVP identity-roster lookup (card e414817b, sub of 66d7e607).
+    /// Identity-roster lookup (card e414817b, sub of 66d7e607; durable
+    /// index follow-up 2026-06-29).
     ///
-    /// Scans recent transcript events in the current room for the
-    /// latest `TranscriptKind::IdentityPublished` emitted by `peer_id`
-    /// and returns the published display name when known. Returns
-    /// `Ok(None)` when the peer has never published an identity card
-    /// in this room's recent window, or when the published `name`
-    /// field is empty (an honest "unknown" rather than rendering an
-    /// empty string).
+    /// Reads `peer_id`'s latest published display name from the DURABLE
+    /// per-peer identity index ([`Self::observe_identity_event`] persists
+    /// every observed `PeerIdentityCard` into `scoped_state` under
+    /// [`ScopeRef::User`], last-writer-wins by `emitted_at_ms`). Returns
+    /// `Ok(None)` when the peer has never published an identity card, or
+    /// when the published `name` is empty (an honest "unknown" rather than
+    /// an empty string).
     ///
-    /// On-demand query — no in-memory cache. The scan window (200
-    /// events) is conservative for a substrate where `IdentityPublished`
-    /// fires once per join, not per chat message. If profiling shows
-    /// hot-path callers, the follow-up is an in-memory roster fed by
-    /// the existing subscribe loop; `peer_alias` keeps its shape.
+    /// Identity is durable state, not bounded recent-event: this replaces
+    /// the original `page_recent(200)` transcript scan, whose window a
+    /// peer's once-per-join card scrolls out of in a busy room — leaving
+    /// every present peer nameless. The index survives that, so a roster
+    /// keeps its names for as long as the peer has ever announced one.
     ///
     /// Consumers: `airc work board format_peer` (card c397567a),
-    /// `airc whois <peer>` (card 20066c49).
+    /// `airc whois <peer>` (card 20066c49), continuum `RoomRosterSource`
+    /// via [`Self::room_roster`].
     pub async fn peer_alias(&self, peer_id: PeerId) -> Result<Option<String>, AircError> {
-        let events = self.page_recent(200).await?;
-        for event in events {
-            if event.kind != airc_core::TranscriptKind::IdentityPublished {
-                continue;
-            }
-            if event.peer_id != peer_id {
-                continue;
-            }
-            let Some(airc_core::Body::Json(value)) = event.body else {
-                continue;
-            };
-            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
-                serde_json::from_value::<airc_core::identity::IdentityEvent>(value)
-            else {
-                continue;
-            };
-            if card.identity.name.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(card.identity.name));
+        // Delegate to the single daemon-aware identity-index read so an
+        // attached scope resolves names from the daemon's index too (a local
+        // read would answer `None` for every foreign peer — see
+        // [`Self::peer_identity_card`]). An empty published `name` is an
+        // honest "unknown", not an empty display string.
+        let Some(card) = self.peer_identity_card(peer_id).await? else {
+            return Ok(None);
+        };
+        if card.identity.name.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(card.identity.name))
+    }
+
+    /// Persist an observed peer identity card into the durable per-peer
+    /// identity index (`scoped_state`, [`ScopeRef::User`]), last-writer-wins
+    /// by `emitted_at_ms`. Called from the ingest chokepoints
+    /// (`append_received_frame` for peers, `append_sent_frame` for self) so
+    /// a name survives its `IdentityPublished` card scrolling out of the
+    /// recent-transcript window. A non-`IdentityPublished` event, an
+    /// empty/undecodable body, or a stale (older) card is a no-op. Failures
+    /// to record are surfaced as diagnostics, never panicked — a missed
+    /// index write degrades a name to its peer-id, it does not drop a frame.
+    pub(crate) async fn observe_identity_event(&self, event: &airc_core::TranscriptEvent) {
+        if event.kind != airc_core::TranscriptKind::IdentityPublished {
+            return;
+        }
+        let Some(airc_core::Body::Json(value)) = &event.body else {
+            return;
+        };
+        let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+            serde_json::from_value::<airc_core::identity::IdentityEvent>(value.clone())
+        else {
+            return;
+        };
+        if let Err(err) = self.record_peer_identity_card(&card).await {
+            self.emit_diag(
+                airc_diagnostics::DiagnosticEvent::warn(
+                    airc_diagnostics::DiagnosticComponent::Subscriber,
+                    airc_diagnostics::DiagnosticCode::StoreAppendFailed,
+                    "failed to record observed peer identity card into the durable \
+                 identity index — peer name will fall back to its id until the \
+                 next card",
+                )
+                .with_field("peer_id", card.peer_id)
+                .with_field("error", err.to_string()),
+            );
+        }
+    }
+
+    /// Read one scoped-state value from the COORDINATOR store
+    /// (`machine_account_home/events.sqlite`), not the scope-local
+    /// `event_store()`. The per-peer identity index is owner-core shared
+    /// state — "like the transcript tip" — so it must live where the
+    /// daemon's identity index ([`airc_ipc`] → `handle_peer_identity_card`)
+    /// reads it: `coordinator_store`. Writing it to a scope-local `store`
+    /// the daemon never opens is exactly the read/write store split that
+    /// left the daemon's index empty and degraded every roster entry to a
+    /// raw peer-id. See [`Self::record_peer_identity_card`].
+    async fn get_coordinator_scoped_state(
+        &self,
+        scope: ScopeRef,
+        key: &str,
+    ) -> Result<Option<ScopedStateEntry>, AircError> {
+        let stored = self
+            .coordinator_store()
+            .get_scoped_state(&scope.scope_key(), key)
+            .await
+            .map_err(AircError::from)?;
+        Ok(stored.map(stored_to_entry))
+    }
+
+    /// LWW write of one scoped-state value into the COORDINATOR store —
+    /// the write-side counterpart of [`Self::get_coordinator_scoped_state`].
+    /// The store records `version` verbatim and never arbitrates; callers
+    /// own the LWW guard.
+    async fn set_coordinator_scoped_state(
+        &self,
+        scope: ScopeRef,
+        key: impl Into<String>,
+        value_json: impl Into<String>,
+        version: i64,
+    ) -> Result<(), AircError> {
+        let entry = StoredScopedState {
+            scope_key: scope.scope_key(),
+            key: key.into(),
+            value_json: value_json.into(),
+            version,
+            updated_at_ms: crate::time::now_ms()? as i64,
+            updated_by: Some(self.peer_id().to_string()),
+        };
+        self.coordinator_store()
+            .set_scoped_state(entry)
+            .await
+            .map_err(AircError::from)
+    }
+
+    /// LWW-guarded write of one peer's identity card into the durable
+    /// index. The store records `version` verbatim and never arbitrates
+    /// (see [`Self::set_coordinator_scoped_state`]), so out-of-order frames
+    /// are guarded here: an incoming card whose `emitted_at_ms` is not newer
+    /// than the indexed one is skipped, never clobbering a fresher name.
+    ///
+    /// The index lives in `coordinator_store` (machine-account home), NOT
+    /// the scope-local `event_store()`: it is owner-core shared state the
+    /// daemon answers `peer_identity_card` from, so an attached client's
+    /// write must land in the same `events.sqlite` the daemon reads.
+    async fn record_peer_identity_card(
+        &self,
+        card: &airc_core::identity::PeerIdentityCard,
+    ) -> Result<(), AircError> {
+        let scope = ScopeRef::User(card.peer_id);
+        let version = card.emitted_at_ms as i64;
+        if let Some(existing) = self
+            .get_coordinator_scoped_state(scope, PEER_IDENTITY_STATE_KEY)
+            .await?
+        {
+            if existing.version >= version {
+                return Ok(());
+            }
+        }
+        let value_json = serde_json::to_string(&card.identity)?;
+        self.set_coordinator_scoped_state(scope, PEER_IDENTITY_STATE_KEY, value_json, version)
+            .await
     }
 
     /// Sign a domain-separated identity assertion — the airc analogue
@@ -2086,7 +2206,8 @@ mod wall_projection_tests {
     // self-describing body must still recover it.
     #[test]
     fn wall_post_recovered_even_when_kind_flattened_to_system() {
-        let wall = DoctrineEvent::WallPostPublished(post(1, "rules", "use rust-rewrite", None, 100));
+        let wall =
+            DoctrineEvent::WallPostPublished(post(1, "rules", "use rust-rewrite", None, 100));
         let body = Body::Json(serde_json::to_value(&wall).expect("serialize wall post"));
         let event = event_with(TranscriptKind::System, Some(body));
         let recovered = wall_post_from_event(event).expect("wall post recovered from System event");
@@ -2231,6 +2352,62 @@ mod publish_identity_tests {
             "the grounded citizen is named by its agent_name, not anonymous"
         );
     }
+
+    // what this catches: the per-peer identity index is owner-core shared
+    // state — it MUST live in the machine-account `coordinator_store`, not
+    // the scope-local `event_store`. The roster-shows-raw-UUIDs bug (a
+    // continuum persona seeing "7711fe60" instead of "Claude", then
+    // confabulating peer names) was this exact write/read split:
+    // record_peer_identity_card wrote the index to the scope store while
+    // every reader — the daemon's IPC index AND any sibling scope —
+    // reads coordinator_store. This pins cross-scope convergence: one
+    // scope records a peer card, a DIFFERENT scope sharing the same
+    // wire_root (machine account) resolves it. Before the coordinator-
+    // store routing, the second scope read its own empty store → None.
+    #[tokio::test]
+    async fn peer_identity_index_converges_across_scopes_via_coordinator_store() {
+        let dir = tempdir().unwrap();
+        let wire_root = dir.path().join("machine/.airc");
+        let writer_home = dir.path().join("writer/.airc");
+        let reader_home = dir.path().join("reader/.airc");
+
+        let writer = Airc::open_with_wire_root_for_test(&writer_home, &wire_root)
+            .await
+            .expect("open writer scope");
+        let reader = Airc::open_with_wire_root_for_test(&reader_home, &wire_root)
+            .await
+            .expect("open reader scope sharing the machine account");
+
+        let claude = PeerId::from_u128(0x7711_fe60);
+        let mut identity = airc_core::identity::Identity::new("Claude");
+        identity.role = "claude-arch".into();
+        let card = airc_core::identity::PeerIdentityCard {
+            peer_id: claude,
+            identity,
+            emitted_at_ms: 1_700_000_000_000,
+        };
+
+        // The writer scope records Claude's card — as it would after
+        // observing the IdentityPublished event off the wire.
+        writer
+            .record_peer_identity_card(&card)
+            .await
+            .expect("record card into the machine-account index");
+
+        // A sibling scope — never having seen the card itself — resolves
+        // it from the shared coordinator store. This is the daemon-less
+        // analog of the attached-client -> daemon-index read.
+        let resolved = reader
+            .peer_identity_card(claude)
+            .await
+            .expect("read")
+            .expect("sibling scope resolves the card via coordinator_store");
+        assert_eq!(
+            resolved.identity.name, "Claude",
+            "the index is shared machine-account state: a peer card recorded \
+             by one scope is the same card every sibling scope (and the daemon) reads"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2276,14 +2453,22 @@ mod scoped_state_tests {
             "the lib stamps the writing peer as provenance"
         );
         assert!(got.updated_at_ms > 0, "the lib stamps a write time");
-        assert_eq!(got.scope(), Some(scope), "scope_key recovers the typed scope");
+        assert_eq!(
+            got.scope(),
+            Some(scope),
+            "scope_key recovers the typed scope"
+        );
 
         // a second key under the same scope, then list sees both.
         airc.set_scoped_state(scope, "notes", "\"wip\"", 1)
             .await
             .expect("set notes");
         let listed = airc.list_scoped_state(scope).await.expect("list");
-        assert_eq!(listed.len(), 2, "range scan returns every key under the scope");
+        assert_eq!(
+            listed.len(),
+            2,
+            "range scan returns every key under the scope"
+        );
 
         airc.delete_scoped_state(scope, "tool.mode")
             .await
