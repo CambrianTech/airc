@@ -43,11 +43,12 @@ pub const IPC_PROTOCOL_VERSION: u16 = 5;
 pub use client::{ClientError, DaemonClient};
 pub use request::{
     AddPeerRequest, AttachParts, AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery,
-    IpcKind, IpcTarget, PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    IpcKind, IpcTarget, PeerIdentityCardRequest, PublishRequest, RemovePeerRequest, Request,
+    RoomTipRequest, SendRequest,
 };
 pub use response::{
-    InboxResponse, IpcRouteEndpoint, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RouteEndpointsResponse, StatusResponse,
+    InboxResponse, IpcIdentityCard, IpcRouteEndpoint, PeerIdentityCardResponse, PeersResponse,
+    PublishResponse, Response, RoomTipResponse, RouteEndpointsResponse, StatusResponse,
 };
 pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};
 // IpcListener / IpcStream stay under `transport` because only the

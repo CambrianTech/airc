@@ -26,6 +26,11 @@
 //!   - `beacons` / `beacon_channels` — account-mesh presence.
 //!   - `refresh_locks` — store-backed singleflight for rare remote
 //!     registry refreshes.
+//!   - `scoped_state` — the generic key→JSON store scoped to a user, a
+//!     room, or a `(user, room)` pair. Backs editable walls, room
+//!     coordination state, per-person prefs, widget UI state, and the
+//!     adaptive tool-menu cursor — all one table, differing only by
+//!     `(scope_key, key)`.
 pub mod account_registry;
 pub mod beacon;
 pub mod beacon_channel;
@@ -37,4 +42,5 @@ pub mod peer_rotation_audit;
 pub mod peer_trust;
 pub mod refresh_lock;
 pub mod runtime_cursor;
+pub mod scoped_state;
 pub mod subscription;
