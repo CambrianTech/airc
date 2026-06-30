@@ -84,3 +84,81 @@ async fn room_roster_joins_presence_and_agrees_with_canonical_name_resolver() {
          resolver — same IdentityPublished cards, no divergence"
     );
 }
+
+#[tokio::test]
+async fn peer_name_survives_identity_card_scrolling_past_the_recent_window() {
+    // what this catches: roster-name decay (continuum memory
+    // `roster-names-decay-join-once-200-event-scan`). A peer's identity
+    // card is published ONCE per join (`IdentityPublished`); the old
+    // resolver scanned only the recent transcript window for it, so in a
+    // busy room the card scrolled out and every peer name collapsed to
+    // `None` → personas confabulated names from raw UUIDs. The durable
+    // per-peer identity index must retain the name no matter how many
+    // later events bury the original card. This test buries the card
+    // under > window events and asserts both `peer_alias` and
+    // `room_roster` still resolve it — it FAILS against any
+    // window-bounded scan.
+    let machine = Machine::boot().await;
+    let airc = machine.solo("general").await;
+    let me = airc.peer_id();
+
+    // Publish our identity card (name "Asha").
+    airc.set_local_identity_card(airc_core::identity::Identity::new("Asha"))
+        .await
+        .expect("publish identity card");
+
+    // Immediately resolvable — the card is the most recent event.
+    assert_eq!(
+        airc.peer_alias(me).await.expect("peer_alias"),
+        Some("Asha".to_string()),
+        "name resolves while the card is still fresh"
+    );
+
+    // Bury the card: emit more plain messages than the roster window
+    // (200) so the `IdentityPublished` event is no longer anywhere a
+    // window-bounded scan would read it.
+    let window = 200usize;
+    for i in 0..(window + 20) {
+        airc.say(&format!("noise {i}")).await.expect("say noise");
+    }
+
+    // The name STILL resolves — proof it comes from the durable index,
+    // not a transcript-window scan.
+    assert_eq!(
+        airc.peer_alias(me).await.expect("peer_alias after burial"),
+        Some("Asha".to_string()),
+        "durable identity index retains the name after the card scrolls \
+         past the recent window"
+    );
+
+    // And it flows through the consumer seam continuum reads: a present
+    // (heartbeating) peer carries its name in the roster even when the
+    // card is ancient.
+    airc.emit_agent_heartbeat_with_coordination(
+        HeartbeatKind::Alive,
+        "claude",
+        None,
+        None,
+        None,
+        CoordinationSignal {
+            availability: Some(AgentAvailabilityState::Ready),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("emit heartbeat");
+
+    let roster = airc
+        .room_roster(Duration::from_secs(120), window)
+        .await
+        .expect("room_roster");
+    let entry = roster
+        .iter()
+        .find(|member| member.peer_id == me)
+        .expect("self present in roster");
+    assert_eq!(
+        entry.display_name,
+        Some("Asha".to_string()),
+        "room_roster carries the durable name through to the consumer seam"
+    );
+}

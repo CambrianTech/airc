@@ -220,12 +220,20 @@ impl EventStore for InMemoryEventStore {
         scope_key: &str,
         key: &str,
     ) -> Result<Option<StoredScopedState>, StoreError> {
-        let state = self.scoped_state.lock().map_err(|_| StoreError::LockPoisoned)?;
-        Ok(state.get(&(scope_key.to_string(), key.to_string())).cloned())
+        let state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(state
+            .get(&(scope_key.to_string(), key.to_string()))
+            .cloned())
     }
 
     async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError> {
-        let mut state = self.scoped_state.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
         state.insert((entry.scope_key.clone(), entry.key.clone()), entry);
         Ok(())
     }
@@ -234,7 +242,10 @@ impl EventStore for InMemoryEventStore {
         &self,
         scope_key: &str,
     ) -> Result<Vec<StoredScopedState>, StoreError> {
-        let state = self.scoped_state.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
         // BTreeMap iterates in (scope_key, key) order, so filtering by
         // scope_key yields the rows already key-ascending — matching the
         // SQLite `order_by_asc(Key)` contract.
@@ -245,12 +256,11 @@ impl EventStore for InMemoryEventStore {
             .collect())
     }
 
-    async fn delete_scoped_state(
-        &self,
-        scope_key: &str,
-        key: &str,
-    ) -> Result<(), StoreError> {
-        let mut state = self.scoped_state.lock().map_err(|_| StoreError::LockPoisoned)?;
+    async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError> {
+        let mut state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
         state.remove(&(scope_key.to_string(), key.to_string()));
         Ok(())
     }
