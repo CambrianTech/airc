@@ -86,7 +86,7 @@ pub use account_registry::{
 };
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
-    DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
+    RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::{machine_account_home, Airc};
 pub use airc_protocol::{
@@ -204,6 +204,7 @@ pub use airc_core::{
     body::Body,
     channel_purpose::{ChannelPurpose, ChannelPurposeEvent, ChannelPurposePublished},
     headers::{HeaderFilter, Headers},
+    identity::{Identity, PeerIdentityCard},
     transcript::MentionTarget,
     ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,
     TranscriptCursor, TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,

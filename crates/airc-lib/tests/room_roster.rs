@@ -162,3 +162,91 @@ async fn peer_name_survives_identity_card_scrolling_past_the_recent_window() {
         "room_roster carries the durable name through to the consumer seam"
     );
 }
+
+#[tokio::test]
+async fn room_roster_cards_carries_the_full_identity_and_agrees_with_peer_alias() {
+    // what this catches: `room_roster_cards` is the richer sibling the
+    // positron desktop roster consumes — it must (1) fold the FULL
+    // identity card (pronouns/role/bio/integrations, not just the name)
+    // into each present member in ONE call, and (2) keep its name source
+    // IDENTICAL to `peer_alias`, since the card drops `display_name` in
+    // favor of `identity.name` (one name source, no drift). A regression
+    // that read the wrong index, dropped a field, or diverged the name
+    // from `peer_alias` fails here before it reaches a rendered roster.
+    let machine = Machine::boot().await;
+    let airc = machine.solo("general").await;
+    let me = airc.peer_id();
+
+    // Publish a RICH card — every field the desktop roster renders.
+    let mut integrations = std::collections::BTreeMap::new();
+    integrations.insert("continuum_persona".to_string(), "asha".to_string());
+    let published = airc_core::identity::Identity {
+        name: "Asha".to_string(),
+        pronouns: "she".to_string(),
+        role: "cognition-architect".to_string(),
+        bio: "designs the persona brain".to_string(),
+        integrations,
+        ..Default::default()
+    };
+    airc.set_local_identity_card(published.clone())
+        .await
+        .expect("publish rich identity card");
+
+    // Presence: a heartbeat so the peer is an active roster member.
+    airc.emit_agent_heartbeat_with_coordination(
+        HeartbeatKind::Alive,
+        "claude",
+        None,
+        None,
+        None,
+        CoordinationSignal {
+            availability: Some(AgentAvailabilityState::Ready),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("emit heartbeat");
+
+    let within = Duration::from_secs(120);
+    let cards = airc
+        .room_roster_cards(within, 200)
+        .await
+        .expect("room_roster_cards");
+
+    let me_card = cards
+        .iter()
+        .find(|card| card.peer_id == me)
+        .expect("self must be present in its own roster");
+
+    // The presence join carries, same as room_roster.
+    assert_eq!(
+        me_card.runtime, "claude",
+        "runtime carries from the heartbeat"
+    );
+    assert_eq!(
+        me_card.availability,
+        Some(AgentAvailabilityState::Ready),
+        "availability carries from the coordination signal"
+    );
+    assert!(me_card.last_seen_ms > 0, "last_seen_ms carries");
+
+    // The WHOLE card folds in — the point of the richer roster. `status`
+    // and `fingerprint` are the published defaults (empty), everything
+    // else round-trips.
+    assert_eq!(
+        me_card.identity.as_ref(),
+        Some(&published),
+        "room_roster_cards folds the full published identity card"
+    );
+
+    // The name source is IDENTICAL to the canonical single-peer resolver:
+    // `identity.name` (there is no separate display_name) equals what
+    // `peer_alias` returns — the compression pin against name drift.
+    let canonical = airc.peer_alias(me).await.expect("peer_alias resolves");
+    assert_eq!(
+        me_card.identity.as_ref().map(|id| id.name.clone()),
+        canonical,
+        "the card's identity.name is the SAME durable-index name peer_alias \
+         reads — one name source, no drift"
+    );
+}

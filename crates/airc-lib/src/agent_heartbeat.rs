@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use airc_core::headers::Headers;
+use airc_core::identity::Identity;
 use airc_core::transcript::MentionTarget;
 use airc_core::{Body, PeerId, TranscriptEvent};
 use airc_protocol::FrameKind;
@@ -210,6 +211,47 @@ pub struct RoomMember {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<AgentAvailabilityState>,
     pub last_seen_ms: u64,
+}
+
+/// One present member of a room joined with the peer's FULL identity
+/// card. Returned by [`Airc::room_roster_cards`].
+///
+/// This is [`RoomMember`]'s richer sibling: same liveness fields
+/// (presence), but instead of just `display_name` it carries the whole
+/// [`Identity`] — `name`, `pronouns`, `role`, `bio`, `status`,
+/// `fingerprint`, and the `integrations` badge map. The motivating
+/// consumer is continuum's positron desktop roster, which renders an
+/// identity card per member (name + pronouns + role + bio + integration
+/// badges) and would otherwise pay `room_roster` + N
+/// [`Airc::peer_identity_card`] round-trips; this folds the join
+/// airc-side so the consumer makes ONE call.
+///
+/// There is deliberately NO separate `display_name` field: the name
+/// lives at `identity.name`, read from the SAME durable per-peer
+/// identity index [`Airc::peer_alias`] reads, so there is one name
+/// source and no drift (the compression principle — one fact, one
+/// place). `identity` is `None` when the peer is present (heartbeating)
+/// but has never published a card — the honest "present but uncarded"
+/// (mirror of `RoomMember::display_name: None`); a consumer renders a
+/// `peer_id` label for those, never an invented name. `self` is
+/// INCLUDED (a roster lists everyone present); a caller rendering "who
+/// else is here" drops its own `peer_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMemberCard {
+    pub peer_id: PeerId,
+    pub runtime: String,
+    /// Self-reported availability from the latest heartbeat's
+    /// coordination signal. `None` = the runtime didn't report it
+    /// (treat as unknown, not "unavailable"). Same field as
+    /// [`RoomMember::availability`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AgentAvailabilityState>,
+    pub last_seen_ms: u64,
+    /// Full published identity card, or `None` for a present-but-uncarded
+    /// peer. `name`/`pronouns`/`role`/`bio`/`integrations` live here —
+    /// there is no separate `display_name` to drift against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
 }
 
 /// Handle to a running heartbeat emit task. Dropping or calling
@@ -541,6 +583,54 @@ impl Airc {
                 runtime: liveness.runtime,
                 availability: liveness.coordination.availability,
                 last_seen_ms: liveness.last_seen_ms,
+            });
+        }
+        Ok(members)
+    }
+
+    /// Richer roster: like [`Self::room_roster`] but each member carries
+    /// the FULL [`Identity`] card instead of just `display_name`. The
+    /// motivating consumer is continuum's positron desktop roster, which
+    /// renders name + pronouns + role + bio + the `integrations` badge
+    /// map per member; without this it would pay `room_roster` + N
+    /// [`Self::peer_identity_card`] round-trips. This folds the identity
+    /// join airc-side so the consumer makes ONE call — the same "airc
+    /// owns presence + the identity join" contract as `room_roster`.
+    ///
+    /// Each card's `identity` reads the SAME durable per-peer identity
+    /// index as [`Self::peer_alias`] / [`Self::peer_identity_card`]
+    /// (`scoped_state`, daemon-routed when attached), so it survives the
+    /// `IdentityPublished` event scrolling out of the recent transcript
+    /// window. A present peer that has never published a card surfaces as
+    /// `identity: None` — the honest "present but uncarded", mirroring
+    /// `room_roster`'s `display_name: None`.
+    ///
+    /// Ordering mirrors [`Self::active_agents`] (stable by peer +
+    /// client_id). `self` is included — a roster lists everyone present;
+    /// a caller rendering "who else is here" filters its own `peer_id`.
+    ///
+    /// Cost: one `peer_identity_card` read per present peer. At roster
+    /// scale (tens of members) the sequential reads are fine; a batched
+    /// `peer_identity_cards(&[PeerId])` daemon path is the documented
+    /// future optimization if a busy room makes the round-trips bite.
+    pub async fn room_roster_cards(
+        &self,
+        within: Duration,
+        window: usize,
+    ) -> Result<Vec<RoomMemberCard>, AircError> {
+        let live = self.active_agents(within, window).await?;
+        let mut members = Vec::with_capacity(live.len());
+        for liveness in live {
+            let identity = self
+                .peer_identity_card(liveness.peer)
+                .await?
+                .map(|card| card.identity);
+            members.push(RoomMemberCard {
+                peer_id: liveness.peer,
+                runtime: liveness.runtime,
+                availability: liveness.coordination.availability,
+                last_seen_ms: liveness.last_seen_ms,
+                identity,
             });
         }
         Ok(members)
