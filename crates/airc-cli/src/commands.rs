@@ -1458,23 +1458,40 @@ pub async fn run_daemon(
                 bin.display()
             );
         }
-        // Stale-token recovery slot (card 1f2cbffa): the SAME slot
-        // goes to the gate (which re-resolves on auth failure) and the
-        // store (whose gh spawns then carry the recovered token), so a
-        // mid-session token rotation no longer bricks the rendezvous
-        // until daemon restart.
-        let gh_token_override = airc_lib::GhTokenOverride::new();
-        let store = match &gh_bin {
-            Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home)
-                .with_bin(bin.clone()),
-            None => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home),
-        }
-        .with_token_override(gh_token_override.clone());
-        let gate = airc_lib::RegistryRefreshGate::GhAuth {
-            gh_bin: gh_bin.clone(),
-            scope_home: registry_home.clone(),
-            token_override: Some(gh_token_override),
+        // Rendezvous SELECTION (#113): which door the mesh converges
+        // through is a data choice, not a hardcode. `AIRC_RENDEZVOUS_DIR`
+        // set → the no-GitHub shared-folder door (on-prem / behind
+        // firewall); unset → the default gist door. The resolver pairs the
+        // chosen store with the gate that matches it (gist → gh-auth,
+        // folder → Always), so this loop never learns which door won.
+        //
+        // Stale-token recovery slot (card 1f2cbffa) rides the gist door:
+        // the SAME slot goes to the gate (which re-resolves on auth
+        // failure) and the store (whose gh spawns then carry the recovered
+        // token), so a mid-session token rotation no longer bricks the
+        // rendezvous until daemon restart. The folder door ignores it.
+        let choice = match airc_lib::RendezvousChoice::from_env() {
+            Ok(choice) => choice,
+            Err(error) => {
+                eprintln!("airc daemon: account-registry loop disabled — {error}");
+                return;
+            }
         };
+        if let airc_lib::RendezvousChoice::Folder { dir } = &choice {
+            eprintln!(
+                "airc daemon: account-registry using shared-folder rendezvous at {} (no gh)",
+                dir.display()
+            );
+        }
+        let (store, gate) = airc_lib::resolve_account_registry_store(
+            choice,
+            airc_lib::GistRendezvous {
+                event_store,
+                scope_home: registry_home.clone(),
+                gh_bin: gh_bin.clone(),
+                token_override: airc_lib::GhTokenOverride::new(),
+            },
+        );
         airc_lib::run_registry_refresh_loop(
             airc,
             store,

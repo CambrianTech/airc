@@ -337,6 +337,29 @@ pub trait AccountRegistryStore: Send + Sync {
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError>;
 }
 
+/// Delegating impl so a `Box<dyn AccountRegistryStore>` — what the
+/// rendezvous resolver returns after picking gist vs shared-folder —
+/// itself satisfies `AccountRegistryStore`. That lets one boxed store
+/// flow through `run_loop`'s generic `S: AccountRegistryStore` bound
+/// unchanged, so provider SELECTION happens once at the seam and the
+/// refresh loop never learns which door the mesh converged through.
+#[async_trait]
+impl AccountRegistryStore for Box<dyn AccountRegistryStore> {
+    async fn publish(
+        &self,
+        document: &AccountRegistryDocument,
+    ) -> Result<(), AccountRegistryError> {
+        (**self).publish(document).await
+    }
+
+    async fn refresh(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        (**self).refresh(mesh_identity).await
+    }
+}
+
 /// Store-backed local cache of account-registry documents.
 ///
 /// Replaces the previous on-disk `<root>/<mesh-identity>/registry.json`

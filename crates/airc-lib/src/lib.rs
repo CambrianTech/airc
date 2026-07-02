@@ -61,6 +61,7 @@ pub mod publish;
 pub mod registry;
 pub mod registry_refresh;
 mod relay;
+pub mod rendezvous;
 pub mod room;
 pub mod route;
 pub mod route_forwarder;
@@ -118,6 +119,10 @@ pub use daemon::decode_wire_event;
 pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
+};
+pub use rendezvous::{
+    parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,
+    RendezvousConfigError, RENDEZVOUS_DIR_ENV,
 };
 // Observability macros live in the substrate (airc-diagnostics) so
 // every consumer reaches for them downward: `airc_lib::probe!` /
