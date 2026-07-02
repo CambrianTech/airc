@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod account_registry;
+pub mod account_registry_fs;
 pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
@@ -60,6 +61,7 @@ pub mod publish;
 pub mod registry;
 pub mod registry_refresh;
 mod relay;
+pub mod rendezvous;
 pub mod room;
 pub mod route;
 pub mod route_forwarder;
@@ -84,6 +86,7 @@ pub use account_registry::{
     AccountRegistryDocument, AccountRegistryError, AccountRegistryStore, RegistryMergeOutcome,
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
+pub use account_registry_fs::FsAccountRegistryStore;
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
@@ -116,6 +119,10 @@ pub use daemon::decode_wire_event;
 pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
+};
+pub use rendezvous::{
+    parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,
+    RendezvousConfigError, RENDEZVOUS_DIR_ENV,
 };
 // Observability macros live in the substrate (airc-diagnostics) so
 // every consumer reaches for them downward: `airc_lib::probe!` /

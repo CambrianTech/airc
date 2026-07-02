@@ -337,6 +337,29 @@ pub trait AccountRegistryStore: Send + Sync {
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError>;
 }
 
+/// Delegating impl so a `Box<dyn AccountRegistryStore>` — what the
+/// rendezvous resolver returns after picking gist vs shared-folder —
+/// itself satisfies `AccountRegistryStore`. That lets one boxed store
+/// flow through `run_loop`'s generic `S: AccountRegistryStore` bound
+/// unchanged, so provider SELECTION happens once at the seam and the
+/// refresh loop never learns which door the mesh converged through.
+#[async_trait]
+impl AccountRegistryStore for Box<dyn AccountRegistryStore> {
+    async fn publish(
+        &self,
+        document: &AccountRegistryDocument,
+    ) -> Result<(), AccountRegistryError> {
+        (**self).publish(document).await
+    }
+
+    async fn refresh(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        (**self).refresh(mesh_identity).await
+    }
+}
+
 /// Store-backed local cache of account-registry documents.
 ///
 /// Replaces the previous on-disk `<root>/<mesh-identity>/registry.json`
@@ -535,6 +558,13 @@ impl Airc {
         // at — the upper bound for any peer's `last_seen`. See the clamp
         // at the touch below.
         let now_ms = crate::time::now_ms()?;
+        // #18 auto-trust: our REAL mesh identity, resolved from our own
+        // credential — never the document's self-asserted `mesh_identity`.
+        // The elevation below only fires when the document's identity
+        // actually MATCHES ours, so a foreign document (or a direct import
+        // of one) leaves its peers `Untrusted`. Using `document.mesh_identity`
+        // for both sides would be circular — a document vouching for itself.
+        let self_mesh = self.mesh_identity().await?;
         for peer in document.peers {
             if peer.peer_id() == self.inner.identity.peer_id {
                 continue;
@@ -545,6 +575,49 @@ impl Airc {
                 peer.peer_spec.pubkey,
             )
             .await?;
+            // #18 auto-trust (import-time elevation, staged model). This
+            // document is OUR OWN account registry — `refresh` loads it by
+            // our mesh identity and `import` re-asserts
+            // `document.mesh_identity == self mesh` via `validate()` above —
+            // so every non-self beacon in it was placed by a machine with
+            // write-access to our account's rendezvous (our `gh` token for
+            // the gist door, our device-scoped ACL for the folder door).
+            // That write-authority is same-account evidence, so the policy
+            // in `detect_tier` resolves these peers to `OwnAccount` rather
+            // than leaving them `Untrusted` (which would surface as an
+            // unusable "unknown" peer needing a manual `set-tier`). We route
+            // through `detect_tier` rather than hardcoding the tier so the
+            // signals→tier policy lives in exactly one place. Locality is
+            // `false` — a registry beacon proves nothing about local
+            // reachability; the `OwnMachine` upgrade is the local-UDS path's
+            // job, not the import's.
+            //
+            // STAGED (Joel's call): this couples trust to rendezvous
+            // write-authority. The planned hardening keeps the enrol here at
+            // `Untrusted` and elevates to `OwnAccount` only once the peer
+            // ALSO proves possession of this pinned key in a live session —
+            // defense-in-depth so a compromised rendezvous alone can't mint
+            // account trust. Tracked as the #18 handshake-gate follow-up.
+            let tier = airc_trust::detect_tier(
+                self.inner.identity.peer_id,
+                Some(self_mesh.as_str()),
+                peer.peer_spec.peer_id,
+                Some(document.mesh_identity.as_str()),
+                false,
+            );
+            airc_trust::set_tier(&self.inner.wire_root, peer.peer_spec.peer_id, tier)
+                .await?
+                // The peer was added to this exact store a few lines up; a
+                // vanished row here is the same structural bug the endpoint
+                // store below guards against, so fail loud rather than
+                // silently leaving the peer at the default tier.
+                .ok_or_else(|| {
+                    AircError::Transport(format!(
+                        "peer {} vanished between trust add and tier elevation \
+                         during registry import — report as a substrate bug",
+                        peer.peer_spec.peer_id
+                    ))
+                })?;
             // Seam #3.2 (liveness): a peer present in a freshly
             // refreshed, stale-pruned registry document just published a
             // beacon — that IS fresh contact. Record it so the age-based
@@ -843,6 +916,100 @@ mod tests {
             vec![RouteEndpoint::Relay {
                 url: "https://relay.example.test".to_string()
             }]
+        );
+    }
+
+    // what this catches: #18 auto-trust (import-time elevation). A peer
+    // beacon carried in OUR OWN account registry (document mesh == our real
+    // mesh) must enrol at `OwnAccount`, not the default `Untrusted` — that
+    // is the difference between "join just works" and an unusable peer that
+    // needs a manual `set-tier`. The SECURITY half: a document whose
+    // mesh_identity is FOREIGN must leave its peers `Untrusted`, proving the
+    // elevation checks our real resolved mesh (never the document's
+    // self-asserted identity — that would be circular and let any document
+    // mint account trust for its own peers).
+    #[tokio::test]
+    async fn import_elevates_same_account_peer_but_not_a_foreign_document() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("machine-b/.airc");
+        std::fs::create_dir_all(&home).unwrap();
+        let airc = Airc::open(&home).await.unwrap();
+
+        // The document's identity IS our own resolved mesh — the same-account
+        // case the auto-trust exists for.
+        let my_mesh = airc.mesh_identity().await.unwrap();
+        let same_account_peer = PeerId::new();
+        let same_spec = peer_spec(same_account_peer);
+        let same_doc = AccountRegistryDocument::new(
+            my_mesh.clone(),
+            2_000,
+            vec![channel("general")],
+            vec![AccountPeerBeacon {
+                presence: crate::coordinator::beacon_now(
+                    same_account_peer,
+                    home.clone(),
+                    vec![channel("general")],
+                    123,
+                    1_000,
+                ),
+                peer_spec: same_spec.clone(),
+                endpoints: Vec::new(),
+            }],
+        );
+        airc.import_account_registry_document(same_doc)
+            .await
+            .unwrap();
+
+        let tier = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.peer_id == same_spec.peer_id)
+            .expect("same-account peer enrolled on import")
+            .tier;
+        assert_eq!(
+            tier,
+            airc_store::TrustTier::OwnAccount,
+            "a peer in our OWN account registry must auto-elevate to OwnAccount"
+        );
+
+        // A document claiming a DIFFERENT mesh identity — its peers must NOT
+        // be elevated (the elevation must consult our real mesh, not the
+        // document's self-asserted one).
+        let foreign_peer = PeerId::new();
+        let foreign_spec = peer_spec(foreign_peer);
+        let foreign_doc = AccountRegistryDocument::new(
+            MeshIdentity::new("someone-else@github"),
+            2_000,
+            vec![channel("general")],
+            vec![AccountPeerBeacon {
+                presence: crate::coordinator::beacon_now(
+                    foreign_peer,
+                    home.clone(),
+                    vec![channel("general")],
+                    123,
+                    1_000,
+                ),
+                peer_spec: foreign_spec.clone(),
+                endpoints: Vec::new(),
+            }],
+        );
+        airc.import_account_registry_document(foreign_doc)
+            .await
+            .unwrap();
+
+        let foreign_tier = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.peer_id == foreign_spec.peer_id)
+            .expect("foreign peer still enrolled (key pinned) on import")
+            .tier;
+        assert_eq!(
+            foreign_tier,
+            airc_store::TrustTier::Untrusted,
+            "a peer from a foreign-mesh document must NOT auto-elevate — \
+             enrolment pins the key, but trust stays Untrusted"
         );
     }
 
