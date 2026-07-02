@@ -1385,7 +1385,22 @@ exit 0
                 airc_store::SqliteEventStore::open_path(&db_dir.join("events.sqlite"))
                     .await
                     .unwrap();
-            GhAccountRegistryStore::new(Arc::new(event_store), scope_home).with_bin(&stub.bin)
+            // Isolate the gh governor per-test. Without this the store falls
+            // through to `GhBudget::account_default()` = the REAL machine-wide
+            // `~/.airc/gh/` — so a live backoff armed by a background airc
+            // daemon (or a sibling test arming one mid-run) denies every gh
+            // call here with "shared gh backoff active", flaking the whole
+            // gh_stub suite under parallelism. Root the budget at the STUB's
+            // state dir (per-test, but SHARED across the multiple store
+            // instances one test builds — e.g. sentinel_loss's first/reborn —
+            // so they coordinate on one governor, exactly as one machine
+            // would). Not `db_dir`: that is per-store and would hand two
+            // stores of the same machine two separate governors.
+            let governor_dir = stub.state.join("governor");
+            std::fs::create_dir_all(&governor_dir).unwrap();
+            GhAccountRegistryStore::new(Arc::new(event_store), scope_home)
+                .with_bin(&stub.bin)
+                .with_budget(crate::gh::governor::GhBudget::at(governor_dir))
         }
 
         fn mesh() -> MeshIdentity {
