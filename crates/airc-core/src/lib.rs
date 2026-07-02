@@ -40,6 +40,7 @@ pub mod identity;
 pub mod ids;
 pub mod persona;
 pub mod receipt;
+pub mod scoped_state;
 pub mod temp_home;
 pub mod transcript;
 
@@ -58,5 +59,6 @@ pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
 pub use persona::{PersonaCapabilities, PersonaCapabilitiesError, PERSONA_CAPABILITIES_KEY};
 pub use receipt::{Receipt, ReceiptKind};
+pub use scoped_state::{ScopeRef, ScopedStateEntry, PEER_IDENTITY_STATE_KEY};
 pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};

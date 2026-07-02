@@ -130,6 +130,15 @@ pub enum Request {
     /// op, not a `limit: 1` flag on the `Inbox` scan. Returns
     /// `Response::RoomTip`.
     RoomTip(RoomTipRequest),
+    /// Resolve one peer's durable identity card from the daemon's
+    /// owner-core identity index (`scoped_state`, `user:<peer>`, key
+    /// `identity.card`). The attached-client read path for peer names:
+    /// a client's LOCAL store never holds foreign peers' cards (they are
+    /// observed off the wire into the DAEMON's index), so `peer_alias` /
+    /// `peer_identity_card` / `room_roster` resolve names by asking the
+    /// daemon — the identity analog of `RoomTip` for the transcript. Returns
+    /// `Response::PeerIdentityCard`.
+    PeerIdentityCard(PeerIdentityCardRequest),
     /// Attach to the daemon's live event stream. Long-lived: after an
     /// initial `Response::Ok`, the daemon streams `Response::Event`
     /// frames (airc-wire bytes) until the client disconnects. Optionally
@@ -164,6 +173,14 @@ pub struct InboxRequest {
 pub struct RoomTipRequest {
     /// The channel (room) whose durable tip is being probed.
     pub channel: airc_core::RoomId,
+}
+
+/// Parameters for `PeerIdentityCard`. The peer whose durable
+/// identity-index row (`user:<peer>` / `identity.card`) is resolved.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerIdentityCardRequest {
+    /// The peer whose published identity card is being resolved.
+    pub peer_id: PeerId,
 }
 
 /// Where an attach stream starts. One intentional choice — not a
@@ -668,6 +685,28 @@ mod tests {
                 limit: Some(1),
             })
         );
+    }
+
+    // what this catches: the `peer_identity_card` op tag + `peer_id`
+    // field are the cross-version wire contract — a symmetric serde
+    // rename (which a round-trip test would miss) breaks an attached
+    // client talking to an older/newer daemon. Pinned as a literal on
+    // BOTH sides, independently.
+    #[test]
+    fn peer_identity_card_wire_bytes_are_pinned() {
+        let request = Request::PeerIdentityCard(PeerIdentityCardRequest {
+            peer_id: airc_core::PeerId::from_u128(0x7),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"op":"peer_identity_card","peer_id":"00000000-0000-0000-0000-000000000007"}"#
+        );
+        let decoded: Request = serde_json::from_str(
+            r#"{"op":"peer_identity_card","peer_id":"00000000-0000-0000-0000-000000000007"}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded, request);
     }
 
     /// Card 4b6a0ffa (#33): the EXACT wire bytes of `RouteEndpoints`

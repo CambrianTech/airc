@@ -10,6 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 const IDENTITY_FIELDS: &[&str] = &["pronouns", "role", "bio", "status"];
+const NAME_MAX: usize = 128;
 const PRONOUNS_MAX: usize = 64;
 const ROLE_MAX: usize = 128;
 const BIO_MAX: usize = 512;
@@ -120,20 +121,30 @@ pub async fn run_show(home: &Path) -> Result<(), Box<dyn Error>> {
 
 pub async fn run_set(
     home: &Path,
+    name: Option<String>,
     pronouns: Option<String>,
     role: Option<String>,
     bio: Option<String>,
     status: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    if pronouns.is_none() && role.is_none() && bio.is_none() && status.is_none() {
-        return Err("Pass at least one of --pronouns / --role / --bio / --status".into());
+    if name.is_none() && pronouns.is_none() && role.is_none() && bio.is_none() && status.is_none() {
+        return Err("Pass at least one of --name / --pronouns / --role / --bio / --status".into());
     }
+    validate_len("name", name.as_deref(), NAME_MAX)?;
     validate_len("pronouns", pronouns.as_deref(), PRONOUNS_MAX)?;
     validate_len("role", role.as_deref(), ROLE_MAX)?;
     validate_len("bio", bio.as_deref(), BIO_MAX)?;
     validate_len("status", status.as_deref(), STATUS_MAX)?;
 
     let mut identity = load_identity_card(home).await?;
+    // `name` is the field the roster / `peer_alias` resolve `display_name`
+    // from. Existing identities created before the agent_name nick-seed
+    // (see airc-identity `generate_and_save_as`) carry an empty name; this
+    // is the only post-creation path to set it so a long-lived peer can
+    // present a real display name to the mesh without a destructive
+    // re-init. `save_identity_card` republishes the card to every
+    // subscribed room, so the durable per-peer identity index updates.
+    set_optional_string(&mut identity.name, name);
     set_optional_string(&mut identity.pronouns, pronouns);
     set_optional_string(&mut identity.role, role);
     set_optional_string(&mut identity.bio, bio);

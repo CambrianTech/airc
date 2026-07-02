@@ -32,6 +32,12 @@ pub enum Response {
     /// store's index. No envelope bytes ride along: the probe returns
     /// the cursor value only, never a copy of an event body.
     RoomTip(RoomTipResponse),
+    /// Response to `PeerIdentityCard` — the peer's durable identity-index
+    /// row (opaque `Identity` JSON + LWW `version`), or `None` when the peer
+    /// has never published a card. The identity analog of `RoomTip`: the
+    /// daemon answers from its owner-core `scoped_state` index, never by
+    /// replaying the room.
+    PeerIdentityCard(PeerIdentityCardResponse),
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
@@ -148,6 +154,33 @@ pub struct RoomTipResponse {
     /// absent on the wire) when the room has no durable events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<IpcCursor>,
+}
+
+/// Result of a `PeerIdentityCard` resolve: the peer's durable
+/// identity-index row, or `None` (absent on the wire) when the peer has
+/// never published a card. The identity analog of [`RoomTipResponse`] —
+/// answered from the daemon's owner-core `scoped_state` index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerIdentityCardResponse {
+    /// The stored identity-index row, or `None` when no card exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<IpcIdentityCard>,
+}
+
+/// One peer's durable identity-index row as it crosses IPC: the opaque
+/// serialized `Identity` JSON plus its LWW `version` (the card's
+/// `emitted_at_ms`). Mirrors `airc_store::StoredScopedState`'s
+/// `(value_json, version)` without leaking the store type across the
+/// boundary — this crate sits below airc-lib/airc-store's consumers,
+/// exactly like `IpcRouteEndpoint` mirrors `RouteEndpoint`. The client
+/// (`airc-lib`) reconstructs the typed `PeerIdentityCard` from these two
+/// fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcIdentityCard {
+    /// Serialized `airc_core::identity::Identity` JSON. Opaque here.
+    pub value_json: String,
+    /// LWW version — the card's `emitted_at_ms`, recorded verbatim.
+    pub version: i64,
 }
 
 /// One dialable endpoint advertised by the daemon (card 4b6a0ffa /
@@ -357,6 +390,37 @@ mod tests {
             (
                 Response::RoomTip(RoomTipResponse { tip: None }),
                 r#"{"kind":"room_tip"}"#,
+            ),
+        ] {
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_eq!(encoded, expected, "wire bytes of {response:?}");
+            let decoded: Response = serde_json::from_str(expected).unwrap();
+            assert_eq!(decoded, response, "decode of pinned literal");
+        }
+    }
+
+    // what this catches: the EXACT wire bytes of `PeerIdentityCard` per
+    // shape — `kind` tag, `card` field, nested `value_json`/`version`
+    // field names all literal. Both shapes covered: a populated card,
+    // and the never-published shape where `card` is ABSENT (not `null`),
+    // mirroring `RoomTipResponse.tip`. A symmetric rename a round-trip
+    // test would miss breaks an attached client ↔ daemon of another
+    // version.
+    #[test]
+    fn peer_identity_card_response_wire_bytes_are_pinned_per_shape() {
+        for (response, expected) in [
+            (
+                Response::PeerIdentityCard(PeerIdentityCardResponse {
+                    card: Some(IpcIdentityCard {
+                        value_json: r#"{"name":"Claude"}"#.to_string(),
+                        version: 1_700_000_000_000,
+                    }),
+                }),
+                r#"{"kind":"peer_identity_card","card":{"value_json":"{\"name\":\"Claude\"}","version":1700000000000}}"#,
+            ),
+            (
+                Response::PeerIdentityCard(PeerIdentityCardResponse { card: None }),
+                r#"{"kind":"peer_identity_card"}"#,
             ),
         ] {
             let encoded = serde_json::to_string(&response).unwrap();

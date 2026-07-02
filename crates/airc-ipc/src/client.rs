@@ -17,12 +17,12 @@ use crate::codec::{read_frame, write_frame};
 use crate::transport::IpcStream;
 
 use crate::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
-    RoomTipRequest, SendRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, PeerIdentityCardRequest, PublishRequest,
+    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use crate::response::{
-    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RouteEndpointsResponse, StatusResponse,
+    InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse, Response,
+    RoomTipResponse, RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,6 +189,22 @@ impl DaemonClient {
     pub async fn room_tip(&self, request: RoomTipRequest) -> Result<RoomTipResponse, ClientError> {
         match self.call(Request::RoomTip(request)).await? {
             Response::RoomTip(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Resolve one peer's durable identity card from the daemon's
+    /// owner-core identity index (`scoped_state`, `user:<peer>`, key
+    /// `identity.card`). The attached-client read path for peer names: a
+    /// client's local store never holds foreign peers' cards, so
+    /// `peer_alias` / `peer_identity_card` ask the daemon — the identity
+    /// analog of `room_tip` for the transcript.
+    pub async fn peer_identity_card(
+        &self,
+        request: PeerIdentityCardRequest,
+    ) -> Result<PeerIdentityCardResponse, ClientError> {
+        match self.call(Request::PeerIdentityCard(request)).await? {
+            Response::PeerIdentityCard(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }

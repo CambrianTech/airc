@@ -320,6 +320,11 @@ impl Airc {
                     // In-process fan-out for any subscriber of THIS
                     // handle, ring-deduped exactly like the store path.
                     let event = frame.into_transcript_event();
+                    // Record an observed peer identity card into the durable
+                    // index. In daemon-host mode the owner-core sink owns the
+                    // transcript, so this handle's index would never see the
+                    // card via the store path otherwise — observe here.
+                    self.observe_identity_event(&event).await;
                     if self.mark_broadcast(event_id) {
                         let _ = self.inner.live_tx.send(Arc::new(event));
                     }
@@ -439,6 +444,9 @@ impl Airc {
         }
         match self.inner.store.append(event.clone()).await {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
+                // Record an observed peer identity card into the durable
+                // per-peer index (no-op for non-identity events).
+                self.observe_identity_event(&event).await;
                 let _ = self.inner.live_tx.send(Arc::new(event));
                 // Card 39d37629: the receipt fires only AFTER the
                 // append committed (or was already durable) — never

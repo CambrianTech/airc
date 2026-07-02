@@ -292,13 +292,26 @@ impl LocalIdentity {
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
+        // Seed the published card's nick from a NAMED citizen's
+        // agent_name (e.g. `attach_as("Claude")` / `init --as Claude`),
+        // so the very first card it publishes carries "Claude" rather
+        // than an empty name that resolves to a raw uuid for peers. The
+        // DEFAULT scope keeps an empty name — that identity is the
+        // user's, filled in later via `airc identity set`, and "default"
+        // is a discriminator, not a display name.
+        let identity = if agent_name == airc_store::DEFAULT_AGENT_NAME {
+            Identity::default()
+        } else {
+            Identity::new(agent_name)
+        };
+
         store
             .insert_local_identity(StoredLocalIdentity {
                 peer_id,
                 client_id,
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms,
-                identity: Identity::default(),
+                identity,
                 agent_name: agent_name.to_string(),
             })
             .await?;

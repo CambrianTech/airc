@@ -16,11 +16,13 @@
 use std::sync::Arc;
 
 use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_core::{Body, MentionTarget, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind};
+use airc_core::{
+    Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
+};
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest,
-    Response, RoomTipRequest, SendRequest,
+    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget,
+    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -379,6 +381,36 @@ impl Airc {
         Ok(response.tip.map(|tip| TranscriptCursor {
             lamport: pack_seq(tip.epoch, tip.counter),
             event_id: tip.event_id,
+        }))
+    }
+
+    /// One peer's durable identity card from the DAEMON's owner-core
+    /// identity index, or `None` if the peer has never published a card.
+    ///
+    /// The identity analog of [`Self::daemon_latest_transcript_cursor`]:
+    /// when a scope is daemon-attached, its LOCAL store only ever holds
+    /// its own card — foreign peers' cards are observed off the wire into
+    /// the DAEMON's index, never streamed into an attached client's store
+    /// (the daemon's subscribe reader forwards events without running the
+    /// identity-observe chokepoint). So `peer_alias` / `peer_identity_card`
+    /// resolve names via this typed IPC op instead of a local read that
+    /// would answer `None` for every peer but self.
+    pub(crate) async fn daemon_peer_identity_card(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .peer_identity_card(PeerIdentityCardRequest { peer_id })
+            .await?;
+        let Some(card) = response.card else {
+            return Ok(None);
+        };
+        let identity: airc_core::identity::Identity = serde_json::from_str(&card.value_json)?;
+        Ok(Some(airc_core::identity::PeerIdentityCard {
+            peer_id,
+            identity,
+            emitted_at_ms: card.version as u64,
         }))
     }
 

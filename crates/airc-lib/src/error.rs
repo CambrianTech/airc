@@ -49,6 +49,13 @@ pub enum AircError {
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 
+    /// JSON (de)serialization of a value the consumer API owns — e.g. the
+    /// `Identity` card serialized into the durable per-peer identity index
+    /// (scoped_state). A programmer error in practice for fixed-shape
+    /// structs, surfaced rather than swallowed.
+    #[error("serde: {0}")]
+    Serde(#[from] serde_json::Error),
+
     #[error("peer spec: {0}")]
     PeerSpec(#[from] crate::registry::PeerSpecError),
 

@@ -28,6 +28,7 @@ use crate::integrations::codex::{CodexHookArgs, CodexStartArgs};
 use crate::knock_cli::KnockArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
+use crate::state_cli::StateArgs;
 use crate::transport_cli::TransportArgs;
 use crate::work_cli::WorkArgs;
 
@@ -516,6 +517,10 @@ pub enum Command {
 
     /// Identity and whois helpers during Rust cutover.
     Identity(IdentityArgs),
+
+    /// Inspect and edit private scoped state (prefs, cursors, widget UI
+    /// state). The peer-private sibling of the room wall.
+    State(StateArgs),
 
     /// Legacy envelope encryption helpers during Rust cutover.
     Envelope(EnvelopeArgs),
