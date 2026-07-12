@@ -66,9 +66,18 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 /// leave a peer with a binary that compiles-but-doesn't-run.
 ///
 /// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
-/// → else back up the installed binary to `airc.prev`, rebuild in place,
-/// smoke-test (the new binary's `version` reports the pulled SHA), and on
-/// failure restore `airc.prev`.
+/// (the daemon is NEVER touched — see below) → else stop the daemon, back
+/// up the installed binary to `airc.prev`, rebuild in place, smoke-test
+/// (the new binary's `version` reports the pulled SHA), and on failure
+/// restore `airc.prev`.
+///
+/// The no-op path must not restart the daemon: `git fetch`/`pull` only
+/// touch the source checkout, never the running binary, so only the
+/// rebuild+swap needs the daemon down. The pre-fix shape stopped the
+/// daemon BEFORE the SHA compare, which killed the transport owner every
+/// hourly "nothing to auto-update" tick — wiping in-process room state
+/// and blinding every subscribed client for the restart window
+/// (continuum blind-room incidents #2/#3, 2026-07-11/12).
 ///
 /// Platform note: on Windows the live `airc.exe` is locked while this
 /// process runs, so the in-place reinstall (and thus the swap) inherits
@@ -91,9 +100,6 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     }
     let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
 
-    if daemon_was_running {
-        stop_daemon(&airc_exe, home, &socket)?;
-    }
     run_checked(
         Command::new("git")
             .arg("-C")
@@ -111,12 +117,17 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
 
     if before == after {
+        // Nothing pulled → nothing to rebuild → the daemon was never
+        // stopped and MUST NOT be restarted. Restart-on-no-op is the bug
+        // this ordering exists to prevent (hourly transport-owner death).
         println!("Already at {after} — nothing to auto-update.");
-        if daemon_was_running {
-            restart_daemon(&airc_exe, home, &socket)?;
-            wait_daemon_ready(&airc_exe, home, &socket)?;
-        }
         return Ok(());
+    }
+
+    // A real update is pending — only NOW does the binary swap need the
+    // transport owner down.
+    if daemon_was_running {
+        stop_daemon(&airc_exe, home, &socket)?;
     }
 
     // Back up the live binary BEFORE the rebuild — this is the rollback
