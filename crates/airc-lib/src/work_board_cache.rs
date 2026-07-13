@@ -160,7 +160,16 @@ impl WorkBoardCache {
             .ok_or_else(|| std::io::Error::other("cache path has no parent directory"))?;
         std::fs::create_dir_all(dir)?;
         let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // Temp name unique per ATTEMPT, not just per process: an embedded
+        // consumer (continuum core) runs many board reads concurrently in
+        // ONE process, and a pid-only suffix made concurrent saves share a
+        // tmp file — the first rename consumed it, the second ENOENT'd, so
+        // the snapshot never persisted and every subsequent read full-
+        // replayed the room (observed live 2026-07-13: paired failure
+        // lines per persona in the continuum core log).
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -193,6 +202,35 @@ mod tests {
         let loaded = WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon)
             .expect("snapshot loads back");
         assert_eq!(loaded, cache);
+    }
+
+    // what this catches: concurrent saves to the SAME snapshot path must
+    // all persist (continuum #154 tail, live 2026-07-13). The tmp file was
+    // named per-process only, so two threads saving one persona's cache
+    // shared a tmp: the first rename consumed it, the second ENOENT'd, and
+    // the cache never engaged — every board read full-replayed the room.
+    #[test]
+    fn concurrent_saves_to_one_path_all_persist() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let channel = RoomId::from_u128(9);
+        let results: Vec<std::io::Result<()>> = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let home = home.path();
+                    scope.spawn(move || {
+                        let cache = sample(channel);
+                        cache.try_save(&WorkBoardCache::path(home, channel))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        for r in results {
+            r.expect("every concurrent save must persist — shared tmp names race");
+        }
+        assert!(WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon).is_some());
     }
 
     #[test]
