@@ -1979,7 +1979,10 @@ pub async fn run_board(
     filter: BoardFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let board = airc.work_board(limit).await?;
+    // Continuum #154: the board is always the COMPLETE projection —
+    // the old recent-window read lost every durable card to chat
+    // traffic in busy rooms. `limit` now caps displayed rows only.
+    let board = airc.work_board().await?;
     let me = airc.peer_id();
 
     // Pre-fetch published aliases for every distinct non-self owner on
@@ -2011,7 +2014,7 @@ pub async fn run_board(
         }
     }
 
-    print_board(&board, me, filter, &aliases);
+    print_board(&board, me, filter, &aliases, limit);
     Ok(())
 }
 
@@ -2154,6 +2157,7 @@ fn print_board(
     me: airc_lib::PeerId,
     filter: BoardFilter,
     aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
+    limit: usize,
 ) {
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
@@ -2163,20 +2167,36 @@ fn print_board(
     let stale_claims = board.stale_claims(now_ms());
 
     let now = now_ms();
-    let visible: Vec<&airc_work::WorkCard> = snapshot
+    let mut visible: Vec<&airc_work::WorkCard> = snapshot
         .cards
         .iter()
         .filter(|card| filter.matches(card, me, now))
         .collect();
+    // Continuum #154: `limit` caps displayed ROWS of the complete
+    // projection (newest kept), never the event window the board is
+    // built from — truncation is announced, never silent.
+    let matched = visible.len();
+    if matched > limit.max(1) {
+        visible = visible.split_off(matched - limit.max(1));
+    }
     if !visible.is_empty() {
         if matches!(filter, BoardFilter::All) {
-            println!("work cards: {}", visible.len());
+            if visible.len() < matched {
+                println!(
+                    "work cards: showing {} of {} (raise --limit for the rest)",
+                    visible.len(),
+                    matched,
+                );
+            } else {
+                println!("work cards: {}", visible.len());
+            }
         } else {
             println!(
-                "work cards: {} (filter={:?}, hidden={})",
+                "work cards: {} of {} matched (filter={:?}, hidden={})",
                 visible.len(),
+                matched,
                 filter,
-                snapshot.cards.len() - visible.len(),
+                snapshot.cards.len() - matched,
             );
         }
     } else if !matches!(filter, BoardFilter::All) {

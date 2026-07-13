@@ -163,7 +163,9 @@ pub enum WorkAction {
     /// over the projection so peers can see their slice fast (kink
     /// b408698c). When none are passed, the full board is shown.
     Board {
-        /// Recent transcript events to replay into the projection.
+        /// Maximum card rows to display (newest kept). The projection
+        /// itself is always complete — continuum #154: the old
+        /// recent-window read lost durable cards to chat traffic.
         #[arg(long, default_value_t = 128)]
         limit: usize,
         /// Show only cards available to claim now: no active claim, or

@@ -832,7 +832,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             LaneAction::State { lane_id, state } => {
                 lane_commands::run_state(&home, lane_id, state).await
             }
-            LaneAction::Status { limit } => lane_commands::run_status(&home, limit).await,
+            LaneAction::Status { limit: _ } => lane_commands::run_status(&home).await,
             LaneAction::Manager { action } => match action {
                 LaneManagerAction::Claim { repo, ttl_ms } => {
                     lane_commands::run_manager_claim(&home, repo, ttl_ms).await
@@ -840,8 +840,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 LaneManagerAction::Release { repo } => {
                     lane_commands::run_manager_release(&home, repo).await
                 }
-                LaneManagerAction::Status { limit } => {
-                    lane_commands::run_manager_status(&home, limit).await
+                LaneManagerAction::Status { limit: _ } => {
+                    lane_commands::run_manager_status(&home).await
                 }
             },
         },
@@ -922,7 +922,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkspaceAction::Release { workspace_id } => {
                 workspace_commands::run_release(&home, workspace_id).await
             }
-            WorkspaceAction::List { limit } => workspace_commands::run_list(&home, limit).await,
+            WorkspaceAction::List { limit: _ } => workspace_commands::run_list(&home).await,
         },
 
         Command::QueueCard(args) => match args.action {
