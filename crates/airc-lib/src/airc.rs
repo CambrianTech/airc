@@ -381,6 +381,48 @@ impl Airc {
         Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
     }
 
+    /// [`open_as`] that ADOPTS a caller-supplied `peer_id` when it mints a
+    /// fresh identity (owner-mode, no daemon).
+    ///
+    /// A multi-citizen host that derives each citizen's identifier BEFORE
+    /// attach — Continuum personas, whose `agent_name`/home are projected from
+    /// a `persona_id` — passes that id here so `peer_id() == persona_id`, a
+    /// coherent identity from birth. A resumed citizen loads its stored
+    /// identity and the supplied id is ignored (never a rotation).
+    pub async fn open_as_with_peer_id(
+        home: impl Into<PathBuf>,
+        agent_name: impl Into<String>,
+        peer_id: PeerId,
+    ) -> Result<Self, AircError> {
+        Self::open_with_policy_as_with_peer_id(
+            home,
+            VerificationPolicy::Strict,
+            agent_name,
+            peer_id,
+        )
+        .await
+    }
+
+    /// [`attach_as`] that ADOPTS a caller-supplied `peer_id` on a fresh mint —
+    /// the daemon-connected form of [`open_as_with_peer_id`], and the
+    /// constructor a Continuum persona runtime reaches for so its airc
+    /// `peer_id` equals the `persona_id` its name + home were derived from.
+    ///
+    /// Equivalent to:
+    /// ```ignore
+    /// let airc = Airc::open_as_with_peer_id(home, agent_name, peer_id).await?
+    ///     .with_daemon_client(DaemonClient::new(socket));
+    /// ```
+    pub async fn attach_as_with_peer_id(
+        home: impl Into<PathBuf>,
+        agent_name: impl Into<String>,
+        socket: impl Into<PathBuf>,
+        peer_id: PeerId,
+    ) -> Result<Self, AircError> {
+        let airc = Self::open_as_with_peer_id(home, agent_name, peer_id).await?;
+        Ok(airc.with_daemon_client(DaemonClient::new(socket.into())))
+    }
+
     /// Test-only [`attach`] that pins the machine-account wire root
     /// explicitly instead of deriving it from `HOME`/`USERPROFILE`.
     /// Two scopes sharing one `wire_root` resolve the same mesh
@@ -407,7 +449,7 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let wire_root = machine_account_home(&home);
-        Self::open_inner(home, wire_root, policy, None).await
+        Self::open_inner(home, wire_root, policy, None, None).await
     }
 
     /// Variant of [`open_with_policy`] that pins the local agent name
@@ -420,7 +462,25 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let wire_root = machine_account_home(&home);
-        Self::open_inner(home, wire_root, policy, Some(agent_name.into())).await
+        Self::open_inner(home, wire_root, policy, Some(agent_name.into()), None).await
+    }
+
+    /// Variant of [`open_with_policy_as`] that also ADOPTS a caller-supplied
+    /// `peer_id` on a fresh mint. This is the constructor behind
+    /// [`Airc::open_as_with_peer_id`] / [`Airc::attach_as_with_peer_id`]; a
+    /// resumed identity ignores the supplied id and keeps its stored one. See
+    /// [`airc_identity::LocalIdentity::generate_and_save_as_with_peer_id`] for
+    /// the coherence rationale.
+    pub async fn open_with_policy_as_with_peer_id(
+        home: impl Into<PathBuf>,
+        policy: VerificationPolicy,
+        agent_name: impl Into<String>,
+        peer_id: PeerId,
+    ) -> Result<Self, AircError> {
+        let home: PathBuf = home.into();
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let wire_root = machine_account_home(&home);
+        Self::open_inner(home, wire_root, policy, Some(agent_name.into()), Some(peer_id)).await
     }
 
     /// Test-only: open with an explicit machine-account wire root rather
@@ -439,6 +499,7 @@ impl Airc {
             wire_root.into(),
             VerificationPolicy::Strict,
             None,
+            None,
         )
         .await
     }
@@ -448,10 +509,17 @@ impl Airc {
         wire_root: PathBuf,
         policy: VerificationPolicy,
         agent_name: Option<String>,
+        // Adopted as the local `peer_id` ONLY on a fresh mint under a named
+        // agent (see `LocalIdentity::load_or_generate_as_with_peer_id`).
+        // `None` mints a random id, the historical behavior. Ignored without
+        // an `agent_name` (the anonymous default-scope path never pins ids).
+        peer_id: Option<PeerId>,
     ) -> Result<Self, AircError> {
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let identity = match agent_name {
-            Some(agent_name) => LocalIdentity::load_or_generate_as(&home, agent_name).await?,
+            Some(agent_name) => {
+                LocalIdentity::load_or_generate_as_with_peer_id(&home, agent_name, peer_id).await?
+            }
             None => LocalIdentity::load_or_generate(&home).await?,
         };
         std::fs::create_dir_all(&wire_root).map_err(IdentityError::Io)?;
