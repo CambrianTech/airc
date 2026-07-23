@@ -574,7 +574,7 @@ impl Airc {
                 // restarted daemon's new port outranks every reader's
                 // stored copy of the old one.
                 endpoints_advertised_at_ms: (!self_endpoints.is_empty())
-                    .then(|| crate::time::now_ms())
+                    .then(crate::time::now_ms)
                     .transpose()?,
                 endpoints: self_endpoints,
             });
