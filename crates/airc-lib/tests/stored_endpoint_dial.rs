@@ -304,17 +304,33 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
     alice.add_peer(bob_spec).await.expect("alice trusts bob");
     bob.add_peer(alice_spec).await.expect("bob trusts alice");
 
-    // Loopback stands in for the LAN IP (reachable via the wildcard
-    // listener); the 100.x Tailscale address is off-box and unreachable.
+    // Bind the wildcard listener (advertising only the unreachable 100.x
+    // Tailscale rung — self-healing join's advertise hygiene rightly
+    // refuses loopback as a LAN advertisement), then build the peer-side
+    // endpoint set MANUALLY with loopback standing in for the LAN IP.
+    // This test pins the DIAL ladder, not the advertise filter, and an
+    // import can legitimately hold any addr an older/other node stored.
     let advertised = alice
-        .listen_lan_advertising(
-            Some(Ipv4Addr::LOCALHOST),
-            Some(Ipv4Addr::new(100, 79, 156, 3)),
-        )
+        .listen_lan_advertising(None, Some(Ipv4Addr::new(100, 79, 156, 3)))
         .await
-        .expect("alice advertises both");
+        .expect("alice advertises the tailscale rung");
+    let port = advertised
+        .iter()
+        .find_map(|endpoint| match endpoint {
+            RouteEndpoint::TailscaleTcp { addr } => Some(addr.port()),
+            _ => None,
+        })
+        .expect("tailscale rung advertised");
+    let both_rungs = vec![
+        RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        },
+        RouteEndpoint::TailscaleTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(100, 79, 156, 3), port)),
+        },
+    ];
 
-    let endpoints_json = endpoints_to_json(&advertised).expect("encode endpoints");
+    let endpoints_json = endpoints_to_json(&both_rungs).expect("encode endpoints");
     airc_trust::set_endpoints_json(
         bob.home(),
         alice.peer_id(),

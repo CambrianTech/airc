@@ -178,6 +178,7 @@ pub use route::{
     PeerDialSkip, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
     TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
     TransportKind, TransportResolver, TransportRole, TransportRoute,
+    DEAD_AFTER_CONSECUTIVE_FAILURES,
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};

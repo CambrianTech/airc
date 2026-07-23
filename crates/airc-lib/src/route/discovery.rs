@@ -99,8 +99,15 @@ pub struct PeerDialSkip {
     pub peer_id: PeerId,
     pub endpoint: RouteEndpoint,
     /// Milliseconds of backoff remaining before this endpoint is dialed
-    /// again.
+    /// again. `0` when [`Self::dead`] (no timer applies — only a fresher
+    /// advertisement revives a dead endpoint).
     pub remaining_ms: u64,
+    /// Self-healing join — failure-counted eviction: `true` when the
+    /// endpoint is DEAD (`DEAD_AFTER_CONSECUTIVE_FAILURES` consecutive
+    /// failures, no fresher advertisement since) rather than in a timed
+    /// backoff window. Surfaced distinctly so `transport health` never
+    /// mislabels an eviction as a countdown.
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +274,11 @@ impl Airc {
         let mut order: Vec<PeerId> = Vec::new();
         let mut merged: std::collections::HashMap<PeerId, Vec<RouteEndpoint>> =
             std::collections::HashMap::new();
+        // Self-healing join: the freshest endpoint-set stamp seen for
+        // each peer across both stores — the failure-counted eviction's
+        // revival signal (a fresher advertisement lifts a dead verdict).
+        let mut advert_stamps: std::collections::HashMap<PeerId, u64> =
+            std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
@@ -313,6 +325,8 @@ impl Airc {
                     slot.push(endpoint);
                 }
             }
+            let stamp = advert_stamps.entry(peer.peer_id).or_insert(0);
+            *stamp = (*stamp).max(peer.endpoints_advertised_at_ms);
         }
 
         // #9: prepend each peer's LEARNED real IP (harvested from an
@@ -346,9 +360,14 @@ impl Airc {
         // tests pin). What is now CONCURRENT is ACROSS peers: dialing
         // peer B must not wait on peer A's 3s timeout (see
         // DIAL_CONCURRENCY — the serial-sum hang this fixes).
-        let dial_list: Vec<(PeerId, Vec<RouteEndpoint>)> = order
+        let dial_list: Vec<(PeerId, Vec<RouteEndpoint>, u64)> = order
             .into_iter()
-            .filter_map(|peer_id| merged.remove(&peer_id).map(|eps| (peer_id, eps)))
+            .filter_map(|peer_id| {
+                merged.remove(&peer_id).map(|eps| {
+                    let stamp = advert_stamps.get(&peer_id).copied().unwrap_or(0);
+                    (peer_id, eps, stamp)
+                })
+            })
             .collect();
 
         // Dial peers concurrently (bounded), then merge results in the
@@ -359,8 +378,12 @@ impl Airc {
         // distinct peers do not race.
         let mut dialed: Vec<(usize, PeerDialOutcome)> =
             futures::stream::iter(dial_list.into_iter().enumerate())
-                .map(|(idx, (peer_id, endpoints))| async move {
-                    (idx, self.dial_one_peer(peer_id, endpoints, now_ms).await)
+                .map(|(idx, (peer_id, endpoints, advert_stamp_ms))| async move {
+                    (
+                        idx,
+                        self.dial_one_peer(peer_id, endpoints, now_ms, advert_stamp_ms)
+                            .await,
+                    )
                 })
                 .buffer_unordered(DIAL_CONCURRENCY)
                 .collect()
@@ -384,6 +407,7 @@ impl Airc {
         peer_id: PeerId,
         endpoints: Vec<RouteEndpoint>,
         now_ms: u64,
+        advert_stamp_ms: u64,
     ) -> PeerDialOutcome {
         let mut failures = Vec::new();
         let mut skips = Vec::new();
@@ -408,15 +432,32 @@ impl Airc {
                     // `airc transport health`'s failure count. The operator still
                     // sees "in backoff" via the skips channel — honest, not a
                     // clean-list lie and not an over-report.
-                    if let Some(remaining_ms) =
-                        self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
-                    {
-                        skips.push(PeerDialSkip {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            remaining_ms,
-                        });
-                        continue;
+                    match self.dial_quarantine_gate(peer_id, addr, now_ms, advert_stamp_ms) {
+                        super::dial_quarantine::DialGate::Dial => {}
+                        super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms,
+                                dead: false,
+                            });
+                            continue;
+                        }
+                        // Self-healing join — failure-counted eviction:
+                        // the endpoint is DEAD (kept on the record,
+                        // never dialed) until a fresher advertisement
+                        // arrives. This is what stops the 172.x ghost
+                        // swarm from burning a 3s timeout per corpse
+                        // per refresh, forever.
+                        super::dial_quarantine::DialGate::Dead { .. } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms: 0,
+                                dead: true,
+                            });
+                            continue;
+                        }
                     }
                     // #1120 sentinel blocking-2: connect_lan has no inner
                     // timeout, and a SYN-dropping firewall (the default posture
@@ -434,7 +475,12 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
-                            self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                peer_id,
+                                addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -442,7 +488,12 @@ impl Airc {
                             });
                         }
                         Err(_elapsed) => {
-                            self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                peer_id,
+                                addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -472,15 +523,27 @@ impl Airc {
                     let Some((relay_peer, relay_addr)) = endpoint.connectable_relay() else {
                         continue;
                     };
-                    if let Some(remaining_ms) =
-                        self.dial_quarantine_remaining_ms(relay_peer, relay_addr, now_ms)
+                    match self.dial_quarantine_gate(relay_peer, relay_addr, now_ms, advert_stamp_ms)
                     {
-                        skips.push(PeerDialSkip {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            remaining_ms,
-                        });
-                        continue;
+                        super::dial_quarantine::DialGate::Dial => {}
+                        super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms,
+                                dead: false,
+                            });
+                            continue;
+                        }
+                        super::dial_quarantine::DialGate::Dead { .. } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms: 0,
+                                dead: true,
+                            });
+                            continue;
+                        }
                     }
                     match tokio::time::timeout(
                         PEER_DIAL_TIMEOUT,
@@ -496,7 +559,12 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
-                            self.dial_quarantine_record_failure(relay_peer, relay_addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                relay_peer,
+                                relay_addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -504,7 +572,12 @@ impl Airc {
                             });
                         }
                         Err(_elapsed) => {
-                            self.dial_quarantine_record_failure(relay_peer, relay_addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                relay_peer,
+                                relay_addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -626,38 +699,43 @@ impl Airc {
         })
     }
 
-    /// Card 7e3c9a1f: backoff remaining for `(peer_id, addr)`, or `None`
-    /// when not quarantined. Keyed per-peer so a recycled container IP
-    /// under a new peer is not shadow-banned by a dead peer's failure.
-    /// Brief lock, never held across an await.
-    fn dial_quarantine_remaining_ms(
+    /// Card 7e3c9a1f + self-healing join: the dial verdict for
+    /// `(peer_id, addr)` — timed backoff, failure-counted DEAD (until a
+    /// fresher advertisement, per `current_advert_stamp_ms`), or dial.
+    /// Keyed per-peer so a recycled container IP under a new peer is
+    /// not shadow-banned by a dead peer's failure. Brief lock, never
+    /// held across an await.
+    fn dial_quarantine_gate(
         &self,
         peer_id: PeerId,
         addr: std::net::SocketAddr,
         now_ms: u64,
-    ) -> Option<u64> {
+        current_advert_stamp_ms: u64,
+    ) -> super::dial_quarantine::DialGate {
         let guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.remaining_ms(&(peer_id, addr), now_ms)
+        guard.gate(&(peer_id, addr), now_ms, current_advert_stamp_ms)
     }
 
     /// Card 7e3c9a1f: stamp a failed dial to `(peer_id, addr)` (starts /
-    /// doubles the backoff).
+    /// doubles the backoff, grows the eviction streak, and remembers the
+    /// advertisement stamp the failure occurred under).
     fn dial_quarantine_record_failure(
         &self,
         peer_id: PeerId,
         addr: std::net::SocketAddr,
         now_ms: u64,
+        advert_stamp_ms: u64,
     ) {
         let mut guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.record_failure((peer_id, addr), now_ms);
+        guard.record_failure((peer_id, addr), now_ms, advert_stamp_ms);
     }
 
     /// Card 7e3c9a1f: clear any quarantine on `(peer_id, addr)` after a
