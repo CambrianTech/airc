@@ -826,6 +826,28 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             )));
         }
         document.validate()?;
+        // #4 registry hygiene: prune stale peers before persisting. The
+        // reader-merge (below) and the FS store both drop beacons past
+        // DEFAULT_PEER_FRESHNESS_TTL_MS, but the GH WRITE path never did — so
+        // a machine's own gist accumulated dead beacons forever (past
+        // sessions, dead containers). They vanish from the live merge yet
+        // linger in the persisted gist, which is why `airc network` kept
+        // counting ~46 stale. Reuse the ONE canonical pruner at the missing
+        // write site; clone because the trait hands us `&document`.
+        let mut owned = document.clone();
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
+        })?;
+        let pruned = prune_stale_peers(&mut owned.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
+        if pruned > 0 {
+            StderrJsonDiagnosticSink.emit(DiagnosticEvent::warn(
+                DiagnosticComponent::Daemon,
+                DiagnosticCode::AccountRegistryStaleBeaconsPruned,
+                "account-registry publish pruned stale peer beacon(s) from the persisted gist \
+                 before write — dead routes never re-persisted",
+            ));
+        }
+        let document = &owned;
         let body = serde_json::to_string_pretty(document).map_err(|error| {
             AccountRegistryError::Adapter(format!("serialize registry: {error}"))
         })?;
