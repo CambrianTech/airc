@@ -1420,6 +1420,14 @@ pub async fn run_daemon(
                          (LAN dialed first; off-LAN peers fall through to Tailscale \
                          after a ~3s LAN-rung timeout, once per session)"
                     );
+                    // Self-healing join — publish-on-bind: a freshly bound
+                    // listener (daemon restart, possibly on a NEW port when
+                    // the stable port was taken) must propagate to the
+                    // rendezvous NOW, not at the refresh loop's first
+                    // cadence tick. `Notify` stores the permit, so the loop
+                    // below publishes immediately on start. Idempotent: an
+                    // unchanged advertisement republishes the same document.
+                    registry_state.endpoint_resync.notify_one();
                 }
                 Err(error) => {
                     eprintln!(
@@ -1744,11 +1752,18 @@ async fn refresh_routes_once(
                         )
                         .await
                     {
-                        Ok(addr) => eprintln!(
-                            "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
-                             self-elected as a relay (listening {addr}) and advertised it on \
-                             this node's routable IP(s) (#1247)"
-                        ),
+                        Ok(addr) => {
+                            eprintln!(
+                                "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                                 self-elected as a relay (listening {addr}) and advertised it on \
+                                 this node's routable IP(s) (#1247)"
+                            );
+                            // Self-healing join — publish-on-bind: the relay
+                            // listener just bound; propagate the new relay
+                            // endpoint to the rendezvous now instead of
+                            // waiting up to a full registry cadence.
+                            endpoint_resync.notify_one();
+                        }
                         Err(error) => eprintln!(
                             "airc daemon: relay self-election failed ({error}); \
                              retrying next interval"
