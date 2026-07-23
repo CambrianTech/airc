@@ -152,6 +152,7 @@ pub use gh::client::{
 };
 pub use gh::governor::{GhBudget, Reservation};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
+pub use lan::{is_tailscale_ipv4, lan_advertise_rejection, tailscale_advertise_rejection};
 pub use lane_coordination::{
     LaneAction, LaneCoordinationEvent, LaneStatus, HEADER_COORD_KIND, HEADER_COORD_LANE_ID,
     HEADER_COORD_PR,
