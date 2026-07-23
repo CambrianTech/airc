@@ -355,14 +355,37 @@ fn run_command(argv: &[&str]) -> Option<String> {
 /// Last-resort identity: `local:<host>:<user>`. Deterministic per
 /// machine+user but does NOT converge across machines or with the
 /// operator's `gh` identity — the operator should know about this.
+///
+/// Cross-platform: on Windows the POSIX probes ALL fail (`HOSTNAME`
+/// and `USER`/`LOGNAME` env vars don't exist; `hostname -s` is
+/// rejected by Windows hostname.exe), which used to collapse every
+/// Windows machine onto the SAME degenerate
+/// `local:unknown-host:unknown-user` identity — the exact fingerprint
+/// of the M5↔bigmama blind-room bug (bigmama's `#general` derived to
+/// `eef18336-…` under that identity while M5 derived `5eedf7b1-…`
+/// under the gh login, so every room frame between them died as
+/// `unknown_channel`). `COMPUTERNAME`/`USERNAME` are the Windows
+/// equivalents; bare `hostname` (no flag) works on every platform.
 fn local_fallback_identity() -> String {
-    let host = std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| run_command(&["hostname", "-s"]))
+    local_fallback_identity_with(&|name| std::env::var(name).ok(), &run_command)
+}
+
+/// Injectable core of [`local_fallback_identity`] — env + command
+/// lookups passed in so tests can pin the per-platform fallback chain
+/// without mutating process globals.
+fn local_fallback_identity_with(
+    env: &dyn Fn(&str) -> Option<String>,
+    run: &dyn Fn(&[&str]) -> Option<String>,
+) -> String {
+    let non_empty = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    let host = non_empty(env("HOSTNAME"))
+        .or_else(|| non_empty(env("COMPUTERNAME"))) // Windows
+        .or_else(|| non_empty(run(&["hostname", "-s"])))
+        .or_else(|| non_empty(run(&["hostname"]))) // Windows hostname.exe rejects -s
         .unwrap_or_else(|| "unknown-host".to_string());
-    let user = std::env::var("USER")
-        .ok()
-        .or_else(|| std::env::var("LOGNAME").ok())
+    let user = non_empty(env("USER"))
+        .or_else(|| non_empty(env("LOGNAME")))
+        .or_else(|| non_empty(env("USERNAME"))) // Windows
         .unwrap_or_else(|| "unknown-user".to_string());
     format!("local:{host}:{user}")
 }
@@ -578,6 +601,49 @@ mod tests {
         save(&store, &entry).await.unwrap();
         let loaded = load_cached(&store).await.unwrap().unwrap();
         assert_eq!(loaded, entry);
+    }
+
+    /// what this catches (M5↔bigmama blind room, root cause): on
+    /// Windows the POSIX env probes all miss, and the old chain
+    /// collapsed to `local:unknown-host:unknown-user` — the SAME
+    /// degenerate identity on every Windows box, silently forking room
+    /// UUID derivation from the account identity. The fallback must
+    /// consult the Windows equivalents before giving up.
+    #[test]
+    fn local_fallback_uses_windows_env_names() {
+        let windows_env = |name: &str| match name {
+            "COMPUTERNAME" => Some("BigMama".to_string()),
+            "USERNAME" => Some("joelt".to_string()),
+            _ => None,
+        };
+        // Windows hostname.exe: `-s` fails (non-zero exit → None),
+        // bare `hostname` would answer — but env wins first.
+        let no_command = |_argv: &[&str]| None;
+        assert_eq!(
+            local_fallback_identity_with(&windows_env, &no_command),
+            "local:BigMama:joelt"
+        );
+    }
+
+    /// what this catches: `hostname -s` failing (Windows) must fall
+    /// through to bare `hostname`, and empty/whitespace probe output
+    /// must not be accepted as a host or user component.
+    #[test]
+    fn local_fallback_hostname_flag_fallthrough_and_empty_rejection() {
+        let empty_env = |name: &str| match name {
+            // Empty values are as bad as missing — never accept them.
+            "HOSTNAME" => Some("   ".to_string()),
+            "USERNAME" => Some("joelt".to_string()),
+            _ => None,
+        };
+        let windows_hostname = |argv: &[&str]| match argv {
+            ["hostname"] => Some("BigMama".to_string()),
+            _ => None, // `hostname -s` → non-zero exit on Windows
+        };
+        assert_eq!(
+            local_fallback_identity_with(&empty_env, &windows_hostname),
+            "local:BigMama:joelt"
+        );
     }
 
     #[test]
