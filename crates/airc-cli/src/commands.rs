@@ -1104,6 +1104,143 @@ pub async fn run_lan_send(
     }
 }
 
+/// Self-healing join — `airc dial HOST:PORT`: manual recovery dial with
+/// the full authenticated handshake, LOUD either way.
+///
+/// Why it exists (M5↔bigmama live repro): when the automatic paths are
+/// wedged — a peer dialing our dead port, a poisoned record — ONE
+/// hands-on authenticated dial both proves reachability AND teaches the
+/// REMOTE side our real source address (learn-live-address, #9), which
+/// un-wedges its next outbound dial. This is the manual override that
+/// used to require hand-driven `lan-send` gymnastics.
+///
+/// The expected peer (for mTLS cert pinning) is inferred when `--peer`
+/// is omitted: first a stored-endpoint exact match, then the
+/// identity-derived stable port (#8). Ambiguity or no match is a loud
+/// error naming the candidates — never a guess.
+pub async fn run_dial(
+    home: &Path,
+    peers: Vec<PeerSpec>,
+    to: std::net::SocketAddr,
+    expected_peer: Option<PeerId>,
+    timeout_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+
+    let expected = match expected_peer {
+        Some(peer) => peer,
+        None => infer_peer_for_endpoint(&airc, home, to).await?,
+    };
+    preflight_expected_peer(&airc, home, &peers, expected).await?;
+
+    println!("dialing {to} expecting peer {expected} …");
+    let deadline = std::time::Duration::from_millis(timeout_ms);
+    match tokio::time::timeout(deadline, airc.connect_lan(to, expected)).await {
+        Ok(Ok(())) => {
+            // A successful authenticated dial IS fresh contact — stamp
+            // recency so the liveness/ghost classifiers see it (same
+            // contract as the registry import's touch). Best-effort on
+            // both stores; `Ok(None)` just means the peer lives in the
+            // other one.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = airc_trust::touch_last_seen(airc.wire_root(), expected, now_ms).await;
+            let _ = airc_trust::touch_last_seen(home, expected, now_ms).await;
+            println!(
+                "CONNECTED: authenticated handshake with {expected} at {to} succeeded.\n\
+                 The remote has now learned THIS machine's real source address \
+                 (learn-live-address) — its next outbound dial can use it even if its \
+                 stored endpoint for us is stale."
+            );
+            Ok(())
+        }
+        Ok(Err(error)) => Err(format!(
+            "DIAL FAILED: {to} (expecting {expected}) — {error}\n\
+             The endpoint answered nothing acceptable. Check `airc network` for the \
+             peer's freshest advertisement, or `airc registry sync` to re-read the \
+             rendezvous."
+        )
+        .into()),
+        Err(_elapsed) => Err(format!(
+            "DIAL FAILED: {to} (expecting {expected}) — no TCP+TLS handshake within \
+             {timeout_ms}ms (endpoint unreachable, or a firewall drops SYN)."
+        )
+        .into()),
+    }
+}
+
+/// Infer which enrolled peer owns `to` for cert pinning: an exact match
+/// against stored endpoints first, else the identity-derived stable
+/// port (#8 — `stable_lan_port(peer_id) == to.port()`). Exactly one
+/// candidate wins; zero or several is a loud error asking for `--peer`.
+async fn infer_peer_for_endpoint(
+    airc: &Airc,
+    home: &Path,
+    to: std::net::SocketAddr,
+) -> Result<PeerId, Box<dyn std::error::Error>> {
+    let mut stored = airc_trust::load(airc.wire_root()).await.unwrap_or_default();
+    if airc.wire_root() != home {
+        stored.extend(airc_trust::load(home).await.unwrap_or_default());
+    }
+    let mut endpoint_matches: Vec<PeerId> = Vec::new();
+    let mut port_matches: Vec<PeerId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for peer in stored {
+        if peer.peer_id == airc.peer_id() || !seen.insert(peer.peer_id) {
+            continue;
+        }
+        if let Some(json) = peer.endpoints_json.as_deref() {
+            if let Ok(endpoints) = airc_lib::endpoints_from_json(json) {
+                let hit = endpoints.iter().any(|endpoint| {
+                    matches!(
+                        endpoint,
+                        airc_lib::RouteEndpoint::LanTcp { addr }
+                        | airc_lib::RouteEndpoint::TailscaleTcp { addr } if *addr == to
+                    )
+                });
+                if hit {
+                    endpoint_matches.push(peer.peer_id);
+                    continue;
+                }
+            }
+        }
+        if airc_lib::stable_lan_port(peer.peer_id) == to.port() {
+            port_matches.push(peer.peer_id);
+        }
+    }
+    let candidates = if endpoint_matches.is_empty() {
+        port_matches
+    } else {
+        endpoint_matches
+    };
+    match candidates.as_slice() {
+        [one] => {
+            println!("inferred expected peer {one} for {to} (trust-store match)");
+            Ok(*one)
+        }
+        [] => Err(format!(
+            "cannot infer which peer to expect at {to}: no enrolled peer's stored \
+             endpoint or stable port matches. Pass --expected-peer <uuid> (see `airc peers`)."
+        )
+        .into()),
+        several => Err(format!(
+            "ambiguous: {} enrolled peers match {to} ({}). Pass --expected-peer <uuid>.",
+            several.len(),
+            several
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into()),
+    }
+}
+
 /// Card bf7c30e2: verify `expected_peer` is known to the SAME trust
 /// material the TLS verifier will pin against — the opened handle's
 /// `peers()` union (scope store + machine-account store + wire-root

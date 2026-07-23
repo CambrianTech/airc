@@ -398,7 +398,11 @@ impl Airc {
 /// (49152..=65535); two scopes on one machine have different peer_ids →
 /// different ports (no self-collision), and the caller falls back to an
 /// ephemeral port if this one is already taken.
-fn stable_lan_port(peer_id: PeerId) -> u16 {
+///
+/// Public since self-healing join: the `airc dial` recovery verb uses it
+/// to infer WHICH enrolled peer owns a bare `host:port` (the port is
+/// identity-derived, so a match identifies the peer to cert-pin).
+pub fn stable_lan_port(peer_id: PeerId) -> u16 {
     const DYNAMIC_BASE: u128 = 49152; // first IANA dynamic/private port
     const DYNAMIC_SPAN: u128 = 65536 - DYNAMIC_BASE; // 16384 ports
     (DYNAMIC_BASE + (peer_id.as_uuid().as_u128() % DYNAMIC_SPAN)) as u16
