@@ -102,6 +102,15 @@ pub struct RouterInboundBridge {
     router: EventRouter,
     coordinator_store: Arc<dyn EventStore>,
     diag_sink: Arc<dyn DiagnosticSink>,
+    /// Self-healing join: the machine's LOCAL account-registry cache
+    /// (`SqliteAccountRegistryStore` over the same events.sqlite in
+    /// production). When an inbound frame's channel is unbound, the
+    /// bridge consults this for the account's KNOWN channels and
+    /// re-binds from the registry's beacons instead of silently
+    /// store-and-dropping (the "blind room"). `None` (tests, embedded
+    /// handles without a rendezvous) keeps the plain unknown-channel
+    /// verdict.
+    account_registry: Option<Arc<dyn crate::account_registry::AccountRegistryStore>>,
 }
 
 impl RouterInboundBridge {
@@ -113,6 +122,7 @@ impl RouterInboundBridge {
             router,
             coordinator_store,
             diag_sink: Arc::new(StderrJsonDiagnosticSink),
+            account_registry: None,
         }
     }
 
@@ -121,6 +131,18 @@ impl RouterInboundBridge {
     #[must_use]
     pub fn with_diagnostic_sink(mut self, sink: Arc<dyn DiagnosticSink>) -> Self {
         self.diag_sink = sink;
+        self
+    }
+
+    /// Attach the machine's local account-registry cache so
+    /// unknown-channel frames can auto-rebind (self-healing join). See
+    /// [`Self::try_rebind_known_channel`].
+    #[must_use]
+    pub fn with_account_registry(
+        mut self,
+        registry: Arc<dyn crate::account_registry::AccountRegistryStore>,
+    ) -> Self {
+        self.account_registry = Some(registry);
         self
     }
 
@@ -150,6 +172,118 @@ impl RouterInboundBridge {
             .flat_map(|beacon| beacon.subscribed_channels.iter())
             .any(|name| derive_room_id(&identity, name) == channel))
     }
+
+    /// Self-healing join — the "blind room" heal (M5↔bigmama decay
+    /// mode #5: a frame from a connected peer landed durably but
+    /// `#general` resolved to unknown_channel, stored and never
+    /// surfaced).
+    ///
+    /// When no scope binds `channel`, ask the account registry's local
+    /// cache whether the ACCOUNT knows it (a channel name in the
+    /// merged document, or any beacon subscribing it, derives to this
+    /// `RoomId`). If so, re-publish the registry's subscribing
+    /// presence beacons into the coordinator store — restoring the
+    /// durable binding that a drained/wiped beacon table lost — then
+    /// re-check. LOUD either way: the rebind emits
+    /// [`DiagnosticCode::UnknownChannelRebound`]; a channel the
+    /// account does not know falls through to the existing
+    /// unknown-channel diagnostics.
+    ///
+    /// Returns `true` iff the channel is bound after the heal.
+    async fn try_rebind_known_channel(&self, channel: RoomId) -> bool {
+        let Some(registry) = &self.account_registry else {
+            return false;
+        };
+        let Ok(cached) = crate::mesh_identity::resolve(self.coordinator_store.as_ref()).await
+        else {
+            // Identity unreadable was already diagnosed by the bound
+            // check; nothing further to add here.
+            return false;
+        };
+        let identity = cached.as_mesh_identity();
+        let document = match registry.refresh(&identity).await {
+            Ok(Some(document)) => document,
+            Ok(None) => return false,
+            Err(error) => {
+                self.diag_sink.emit(
+                    DiagnosticEvent::warn(
+                        DiagnosticComponent::Subscriber,
+                        DiagnosticCode::FrameUndeliverable,
+                        "account-registry cache unreadable while healing an unbound channel",
+                    )
+                    .with_field("channel", channel)
+                    .with_field("error", error.to_string()),
+                );
+                return false;
+            }
+        };
+        // Does the account know this channel? Check the document's
+        // channel union AND every beacon's subscription list (belt and
+        // braces — older documents may carry one but not the other).
+        let Some(name) = document
+            .channels
+            .iter()
+            .chain(
+                document
+                    .peers
+                    .iter()
+                    .flat_map(|peer| peer.presence.subscribed_channels.iter()),
+            )
+            .find(|name| derive_room_id(&identity, name) == channel)
+            .cloned()
+        else {
+            return false;
+        };
+        // Re-bind: republish every registry beacon that subscribes the
+        // channel into the coordinator store (idempotent upsert — the
+        // exact write `join`'s publish_presence does).
+        let mut rebound = 0usize;
+        for peer in &document.peers {
+            if !peer.presence.subscribed_channels.contains(&name) {
+                continue;
+            }
+            match coordinator::publish_store(
+                self.coordinator_store.as_ref(),
+                &identity,
+                &peer.presence,
+            )
+            .await
+            {
+                Ok(()) => rebound += 1,
+                Err(error) => {
+                    self.diag_sink.emit(
+                        DiagnosticEvent::warn(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "could not republish a registry beacon while healing an \
+                             unbound channel",
+                        )
+                        .with_field("channel", channel)
+                        .with_field("peer", peer.presence.peer_id)
+                        .with_field("error", error.to_string()),
+                    );
+                }
+            }
+        }
+        if rebound == 0 {
+            return false;
+        }
+        self.diag_sink.emit(
+            DiagnosticEvent::warn(
+                DiagnosticComponent::Subscriber,
+                DiagnosticCode::UnknownChannelRebound,
+                "inbound frame's channel had NO bound scope, but the account registry \
+                 knows it — re-bound from the registry's beacons so the room is no \
+                 longer blind",
+            )
+            .with_field("channel", channel)
+            .with_field("channel_name", name.as_str())
+            .with_field("rebound_beacons", rebound),
+        );
+        // The verdict must stay honest: only claim Delivered if the
+        // re-published beacons actually bind the channel now.
+        matches!(self.channel_has_subscribed_scope(channel).await, Ok(true))
+    }
 }
 
 #[async_trait]
@@ -169,7 +303,16 @@ impl InboundFrameSink for RouterInboundBridge {
             Ok(PublishIfNew::Published(_)) | Ok(PublishIfNew::Duplicate) => {
                 match self.channel_has_subscribed_scope(channel).await {
                     Ok(true) => InboundDeliveryVerdict::Delivered,
-                    Ok(false) => InboundDeliveryVerdict::UnknownChannel,
+                    // Self-healing join: before concluding "stored but
+                    // blind", try re-binding from the account
+                    // registry's known channels (decay mode #5).
+                    Ok(false) => {
+                        if self.try_rebind_known_channel(channel).await {
+                            InboundDeliveryVerdict::Delivered
+                        } else {
+                            InboundDeliveryVerdict::UnknownChannel
+                        }
+                    }
                     Err(error) => {
                         // Can't read the beacon set ⇒ can't honestly
                         // claim a subscribed scope will see it. Loud,

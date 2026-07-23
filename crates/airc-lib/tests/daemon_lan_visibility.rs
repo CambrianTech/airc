@@ -419,3 +419,117 @@ async fn delivered_ack_means_visible_to_subscribed_scopes_not_just_durable() {
         "the pre-subscription frame stays durable and replays to a late joiner"
     );
 }
+
+/// what this catches (self-healing join, M5↔bigmama decay mode #5 —
+/// the "blind room"): an inbound frame for a channel NO scope binds
+/// used to be durably stored and never surfaced, with only a stderr
+/// diagnostic. When the account registry's local cache KNOWS the
+/// channel, the bridge must re-bind from the registry's beacons and
+/// deliver — and a channel the account does NOT know must keep the
+/// honest unknown-channel verdict. Mutation checks: dropping the
+/// `try_rebind_known_channel` call keeps the first assert at
+/// UnknownChannel; dropping the post-rebind re-check would claim
+/// Delivered even when binding failed (the second frame's no-new-diag
+/// assert pins the binding actually persisted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
+    use airc_lib::AccountRegistryStore as _;
+
+    let machine = Machine::boot().await;
+    let store = machine_coordinator_store(&machine).await;
+    let identity = airc_lib::resolve_mesh_identity(store.as_ref())
+        .await
+        .expect("resolve mesh identity")
+        .as_mesh_identity();
+
+    // Seed the LOCAL account-registry cache: the account knows
+    // #general via a remote machine's beacon. No scope on THIS machine
+    // has ever joined, so the coordinator store holds no binding.
+    let channel_name = airc_lib::subscriptions::ChannelName::new("general").expect("channel");
+    let remote_peer = PeerId::new();
+    let remote_keypair = airc_protocol::PeerKeypair::generate();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let document = airc_lib::AccountRegistryDocument::new(
+        identity.clone(),
+        now_ms,
+        vec![channel_name.clone()],
+        vec![airc_lib::AccountPeerBeacon {
+            presence: airc_lib::beacon_now(
+                remote_peer,
+                "/machine/remote/.airc".into(),
+                vec![channel_name.clone()],
+                123,
+                now_ms,
+            ),
+            peer_spec: PeerSpec {
+                peer_id: remote_peer,
+                pubkey: remote_keypair.public_bytes(),
+            },
+            endpoints: Vec::new(),
+            endpoints_advertised_at_ms: None,
+        }],
+    );
+    let concrete = Arc::new(
+        SqliteEventStore::open_path(&machine.wire_root().join("events.sqlite"))
+            .await
+            .expect("open concrete machine store"),
+    );
+    let registry = Arc::new(airc_lib::SqliteAccountRegistryStore::new(concrete));
+    registry.publish(&document).await.expect("seed cache");
+
+    let sink = MemoryDiagnosticSink::default();
+    let bridge = RouterInboundBridge::new(machine.daemon.router(), store.clone())
+        .with_account_registry(registry)
+        .with_diagnostic_sink(Arc::new(sink.clone()));
+
+    // Control: a channel the ACCOUNT does not know keeps the honest
+    // unknown-channel verdict (durable, blind, loudly diagnosed by the
+    // transport layer above the bridge).
+    let unknown = RoomId::new();
+    assert_eq!(
+        bridge
+            .deliver(&inbound_frame(unknown, EventId::new(), "nobody knows me"))
+            .await,
+        InboundDeliveryVerdict::UnknownChannel,
+        "an account-unknown channel must not fake a rebind"
+    );
+
+    // The heal: the frame's channel derives from a registry-known name
+    // → rebound from the registry beacon and DELIVERED.
+    let general = airc_lib::subscriptions::derive_room_id(&identity, &channel_name);
+    assert_eq!(
+        bridge
+            .deliver(&inbound_frame(general, EventId::new(), "hello blind room"))
+            .await,
+        InboundDeliveryVerdict::Delivered,
+        "a registry-known channel must re-bind and deliver, not store-and-drop"
+    );
+    let rebinds = |sink: &MemoryDiagnosticSink| {
+        sink.events()
+            .iter()
+            .filter(|event| event.code == DiagnosticCode::UnknownChannelRebound)
+            .count()
+    };
+    assert_eq!(
+        rebinds(&sink),
+        1,
+        "the rebind must be LOUD (one diagnostic)"
+    );
+
+    // The binding persists: the next frame delivers with NO further
+    // rebind — the heal restored durable state, not a per-frame patch.
+    assert_eq!(
+        bridge
+            .deliver(&inbound_frame(general, EventId::new(), "second frame"))
+            .await,
+        InboundDeliveryVerdict::Delivered,
+    );
+    assert_eq!(
+        rebinds(&sink),
+        1,
+        "a persisted binding needs no second rebind"
+    );
+}

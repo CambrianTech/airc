@@ -1350,8 +1350,11 @@ pub async fn run_daemon(
     let machine_home = airc_lib::machine_account_home(home);
     std::fs::create_dir_all(&machine_home)?;
     let db_path = machine_home.join("events.sqlite");
-    let coordinator_store: Arc<dyn EventStore> =
-        Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    // Concrete handle kept alongside the trait object: the inbound
+    // bridge's unknown-channel heal reads the account-registry CACHE
+    // (a concrete SqliteAccountRegistryStore over this same file).
+    let machine_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let coordinator_store: Arc<dyn EventStore> = machine_store.clone();
     let state = Arc::new(
         DaemonState::build(
             identity.peer_id,
@@ -1394,10 +1397,16 @@ pub async fn run_daemon(
     // installed ONCE here; the listener bind stays in the registry task
     // (gated), the dial happens in route refresh — all on this one handle.
     let daemon_airc = Airc::open(&state.home).await?;
-    daemon_airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
-        state.router.clone(),
-        state.coordinator_store.clone(),
-    )));
+    daemon_airc.set_inbound_frame_sink(Arc::new(
+        airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())
+            // Self-healing join (the "blind room" heal): an inbound
+            // frame for a channel no scope binds consults the local
+            // account-registry cache and re-binds from its beacons
+            // instead of silently store-and-dropping.
+            .with_account_registry(Arc::new(airc_lib::SqliteAccountRegistryStore::new(
+                machine_store.clone(),
+            ))),
+    ));
     routed_forwarder.add_link(daemon_airc.clone()).await;
 
     // Self-healing join (refresh-on-failure): the ONE resolved rendezvous
