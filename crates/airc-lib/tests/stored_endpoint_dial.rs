@@ -24,6 +24,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use airc_lib::{endpoints_to_json, Airc, PeerSpec, RouteEndpoint};
 use tempfile::TempDir;
 
+/// Self-healing join: endpoint writes carry a freshness stamp; these
+/// tests simulate "the import just persisted a current advertisement",
+/// so the stamp is simply now.
+fn test_stamp_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64
+}
+
 /// The happy path: bob's trust record for alice carries alice's
 /// listen endpoint; bob's route discovery dials it and the LAN link
 /// comes up without bob ever calling `connect_lan` himself.
@@ -52,7 +62,7 @@ async fn discovery_dials_stored_lan_endpoint_outbound() {
     // verb `peer add --endpoint` would have stored.
     let endpoints_json =
         endpoints_to_json(&[RouteEndpoint::LanTcp { addr: alice_addr }]).expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -101,7 +111,7 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
     };
     let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: closed_addr }])
         .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -162,7 +172,7 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     };
     let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: closed_addr }])
         .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -290,7 +300,7 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
         .expect("alice advertises both");
 
     let endpoints_json = endpoints_to_json(&advertised).expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -362,6 +372,7 @@ async fn split_store_import_still_dials_no_silent_shadow() {
         2_000,
         vec![channel.clone()],
         vec![AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
             presence: beacon_now(
                 alice.peer_id(),
                 tmp_a.path().join(".airc"),
@@ -468,7 +479,7 @@ async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
         RouteEndpoint::TailscaleTcp { addr: alice_addr },
     ])
     .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -554,7 +565,7 @@ async fn dial_walks_endpoints_in_stored_order_and_stops_on_success() {
         RouteEndpoint::LanTcp { addr: alice_addr },
     ])
     .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
+    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json), test_stamp_now_ms())
         .await
         .expect("store endpoints")
         .expect("alice must be enrolled on bob");
@@ -648,7 +659,7 @@ async fn peers_are_dialed_concurrently_not_serially() {
         bob.add_peer(peer_spec).await.expect("bob trusts peer");
         let endpoints_json =
             endpoints_to_json(&[RouteEndpoint::LanTcp { addr }]).expect("encode endpoints");
-        airc_trust::set_endpoints_json(bob.home(), peer_id, Some(endpoints_json))
+        airc_trust::set_endpoints_json(bob.home(), peer_id, Some(endpoints_json), test_stamp_now_ms())
             .await
             .expect("store endpoints")
             .expect("peer must be enrolled on bob");

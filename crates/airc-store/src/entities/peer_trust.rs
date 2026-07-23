@@ -29,6 +29,13 @@ pub struct Model {
     /// `added_at_ms` so a pre-migration row reads as last-seen-at-
     /// enrolment rather than instantly stale.
     pub last_seen_ms: Option<i64>,
+    /// Self-healing join: epoch-ms freshness stamp of the CURRENT
+    /// `endpoints_json` set (the advertisement instant, clamped to the
+    /// importer's clock). Endpoints and stamp are written together,
+    /// atomically; a write carrying a staler stamp is refused so a
+    /// re-sync can never resurrect a dead `(ip, port)`. NULL =
+    /// pre-migration / freshness unknown; read layer floors to 0.
+    pub endpoints_advertised_at_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

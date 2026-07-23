@@ -237,11 +237,18 @@ pub async fn set_tier(
         .map_err(Into::into)
 }
 
-/// Card 625abe6d slice 1 — replace the advertised endpoints on an
-/// enrolled peer. `endpoints_json` is the serde JSON of
-/// `Vec<RouteEndpoint>`; the enum lives in airc-lib (above this
-/// crate), so the payload is opaque here — typed encode/decode stays
-/// with the enum. `None` clears back to identity-only.
+/// Card 625abe6d slice 1 + self-healing join — replace the advertised
+/// endpoints on an enrolled peer, atomically with their freshness
+/// stamp. `endpoints_json` is the serde JSON of `Vec<RouteEndpoint>`;
+/// the enum lives in airc-lib (above this crate), so the payload is
+/// opaque here — typed encode/decode stays with the enum. `None`
+/// clears back to identity-only.
+///
+/// `advertised_at_ms` is the epoch-ms instant of the advertisement the
+/// set came from (callers importing remote beacons must clamp it to
+/// their own clock first). The store replaces monotonically: a staler
+/// stamp than the stored one is a no-op — a re-sync can never
+/// resurrect a dead `(ip, port)`.
 ///
 /// Returns `Ok(None)` when the peer isn't enrolled: endpoints without
 /// a trust anchor are meaningless (there is no pubkey to cert-pin the
@@ -250,10 +257,11 @@ pub async fn set_endpoints_json(
     home: &Path,
     peer_id: PeerId,
     endpoints_json: Option<String>,
+    advertised_at_ms: u64,
 ) -> Result<Option<StoredPeer>, PeersStoreError> {
     open_store(home)
         .await?
-        .set_peer_trust_endpoints(peer_id, endpoints_json)
+        .set_peer_trust_endpoints(peer_id, endpoints_json, advertised_at_ms)
         .await
         .map_err(Into::into)
 }

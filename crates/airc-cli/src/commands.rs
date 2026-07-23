@@ -2006,7 +2006,14 @@ pub async fn run_peer_add(
     if !endpoints.is_empty() {
         let endpoints_json = airc_lib::endpoints_to_json(&endpoints)
             .map_err(|error| format!("encoding --endpoint values: {error}"))?;
-        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json))
+        // Self-healing join: an operator-supplied endpoint is fresh AS
+        // OF NOW — stamp it so it outranks any stale stored set, and so
+        // a later fresher advertisement can in turn replace it.
+        let advertised_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|error| format!("system clock before epoch: {error}"))?;
+        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json), advertised_at_ms)
             .await?
             .ok_or_else(|| {
                 format!(

@@ -241,6 +241,7 @@ mod tests {
     // the merge's hermetic guard) carrying one dialable relay endpoint.
     fn beacon(peer_id: PeerId, scope_home: &str, relay: &str) -> AccountPeerBeacon {
         AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
             presence: crate::coordinator::beacon_now(
                 peer_id,
                 scope_home.into(),

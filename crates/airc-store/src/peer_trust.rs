@@ -132,6 +132,14 @@ pub struct StoredPeer {
     /// `added_at_ms`, so this is always a defensible "no later than"
     /// recency floor the age-based eviction classifier can read.
     pub last_seen_ms: u64,
+    /// Self-healing join: freshness stamp of the CURRENT
+    /// `endpoints_json` set (epoch-ms of the advertisement it came
+    /// from). Written atomically WITH the endpoint set; a staler write
+    /// is refused, so a merge/import ordering bug can never resurrect
+    /// a dead `(ip, port)`. Concrete, never `None`: a NULL column
+    /// (pre-migration row / freshness unknown) reads back as 0, so any
+    /// stamped advertisement outranks a legacy unstamped set.
+    pub endpoints_advertised_at_ms: u64,
 }
 
 impl StoredPeer {

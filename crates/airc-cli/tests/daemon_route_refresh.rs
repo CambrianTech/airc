@@ -113,10 +113,19 @@ async fn scenario() {
 
         let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: alice_addr }])
             .expect("encode endpoints");
-        airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-            .await
-            .expect("store endpoints")
-            .expect("alice must be enrolled on bob");
+        let advertised_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        airc_trust::set_endpoints_json(
+            bob.home(),
+            alice.peer_id(),
+            Some(endpoints_json),
+            advertised_at_ms,
+        )
+        .await
+        .expect("store endpoints")
+        .expect("alice must be enrolled on bob");
         bob.peer_id()
     };
 
