@@ -408,6 +408,27 @@ impl AccountRegistryStore for Box<dyn AccountRegistryStore> {
     }
 }
 
+/// Same delegation for `Arc<dyn AccountRegistryStore>` — the shape the
+/// daemon SHARES between the registry-refresh loop and the
+/// route-refresh loop's refresh-on-failure heal (self-healing join):
+/// one resolved rendezvous, two consumers, no second resolution.
+#[async_trait]
+impl AccountRegistryStore for Arc<dyn AccountRegistryStore> {
+    async fn publish(
+        &self,
+        document: &AccountRegistryDocument,
+    ) -> Result<(), AccountRegistryError> {
+        (**self).publish(document).await
+    }
+
+    async fn refresh(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        (**self).refresh(mesh_identity).await
+    }
+}
+
 /// Store-backed local cache of account-registry documents.
 ///
 /// Replaces the previous on-disk `<root>/<mesh-identity>/registry.json`

@@ -80,10 +80,15 @@ async fn discovery_connects_stored_relay_endpoint_and_marks_it_healthy() {
     // relay's endpoint, carrying its peer id so it's connectable + pinnable.
     let endpoints_json =
         endpoints_to_json(&[RouteEndpoint::relay(relay_peer, relay_addr)]).expect("encode");
-    airc_trust::set_endpoints_json(bob.home(), relay_peer, Some(endpoints_json), test_stamp_now_ms())
-        .await
-        .expect("store relay endpoint")
-        .expect("relay must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        relay_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+    )
+    .await
+    .expect("store relay endpoint")
+    .expect("relay must be enrolled on bob");
 
     let snapshot = bob
         .refresh_route_discovery()
@@ -170,10 +175,15 @@ async fn a_node_becomes_a_relay_and_a_client_discovers_it() {
     let endpoints_json =
         endpoints_to_json(&[RouteEndpoint::relay(relay_node.peer_id(), relay_addr)])
             .expect("encode");
-    airc_trust::set_endpoints_json(client.home(), relay_node.peer_id(), Some(endpoints_json), test_stamp_now_ms())
-        .await
-        .expect("store relay endpoint")
-        .expect("relay node enrolled on client");
+    airc_trust::set_endpoints_json(
+        client.home(),
+        relay_node.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+    )
+    .await
+    .expect("store relay endpoint")
+    .expect("relay node enrolled on client");
 
     let snapshot = client
         .refresh_route_discovery()

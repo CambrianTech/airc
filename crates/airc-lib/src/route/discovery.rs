@@ -531,6 +531,88 @@ impl Airc {
         (failures, skips)
     }
 
+    /// Self-healing join — refresh-on-failure (M5↔bigmama decay mode
+    /// #1: a peer kept dialing a restarted daemon's DEAD port forever,
+    /// never re-reading the rendezvous).
+    ///
+    /// When a route refresh recorded dial failures, re-read the
+    /// rendezvous for FRESHER endpoints for the failed peers BEFORE the
+    /// next blind retry of the dead ones:
+    ///
+    /// 1. record the failed peers' stored endpoint sets;
+    /// 2. `refresh_account_registry(store)` — one rendezvous re-read;
+    ///    the import replaces endpoints atomically + monotonically (a
+    ///    staler advertisement is refused, so this can never make
+    ///    things worse);
+    /// 3. if any failed peer's stored endpoints CHANGED, run one more
+    ///    route-discovery pass so the fresh endpoints are dialed NOW —
+    ///    the just-failed endpoints sit in dial-failure backoff
+    ///    ([`crate::route::dial_quarantine`]), so the extra pass dials
+    ///    the fresh candidates, not the corpses.
+    ///
+    /// Bounded by construction: at most ONE rendezvous re-read and ONE
+    /// extra dial pass per refresh cycle, and the extra pass fires only
+    /// when the rendezvous actually produced a different endpoint set
+    /// for a peer that just failed. Retry of the dead endpoints
+    /// themselves stays governed by the quarantine backoff — this is
+    /// "re-read instead of blind retry", not a retry loop.
+    ///
+    /// Returns `Ok(None)` when there was nothing to heal (no failures,
+    /// no rendezvous document, or no fresher endpoint for any failed
+    /// peer); `Ok(Some(snapshot))` with the post-heal discovery
+    /// snapshot otherwise. Rendezvous errors propagate — the caller
+    /// (daemon loop) logs and continues per the self-heal doctrine.
+    pub async fn heal_failed_dials(
+        &self,
+        store: &dyn crate::account_registry::AccountRegistryStore,
+        failures: &[PeerDialFailure],
+    ) -> Result<Option<RouteDiscoverySnapshot>, AircError> {
+        if failures.is_empty() {
+            return Ok(None);
+        }
+        let failed_peers: std::collections::HashSet<PeerId> =
+            failures.iter().map(|failure| failure.peer_id).collect();
+
+        // Stored endpoint sets BEFORE the re-read — the registry import
+        // writes to the wire root, so that's the record we watch.
+        let endpoints_of = |peers: Vec<airc_trust::StoredPeer>| {
+            peers
+                .into_iter()
+                .filter(|peer| failed_peers.contains(&peer.peer_id))
+                .map(|peer| (peer.peer_id, peer.endpoints_json))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let before = endpoints_of(
+            airc_trust::load(&self.inner.wire_root)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+
+        // ONE rendezvous re-read + import (atomic, monotonic — item 1).
+        if self.refresh_account_registry(store).await?.is_none() {
+            return Ok(None);
+        }
+
+        let after = endpoints_of(
+            airc_trust::load(&self.inner.wire_root)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+        let fresher_arrived = failed_peers
+            .iter()
+            .any(|peer_id| before.get(peer_id) != after.get(peer_id));
+        if !fresher_arrived {
+            // Nothing fresher on the rendezvous — do NOT blind-retry
+            // the dead endpoints here; the quarantine backoff owns
+            // their retry cadence.
+            return Ok(None);
+        }
+        // Fresh endpoints exist for at least one failed peer: dial them
+        // now through the one pinned dial path (cost order, quarantine
+        // skips, stop-on-first-success), not a parallel dialer.
+        Ok(Some(self.refresh_route_discovery().await?))
+    }
+
     /// Snapshot the last known discovery state without mutating
     /// route health.
     pub async fn route_discovery_snapshot(&self) -> Result<RouteDiscoverySnapshot, AircError> {

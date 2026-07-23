@@ -1263,10 +1263,24 @@ pub async fn run_daemon(
     )));
     routed_forwarder.add_link(daemon_airc.clone()).await;
 
+    // Self-healing join (refresh-on-failure): the ONE resolved rendezvous
+    // store + gate, shared between the registry-refresh loop (its owner,
+    // which fills this slot once resolution succeeds) and the
+    // route-refresh loop (which re-reads the rendezvous when dials fail,
+    // instead of blindly retrying dead endpoints). Empty until the
+    // registry task resolves — and stays empty when the rendezvous is
+    // disabled (hermetic gate / no store), in which case there is
+    // nothing to re-read and the heal path correctly stays off.
+    let rendezvous_for_heal: Arc<SharedRendezvousSlot> = Arc::new(std::sync::OnceLock::new());
+
     // Card 625abe6d slice 2: the daemon, not the operator, keeps
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
-    let route_refresh_task = spawn_route_refresh(state.clone(), daemon_airc.clone());
+    let route_refresh_task = spawn_route_refresh(
+        state.clone(),
+        daemon_airc.clone(),
+        rendezvous_for_heal.clone(),
+    );
 
     // #1268: autonomous self-update — keep the node on current canary with no
     // human in the loop (the version-drift pain we just lived: stale binaries,
@@ -1312,6 +1326,9 @@ pub async fn run_daemon(
     // daemon handle (one adapter for accept + dial + forward) rather than
     // opening its own — that split was the reverse-broadcast bug.
     let registry_airc = daemon_airc.clone();
+    // Self-healing join: the registry task fills this once the
+    // rendezvous store is resolved (see `rendezvous_for_heal` above).
+    let heal_slot = rendezvous_for_heal.clone();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -1492,6 +1509,13 @@ pub async fn run_daemon(
                 token_override: airc_lib::GhTokenOverride::new(),
             },
         );
+        // Self-healing join: share the resolved store + gate with the
+        // route-refresh loop so a failed dial can re-read the rendezvous
+        // (refresh-on-failure) instead of blindly retrying a dead
+        // endpoint. `Arc<dyn>` because both loops consume the SAME
+        // resolved door — resolving twice would race gh token recovery.
+        let store: Arc<dyn airc_lib::AccountRegistryStore> = Arc::from(store);
+        let _ = heal_slot.set((store.clone(), gate.clone()));
         airc_lib::run_registry_refresh_loop(
             airc,
             store,
@@ -1541,12 +1565,26 @@ pub async fn run_daemon(
 /// connections live on its adapter, so re-opening per tick would sever
 /// them. Inbound sink + forwarder link are installed once in
 /// `run_daemon` before this spawns.
-fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
+/// Self-healing join: the daemon's ONE resolved rendezvous (store +
+/// gate), filled by the registry task, read by the route-refresh loop's
+/// refresh-on-failure heal. `OnceLock` because resolution happens
+/// exactly once and the readers only ever need "the resolved door or
+/// nothing yet".
+type SharedRendezvousSlot = std::sync::OnceLock<(
+    Arc<dyn airc_lib::AccountRegistryStore>,
+    airc_lib::RegistryRefreshGate,
+)>;
+
+fn spawn_route_refresh(
+    state: Arc<DaemonState>,
+    airc: Airc,
+    rendezvous: Arc<SharedRendezvousSlot>,
+) -> tokio::task::JoinHandle<()> {
     let connected = state.connected_lan_peers.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
         airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&airc, &connected, &endpoint_resync)
+            refresh_routes_once(&airc, &connected, &endpoint_resync, &rendezvous)
         })
         .await;
     })
@@ -1561,6 +1599,7 @@ async fn refresh_routes_once(
     airc: &Airc,
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
     endpoint_resync: &tokio::sync::Notify,
+    rendezvous: &SharedRendezvousSlot,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
     // Tailscale IPv4 every tick (cheap, local — no network) and re-advertise
@@ -1603,16 +1642,7 @@ async fn refresh_routes_once(
         }
     }
     match airc.refresh_route_discovery().await {
-        Ok(snapshot) => {
-            // Publish the live LAN-peer count for `Status` to report —
-            // the set room broadcast actually fans out to. This is the
-            // ONLY writer (the daemon crate can't reach the airc-lib
-            // handle that owns the connections), refreshed every tick so
-            // `airc send` can warn loudly when a broadcast reaches no one.
-            connected_lan_peers.store(
-                snapshot.connected_lan_peers.len(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        Ok(mut snapshot) => {
             for failure in &snapshot.peer_dial_failures {
                 StderrJsonDiagnosticSink.emit(
                     DiagnosticEvent::warn(
@@ -1625,6 +1655,58 @@ async fn refresh_routes_once(
                     .with_field("error", &failure.error),
                 );
             }
+
+            // Self-healing join — refresh-on-failure: dials failed, so
+            // re-read the rendezvous for FRESHER endpoints for those
+            // peers before their next blind retry (the M5↔bigmama
+            // stale-port decay: the old port stays dead forever unless
+            // someone re-reads the advertisement). Gated exactly like
+            // the registry loop's own ticks; when a fresher endpoint
+            // arrived, the heal already re-dialed it and the healed
+            // snapshot replaces this tick's (so the connected count and
+            // relay self-election below see the post-heal truth).
+            if !snapshot.peer_dial_failures.is_empty() {
+                if let Some((store, gate)) = rendezvous.get() {
+                    if gate.block().await.is_none() {
+                        match airc
+                            .heal_failed_dials(store.as_ref(), &snapshot.peer_dial_failures)
+                            .await
+                        {
+                            Ok(Some(healed)) => {
+                                eprintln!(
+                                    "airc daemon: dial failure(s) triggered a rendezvous re-read; \
+                                     fresher endpoint(s) found and re-dialed — connected LAN \
+                                     peers now: {}",
+                                    healed.connected_lan_peers.len()
+                                );
+                                snapshot = healed;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                StderrJsonDiagnosticSink.emit(
+                                    DiagnosticEvent::warn(
+                                        DiagnosticComponent::Daemon,
+                                        DiagnosticCode::RouteRefreshFailed,
+                                        "refresh-on-failure rendezvous re-read failed; dead \
+                                         endpoints stay in backoff until the next cycle",
+                                    )
+                                    .with_field("error", error),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Publish the live LAN-peer count for `Status` to report —
+            // the set room broadcast actually fans out to. This is the
+            // ONLY writer (the daemon crate can't reach the airc-lib
+            // handle that owns the connections), refreshed every tick so
+            // `airc send` can warn loudly when a broadcast reaches no one.
+            connected_lan_peers.store(
+                snapshot.connected_lan_peers.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             // #1247 slice 4b — relay self-election. When this node can
             // reach no peer directly AND has no live relay yet, but knows
