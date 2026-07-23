@@ -1794,6 +1794,17 @@ impl Airc {
         self.inner.coordinator_store.as_ref()
     }
 
+    /// Test-only access to the machine coordinator store (mesh-identity
+    /// cache + presence beacons) so integration tests can PIN a mesh
+    /// identity (`crate::mesh_identity::save` with an `Operator`-source
+    /// entry) instead of shelling out to gh — e.g. to reproduce the
+    /// diverged-identity blind-room scenario hermetically. Same pattern
+    /// as [`Airc::send_frame_to_for_test`].
+    #[doc(hidden)]
+    pub fn coordinator_store_for_test(&self) -> &dyn EventStore {
+        self.coordinator_store()
+    }
+
     /// Load a named runtime consumer checkpoint from the durable
     /// store. This is for hooks/feeds/monitors that need replay
     /// state; it is intentionally store-backed so runtime delivery

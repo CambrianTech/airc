@@ -76,6 +76,16 @@ pub enum InboundDeliveryVerdict {
     /// subscribed scope reads, and at least one scope binds the
     /// channel.
     Delivered,
+    /// Delivered — but under a LOCAL channel that differs from the one
+    /// the frame was addressed to. The sender's identity-scoped channel
+    /// derivation diverged from ours (its mesh identity forked onto a
+    /// fallback, e.g. `local:unknown-host:unknown-user` on a Windows
+    /// box where gh was unreachable), and the frame carried the human
+    /// channel NAME (`HEADER_AIRC_CHANNEL_NAME`), which derives — under
+    /// THIS machine's identity — to a room a local scope binds. Carries
+    /// the local `RoomId` the frame actually landed in, so the
+    /// transport layer's fan-out + delivery ack stay truthful.
+    DeliveredRemapped(RoomId),
     /// Durably stored, but no scope on this machine has the frame's
     /// channel bound — no transcript surface will show it until one
     /// does. Reported as `undeliverable{unknown_channel}`.
@@ -284,14 +294,104 @@ impl RouterInboundBridge {
         // re-published beacons actually bind the channel now.
         matches!(self.channel_has_subscribed_scope(channel).await, Ok(true))
     }
+
+    /// Self-healing join — cross-machine NAME reconvergence (the
+    /// M5↔bigmama blind-room root cause). Channel UUIDs derive from
+    /// `(mesh_identity, name)`; when the sender's identity resolution
+    /// forked (gh unreachable → `local:<host>:<user>` fallback), its
+    /// room UUID diverges from ours and every frame it sends dies here
+    /// as unknown_channel — while the SAME room, by name, is bound by
+    /// local scopes. When the addressed channel binds no local scope
+    /// but the frame carries [`airc_protocol::HEADER_AIRC_CHANNEL_NAME`],
+    /// re-derive the room under THIS machine's identity; if that local
+    /// channel is bound (directly, or after the registry rebind heal),
+    /// deliver there — LOUDLY ([`DiagnosticCode::ChannelNameReconverged`]).
+    ///
+    /// Trust posture: the name is a heal HINT from an already
+    /// authenticated, enrolled-account peer, consulted ONLY when the
+    /// addressed UUID binds nothing — a bound channel is never
+    /// re-routed.
+    ///
+    /// Returns the local `RoomId` to deliver under, or `None` when no
+    /// honest reconvergence exists.
+    async fn reconverge_by_name(&self, frame: &Frame, addressed: RoomId) -> Option<RoomId> {
+        let raw = frame
+            .envelope
+            .headers
+            .get(airc_protocol::HEADER_AIRC_CHANNEL_NAME)?;
+        let name = crate::subscriptions::ChannelName::new(raw.clone()).ok()?;
+        let cached = crate::mesh_identity::resolve(self.coordinator_store.as_ref())
+            .await
+            .ok()?;
+        let identity = cached.as_mesh_identity();
+        let local = derive_room_id(&identity, &name);
+        if local == addressed {
+            // Same derivation — the channel is genuinely unbound here,
+            // not diverged; the registry rebind path owns that case.
+            return None;
+        }
+        let bound = matches!(self.channel_has_subscribed_scope(local).await, Ok(true))
+            || self.try_rebind_known_channel(local).await;
+        if !bound {
+            return None;
+        }
+        self.diag_sink.emit(
+            DiagnosticEvent::warn(
+                DiagnosticComponent::Subscriber,
+                DiagnosticCode::ChannelNameReconverged,
+                "inbound frame's channel UUID binds NO local scope, but its channel \
+                 NAME derives — under this machine's identity — to a bound room; \
+                 delivered there. The SENDING machine's mesh identity has diverged \
+                 from the account identity (likely gh unreachable there) and should \
+                 be fixed",
+            )
+            .with_field("addressed_channel", addressed)
+            .with_field("local_channel", local)
+            .with_field("channel_name", name.as_str())
+            .with_field("sender", frame.envelope.sender),
+        );
+        Some(local)
+    }
+}
+
+/// Local binding state of an inbound frame's channel, resolved BEFORE
+/// publish so a name-reconverged frame lands in the room a scope
+/// actually reads. `Unknown` carries the beacon-read error for the
+/// loud verdict path.
+enum ChannelBinding {
+    Bound,
+    Unbound,
+    Unknown(String),
 }
 
 #[async_trait]
 impl InboundFrameSink for RouterInboundBridge {
     async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
-        let env = bus_envelope_for_inbound(frame);
         let event_id = frame.envelope.event_id;
-        let channel = frame.envelope.channel;
+        let addressed = frame.envelope.channel;
+        // Resolve the local binding BEFORE publish so a name-
+        // reconverged frame lands in the transcript of the room a
+        // local scope actually reads — never in a ghost channel.
+        let binding = match self.channel_has_subscribed_scope(addressed).await {
+            Ok(true) => ChannelBinding::Bound,
+            Ok(false) => ChannelBinding::Unbound,
+            Err(error) => ChannelBinding::Unknown(error),
+        };
+        let remapped = match binding {
+            // A bound channel is never re-routed — the name header is
+            // a heal hint, not addressing authority.
+            ChannelBinding::Unbound => self.reconverge_by_name(frame, addressed).await,
+            ChannelBinding::Bound | ChannelBinding::Unknown(_) => None,
+        };
+        let mut env = bus_envelope_for_inbound(frame);
+        if let Some(local) = remapped {
+            env.channel = local;
+            // Keep a room mention coherent with the delivery channel
+            // (room mentions round-trip as `room:<uuid>` endpoints).
+            if frame.envelope.target == MentionTarget::Room(addressed) {
+                env.target = Target::Endpoint(format!("room:{}", local.as_uuid()));
+            }
+        }
         // Card 1998f6cb: attach the verified link origin so the
         // router's outbound forward sink (when installed) never
         // echoes this frame back over the link it arrived on.
@@ -300,39 +400,42 @@ impl InboundFrameSink for RouterInboundBridge {
             // Duplicate IS delivered: the existing copy stands, so the
             // ack stays truthful and the second LAN link's copy never
             // double-fans-out.
-            Ok(PublishIfNew::Published(_)) | Ok(PublishIfNew::Duplicate) => {
-                match self.channel_has_subscribed_scope(channel).await {
-                    Ok(true) => InboundDeliveryVerdict::Delivered,
-                    // Self-healing join: before concluding "stored but
-                    // blind", try re-binding from the account
-                    // registry's known channels (decay mode #5).
-                    Ok(false) => {
-                        if self.try_rebind_known_channel(channel).await {
-                            InboundDeliveryVerdict::Delivered
-                        } else {
-                            InboundDeliveryVerdict::UnknownChannel
-                        }
-                    }
-                    Err(error) => {
-                        // Can't read the beacon set ⇒ can't honestly
-                        // claim a subscribed scope will see it. Loud,
-                        // then the unknown-channel verdict (the frame
-                        // IS durable in the router — `persist_failed`
-                        // would be the lie here).
-                        self.diag_sink.emit(
-                            DiagnosticEvent::error(
-                                DiagnosticComponent::Subscriber,
-                                DiagnosticCode::FrameUndeliverable,
-                                "beacon set unreadable while concluding inbound delivery",
-                            )
-                            .with_field("event_id", event_id)
-                            .with_field("channel", channel)
-                            .with_field("error", error),
-                        );
+            Ok(PublishIfNew::Published(_)) | Ok(PublishIfNew::Duplicate) => match binding {
+                ChannelBinding::Bound => InboundDeliveryVerdict::Delivered,
+                ChannelBinding::Unbound => {
+                    if let Some(local) = remapped {
+                        // Name reconvergence already proved (and, when
+                        // needed, rebound) the local binding — and the
+                        // frame was PUBLISHED under it.
+                        InboundDeliveryVerdict::DeliveredRemapped(local)
+                    } else if self.try_rebind_known_channel(addressed).await {
+                        // Self-healing join: before concluding "stored
+                        // but blind", try re-binding from the account
+                        // registry's known channels (decay mode #5).
+                        InboundDeliveryVerdict::Delivered
+                    } else {
                         InboundDeliveryVerdict::UnknownChannel
                     }
                 }
-            }
+                ChannelBinding::Unknown(error) => {
+                    // Can't read the beacon set ⇒ can't honestly
+                    // claim a subscribed scope will see it. Loud,
+                    // then the unknown-channel verdict (the frame
+                    // IS durable in the router — `persist_failed`
+                    // would be the lie here).
+                    self.diag_sink.emit(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "beacon set unreadable while concluding inbound delivery",
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("channel", addressed)
+                        .with_field("error", error),
+                    );
+                    InboundDeliveryVerdict::UnknownChannel
+                }
+            },
             Err(error) => InboundDeliveryVerdict::Failed(format!("router publish: {error}")),
         }
     }

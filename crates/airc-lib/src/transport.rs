@@ -341,6 +341,31 @@ impl Airc {
                         .await;
                     }
                 }
+                crate::router_bridge::InboundDeliveryVerdict::DeliveredRemapped(local) => {
+                    // Name reconvergence (blind-room heal): the frame was
+                    // delivered under a LOCAL channel derived from its
+                    // channel-name header — the addressed UUID binds no
+                    // scope here. Fan out + ack under the channel the
+                    // frame actually landed in, so both stay truthful.
+                    let mut event = frame.into_transcript_event();
+                    event.room_id = local;
+                    self.observe_identity_event(&event).await;
+                    if self.mark_broadcast(event_id) {
+                        let _ = self.inner.live_tx.send(Arc::new(event));
+                    }
+                    if ack_requested {
+                        self.respond_delivery_ack(
+                            ack_origin,
+                            event_id,
+                            frame_channel,
+                            airc_protocol::DeliveryOutcome::Delivered {
+                                channel: local,
+                                cursor: frame_cursor,
+                            },
+                        )
+                        .await;
+                    }
+                }
                 crate::router_bridge::InboundDeliveryVerdict::UnknownChannel => {
                     // Loud regardless of whether an ack was requested —
                     // a durable frame no scope will surface is the

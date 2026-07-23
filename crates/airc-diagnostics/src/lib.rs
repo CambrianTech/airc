@@ -93,6 +93,18 @@ pub enum DiagnosticCode {
     /// heal worked, but something (drained beacons / a wiped store)
     /// lost the binding and the operator should know.
     UnknownChannelRebound,
+    /// Self-healing join (the other half of the M5↔bigmama blind
+    /// room): an inbound frame was addressed to a channel UUID NO
+    /// scope here binds, but the frame carries the human channel NAME
+    /// (`HEADER_AIRC_CHANNEL_NAME`) and that name derives — under THIS
+    /// machine's mesh identity — to a channel a local scope DOES bind.
+    /// The sender's identity resolution diverged (gh unreachable →
+    /// `local:<host>:<user>` fallback), so its room UUID forked from
+    /// ours; the bridge re-converged by name and delivered the frame
+    /// into the locally bound room. Warn severity: delivery healed,
+    /// but the sending machine's identity is split from the account
+    /// identity and the operator should fix its gh auth.
+    ChannelNameReconverged,
     /// Card 39d37629: a delivery-ack response could not be written
     /// back to the requesting sender (no live connection, dead
     /// socket). The frame's own fate was already decided and logged;
