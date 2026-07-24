@@ -230,6 +230,157 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     );
 }
 
+/// what this catches (self-healing join item 1, machine-vs-scope): a
+/// stored record pins a SCOPE peer while the endpoint's TLS listener
+/// answers with the MACHINE (daemon) identity — the live two-machine
+/// failure where every automatic dial died with a loud identity
+/// mismatch until a human redialed with the machine id. The dialer must
+/// do what the human did: parse the presented identity out of the
+/// mismatch, verify it is ENROLLED, and retry the pin exactly once.
+/// Mutation checks: dropping the retry leaves `connected` empty and a
+/// mismatch failure recorded; retrying without the enrolment gate is
+/// pinned by the strictness test below.
+#[tokio::test]
+async fn identity_mismatch_dial_retries_once_pinning_the_presented_enrolled_identity() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    // "machine" is the daemon-shaped listener identity that answers TLS.
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    // The scope peer: a real identity hosted behind the machine's
+    // listener (its own keypair — enrolled, but NOT what the listener's
+    // cert presents).
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+
+    let machine_spec: PeerSpec = machine.peer_spec().parse().expect("machine spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine.add_peer(bob_spec).await.expect("machine trusts bob");
+    bob.add_peer(machine_spec)
+        .await
+        .expect("bob trusts the machine identity");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+
+    // The field shape: the SCOPE peer's trust record carries the
+    // MACHINE's endpoint (a scope-published registry beacon advertising
+    // the daemon's listener).
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+
+    assert!(
+        snapshot.connected_lan_peers.contains(&machine.peer_id()),
+        "the mismatch retry must connect to the enrolled identity the cert \
+         presented (the machine); connected: {:?}",
+        snapshot.connected_lan_peers
+    );
+    assert!(
+        snapshot.peer_dial_failures.is_empty(),
+        "a healed mismatch must not surface as a dial failure: {:?}",
+        snapshot.peer_dial_failures
+    );
+}
+
+/// what this catches (strict pinning, the retry's non-negotiable gate):
+/// when the endpoint answers with an identity this scope has NEVER
+/// enrolled, there is no retry and no connection — the dial fails loud.
+/// An unknown identity must never be accepted, no matter how convenient
+/// the heal would be.
+#[tokio::test]
+async fn identity_mismatch_never_retries_an_unenrolled_identity() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+    // bob trusts ONLY the scope peer — the machine identity answering
+    // TLS at the endpoint is a stranger to bob's trust store.
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine.add_peer(bob_spec).await.expect("machine trusts bob");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("refresh must survive the refused dial");
+
+    assert!(
+        snapshot.connected_lan_peers.is_empty(),
+        "an unenrolled listener identity must never be connected to: {:?}",
+        snapshot.connected_lan_peers
+    );
+    assert_eq!(
+        snapshot.peer_dial_failures.len(),
+        1,
+        "the refused dial must be recorded loudly: {:?}",
+        snapshot.peer_dial_failures
+    );
+    let failure = &snapshot.peer_dial_failures[0];
+    assert_eq!(failure.peer_id, scope_peer);
+    assert!(
+        failure.error.contains("not enrolled") || failure.error.contains("expected"),
+        "the failure must carry the verifier's loud refusal: {}",
+        failure.error
+    );
+}
+
 /// The dual-advertise contract: `listen_lan_advertising` binds ONE
 /// wildcard listener and publishes BOTH the LAN and the Tailscale
 /// address under the same port, LAN sorted first. This is the daemon's

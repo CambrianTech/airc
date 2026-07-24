@@ -34,8 +34,8 @@ pub use error::LocalFsError;
 pub use gh_gist::{GhCliClient, GhGistError, GhGistInviteStore, GistClient, GIST_INVITE_FILE};
 pub use lan_tcp::{
     build_client_config, build_server_config, extract_ed25519_pubkey, generate_self_signed_cert,
-    CertGenError, CertParseError, LanTcpAdapter, LanTcpError, PinnedClientVerifier,
-    PinnedServerVerifier, TlsConfigError,
+    peer_identity_mismatch_error, presented_peer_from_mismatch_error, CertGenError, CertParseError,
+    LanTcpAdapter, LanTcpError, PinnedClientVerifier, PinnedServerVerifier, TlsConfigError,
 };
 pub use relay::{RelayAdapter, RelayClientConfig, RelayClientError};
 pub use signed::{SignedError, SignedTransport};

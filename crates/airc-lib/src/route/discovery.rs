@@ -475,6 +475,26 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
+                            let error_text = error.to_string();
+                            // Self-healing join — machine-vs-scope retry: the
+                            // endpoint answered TLS with a DIFFERENT enrolled
+                            // identity than the record pinned (live evidence:
+                            // scopes send as scope peers while the daemon's
+                            // listener presents the MACHINE identity, and a
+                            // human fixed it every time by redialing with the
+                            // machine id). Do what the human does, once, and
+                            // only for an identity we already trust.
+                            if self
+                                .retry_dial_pinning_presented_identity(addr, peer_id, &error_text)
+                                .await
+                            {
+                                // Healed: the endpoint is live and its real
+                                // identity is connected. Clear this record's
+                                // quarantine so the mapped endpoint is not
+                                // failure-counted toward eviction.
+                                self.dial_quarantine_record_success(peer_id, addr);
+                                break;
+                            }
                             self.dial_quarantine_record_failure(
                                 peer_id,
                                 addr,
@@ -484,7 +504,7 @@ impl Airc {
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
-                                error: error.to_string(),
+                                error: error_text,
                             });
                         }
                         Err(_elapsed) => {
@@ -697,6 +717,96 @@ impl Airc {
             peer_dial_skips: Vec::new(),
             ghost_peers_skipped: 0,
         })
+    }
+
+    /// Self-healing join — the machine-vs-scope identity retry (item 1
+    /// of the restart-reconnect heal).
+    ///
+    /// A stored record can pin a SCOPE peer while the endpoint's TLS
+    /// listener presents the MACHINE (daemon) identity — the dial then
+    /// fails with the loud verifier mismatch naming the identity the
+    /// cert actually resolved to. When that presented identity is
+    /// ALREADY ENROLLED (strictness: an unknown identity is never
+    /// accepted, never dialed-for), retry the dial exactly once pinned
+    /// to it — the same recovery a human performs with the mismatch
+    /// error in hand. Returns `true` iff the endpoint's real identity
+    /// is connected after the retry.
+    ///
+    /// The durable scope→machine mapping (so first dials pin correctly
+    /// without a failed handshake) is the account-registry
+    /// `endpoints_peer_id` model; this retry is the fallback for
+    /// records that predate the mapping or whose mapping is missing.
+    async fn retry_dial_pinning_presented_identity(
+        &self,
+        addr: std::net::SocketAddr,
+        pinned: PeerId,
+        error_text: &str,
+    ) -> bool {
+        let Some(presented) = airc_transport::presented_peer_from_mismatch_error(error_text)
+        else {
+            return false;
+        };
+        if presented == pinned {
+            return false;
+        }
+        if !self.inner.registry.has_peer(presented) {
+            // Strict cert pinning: the mismatch names an identity this
+            // scope does not trust — say so and stop. (The verifier can
+            // only name enrolled peers, so this arm means the verifier
+            // registry changed under us — still: never re-pin blind.)
+            tracing::warn!(
+                %addr,
+                pinned = %pinned,
+                presented = %presented,
+                "dial identity mismatch names an UNENROLLED identity — not retrying \
+                 (strict pinning; enrol the peer or fix the record)"
+            );
+            return false;
+        }
+        // Already connected to the presented identity (an earlier record
+        // in this refresh healed the same endpoint): nothing to dial.
+        if self.connected_lan_peers().await.contains(&presented) {
+            tracing::warn!(
+                %addr,
+                pinned = %pinned,
+                presented = %presented,
+                "dial identity mismatch: endpoint is the already-connected machine \
+                 identity — record pins a scope peer hosted there (machine-vs-scope)"
+            );
+            return true;
+        }
+        match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, presented)).await {
+            Ok(Ok(())) => {
+                self.dial_quarantine_record_success(presented, addr);
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    "dial identity mismatch HEALED: retried once pinning the enrolled \
+                     identity the cert presented (machine-vs-scope) — connected"
+                );
+                true
+            }
+            Ok(Err(retry_error)) => {
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    error = %retry_error,
+                    "dial identity mismatch retry failed"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    "dial identity mismatch retry timed out"
+                );
+                false
+            }
+        }
     }
 
     /// Card 7e3c9a1f + self-healing join: the dial verdict for

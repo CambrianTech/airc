@@ -21,15 +21,21 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-/// How long after daemon start the FIRST refresh runs.
+/// How long after daemon start the FIRST refresh runs: immediately.
 ///
 /// Card 625abe6d: "sleep/wake + daemon restart re-establish routes
-/// with zero operator action." A restarted (or woken) daemon must
-/// come back onto the mesh in seconds, not wait out a full steady-
-/// state interval. 5s gives the IPC listener and trust import time
-/// to settle without competing with startup I/O, while staying well
-/// under human-noticeable downtime.
-pub const FIRST_REFRESH_DELAY: Duration = Duration::from_secs(5);
+/// with zero operator action." Self-healing join (auto-reconnect
+/// after restart): every daemon restart DROPS the LAN transport
+/// sessions, and live two-machine evidence showed reconnection never
+/// converged unaided — a manual `airc dial` fixed it every time,
+/// because peers only redialed on a later tick / next send. The host
+/// (`run_daemon`) spawns this loop only after the daemon's identity,
+/// trust store, and router are built, so there is nothing left to
+/// "settle": dial the stored live peers NOW. The refresh itself
+/// still honors the dial-quarantine gates and ghost-peer freshness
+/// (fresh-enough endpoints only), so an immediate first tick can
+/// never stampede dead endpoints.
+pub const FIRST_REFRESH_DELAY: Duration = Duration::ZERO;
 
 /// Steady-state refresh cadence.
 ///
@@ -47,9 +53,10 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Pure scheduling rule: how long to wait before the next refresh,
 /// given how many refreshes have already completed.
 ///
-/// Tick 0 (nothing completed yet) waits [`FIRST_REFRESH_DELAY`] so a
-/// restarted daemon re-establishes routes fast; every later tick
-/// waits the steady [`REFRESH_INTERVAL`].
+/// Tick 0 (nothing completed yet) waits [`FIRST_REFRESH_DELAY`]
+/// (zero — a restarted daemon redials stored live peers immediately
+/// instead of waiting out a tick); every later tick waits the steady
+/// [`REFRESH_INTERVAL`].
 pub fn delay_before_refresh(completed_refreshes: u64) -> Duration {
     if completed_refreshes == 0 {
         FIRST_REFRESH_DELAY
@@ -109,11 +116,19 @@ mod tests {
         delay_before_refresh, run_periodic_refresh, FIRST_REFRESH_DELAY, REFRESH_INTERVAL,
     };
 
-    /// Pin the scheduling rule: a fresh daemon refreshes fast (the
-    /// sleep/wake requirement), then settles into the steady cadence.
+    /// Pin the scheduling rule: a restarted daemon dials IMMEDIATELY
+    /// (self-healing join: restart drops every transport session, and
+    /// waiting out even a short warm-up left two live machines dark
+    /// until a manual `airc dial`), then settles into the steady
+    /// cadence.
     #[test]
-    fn first_refresh_is_fast_then_steady_interval() {
-        assert_eq!(delay_before_refresh(0), FIRST_REFRESH_DELAY);
+    fn first_refresh_is_immediate_then_steady_interval() {
+        assert_eq!(
+            delay_before_refresh(0),
+            Duration::ZERO,
+            "daemon boot must schedule the first stored-peer dial pass \
+             immediately, not after a warm-up tick"
+        );
         assert_eq!(delay_before_refresh(1), REFRESH_INTERVAL);
         assert_eq!(delay_before_refresh(1_000), REFRESH_INTERVAL);
         assert!(
@@ -124,11 +139,13 @@ mod tests {
         );
     }
 
-    /// The first refresh fires after the warm-up delay, not after a
-    /// full steady-state interval — a restarted daemon must redial
-    /// stored endpoints in seconds.
+    /// The restart-shaped regression (self-healing join, auto-reconnect
+    /// after restart): a daemon boot must schedule its first refresh —
+    /// the stored-live-peer dial pass — IMMEDIATELY, not after a warm-up
+    /// window and not after a steady interval. Mutation check: restoring
+    /// any nonzero FIRST_REFRESH_DELAY fails the count==1 assert at t=0+.
     #[tokio::test(start_paused = true)]
-    async fn first_refresh_fires_after_warmup_not_a_full_interval() {
+    async fn boot_schedules_the_first_refresh_immediately() {
         let shutdown = Arc::new(Notify::new());
         let count = Arc::new(AtomicUsize::new(0));
 
@@ -146,16 +163,20 @@ mod tests {
             }
         });
 
-        // Just before the warm-up boundary: nothing yet.
-        tokio::time::sleep(FIRST_REFRESH_DELAY - Duration::from_millis(1)).await;
-        assert_eq!(count.load(Ordering::SeqCst), 0, "no refresh before warm-up");
-
-        // Crossing it: exactly the first refresh.
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        assert_eq!(count.load(Ordering::SeqCst), 1, "first refresh at warm-up");
+        // With paused time, this sleep advances the clock by only 1ms —
+        // the first refresh can only have run if it was scheduled at
+        // t=0 (Duration::ZERO), never a warm-up or interval later.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "daemon boot must run the first stored-peer dial pass immediately"
+        );
 
         // Just before the first steady interval elapses: still one.
-        tokio::time::sleep(REFRESH_INTERVAL - Duration::from_millis(1)).await;
+        // (-2ms: the probe above already advanced the clock 1ms past
+        // the completion instant the next delay is measured from.)
+        tokio::time::sleep(REFRESH_INTERVAL - Duration::from_millis(2)).await;
         assert_eq!(count.load(Ordering::SeqCst), 1, "steady cadence respected");
 
         // Crossing the steady interval: the second refresh.
@@ -248,8 +269,9 @@ mod tests {
             }
         });
 
-        // Mid warm-up delay: the loop is parked on its sleep with the
-        // pinned shutdown waiter registered.
+        // The first refresh runs immediately at boot; 1s in, the loop
+        // is parked on its STEADY-interval sleep with the pinned
+        // shutdown waiter registered.
         tokio::time::sleep(Duration::from_secs(1)).await;
         shutdown.notify_waiters();
 
@@ -259,8 +281,9 @@ mod tests {
             .expect("loop task must not panic");
         assert_eq!(
             count.load(Ordering::SeqCst),
-            0,
-            "no refresh ran before shutdown"
+            1,
+            "exactly the boot-immediate refresh ran before shutdown — the \
+             mid-interval sleep was interrupted, not waited out"
         );
     }
 }
