@@ -67,6 +67,7 @@ async fn discovery_dials_stored_lan_endpoint_outbound() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -121,6 +122,7 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -187,6 +189,7 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -264,7 +267,10 @@ async fn identity_mismatch_dial_retries_once_pinning_the_presented_enrolled_iden
 
     let machine_spec: PeerSpec = machine.peer_spec().parse().expect("machine spec");
     let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
-    machine.add_peer(bob_spec).await.expect("machine trusts bob");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
     bob.add_peer(machine_spec)
         .await
         .expect("bob trusts the machine identity");
@@ -287,6 +293,7 @@ async fn identity_mismatch_dial_retries_once_pinning_the_presented_enrolled_iden
         scope_peer,
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -307,6 +314,91 @@ async fn identity_mismatch_dial_retries_once_pinning_the_presented_enrolled_iden
         snapshot.peer_dial_failures.is_empty(),
         "a healed mismatch must not surface as a dial failure: {:?}",
         snapshot.peer_dial_failures
+    );
+}
+
+/// what this catches (machine-vs-scope item 3 — the stored mapping):
+/// a trust record whose endpoints carry the registry-imported
+/// `endpoints_peer_id` host mapping must cert-pin the MACHINE identity
+/// on the FIRST dial — no failed handshake, no mismatch retry — and
+/// the route must come up. Together with the resolve_dial_pin unit
+/// tests (strictness: unenrolled/self/absent mappings pin the record's
+/// own peer), this pins item 3(c): dial-by-scope-peer resolves to the
+/// machine identity for cert pinning when the mapping is known.
+#[tokio::test]
+async fn stored_host_mapping_pins_the_machine_identity_and_connects() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+    let machine_spec: PeerSpec = machine.peer_spec().parse().expect("machine spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
+    bob.add_peer(machine_spec)
+        .await
+        .expect("bob trusts the machine identity");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+
+    // What the account-registry import now persists: the scope peer's
+    // endpoints WITH the machine's identity as their transport host.
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        Some(machine.peer_id()),
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+
+    assert!(
+        snapshot.peer_dial_failures.is_empty(),
+        "a correctly-pinned first dial must record NO failure: {:?}",
+        snapshot.peer_dial_failures
+    );
+    assert!(
+        snapshot.connected_lan_peers.contains(&machine.peer_id()),
+        "the mapped dial must connect to the machine identity; connected: {:?}",
+        snapshot.connected_lan_peers
+    );
+
+    // Steady state: the next refresh sees the machine connected and
+    // skips the hosted record cleanly — no re-dial churn, no failures.
+    let second = bob.refresh_route_discovery().await.expect("second refresh");
+    assert!(
+        second.peer_dial_failures.is_empty(),
+        "a hosted record behind a live machine connection must not re-dial \
+         into failures: {:?}",
+        second.peer_dial_failures
     );
 }
 
@@ -335,7 +427,10 @@ async fn identity_mismatch_never_retries_an_unenrolled_identity() {
     // bob trusts ONLY the scope peer — the machine identity answering
     // TLS at the endpoint is a stranger to bob's trust store.
     let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
-    machine.add_peer(bob_spec).await.expect("machine trusts bob");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
     bob.add_peer(scope_spec)
         .await
         .expect("bob trusts the scope peer");
@@ -351,6 +446,7 @@ async fn identity_mismatch_never_retries_an_unenrolled_identity() {
         scope_peer,
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -487,6 +583,7 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -560,6 +657,7 @@ async fn split_store_import_still_dials_no_silent_shadow() {
         vec![channel.clone()],
         vec![AccountPeerBeacon {
             endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: beacon_now(
                 alice.peer_id(),
                 tmp_a.path().join(".airc"),
@@ -671,6 +769,7 @@ async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -762,6 +861,7 @@ async fn dial_walks_endpoints_in_stored_order_and_stops_on_success() {
         alice.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store endpoints")
@@ -861,6 +961,7 @@ async fn peers_are_dialed_concurrently_not_serially() {
             peer_id,
             Some(endpoints_json),
             test_stamp_now_ms(),
+            None,
         )
         .await
         .expect("store endpoints")
@@ -959,6 +1060,7 @@ fn one_beacon_doc(
             peer_spec: spec.clone(),
             endpoints,
             endpoints_advertised_at_ms: Some(heartbeat_at_ms),
+            endpoints_peer_id: None,
         }],
     )
 }

@@ -197,6 +197,15 @@ pub(crate) struct AircInner {
     /// clones (like `live_tx`) so whichever handle dials, the quarantine
     /// is unified. See [`crate::route::dial_quarantine`].
     pub(crate) dial_quarantine: Arc<std::sync::Mutex<crate::route::DialQuarantine>>,
+    /// Self-healing join (machine-vs-scope cert identity): the peer id
+    /// of the TRANSPORT HOST whose TLS cert answers at this handle's
+    /// advertised `route_endpoints` — set (via
+    /// [`Airc::set_advertised_endpoints_host`]) when the endpoints were
+    /// read back from the daemon over IPC (`registry sync` from a
+    /// scope), so the published beacon carries the identity a dialer
+    /// must actually pin. `None` = this handle owns its own listener
+    /// (the endpoints answer as this handle's peer).
+    pub(crate) advertised_endpoints_host: std::sync::Mutex<Option<PeerId>>,
     /// #9: in-session learned real IPs per peer, harvested from AUTHENTICATED
     /// inbound connections (a peer that dialed us proved it's reachable at that
     /// source IP — on a LAN, symmetric). The dial path pairs a learned IP with
@@ -480,6 +489,7 @@ impl Airc {
                 dial_quarantine: Arc::new(std::sync::Mutex::new(
                     crate::route::DialQuarantine::default(),
                 )),
+                advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
@@ -1289,6 +1299,7 @@ impl Airc {
             // Share the quarantine across the daemon clone so dial-failure
             // backoff is unified regardless of which handle runs discovery.
             dial_quarantine: self.inner.dial_quarantine.clone(),
+            advertised_endpoints_host: std::sync::Mutex::new(None),
             // #9: share the learned-IP map across the daemon clone so an
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
@@ -1447,6 +1458,33 @@ impl Airc {
             }
         }
         Ok(())
+    }
+
+    /// Self-healing join (machine-vs-scope cert identity): declare the
+    /// TRANSPORT HOST whose TLS certificate answers at this handle's
+    /// advertised endpoints. Callers that inject endpoints they do not
+    /// themselves serve — `registry sync` reading the daemon's listener
+    /// back over IPC — MUST set this to the daemon's peer id, or the
+    /// published beacon advertises endpoints a dialer will pin to the
+    /// WRONG identity (the live mismatch this heals). Handles that own
+    /// their own listener never call this.
+    pub fn set_advertised_endpoints_host(&self, host: PeerId) {
+        *self
+            .inner
+            .advertised_endpoints_host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(host);
+    }
+
+    /// The declared transport host for this handle's advertised
+    /// endpoints, or `None` when the endpoints answer as this handle's
+    /// own peer. See [`Self::set_advertised_endpoints_host`].
+    pub(crate) fn advertised_endpoints_host(&self) -> Option<PeerId> {
+        *self
+            .inner
+            .advertised_endpoints_host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     async fn publish_presence(

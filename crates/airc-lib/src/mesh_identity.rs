@@ -726,7 +726,10 @@ mod tests {
             !a.contains("unknown-host") && !a.contains("unknown-user"),
             "must never emit the colliding sentinel identity, got {a}"
         );
-        assert_ne!(a, b, "two machines with distinct machine-ids must NOT collide");
+        assert_ne!(
+            a, b,
+            "two machines with distinct machine-ids must NOT collide"
+        );
         assert_eq!(a, "local:machine-aaaaaaaabbbb:machine-aaaaaaaabbbb");
     }
 

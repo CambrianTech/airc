@@ -36,6 +36,29 @@ const DIAL_CONCURRENCY: usize = 16;
 /// collection below doesn't trip clippy's `type_complexity` gate.
 type PeerDialOutcome = (Vec<PeerDialFailure>, Vec<PeerDialSkip>);
 
+/// Self-healing join (machine-vs-scope cert identity) — the PURE pin
+/// decision: which identity a dial to `record_peer`'s stored endpoints
+/// must expect in the TLS handshake.
+///
+/// A trust record can declare that its endpoints are HOSTED by a
+/// different transport identity (`endpoints_peer_id` — the daemon whose
+/// cert answers at the shared listener). Honor that mapping ONLY when
+/// the declared host is itself enrolled: cert pinning stays strict — an
+/// unknown identity is never dialed-for, so a poisoned mapping can at
+/// worst redirect the pin to another already-trusted peer, never open a
+/// door to a stranger. A self- or absent mapping pins the record's own
+/// peer, exactly the pre-mapping behavior.
+fn resolve_dial_pin(
+    record_peer: PeerId,
+    declared_host: Option<PeerId>,
+    host_is_enrolled: bool,
+) -> PeerId {
+    match declared_host {
+        Some(host) if host != record_peer && host_is_enrolled => host,
+        Some(_) | None => record_peer,
+    }
+}
+
 /// #10: is this enrolled peer a GHOST — no fresh contact within the freshness
 /// TTL? A live peer's registry beacon refreshes `last_seen_ms` every cycle, so
 /// a peer past the TTL is a dead container / abandoned scope whose stale
@@ -279,6 +302,13 @@ impl Airc {
         // revival signal (a fresher advertisement lifts a dead verdict).
         let mut advert_stamps: std::collections::HashMap<PeerId, u64> =
             std::collections::HashMap::new();
+        // Self-healing join (machine-vs-scope): each peer's declared
+        // transport host — the identity whose TLS cert answers at its
+        // stored endpoints. First-seen (wire-root) order wins, matching
+        // the endpoint merge above; normalized on write, so any Some
+        // here names a DIFFERENT peer than the record's own.
+        let mut declared_hosts: std::collections::HashMap<PeerId, PeerId> =
+            std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
@@ -327,6 +357,9 @@ impl Airc {
             }
             let stamp = advert_stamps.entry(peer.peer_id).or_insert(0);
             *stamp = (*stamp).max(peer.endpoints_advertised_at_ms);
+            if let Some(host) = peer.endpoints_peer_id.filter(|host| *host != peer.peer_id) {
+                declared_hosts.entry(peer.peer_id).or_insert(host);
+            }
         }
 
         // #9: prepend each peer's LEARNED real IP (harvested from an
@@ -360,12 +393,34 @@ impl Airc {
         // tests pin). What is now CONCURRENT is ACROSS peers: dialing
         // peer B must not wait on peer A's 3s timeout (see
         // DIAL_CONCURRENCY — the serial-sum hang this fixes).
-        let dial_list: Vec<(PeerId, Vec<RouteEndpoint>, u64)> = order
+        let dial_list: Vec<(PeerId, PeerId, Vec<RouteEndpoint>, u64)> = order
             .into_iter()
             .filter_map(|peer_id| {
                 merged.remove(&peer_id).map(|eps| {
                     let stamp = advert_stamps.get(&peer_id).copied().unwrap_or(0);
-                    (peer_id, eps, stamp)
+                    // Machine-vs-scope: cert-pin the record's declared
+                    // transport host when it is enrolled (strict —
+                    // resolve_dial_pin); an unenrolled declared host is
+                    // LOUD and falls back to pinning the record's own
+                    // peer, which will fail the handshake honestly
+                    // rather than ever accepting an unknown identity.
+                    let declared = declared_hosts.get(&peer_id).copied();
+                    let host_enrolled = declared
+                        .map(|host| self.inner.registry.has_peer(host))
+                        .unwrap_or(false);
+                    let pin = resolve_dial_pin(peer_id, declared, host_enrolled);
+                    if let Some(host) = declared {
+                        if !host_enrolled {
+                            tracing::warn!(
+                                record_peer = %peer_id,
+                                declared_host = %host,
+                                "trust record declares an UNENROLLED transport host for its \
+                                 endpoints — pinning the record's own peer (strict); enrol \
+                                 the host or refresh the registry"
+                            );
+                        }
+                    }
+                    (peer_id, pin, eps, stamp)
                 })
             })
             .collect();
@@ -378,13 +433,15 @@ impl Airc {
         // distinct peers do not race.
         let mut dialed: Vec<(usize, PeerDialOutcome)> =
             futures::stream::iter(dial_list.into_iter().enumerate())
-                .map(|(idx, (peer_id, endpoints, advert_stamp_ms))| async move {
-                    (
-                        idx,
-                        self.dial_one_peer(peer_id, endpoints, now_ms, advert_stamp_ms)
-                            .await,
-                    )
-                })
+                .map(
+                    |(idx, (peer_id, pin, endpoints, advert_stamp_ms))| async move {
+                        (
+                            idx,
+                            self.dial_one_peer(peer_id, pin, endpoints, now_ms, advert_stamp_ms)
+                                .await,
+                        )
+                    },
+                )
                 .buffer_unordered(DIAL_CONCURRENCY)
                 .collect()
                 .await;
@@ -402,15 +459,30 @@ impl Airc {
     /// per-peer dials run concurrently; the inner endpoint walk here
     /// stays serial because cost-order + stop-on-first-success is the
     /// pinned contract.
+    ///
+    /// `pin` is the identity the TLS handshake must present
+    /// ([`resolve_dial_pin`]): the record's own peer, or its enrolled
+    /// declared transport host (machine-vs-scope). Quarantine stays
+    /// keyed by the RECORD's `(peer_id, addr)` — the record owns the
+    /// endpoint entry regardless of which identity answers it.
     async fn dial_one_peer(
         &self,
         peer_id: PeerId,
+        pin: PeerId,
         endpoints: Vec<RouteEndpoint>,
         now_ms: u64,
         advert_stamp_ms: u64,
     ) -> PeerDialOutcome {
         let mut failures = Vec::new();
         let mut skips = Vec::new();
+        // Machine-vs-scope: when the record's endpoints are hosted by a
+        // different (enrolled) identity that is ALREADY connected, the
+        // route is up — dialing again would only trip the adapter's
+        // already-connected guard. Same silent-skip semantics as the
+        // connected-record check in the collection loop.
+        if pin != peer_id && self.connected_lan_peers().await.contains(&pin) {
+            return (failures, skips);
+        }
         for endpoint in &endpoints {
             match endpoint {
                 RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => {
@@ -464,8 +536,7 @@ impl Airc {
                     // of the NATs this card exists to cross) hangs the OS connect
                     // for ~21-130s per endpoint. Bound every dial; a timeout is a
                     // recorded failure like any other.
-                    match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id))
-                        .await
+                    match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, pin)).await
                     {
                         Ok(Ok(())) => {
                             // Card 7e3c9a1f: a live connect lifts any prior
@@ -476,6 +547,15 @@ impl Airc {
                         }
                         Ok(Err(error)) => {
                             let error_text = error.to_string();
+                            // A concurrent dial (another record hosted by the
+                            // same machine) may have connected the pinned
+                            // identity while ours failed the adapter's
+                            // already-connected guard — a live route is a
+                            // success, not a failure.
+                            if pin != peer_id && self.connected_lan_peers().await.contains(&pin) {
+                                self.dial_quarantine_record_success(peer_id, addr);
+                                break;
+                            }
                             // Self-healing join — machine-vs-scope retry: the
                             // endpoint answered TLS with a DIFFERENT enrolled
                             // identity than the record pinned (live evidence:
@@ -483,9 +563,12 @@ impl Airc {
                             // listener presents the MACHINE identity, and a
                             // human fixed it every time by redialing with the
                             // machine id). Do what the human does, once, and
-                            // only for an identity we already trust.
+                            // only for an identity we already trust. (With a
+                            // stored host mapping the pin was already correct;
+                            // this is the fallback for records that predate
+                            // the mapping.)
                             if self
-                                .retry_dial_pinning_presented_identity(addr, peer_id, &error_text)
+                                .retry_dial_pinning_presented_identity(addr, pin, &error_text)
                                 .await
                             {
                                 // Healed: the endpoint is live and its real
@@ -742,8 +825,7 @@ impl Airc {
         pinned: PeerId,
         error_text: &str,
     ) -> bool {
-        let Some(presented) = airc_transport::presented_peer_from_mismatch_error(error_text)
-        else {
+        let Some(presented) = airc_transport::presented_peer_from_mismatch_error(error_text) else {
             return false;
         };
         if presented == pinned {
@@ -927,6 +1009,26 @@ mod tests {
             !is_ghost_peer(now, now + 5_000),
             "a future last_seen (clamped on import; skew) must read fresh, never underflow"
         );
+    }
+
+    // what this catches (machine-vs-scope cert identity — the pin
+    // decision): a record's declared transport host is honored ONLY
+    // when it names a different peer AND that host is enrolled. Every
+    // other shape — absent, self-mapping, unenrolled host — pins the
+    // record's own peer, so strict pinning can never be redirected to
+    // an identity this scope does not already trust.
+    #[test]
+    fn dial_pin_honors_only_an_enrolled_foreign_host_mapping() {
+        let scope = PeerId::from_u128(0xce8b);
+        let machine = PeerId::from_u128(0xe85a);
+        // The mapping case: enrolled foreign host → pin the host.
+        assert_eq!(resolve_dial_pin(scope, Some(machine), true), machine);
+        // Strictness: an unenrolled declared host is never pinned.
+        assert_eq!(resolve_dial_pin(scope, Some(machine), false), scope);
+        // A self-mapping adds nothing.
+        assert_eq!(resolve_dial_pin(scope, Some(scope), true), scope);
+        // No mapping — the pre-mapping behavior.
+        assert_eq!(resolve_dial_pin(scope, None, false), scope);
     }
 
     fn snapshot(

@@ -122,6 +122,7 @@ async fn scenario() {
             alice.peer_id(),
             Some(endpoints_json),
             advertised_at_ms,
+            None,
         )
         .await
         .expect("store endpoints")

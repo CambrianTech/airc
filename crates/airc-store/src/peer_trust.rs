@@ -140,6 +140,18 @@ pub struct StoredPeer {
     /// (pre-migration row / freshness unknown) reads back as 0, so any
     /// stamped advertisement outranks a legacy unstamped set.
     pub endpoints_advertised_at_ms: u64,
+    /// Self-healing join (machine-vs-scope): the TRANSPORT HOST whose
+    /// TLS certificate answers at `endpoints_json` — the daemon
+    /// (machine keypair) identity when this row is a scope peer hosted
+    /// behind a shared daemon listener. Dials to this peer's endpoints
+    /// must cert-pin the host, and the dial layer only honors the
+    /// mapping when the host is itself enrolled (strict pinning: an
+    /// unknown identity is never accepted). Written atomically WITH
+    /// the endpoint set under the same freshness stamp. `None` = the
+    /// endpoints answer as this row's own peer. Distinct from the
+    /// mesh-identity machine-id (a registry rendezvous key string) —
+    /// this is a cert identity.
+    pub endpoints_peer_id: Option<PeerId>,
 }
 
 impl StoredPeer {

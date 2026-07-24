@@ -211,6 +211,7 @@ impl SqliteEventStore {
                     tier,
                     endpoints_json: row.endpoints_json,
                     last_seen_ms: stored_last_seen_ms(row.last_seen_ms, added_at_ms)?,
+                    endpoints_peer_id: row.endpoints_peer_id.map(PeerId::from_uuid),
                     endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
                         row.endpoints_advertised_at_ms,
                     )?,
@@ -265,6 +266,8 @@ impl SqliteEventStore {
             last_seen_ms: Set(Some(u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?)),
             // No endpoints yet, so no endpoint freshness either.
             endpoints_advertised_at_ms: Set(None),
+            // …and no host mapping (mapping travels with endpoints).
+            endpoints_peer_id: Set(None),
         };
         let insert = peer_trust::Entity::insert(active)
             .on_conflict(
@@ -308,6 +311,7 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json: stored.endpoints_json,
             last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: stored.endpoints_peer_id.map(PeerId::from_uuid),
             endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
                 stored.endpoints_advertised_at_ms,
             )?,
@@ -346,6 +350,9 @@ impl SqliteEventStore {
         let existing_endpoints_stamp = existing
             .as_ref()
             .and_then(|row| row.endpoints_advertised_at_ms);
+        // The host mapping travels with the endpoint set — preserved
+        // across rotation exactly like the endpoints and their stamp.
+        let existing_endpoints_peer = existing.as_ref().and_then(|row| row.endpoints_peer_id);
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
@@ -357,6 +364,7 @@ impl SqliteEventStore {
                 None => u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?,
             })),
             endpoints_advertised_at_ms: Set(existing_endpoints_stamp),
+            endpoints_peer_id: Set(existing_endpoints_peer),
         };
         peer_trust::Entity::insert(active)
             .on_conflict(
@@ -373,6 +381,7 @@ impl SqliteEventStore {
             tier: existing_tier,
             endpoints_json: existing_endpoints,
             last_seen_ms: stored_last_seen_ms(existing_last_seen, added_at_ms)?,
+            endpoints_peer_id: existing_endpoints_peer.map(PeerId::from_uuid),
             endpoints_advertised_at_ms: stored_endpoints_stamp_ms(existing_endpoints_stamp)?,
         })
     }
@@ -407,6 +416,7 @@ impl SqliteEventStore {
             tier: removed_tier,
             endpoints_json: stored.endpoints_json,
             last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: stored.endpoints_peer_id.map(PeerId::from_uuid),
             endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
                 stored.endpoints_advertised_at_ms,
             )?,
@@ -451,6 +461,7 @@ impl SqliteEventStore {
             tier,
             endpoints_json: existing.endpoints_json,
             last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
             endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
                 existing.endpoints_advertised_at_ms,
             )?,
@@ -483,6 +494,7 @@ impl SqliteEventStore {
         peer_id: PeerId,
         endpoints_json: Option<String>,
         advertised_at_ms: u64,
+        endpoints_peer_id: Option<PeerId>,
     ) -> Result<Option<StoredPeer>, StoreError> {
         let txn = self.db.begin().await?;
         let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
@@ -502,9 +514,10 @@ impl SqliteEventStore {
         let stored_stamp = stored_endpoints_stamp_ms(existing.endpoints_advertised_at_ms)?;
         if advertised_at_ms < stored_stamp {
             // Staler advertisement than what we hold — refuse the whole
-            // write. Returning the UNCHANGED row (not an error) keeps
-            // import loops total: one stale beacon must not abort the
-            // rest of a registry sync.
+            // write (endpoints AND their host mapping move as one value
+            // with the stamp). Returning the UNCHANGED row (not an
+            // error) keeps import loops total: one stale beacon must
+            // not abort the rest of a registry sync.
             txn.commit().await?;
             return Ok(Some(StoredPeer {
                 peer_id,
@@ -513,6 +526,7 @@ impl SqliteEventStore {
                 tier: stored_tier,
                 endpoints_json: existing.endpoints_json,
                 last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+                endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
                 endpoints_advertised_at_ms: stored_stamp,
             }));
         }
@@ -522,6 +536,12 @@ impl SqliteEventStore {
             "peer_trust.endpoints_advertised_at_ms",
             advertised_at_ms,
         )?));
+        // Self-healing join (machine-vs-scope): the transport-host
+        // mapping travels WITH the endpoint set, under the same stamp —
+        // a fresher advertisement replaces both, a staler one was
+        // refused above, and a mapping can never outlive the endpoints
+        // it describes.
+        active.endpoints_peer_id = Set(endpoints_peer_id.map(|peer| peer.as_uuid()));
         peer_trust::Entity::update(active).exec(&txn).await?;
         txn.commit().await?;
         Ok(Some(StoredPeer {
@@ -531,6 +551,7 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json,
             last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id,
             endpoints_advertised_at_ms: advertised_at_ms,
         }))
     }
@@ -583,6 +604,7 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json: existing.endpoints_json,
             last_seen_ms: next,
+            endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
             endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
                 existing.endpoints_advertised_at_ms,
             )?,
@@ -2366,7 +2388,12 @@ mod tests {
             .unwrap();
         let json = r#"[{"kind":"lan_tcp","addr":"192.168.1.232:7474"}]"#;
         store
-            .set_peer_trust_endpoints(peer_id, Some(json.to_string()), 150)
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(json.to_string()),
+                150,
+                Some(PeerId::from_u128(0xda_e0)),
+            )
             .await
             .unwrap()
             .expect("peer enrolled");
@@ -2384,6 +2411,11 @@ mod tests {
             rotated.endpoints_advertised_at_ms, 150,
             "rotation must carry the endpoint freshness stamp with the endpoints"
         );
+        assert_eq!(
+            rotated.endpoints_peer_id,
+            Some(PeerId::from_u128(0xda_e0)),
+            "rotation must carry the transport-host mapping with the endpoints"
+        );
         let loaded = store.load_peers().await.unwrap();
         assert_eq!(loaded[0].endpoints_json.as_deref(), Some(json));
         assert_eq!(loaded[0].pubkey_b64, "BBBB".repeat(11));
@@ -2397,7 +2429,7 @@ mod tests {
         let store = SqliteEventStore::in_memory().await.unwrap();
         let peer_id = PeerId::from_u128(0xdead_beef);
         let result = store
-            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()), 100)
+            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()), 100, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -2426,24 +2458,44 @@ mod tests {
         let fresh = r#"[{"kind":"lan_tcp","addr":"192.168.1.250:57958"}]"#;
 
         store
-            .set_peer_trust_endpoints(peer_id, Some(old.to_string()), 1_000)
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(old.to_string()),
+                1_000,
+                Some(PeerId::from_u128(0xaa)),
+            )
             .await
             .unwrap()
             .expect("peer enrolled");
 
         // Fresher advertisement: full replace — addr AND port together.
         let replaced = store
-            .set_peer_trust_endpoints(peer_id, Some(fresh.to_string()), 2_000)
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(fresh.to_string()),
+                2_000,
+                Some(PeerId::from_u128(0xbb)),
+            )
             .await
             .unwrap()
             .expect("peer enrolled");
         assert_eq!(replaced.endpoints_json.as_deref(), Some(fresh));
         assert_eq!(replaced.endpoints_advertised_at_ms, 2_000);
+        assert_eq!(
+            replaced.endpoints_peer_id,
+            Some(PeerId::from_u128(0xbb)),
+            "a fresher advertisement replaces the host mapping WITH the endpoints"
+        );
 
         // Staler advertisement (an out-of-order re-sync carrying the
         // dead port): refused whole, row unchanged.
         let refused = store
-            .set_peer_trust_endpoints(peer_id, Some(old.to_string()), 1_500)
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(old.to_string()),
+                1_500,
+                Some(PeerId::from_u128(0xaa)),
+            )
             .await
             .unwrap()
             .expect("peer enrolled");
@@ -2453,6 +2505,11 @@ mod tests {
             "a staler advertisement must never resurrect a dead endpoint"
         );
         assert_eq!(refused.endpoints_advertised_at_ms, 2_000);
+        assert_eq!(
+            refused.endpoints_peer_id,
+            Some(PeerId::from_u128(0xbb)),
+            "a refused staler advertisement must not touch the host mapping either"
+        );
 
         let loaded = store.load_peers().await.unwrap();
         assert_eq!(loaded[0].endpoints_json.as_deref(), Some(fresh));

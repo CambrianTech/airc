@@ -509,6 +509,7 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
             },
             endpoints: Vec::new(),
             endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
         }],
     );
     let concrete = Arc::new(
@@ -861,9 +862,7 @@ async fn healed_identity_rebinds_stale_subscription_to_the_converged_room() {
     );
     let recent = operator.page_recent(32).await.expect("page_recent");
     assert!(
-        recent
-            .iter()
-            .any(|event| event.event_id == stale_addressed),
+        recent.iter().any(|event| event.event_id == stale_addressed),
         "frames remapped from the old UUID must surface in the rebound room"
     );
 }

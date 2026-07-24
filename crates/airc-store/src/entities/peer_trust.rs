@@ -36,6 +36,17 @@ pub struct Model {
     /// re-sync can never resurrect a dead `(ip, port)`. NULL =
     /// pre-migration / freshness unknown; read layer floors to 0.
     pub endpoints_advertised_at_ms: Option<i64>,
+    /// Self-healing join (machine-vs-scope): the peer id of the
+    /// TRANSPORT HOST whose TLS certificate answers at
+    /// `endpoints_json` — the daemon (machine keypair) identity when
+    /// this row is a scope peer hosted behind a shared daemon
+    /// listener. Dials to this peer's endpoints must cert-pin the
+    /// host, not this row's peer. Written atomically WITH the endpoint
+    /// set under the same freshness stamp. NULL = the endpoints answer
+    /// as this row's own peer (the pre-mapping and single-identity
+    /// case). NOTE: distinct from the mesh-identity machine-id (a
+    /// registry rendezvous key string) — this is a cert identity.
+    pub endpoints_peer_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

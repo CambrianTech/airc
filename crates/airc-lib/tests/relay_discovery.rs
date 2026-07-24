@@ -85,6 +85,7 @@ async fn discovery_connects_stored_relay_endpoint_and_marks_it_healthy() {
         relay_peer,
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store relay endpoint")
@@ -180,6 +181,7 @@ async fn a_node_becomes_a_relay_and_a_client_discovers_it() {
         relay_node.peer_id(),
         Some(endpoints_json),
         test_stamp_now_ms(),
+        None,
     )
     .await
     .expect("store relay endpoint")

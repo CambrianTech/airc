@@ -2256,7 +2256,9 @@ pub async fn run_peer_add(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .map_err(|error| format!("system clock before epoch: {error}"))?;
-        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json), advertised_at_ms)
+        // Operator `peer add --endpoint` names the peer it dials — the
+        // endpoints answer as that peer itself (no host mapping).
+        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json), advertised_at_ms, None)
             .await?
             .ok_or_else(|| {
                 format!(
@@ -2533,6 +2535,10 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
                     // a serde document; nesting it re-parsed keeps the
                     // machine surface honest about decode failures).
                     "endpoints_json": p.endpoints_json,
+                    // Machine-vs-scope: the transport host whose TLS
+                    // cert answers at the endpoints (dials pin THIS
+                    // identity). Null = the peer answers itself.
+                    "endpoints_peer_id": p.endpoints_peer_id.map(|host| host.to_string()),
                 })
             })
             .collect();
@@ -2569,8 +2575,14 @@ fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<
                 Err(error) => format!("  endpoints=<undecodable: {error}>"),
             },
         };
+        // Machine-vs-scope: show which identity actually answers at the
+        // stored endpoints, so the mapping the dialer pins is visible.
+        let host = match peer.endpoints_peer_id {
+            Some(host) => format!("  host={host}"),
+            None => String::new(),
+        };
         lines.push(format!(
-            "{}  {}  tier={}{endpoints}",
+            "{}  {}  tier={}{endpoints}{host}",
             peer.peer_id,
             peer.pubkey_b64,
             peer.tier.as_wire_str()
@@ -2615,6 +2627,49 @@ pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std
         [peer] => {
             println!("  peer_id:   {}", peer.peer_id);
             println!("  pubkey:    {}", peer.pubkey_b64);
+            // Machine↔scope, one card (self-healing join): show the
+            // transport HOST whose TLS cert answers at this peer's
+            // endpoints, and — when this peer IS a host — the scope
+            // peers reachable through it. Cert identity, joinable with
+            // the registry machine-id in the identity card below. Read
+            // from the same trust stores the dialer consults (wire root
+            // first, then the scope store — `peers()` is the identity
+            // union and doesn't carry endpoint metadata).
+            let mut trust_records = airc_trust::load(airc.wire_root()).await.unwrap_or_default();
+            if airc.wire_root() != home {
+                trust_records.extend(airc_trust::load(home).await.unwrap_or_default());
+            }
+            let host_of = |target: airc_core::PeerId| {
+                trust_records
+                    .iter()
+                    .find(|record| record.peer_id == target)
+                    .and_then(|record| record.endpoints_peer_id)
+                    .filter(|host| *host != target)
+            };
+            if let Some(host) = host_of(peer.peer_id) {
+                println!(
+                    "  machine:   {host} (transport host — TLS at this peer's \
+                     endpoints answers as this identity; dials pin it)"
+                );
+            }
+            let mut hosted: Vec<airc_core::PeerId> = trust_records
+                .iter()
+                .filter(|record| {
+                    record.endpoints_peer_id == Some(peer.peer_id) && record.peer_id != peer.peer_id
+                })
+                .map(|record| record.peer_id)
+                .collect();
+            hosted.sort_by_key(|scope| scope.to_string());
+            hosted.dedup();
+            if !hosted.is_empty() {
+                println!(
+                    "  hosts:     {} scope peer(s) behind this machine:",
+                    hosted.len()
+                );
+                for scope in hosted {
+                    println!("             {scope}");
+                }
+            }
             // Card 20066c49: read the identity card the peer published
             // via the substrate (IdentityPublished events emitted on
             // join — cards 088af06 / cd638b8) when known. Falls back

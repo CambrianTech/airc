@@ -250,6 +250,12 @@ pub async fn set_tier(
 /// stamp than the stored one is a no-op — a re-sync can never
 /// resurrect a dead `(ip, port)`.
 ///
+/// `endpoints_peer_id` (self-healing join, machine-vs-scope) is the
+/// TRANSPORT HOST whose TLS cert answers at these endpoints — the
+/// daemon identity when the peer is a scope hosted behind a shared
+/// listener; `None` when the endpoints answer as the peer itself. It
+/// travels atomically WITH the endpoint set under the same stamp.
+///
 /// Returns `Ok(None)` when the peer isn't enrolled: endpoints without
 /// a trust anchor are meaningless (there is no pubkey to cert-pin the
 /// dial against), so this never inserts a row.
@@ -258,10 +264,11 @@ pub async fn set_endpoints_json(
     peer_id: PeerId,
     endpoints_json: Option<String>,
     advertised_at_ms: u64,
+    endpoints_peer_id: Option<PeerId>,
 ) -> Result<Option<StoredPeer>, PeersStoreError> {
     open_store(home)
         .await?
-        .set_peer_trust_endpoints(peer_id, endpoints_json, advertised_at_ms)
+        .set_peer_trust_endpoints(peer_id, endpoints_json, advertised_at_ms, endpoints_peer_id)
         .await
         .map_err(Into::into)
 }

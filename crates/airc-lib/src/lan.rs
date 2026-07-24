@@ -602,7 +602,7 @@ mod tests {
             addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 7777)),
         }])
         .unwrap();
-        airc_trust::set_endpoints_json(airc.wire_root(), other, Some(json), 1_000)
+        airc_trust::set_endpoints_json(airc.wire_root(), other, Some(json), 1_000, None)
             .await
             .unwrap()
             .expect("other peer enrolled");
