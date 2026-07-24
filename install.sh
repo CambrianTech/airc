@@ -1146,6 +1146,7 @@ _install_airc_git_hooks() {
   [ "${AIRC_SKIP_GIT_HOOKS:-0}" = "1" ] && return 0
   local hooks_dir="$CLONE_DIR/.git/hooks"
   local worker="$CLONE_DIR/integrations/git-hooks/airc-fetch-base.sh"
+  local cargo_worker="$CLONE_DIR/integrations/git-hooks/airc-cargo-gate.sh"
   # core.hooksPath override (e.g. when the repo points hooks elsewhere).
   local hp
   hp="$(git -C "$CLONE_DIR" config --get core.hooksPath 2>/dev/null || true)"
@@ -1159,6 +1160,7 @@ _install_airc_git_hooks() {
   [ -f "$worker" ] || { warn "Git hook worker not found: $worker"; return 0; }
   mkdir -p "$hooks_dir" 2>/dev/null || { warn "Could not create $hooks_dir"; return 0; }
   chmod +x "$worker" 2>/dev/null || true
+  chmod +x "$cargo_worker" 2>/dev/null || true
 
   local phase hook tmp marker="# AIRC-FETCH-HOOK"
   for phase in pre-commit pre-push; do
@@ -1188,13 +1190,18 @@ _install_airc_git_hooks() {
       printf 'if [ -x "$WORKER" ] || [ -f "$WORKER" ]; then\n'
       printf '  bash "$WORKER" %q "$@" || exit $?\n' "$phase"
       printf 'fi\n'
+      printf 'CARGOGATE=%q\n' "$cargo_worker"
+      printf '%s\n' "# Then the cargo fmt+clippy gate (self-gates: no-op except on pre-push)."
+      printf 'if [ -x "$CARGOGATE" ] || [ -f "$CARGOGATE" ]; then\n'
+      printf '  bash "$CARGOGATE" %q "$@" || exit $?\n' "$phase"
+      printf 'fi\n'
       printf '%s\n' "# Chain a preserved local hook, forwarding stdin (pre-push gets refs on stdin)."
       printf 'if [ -x "$LOCAL" ]; then exec "$LOCAL" "$@"; fi\n'
       printf 'exit 0\n'
     } > "$tmp"
     mv "$tmp" "$hook"
     chmod +x "$hook" 2>/dev/null || true
-    ok "Git hook installed: $phase (fetch-before-$phase staleness guard)"
+    ok "Git hook installed: $phase (fetch staleness guard + cargo fmt/clippy gate on push)"
   done
 }
 
