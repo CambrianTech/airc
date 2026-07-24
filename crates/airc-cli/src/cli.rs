@@ -770,6 +770,20 @@ pub enum Command {
         room: Option<String>,
     },
 
+    /// Out-of-band coordination channel of last resort.
+    ///
+    /// A GitHub-gist-comment thread that works whenever `gh` works —
+    /// which is exactly when the airc wire is broken (blind rooms,
+    /// stale peers, dead dials). Post with `send`, surface peers'
+    /// posts with `watch`, and find/read the channel with `status`.
+    /// Every post is prefixed with this node's machine label so a
+    /// human can tell machines apart at a glance; `watch` self-filters
+    /// this node's own posts.
+    Sos {
+        #[command(subcommand)]
+        action: SosAction,
+    },
+
     /// Print the installed `airc` build metadata: short commit, branch,
     /// commit subject, and install dir. Use this to verify two scopes
     /// are on the same build. (`--version` flag prints just the
@@ -878,6 +892,33 @@ pub enum Command {
         /// Timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.
         timestamp: String,
     },
+}
+
+/// Subcommands for `airc sos` — the out-of-band gist-comment channel.
+#[derive(Debug, Subcommand)]
+pub enum SosAction {
+    /// Post a message to the account's SOS gist, prefixed with this
+    /// node's machine label (e.g. `[BIGMAMA] daemon wedged`). Finds or
+    /// creates the SOS gist first.
+    Send {
+        /// The message body to post.
+        message: String,
+    },
+
+    /// Surface new PEER messages from the SOS gist (self-filtering this
+    /// node's own posts). Default (agent mode) prints any new peer
+    /// message(s) and exits so a harness can re-invoke; `--follow`
+    /// streams continuously for a human.
+    Watch {
+        /// Stream continuously instead of printing new messages once and
+        /// exiting.
+        #[arg(long)]
+        follow: bool,
+    },
+
+    /// Print the SOS gist id, its html url, and the last few comments so
+    /// a peer can find and read the channel.
+    Status,
 }
 
 #[cfg(test)]
