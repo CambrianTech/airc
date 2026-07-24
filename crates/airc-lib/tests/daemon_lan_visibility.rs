@@ -772,3 +772,98 @@ async fn diverged_remote_lan_send_reconverges_and_acks_delivered() {
         "the sender must stamp the channel name on the wire — the convergence key"
     );
 }
+
+/// what this catches (self-healing join item 2 — receive-binding
+/// re-derive on identity heal; the live sequel to the d79843c heal):
+/// a scope that joined WHILE its machine's mesh identity was diverged
+/// stores its subscription under the diverged room UUID. After the
+/// identity heals, inbound frames arrive addressed to the CONVERGED
+/// UUID — the per-frame name reconvergence heals delivery TO a bound
+/// room, but a room bound under a stale UUID must be REBOUND or the
+/// scope keeps reading the dead room (live evidence: it took a manual
+/// `airc stop && airc join`). The join-shaped touchpoint must re-derive
+/// and re-bind; after that, a frame addressed to the converged UUID is
+/// delivered AND visible to the scope, while the old diverged UUID
+/// keeps working via the existing name reconvergence remap. Mutation
+/// checks: dropping `rebind_diverged` (or not calling it from `join`)
+/// fails the room-UUID assert and the operator-visibility assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healed_identity_rebinds_stale_subscription_to_the_converged_room() {
+    let machine = Machine::boot().await;
+    let store = machine_coordinator_store(&machine).await;
+    let name = airc_lib::subscriptions::ChannelName::new("general").expect("channel name");
+
+    // Boot diverged (the Windows-fallback shape), join #general.
+    pin_identity(store.as_ref(), "diverged-boot-identity").await;
+    let operator = machine.attach("operator").await;
+    let stale_room = operator.join("general").await.expect("diverged join");
+
+    let diverged_id = airc_lib::subscriptions::derive_room_id(
+        &airc_lib::subscriptions::MeshIdentity::new("diverged-boot-identity"),
+        &name,
+    );
+    let converged_id = airc_lib::subscriptions::derive_room_id(
+        &airc_lib::subscriptions::MeshIdentity::new("converged-account"),
+        &name,
+    );
+    assert_eq!(stale_room.channel, diverged_id, "premise: joined diverged");
+    assert_ne!(diverged_id, converged_id, "premise: identities diverge");
+
+    // The identity HEALS (gh reachable again / operator re-pin).
+    pin_identity(store.as_ref(), "converged-account").await;
+
+    // The join-shaped touchpoint re-binds the stored subscription.
+    let healed_room = operator.join("general").await.expect("healed join");
+    assert_eq!(
+        healed_room.channel, converged_id,
+        "join after the identity heal must re-bind the stored subscription \
+         to the converged room UUID, not keep returning the stale one"
+    );
+
+    // An inbound frame addressed to the CONVERGED UUID now delivers…
+    let sink = MemoryDiagnosticSink::default();
+    let bridge = RouterInboundBridge::new(machine.daemon.router(), store.clone())
+        .with_diagnostic_sink(Arc::new(sink.clone()));
+    let converged_event = EventId::new();
+    assert_eq!(
+        bridge
+            .deliver(&inbound_frame(
+                converged_id,
+                converged_event,
+                "addressed to the converged room"
+            ))
+            .await,
+        InboundDeliveryVerdict::Delivered,
+        "the healed binding must make the converged room deliverable"
+    );
+    // …and the SCOPE actually reads it (the read side is what the
+    // per-frame remap could never heal).
+    let recent = operator.page_recent(32).await.expect("page_recent");
+    assert!(
+        recent.iter().any(|event| event.event_id == converged_event),
+        "the rebound scope must see frames addressed to the converged room"
+    );
+
+    // The OLD diverged UUID keeps working via the existing name
+    // reconvergence remap (a not-yet-healed sender still converges).
+    let stale_addressed = EventId::new();
+    assert_eq!(
+        bridge
+            .deliver(&inbound_frame_with_headers(
+                diverged_id,
+                stale_addressed,
+                "addressed to the old diverged room",
+                &[(airc_protocol::HEADER_AIRC_CHANNEL_NAME, "general")],
+            ))
+            .await,
+        InboundDeliveryVerdict::DeliveredRemapped(converged_id),
+        "the old UUID must keep delivering via the per-frame name remap"
+    );
+    let recent = operator.page_recent(32).await.expect("page_recent");
+    assert!(
+        recent
+            .iter()
+            .any(|event| event.event_id == stale_addressed),
+        "frames remapped from the old UUID must surface in the rebound room"
+    );
+}

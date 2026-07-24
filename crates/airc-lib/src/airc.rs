@@ -1484,6 +1484,13 @@ impl Airc {
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        // Self-healing join: `mesh_identity()` above may have HEALED
+        // (re-resolved) since these subscriptions were stored — re-bind
+        // any room UUID that no longer derives from its stored name, or
+        // this scope keeps reading (and attaching to) a dead diverged
+        // room while inbound frames land in the converged one. Saved +
+        // re-beaconed by the save/publish_presence below.
+        warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel.clone())?;
@@ -1645,6 +1652,12 @@ impl Airc {
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        // Self-healing join: this method re-runs constantly (bare
+        // `airc join`, init re-runs, daemon-bounce recovery, monitor
+        // resume) — it is the join-shaped touchpoint where a healed
+        // mesh identity re-binds stale subscriptions to their converged
+        // room UUIDs. See `SubscriptionSet::rebind_diverged`.
+        warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let mut rooms = Vec::new();
 
         // Card 1eae6f3e: the default room is DURABLE scope state. This
@@ -1959,6 +1972,25 @@ mod trust_tier_wire_str {
 /// deserializes to this variant for an actual wall post, so it is the
 /// authoritative identity; doctrine / identity / chat bodies fall through
 /// to `None` (heterogeneous-stream projection, not error-swallowing).
+/// Self-healing join — receive-binding re-derive on identity heal: be
+/// LOUD about every subscription whose stored room UUID was re-bound to
+/// the current derivation of its stored name. A silent rebind would hide
+/// a mesh-identity change that re-targets what this scope reads; the
+/// old UUID stays reachable via the router bridge's per-frame name
+/// reconvergence, so naming old→new here is the operator's only signal.
+fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
+    for rebind in rebinds {
+        tracing::warn!(
+            channel = %rebind.name.display_with_hash(),
+            old_room_id = %rebind.old_room_id,
+            new_room_id = %rebind.new_room_id,
+            "subscription REBOUND: stored room UUID no longer derives from this \
+             scope's mesh identity (identity healed since join) — re-bound to the \
+             converged room so inbound frames and reads converge again"
+        );
+    }
+}
+
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
 ) -> Option<airc_core::doctrine::WallPostPublished> {
