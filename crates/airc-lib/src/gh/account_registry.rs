@@ -307,7 +307,6 @@ fn has_only_stale_beacons(document: &AccountRegistryDocument, now_ms: u64, ttl_m
             .any(|peer| peer.presence.is_fresh(now_ms, ttl_ms))
 }
 
-
 /// Shared fresh-token slot for a daemon's gh transport (card 1f2cbffa).
 ///
 /// `GH_TOKEN` is injected into the daemon's environment ONCE at spawn
@@ -676,8 +675,7 @@ impl GhAccountRegistryStore {
             if let Ok(Some(document)) = self.fetch_gist_document(entry).await {
                 if has_only_stale_beacons(&document, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS) {
                     verdict.action = GcAction::Delete;
-                    verdict.reason =
-                        "all beacons stale — superseded/dead machine gist".to_string();
+                    verdict.reason = "all beacons stale — superseded/dead machine gist".to_string();
                 }
             }
         }
