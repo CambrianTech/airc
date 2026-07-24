@@ -158,26 +158,21 @@ fn disable_env_set() -> bool {
     }
 }
 
-/// Stable per-writer key: `<host>-<user>`, sanitized. Derives from
-/// MACHINE identity (hostname + user), NOT from the rotating
-/// peer/mesh identity — so the same box always maps to the same
-/// registry gist even when its local sentinel or events.sqlite is
-/// wiped. Create-on-miss keyed off rotating identity is exactly what
-/// proliferated 5+ duplicate registry gists under joelteply.
+/// Stable per-writer key: the canonical per-machine `machine_id`.
+///
+/// This was `<host>-<user>`, which STILL fragmented — `hostname` resolves
+/// three different ways on one Mac (`joels-macbook-pro-local`,
+/// `joels-mbp-lan`, `macbookpro-lan`), minting THREE registry gists for a
+/// single machine. The persisted `machine_id` (`~/.airc/machine-id`, one
+/// value per box shared across scopes) is stable regardless of how
+/// `hostname` resolves, so a box maps to exactly ONE registry gist even
+/// when its local sentinel / events.sqlite is wiped. Human-readable
+/// host/platform lives in the gist's beacon content, not the filename.
+/// Old `<host>-<user>` gists stop receiving fresh beacons once a box
+/// adopts this key and are reaped by the all-stale gist gc pass.
 pub fn writer_key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let host = first_nonempty_env(&["HOSTNAME", "COMPUTERNAME"])
-            .or_else(hostname_from_command)
-            .unwrap_or_else(|| "unknown-host".to_string());
-        let user = first_nonempty_env(&["USER", "LOGNAME", "USERNAME"])
-            .unwrap_or_else(|| "unknown-user".to_string());
-        format!(
-            "{}-{}",
-            sanitize_writer_component(&host),
-            sanitize_writer_component(&user)
-        )
-    })
+    KEY.get_or_init(crate::mesh_identity::machine_id)
 }
 
 /// Per-writer registry filename: the stable marker this writer uses to
@@ -294,47 +289,6 @@ pub fn classify_registry_gc(gists: &[(String, String)]) -> Vec<GcVerdict> {
         .collect()
 }
 
-fn first_nonempty_env(names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
-}
-
-fn hostname_from_command() -> Option<String> {
-    let output = std::process::Command::new("hostname").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
-
-fn sanitize_writer_component(raw: &str) -> String {
-    let mut out = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    let mut component: String = trimmed.chars().take(24).collect();
-    while component.ends_with('-') {
-        component.pop();
-    }
-    if component.is_empty() {
-        "unknown".to_string()
-    } else {
-        component
-    }
-}
 
 /// Shared fresh-token slot for a daemon's gh transport (card 1f2cbffa).
 ///
@@ -1152,18 +1106,6 @@ mod tests {
     fn extract_gist_id_returns_none_for_empty_or_trailing_slash() {
         assert!(extract_gist_id("").is_none());
         assert!(extract_gist_id("https://gist.github.com/joelteply/").is_none());
-    }
-
-    #[test]
-    fn sanitize_writer_component_is_stable_and_safe() {
-        assert_eq!(
-            sanitize_writer_component("Joels-MacBook-Pro.local"),
-            "joels-macbook-pro-local"
-        );
-        assert_eq!(sanitize_writer_component("BIGMAMA"), "bigmama");
-        assert_eq!(sanitize_writer_component("  weird host!! "), "weird-host");
-        assert_eq!(sanitize_writer_component(""), "unknown");
-        assert_eq!(sanitize_writer_component("---"), "unknown");
     }
 
     #[test]

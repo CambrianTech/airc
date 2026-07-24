@@ -385,11 +385,12 @@ fn machine_home() -> Option<PathBuf> {
 /// Stable, machine-wide unique id — persisted once at `~/.airc/machine-id`
 /// and reused by every scope. The canonical machine key: it keeps the
 /// last-resort local identity DISTINCT across machines (never the
-/// colliding `unknown-host`) and is the intended single key for the
-/// account-registry gist name (one gist per machine, regardless of how
-/// `hostname` resolves). If the home is unwritable it degrades to a
-/// per-process id — still distinct across machines, just not persisted.
-fn machine_id() -> String {
+/// colliding `unknown-host`) and is the single key for the account-registry
+/// gist name (one gist per machine, regardless of how `hostname` resolves —
+/// see `gh::account_registry::writer_key`). If the home is unwritable it
+/// degrades to a per-process id — still distinct across machines, just not
+/// persisted.
+pub(crate) fn machine_id() -> String {
     if let Some(home) = machine_home() {
         let path = home.join("machine-id");
         if let Ok(existing) = std::fs::read_to_string(&path) {
