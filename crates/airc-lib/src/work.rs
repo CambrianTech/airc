@@ -1155,6 +1155,19 @@ impl Airc {
                 room_id: room.channel,
             });
         };
+        // Settled work is history, not backlog: a Review/Merged/Closed card is
+        // past claiming regardless of lease status. Live evidence (2026-07-24):
+        // personas kept re-claiming already-completed cards because this guard
+        // only checked lease expiry — the board read as open work forever.
+        // Reopening is an explicit `airc work state` transition, never a claim.
+        if matches!(
+            card.state,
+            airc_work::CardState::Review
+                | airc_work::CardState::Merged
+                | airc_work::CardState::Closed
+        ) {
+            return Err(AircError::WorkCardNotClaimable { card_id, state: card.state });
+        }
         let now_ms = now_ms()?;
         if card.claim_id.is_none()
             || card
