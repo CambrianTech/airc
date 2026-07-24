@@ -46,6 +46,43 @@ fn supported_schemes() -> Vec<SignatureScheme> {
     vec![SignatureScheme::ED25519]
 }
 
+/// Marker prefix of the peer-identity-mismatch handshake error. Kept as
+/// a named constant so the FORMATTER ([`peer_identity_mismatch_error`])
+/// and the PARSER ([`presented_peer_from_mismatch_error`]) can never
+/// drift apart — the self-healing dialer (airc-lib route discovery)
+/// parses this error to learn which ENROLLED identity actually answered
+/// an endpoint (the machine-vs-scope case) and retry the pin once.
+const MISMATCH_ERROR_PREFIX: &str = "server cert is for peer ";
+const MISMATCH_ERROR_INFIX: &str = ", expected ";
+
+/// The loud client-side verdict when the dialed endpoint presented a
+/// cert for a DIFFERENT enrolled peer than the caller pinned. Public
+/// (with its parser twin) so the message is a stable contract, not an
+/// incidental string.
+pub fn peer_identity_mismatch_error(presented: PeerId, expected: PeerId) -> String {
+    format!("{MISMATCH_ERROR_PREFIX}{presented}{MISMATCH_ERROR_INFIX}{expected}")
+}
+
+/// Parse the PRESENTED peer identity out of a (possibly wrapped)
+/// peer-identity-mismatch error message, or `None` when the message is
+/// not a mismatch verdict. The presented identity was resolved from the
+/// TLS cert against the enrolled `PeerKeyRegistry` before the error was
+/// produced — it names a KNOWN enrolled peer, never an attacker-chosen
+/// string — but callers must still re-check enrolment before pinning it
+/// (strict posture: never dial expecting an identity you don't trust).
+///
+/// Searches anywhere in the message because transport errors arrive
+/// wrapped ("dial: TLS handshake: server cert is for peer …").
+pub fn presented_peer_from_mismatch_error(message: &str) -> Option<PeerId> {
+    let start = message.find(MISMATCH_ERROR_PREFIX)? + MISMATCH_ERROR_PREFIX.len();
+    let rest = &message[start..];
+    let infix = rest.find(MISMATCH_ERROR_INFIX)?;
+    rest[..infix]
+        .parse::<uuid::Uuid>()
+        .ok()
+        .map(PeerId::from_uuid)
+}
+
 /// Client-side: the caller dialed a specific `expected_peer` and the
 /// server's cert MUST present one of that peer's enrolled keys.
 #[derive(Debug)]
@@ -81,9 +118,9 @@ impl ServerCertVerifier for PinnedServerVerifier {
             Some((peer, _key_id)) if peer == self.expected_peer => {
                 Ok(ServerCertVerified::assertion())
             }
-            Some((peer, _)) => Err(RustlsError::General(format!(
-                "server cert is for peer {peer}, expected {expected}",
-                expected = self.expected_peer
+            Some((peer, _)) => Err(RustlsError::General(peer_identity_mismatch_error(
+                peer,
+                self.expected_peer,
             ))),
             None => Err(RustlsError::General(format!(
                 "server cert pubkey is not enrolled (expected peer {}) — either the \
@@ -296,6 +333,75 @@ mod tests {
         assert!(
             msg.contains("expected") || msg.contains("for peer"),
             "error message must mention expected vs actual peer: {msg}"
+        );
+    }
+
+    // what this catches (self-healing join, machine-vs-scope dial): the
+    // mismatch-error FORMAT and its PARSER are one contract. The dialer
+    // heals a wrong-pin dial by parsing the PRESENTED identity out of
+    // this error and retrying once against it (if enrolled) — a format
+    // drift here would silently disable that heal. Round-trip, wrapped
+    // (transport errors arrive nested), and negative cases pinned.
+    #[test]
+    fn mismatch_error_round_trips_presented_peer_through_the_parser() {
+        let presented = PeerId::from_u128(0xe85a);
+        let expected = PeerId::from_u128(0xce8b);
+        let message = peer_identity_mismatch_error(presented, expected);
+        assert_eq!(
+            presented_peer_from_mismatch_error(&message),
+            Some(presented),
+            "bare mismatch message must parse back the presented peer"
+        );
+        // Wrapped, as the dial path actually sees it.
+        let wrapped = format!("transport: dial 10.0.0.2:7717: TLS handshake failed: {message}");
+        assert_eq!(
+            presented_peer_from_mismatch_error(&wrapped),
+            Some(presented),
+            "the parser must find the verdict inside wrapped transport errors"
+        );
+        // Non-mismatch errors must never yield a peer to re-pin.
+        assert_eq!(
+            presented_peer_from_mismatch_error(
+                "server cert pubkey is not enrolled (expected peer ce8b9074)"
+            ),
+            None,
+            "an unenrolled-cert error is NOT a mismatch — no retry identity"
+        );
+        assert_eq!(
+            presented_peer_from_mismatch_error("connection refused"),
+            None
+        );
+        assert_eq!(
+            presented_peer_from_mismatch_error(
+                "server cert is for peer not-a-uuid, expected also-not"
+            ),
+            None,
+            "a garbled identity must parse to None, never panic or guess"
+        );
+    }
+
+    // The wrong-peer verifier rejection must produce EXACTLY the
+    // parseable mismatch verdict — this is the production source of the
+    // string the heal parses.
+    #[test]
+    fn wrong_peer_rejection_is_parseable_by_the_mismatch_parser() {
+        let peer_a = PeerId::from_u128(0xa1);
+        let peer_b = PeerId::from_u128(0xb2);
+        let kp_a = PeerKeypair::generate();
+        let kp_b = PeerKeypair::generate();
+        let (cert_b, _) = generate_self_signed_cert(&kp_b, peer_b).unwrap();
+        let registry = PeerKeyRegistry::new();
+        registry.enrol(peer_a, 0, kp_a.public_bytes()).unwrap();
+        registry.enrol(peer_b, 0, kp_b.public_bytes()).unwrap();
+        let verifier = PinnedServerVerifier::new(peer_a, Arc::new(registry));
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let error = verifier
+            .verify_server_cert(&cert_b, &[], &server_name, &[], unix_now())
+            .expect_err("wrong peer must be rejected");
+        assert_eq!(
+            presented_peer_from_mismatch_error(&format!("{error}")),
+            Some(peer_b),
+            "the live rustls rejection must carry the parseable presented identity"
         );
     }
 

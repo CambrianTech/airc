@@ -152,6 +152,9 @@ pub use gh::client::{
 };
 pub use gh::governor::{GhBudget, Reservation};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
+pub use lan::{
+    is_tailscale_ipv4, lan_advertise_rejection, stable_lan_port, tailscale_advertise_rejection,
+};
 pub use lane_coordination::{
     LaneAction, LaneCoordinationEvent, LaneStatus, HEADER_COORD_KIND, HEADER_COORD_LANE_ID,
     HEADER_COORD_PR,
@@ -177,6 +180,7 @@ pub use route::{
     PeerDialSkip, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
     TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
     TransportKind, TransportResolver, TransportRole, TransportRoute,
+    DEAD_AFTER_CONSECUTIVE_FAILURES,
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};

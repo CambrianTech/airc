@@ -375,6 +375,18 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
 
+        Command::Dial {
+            to,
+            peer,
+            timeout_ms,
+        } => {
+            let expected = match peer {
+                Some(raw) => Some(parse_peer_id(&raw)?),
+                None => None,
+            };
+            commands::run_dial(&home, parsed.peers, to, expected, timeout_ms).await
+        }
+
         Command::LanSend {
             to,
             expected_peer,

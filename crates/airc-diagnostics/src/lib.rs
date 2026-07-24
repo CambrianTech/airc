@@ -83,6 +83,28 @@ pub enum DiagnosticCode {
     /// drops between transport accept and transcript persistence are
     /// the bug class this code makes impossible.
     FrameUndeliverable,
+    /// Self-healing join (the "blind room" half of the M5↔bigmama
+    /// repro): an inbound frame arrived for a channel NO scope on this
+    /// machine had bound, but the account registry's cached document
+    /// KNOWS the channel — the bridge re-published the registry's
+    /// subscribing beacons into the coordinator store, restoring the
+    /// binding so the frame (and every one after it) surfaces instead
+    /// of being durably stored and never shown. Warn severity: the
+    /// heal worked, but something (drained beacons / a wiped store)
+    /// lost the binding and the operator should know.
+    UnknownChannelRebound,
+    /// Self-healing join (the other half of the M5↔bigmama blind
+    /// room): an inbound frame was addressed to a channel UUID NO
+    /// scope here binds, but the frame carries the human channel NAME
+    /// (`HEADER_AIRC_CHANNEL_NAME`) and that name derives — under THIS
+    /// machine's mesh identity — to a channel a local scope DOES bind.
+    /// The sender's identity resolution diverged (gh unreachable →
+    /// `local:<host>:<user>` fallback), so its room UUID forked from
+    /// ours; the bridge re-converged by name and delivered the frame
+    /// into the locally bound room. Warn severity: delivery healed,
+    /// but the sending machine's identity is split from the account
+    /// identity and the operator should fix its gh auth.
+    ChannelNameReconverged,
     /// Card 39d37629: a delivery-ack response could not be written
     /// back to the requesting sender (no live connection, dead
     /// socket). The frame's own fate was already decided and logged;

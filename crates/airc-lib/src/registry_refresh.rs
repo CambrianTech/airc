@@ -641,6 +641,85 @@ exit 1
         }
     }
 
+    // Self-healing join — publish-on-bind. The daemon nudges
+    // `endpoint_resync` the moment it binds a listen socket (restart on
+    // a possibly-NEW port); `Notify` stores that permit, so the loop
+    // must publish IMMEDIATELY on start instead of sitting out the
+    // first_tick/cadence while every peer keeps dialing the dead port.
+    //
+    // what this catches: a restart's fresh advertisement waiting a full
+    // first-tick (or worse, a cadence) before reaching the rendezvous.
+    // Both first_tick and cadence are set far beyond the test budget,
+    // so the ONLY way the document can appear on the store in time is
+    // the pre-loop resync permit. Mutation check: dropping the
+    // `resync.notified()` arm from `run_loop`'s select (or notifying
+    // after the permit is lost) times the wait out.
+    #[tokio::test]
+    async fn pre_loop_resync_permit_publishes_immediately_not_at_first_tick() {
+        let dir = tempdir().unwrap();
+        let machine = dir.path().join("machine/.airc");
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let store = sqlite_registry_store_at(&dir.path().join("rendezvous")).await;
+        let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
+            .await
+            .unwrap();
+        airc.join("general").await.unwrap();
+
+        let resync = Arc::new(tokio::sync::Notify::new());
+        // The bind site nudges BEFORE the loop starts — the permit must
+        // not be lost.
+        resync.notify_one();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let config = RegistryRefreshConfig {
+            // Far beyond the bounded wait below: only the resync permit
+            // can publish in time.
+            first_tick: Duration::from_secs(3600),
+            cadence: Duration::from_secs(3600),
+        };
+        let loop_airc = airc.clone();
+        let loop_store = store.clone();
+        let loop_resync = resync.clone();
+        let handle = tokio::spawn(async move {
+            run_loop(
+                loop_airc,
+                loop_store,
+                RegistryRefreshGate::Always,
+                config,
+                &loop_resync,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        });
+
+        // Bounded poll: the published document must land well before the
+        // 3600s first tick could ever fire.
+        let mesh = crate::subscriptions::MeshIdentity::new("joelteply");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut published = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(doc) = store.refresh(&mesh).await.unwrap() {
+                published = Some(doc);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let doc = published.expect(
+            "a pre-loop resync permit (publish-on-bind) must publish immediately, \
+             not at the first cadence tick",
+        );
+        assert!(
+            doc.peers.iter().any(|p| p.peer_id() == airc.peer_id()),
+            "the immediate publish must carry this node's own beacon"
+        );
+
+        tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
     // The loop honors shutdown promptly even with a long cadence —
     // proves the pinned-shutdown wiring (bounded by the 1s test budget).
     #[tokio::test]

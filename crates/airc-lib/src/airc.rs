@@ -197,6 +197,15 @@ pub(crate) struct AircInner {
     /// clones (like `live_tx`) so whichever handle dials, the quarantine
     /// is unified. See [`crate::route::dial_quarantine`].
     pub(crate) dial_quarantine: Arc<std::sync::Mutex<crate::route::DialQuarantine>>,
+    /// Self-healing join (machine-vs-scope cert identity): the peer id
+    /// of the TRANSPORT HOST whose TLS cert answers at this handle's
+    /// advertised `route_endpoints` — set (via
+    /// [`Airc::set_advertised_endpoints_host`]) when the endpoints were
+    /// read back from the daemon over IPC (`registry sync` from a
+    /// scope), so the published beacon carries the identity a dialer
+    /// must actually pin. `None` = this handle owns its own listener
+    /// (the endpoints answer as this handle's peer).
+    pub(crate) advertised_endpoints_host: std::sync::Mutex<Option<PeerId>>,
     /// #9: in-session learned real IPs per peer, harvested from AUTHENTICATED
     /// inbound connections (a peer that dialed us proved it's reachable at that
     /// source IP — on a LAN, symmetric). The dial path pairs a learned IP with
@@ -480,6 +489,7 @@ impl Airc {
                 dial_quarantine: Arc::new(std::sync::Mutex::new(
                     crate::route::DialQuarantine::default(),
                 )),
+                advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
@@ -1289,6 +1299,7 @@ impl Airc {
             // Share the quarantine across the daemon clone so dial-failure
             // backoff is unified regardless of which handle runs discovery.
             dial_quarantine: self.inner.dial_quarantine.clone(),
+            advertised_endpoints_host: std::sync::Mutex::new(None),
             // #9: share the learned-IP map across the daemon clone so an
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
@@ -1449,6 +1460,33 @@ impl Airc {
         Ok(())
     }
 
+    /// Self-healing join (machine-vs-scope cert identity): declare the
+    /// TRANSPORT HOST whose TLS certificate answers at this handle's
+    /// advertised endpoints. Callers that inject endpoints they do not
+    /// themselves serve — `registry sync` reading the daemon's listener
+    /// back over IPC — MUST set this to the daemon's peer id, or the
+    /// published beacon advertises endpoints a dialer will pin to the
+    /// WRONG identity (the live mismatch this heals). Handles that own
+    /// their own listener never call this.
+    pub fn set_advertised_endpoints_host(&self, host: PeerId) {
+        *self
+            .inner
+            .advertised_endpoints_host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(host);
+    }
+
+    /// The declared transport host for this handle's advertised
+    /// endpoints, or `None` when the endpoints answer as this handle's
+    /// own peer. See [`Self::set_advertised_endpoints_host`].
+    pub(crate) fn advertised_endpoints_host(&self) -> Option<PeerId> {
+        *self
+            .inner
+            .advertised_endpoints_host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     async fn publish_presence(
         &self,
         identity: &MeshIdentity,
@@ -1484,6 +1522,13 @@ impl Airc {
         let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        // Self-healing join: `mesh_identity()` above may have HEALED
+        // (re-resolved) since these subscriptions were stored — re-bind
+        // any room UUID that no longer derives from its stored name, or
+        // this scope keeps reading (and attaching to) a dead diverged
+        // room while inbound frames land in the converged one. Saved +
+        // re-beaconed by the save/publish_presence below.
+        warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel.clone())?;
@@ -1645,6 +1690,12 @@ impl Airc {
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        // Self-healing join: this method re-runs constantly (bare
+        // `airc join`, init re-runs, daemon-bounce recovery, monitor
+        // resume) — it is the join-shaped touchpoint where a healed
+        // mesh identity re-binds stale subscriptions to their converged
+        // room UUIDs. See `SubscriptionSet::rebind_diverged`.
+        warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let mut rooms = Vec::new();
 
         // Card 1eae6f3e: the default room is DURABLE scope state. This
@@ -1792,6 +1843,17 @@ impl Airc {
 
     pub(crate) fn coordinator_store(&self) -> &dyn EventStore {
         self.inner.coordinator_store.as_ref()
+    }
+
+    /// Test-only access to the machine coordinator store (mesh-identity
+    /// cache + presence beacons) so integration tests can PIN a mesh
+    /// identity (`crate::mesh_identity::save` with an `Operator`-source
+    /// entry) instead of shelling out to gh — e.g. to reproduce the
+    /// diverged-identity blind-room scenario hermetically. Same pattern
+    /// as [`Airc::send_frame_to_for_test`].
+    #[doc(hidden)]
+    pub fn coordinator_store_for_test(&self) -> &dyn EventStore {
+        self.coordinator_store()
     }
 
     /// Load a named runtime consumer checkpoint from the durable
@@ -1948,6 +2010,25 @@ mod trust_tier_wire_str {
 /// deserializes to this variant for an actual wall post, so it is the
 /// authoritative identity; doctrine / identity / chat bodies fall through
 /// to `None` (heterogeneous-stream projection, not error-swallowing).
+/// Self-healing join — receive-binding re-derive on identity heal: be
+/// LOUD about every subscription whose stored room UUID was re-bound to
+/// the current derivation of its stored name. A silent rebind would hide
+/// a mesh-identity change that re-targets what this scope reads; the
+/// old UUID stays reachable via the router bridge's per-frame name
+/// reconvergence, so naming old→new here is the operator's only signal.
+fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
+    for rebind in rebinds {
+        tracing::warn!(
+            channel = %rebind.name.display_with_hash(),
+            old_room_id = %rebind.old_room_id,
+            new_room_id = %rebind.new_room_id,
+            "subscription REBOUND: stored room UUID no longer derives from this \
+             scope's mesh identity (identity healed since join) — re-bound to the \
+             converged room so inbound frames and reads converge again"
+        );
+    }
+}
+
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
 ) -> Option<airc_core::doctrine::WallPostPublished> {

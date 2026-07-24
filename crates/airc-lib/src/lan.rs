@@ -13,6 +13,99 @@ use crate::error::AircError;
 use crate::route::{RouteEndpoint, TransportHealthSample, TransportKind};
 use crate::Airc;
 
+/// Self-healing join — advertise hygiene for the LAN rung. Returns the
+/// reason an IPv4 must NEVER be advertised as a dialable LAN endpoint,
+/// or `None` when it is admissible.
+///
+/// The live M5↔bigmama repro (decay mode #4): Docker containers
+/// advertised internal bridge IPs (`172.x`) as reachable endpoints and
+/// every peer on the account burned dozens of 3s dial timeouts on
+/// them. The rejected classes:
+/// - loopback / unspecified — never dialable off-host;
+/// - link-local `169.254/16` — never routed;
+/// - `172.16/12` — the docker0/br-* bridge band. We detect by RANGE,
+///   not interface name (the UDP source-address trick has no ifname),
+///   which deliberately also refuses 172.16/12 corporate LANs: per the
+///   live evidence this band is "never correct" on this mesh, and a
+///   host on such a LAN still advertises its Tailscale rung;
+/// - `100.64/10` CGNAT — a Tailscale address; it rides the Tailscale
+///   rung ([`tailscale_advertise_rejection`]), never the LAN rung.
+///
+/// RFC1918 `10/8` + `192.168/16` (the en0-style LANs) and public
+/// addresses pass.
+pub fn lan_advertise_rejection(ip: Ipv4Addr) -> Option<&'static str> {
+    let octets = ip.octets();
+    if ip.is_loopback() {
+        Some("loopback is never dialable off-host")
+    } else if ip.is_unspecified() {
+        Some("the unspecified address is not dialable")
+    } else if ip.is_link_local() {
+        Some("link-local (169.254/16) is never routed off-link")
+    } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        Some(
+            "172.16/12 is the docker/bridge band — advertising it floods every peer \
+             with undialable ghosts (the 172.x swarm); advertise the HOST's routable \
+             address instead (AIRC_ADVERTISE_IP)",
+        )
+    } else if is_tailscale_ipv4(ip) {
+        Some("100.64/10 is a Tailscale/CGNAT address — it belongs on the Tailscale rung")
+    } else {
+        None
+    }
+}
+
+/// Self-healing join — advertise hygiene for the Tailscale rung: the
+/// address must actually BE a Tailscale/CGNAT address (`100.64/10`).
+/// Anything else on this rung is a corrupted or mislabelled
+/// advertisement.
+pub fn tailscale_advertise_rejection(ip: Ipv4Addr) -> Option<&'static str> {
+    if is_tailscale_ipv4(ip) {
+        None
+    } else {
+        Some("not a 100.64/10 CGNAT address — the Tailscale rung only carries Tailscale IPs")
+    }
+}
+
+/// Tailscale's CGNAT range is `100.64.0.0/10` (100.64.0.0 –
+/// 100.127.255.255). ONE definition — the CLI's detection and the
+/// advertise hygiene both use it.
+pub fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+/// Apply advertise hygiene + the known-peer-collision guard to one
+/// candidate rung. Returns the IP iff it may be advertised; refusals
+/// are LOUD (a reachability-affecting decision is never silent).
+///
+/// The collision guard is decay mode #3 from the live repro: a peer
+/// record carried the reader's OWN Tailscale IP as another machine's
+/// endpoint. Advertising an endpoint that equals a KNOWN other peer's
+/// stored endpoint would extend exactly that corruption chain onto the
+/// rendezvous, so we refuse and say why.
+fn admissible_advertise_ip(
+    rung: &str,
+    ip: Option<Ipv4Addr>,
+    port: u16,
+    known_peer_addrs: &std::collections::HashSet<SocketAddr>,
+    rejection: fn(Ipv4Addr) -> Option<&'static str>,
+) -> Option<Ipv4Addr> {
+    let ip = ip?;
+    if let Some(reason) = rejection(ip) {
+        eprintln!("airc: refusing to advertise {ip}:{port} on the {rung} rung — {reason}");
+        return None;
+    }
+    if known_peer_addrs.contains(&SocketAddr::from((ip, port))) {
+        eprintln!(
+            "airc: refusing to advertise {ip}:{port} on the {rung} rung — it equals a KNOWN \
+             other peer's stored endpoint (corrupted advertisement chain; not re-poisoning \
+             the rendezvous)"
+        );
+        return None;
+    }
+    Some(ip)
+}
+
 impl Airc {
     /// Bind a TLS-pinned LAN listener and ingest received frames into
     /// the same store/live stream as local-fs frames.
@@ -71,6 +164,18 @@ impl Airc {
         self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         let port = actual.port();
+        // Self-healing join — advertise hygiene: never let a bridge /
+        // loopback / mislabelled / peer-colliding address onto the
+        // rendezvous (see `admissible_advertise_ip`).
+        let known = self.known_other_peer_addrs().await?;
+        let lan_ip = admissible_advertise_ip("LAN", lan_ip, port, &known, lan_advertise_rejection);
+        let tailscale_ip = admissible_advertise_ip(
+            "Tailscale",
+            tailscale_ip,
+            port,
+            &known,
+            tailscale_advertise_rejection,
+        );
         let mut advertised = Vec::new();
         if let Some(ip) = lan_ip {
             let endpoint = RouteEndpoint::LanTcp {
@@ -87,6 +192,50 @@ impl Airc {
             advertised.push(endpoint);
         }
         Ok(advertised)
+    }
+
+    /// Every socket address stored as ANOTHER peer's dialable endpoint
+    /// (both trust stores, same merge scope as the dialer). Input to the
+    /// advertise collision guard — we must never advertise an address the
+    /// mesh already attributes to someone else. A record whose endpoint
+    /// JSON this binary can't decode contributes nothing here (the dial
+    /// path already surfaces that skew loudly).
+    async fn known_other_peer_addrs(
+        &self,
+    ) -> Result<std::collections::HashSet<SocketAddr>, AircError> {
+        let mut stored = Vec::new();
+        if self.inner.wire_root != self.inner.home {
+            stored.extend(
+                airc_trust::load(&self.inner.wire_root)
+                    .await
+                    .map_err(|error| AircError::Transport(error.to_string()))?,
+            );
+        }
+        stored.extend(
+            airc_trust::load(&self.inner.home)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+        let mut addrs = std::collections::HashSet::new();
+        for peer in stored {
+            if peer.peer_id == self.inner.identity.peer_id {
+                continue;
+            }
+            let Some(json) = peer.endpoints_json.as_deref() else {
+                continue;
+            };
+            let Ok(endpoints) = crate::route::endpoints_from_json(json) else {
+                continue;
+            };
+            for endpoint in endpoints {
+                if let RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } =
+                    endpoint
+                {
+                    addrs.insert(addr);
+                }
+            }
+        }
+        Ok(addrs)
     }
 
     /// Re-evaluate the dialable endpoints this daemon advertises against
@@ -143,6 +292,21 @@ impl Airc {
             }
             return Ok(false);
         };
+
+        // Self-healing join — advertise hygiene, same guard as
+        // `listen_lan_advertising`. A rejected IP reads as `None`
+        // below, so an already-advertised poisoned address (a bridge
+        // IP, or a known peer's address) is WITHDRAWN on the next tick
+        // — the poisoned-advertisement self-heal.
+        let known = self.known_other_peer_addrs().await?;
+        let lan_ip = admissible_advertise_ip("LAN", lan_ip, port, &known, lan_advertise_rejection);
+        let tailscale_ip = admissible_advertise_ip(
+            "Tailscale",
+            tailscale_ip,
+            port,
+            &known,
+            tailscale_advertise_rejection,
+        );
 
         let mut changed = false;
 
@@ -234,7 +398,11 @@ impl Airc {
 /// (49152..=65535); two scopes on one machine have different peer_ids →
 /// different ports (no self-collision), and the caller falls back to an
 /// ephemeral port if this one is already taken.
-fn stable_lan_port(peer_id: PeerId) -> u16 {
+///
+/// Public since self-healing join: the `airc dial` recovery verb uses it
+/// to infer WHICH enrolled peer owns a bare `host:port` (the port is
+/// identity-derived, so a match identifies the peer to cert-pin).
+pub fn stable_lan_port(peer_id: PeerId) -> u16 {
     const DYNAMIC_BASE: u128 = 49152; // first IANA dynamic/private port
     const DYNAMIC_SPAN: u128 = 65536 - DYNAMIC_BASE; // 16384 ports
     (DYNAMIC_BASE + (peer_id.as_uuid().as_u128() % DYNAMIC_SPAN)) as u16
@@ -341,6 +509,121 @@ mod tests {
             .await
             .unwrap();
         assert!(!changed, "same IP ⇒ no change ⇒ no resync (no spam)");
+    }
+
+    // what this catches (self-healing join, M5↔bigmama decay mode #4 —
+    // the 172.x ghost swarm): the advertise-hygiene predicate must
+    // refuse every never-correct class (loopback, unspecified,
+    // link-local, the docker/bridge 172.16/12 band, CGNAT on the LAN
+    // rung, non-CGNAT on the Tailscale rung) and admit real en0-style
+    // LANs + public addresses. Mutation check: dropping any rejection
+    // arm fails its assert.
+    #[test]
+    fn advertise_hygiene_rejects_never_correct_classes_and_admits_real_lans() {
+        // Rejected on the LAN rung.
+        for poisoned in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(169, 254, 7, 7),  // link-local
+            Ipv4Addr::new(172, 16, 0, 2),   // docker/bridge band low edge
+            Ipv4Addr::new(172, 18, 0, 5),   // the literal live ghost class
+            Ipv4Addr::new(172, 31, 255, 9), // band high edge
+            Ipv4Addr::new(100, 79, 156, 3), // Tailscale IP on the WRONG rung
+        ] {
+            assert!(
+                lan_advertise_rejection(poisoned).is_some(),
+                "{poisoned} must be refused on the LAN rung"
+            );
+        }
+        // Admitted on the LAN rung.
+        for real in [
+            Ipv4Addr::new(192, 168, 1, 232), // en0-style home/office LAN
+            Ipv4Addr::new(10, 0, 1, 16),     // 10/8 LAN
+            Ipv4Addr::new(172, 32, 0, 1),    // just past the bridge band
+            Ipv4Addr::new(8, 8, 8, 8),       // public
+        ] {
+            assert!(
+                lan_advertise_rejection(real).is_none(),
+                "{real} must be advertisable on the LAN rung"
+            );
+        }
+        // The Tailscale rung only carries CGNAT.
+        assert!(tailscale_advertise_rejection(Ipv4Addr::new(100, 79, 156, 3)).is_none());
+        assert!(tailscale_advertise_rejection(Ipv4Addr::new(192, 168, 1, 232)).is_some());
+    }
+
+    // what this catches (self-healing join): an already-advertised
+    // POISONED address (a docker-bridge IP that slipped onto the
+    // rendezvous pre-hygiene) must be WITHDRAWN by the refresh tick,
+    // not re-advertised — the rejected IP reads as None and takes the
+    // existing withdraw arm. Mutation check: dropping the
+    // `admissible_advertise_ip` filter in `refresh_advertised_endpoints`
+    // keeps the bridge IP advertised and fails both asserts.
+    #[tokio::test]
+    async fn refresh_withdraws_a_poisoned_advertised_bridge_ip() {
+        let (_dir, airc) = test_airc().await;
+        // A pre-hygiene daemon advertised its docker bridge address.
+        airc.upsert_route_endpoint(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(172, 18, 0, 5), 7777)),
+        })
+        .unwrap();
+
+        // The tick re-detects the same poisoned IP — hygiene must refuse
+        // it and withdraw the rung instead of keeping the ghost alive.
+        let changed = airc
+            .refresh_advertised_endpoints(Some(Ipv4Addr::new(172, 18, 0, 5)), None)
+            .await
+            .unwrap();
+
+        assert!(changed, "withdrawing the poisoned rung is a change");
+        assert_eq!(
+            lan_addr(&airc.route_endpoints().unwrap()),
+            None,
+            "a bridge IP must never survive on the advertised set"
+        );
+    }
+
+    // what this catches (self-healing join, decay mode #3 — a peer
+    // record carrying OUR address as another machine's endpoint): we
+    // must never advertise an endpoint that equals a KNOWN other
+    // peer's stored endpoint — that would extend the corruption chain
+    // onto the rendezvous. Mutation check: dropping the
+    // `known_peer_addrs.contains` guard advertises the colliding
+    // address and fails the assert.
+    #[tokio::test]
+    async fn refresh_refuses_to_advertise_a_known_peers_address() {
+        let (_dir, airc) = test_airc().await;
+        // A known peer's stored endpoint at (192.168.1.50, 7777).
+        let other = PeerId::from_u128(0x07e6_0000_0001);
+        airc_trust::add(airc.wire_root(), other, [7u8; 32])
+            .await
+            .unwrap();
+        let json = crate::route::endpoints_to_json(&[RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 7777)),
+        }])
+        .unwrap();
+        airc_trust::set_endpoints_json(airc.wire_root(), other, Some(json), 1_000, None)
+            .await
+            .unwrap()
+            .expect("other peer enrolled");
+
+        // Our currently-advertised rung shares port 7777; the tick then
+        // "detects" the other peer's IP (the corrupted-chain shape).
+        airc.upsert_route_endpoint(RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 232), 7777)),
+        })
+        .unwrap();
+        let changed = airc
+            .refresh_advertised_endpoints(Some(Ipv4Addr::new(192, 168, 1, 50)), None)
+            .await
+            .unwrap();
+
+        assert!(changed, "the stale own-rung must be withdrawn");
+        assert_eq!(
+            lan_addr(&airc.route_endpoints().unwrap()),
+            None,
+            "a KNOWN other peer's address must never be advertised as ours"
+        );
     }
 
     // what this catches: Tailscale toggle. Turning Tailscale on adds the

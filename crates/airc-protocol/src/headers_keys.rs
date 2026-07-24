@@ -104,6 +104,22 @@ pub const HEADER_AIRC_BODY_ENC_KEY_ID: &str = "airc.body.enc.key_id";
 /// AAD on decrypt or authentication will fail closed.
 pub const HEADER_AIRC_BODY_ENC_AAD: &str = "airc.body.enc.aad";
 
+/// Human channel NAME the sender addressed (e.g. `"general"`) — the
+/// convergence key for cross-machine room delivery. Channel UUIDs are
+/// derived from `(mesh_identity, name)`, so two machines whose identity
+/// resolution diverged (gh unreachable on one → `local:<host>:<user>`
+/// fallback) derive DIFFERENT UUIDs for the same room and every frame
+/// between them dies as `unknown_channel` (the M5↔bigmama blind-room
+/// bug: bigmama's `#general` derived under `local:unknown-host:unknown-user`
+/// while M5 derived under the gh login). The name header lets the
+/// receiving bridge re-derive the room under ITS OWN identity and
+/// deliver into the room the operator actually reads — loudly
+/// (`DiagnosticCode::ChannelNameReconverged`). Senders stamp it on every
+/// room send; receivers treat it as a heal hint, never as authority
+/// (only consulted when the addressed UUID binds NO local scope, and
+/// only within an already-authenticated, enrolled-peer link).
+pub const HEADER_AIRC_CHANNEL_NAME: &str = "airc.channel_name";
+
 /// A base64-encoded, serialized `airc_lib::grid_auth::SignedCapabilityGrant` —
 /// the owner-signed capability the caller PRESENTS so a receiving node can
 /// authorize the command against it (the contracted-grid auth gate): verify the
@@ -126,6 +142,15 @@ mod tests {
         assert_eq!(HEADER_AIRC_BODY_ENC_SCHEME, "airc.body.enc.scheme");
         assert_eq!(HEADER_AIRC_BODY_ENC_KEY_ID, "airc.body.enc.key_id");
         assert_eq!(HEADER_AIRC_BODY_ENC_AAD, "airc.body.enc.aad");
+    }
+
+    /// what this catches: the channel-name header is the CROSS-VERSION
+    /// convergence key for the blind-room heal — a sender on build N
+    /// stamps it, a receiver on build N+1 looks it up by exact string.
+    /// A rename would silently disable the heal with no compile error.
+    #[test]
+    fn channel_name_header_is_stable_and_substrate_namespaced() {
+        assert_eq!(HEADER_AIRC_CHANNEL_NAME, "airc.channel_name");
     }
 
     /// Card 1224aac2 slice 2: every encryption header lives under the

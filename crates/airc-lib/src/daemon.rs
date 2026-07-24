@@ -136,8 +136,11 @@ impl Airc {
         &self,
         room: &Room,
         text: &str,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<airc_core::EventId, AircError> {
+        // Cross-machine name reconvergence (blind-room heal): every
+        // room send carries the human channel name.
+        room.stamp_name_header(&mut headers);
         let receipt = self
             .require_daemon_client()?
             .send(SendRequest {
@@ -162,8 +165,9 @@ impl Airc {
         kind: FrameKind,
         target: MentionTarget,
         body: Body,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<crate::messaging::SendFrameResult, AircError> {
+        room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
@@ -191,8 +195,9 @@ impl Airc {
         room: &Room,
         kind: FrameKind,
         body: Body,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<PublishReceipt, AircError> {
+        room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {

@@ -24,6 +24,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use airc_lib::{endpoints_to_json, Airc, PeerSpec, RouteEndpoint};
 use tempfile::TempDir;
 
+/// Self-healing join: endpoint writes carry a freshness stamp; these
+/// tests simulate "the import just persisted a current advertisement",
+/// so the stamp is simply now.
+fn test_stamp_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64
+}
+
 /// The happy path: bob's trust record for alice carries alice's
 /// listen endpoint; bob's route discovery dials it and the LAN link
 /// comes up without bob ever calling `connect_lan` himself.
@@ -52,10 +62,16 @@ async fn discovery_dials_stored_lan_endpoint_outbound() {
     // verb `peer add --endpoint` would have stored.
     let endpoints_json =
         endpoints_to_json(&[RouteEndpoint::LanTcp { addr: alice_addr }]).expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     let snapshot = bob
         .refresh_route_discovery()
@@ -101,10 +117,16 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
     };
     let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: closed_addr }])
         .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     let snapshot = bob
         .refresh_route_discovery()
@@ -162,10 +184,16 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     };
     let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: closed_addr }])
         .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     // First refresh: the dial is ATTEMPTED and fails → recorded as a
     // failure, nothing skipped.
@@ -202,6 +230,250 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     assert!(
         skip.remaining_ms > 0,
         "the operator sees the remaining backoff"
+    );
+}
+
+/// what this catches (self-healing join item 1, machine-vs-scope): a
+/// stored record pins a SCOPE peer while the endpoint's TLS listener
+/// answers with the MACHINE (daemon) identity — the live two-machine
+/// failure where every automatic dial died with a loud identity
+/// mismatch until a human redialed with the machine id. The dialer must
+/// do what the human did: parse the presented identity out of the
+/// mismatch, verify it is ENROLLED, and retry the pin exactly once.
+/// Mutation checks: dropping the retry leaves `connected` empty and a
+/// mismatch failure recorded; retrying without the enrolment gate is
+/// pinned by the strictness test below.
+#[tokio::test]
+async fn identity_mismatch_dial_retries_once_pinning_the_presented_enrolled_identity() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    // "machine" is the daemon-shaped listener identity that answers TLS.
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    // The scope peer: a real identity hosted behind the machine's
+    // listener (its own keypair — enrolled, but NOT what the listener's
+    // cert presents).
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+
+    let machine_spec: PeerSpec = machine.peer_spec().parse().expect("machine spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
+    bob.add_peer(machine_spec)
+        .await
+        .expect("bob trusts the machine identity");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+
+    // The field shape: the SCOPE peer's trust record carries the
+    // MACHINE's endpoint (a scope-published registry beacon advertising
+    // the daemon's listener).
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+
+    assert!(
+        snapshot.connected_lan_peers.contains(&machine.peer_id()),
+        "the mismatch retry must connect to the enrolled identity the cert \
+         presented (the machine); connected: {:?}",
+        snapshot.connected_lan_peers
+    );
+    assert!(
+        snapshot.peer_dial_failures.is_empty(),
+        "a healed mismatch must not surface as a dial failure: {:?}",
+        snapshot.peer_dial_failures
+    );
+}
+
+/// what this catches (machine-vs-scope item 3 — the stored mapping):
+/// a trust record whose endpoints carry the registry-imported
+/// `endpoints_peer_id` host mapping must cert-pin the MACHINE identity
+/// on the FIRST dial — no failed handshake, no mismatch retry — and
+/// the route must come up. Together with the resolve_dial_pin unit
+/// tests (strictness: unenrolled/self/absent mappings pin the record's
+/// own peer), this pins item 3(c): dial-by-scope-peer resolves to the
+/// machine identity for cert pinning when the mapping is known.
+#[tokio::test]
+async fn stored_host_mapping_pins_the_machine_identity_and_connects() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+    let machine_spec: PeerSpec = machine.peer_spec().parse().expect("machine spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
+    bob.add_peer(machine_spec)
+        .await
+        .expect("bob trusts the machine identity");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+
+    // What the account-registry import now persists: the scope peer's
+    // endpoints WITH the machine's identity as their transport host.
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        Some(machine.peer_id()),
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+
+    assert!(
+        snapshot.peer_dial_failures.is_empty(),
+        "a correctly-pinned first dial must record NO failure: {:?}",
+        snapshot.peer_dial_failures
+    );
+    assert!(
+        snapshot.connected_lan_peers.contains(&machine.peer_id()),
+        "the mapped dial must connect to the machine identity; connected: {:?}",
+        snapshot.connected_lan_peers
+    );
+
+    // Steady state: the next refresh sees the machine connected and
+    // skips the hosted record cleanly — no re-dial churn, no failures.
+    let second = bob.refresh_route_discovery().await.expect("second refresh");
+    assert!(
+        second.peer_dial_failures.is_empty(),
+        "a hosted record behind a live machine connection must not re-dial \
+         into failures: {:?}",
+        second.peer_dial_failures
+    );
+}
+
+/// what this catches (strict pinning, the retry's non-negotiable gate):
+/// when the endpoint answers with an identity this scope has NEVER
+/// enrolled, there is no retry and no connection — the dial fails loud.
+/// An unknown identity must never be accepted, no matter how convenient
+/// the heal would be.
+#[tokio::test]
+async fn identity_mismatch_never_retries_an_unenrolled_identity() {
+    let tmp_machine = TempDir::new().expect("machine tempdir");
+    let tmp_bob = TempDir::new().expect("bob tempdir");
+    let machine = Airc::open(tmp_machine.path().join(".airc"))
+        .await
+        .expect("machine open");
+    let bob = Airc::open(tmp_bob.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let scope_peer = airc_core::PeerId::new();
+    let scope_keypair = airc_protocol::PeerKeypair::generate();
+    let scope_spec = airc_lib::PeerSpec {
+        peer_id: scope_peer,
+        pubkey: scope_keypair.public_bytes(),
+    };
+    // bob trusts ONLY the scope peer — the machine identity answering
+    // TLS at the endpoint is a stranger to bob's trust store.
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    machine
+        .add_peer(bob_spec)
+        .await
+        .expect("machine trusts bob");
+    bob.add_peer(scope_spec)
+        .await
+        .expect("bob trusts the scope peer");
+
+    let machine_addr: SocketAddr = machine
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("machine listens");
+    let endpoints_json = endpoints_to_json(&[RouteEndpoint::LanTcp { addr: machine_addr }])
+        .expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        scope_peer,
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("scope peer must be enrolled on bob");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("refresh must survive the refused dial");
+
+    assert!(
+        snapshot.connected_lan_peers.is_empty(),
+        "an unenrolled listener identity must never be connected to: {:?}",
+        snapshot.connected_lan_peers
+    );
+    assert_eq!(
+        snapshot.peer_dial_failures.len(),
+        1,
+        "the refused dial must be recorded loudly: {:?}",
+        snapshot.peer_dial_failures
+    );
+    let failure = &snapshot.peer_dial_failures[0];
+    assert_eq!(failure.peer_id, scope_peer);
+    assert!(
+        failure.error.contains("not enrolled") || failure.error.contains("expected"),
+        "the failure must carry the verifier's loud refusal: {}",
+        failure.error
     );
 }
 
@@ -279,21 +551,43 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
     alice.add_peer(bob_spec).await.expect("alice trusts bob");
     bob.add_peer(alice_spec).await.expect("bob trusts alice");
 
-    // Loopback stands in for the LAN IP (reachable via the wildcard
-    // listener); the 100.x Tailscale address is off-box and unreachable.
+    // Bind the wildcard listener (advertising only the unreachable 100.x
+    // Tailscale rung — self-healing join's advertise hygiene rightly
+    // refuses loopback as a LAN advertisement), then build the peer-side
+    // endpoint set MANUALLY with loopback standing in for the LAN IP.
+    // This test pins the DIAL ladder, not the advertise filter, and an
+    // import can legitimately hold any addr an older/other node stored.
     let advertised = alice
-        .listen_lan_advertising(
-            Some(Ipv4Addr::LOCALHOST),
-            Some(Ipv4Addr::new(100, 79, 156, 3)),
-        )
+        .listen_lan_advertising(None, Some(Ipv4Addr::new(100, 79, 156, 3)))
         .await
-        .expect("alice advertises both");
+        .expect("alice advertises the tailscale rung");
+    let port = advertised
+        .iter()
+        .find_map(|endpoint| match endpoint {
+            RouteEndpoint::TailscaleTcp { addr } => Some(addr.port()),
+            _ => None,
+        })
+        .expect("tailscale rung advertised");
+    let both_rungs = vec![
+        RouteEndpoint::LanTcp {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        },
+        RouteEndpoint::TailscaleTcp {
+            addr: SocketAddr::from((Ipv4Addr::new(100, 79, 156, 3), port)),
+        },
+    ];
 
-    let endpoints_json = endpoints_to_json(&advertised).expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    let endpoints_json = endpoints_to_json(&both_rungs).expect("encode endpoints");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     let snapshot = bob
         .refresh_route_discovery()
@@ -362,6 +656,8 @@ async fn split_store_import_still_dials_no_silent_shadow() {
         2_000,
         vec![channel.clone()],
         vec![AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: beacon_now(
                 alice.peer_id(),
                 tmp_a.path().join(".airc"),
@@ -468,10 +764,16 @@ async fn off_lan_peer_pays_lan_dial_timeout_then_connects_via_tailscale() {
         RouteEndpoint::TailscaleTcp { addr: alice_addr },
     ])
     .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     let started = std::time::Instant::now();
     let snapshot = bob
@@ -554,10 +856,16 @@ async fn dial_walks_endpoints_in_stored_order_and_stops_on_success() {
         RouteEndpoint::LanTcp { addr: alice_addr },
     ])
     .expect("encode endpoints");
-    airc_trust::set_endpoints_json(bob.home(), alice.peer_id(), Some(endpoints_json))
-        .await
-        .expect("store endpoints")
-        .expect("alice must be enrolled on bob");
+    airc_trust::set_endpoints_json(
+        bob.home(),
+        alice.peer_id(),
+        Some(endpoints_json),
+        test_stamp_now_ms(),
+        None,
+    )
+    .await
+    .expect("store endpoints")
+    .expect("alice must be enrolled on bob");
 
     let started = std::time::Instant::now();
     let snapshot = bob
@@ -648,10 +956,16 @@ async fn peers_are_dialed_concurrently_not_serially() {
         bob.add_peer(peer_spec).await.expect("bob trusts peer");
         let endpoints_json =
             endpoints_to_json(&[RouteEndpoint::LanTcp { addr }]).expect("encode endpoints");
-        airc_trust::set_endpoints_json(bob.home(), peer_id, Some(endpoints_json))
-            .await
-            .expect("store endpoints")
-            .expect("peer must be enrolled on bob");
+        airc_trust::set_endpoints_json(
+            bob.home(),
+            peer_id,
+            Some(endpoints_json),
+            test_stamp_now_ms(),
+            None,
+        )
+        .await
+        .expect("store endpoints")
+        .expect("peer must be enrolled on bob");
         peer_tmps.push((tmp, peer));
     }
 
@@ -681,4 +995,180 @@ async fn peers_are_dialed_concurrently_not_serially() {
     for handle in tarpits {
         handle.abort();
     }
+}
+
+// ---------------------------------------------------------------------
+// Self-healing join — refresh-on-failure (`Airc::heal_failed_dials`).
+// ---------------------------------------------------------------------
+
+/// Stub rendezvous: hands back whatever document the test placed in it.
+/// The trait seam (`AccountRegistryStore`) IS the stub point — no gh, no
+/// network, fully deterministic.
+struct StubRendezvous {
+    doc: std::sync::Mutex<Option<airc_lib::AccountRegistryDocument>>,
+}
+
+impl StubRendezvous {
+    fn holding(doc: airc_lib::AccountRegistryDocument) -> Self {
+        Self {
+            doc: std::sync::Mutex::new(Some(doc)),
+        }
+    }
+
+    fn set(&self, doc: airc_lib::AccountRegistryDocument) {
+        *self.doc.lock().expect("stub lock") = Some(doc);
+    }
+}
+
+#[async_trait::async_trait]
+impl airc_lib::AccountRegistryStore for StubRendezvous {
+    async fn publish(
+        &self,
+        _document: &airc_lib::AccountRegistryDocument,
+    ) -> Result<(), airc_lib::AccountRegistryError> {
+        Ok(())
+    }
+
+    async fn refresh(
+        &self,
+        _mesh_identity: &airc_lib::MeshIdentity,
+    ) -> Result<Option<airc_lib::AccountRegistryDocument>, airc_lib::AccountRegistryError> {
+        Ok(self.doc.lock().expect("stub lock").clone())
+    }
+}
+
+/// One-beacon registry document for `peer` advertising `endpoints`,
+/// heartbeated at `heartbeat_at_ms` (which also stamps the endpoints'
+/// freshness via `endpoints_freshness_ms`).
+fn one_beacon_doc(
+    spec: &PeerSpec,
+    endpoints: Vec<RouteEndpoint>,
+    heartbeat_at_ms: u64,
+) -> airc_lib::AccountRegistryDocument {
+    airc_lib::AccountRegistryDocument::new(
+        airc_lib::MeshIdentity::new("joelteply"),
+        heartbeat_at_ms,
+        Vec::new(),
+        vec![airc_lib::AccountPeerBeacon {
+            presence: airc_lib::beacon_now(
+                spec.peer_id,
+                "/machine/alice/.airc".into(),
+                Vec::new(),
+                123,
+                heartbeat_at_ms,
+            ),
+            peer_spec: spec.clone(),
+            endpoints,
+            endpoints_advertised_at_ms: Some(heartbeat_at_ms),
+            endpoints_peer_id: None,
+        }],
+    )
+}
+
+/// what this catches (self-healing join, M5↔bigmama decay mode #1 —
+/// "stale port dialed forever"): after a dial failure,
+/// `heal_failed_dials` must (a) do NOTHING when the rendezvous has no
+/// fresher endpoint — no blind retry of the corpse — and (b) once a
+/// fresher advertisement lands, re-read it, replace the stored
+/// endpoint, and dial the LIVE endpoint immediately instead of waiting
+/// for the next blind cadence. Mutation check: dropping the
+/// changed-endpoint gate makes (a) return Some (blind retry); dropping
+/// the post-import re-dial makes (b) return a snapshot without the
+/// live connection.
+#[tokio::test]
+async fn heal_failed_dials_rereads_rendezvous_and_dials_fresh_endpoint() {
+    let tmp_a = TempDir::new().expect("alice tempdir");
+    let tmp_b = TempDir::new().expect("bob tempdir");
+    let alice = Airc::open(tmp_a.path().join(".airc"))
+        .await
+        .expect("alice open");
+    let bob = Airc::open(tmp_b.path().join(".airc"))
+        .await
+        .expect("bob open");
+
+    let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice spec");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    alice.add_peer(bob_spec).await.expect("alice trusts bob");
+    bob.add_peer(alice_spec.clone())
+        .await
+        .expect("bob trusts alice");
+
+    // Alice's REAL listener (the restarted daemon's new port)...
+    let live_addr: SocketAddr = alice
+        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("alice listens");
+    // ...and the dead port her stale advertisement still points at.
+    let dead_addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        listener.local_addr().expect("probe addr")
+    };
+
+    let now_ms = test_stamp_now_ms();
+    // The rendezvous initially carries the STALE advertisement.
+    let stub = StubRendezvous::holding(one_beacon_doc(
+        &alice_spec,
+        vec![RouteEndpoint::LanTcp { addr: dead_addr }],
+        now_ms - 60_000,
+    ));
+    bob.refresh_account_registry(&stub)
+        .await
+        .expect("import stale advertisement");
+
+    let snapshot = bob
+        .refresh_route_discovery()
+        .await
+        .expect("bob discovery refresh");
+    assert_eq!(
+        snapshot.peer_dial_failures.len(),
+        1,
+        "the stale endpoint must fail: {:?}",
+        snapshot.peer_dial_failures
+    );
+
+    // (a) Rendezvous unchanged → nothing fresher → heal must be a
+    // no-op (the quarantine backoff owns the dead endpoint's retry).
+    let unchanged = bob
+        .heal_failed_dials(&stub, &snapshot.peer_dial_failures)
+        .await
+        .expect("heal with unchanged rendezvous");
+    assert!(
+        unchanged.is_none(),
+        "no fresher endpoint on the rendezvous must mean NO extra dial pass"
+    );
+
+    // (b) The fresh advertisement lands (daemon restarted, new port).
+    stub.set(one_beacon_doc(
+        &alice_spec,
+        vec![RouteEndpoint::LanTcp { addr: live_addr }],
+        now_ms,
+    ));
+    let healed = bob
+        .heal_failed_dials(&stub, &snapshot.peer_dial_failures)
+        .await
+        .expect("heal with fresh rendezvous")
+        .expect("a fresher endpoint must trigger the re-dial pass");
+    assert!(
+        healed.connected_lan_peers.contains(&alice.peer_id()),
+        "heal must dial the FRESH endpoint and connect; connected: {:?}, failures: {:?}",
+        healed.connected_lan_peers,
+        healed.peer_dial_failures
+    );
+
+    // The stored record is now exactly the live endpoint (atomic
+    // replace, item 1) — the corpse is gone from the dial set.
+    let stored = airc_trust::load(bob.wire_root())
+        .await
+        .expect("load bob trust")
+        .into_iter()
+        .find(|p| p.peer_id == alice.peer_id())
+        .expect("alice enrolled on bob");
+    let stored_endpoints =
+        airc_lib::endpoints_from_json(stored.endpoints_json.as_deref().expect("endpoints stored"))
+            .expect("decode stored endpoints");
+    assert_eq!(
+        stored_endpoints,
+        vec![RouteEndpoint::LanTcp { addr: live_addr }],
+        "the fresher advertisement must fully replace the dead endpoint"
+    );
 }

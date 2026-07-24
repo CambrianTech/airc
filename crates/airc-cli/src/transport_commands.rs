@@ -146,14 +146,26 @@ pub async fn run_health(
     // Card 7e3c9a1f: endpoints in dial-failure backoff — shown as a
     // DISTINCT state, never as "dial failed" (no dial was attempted this
     // refresh). Surfaced so the operator sees the backoff is intentional,
-    // and re-dialed once the window elapses.
+    // and re-dialed once the window elapses. Self-healing join: a DEAD
+    // endpoint (failure-counted eviction) is a third distinct state —
+    // no countdown applies; only a fresher advertisement revives it.
     for skip in &snapshot.peer_dial_skips {
-        println!(
-            "dial backoff: {} via {:?} — skipped, ~{}s remaining after a prior failed dial",
-            skip.peer_id,
-            skip.endpoint,
-            skip.remaining_ms.div_ceil(1000)
-        );
+        if skip.dead {
+            println!(
+                "endpoint dead: {} via {:?} — evicted after {} consecutive failed dials; \
+                 revived only by a fresher advertisement",
+                skip.peer_id,
+                skip.endpoint,
+                airc_lib::DEAD_AFTER_CONSECUTIVE_FAILURES
+            );
+        } else {
+            println!(
+                "dial backoff: {} via {:?} — skipped, ~{}s remaining after a prior failed dial",
+                skip.peer_id,
+                skip.endpoint,
+                skip.remaining_ms.div_ceil(1000)
+            );
+        }
     }
 
     if !verdict.is_failure() || !fail {

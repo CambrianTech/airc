@@ -86,9 +86,35 @@ pub const MAX_BACKOFF_MS: u64 = 120_000;
 /// vanished from the registry (no longer dialed).
 const QUARANTINE_RETENTION_MS: u64 = 600_000;
 
+/// Self-healing join — failure-counted eviction (M5↔bigmama decay mode
+/// #4, the 172.x ghost swarm): after this many CONSECUTIVE failures an
+/// endpoint is DEAD — evicted from the dial set entirely (record kept,
+/// endpoint skipped) until a FRESHER advertisement for the peer's
+/// endpoint set arrives. Five attempts spans several timed-backoff
+/// windows (~15s→120s), so a transiently-flapping endpoint recovers
+/// long before eviction, while a genuinely-dead corpse stops burning a
+/// 3s timeout on every discovery cycle forever.
+pub const DEAD_AFTER_CONSECUTIVE_FAILURES: u32 = 5;
+
 /// Quarantine key: the dead thing is a specific peer's endpoint, not the
 /// bare address (which a recycled-IP live peer may now own).
 type QuarantineKey = (PeerId, SocketAddr);
+
+/// The dialer's verdict for one endpoint, from this quarantine's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialGate {
+    /// No failure memory (or the window elapsed, or a fresher
+    /// advertisement revived the endpoint) — dial it.
+    Dial,
+    /// Inside the timed backoff window after recent failure(s).
+    Backoff { remaining_ms: u64 },
+    /// Failure-counted eviction: `DEAD_AFTER_CONSECUTIVE_FAILURES`+
+    /// consecutive failures with no fresher advertisement since — do
+    /// not dial until one arrives (or the retention sweep forgets the
+    /// streak after [`QUARANTINE_RETENTION_MS`] idle, the bounded
+    /// "second chance" horizon).
+    Dead { consecutive_failures: u32 },
+}
 
 /// One quarantined endpoint: when it last failed and how long to skip it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +125,19 @@ struct QuarantineEntry {
     /// `failed_at_ms + backoff_ms`; doubles per consecutive failure up to
     /// [`MAX_BACKOFF_MS`].
     backoff_ms: u64,
+    /// Self-healing join: length of the CURRENT consecutive-failure
+    /// streak. At [`DEAD_AFTER_CONSECUTIVE_FAILURES`] the endpoint is
+    /// evicted from the dial set (see [`DialGate::Dead`]). Cleared with
+    /// the entry on success.
+    consecutive_failures: u32,
+    /// Self-healing join: the peer's endpoint-set freshness stamp
+    /// (`StoredPeer::endpoints_advertised_at_ms`) as of the most recent
+    /// failure. A CURRENT stamp strictly greater than this means a
+    /// fresher advertisement arrived since the streak — the eviction is
+    /// lifted for ONE probe (a failure under the fresher stamp re-kills
+    /// immediately, so a live-but-unreachable publisher costs at most
+    /// one 3s dial per fresh advertisement, not one per tick).
+    advert_stamp_ms: u64,
 }
 
 impl QuarantineEntry {
@@ -128,12 +167,38 @@ impl DialQuarantine {
         self.entries.get(key).and_then(|e| e.remaining_ms(now_ms))
     }
 
+    /// The full dial verdict for `key` (self-healing join): DEAD after
+    /// [`DEAD_AFTER_CONSECUTIVE_FAILURES`] consecutive failures unless
+    /// `current_advert_stamp_ms` is STRICTLY fresher than the stamp the
+    /// streak accrued under (a fresher advertisement revives the
+    /// endpoint for a probe); otherwise the timed backoff; otherwise
+    /// dial.
+    pub fn gate(&self, key: &QuarantineKey, now_ms: u64, current_advert_stamp_ms: u64) -> DialGate {
+        let Some(entry) = self.entries.get(key) else {
+            return DialGate::Dial;
+        };
+        if entry.consecutive_failures >= DEAD_AFTER_CONSECUTIVE_FAILURES
+            && current_advert_stamp_ms <= entry.advert_stamp_ms
+        {
+            return DialGate::Dead {
+                consecutive_failures: entry.consecutive_failures,
+            };
+        }
+        match entry.remaining_ms(now_ms) {
+            Some(remaining_ms) => DialGate::Backoff { remaining_ms },
+            None => DialGate::Dial,
+        }
+    }
+
     /// Record a failed dial to `key`: start the backoff at
     /// [`INITIAL_BACKOFF_MS`], or double the existing window (capped at
-    /// [`MAX_BACKOFF_MS`]) for a repeat failure. Also sweeps entries whose
-    /// window has fully elapsed, so the map can't grow unbounded as a
+    /// [`MAX_BACKOFF_MS`]) for a repeat failure; the consecutive-failure
+    /// streak grows toward [`DEAD_AFTER_CONSECUTIVE_FAILURES`] and the
+    /// entry remembers the freshest advertisement stamp it failed under
+    /// (`advert_stamp_ms`, monotonic). Also sweeps entries whose window
+    /// has fully elapsed, so the map can't grow unbounded as a
     /// long-lived daemon churns through ephemeral container addresses.
-    pub fn record_failure(&mut self, key: QuarantineKey, now_ms: u64) {
+    pub fn record_failure(&mut self, key: QuarantineKey, now_ms: u64, advert_stamp_ms: u64) {
         // Sweep entries not re-failed within the retention horizon. This
         // is INTENTIONALLY keyed off `QUARANTINE_RETENTION_MS`, NOT the
         // (shorter) backoff window — sweeping at window expiry would drop
@@ -143,15 +208,25 @@ impl DialQuarantine {
         self.entries.retain(|_, entry| {
             now_ms.saturating_sub(entry.failed_at_ms) <= QUARANTINE_RETENTION_MS
         });
-        let backoff_ms = match self.entries.get(&key) {
-            Some(prev) => prev.backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS),
-            None => INITIAL_BACKOFF_MS,
+        let (backoff_ms, consecutive_failures, prev_stamp) = match self.entries.get(&key) {
+            Some(prev) => (
+                prev.backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS),
+                prev.consecutive_failures.saturating_add(1),
+                prev.advert_stamp_ms,
+            ),
+            None => (INITIAL_BACKOFF_MS, 1, 0),
         };
         self.entries.insert(
             key,
             QuarantineEntry {
                 failed_at_ms: now_ms,
                 backoff_ms,
+                consecutive_failures,
+                // Monotonic max: a failure under a FRESHER advertisement
+                // re-arms the eviction against that stamp (the one-probe-
+                // per-fresh-advertisement contract); a stale caller value
+                // must never rewind it.
+                advert_stamp_ms: prev_stamp.max(advert_stamp_ms),
             },
         );
     }
@@ -192,7 +267,7 @@ mod tests {
     fn failure_quarantines_for_initial_window_then_expires() {
         let mut q = DialQuarantine::default();
         let now = 1_000_000;
-        q.record_failure(key(7717), now);
+        q.record_failure(key(7717), now, 0);
 
         assert!(q.remaining_ms(&key(7717), now).is_some(), "skipped now");
         assert!(
@@ -217,9 +292,9 @@ mod tests {
         let mut q = DialQuarantine::default();
         let mut now = 0u64;
 
-        q.record_failure(key(7717), now);
+        q.record_failure(key(7717), now, 0);
         now += INITIAL_BACKOFF_MS;
-        q.record_failure(key(7717), now);
+        q.record_failure(key(7717), now, 0);
         assert!(
             q.remaining_ms(&key(7717), now + INITIAL_BACKOFF_MS + 1)
                 .is_some(),
@@ -227,7 +302,7 @@ mod tests {
         );
 
         for _ in 0..20 {
-            q.record_failure(key(7717), now);
+            q.record_failure(key(7717), now, 0);
         }
         assert!(q
             .remaining_ms(&key(7717), now + MAX_BACKOFF_MS - 1)
@@ -243,7 +318,7 @@ mod tests {
     fn success_clears_quarantine_immediately() {
         let mut q = DialQuarantine::default();
         let now = 1_000_000;
-        q.record_failure(key(7717), now);
+        q.record_failure(key(7717), now, 0);
         assert!(q.remaining_ms(&key(7717), now).is_some());
 
         q.record_success(&key(7717));
@@ -266,7 +341,7 @@ mod tests {
         let dead_peer = (PeerId::from_u128(0x01), addr);
         let live_peer = (PeerId::from_u128(0x02), addr);
 
-        q.record_failure(dead_peer, now);
+        q.record_failure(dead_peer, now, 0);
         assert!(
             q.remaining_ms(&dead_peer, now).is_some(),
             "dead peer backed off"
@@ -286,7 +361,7 @@ mod tests {
     fn backward_clock_step_does_not_extend_or_expire() {
         let mut q = DialQuarantine::default();
         let failed_at = 1_000_000;
-        q.record_failure(key(7717), failed_at);
+        q.record_failure(key(7717), failed_at, 0);
         let remaining = q.remaining_ms(&key(7717), failed_at - 5_000);
         assert_eq!(
             remaining,
@@ -303,15 +378,80 @@ mod tests {
     #[test]
     fn record_failure_sweeps_entries_past_retention() {
         let mut q = DialQuarantine::default();
-        q.record_failure(key(1), 0);
+        q.record_failure(key(1), 0, 0);
         // A failure long past key(1)'s retention horizon sweeps it.
-        q.record_failure(key(2), QUARANTINE_RETENTION_MS + 1);
+        q.record_failure(key(2), QUARANTINE_RETENTION_MS + 1, 0);
         assert_eq!(
             q.entries.len(),
             1,
             "key(1) past retention swept; only key(2) remains"
         );
         assert!(q.entries.contains_key(&key(2)));
+    }
+
+    // what this catches (self-healing join — failure-counted eviction,
+    // the 172.x ghost swarm): the 5th consecutive failure marks the
+    // endpoint DEAD — skipped even after every timed backoff window has
+    // elapsed — and ONLY a strictly-fresher advertisement stamp revives
+    // it, for exactly one probe (a failure under the fresher stamp
+    // re-kills immediately). Mutation checks: dropping the dead arm from
+    // `gate` fails the "still dead after backoff expiry" assert; using
+    // `<` instead of `<=` on the stamp comparison fails the same-stamp
+    // assert; dropping the monotonic stamp max in `record_failure` fails
+    // the re-kill assert.
+    #[test]
+    fn fifth_consecutive_failure_is_dead_until_a_fresher_advertisement() {
+        let mut q = DialQuarantine::default();
+        let stamp = 1_000u64;
+        let mut now = 0u64;
+        for _ in 0..DEAD_AFTER_CONSECUTIVE_FAILURES {
+            q.record_failure(key(7717), now, stamp);
+            now += MAX_BACKOFF_MS + 1;
+        }
+
+        // Every backoff window has elapsed — a timed quarantine would
+        // dial again. Failure-counted eviction must NOT.
+        assert!(
+            matches!(
+                q.gate(&key(7717), now, stamp),
+                DialGate::Dead {
+                    consecutive_failures
+                } if consecutive_failures == DEAD_AFTER_CONSECUTIVE_FAILURES
+            ),
+            "5 consecutive failures with no fresher advertisement = dead, \
+             even after the backoff expired"
+        );
+
+        // Four failures is NOT dead (streak below the threshold).
+        let mut four = DialQuarantine::default();
+        for i in 0..(DEAD_AFTER_CONSECUTIVE_FAILURES - 1) {
+            four.record_failure(key(1), u64::from(i), stamp);
+        }
+        assert!(
+            !matches!(four.gate(&key(1), now, stamp), DialGate::Dead { .. }),
+            "below the threshold the timed backoff still governs"
+        );
+
+        // A STRICTLY fresher advertisement revives the endpoint for a probe.
+        assert_eq!(
+            q.gate(&key(7717), now, stamp + 1),
+            DialGate::Dial,
+            "a fresher advertisement must lift the eviction for one probe"
+        );
+        // ...and a failure under that fresher stamp re-kills immediately
+        // (one probe per fresh advertisement, not one per tick).
+        q.record_failure(key(7717), now, stamp + 1);
+        assert!(
+            matches!(
+                q.gate(&key(7717), now + MAX_BACKOFF_MS + 1, stamp + 1),
+                DialGate::Dead { .. }
+            ),
+            "a failure under the fresher stamp re-arms the eviction against it"
+        );
+
+        // A success wipes the streak entirely.
+        q.record_success(&key(7717));
+        assert_eq!(q.gate(&key(7717), now, stamp), DialGate::Dial);
     }
 
     // what this catches: doubling must SURVIVE a re-failure that lands
@@ -322,11 +462,11 @@ mod tests {
     #[test]
     fn doubling_survives_re_failure_across_the_backoff_window() {
         let mut q = DialQuarantine::default();
-        q.record_failure(key(7717), 0);
+        q.record_failure(key(7717), 0, 0);
         // Re-fail AFTER the initial window elapsed (INITIAL+1) but well
         // within retention — must double, not reset.
         let t = INITIAL_BACKOFF_MS + 1;
-        q.record_failure(key(7717), t);
+        q.record_failure(key(7717), t, 0);
         assert!(
             q.remaining_ms(&key(7717), t + INITIAL_BACKOFF_MS + 1)
                 .is_some(),

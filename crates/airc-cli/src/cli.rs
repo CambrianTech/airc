@@ -548,6 +548,29 @@ pub enum Command {
         replay: bool,
     },
 
+    /// Self-healing join — manual recovery dial: connect to `HOST:PORT`
+    /// with the full authenticated (mTLS-pinned) handshake and report
+    /// LOUDLY. A successful dial also teaches the REMOTE our real
+    /// source address (learn-live-address, #9), so a peer stuck dialing
+    /// our stale endpoint can recover from one inbound contact. The
+    /// expected peer is inferred from the trust store (stored endpoint
+    /// match, else the identity-derived stable port); pass `--expected-peer`
+    /// when inference is ambiguous.
+    Dial {
+        /// Endpoint to dial (e.g. `192.168.1.249:57958`).
+        to: SocketAddr,
+        /// UUID of the peer expected at that endpoint (for cert
+        /// pinning). Inferred from the trust store when omitted.
+        /// (`--peer` is the global volatile-peer-spec flag, hence the
+        /// longer name — same convention as `lan-send`.)
+        #[arg(long = "expected-peer")]
+        peer: Option<String>,
+        /// Dial + handshake deadline. Generous next to discovery's 3s
+        /// budget — this is a hands-on recovery verb, not a sweep.
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+    },
+
     /// Same-LAN secure send: dial a peer over TLS, send a single
     /// text frame to the current room's channel, and wait for the
     /// receiver's typed delivery ack (card 39d37629). Exit 0 only on
@@ -954,6 +977,41 @@ mod tests {
             matches!(parsed.command, Command::IpcEndpoint),
             "ipc-endpoint must map to Command::IpcEndpoint, got {:?}",
             parsed.command
+        );
+    }
+
+    // what this catches (self-healing join): the `airc dial HOST:PORT`
+    // recovery verb — positional endpoint, optional --peer pin, bounded
+    // --timeout-ms. The runbook for a wedged mesh says exactly
+    // `airc dial <host:port>`; a silent rename/removal strands the
+    // operator mid-recovery.
+    #[test]
+    fn dial_verb_parses_endpoint_and_optional_peer() {
+        use super::{Cli, Command};
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["airc", "dial", "192.168.1.249:57958"])
+            .expect("`airc dial HOST:PORT` must parse");
+        match parsed.command {
+            Command::Dial {
+                to,
+                peer,
+                timeout_ms,
+            } => {
+                assert_eq!(
+                    to,
+                    "192.168.1.249:57958"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                );
+                assert_eq!(peer, None, "expected-peer inference is the default");
+                assert_eq!(timeout_ms, 10_000, "generous recovery-verb default");
+            }
+            other => panic!("dial must map to Command::Dial, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["airc", "dial", "not-an-endpoint"]).is_err(),
+            "a non-socket-addr endpoint must be a parse error"
         );
     }
 

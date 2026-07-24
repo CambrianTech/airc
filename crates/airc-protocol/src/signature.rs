@@ -140,6 +140,16 @@ impl PeerKeyRegistry {
         before - self.keys.len()
     }
 
+    /// True when at least one key is enrolled for `peer` — the cheap
+    /// "is this identity trusted at all" gate. Used by the self-healing
+    /// dialer before re-pinning a dial to the identity a server cert
+    /// actually presented (machine-vs-scope mismatch): an UNKNOWN
+    /// identity must never be dialed-for, so the retry is gated on
+    /// enrolment here.
+    pub fn has_peer(&self, peer: PeerId) -> bool {
+        self.keys.iter().any(|entry| entry.key().0 == peer)
+    }
+
     /// Reverse lookup: find which `(peer, key_id)` enrolled a given
     /// pubkey. Used by the lan-tcp TLS verifier — at handshake time
     /// the server receives a client cert but doesn't know which peer

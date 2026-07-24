@@ -96,9 +96,14 @@ impl Airc {
         kind: FrameKind,
         target: MentionTarget,
         body: Body,
-        headers: Headers,
+        mut headers: Headers,
         room: &crate::Room,
     ) -> Result<SendFrameResult, AircError> {
+        // Cross-machine name reconvergence (blind-room heal): every
+        // room send carries the human channel name so a receiver whose
+        // identity-scoped channel derivation diverged from ours can
+        // re-derive the room under its own identity and still deliver.
+        room.stamp_name_header(&mut headers);
         // Daemon-attached: ALL structured sends (publish, work events,
         // lifecycle) route through the daemon's router — not just `say`.
         // Keeps the write path consistent with the daemon read path.

@@ -158,26 +158,21 @@ fn disable_env_set() -> bool {
     }
 }
 
-/// Stable per-writer key: `<host>-<user>`, sanitized. Derives from
-/// MACHINE identity (hostname + user), NOT from the rotating
-/// peer/mesh identity — so the same box always maps to the same
-/// registry gist even when its local sentinel or events.sqlite is
-/// wiped. Create-on-miss keyed off rotating identity is exactly what
-/// proliferated 5+ duplicate registry gists under joelteply.
+/// Stable per-writer key: the canonical per-machine `machine_id`.
+///
+/// This was `<host>-<user>`, which STILL fragmented — `hostname` resolves
+/// three different ways on one Mac (`joels-macbook-pro-local`,
+/// `joels-mbp-lan`, `macbookpro-lan`), minting THREE registry gists for a
+/// single machine. The persisted `machine_id` (`~/.airc/machine-id`, one
+/// value per box shared across scopes) is stable regardless of how
+/// `hostname` resolves, so a box maps to exactly ONE registry gist even
+/// when its local sentinel / events.sqlite is wiped. Human-readable
+/// host/platform lives in the gist's beacon content, not the filename.
+/// Old `<host>-<user>` gists stop receiving fresh beacons once a box
+/// adopts this key and are reaped by the all-stale gist gc pass.
 pub fn writer_key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let host = first_nonempty_env(&["HOSTNAME", "COMPUTERNAME"])
-            .or_else(hostname_from_command)
-            .unwrap_or_else(|| "unknown-host".to_string());
-        let user = first_nonempty_env(&["USER", "LOGNAME", "USERNAME"])
-            .unwrap_or_else(|| "unknown-user".to_string());
-        format!(
-            "{}-{}",
-            sanitize_writer_component(&host),
-            sanitize_writer_component(&user)
-        )
-    })
+    KEY.get_or_init(crate::mesh_identity::machine_id)
 }
 
 /// Per-writer registry filename: the stable marker this writer uses to
@@ -294,46 +289,22 @@ pub fn classify_registry_gc(gists: &[(String, String)]) -> Vec<GcVerdict> {
         .collect()
 }
 
-fn first_nonempty_env(names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
-}
-
-fn hostname_from_command() -> Option<String> {
-    let output = std::process::Command::new("hostname").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
-
-fn sanitize_writer_component(raw: &str) -> String {
-    let mut out = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    let mut component: String = trimmed.chars().take(24).collect();
-    while component.ends_with('-') {
-        component.pop();
-    }
-    if component.is_empty() {
-        "unknown".to_string()
-    } else {
-        component
-    }
+/// True when a registry document carries beacons and EVERY one is stale
+/// (older than `ttl_ms`). Such a gist is a dead machine or an orphaned
+/// pre-machine-id `<host>-<user>` gist a box left behind when it adopted
+/// the stable machine-id key — those retain their LAST-written (now stale)
+/// beacons, never empty — so the opt-in gc may reap it; the owner recreates
+/// a fresh gist on return via the sentinel find-or-update. An EMPTY document
+/// is conservatively NOT reapable (a just-created gist mid-first-write, or
+/// one we don't fully model — never delete on ambiguity). Pure +
+/// side-effect-free so the policy stays unit-testable; the gc method
+/// supplies the fetched document + clock.
+fn has_only_stale_beacons(document: &AccountRegistryDocument, now_ms: u64, ttl_ms: u64) -> bool {
+    !document.peers.is_empty()
+        && !document
+            .peers
+            .iter()
+            .any(|peer| peer.presence.is_fresh(now_ms, ttl_ms))
 }
 
 /// Shared fresh-token slot for a daemon's gh transport (card 1f2cbffa).
@@ -664,7 +635,7 @@ impl GhAccountRegistryStore {
         // env (USER/LOGNAME/USERNAME) unset would publish exactly such a
         // key — so force-Keep our own writer filename before any delete.
         let self_filename = writer_filename();
-        let verdicts: Vec<GcVerdict> = classify_registry_gc(&pairs)
+        let mut verdicts: Vec<GcVerdict> = classify_registry_gc(&pairs)
             .into_iter()
             .map(|mut verdict| {
                 if verdict.action == GcAction::Delete && verdict.filename == self_filename {
@@ -675,6 +646,40 @@ impl GhAccountRegistryStore {
                 verdict
             })
             .collect();
+
+        // #5 part 2 — reap superseded/dead machine gists. A real machine-keyed
+        // gist whose beacons are ALL stale (nothing fresh within the freshness
+        // TTL) is a dead machine or an orphaned old `<host>-<user>` gist a box
+        // left behind when it adopted the stable machine-id key (part 1). The
+        // owner republishes a fresh gist on return via the sentinel, so reaping
+        // it is safe. We only downgrade Keep->Delete: junk stays junk, our own
+        // gist stays Kept, and an unreadable body leaves the gist Kept (never
+        // delete on a blind fetch). Filename classification stays pure; the
+        // freshness dimension lives here in the I/O method.
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
+        })?;
+        for verdict in verdicts.iter_mut() {
+            if verdict.action != GcAction::Keep
+                || verdict.filename == self_filename
+                || !matches!(
+                    parse_registry_filename(&verdict.filename),
+                    RegistryFilename::Keyed(_)
+                )
+            {
+                continue;
+            }
+            let Some(entry) = entries.iter().find(|e| e.id == verdict.id) else {
+                continue;
+            };
+            if let Ok(Some(document)) = self.fetch_gist_document(entry).await {
+                if has_only_stale_beacons(&document, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS) {
+                    verdict.action = GcAction::Delete;
+                    verdict.reason = "all beacons stale — superseded/dead machine gist".to_string();
+                }
+            }
+        }
+
         let kept = verdicts
             .iter()
             .filter(|v| v.action == GcAction::Keep)
@@ -826,6 +831,28 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             )));
         }
         document.validate()?;
+        // #4 registry hygiene: prune stale peers before persisting. The
+        // reader-merge (below) and the FS store both drop beacons past
+        // DEFAULT_PEER_FRESHNESS_TTL_MS, but the GH WRITE path never did — so
+        // a machine's own gist accumulated dead beacons forever (past
+        // sessions, dead containers). They vanish from the live merge yet
+        // linger in the persisted gist, which is why `airc network` kept
+        // counting ~46 stale. Reuse the ONE canonical pruner at the missing
+        // write site; clone because the trait hands us `&document`.
+        let mut owned = document.clone();
+        let now_ms = time::now_ms().map_err(|error| {
+            AccountRegistryError::Adapter(format!("system clock before unix epoch: {error}"))
+        })?;
+        let pruned = prune_stale_peers(&mut owned.peers, now_ms, DEFAULT_PEER_FRESHNESS_TTL_MS);
+        if pruned > 0 {
+            StderrJsonDiagnosticSink.emit(DiagnosticEvent::warn(
+                DiagnosticComponent::Daemon,
+                DiagnosticCode::AccountRegistryStaleBeaconsPruned,
+                "account-registry publish pruned stale peer beacon(s) from the persisted gist \
+                 before write — dead routes never re-persisted",
+            ));
+        }
+        let document = &owned;
         let body = serde_json::to_string_pretty(document).map_err(|error| {
             AccountRegistryError::Adapter(format!("serialize registry: {error}"))
         })?;
@@ -1133,18 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_writer_component_is_stable_and_safe() {
-        assert_eq!(
-            sanitize_writer_component("Joels-MacBook-Pro.local"),
-            "joels-macbook-pro-local"
-        );
-        assert_eq!(sanitize_writer_component("BIGMAMA"), "bigmama");
-        assert_eq!(sanitize_writer_component("  weird host!! "), "weird-host");
-        assert_eq!(sanitize_writer_component(""), "unknown");
-        assert_eq!(sanitize_writer_component("---"), "unknown");
-    }
-
-    #[test]
     fn writer_filename_is_marked_and_stable() {
         let filename = writer_filename();
         assert!(filename.starts_with("airc-account-mesh-registry."));
@@ -1429,6 +1444,8 @@ exit 0
         ) -> AccountPeerBeacon {
             let keypair = PeerKeypair::generate();
             AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     peer_id,
                     scope_home.into(),
@@ -1451,6 +1468,33 @@ exit 0
             peers: Vec<AccountPeerBeacon>,
         ) -> AccountRegistryDocument {
             AccountRegistryDocument::new(mesh(), generated_at_ms, Vec::new(), peers)
+        }
+
+        // what this catches: the #5 part-2 reaper predicate. A gist with any
+        // fresh beacon must be KEPT; one that carries beacons ALL older than
+        // the TTL (an orphaned pre-machine-id `<host>-<user>` gist, or a dead
+        // box) must read reapable so the opt-in gc cleans it. An EMPTY document
+        // is conservatively NOT reapable — never delete on ambiguity.
+        #[test]
+        fn has_only_stale_beacons_reaps_all_stale_but_never_fresh_or_empty() {
+            let now = 10_000_000u64;
+            let ttl = DEFAULT_PEER_FRESHNESS_TTL_MS;
+            let fresh = beacon("/m/a/.airc", now - 1_000, "relay-a");
+            let stale1 = beacon("/m/b/.airc", now - ttl - 1, "relay-b");
+            let stale2 = beacon("/m/c/.airc", now - ttl - 1, "relay-c");
+
+            assert!(
+                !has_only_stale_beacons(&document(now, vec![fresh, stale1]), now, ttl),
+                "one fresh beacon must keep the gist — never reap a live machine"
+            );
+            assert!(
+                has_only_stale_beacons(&document(now, vec![stale2]), now, ttl),
+                "every beacon past the TTL reads as reapable"
+            );
+            assert!(
+                !has_only_stale_beacons(&document(now, vec![]), now, ttl),
+                "an empty document is NOT reapable — never delete on ambiguity"
+            );
         }
 
         // what this catches: `gc` dry-run reports the junk plan without
