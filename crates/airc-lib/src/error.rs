@@ -129,6 +129,20 @@ pub enum AircError {
         owner: Option<airc_core::PeerId>,
     },
 
+    /// Caller attempted to claim a card whose lifecycle state is past
+    /// claiming (Review/Merged/Closed). Live evidence (2026-07-24):
+    /// personas kept re-claiming ALREADY-COMPLETED cards because the
+    /// claim guard only checked lease expiry, not state — settled work
+    /// looked open to every board reader. Settled cards are history,
+    /// not backlog.
+    #[error(
+        "work card {card_id} is {state:?} — settled work is not claimable; pick an Open card (or reopen this one explicitly with `airc work state`)"
+    )]
+    WorkCardNotClaimable {
+        card_id: airc_work::WorkCardId,
+        state: airc_work::CardState,
+    },
+
     /// Card 09fddedd: `relink` supersedes an EXISTING link — a card
     /// with no linked PR has nothing to supersede. Use `airc work
     /// link` for the first link; refusing here keeps the audit
