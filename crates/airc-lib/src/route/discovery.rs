@@ -302,6 +302,13 @@ impl Airc {
         // revival signal (a fresher advertisement lifts a dead verdict).
         let mut advert_stamps: std::collections::HashMap<PeerId, u64> =
             std::collections::HashMap::new();
+        // Self-healing join (#240): the freshest presence stamp seen for
+        // each peer across both stores — proof-of-life that revives a DEAD
+        // endpoint for a probe even when its endpoint set (and thus its
+        // advert stamp) is unchanged. Same monotonic-max discipline as
+        // `advert_stamps` (a stale store copy must never rewind it).
+        let mut proof_of_life: std::collections::HashMap<PeerId, u64> =
+            std::collections::HashMap::new();
         // Self-healing join (machine-vs-scope): each peer's declared
         // transport host — the identity whose TLS cert answers at its
         // stored endpoints. First-seen (wire-root) order wins, matching
@@ -357,6 +364,8 @@ impl Airc {
             }
             let stamp = advert_stamps.entry(peer.peer_id).or_insert(0);
             *stamp = (*stamp).max(peer.endpoints_advertised_at_ms);
+            let alive = proof_of_life.entry(peer.peer_id).or_insert(0);
+            *alive = (*alive).max(peer.last_seen_ms);
             if let Some(host) = peer.endpoints_peer_id.filter(|host| *host != peer.peer_id) {
                 declared_hosts.entry(peer.peer_id).or_insert(host);
             }
@@ -393,11 +402,12 @@ impl Airc {
         // tests pin). What is now CONCURRENT is ACROSS peers: dialing
         // peer B must not wait on peer A's 3s timeout (see
         // DIAL_CONCURRENCY — the serial-sum hang this fixes).
-        let dial_list: Vec<(PeerId, PeerId, Vec<RouteEndpoint>, u64)> = order
+        let dial_list: Vec<(PeerId, PeerId, Vec<RouteEndpoint>, u64, u64)> = order
             .into_iter()
             .filter_map(|peer_id| {
                 merged.remove(&peer_id).map(|eps| {
                     let stamp = advert_stamps.get(&peer_id).copied().unwrap_or(0);
+                    let alive = proof_of_life.get(&peer_id).copied().unwrap_or(0);
                     // Machine-vs-scope: cert-pin the record's declared
                     // transport host when it is enrolled (strict —
                     // resolve_dial_pin); an unenrolled declared host is
@@ -420,7 +430,7 @@ impl Airc {
                             );
                         }
                     }
-                    (peer_id, pin, eps, stamp)
+                    (peer_id, pin, eps, stamp, alive)
                 })
             })
             .collect();
@@ -431,20 +441,28 @@ impl Airc {
         // Arc adapter and every mutation (quarantine map, transport
         // health) sits behind its own brief lock, so concurrent dials to
         // distinct peers do not race.
-        let mut dialed: Vec<(usize, PeerDialOutcome)> =
-            futures::stream::iter(dial_list.into_iter().enumerate())
-                .map(
-                    |(idx, (peer_id, pin, endpoints, advert_stamp_ms))| async move {
-                        (
-                            idx,
-                            self.dial_one_peer(peer_id, pin, endpoints, now_ms, advert_stamp_ms)
-                                .await,
-                        )
-                    },
+        let mut dialed: Vec<(usize, PeerDialOutcome)> = futures::stream::iter(
+            dial_list.into_iter().enumerate(),
+        )
+        .map(
+            |(idx, (peer_id, pin, endpoints, advert_stamp_ms, proof_of_life_ms))| async move {
+                (
+                    idx,
+                    self.dial_one_peer(
+                        peer_id,
+                        pin,
+                        endpoints,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    )
+                    .await,
                 )
-                .buffer_unordered(DIAL_CONCURRENCY)
-                .collect()
-                .await;
+            },
+        )
+        .buffer_unordered(DIAL_CONCURRENCY)
+        .collect()
+        .await;
         dialed.sort_by_key(|(idx, _)| *idx);
         for (_, (peer_failures, peer_skips)) in dialed {
             failures.extend(peer_failures);
@@ -472,6 +490,11 @@ impl Airc {
         endpoints: Vec<RouteEndpoint>,
         now_ms: u64,
         advert_stamp_ms: u64,
+        // Self-healing join (#240): the peer's presence freshness
+        // (`StoredPeer::last_seen_ms`) — a DEAD endpoint is revived for one
+        // probe when this proves the peer is alive since its last failure,
+        // even with no fresher endpoint advertisement.
+        proof_of_life_ms: u64,
     ) -> PeerDialOutcome {
         let mut failures = Vec::new();
         let mut skips = Vec::new();
@@ -504,7 +527,13 @@ impl Airc {
                     // `airc transport health`'s failure count. The operator still
                     // sees "in backoff" via the skips channel — honest, not a
                     // clean-list lie and not an over-report.
-                    match self.dial_quarantine_gate(peer_id, addr, now_ms, advert_stamp_ms) {
+                    match self.dial_quarantine_gate(
+                        peer_id,
+                        addr,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    ) {
                         super::dial_quarantine::DialGate::Dial => {}
                         super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
                             skips.push(PeerDialSkip {
@@ -626,8 +655,13 @@ impl Airc {
                     let Some((relay_peer, relay_addr)) = endpoint.connectable_relay() else {
                         continue;
                     };
-                    match self.dial_quarantine_gate(relay_peer, relay_addr, now_ms, advert_stamp_ms)
-                    {
+                    match self.dial_quarantine_gate(
+                        relay_peer,
+                        relay_addr,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    ) {
                         super::dial_quarantine::DialGate::Dial => {}
                         super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
                             skips.push(PeerDialSkip {
@@ -903,13 +937,19 @@ impl Airc {
         addr: std::net::SocketAddr,
         now_ms: u64,
         current_advert_stamp_ms: u64,
+        proof_of_life_ms: u64,
     ) -> super::dial_quarantine::DialGate {
         let guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.gate(&(peer_id, addr), now_ms, current_advert_stamp_ms)
+        guard.gate(
+            &(peer_id, addr),
+            now_ms,
+            current_advert_stamp_ms,
+            proof_of_life_ms,
+        )
     }
 
     /// Card 7e3c9a1f: stamp a failed dial to `(peer_id, addr)` (starts /

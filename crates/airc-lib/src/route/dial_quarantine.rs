@@ -168,17 +168,49 @@ impl DialQuarantine {
     }
 
     /// The full dial verdict for `key` (self-healing join): DEAD after
-    /// [`DEAD_AFTER_CONSECUTIVE_FAILURES`] consecutive failures unless
-    /// `current_advert_stamp_ms` is STRICTLY fresher than the stamp the
-    /// streak accrued under (a fresher advertisement revives the
-    /// endpoint for a probe); otherwise the timed backoff; otherwise
-    /// dial.
-    pub fn gate(&self, key: &QuarantineKey, now_ms: u64, current_advert_stamp_ms: u64) -> DialGate {
+    /// [`DEAD_AFTER_CONSECUTIVE_FAILURES`] consecutive failures unless the
+    /// endpoint is revived for a probe; otherwise the timed backoff;
+    /// otherwise dial.
+    ///
+    /// A DEAD endpoint is revived for ONE probe when EITHER revival signal
+    /// is fresher than this streak's last failure:
+    ///
+    /// - `current_advert_stamp_ms` STRICTLY greater than the stamp the
+    ///   streak accrued under — a fresher endpoint ADVERTISEMENT arrived
+    ///   (a rendezvous import rewrote the peer's endpoint set), or
+    /// - `proof_of_life_ms` STRICTLY greater than the last failure's
+    ///   wall-clock — the peer has been seen ALIVE since we last failed to
+    ///   reach it (a fresh presence beacon; `StoredPeer::last_seen_ms`).
+    ///
+    /// Proof-of-life is the strictly more robust of the two: `last_seen_ms`
+    /// advances on EVERY registry import (`airc_trust::touch_last_seen`),
+    /// whereas the advert stamp advances only when that same import ALSO
+    /// rewrites the endpoint set (`set_endpoints_json`, gated on the beacon
+    /// carrying endpoints + the monotonic guard). A provably-live peer whose
+    /// endpoint set is unchanged — or whose stamp write is skipped for a
+    /// cycle — would otherwise stay evicted FOREVER despite beaconing,
+    /// which is exactly the "live peer stuck at 0-connected until a manual
+    /// `airc join`" gap (#240). Recognizing proof-of-life closes it while
+    /// keeping the eviction's purpose: the anti-noise contract is identical
+    /// — a failure under the fresher signal re-kills immediately (see
+    /// [`Self::record_failure`], which re-stamps `failed_at_ms` to the probe
+    /// instant), so a live-but-unreachable endpoint costs at most one 3s
+    /// dial per fresh beacon, never one per tick.
+    pub fn gate(
+        &self,
+        key: &QuarantineKey,
+        now_ms: u64,
+        current_advert_stamp_ms: u64,
+        proof_of_life_ms: u64,
+    ) -> DialGate {
         let Some(entry) = self.entries.get(key) else {
             return DialGate::Dial;
         };
+        let advert_fresher = current_advert_stamp_ms > entry.advert_stamp_ms;
+        let alive_since_failure = proof_of_life_ms > entry.failed_at_ms;
         if entry.consecutive_failures >= DEAD_AFTER_CONSECUTIVE_FAILURES
-            && current_advert_stamp_ms <= entry.advert_stamp_ms
+            && !advert_fresher
+            && !alive_since_failure
         {
             return DialGate::Dead {
                 consecutive_failures: entry.consecutive_failures,
@@ -410,10 +442,12 @@ mod tests {
         }
 
         // Every backoff window has elapsed — a timed quarantine would
-        // dial again. Failure-counted eviction must NOT.
+        // dial again. Failure-counted eviction must NOT. `proof_of_life=0`
+        // here means "peer not seen alive since the streak" — isolates the
+        // advertisement-revival axis from proof-of-life revival.
         assert!(
             matches!(
-                q.gate(&key(7717), now, stamp),
+                q.gate(&key(7717), now, stamp, 0),
                 DialGate::Dead {
                     consecutive_failures
                 } if consecutive_failures == DEAD_AFTER_CONSECUTIVE_FAILURES
@@ -428,13 +462,13 @@ mod tests {
             four.record_failure(key(1), u64::from(i), stamp);
         }
         assert!(
-            !matches!(four.gate(&key(1), now, stamp), DialGate::Dead { .. }),
+            !matches!(four.gate(&key(1), now, stamp, 0), DialGate::Dead { .. }),
             "below the threshold the timed backoff still governs"
         );
 
         // A STRICTLY fresher advertisement revives the endpoint for a probe.
         assert_eq!(
-            q.gate(&key(7717), now, stamp + 1),
+            q.gate(&key(7717), now, stamp + 1, 0),
             DialGate::Dial,
             "a fresher advertisement must lift the eviction for one probe"
         );
@@ -443,7 +477,7 @@ mod tests {
         q.record_failure(key(7717), now, stamp + 1);
         assert!(
             matches!(
-                q.gate(&key(7717), now + MAX_BACKOFF_MS + 1, stamp + 1),
+                q.gate(&key(7717), now + MAX_BACKOFF_MS + 1, stamp + 1, 0),
                 DialGate::Dead { .. }
             ),
             "a failure under the fresher stamp re-arms the eviction against it"
@@ -451,7 +485,81 @@ mod tests {
 
         // A success wipes the streak entirely.
         q.record_success(&key(7717));
-        assert_eq!(q.gate(&key(7717), now, stamp), DialGate::Dial);
+        assert_eq!(q.gate(&key(7717), now, stamp, 0), DialGate::Dial);
+    }
+
+    // what this catches (#240 — live-beaconing peer stuck at 0-connected):
+    // a DEAD endpoint whose peer is PROVABLY ALIVE (a presence beacon seen
+    // AFTER the streak's last failure — `proof_of_life_ms > failed_at_ms`)
+    // is revived for one probe EVEN WITH NO fresher endpoint advertisement.
+    // This is the robustness gap: `last_seen_ms` advances on every registry
+    // import while the advert stamp can stay frozen (unchanged endpoint set
+    // / skipped stamp write), so without this a beaconing peer stays evicted
+    // forever and needs a manual `airc join`. Mutation checks: dropping the
+    // `alive_since_failure` term fails the revival assert; comparing against
+    // anything other than `failed_at_ms` breaks the re-kill assert below.
+    #[test]
+    fn fresh_proof_of_life_revives_a_dead_endpoint_without_a_new_advertisement() {
+        let mut q = DialQuarantine::default();
+        let stamp = 1_000u64;
+        // Fail 5×, most recent failure at `last_failure_at`. The advertised
+        // stamp NEVER advances (the frozen-endpoint-set condition), so the
+        // advert-revival axis stays inert throughout this test.
+        let mut now = 0u64;
+        let mut last_failure_at = 0u64;
+        for _ in 0..DEAD_AFTER_CONSECUTIVE_FAILURES {
+            last_failure_at = now;
+            q.record_failure(key(7717), now, stamp);
+            now += MAX_BACKOFF_MS + 1;
+        }
+
+        // Same stamp + no proof of life (last_seen at/behind the failure) =>
+        // still DEAD, exactly as before this fix.
+        assert!(
+            matches!(
+                q.gate(&key(7717), now, stamp, last_failure_at),
+                DialGate::Dead { .. }
+            ),
+            "a stale-or-equal proof-of-life must NOT revive (last_seen == failed_at)"
+        );
+
+        // A presence beacon seen AFTER the last failure revives for one probe
+        // — with the SAME advertisement stamp (no rendezvous re-read needed).
+        assert_eq!(
+            q.gate(&key(7717), now, stamp, last_failure_at + 1),
+            DialGate::Dial,
+            "fresh proof-of-life must lift the eviction for one probe, no new advert"
+        );
+
+        // The probe fails again: re-stamps `failed_at_ms` to the probe
+        // instant, so the SAME proof-of-life no longer counts as "since the
+        // failure" — one probe per fresh beacon, not one per tick.
+        let probe_at = now;
+        q.record_failure(key(7717), probe_at, stamp);
+        assert!(
+            matches!(
+                q.gate(
+                    &key(7717),
+                    probe_at + MAX_BACKOFF_MS + 1,
+                    stamp,
+                    last_failure_at + 1
+                ),
+                DialGate::Dead { .. }
+            ),
+            "the beacon that already bought a probe must not buy another (re-killed)"
+        );
+
+        // A newer beacon (after the probe failure) buys the next probe.
+        assert_eq!(
+            q.gate(
+                &key(7717),
+                probe_at + MAX_BACKOFF_MS + 1,
+                stamp,
+                probe_at + 1
+            ),
+            DialGate::Dial,
+            "a beacon fresher than the probe failure revives again"
+        );
     }
 
     // what this catches: doubling must SURVIVE a re-failure that lands
