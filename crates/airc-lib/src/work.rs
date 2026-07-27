@@ -1166,7 +1166,10 @@ impl Airc {
                 | airc_work::CardState::Merged
                 | airc_work::CardState::Closed
         ) {
-            return Err(AircError::WorkCardNotClaimable { card_id, state: card.state });
+            return Err(AircError::WorkCardNotClaimable {
+                card_id,
+                state: card.state,
+            });
         }
         let now_ms = now_ms()?;
         if card.claim_id.is_none()
