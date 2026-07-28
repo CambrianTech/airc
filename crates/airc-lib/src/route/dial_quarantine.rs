@@ -138,6 +138,20 @@ struct QuarantineEntry {
     /// immediately, so a live-but-unreachable publisher costs at most
     /// one 3s dial per fresh advertisement, not one per tick).
     advert_stamp_ms: u64,
+    /// TERMINAL (deterministic-cause) eviction — set by
+    /// [`DialQuarantine::record_terminal_failure`], the cert-identity-mismatch
+    /// path. When true, PROOF-OF-LIFE does NOT revive this entry in
+    /// [`DialQuarantine::gate`]; only a fresher endpoint ADVERTISEMENT can.
+    /// The peer being alive is irrelevant to a deterministic failure — the
+    /// SAME stored endpoint still presents the wrong cert forever, so reviving
+    /// on every presence beacon just re-dials, re-mismatches, and re-kills:
+    /// the route flaps 0↔1 once per beacon (glass-boxed on the M5↔bigmama grid
+    /// 2026-07-28 — "cert is for 71dcc50f, expected 2f0aed7f" oscillating every
+    /// ~20s). Only a genuinely NEW endpoint (fresher advert) can clear a
+    /// deterministic cert mismatch. A normal (non-terminal) failure keeps both
+    /// revival signals — its cause may be transient, so a live peer proves the
+    /// endpoint worth one more probe (#240).
+    terminal: bool,
 }
 
 impl QuarantineEntry {
@@ -180,7 +194,12 @@ impl DialQuarantine {
     ///   (a rendezvous import rewrote the peer's endpoint set), or
     /// - `proof_of_life_ms` STRICTLY greater than the last failure's
     ///   wall-clock — the peer has been seen ALIVE since we last failed to
-    ///   reach it (a fresh presence beacon; `StoredPeer::last_seen_ms`).
+    ///   reach it (a fresh presence beacon; `StoredPeer::last_seen_ms`) —
+    ///   BUT ONLY for a NON-terminal eviction. A terminal (deterministic
+    ///   cert-identity-mismatch) endpoint fails identically however alive the
+    ///   peer is, so proof-of-life reviving it just re-dials → re-mismatches →
+    ///   re-kills once per beacon — the route flap. A terminal entry revives
+    ///   solely on the fresher-advertisement signal above.
     ///
     /// Proof-of-life is the strictly more robust of the two: `last_seen_ms`
     /// advances on EVERY registry import (`airc_trust::touch_last_seen`),
@@ -207,7 +226,12 @@ impl DialQuarantine {
             return DialGate::Dial;
         };
         let advert_fresher = current_advert_stamp_ms > entry.advert_stamp_ms;
-        let alive_since_failure = proof_of_life_ms > entry.failed_at_ms;
+        // Proof-of-life revives only a NON-terminal eviction. A terminal
+        // (deterministic cert-identity-mismatch) endpoint keeps failing
+        // identically no matter how alive the peer is — reviving it on every
+        // presence beacon is exactly the route-flap. Only a fresher endpoint
+        // ADVERTISEMENT (a genuinely different addr/port/cert) can clear it.
+        let alive_since_failure = !entry.terminal && proof_of_life_ms > entry.failed_at_ms;
         if entry.consecutive_failures >= DEAD_AFTER_CONSECUTIVE_FAILURES
             && !advert_fresher
             && !alive_since_failure
@@ -259,6 +283,8 @@ impl DialQuarantine {
                 // per-fresh-advertisement contract); a stale caller value
                 // must never rewind it.
                 advert_stamp_ms: prev_stamp.max(advert_stamp_ms),
+                // A non-deterministic failure: proof-of-life still revives it.
+                terminal: false,
             },
         );
     }
@@ -273,10 +299,13 @@ impl DialQuarantine {
     /// "survivor stuck on the orphan" wedge.
     ///
     /// This jumps the streak straight to [`DEAD_AFTER_CONSECUTIVE_FAILURES`]
-    /// so [`Self::gate`] evicts the endpoint on the FIRST such failure. Crucially
-    /// it changes ONLY the strike count — the revival conditions are untouched:
-    /// a FRESHER advertisement (`advert_stamp_ms`) or a proof-of-life newer than
-    /// `failed_at_ms` still revives it in `gate`. So when the returning peer
+    /// so [`Self::gate`] evicts the endpoint on the FIRST such failure, AND
+    /// marks it `terminal` so proof-of-life can NEVER revive it — only a
+    /// FRESHER advertisement (`advert_stamp_ms`, a genuinely new endpoint) can.
+    /// A deterministic cert mismatch fails identically however alive the peer
+    /// is, so reviving on each presence beacon just re-dials → re-mismatches →
+    /// re-kills once per beacon: the route flaps 0↔1 forever (glass-boxed on
+    /// the M5↔bigmama grid 2026-07-28). So when the returning peer
     /// re-advertises its new endpoint (or that endpoint proves live), the dead
     /// orphan is released exactly as a failure-counted one would be — the peer
     /// reconnects on its own, no manual `airc join`.
@@ -307,6 +336,9 @@ impl DialQuarantine {
                 consecutive_failures: DEAD_AFTER_CONSECUTIVE_FAILURES,
                 // Monotonic max, same contract as record_failure.
                 advert_stamp_ms: prev_stamp.max(advert_stamp_ms),
+                // Deterministic cause: proof-of-life must NOT revive it (that
+                // is the flap). Only a fresher advert clears it.
+                terminal: true,
             },
         );
     }
@@ -539,13 +571,13 @@ mod tests {
     // what this catches (2026-07-28 M5↔bigmama "survivor stuck on the orphan"):
     // a TERMINAL failure — an identity-mismatch verdict, deterministic, will
     // fail identically forever — must evict the endpoint on the FIRST strike,
-    // NOT waste five refresh cycles hammering it. But it must NOT change the
-    // revival contract: a fresher advertisement (the returning peer's new
-    // endpoint) or a proof-of-life still lifts the eviction, so reconnection is
-    // automatic. Mutation checks: not jumping to the DEAD threshold fails the
-    // first-strike assert; a revival axis regression fails the advert/PoL asserts.
+    // NOT waste five refresh cycles hammering it. A STRICTLY fresher
+    // advertisement (the returning peer's genuinely new endpoint) lifts it, so
+    // reconnection is automatic. Mutation checks: not jumping to the DEAD
+    // threshold fails the first-strike assert; a revival-axis regression fails
+    // the advert assert.
     #[test]
-    fn terminal_failure_is_dead_on_the_first_strike_but_still_revives() {
+    fn terminal_failure_is_dead_on_the_first_strike_revives_only_on_fresher_advert() {
         let stamp = 1_000u64;
         // Past the backoff window, so revival lands on Dial (not Backoff) —
         // isolates the eviction/revival axis from the timed backoff, exactly as
@@ -576,15 +608,47 @@ mod tests {
             DialGate::Dial,
             "a fresher advert must lift a terminal eviction — automatic reconnect"
         );
+    }
 
-        // Proof-of-life newer than the failure also lifts it (the peer is
-        // provably reachable again), independent of the advert axis.
-        let mut q2 = DialQuarantine::default();
-        q2.record_terminal_failure(key(54060), 0, stamp);
+    // what this catches (2026-07-28 M5↔bigmama ROUTE FLAP): a TERMINAL
+    // (deterministic cert-identity-mismatch) eviction must NOT be revived by
+    // proof-of-life — the peer being alive changes nothing about a cert that
+    // will mismatch forever on the SAME stored endpoint. The old behavior
+    // revived on every presence beacon, so the substrate re-dialed → re-
+    // mismatched → re-killed once per beacon and `transport health` oscillated
+    // 0↔1 route every ~20s. Contrast: a NON-terminal failure (transient) MUST
+    // still revive on proof-of-life (#240 live-peer heal) — that invariant is
+    // pinned by `fresh_proof_of_life_revives_a_dead_endpoint_without_a_new_advertisement`.
+    #[test]
+    fn terminal_eviction_is_not_revived_by_proof_of_life_no_flap() {
+        let stamp = 1_000u64;
+        let later = MAX_BACKOFF_MS + 1;
+        let mut q = DialQuarantine::default();
+        q.record_terminal_failure(key(54060), 0, stamp);
+
+        // A presence beacon (proof-of-life strictly after the failure) does NOT
+        // revive it — the endpoint stays DEAD. This is the whole flap fix.
+        assert!(
+            matches!(q.gate(&key(54060), later, stamp, 1), DialGate::Dead { .. }),
+            "proof-of-life must NOT revive a terminal eviction — that is the route flap"
+        );
+        // Beacons keep arriving with an ever-advancing proof-of-life and an
+        // UNCHANGED advert stamp: it must stay DEAD every single time, never
+        // oscillating back to Dial.
+        for pol in [2u64, 3, 100, 10_000] {
+            assert!(
+                matches!(
+                    q.gate(&key(54060), later, stamp, pol),
+                    DialGate::Dead { .. }
+                ),
+                "still dead under advancing proof-of-life (pol={pol}) — no flap"
+            );
+        }
+        // Only a genuinely fresher ENDPOINT advertisement clears it.
         assert_eq!(
-            q2.gate(&key(54060), later, stamp, 1),
+            q.gate(&key(54060), later, stamp + 1, 10_000),
             DialGate::Dial,
-            "proof-of-life after the failure lifts a terminal eviction too"
+            "a fresher advert still lifts it — reconnection on a real new endpoint"
         );
     }
 
