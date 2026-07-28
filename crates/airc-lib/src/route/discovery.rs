@@ -607,12 +607,29 @@ impl Airc {
                                 self.dial_quarantine_record_success(peer_id, addr);
                                 break;
                             }
-                            self.dial_quarantine_record_failure(
-                                peer_id,
-                                addr,
-                                now_ms,
-                                advert_stamp_ms,
-                            );
+                            // An identity-mismatch we could NOT heal (presented
+                            // peer not enrolled/trusted) is TERMINAL — this stored
+                            // endpoint now hosts a different peer and will fail
+                            // identically forever. Evict on the first strike so the
+                            // orphan isn't hammered for five cycles; a transient
+                            // failure still counts normally.
+                            if airc_transport::presented_peer_from_mismatch_error(&error_text)
+                                .is_some()
+                            {
+                                self.dial_quarantine_record_terminal_failure(
+                                    peer_id,
+                                    addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            } else {
+                                self.dial_quarantine_record_failure(
+                                    peer_id,
+                                    addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            }
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -696,16 +713,35 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
-                            self.dial_quarantine_record_failure(
-                                relay_peer,
-                                relay_addr,
-                                now_ms,
-                                advert_stamp_ms,
-                            );
+                            // A relay host that re-installed comes back under a NEW
+                            // identity, so its stored endpoint now presents a cert
+                            // for a different peer — a TERMINAL mismatch that fails
+                            // identically forever (glass-boxed: the M5↔bigmama
+                            // "cert is for 71dcc50f, expected 2f0aed7f" orphan).
+                            // Evict on the first strike; revival on a fresher advert
+                            // still brings the relay's new endpoint in on its own.
+                            let error_text = error.to_string();
+                            if airc_transport::presented_peer_from_mismatch_error(&error_text)
+                                .is_some()
+                            {
+                                self.dial_quarantine_record_terminal_failure(
+                                    relay_peer,
+                                    relay_addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            } else {
+                                self.dial_quarantine_record_failure(
+                                    relay_peer,
+                                    relay_addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            }
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
-                                error: format!("relay connect: {error}"),
+                                error: format!("relay connect: {error_text}"),
                             });
                         }
                         Err(_elapsed) => {
@@ -968,6 +1004,28 @@ impl Airc {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.record_failure((peer_id, addr), now_ms, advert_stamp_ms);
+    }
+
+    /// Terminal-failure eviction: a dial whose failure is DETERMINISTIC (an
+    /// identity-mismatch verdict — the endpoint now hosts a different peer, so
+    /// every dial will fail identically) evicts on the FIRST strike instead of
+    /// counting five. Stops the "survivor stuck on the orphan" wedge where a
+    /// re-installed peer's stale endpoint is hammered for ~5 refresh cycles.
+    /// Revival (fresher advert / proof-of-life) is unchanged — the returning
+    /// peer's new endpoint replaces the orphan on its own.
+    fn dial_quarantine_record_terminal_failure(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+        advert_stamp_ms: u64,
+    ) {
+        let mut guard = self
+            .inner
+            .dial_quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.record_terminal_failure((peer_id, addr), now_ms, advert_stamp_ms);
     }
 
     /// Card 7e3c9a1f: clear any quarantine on `(peer_id, addr)` after a

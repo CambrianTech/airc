@@ -263,6 +263,54 @@ impl DialQuarantine {
         );
     }
 
+    /// Record a TERMINAL dial failure — one whose cause is deterministic, so
+    /// retrying the SAME stored endpoint can never succeed and counting five
+    /// strikes only wastes ~five refresh cycles hammering an orphan. The
+    /// canonical case (glass-boxed on the M5↔bigmama grid 2026-07-28): a peer
+    /// re-installs and comes back under a NEW identity, so its old advertised
+    /// endpoint now presents a cert for a DIFFERENT peer — every dial to it
+    /// fails with the same identity-mismatch verdict forever. That is the
+    /// "survivor stuck on the orphan" wedge.
+    ///
+    /// This jumps the streak straight to [`DEAD_AFTER_CONSECUTIVE_FAILURES`]
+    /// so [`Self::gate`] evicts the endpoint on the FIRST such failure. Crucially
+    /// it changes ONLY the strike count — the revival conditions are untouched:
+    /// a FRESHER advertisement (`advert_stamp_ms`) or a proof-of-life newer than
+    /// `failed_at_ms` still revives it in `gate`. So when the returning peer
+    /// re-advertises its new endpoint (or that endpoint proves live), the dead
+    /// orphan is released exactly as a failure-counted one would be — the peer
+    /// reconnects on its own, no manual `airc join`.
+    pub fn record_terminal_failure(
+        &mut self,
+        key: QuarantineKey,
+        now_ms: u64,
+        advert_stamp_ms: u64,
+    ) {
+        // Same unbounded-growth sweep as record_failure.
+        self.entries.retain(|_, entry| {
+            now_ms.saturating_sub(entry.failed_at_ms) <= QUARANTINE_RETENTION_MS
+        });
+        let prev_stamp = self
+            .entries
+            .get(&key)
+            .map_or(0, |prev| prev.advert_stamp_ms);
+        self.entries.insert(
+            key,
+            QuarantineEntry {
+                failed_at_ms: now_ms,
+                // Cap the backoff too: irrelevant while DEAD (gate short-circuits
+                // before the backoff check), but if a fresher advert revives the
+                // entry and it terminally re-fails, it must not restart at the
+                // initial window.
+                backoff_ms: MAX_BACKOFF_MS,
+                // The whole point: DEAD on the first terminal strike.
+                consecutive_failures: DEAD_AFTER_CONSECUTIVE_FAILURES,
+                // Monotonic max, same contract as record_failure.
+                advert_stamp_ms: prev_stamp.max(advert_stamp_ms),
+            },
+        );
+    }
+
     /// A successful dial clears any quarantine for `key` so the endpoint
     /// is immediately eligible again — a peer that flapped and came back
     /// must not stay shadow-banned behind a stale backoff.
@@ -486,6 +534,58 @@ mod tests {
         // A success wipes the streak entirely.
         q.record_success(&key(7717));
         assert_eq!(q.gate(&key(7717), now, stamp, 0), DialGate::Dial);
+    }
+
+    // what this catches (2026-07-28 M5↔bigmama "survivor stuck on the orphan"):
+    // a TERMINAL failure — an identity-mismatch verdict, deterministic, will
+    // fail identically forever — must evict the endpoint on the FIRST strike,
+    // NOT waste five refresh cycles hammering it. But it must NOT change the
+    // revival contract: a fresher advertisement (the returning peer's new
+    // endpoint) or a proof-of-life still lifts the eviction, so reconnection is
+    // automatic. Mutation checks: not jumping to the DEAD threshold fails the
+    // first-strike assert; a revival axis regression fails the advert/PoL asserts.
+    #[test]
+    fn terminal_failure_is_dead_on_the_first_strike_but_still_revives() {
+        let stamp = 1_000u64;
+        // Past the backoff window, so revival lands on Dial (not Backoff) —
+        // isolates the eviction/revival axis from the timed backoff, exactly as
+        // the fifth-failure sibling test does.
+        let later = MAX_BACKOFF_MS + 1;
+
+        // ONE terminal failure ⇒ already DEAD (vs. record_failure, which needs 5).
+        // Checked at the failure instant AND after the backoff elapsed: a timed
+        // quarantine would dial again at `later`; the terminal eviction must not.
+        let mut q = DialQuarantine::default();
+        q.record_terminal_failure(key(54060), 0, stamp);
+        assert!(
+            matches!(
+                q.gate(&key(54060), 0, stamp, 0),
+                DialGate::Dead { consecutive_failures } if consecutive_failures == DEAD_AFTER_CONSECUTIVE_FAILURES
+            ),
+            "a deterministic (identity-mismatch) failure evicts on the first strike"
+        );
+        assert!(
+            matches!(q.gate(&key(54060), later, stamp, 0), DialGate::Dead { .. }),
+            "still dead after the backoff expired — it's failure-counted, not timed"
+        );
+
+        // A STRICTLY fresher advertisement (the peer came back under a new
+        // endpoint) lifts the eviction — the orphan releases on its own.
+        assert_eq!(
+            q.gate(&key(54060), later, stamp + 1, 0),
+            DialGate::Dial,
+            "a fresher advert must lift a terminal eviction — automatic reconnect"
+        );
+
+        // Proof-of-life newer than the failure also lifts it (the peer is
+        // provably reachable again), independent of the advert axis.
+        let mut q2 = DialQuarantine::default();
+        q2.record_terminal_failure(key(54060), 0, stamp);
+        assert_eq!(
+            q2.gate(&key(54060), later, stamp, 1),
+            DialGate::Dial,
+            "proof-of-life after the failure lifts a terminal eviction too"
+        );
     }
 
     // what this catches (#240 — live-beaconing peer stuck at 0-connected):
