@@ -1428,6 +1428,19 @@ pub async fn run_daemon(
         rendezvous_for_heal.clone(),
     );
 
+    // #240 event-driven heal (peer-DROPPED mirror of the registry-import
+    // nudge): when a live LAN session terminates, nudge the route-refresh loop
+    // to attempt reconnection AT ONCE — quarantine-gated, so a genuinely-offline
+    // peer costs at most one dial, while a transient blip reconnects in seconds
+    // instead of waiting out a full refresh interval. Registered on the shared
+    // daemon handle; the wake permit coalesces a burst of drops into one refresh.
+    {
+        let route_wake = state.route_wake.clone();
+        daemon_airc.set_disconnect_observer(std::sync::Arc::new(move |_peer_id| {
+            route_wake.notify_one();
+        }));
+    }
+
     // #1268: autonomous self-update — keep the node on current canary with no
     // human in the loop (the version-drift pain we just lived: stale binaries,
     // peers that can't speak the current protocol). The dangerous half (fetch +
