@@ -53,8 +53,8 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    InboundObserver, Inner, Outbound, OutboundTx, SubscriberHandle, MAX_FRAME_BYTES,
-    SUBSCRIBER_CHANNEL_DEPTH,
+    DisconnectObserver, InboundObserver, Inner, Outbound, OutboundTx, SubscriberHandle,
+    MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
 use crate::transport::{FrameStream, Transport};
@@ -85,6 +85,7 @@ impl LanTcpAdapter {
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
                 on_inbound: std::sync::Mutex::new(None),
+                on_disconnect: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -97,6 +98,17 @@ impl LanTcpAdapter {
     /// set-once; a later call replaces the observer.
     pub fn set_inbound_observer(&self, observer: InboundObserver) {
         if let Ok(mut guard) = self.inner.on_inbound.lock() {
+            *guard = Some(observer);
+        }
+    }
+
+    /// #240: register an observer called once per peer whose live session
+    /// TERMINATES. The daemon uses this to nudge the route-refresh loop so a
+    /// dropped-but-still-reachable peer is re-dialed at once instead of up to a
+    /// full refresh interval later. Idempotent set-once; a later call replaces
+    /// the observer.
+    pub fn set_disconnect_observer(&self, observer: DisconnectObserver) {
+        if let Ok(mut guard) = self.inner.on_disconnect.lock() {
             *guard = Some(observer);
         }
     }
@@ -442,6 +454,39 @@ mod tests {
                 .and_then(Body::as_text)
                 .unwrap(),
             "hello from alice"
+        );
+    }
+
+    // #240 event-driven heal: a terminated session must (1) drop the peer from
+    // `connections` and (2) fire the registered disconnect observer with that
+    // peer_id — the signal the daemon turns into a route-refresh wake nudge.
+    // Mutation checks: dropping the observer call in `disconnect` fails the
+    // "observer fired" assert; skipping the remove fails the "gone" assert.
+    #[tokio::test]
+    async fn disconnect_removes_the_peer_and_fires_the_observer() {
+        let (_alice_id, alice, bob_id, _bob) = make_paired_adapters();
+
+        let fired: Arc<std::sync::Mutex<Vec<PeerId>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        alice.set_disconnect_observer(Arc::new(move |peer| {
+            sink.lock().unwrap().push(peer);
+        }));
+
+        // Stand in a live connection entry for bob, then terminate it.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Outbound>(1);
+        alice.inner.connections.lock().await.insert(bob_id, tx);
+        assert!(alice.inner.connections.lock().await.contains_key(&bob_id));
+
+        super::connection::disconnect(&alice.inner, bob_id).await;
+
+        assert!(
+            !alice.inner.connections.lock().await.contains_key(&bob_id),
+            "the terminated peer must be dropped from connections"
+        );
+        assert_eq!(
+            fired.lock().unwrap().as_slice(),
+            &[bob_id],
+            "the disconnect observer must fire once with the terminated peer's id"
         );
     }
 

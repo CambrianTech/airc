@@ -179,6 +179,13 @@ pub struct Airc {
     pub(crate) inner: Arc<AircInner>,
 }
 
+/// #240 event-driven heal: the shared slot holding the optional peer-disconnect
+/// callback the daemon registers (see [`AircInner::on_disconnect`]). Aliased so
+/// the nested handle type doesn't trip clippy's `type_complexity` gate at the
+/// field and at every construction.
+pub(crate) type DisconnectCallbackSlot =
+    Arc<std::sync::Mutex<Option<Arc<dyn Fn(PeerId) + Send + Sync>>>>;
+
 pub(crate) struct AircInner {
     pub(crate) home: PathBuf,
     pub(crate) wire_root: PathBuf,
@@ -216,6 +223,15 @@ pub(crate) struct AircInner {
     /// accepts the inbound, every handle's dialer sees the learned IP.
     pub(crate) learned_ips:
         Arc<std::sync::Mutex<std::collections::HashMap<PeerId, std::net::IpAddr>>>,
+    /// #240 event-driven heal: optional callback the daemon registers to be
+    /// notified when a peer's live LAN session terminates. A SLOT (not the
+    /// adapter observer itself) so registration order is irrelevant — the LAN
+    /// adapter's disconnect observer, wired once at adapter creation, reads
+    /// this slot each disconnect, so `set_disconnect_observer` works whether it
+    /// runs before or after the adapter is first built. Shared across daemon
+    /// clones like `learned_ips`, so whichever handle owns the dropped session
+    /// fires the same callback (the daemon's route-refresh wake nudge).
+    pub(crate) on_disconnect: DisconnectCallbackSlot,
     pub(crate) lamport_clock: AtomicU64,
     /// Epoch-ms of the last send-path peer-registry sync. Debounces the
     /// per-send disk load (see `sync_account_peer_registry_debounced`).
@@ -491,6 +507,7 @@ impl Airc {
                 )),
                 advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                on_disconnect: Arc::new(std::sync::Mutex::new(None)),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
@@ -1303,6 +1320,7 @@ impl Airc {
             // #9: share the learned-IP map across the daemon clone so an
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
+            on_disconnect: self.inner.on_disconnect.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             peer_sync_last_ms: AtomicU64::new(0),
             lan_tcp: Mutex::new(None),

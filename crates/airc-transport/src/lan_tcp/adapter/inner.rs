@@ -88,9 +88,22 @@ pub(super) struct Inner {
     /// set-once at adapter wiring, read briefly on each accept, never held
     /// across an await.
     pub(super) on_inbound: std::sync::Mutex<Option<InboundObserver>>,
+    /// #240 event-driven heal: optional observer invoked once per peer whose
+    /// live session TERMINATES (clean EOF, I/O error, or a malformed/oversized
+    /// frame) — i.e. the moment `connections` loses that peer. Symmetric with
+    /// `on_inbound`: the pipe reports that a link went away; it has no idea
+    /// what the layer above does with it. The daemon uses it to nudge the
+    /// route-refresh loop so a dropped-but-still-reachable peer is re-dialed
+    /// AT ONCE instead of up to a full refresh interval later. Same discipline
+    /// as `on_inbound` — brief lock, never held across an await or the removal.
+    pub(super) on_disconnect: std::sync::Mutex<Option<DisconnectObserver>>,
 }
 
 /// #9: callback the airc-lib layer registers to learn `(peer_id, source_ip)`
 /// from authenticated inbound connections. `Send + Sync` so the accept loop
 /// can invoke it from any connection task.
 pub(super) type InboundObserver = std::sync::Arc<dyn Fn(PeerId, std::net::IpAddr) + Send + Sync>;
+
+/// #240: callback invoked with the `peer_id` whose live session just
+/// terminated. `Send + Sync` so any connection task can fire it.
+pub(super) type DisconnectObserver = std::sync::Arc<dyn Fn(PeerId) + Send + Sync>;

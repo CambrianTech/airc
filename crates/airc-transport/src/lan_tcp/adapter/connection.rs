@@ -117,6 +117,23 @@ async fn install_and_spawn_loops<R, W>(
     tokio::spawn(read_loop(inner, peer_id, read_half));
 }
 
+/// #240: terminate this peer's live session — drop it from `connections` and
+/// fire the disconnect observer (if the layer above registered one) so a
+/// dropped-but-still-reachable peer can be re-dialed at once. The connections
+/// lock is released BEFORE the observer runs (never held across the callback,
+/// mirroring the accept path's `on_inbound` discipline).
+pub(super) async fn disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
+    inner.connections.lock().await.remove(&peer_id);
+    let observer = inner
+        .on_disconnect
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(observer) = observer {
+        observer(peer_id);
+    }
+}
+
 /// Read loop: pull length-prefixed JSON frames off the TLS stream
 /// and fan out to subscribers per the Transport trait's lag policy.
 /// Removes this peer's entry from `connections` on any termination
@@ -129,17 +146,17 @@ where
         // Read 4-byte BE length prefix.
         let mut len_bytes = [0u8; 4];
         if read_half.read_exact(&mut len_bytes).await.is_err() {
-            inner.connections.lock().await.remove(&peer_id);
+            disconnect(&inner, peer_id).await;
             return;
         }
         let len = u32::from_be_bytes(len_bytes);
         if len > MAX_FRAME_BYTES {
-            inner.connections.lock().await.remove(&peer_id);
+            disconnect(&inner, peer_id).await;
             return;
         }
         let mut payload = vec![0u8; len as usize];
         if read_half.read_exact(&mut payload).await.is_err() {
-            inner.connections.lock().await.remove(&peer_id);
+            disconnect(&inner, peer_id).await;
             return;
         }
 
@@ -162,7 +179,7 @@ where
                     .with_field("payload_bytes", payload.len())
                     .with_field("error", error),
                 );
-                inner.connections.lock().await.remove(&peer_id);
+                disconnect(&inner, peer_id).await;
                 return;
             }
         };

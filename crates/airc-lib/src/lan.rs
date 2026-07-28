@@ -382,8 +382,30 @@ impl Airc {
                 map.insert(peer_id, ip);
             }
         }));
+        // #240 event-driven heal: forward every session termination to the
+        // `on_disconnect` SLOT. Wired once here; it reads the slot each drop, so
+        // `set_disconnect_observer` works before OR after this adapter is built.
+        let on_disconnect = self.inner.on_disconnect.clone();
+        adapter.set_disconnect_observer(std::sync::Arc::new(move |peer_id| {
+            let cb = on_disconnect.lock().ok().and_then(|guard| guard.clone());
+            if let Some(cb) = cb {
+                cb(peer_id);
+            }
+        }));
         *guard = Some(adapter.clone());
         Ok(adapter)
+    }
+
+    /// #240 event-driven heal: register a callback invoked with the `peer_id`
+    /// of every peer whose live LAN session terminates. The daemon uses this to
+    /// nudge its route-refresh loop so a dropped-but-still-reachable peer is
+    /// re-dialed at once instead of up to a full refresh interval later. Stored
+    /// in a slot the LAN adapter reads each disconnect, so this may be called
+    /// before or after the adapter is first built. A later call replaces it.
+    pub fn set_disconnect_observer(&self, observer: std::sync::Arc<dyn Fn(PeerId) + Send + Sync>) {
+        if let Ok(mut guard) = self.inner.on_disconnect.lock() {
+            *guard = Some(observer);
+        }
     }
 }
 
