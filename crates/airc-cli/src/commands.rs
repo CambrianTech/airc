@@ -1676,6 +1676,10 @@ pub async fn run_daemon(
             gate,
             airc_lib::RegistryRefreshConfig::default(),
             &registry_state.endpoint_resync,
+            // #240 event-driven heal: nudge the route-refresh loop the
+            // instant an import lands fresh endpoints so they are dialed
+            // NOW, not up to a full route-refresh interval later.
+            &registry_state.route_wake,
             registry_state.shutdown.notified(),
         )
         .await;
@@ -1737,9 +1741,11 @@ fn spawn_route_refresh(
     let connected = state.connected_lan_peers.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
-        airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&airc, &connected, &endpoint_resync, &rendezvous)
-        })
+        airc_daemon::route_refresh::run_periodic_refresh(
+            &state.shutdown,
+            &state.route_wake,
+            || refresh_routes_once(&airc, &connected, &endpoint_resync, &rendezvous),
+        )
         .await;
     })
 }

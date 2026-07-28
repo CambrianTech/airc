@@ -282,12 +282,20 @@ pub async fn sync_once(
 /// loop). `shutdown` is awaited via a single pinned future so a
 /// `notify_waiters()` landing between ticks is never lost (the exact
 /// hazard `server::run` documents).
+/// `route_wake` is the MIRROR of `resync` (#240 event-driven heal): after
+/// every tick that actually imports (fresh beacons/endpoints just landed in
+/// the trust store), this notifies the route-refresh loop so it dials those
+/// endpoints IMMEDIATELY instead of waiting out the remainder of its own
+/// interval. Only fires on a real import (not a gate-skip or failed tick), so
+/// steady-state adds at most one nudge per cadence, and the woken refresh is a
+/// cheap no-op when every peer is already connected.
 pub async fn run_loop<S>(
     airc: Airc,
     store: S,
     gate: RegistryRefreshGate,
     config: RegistryRefreshConfig,
     resync: &tokio::sync::Notify,
+    route_wake: &tokio::sync::Notify,
     shutdown: impl Future<Output = ()>,
 ) where
     S: AccountRegistryStore,
@@ -312,10 +320,14 @@ pub async fn run_loop<S>(
             // spam). `Notify` stores one permit if the nudge lands during
             // a tick, so the wakeup is never lost.
             _ = resync.notified() => {
-                gated_tick(&gate, &airc, &store, &sink).await;
+                if gated_tick(&gate, &airc, &store, &sink).await {
+                    route_wake.notify_one();
+                }
             }
             _ = ticker.tick() => {
-                gated_tick(&gate, &airc, &store, &sink).await;
+                if gated_tick(&gate, &airc, &store, &sink).await {
+                    route_wake.notify_one();
+                }
             }
         }
     }
@@ -326,12 +338,19 @@ pub async fn run_loop<S>(
 /// on failure; callers deliberately swallow the `Err` and keep ticking
 /// (self-heal: a transient gh failure must not kill discovery for the
 /// daemon's lifetime).
+///
+/// Returns `true` iff a publish+refresh actually RAN AND SUCCEEDED — i.e.
+/// fresh beacons/endpoints were imported into the trust store this tick.
+/// The loop uses that to nudge the route-refresh loop (#240 event-driven
+/// heal): a gate-skip or a failed import imported nothing, so there is
+/// nothing newly-dialable to wake for.
 async fn gated_tick<S>(
     gate: &RegistryRefreshGate,
     airc: &Airc,
     store: &S,
     sink: &StderrJsonDiagnosticSink,
-) where
+) -> bool
+where
     S: AccountRegistryStore,
 {
     if let Some(block) = gate.block().await {
@@ -344,9 +363,9 @@ async fn gated_tick<S>(
             code,
             format!("account registry tick skipped: {block}"),
         ));
-        return;
+        return false;
     }
-    let _ = run_tick(airc, store, sink).await;
+    run_tick(airc, store, sink).await.is_ok()
 }
 
 #[cfg(test)]
@@ -682,12 +701,14 @@ exit 1
         let loop_store = store.clone();
         let loop_resync = resync.clone();
         let handle = tokio::spawn(async move {
+            let loop_wake = tokio::sync::Notify::new();
             run_loop(
                 loop_airc,
                 loop_store,
                 RegistryRefreshGate::Always,
                 config,
                 &loop_resync,
+                &loop_wake,
                 async move {
                     let _ = rx.await;
                 },
@@ -741,12 +762,14 @@ exit 1
         };
         let handle = tokio::spawn(async move {
             let resync = tokio::sync::Notify::new();
+            let route_wake = tokio::sync::Notify::new();
             run_loop(
                 airc,
                 store,
                 RegistryRefreshGate::Always,
                 config,
                 &resync,
+                &route_wake,
                 async move {
                     let _ = rx.await;
                 },

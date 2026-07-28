@@ -79,7 +79,16 @@ pub fn delay_before_refresh(completed_refreshes: u64) -> Duration {
 /// wakes only waiters registered at that instant and stores no
 /// permit; re-creating `notified()` each turn would leave windows
 /// where the signal is lost and the loop never exits.
-pub async fn run_periodic_refresh<F, Fut>(shutdown: &Notify, mut refresh: F)
+/// `wake` is the event-driven nudge (#240): the account-registry loop
+/// notifies it the instant an import lands fresh beacons / endpoints in the
+/// trust store, so a refresh runs IMMEDIATELY instead of waiting out the
+/// remaining interval — freshly-advertised endpoints for a disconnected peer
+/// are dialed at once, not up to `REFRESH_INTERVAL` later. The nudge only
+/// short-circuits the *wait*; the refresh work is unchanged (connected peers
+/// skipped, quarantine/ghost gates apply), so a nudge in steady state is a
+/// cheap no-op. `Notify` stores one permit, so a nudge landing DURING a
+/// refresh is consumed by the next iteration's wait (never lost, coalesced).
+pub async fn run_periodic_refresh<F, Fut>(shutdown: &Notify, wake: &Notify, mut refresh: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()>,
@@ -89,10 +98,18 @@ where
 
     let mut completed: u64 = 0;
     loop {
-        tokio::select! {
-            biased;
-            _ = &mut notified => return,
-            () = tokio::time::sleep(delay_before_refresh(completed)) => {}
+        // Wait for the interval to elapse OR an external wake nudge, whichever
+        // comes first. A fresh `notified()` per iteration so a permit stored
+        // while `refresh()` ran fires the next wait immediately.
+        {
+            let woken = wake.notified();
+            tokio::pin!(woken);
+            tokio::select! {
+                biased;
+                _ = &mut notified => return,
+                _ = &mut woken => {}
+                () = tokio::time::sleep(delay_before_refresh(completed)) => {}
+            }
         }
         tokio::select! {
             biased;
@@ -148,12 +165,14 @@ mod tests {
     async fn boot_schedules_the_first_refresh_immediately() {
         let shutdown = Arc::new(Notify::new());
         let count = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
 
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
+            let wake = wake.clone();
             let count = count.clone();
             async move {
-                run_periodic_refresh(&shutdown, move || {
+                run_periodic_refresh(&shutdown, &wake, move || {
                     let count = count.clone();
                     async move {
                         count.fetch_add(1, Ordering::SeqCst);
@@ -203,14 +222,16 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
 
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
+            let wake = wake.clone();
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
             let completed = completed.clone();
             async move {
-                run_periodic_refresh(&shutdown, move || {
+                run_periodic_refresh(&shutdown, &wake, move || {
                     let in_flight = in_flight.clone();
                     let max_in_flight = max_in_flight.clone();
                     let completed = completed.clone();
@@ -254,12 +275,14 @@ mod tests {
     async fn shutdown_stops_the_loop_mid_sleep() {
         let shutdown = Arc::new(Notify::new());
         let count = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
 
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
+            let wake = wake.clone();
             let count = count.clone();
             async move {
-                run_periodic_refresh(&shutdown, move || {
+                run_periodic_refresh(&shutdown, &wake, move || {
                     let count = count.clone();
                     async move {
                         count.fetch_add(1, Ordering::SeqCst);
@@ -285,5 +308,62 @@ mod tests {
             "exactly the boot-immediate refresh ran before shutdown — the \
              mid-interval sleep was interrupted, not waited out"
         );
+    }
+
+    /// #240 event-driven heal: a `wake` nudge (the registry loop after an
+    /// import) runs a refresh IMMEDIATELY, mid-interval — freshly-imported
+    /// endpoints are dialed at once instead of waiting out the remaining
+    /// `REFRESH_INTERVAL`. Mutation check: dropping the `woken` arm from the
+    /// wait select fails the "count==2 well before the interval" assert (the
+    /// nudge would then be ignored until the timer fired).
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_nudge_runs_a_refresh_before_the_interval_elapses() {
+        let shutdown = Arc::new(Notify::new());
+        let wake = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let wake = wake.clone();
+            let count = count.clone();
+            async move {
+                run_periodic_refresh(&shutdown, &wake, move || {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await;
+            }
+        });
+
+        // Boot-immediate refresh lands, then the loop parks on its steady
+        // interval. Advance to the MIDPOINT of that interval — no timer
+        // refresh is due yet.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "boot refresh only");
+        tokio::time::sleep(REFRESH_INTERVAL / 2).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "mid-interval: the timer has not fired a second refresh"
+        );
+
+        // Nudge — a fresh import just landed. The refresh must run NOW, not
+        // at the far end of the interval.
+        wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "the wake nudge ran a refresh immediately, mid-interval — not \
+             deferred to the next timer tick"
+        );
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
     }
 }
