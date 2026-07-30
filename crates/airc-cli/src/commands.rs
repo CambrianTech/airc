@@ -80,8 +80,8 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
             let current = airc.current_room().await?;
             let set = airc.subscription_set().await?;
             println!("room:    {}", current.name);
-            println!("  wire:    {}", current.wire.display());
-            println!("  channel: {}", current.channel);
+            println!("wire:    {}", current.wire.display());
+            println!("channel: {}", current.channel);
             let others: Vec<_> = set
                 .all()
                 .filter(|s| s.name.as_str() != current.name)
