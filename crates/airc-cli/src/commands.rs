@@ -79,7 +79,7 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
             // visible to be trusted.
             let current = airc.current_room().await?;
             let set = airc.subscription_set().await?;
-            println!("current: {}", current.name);
+            println!("room:    {}", current.name);
             println!("  wire:    {}", current.wire.display());
             println!("  channel: {}", current.channel);
             let others: Vec<_> = set
