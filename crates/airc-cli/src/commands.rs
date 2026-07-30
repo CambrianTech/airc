@@ -1909,14 +1909,17 @@ async fn refresh_routes_once(
                          — staying a client (open a routable interface to host a relay)"
                     );
                 } else {
-                    match airc
-                        .become_relay(
-                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                            lan_ip,
-                            tailscale_ip,
-                        )
-                        .await
-                    {
+                    // #267: prefer the port the LAST relay incarnation bound
+                    // (persisted in the runtime dir). An OS-assigned port
+                    // drifts on every daemon restart, and remote peers'
+                    // imported `airc-relay://me@ip:port` cards republish on
+                    // THEIR cadence — so every restart stranded the mesh on
+                    // a dead port (glass-boxed live: peers dialing :65280
+                    // while the new relay sat on :57958, 0 healthy routes).
+                    // Re-binding the persisted port keeps every stale card
+                    // valid; OS-assigned is only the first-election / port-
+                    // stolen fallback, and whatever binds gets persisted.
+                    match become_relay_with_stable_port(airc, lan_ip, tailscale_ip).await {
                         Ok(addr) => {
                             eprintln!(
                                 "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
@@ -1948,6 +1951,68 @@ async fn refresh_routes_once(
             );
         }
     }
+}
+
+/// #267: where this machine's relay listener port persists across daemon
+/// restarts — machine-scope (one relay per node), beside the daemon socket.
+fn relay_port_file() -> Option<std::path::PathBuf> {
+    crate::runtime_dir::runtime_dir()
+        .ok()
+        .map(|dir| dir.join("relay-port"))
+}
+
+fn read_persisted_relay_port() -> Option<u16> {
+    std::fs::read_to_string(relay_port_file()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn persist_relay_port(port: u16) {
+    if let Some(path) = relay_port_file() {
+        // Best-effort: a failed persist only costs port stability on the
+        // NEXT restart, never this election.
+        let _ = std::fs::write(path, port.to_string());
+    }
+}
+
+/// Bind order for relay self-election: the persisted previous port first
+/// (keeps every peer's imported `airc-relay://me@ip:port` card valid across
+/// restarts), OS-assigned as the first-election / port-stolen fallback.
+fn relay_bind_candidates(persisted: Option<u16>) -> Vec<u16> {
+    match persisted {
+        Some(port) if port != 0 => vec![port, 0],
+        _ => vec![0],
+    }
+}
+
+/// Self-elect as a relay on a RESTART-STABLE port (#267). Tries the
+/// persisted previous port, falls back to OS-assigned, and persists
+/// whatever actually bound so the next incarnation lands on it again.
+async fn become_relay_with_stable_port(
+    airc: &Airc,
+    lan_ip: Option<std::net::Ipv4Addr>,
+    tailscale_ip: Option<std::net::Ipv4Addr>,
+) -> Result<std::net::SocketAddr, airc_lib::AircError> {
+    let mut last_err = None;
+    for port in relay_bind_candidates(read_persisted_relay_port()) {
+        match airc
+            .become_relay(
+                std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+                lan_ip,
+                tailscale_ip,
+            )
+            .await
+        {
+            Ok(addr) => {
+                persist_relay_port(addr.port());
+                return Ok(addr);
+            }
+            Err(error) => last_err = Some(error),
+        }
+    }
+    Err(last_err.expect("relay_bind_candidates is never empty"))
 }
 
 fn current_daemon_runtime_info() -> DaemonRuntimeInfo {
@@ -2776,6 +2841,18 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#267): relay self-election must try the PERSISTED
+    /// previous port before an OS-assigned one — port drift across daemon
+    /// restarts is what stranded every peer's imported relay card on a dead
+    /// port. A persisted 0 (or nothing persisted) must not produce a
+    /// degenerate double-\[0\] list.
+    #[test]
+    fn relay_bind_prefers_the_persisted_port_with_os_fallback() {
+        assert_eq!(relay_bind_candidates(Some(65280)), vec![65280, 0]);
+        assert_eq!(relay_bind_candidates(None), vec![0]);
+        assert_eq!(relay_bind_candidates(Some(0)), vec![0]);
+    }
 
     /// what this catches: the send receipt must NOT report the enrolled
     /// peer count as confirmed delivery. The old line was
