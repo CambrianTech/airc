@@ -550,6 +550,22 @@ where
         None
     };
 
+    // CURSOR HEARTBEAT (continuum #261, PR #2057 review): the seam summary
+    // above was the ONLY `AttachCursorAdvanced` a consumer ever saw — during
+    // live streaming the watermark never advanced, so a consumer persisting
+    // cursors re-received the WHOLE session's events on its next attach
+    // (2026-07-30: five reboots × full-session redelivery = persona echo
+    // storm). After each forwarded event, emit an advance frame carrying that
+    // event's cursor — throttled to one per second so a StreamChunk burst
+    // (attaches subscribe kinds: None) never becomes a frame/persist storm.
+    // The un-advanced tail at shutdown is now ≤1s of events instead of the
+    // whole session. Initialized in the past so the FIRST event always
+    // advances (a quiet room reconnecting tightens immediately).
+    const ADVANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut last_advance = std::time::Instant::now()
+        .checked_sub(ADVANCE_EVERY)
+        .unwrap_or_else(std::time::Instant::now);
+
     loop {
         let (stream, lag) = pending
             .take()
@@ -588,6 +604,25 @@ where
                                 },
                             )
                             .await?;
+                            // Cursor heartbeat: tell the consumer this event
+                            // is now safely delivered on this stream so its
+                            // persisted watermark can advance past it.
+                            if last_advance.elapsed() >= ADVANCE_EVERY {
+                                last_advance = std::time::Instant::now();
+                                let c = env.cursor();
+                                write_response(
+                                    &mut writer,
+                                    &Response::AttachCursorAdvanced {
+                                        skipped: 0,
+                                        advanced_to: airc_ipc::request::IpcCursor {
+                                            epoch: c.seq.epoch,
+                                            counter: c.seq.counter,
+                                            event_id: c.event_id,
+                                        },
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                         if lag.is_lagged() {
                             // Dropped a live push — break to re-resume
