@@ -71,10 +71,32 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
             println!("  channel: {}", next.channel);
         }
         None => {
+            // #270: bare `airc room` lists EVERY subscription, not just the
+            // current one. The old current-only display read as "my rooms",
+            // which is exactly how a whole afternoon of seam messages sat
+            // unread in a subscribed-but-not-current channel while both
+            // agents concluded the transport was broken. Membership must be
+            // visible to be trusted.
             let current = airc.current_room().await?;
-            println!("room:    {}", current.name);
-            println!("wire:    {}", current.wire.display());
-            println!("channel: {}", current.channel);
+            let set = airc.subscription_set().await?;
+            println!("current: {}", current.name);
+            println!("  wire:    {}", current.wire.display());
+            println!("  channel: {}", current.channel);
+            let others: Vec<_> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .collect();
+            if others.is_empty() {
+                println!("subscribed: (only the current room)");
+            } else {
+                println!(
+                    "subscribed ({} more — `airc room <name>` to switch):",
+                    others.len()
+                );
+                for sub in others {
+                    println!("  {}  channel {}", sub.name.as_str(), sub.room_id);
+                }
+            }
         }
     }
     Ok(())
@@ -2158,6 +2180,32 @@ pub async fn run_inbox(
         Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
         None => airc.page_recent(effective_limit).await?,
     };
+    // #270: `inbox` reads ONE room (the current one) — say so, loudly,
+    // and name what it is NOT showing. The unlabeled view is how "your
+    // message isn't in my inbox" became a false transport diagnosis
+    // twice in one day: the message was in the store the whole time,
+    // in a subscribed room that wasn't current.
+    if !as_json {
+        if let (Ok(current), Ok(set)) = (airc.current_room().await, airc.subscription_set().await) {
+            let others: Vec<String> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .map(|s| s.name.as_str().to_string())
+                .collect();
+            if others.is_empty() {
+                println!("inbox: room '{}' (your only subscribed room)", current.name);
+            } else {
+                println!(
+                    "inbox: room '{}' ONLY — {} other subscribed room(s) NOT shown: {} \
+                     (switch with `airc room <name>`)",
+                    current.name,
+                    others.len(),
+                    others.join(", ")
+                );
+            }
+            println!();
+        }
+    }
     if as_json {
         print_inbox_json(&events)?;
         return Ok(());
