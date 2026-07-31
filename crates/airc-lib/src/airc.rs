@@ -480,7 +480,14 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let wire_root = machine_account_home(&home);
-        Self::open_inner(home, wire_root, policy, Some(agent_name.into()), Some(peer_id)).await
+        Self::open_inner(
+            home,
+            wire_root,
+            policy,
+            Some(agent_name.into()),
+            Some(peer_id),
+        )
+        .await
     }
 
     /// Test-only: open with an explicit machine-account wire root rather

@@ -242,7 +242,8 @@ impl LocalIdentity {
             // The ONLY fresh-mint arm: adopt the supplied peer_id if any.
             (false, None) => match peer_id {
                 Some(peer_id) => {
-                    Self::generate_and_save_as_with_peer_id(home, &store, &agent_name, peer_id).await
+                    Self::generate_and_save_as_with_peer_id(home, &store, &agent_name, peer_id)
+                        .await
                 }
                 None => Self::generate_and_save_as(home, &store, &agent_name).await,
             },
@@ -626,7 +627,10 @@ mod tests {
             LocalIdentity::load_or_generate_as_with_peer_id(home.path(), "helper", Some(chosen))
                 .await
                 .unwrap();
-        assert_eq!(first.peer_id, chosen, "fresh mint must adopt the supplied peer_id");
+        assert_eq!(
+            first.peer_id, chosen,
+            "fresh mint must adopt the supplied peer_id"
+        );
 
         // Resume with a DIFFERENT supplied id — the stored one wins.
         let other = PeerId::new();
@@ -635,7 +639,10 @@ mod tests {
             LocalIdentity::load_or_generate_as_with_peer_id(home.path(), "helper", Some(other))
                 .await
                 .unwrap();
-        assert_eq!(second.peer_id, chosen, "resume must ignore a supplied peer_id");
+        assert_eq!(
+            second.peer_id, chosen,
+            "resume must ignore a supplied peer_id"
+        );
         assert_eq!(
             first.keypair.secret_bytes(),
             second.keypair.secret_bytes(),
@@ -644,10 +651,9 @@ mod tests {
 
         // And the None path still mints a random id (historical behavior).
         let home2 = TempDir::new().unwrap();
-        let random =
-            LocalIdentity::load_or_generate_as_with_peer_id(home2.path(), "helper", None)
-                .await
-                .unwrap();
+        let random = LocalIdentity::load_or_generate_as_with_peer_id(home2.path(), "helper", None)
+            .await
+            .unwrap();
         assert_ne!(random.peer_id, chosen);
     }
 
