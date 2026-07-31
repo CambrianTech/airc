@@ -2029,9 +2029,15 @@ async fn become_relay_with_stable_port(
     lan_ip: Option<std::net::Ipv4Addr>,
     tailscale_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<std::net::SocketAddr, airc_lib::AircError> {
-    let mut last_err = None;
+    // Sticky candidates first; the OS-assigned bind (port 0, always the
+    // final candidate — pinned by the relay_bind_candidates tests) is the
+    // TERMINAL attempt whose error propagates directly, so no empty-list
+    // panic path exists (CI denies clippy::expect_used).
     for port in relay_bind_candidates(read_persisted_relay_port()) {
-        match airc
+        if port == 0 {
+            continue;
+        }
+        if let Ok(addr) = airc
             .become_relay(
                 std::net::SocketAddr::from(([0, 0, 0, 0], port)),
                 lan_ip,
@@ -2039,14 +2045,19 @@ async fn become_relay_with_stable_port(
             )
             .await
         {
-            Ok(addr) => {
-                persist_relay_port(addr.port());
-                return Ok(addr);
-            }
-            Err(error) => last_err = Some(error),
+            persist_relay_port(addr.port());
+            return Ok(addr);
         }
     }
-    Err(last_err.expect("relay_bind_candidates is never empty"))
+    let addr = airc
+        .become_relay(
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            lan_ip,
+            tailscale_ip,
+        )
+        .await?;
+    persist_relay_port(addr.port());
+    Ok(addr)
 }
 
 fn current_daemon_runtime_info() -> DaemonRuntimeInfo {

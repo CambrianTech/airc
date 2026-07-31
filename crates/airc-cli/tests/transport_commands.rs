@@ -30,7 +30,17 @@ fn transport_health_reports_no_routes_on_fresh_scope() {
         "no-routes must not render as ok (the live-found seam-#6 lie): {output}"
     );
     assert!(!output.contains("local-fs"));
-    assert!(output.contains("endpoints: none"));
+    // #270-family: the endpoints line is DAEMON-authoritative now. A fresh
+    // scope renders one of two honest states — a reachable daemon that
+    // advertises nothing, or no daemon at all (labeled scope-local view).
+    // Which appears depends on whether the environment auto-spawned the
+    // scope daemon, so accept both; the killed lie — a bare scope-local
+    // "endpoints: none" presented as authoritative — matches neither.
+    assert!(
+        output.contains("endpoints: none advertised by the daemon")
+            || output.contains("endpoints: daemon unreachable"),
+        "expected an honest daemon-authoritative endpoints line, got: {output}"
+    );
     assert!(output.contains("lan peers: none"));
 }
 
