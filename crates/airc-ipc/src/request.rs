@@ -139,6 +139,13 @@ pub enum Request {
     /// daemon — the identity analog of `RoomTip` for the transcript. Returns
     /// `Response::PeerIdentityCard`.
     PeerIdentityCard(PeerIdentityCardRequest),
+    /// **#270/#241.** The scope's durable subscribed-room registry
+    /// (name + room id + joined-at + default flag, parted rooms
+    /// excluded). The membership read that lets an attached client
+    /// (continuum's nav, a TUI room list) show EVERY room the account
+    /// is in — not just the rooms that happened to emit traffic since
+    /// boot. Returned via `Response::Rooms`.
+    ListRooms,
     /// Attach to the daemon's live event stream. Long-lived: after an
     /// initial `Response::Ok`, the daemon streams `Response::Event`
     /// frames (airc-wire bytes) until the client disconnects. Optionally

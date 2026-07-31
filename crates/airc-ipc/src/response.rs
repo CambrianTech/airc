@@ -38,6 +38,11 @@ pub enum Response {
     /// daemon answers from its owner-core `scoped_state` index, never by
     /// replaying the room.
     PeerIdentityCard(PeerIdentityCardResponse),
+    /// **#270/#241.** Response to `ListRooms` — the scope's durable
+    /// subscribed-room registry (parted rooms excluded). Answered from
+    /// the coordinator store's subscriptions table, never inferred from
+    /// transcript traffic.
+    Rooms(RoomsResponse),
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
@@ -128,6 +133,25 @@ pub struct PeerEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeersResponse {
     pub peers: Vec<PeerEntry>,
+}
+
+/// The scope's durable subscribed rooms (#270/#241).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomsResponse {
+    pub rooms: Vec<IpcRoomInfo>,
+}
+
+/// One subscribed room, straight from the coordinator store's
+/// subscriptions table. `name` is the human channel name (`general`,
+/// `k3-serving`); `room_id` is the converged UUID clients address
+/// events with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcRoomInfo {
+    pub room_id: RoomId,
+    pub name: String,
+    pub joined_at_ms: u64,
+    /// The scope's default channel (`airc msg` with no `--room`).
+    pub is_default: bool,
 }
 
 /// Result of an `Inbox` pull: durable envelopes (airc-wire bytes) + the
