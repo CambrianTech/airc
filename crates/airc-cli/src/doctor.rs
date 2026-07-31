@@ -510,6 +510,25 @@ async fn check_health(home: &Path) -> Vec<Finding> {
         }
     };
     let total = snapshot.health.len();
+    // #267: zero routes is NOT vacuously healthy. `degraded == 0` was true
+    // for an EMPTY health list, so doctor stamped "[ok] 0 route(s) healthy"
+    // while every remote peer was unreachable — the exact lie that hid a
+    // dead mesh behind a green check. With remote peers enrolled, no routes
+    // means beyond-this-machine delivery is DOWN: say so, loudly.
+    if total == 0 {
+        let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
+        if enrolled > 0 {
+            return vec![Finding::warn(
+                "route health",
+                format!("0 routes with {enrolled} enrolled peer(s) — remote delivery is DOWN"),
+                "run `airc transport health` for the dial errors; `airc join` re-runs discovery",
+            )];
+        }
+        return vec![Finding::ok(
+            "route health",
+            "0 routes (no remote peers enrolled — nothing to route to)",
+        )];
+    }
     let degraded = snapshot
         .health
         .iter()

@@ -17,6 +17,15 @@ use serde_json::Value;
 /// minute) and carry nothing the reader acts on.
 pub(crate) fn render_feed_line(event: &TranscriptEvent) -> Option<String> {
     let detail = body_detail(event.body.as_ref())?;
+    // ONE event = ONE line, unconditionally. A multi-line message body used to
+    // print raw, so every consumer that tails this feed line-by-line (agent
+    // monitors, hooks, grep pipelines) saw the first line with its [kind]
+    // header and then a storm of orphan fragments ("1. **", "- Investigate",
+    // "Let") with no sender, no channel, no kind — hours of unattributable
+    // noise per multi-paragraph message (glass-boxed 2026-07-31). Newlines
+    // become a visible pilcrow so structure stays readable while the line
+    // contract holds.
+    let detail = detail.replace('\n', " ¶ ");
     Some(format!(
         "[{kind:?}] {sender} → {channel}: {detail}",
         kind = event.kind,
@@ -107,6 +116,44 @@ mod tests {
         assert_eq!(
             body_detail(Some(&Body::text("hello"))),
             Some("hello".into())
+        );
+    }
+
+    // what this catches: the ONE-event-ONE-line feed contract (glass-boxed
+    // 2026-07-31) — a multi-paragraph message must never spill raw newlines
+    // into the feed, where line-tailing consumers (agent monitors, hooks,
+    // grep) render every body line as an orphan fragment with no sender or
+    // kind. Regression: hours of "1. **" / "- Investigate" noise per message.
+    #[test]
+    fn multiline_body_renders_as_exactly_one_feed_line() {
+        use airc_core::{
+            ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+        };
+        let event = TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text(
+                "Focused tasks:\n1. **NVMe benchmarks**\n- run io-probe\n\n2. **Layer split**",
+            )),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let line = render_feed_line(&event).expect("message renders");
+        assert!(
+            !line.contains('\n'),
+            "feed line must never contain a raw newline: {line:?}"
+        );
+        assert!(
+            line.contains("NVMe") && line.contains("Layer split"),
+            "content survives flattening: {line}"
         );
     }
 

@@ -306,24 +306,45 @@ async fn attach_legacy_shape_still_replays_event_by_event() {
         other => panic!("expected Ok ack from attach, got {other:?}"),
     }
 
-    // Collect BACKLOG_N Event frames — legacy event-by-event replay.
-    for i in 0..BACKLOG_N {
+    // Collect BACKLOG_N Event frames — legacy event-by-event replay. The
+    // cursor HEARTBEAT (continuum #261) may interleave AttachCursorAdvanced
+    // frames on ANY attach shape now; clients must tolerate them. The
+    // no-skip property they must uphold: an advance NEVER precedes the
+    // delivery of the event it points at — a consumer persisting
+    // `advanced_to` can only ever resume at-or-before what it has seen.
+    let mut events_seen = 0usize;
+    let mut advances_seen = 0usize;
+    while events_seen < BACKLOG_N {
         let frame = tokio::time::timeout(
             Duration::from_secs(2),
             read_frame::<_, Response>(&mut stream),
         )
         .await
-        .unwrap_or_else(|_| panic!("backlog event {i} timeout"))
+        .unwrap_or_else(|_| panic!("backlog frame timeout after {events_seen} events"))
         .expect("frame")
         .expect("Some");
         match frame {
-            Response::Event { .. } => { /* expected */ }
-            Response::AttachCursorAdvanced { .. } => panic!(
-                "legacy shape (no coalesce_backlog) must NOT emit \
-                 AttachCursorAdvanced; got it at event index {i}"
-            ),
-            other => panic!("unexpected frame at index {i}: {other:?}"),
+            Response::Event { .. } => events_seen += 1,
+            Response::AttachCursorAdvanced { skipped, .. } => {
+                assert_eq!(
+                    skipped, 0,
+                    "heartbeat advances report skipped=0 (nothing suppressed)"
+                );
+                assert!(
+                    events_seen > 0,
+                    "no-skip guarantee: an advance must never arrive before \
+                     the first delivered event"
+                );
+                advances_seen += 1;
+            }
+            other => panic!("unexpected frame after {events_seen} events: {other:?}"),
         }
     }
+    // The heartbeat is throttled (1/s), so a fast replay yields at least the
+    // first-event advance; more are allowed, none required beyond it.
+    assert!(
+        advances_seen >= 1,
+        "cursor heartbeat: at least one advance rides a legacy replay"
+    );
     daemon.stop().await;
 }

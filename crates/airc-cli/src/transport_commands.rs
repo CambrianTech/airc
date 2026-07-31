@@ -124,10 +124,37 @@ pub async fn run_health(
         print_sample(sample);
     }
 
-    if snapshot.endpoints.is_empty() {
-        println!("endpoints: none");
-    } else {
-        println!("endpoints: {}", snapshot.endpoints.len());
+    // #270-family split-view fix: the ADVERTISED endpoints live in the
+    // MACHINE DAEMON (the process that owns the listeners), not in this
+    // short-lived CLI scope — printing the scope's own (always-empty)
+    // table produced "endpoints: none" while the daemon was listening on
+    // two ports with live inbound connections, and that lie repeatedly
+    // misdirected transport debugging toward routes that were fine. Ask
+    // the daemon (Request::RouteEndpoints, card 4b6a0ffa); only if no
+    // daemon answers do we fall back to the scope view, LABELED as such.
+    let daemon_endpoints = {
+        let socket = crate::cli::default_socket_path_in(home);
+        match airc_ipc::DaemonClient::new(socket).route_endpoints().await {
+            Ok(response) => Some(response.endpoints),
+            Err(_) => None,
+        }
+    };
+    match daemon_endpoints {
+        Some(endpoints) if endpoints.is_empty() => {
+            println!("endpoints: none advertised by the daemon — this node is NOT dialable");
+        }
+        Some(endpoints) => {
+            println!("endpoints (daemon-advertised): {}", endpoints.len());
+            for endpoint in &endpoints {
+                println!("  {endpoint:?}");
+            }
+        }
+        None => {
+            println!(
+                "endpoints: daemon unreachable — scope-local view only ({}; NOT authoritative)",
+                snapshot.endpoints.len()
+            );
+        }
     }
     if snapshot.connected_lan_peers.is_empty() {
         println!("lan peers: none");

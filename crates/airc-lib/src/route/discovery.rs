@@ -672,6 +672,28 @@ impl Airc {
                     let Some((relay_peer, relay_addr)) = endpoint.connectable_relay() else {
                         continue;
                     };
+                    // #267: when the advertised relay IS this node, the
+                    // recorded port may belong to a PREVIOUS daemon
+                    // incarnation — the OS-assigned relay bind drifts across
+                    // restarts, and peers' imported cards republish on their
+                    // own cadence, so the stale port survives in route
+                    // records indefinitely (glass-boxed live: dialing our own
+                    // dead :65280 while the live relay sat on :57958,
+                    // "Connection refused" and 0 healthy routes). This node
+                    // is the AUTHORITY on its own relay listener: substitute
+                    // the live bound port instead of dialing — and then
+                    // quarantining — a dead self-port.
+                    let live_self_port = if relay_peer == self.inner.identity.peer_id {
+                        self.inner
+                            .relay_server
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|server| server.local_addr().port())
+                    } else {
+                        None
+                    };
+                    let relay_addr = substitute_self_relay_port(relay_addr, live_self_port);
                     match self.dial_quarantine_gate(
                         relay_peer,
                         relay_addr,
@@ -1048,9 +1070,46 @@ impl Airc {
     }
 }
 
+/// #267: rewrite a self-relay dial target onto the LIVE listener port.
+/// `live_self_port` is `Some` only when the relay endpoint pins THIS node's
+/// peer id AND a relay server is currently bound — the one case where the
+/// route record's port can be authoritatively overridden without any
+/// network read. The IP is kept as recorded (it is this node's routable
+/// address, which the live listener serves via its wildcard bind).
+fn substitute_self_relay_port(
+    recorded: std::net::SocketAddr,
+    live_self_port: Option<u16>,
+) -> std::net::SocketAddr {
+    match live_self_port {
+        Some(port) => std::net::SocketAddr::from((recorded.ip(), port)),
+        None => recorded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (#267): a stale self-relay port in a route record must
+    // be rewritten to the LIVE listener port before dialing — the exact bug
+    // where every dial refused on a previous incarnation's OS-assigned port
+    // and the node quarantined ITSELF. A foreign relay (live_self_port=None)
+    // must dial exactly as recorded.
+    #[test]
+    fn self_relay_dials_the_live_port_never_a_dead_incarnation() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let recorded = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 249), 65280));
+        assert_eq!(
+            substitute_self_relay_port(recorded, Some(57958)),
+            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 249), 57958)),
+            "self-relay: live port wins over the recorded one"
+        );
+        assert_eq!(
+            substitute_self_relay_port(recorded, None),
+            recorded,
+            "foreign relay (or no live server): dial as recorded"
+        );
+    }
 
     // what this catches (#9): the learn-live-address candidate builder. A peer
     // that connected to us teaches its real IP; we must produce

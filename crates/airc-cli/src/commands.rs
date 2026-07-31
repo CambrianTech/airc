@@ -71,10 +71,32 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
             println!("  channel: {}", next.channel);
         }
         None => {
+            // #270: bare `airc room` lists EVERY subscription, not just the
+            // current one. The old current-only display read as "my rooms",
+            // which is exactly how a whole afternoon of seam messages sat
+            // unread in a subscribed-but-not-current channel while both
+            // agents concluded the transport was broken. Membership must be
+            // visible to be trusted.
             let current = airc.current_room().await?;
+            let set = airc.subscription_set().await?;
             println!("room:    {}", current.name);
             println!("wire:    {}", current.wire.display());
             println!("channel: {}", current.channel);
+            let others: Vec<_> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .collect();
+            if others.is_empty() {
+                println!("subscribed: (only the current room)");
+            } else {
+                println!(
+                    "subscribed ({} more — `airc room <name>` to switch):",
+                    others.len()
+                );
+                for sub in others {
+                    println!("  {}  channel {}", sub.name.as_str(), sub.room_id);
+                }
+            }
         }
     }
     Ok(())
@@ -1895,7 +1917,19 @@ async fn refresh_routes_once(
             // the gist advertises whatever port the OS gave, so the
             // durable pointer stays valid across restarts.
             let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
-            if snapshot.should_self_elect_as_relay(enrolled) {
+            // #267 follow-up (2026-07-31 regression): relay-hood is a
+            // DURABLE ROLE, not an emergency fallback. Once this node has
+            // ever been a relay, peers hold `airc-relay://me@ip:port`
+            // cards — if a daemon restart only re-elects when NO peer is
+            // reachable, every card-holder gets Connection refused while
+            // this node chats happily over its one direct LAN link
+            // (glass-boxed live: overnight restart dropped :65280 while
+            // .232 stayed connected). A persisted relay-port file IS the
+            // role record: re-assume it on every tick unconditionally
+            // (become_relay is idempotent — already-relaying is a cheap
+            // re-advertise).
+            let has_relay_role = read_persisted_relay_port().is_some();
+            if snapshot.should_self_elect_as_relay(enrolled) || has_relay_role {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
                 // dial a wildcard. Reuses the IPs detected once at the top
@@ -1909,14 +1943,17 @@ async fn refresh_routes_once(
                          — staying a client (open a routable interface to host a relay)"
                     );
                 } else {
-                    match airc
-                        .become_relay(
-                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                            lan_ip,
-                            tailscale_ip,
-                        )
-                        .await
-                    {
+                    // #267: prefer the port the LAST relay incarnation bound
+                    // (persisted in the runtime dir). An OS-assigned port
+                    // drifts on every daemon restart, and remote peers'
+                    // imported `airc-relay://me@ip:port` cards republish on
+                    // THEIR cadence — so every restart stranded the mesh on
+                    // a dead port (glass-boxed live: peers dialing :65280
+                    // while the new relay sat on :57958, 0 healthy routes).
+                    // Re-binding the persisted port keeps every stale card
+                    // valid; OS-assigned is only the first-election / port-
+                    // stolen fallback, and whatever binds gets persisted.
+                    match become_relay_with_stable_port(airc, lan_ip, tailscale_ip).await {
                         Ok(addr) => {
                             eprintln!(
                                 "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
@@ -1948,6 +1985,79 @@ async fn refresh_routes_once(
             );
         }
     }
+}
+
+/// #267: where this machine's relay listener port persists across daemon
+/// restarts — machine-scope (one relay per node), beside the daemon socket.
+fn relay_port_file() -> Option<std::path::PathBuf> {
+    crate::runtime_dir::runtime_dir()
+        .ok()
+        .map(|dir| dir.join("relay-port"))
+}
+
+fn read_persisted_relay_port() -> Option<u16> {
+    std::fs::read_to_string(relay_port_file()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn persist_relay_port(port: u16) {
+    if let Some(path) = relay_port_file() {
+        // Best-effort: a failed persist only costs port stability on the
+        // NEXT restart, never this election.
+        let _ = std::fs::write(path, port.to_string());
+    }
+}
+
+/// Bind order for relay self-election: the persisted previous port first
+/// (keeps every peer's imported `airc-relay://me@ip:port` card valid across
+/// restarts), OS-assigned as the first-election / port-stolen fallback.
+fn relay_bind_candidates(persisted: Option<u16>) -> Vec<u16> {
+    match persisted {
+        Some(port) if port != 0 => vec![port, 0],
+        _ => vec![0],
+    }
+}
+
+/// Self-elect as a relay on a RESTART-STABLE port (#267). Tries the
+/// persisted previous port, falls back to OS-assigned, and persists
+/// whatever actually bound so the next incarnation lands on it again.
+async fn become_relay_with_stable_port(
+    airc: &Airc,
+    lan_ip: Option<std::net::Ipv4Addr>,
+    tailscale_ip: Option<std::net::Ipv4Addr>,
+) -> Result<std::net::SocketAddr, airc_lib::AircError> {
+    // Sticky candidates first; the OS-assigned bind (port 0, always the
+    // final candidate — pinned by the relay_bind_candidates tests) is the
+    // TERMINAL attempt whose error propagates directly, so no empty-list
+    // panic path exists (CI denies clippy::expect_used).
+    for port in relay_bind_candidates(read_persisted_relay_port()) {
+        if port == 0 {
+            continue;
+        }
+        if let Ok(addr) = airc
+            .become_relay(
+                std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+                lan_ip,
+                tailscale_ip,
+            )
+            .await
+        {
+            persist_relay_port(addr.port());
+            return Ok(addr);
+        }
+    }
+    let addr = airc
+        .become_relay(
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            lan_ip,
+            tailscale_ip,
+        )
+        .await?;
+    persist_relay_port(addr.port());
+    Ok(addr)
 }
 
 fn current_daemon_runtime_info() -> DaemonRuntimeInfo {
@@ -2093,6 +2203,32 @@ pub async fn run_inbox(
         Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
         None => airc.page_recent(effective_limit).await?,
     };
+    // #270: `inbox` reads ONE room (the current one) — say so, loudly,
+    // and name what it is NOT showing. The unlabeled view is how "your
+    // message isn't in my inbox" became a false transport diagnosis
+    // twice in one day: the message was in the store the whole time,
+    // in a subscribed room that wasn't current.
+    if !as_json {
+        if let (Ok(current), Ok(set)) = (airc.current_room().await, airc.subscription_set().await) {
+            let others: Vec<String> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .map(|s| s.name.as_str().to_string())
+                .collect();
+            if others.is_empty() {
+                println!("inbox: room '{}' (your only subscribed room)", current.name);
+            } else {
+                println!(
+                    "inbox: room '{}' ONLY — {} other subscribed room(s) NOT shown: {} \
+                     (switch with `airc room <name>`)",
+                    current.name,
+                    others.len(),
+                    others.join(", ")
+                );
+            }
+            println!();
+        }
+    }
     if as_json {
         print_inbox_json(&events)?;
         return Ok(());
@@ -2776,6 +2912,18 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#267): relay self-election must try the PERSISTED
+    /// previous port before an OS-assigned one — port drift across daemon
+    /// restarts is what stranded every peer's imported relay card on a dead
+    /// port. A persisted 0 (or nothing persisted) must not produce a
+    /// degenerate double-\[0\] list.
+    #[test]
+    fn relay_bind_prefers_the_persisted_port_with_os_fallback() {
+        assert_eq!(relay_bind_candidates(Some(65280)), vec![65280, 0]);
+        assert_eq!(relay_bind_candidates(None), vec![0]);
+        assert_eq!(relay_bind_candidates(Some(0)), vec![0]);
+    }
 
     /// what this catches: the send receipt must NOT report the enrolled
     /// peer count as confirmed delivery. The old line was
