@@ -1917,7 +1917,19 @@ async fn refresh_routes_once(
             // the gist advertises whatever port the OS gave, so the
             // durable pointer stays valid across restarts.
             let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
-            if snapshot.should_self_elect_as_relay(enrolled) {
+            // #267 follow-up (2026-07-31 regression): relay-hood is a
+            // DURABLE ROLE, not an emergency fallback. Once this node has
+            // ever been a relay, peers hold `airc-relay://me@ip:port`
+            // cards — if a daemon restart only re-elects when NO peer is
+            // reachable, every card-holder gets Connection refused while
+            // this node chats happily over its one direct LAN link
+            // (glass-boxed live: overnight restart dropped :65280 while
+            // .232 stayed connected). A persisted relay-port file IS the
+            // role record: re-assume it on every tick unconditionally
+            // (become_relay is idempotent — already-relaying is a cheap
+            // re-advertise).
+            let has_relay_role = read_persisted_relay_port().is_some();
+            if snapshot.should_self_elect_as_relay(enrolled) || has_relay_role {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
                 // dial a wildcard. Reuses the IPs detected once at the top
