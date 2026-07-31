@@ -23,8 +23,9 @@ use airc_ipc::request::{
     SendRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, IpcIdentityCard, PeerEntry, PeerIdentityCardResponse, PeersResponse,
-    PublishResponse, Response, RoomTipResponse, RouteEndpointsResponse, StatusResponse,
+    InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
+    PeersResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -62,6 +63,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::AddPeer(add) => handle_add_peer(state, add).await,
         Request::RemovePeer(remove) => handle_remove_peer(state, remove).await,
         Request::ListPeers => handle_list_peers(state).await,
+        Request::ListRooms => handle_list_rooms(state).await,
         // Card 4b6a0ffa (#33): serve the endpoints the registry glue
         // recorded after binding its listener. Empty means "up but not
         // dialable" — the client decides what that implies.
@@ -360,4 +362,31 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
         })
         .collect();
     Response::Peers(PeersResponse { peers: entries })
+}
+
+/// #270/#241: serve the durable subscribed-room registry from the
+/// coordinator store. Parted rooms are excluded — the store keeps them
+/// only so auto-restore doesn't resurrect an explicit leave. This is
+/// THE membership read: nav/room-list clients seed from it instead of
+/// inferring rooms from observed traffic (the seam that left a rebooted
+/// interface showing one room until each of the others happened to
+/// speak).
+async fn handle_list_rooms(state: Arc<DaemonState>) -> Response {
+    match state.coordinator_store.load_subscriptions().await {
+        Ok(rows) => Response::Rooms(RoomsResponse {
+            rooms: rows
+                .into_iter()
+                .filter(|row| !row.parted)
+                .map(|row| IpcRoomInfo {
+                    room_id: row.room_id,
+                    name: row.channel_name,
+                    joined_at_ms: row.joined_at_ms,
+                    is_default: row.is_default,
+                })
+                .collect(),
+        }),
+        Err(error) => Response::Error {
+            message: format!("list_rooms: {error}"),
+        },
+    }
 }

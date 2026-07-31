@@ -22,7 +22,7 @@ use crate::request::{
 };
 use crate::response::{
     InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse, Response,
-    RoomTipResponse, RouteEndpointsResponse, StatusResponse,
+    RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -238,6 +238,16 @@ impl DaemonClient {
     pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
         match self.call(Request::RouteEndpoints).await? {
             Response::RouteEndpoints(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// #270/#241: the scope's durable subscribed-room registry. The
+    /// membership read continuum's nav seeds from — a member's rooms
+    /// exist in the interface before their first event, not after.
+    pub async fn list_rooms(&self) -> Result<RoomsResponse, ClientError> {
+        match self.call(Request::ListRooms).await? {
+            Response::Rooms(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
