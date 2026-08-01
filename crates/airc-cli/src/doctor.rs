@@ -534,7 +534,7 @@ async fn check_health(home: &Path) -> Vec<Finding> {
         .iter()
         .filter(|sample| sample.state != TransportHealthState::Healthy)
         .count();
-    if degraded == 0 {
+    let mut findings = if degraded == 0 {
         vec![Finding::ok(
             "route health",
             format!("{total} route(s) healthy"),
@@ -545,7 +545,86 @@ async fn check_health(home: &Path) -> Vec<Finding> {
             format!("{degraded} of {total} route(s) degraded"),
             "run `airc transport health` to see the row-level detail",
         )]
+    };
+    findings.extend(check_delivery_truth(home).await);
+    findings
+}
+
+/// #1306 slice 2 — the delivery-truth check. Route health above measures
+/// pipes; THIS reports whether messages actually arrive: per peer, "last
+/// confirmed delivery: N ago" from the daemon's delivery ledger. The
+/// 2026-07-31 failure shape — both doctors 8/8 clean while outbound
+/// silently queued for hours — is exactly what this line makes visible.
+/// Absent daemon or empty ledger (no cross-machine forward yet) reports
+/// as informational, never vacuously ok.
+async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
+    let socket = crate::cli::default_socket_path_in(home);
+    let stats = match airc_ipc::DaemonClient::new(socket).delivery_stats().await {
+        Ok(response) => response.peers,
+        Err(_) => {
+            // No daemon (or an older build without the verb): delivery
+            // truth is unknown, not fine. Quietly informational — the
+            // daemon-liveness check above already reports the daemon.
+            return Vec::new();
+        }
+    };
+    if stats.is_empty() {
+        return vec![Finding::ok(
+            "delivery truth",
+            "no cross-machine deliveries attempted yet (nothing to confirm)",
+        )];
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let age = |stamp_ms: u64| -> String {
+        let secs = now_ms.saturating_sub(stamp_ms) / 1000;
+        if secs < 120 {
+            format!("{secs}s ago")
+        } else if secs < 7200 {
+            format!("{}m ago", secs / 60)
+        } else {
+            format!("{}h ago", secs / 3600)
+        }
+    };
+    let mut findings = Vec::new();
+    for peer in &stats {
+        match (peer.suspect, peer.last_ack_ms) {
+            (true, last) => findings.push(Finding::warn(
+                "delivery truth",
+                format!(
+                    "{}: {} flushed frame(s) UNACKED since last confirmation ({}) — \
+                     connection presumed half-open, route refresh is re-dialing",
+                    peer.peer_id,
+                    peer.attempts_since_ack,
+                    last.map(&age).unwrap_or_else(|| "never confirmed".into()),
+                ),
+                "watch `airc transport health` for the suspect-drop + re-dial",
+            )),
+            (false, Some(last_ack_ms)) => findings.push(Finding::ok(
+                "delivery truth",
+                format!(
+                    "{}: last confirmed delivery {}{} ({} of {} acked)",
+                    peer.peer_id,
+                    age(last_ack_ms),
+                    peer.rtt_ema_ms
+                        .map(|rtt| format!(", rtt ~{rtt}ms"))
+                        .unwrap_or_default(),
+                    peer.acked,
+                    peer.attempts,
+                ),
+            )),
+            (false, None) => findings.push(Finding::ok(
+                "delivery truth",
+                format!(
+                    "{}: {} attempt(s), none confirmed yet (within tolerance)",
+                    peer.peer_id, peer.attempts
+                ),
+            )),
+        }
+    }
+    findings
 }
 
 async fn apply_fixes(

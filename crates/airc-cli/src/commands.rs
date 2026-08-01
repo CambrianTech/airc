@@ -1781,12 +1781,21 @@ fn spawn_route_refresh(
     rendezvous: Arc<SharedRendezvousSlot>,
 ) -> tokio::task::JoinHandle<()> {
     let connected = state.connected_lan_peers.clone();
+    let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
         airc_daemon::route_refresh::run_periodic_refresh(
             &state.shutdown,
             &state.route_wake,
-            || refresh_routes_once(&airc, &connected, &endpoint_resync, &rendezvous),
+            || {
+                refresh_routes_once(
+                    &airc,
+                    &connected,
+                    &delivery_stats,
+                    &endpoint_resync,
+                    &rendezvous,
+                )
+            },
         )
         .await;
     })
@@ -1800,6 +1809,7 @@ fn spawn_route_refresh(
 async fn refresh_routes_once(
     airc: &Airc,
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
+    delivery_stats: &tokio::sync::RwLock<Vec<airc_ipc::IpcPeerDeliveryStats>>,
     endpoint_resync: &tokio::sync::Notify,
     rendezvous: &SharedRendezvousSlot,
 ) {
@@ -1909,6 +1919,29 @@ async fn refresh_routes_once(
                 snapshot.connected_lan_peers.len(),
                 std::sync::atomic::Ordering::Relaxed,
             );
+
+            // #1306 slice 2: publish the delivery-ledger snapshot for
+            // `Request::DeliveryStats` — the delivery-truth read behind
+            // doctor's "last confirmed delivery to X: N ago". Same
+            // single-writer wiring split as the counter above (the
+            // daemon crate can't reach the airc-lib ledger).
+            if let Some(ledger) = airc.delivery_ledger() {
+                let rows = ledger
+                    .snapshot()
+                    .into_iter()
+                    .map(|(peer_id, stats)| airc_ipc::IpcPeerDeliveryStats {
+                        peer_id,
+                        attempts: stats.attempts,
+                        acked: stats.acked,
+                        attempts_since_ack: stats.attempts_since_ack,
+                        last_attempt_ms: stats.last_attempt_ms,
+                        last_ack_ms: stats.last_ack_ms,
+                        rtt_ema_ms: stats.rtt_ema_ms,
+                        suspect: stats.suspect(),
+                    })
+                    .collect::<Vec<_>>();
+                *delivery_stats.write().await = rows;
+            }
 
             // #1247 slice 4b — relay self-election. When this node can
             // reach no peer directly AND has no live relay yet, but knows

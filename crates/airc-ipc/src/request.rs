@@ -146,6 +146,14 @@ pub enum Request {
     /// is in — not just the rooms that happened to emit traffic since
     /// boot. Returned via `Response::Rooms`.
     ListRooms,
+    /// **#1306 slice 2.** Per-peer end-to-end delivery accounting from
+    /// the daemon's delivery ledger — attempts, acks, last confirmed
+    /// delivery, measured RTT, suspect verdict. THE delivery-truth read:
+    /// doctor reports "last confirmed delivery to X: N ago" from this
+    /// instead of inferring health from TCP connection state. Returned
+    /// via `Response::DeliveryStats`. Empty until the routed forwarder
+    /// has attempted at least one cross-machine delivery.
+    DeliveryStats,
     /// Attach to the daemon's live event stream. Long-lived: after an
     /// initial `Response::Ok`, the daemon streams `Response::Event`
     /// frames (airc-wire bytes) until the client disconnects. Optionally

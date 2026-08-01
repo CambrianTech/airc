@@ -43,6 +43,9 @@ pub enum Response {
     /// the coordinator store's subscriptions table, never inferred from
     /// transcript traffic.
     Rooms(RoomsResponse),
+    /// **#1306 slice 2.** Response to `DeliveryStats` — per-peer
+    /// delivery-ledger rows from the daemon's routed forwarder.
+    DeliveryStats(DeliveryStatsResponse),
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
@@ -152,6 +155,40 @@ pub struct IpcRoomInfo {
     pub joined_at_ms: u64,
     /// The scope's default channel (`airc msg` with no `--room`).
     pub is_default: bool,
+}
+
+/// **#1306 slice 2.** Per-peer delivery-ledger rows. The wiring split is
+/// the same as `route_endpoints` / `connected_lan_peers`: the concrete
+/// ledger lives on an `airc-lib` handle this crate must not depend on,
+/// so the host's route-refresh loop snapshots it into `DaemonState`
+/// each tick and the daemon serves that snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryStatsResponse {
+    pub peers: Vec<IpcPeerDeliveryStats>,
+}
+
+/// One peer's end-to-end delivery accounting — mirrors
+/// `airc-lib`'s `PeerDeliveryStats` the way `IpcRouteEndpoint` mirrors
+/// `RouteEndpoint`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcPeerDeliveryStats {
+    pub peer_id: PeerId,
+    /// Frames flushed to this peer's connection (kernel buffer, not
+    /// enqueue).
+    pub attempts: u64,
+    /// Typed delivery acks received back (any outcome — each proves the
+    /// pipe and the remote daemon end-to-end).
+    pub acked: u64,
+    /// Flushed frames since the last ack — the suspect trigger.
+    pub attempts_since_ack: u32,
+    pub last_attempt_ms: Option<u64>,
+    /// Wall stamp of the last ack — "last confirmed delivery: N ago".
+    pub last_ack_ms: Option<u64>,
+    /// Measured send→ack round trip (EMA).
+    pub rtt_ema_ms: Option<u32>,
+    /// The connection is presumed half-open; route refresh will drop +
+    /// re-dial it.
+    pub suspect: bool,
 }
 
 /// Result of an `Inbox` pull: durable envelopes (airc-wire bytes) + the

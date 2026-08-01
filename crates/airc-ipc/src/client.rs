@@ -21,8 +21,8 @@ use crate::request::{
     RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use crate::response::{
-    InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse, Response,
-    RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
+    DeliveryStatsResponse, InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse,
+    Response, RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -238,6 +238,16 @@ impl DaemonClient {
     pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
         match self.call(Request::RouteEndpoints).await? {
             Response::RouteEndpoints(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// #1306 slice 2: per-peer end-to-end delivery accounting. The
+    /// delivery-truth read — doctor prints "last confirmed delivery to
+    /// X: N ago" from this instead of inferring health from TCP state.
+    pub async fn delivery_stats(&self) -> Result<DeliveryStatsResponse, ClientError> {
+        match self.call(Request::DeliveryStats).await? {
+            Response::DeliveryStats(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }
