@@ -41,6 +41,37 @@ pub const DEFAULT_MAX_REQUESTS_PER_MIN: usize = 30;
 /// How long to self-throttle after blowing the local per-minute budget.
 const LOCAL_THROTTLE_BACKOFF_SEC: f64 = 60.0;
 
+/// How many of the per-minute slots are RESERVED for [`GhClass::Registry`]
+/// traffic — beacons may never consume into this floor. Sized so a full
+/// registry cycle (refresh + publish) always fits even under beacon storm
+/// (2026-08-01 starvation: beacons held all 30 slots continuously for days;
+/// the registry logged 33k failures, converged never, and undialable peers
+/// took the mesh down).
+pub const REGISTRY_FLOOR: usize = 6;
+
+/// Traffic class for a gh reservation — the prioritization that keeps
+/// load-bearing convergence traffic alive under polling pressure. One
+/// budget, one window, but the classes drain it asymmetrically:
+///
+/// - `Beacon` may use at most `limit - REGISTRY_FLOOR` of the window.
+/// - `Registry` and `Interactive` may use the whole window, including the
+///   floor beacons can't touch.
+///
+/// GitHub's OWN limits (the shared backoff armed by [`GhBudget::note_rate_limit`])
+/// remain absolute for every class — prioritization never overrides the
+/// upstream throttle, only arbitrates OUR local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhClass {
+    /// Account-registry refresh/publish — the mesh's convergence data.
+    /// Starving this makes same-owner peers undialable grid-wide.
+    Registry,
+    /// Periodic beacon/channel polling — frequent and deferrable; a
+    /// skipped poll costs seconds, a starved registry costs the mesh.
+    Beacon,
+    /// Human- or agent-invoked one-shots (PR ops, doctor probes).
+    Interactive,
+}
+
 /// Outcome of asking the governor for permission to make a gh request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reservation {
@@ -89,6 +120,29 @@ impl GhBudget {
     /// Cross-process safe: the whole check-and-record happens under the
     /// shared file lock.
     pub fn reserve(&self, args: &[String], now: f64) -> std::io::Result<Reservation> {
+        self.reserve_class(args, now, GhClass::Interactive)
+    }
+
+    /// Class-aware [`reserve`](Self::reserve) — the starvation fix. Two
+    /// deliberate changes from the classless behavior:
+    ///
+    /// 1. **The registry floor.** `Beacon` reservations are denied once the
+    ///    window reaches `limit - REGISTRY_FLOOR`, so registry convergence
+    ///    always finds budget no matter how hot the polling is.
+    /// 2. **Local exceed no longer arms the SHARED backoff.** The old path
+    ///    let one noisy beacon blowing the local window lock out EVERY
+    ///    caller (registry included) for 60s, over and over — the second
+    ///    half of the 33k-error starvation. The sliding window is already
+    ///    self-limiting; a local denial now returns its own retry hint and
+    ///    nothing more. The shared backoff remains exclusively GitHub's
+    ///    voice ([`note_rate_limit`](Self::note_rate_limit)) — upstream
+    ///    limits stay absolute for all classes.
+    pub fn reserve_class(
+        &self,
+        args: &[String],
+        now: f64,
+        class: GhClass,
+    ) -> std::io::Result<Reservation> {
         let _lock = self.lock()?;
         let until = self.read_backoff();
         if now < until {
@@ -102,11 +156,16 @@ impl GhBudget {
         }
         let count = self.recent_count(now)?;
         let limit = max_requests_per_min();
-        if count >= limit {
-            self.write_backoff(now + LOCAL_THROTTLE_BACKOFF_SEC)?;
+        let class_limit = match class {
+            GhClass::Beacon => limit.saturating_sub(REGISTRY_FLOOR),
+            GhClass::Registry | GhClass::Interactive => limit,
+        };
+        if count >= class_limit {
             return Ok(Reservation::Denied {
                 retry_after_secs: LOCAL_THROTTLE_BACKOFF_SEC as i64,
-                reason: format!("gh request budget exceeded ({count}/{limit} in 60s)"),
+                reason: format!(
+                    "gh request budget exceeded for {class:?} ({count}/{class_limit} of {limit} in 60s)"
+                ),
             });
         }
         self.record(now)?;
@@ -347,6 +406,120 @@ mod tests {
         GhBudget::at(dir)
     }
 
+    /// Serializes every test whose assertions depend on
+    /// `max_requests_per_min()`: one legacy test MUTATES the
+    /// `AIRC_GH_MAX_REQUESTS_PER_MIN` env var, and process env is global —
+    /// unserialized, the limit changes under a sibling test's loop
+    /// mid-flight (observed: denials at "beacon 1"/"interactive 7").
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn gist_args() -> Vec<String> {
+        vec!["api".into(), "/gists/x".into()]
+    }
+
+    /// what this catches (#288 starvation fix): the registry floor —
+    /// once beacons fill the window to `limit - REGISTRY_FLOOR`, further
+    /// Beacon reservations are DENIED while Registry (and Interactive)
+    /// still reserve into the floor. This is the invariant whose absence
+    /// let polling hold all 30 slots for days while registry convergence
+    /// logged 33k failures and never completed.
+    #[test]
+    fn registry_rides_the_floor_beacons_cannot_drain() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        let b = budget(dir.path());
+        let now = 1_000_000.0;
+        let limit = max_requests_per_min();
+        // Env-agnostic: another test in this process may shrink the limit
+        // via AIRC_GH_MAX_REQUESTS_PER_MIN; the invariants below hold for
+        // ANY limit (cap saturates to 0 → the first beacon is denied and
+        // registry gets the whole window).
+        let beacon_cap = limit.saturating_sub(REGISTRY_FLOOR);
+        for i in 0..beacon_cap {
+            assert!(
+                b.reserve_class(&gist_args(), now, GhClass::Beacon)
+                    .expect("io")
+                    .allowed(),
+                "beacon {i} within cap must be allowed"
+            );
+        }
+        assert!(
+            !b.reserve_class(&gist_args(), now, GhClass::Beacon)
+                .expect("io")
+                .allowed(),
+            "beacon at cap must be denied — the floor is reserved"
+        );
+        let floor_available = limit - beacon_cap; // min(REGISTRY_FLOOR, limit)
+        for i in 0..floor_available {
+            assert!(
+                b.reserve_class(&gist_args(), now, GhClass::Registry)
+                    .expect("io")
+                    .allowed(),
+                "registry {i} must reserve into the floor beacons cannot touch"
+            );
+        }
+        assert!(
+            !b.reserve_class(&gist_args(), now, GhClass::Registry)
+                .expect("io")
+                .allowed(),
+            "the absolute limit still binds registry — prioritization never mints budget"
+        );
+    }
+
+    /// what this catches (#288, the second starvation mechanism): a LOCAL
+    /// exceed must NOT arm the shared backoff. Under the old behavior a
+    /// beacon blowing the window locked out EVERY class for 60s; now a
+    /// denied beacon leaves higher classes immediately reservable, and
+    /// the shared backoff remains exclusively GitHub's own signal.
+    #[test]
+    fn local_exceed_never_arms_the_shared_backoff() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        let b = budget(dir.path());
+        let now = 2_000_000.0;
+        let limit = max_requests_per_min();
+        for _ in 0..limit.saturating_sub(REGISTRY_FLOOR) {
+            assert!(b
+                .reserve_class(&gist_args(), now, GhClass::Beacon)
+                .expect("io")
+                .allowed());
+        }
+        // Beacon exceeds — denied, but with NO side effect on others.
+        assert!(!b
+            .reserve_class(&gist_args(), now, GhClass::Beacon)
+            .expect("io")
+            .allowed());
+        let after = b
+            .reserve_class(&gist_args(), now, GhClass::Registry)
+            .expect("io");
+        assert!(
+            after.allowed(),
+            "registry must reserve immediately after a beacon local-exceed \
+             (a shared-backoff denial here is the old lockout bug): {after:?}"
+        );
+    }
+
+    /// what this catches: back-compat — the classless `reserve` is
+    /// Interactive (full window), so existing callers keep their exact
+    /// prior allowance.
+    #[test]
+    fn classless_reserve_keeps_the_full_window() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        let b = budget(dir.path());
+        let now = 3_000_000.0;
+        for i in 0..max_requests_per_min() {
+            assert!(
+                b.reserve(&gist_args(), now).expect("io").allowed(),
+                "interactive {i} within the full limit must be allowed"
+            );
+        }
+        assert!(!b.reserve(&gist_args(), now).expect("io").allowed());
+    }
+
     #[test]
     fn quota_relevant_only_for_api_gist_authstatus() {
         // what this catches: free commands (--version) must not consume
@@ -360,8 +533,14 @@ mod tests {
 
     #[test]
     fn reserve_allows_until_budget_then_denies_and_backs_off() {
-        // what this catches: the per-minute cap actually fires, and once
-        // tripped arms a backoff so callers stop hammering.
+        // what this catches: the per-minute cap actually fires and stays
+        // denied while the window is full. UPDATED for the #288 starvation
+        // fix: a LOCAL exceed no longer arms the shared backoff (the old
+        // assertion here encoded the lockout bug — one noisy caller froze
+        // every class for 60s). The window itself keeps denying, which is
+        // what this now pins; backoff arming is exclusively note_rate_limit's
+        // (GitHub's own signal), covered by its own tests.
+        let _env = env_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         let b = budget(tmp.path());
         std::env::set_var("AIRC_GH_MAX_REQUESTS_PER_MIN", "3");
@@ -372,8 +551,15 @@ mod tests {
         }
         let denied = b.reserve(&args, now).unwrap();
         assert!(!denied.allowed(), "4th call over a budget of 3 must deny");
-        // a follow-up call is still denied by the armed backoff
+        // Still denied while the window is full — by the WINDOW, not an
+        // armed backoff.
         assert!(!b.reserve(&args, now).unwrap().allowed());
+        // Once the window slides past, callers are immediately allowed
+        // again — no lingering 60s lockout from the local throttle.
+        assert!(
+            b.reserve(&args, now + 61.0).unwrap().allowed(),
+            "window slid — a local exceed must not leave an armed backoff behind"
+        );
         std::env::remove_var("AIRC_GH_MAX_REQUESTS_PER_MIN");
     }
 

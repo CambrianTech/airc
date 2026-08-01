@@ -492,10 +492,14 @@ impl GhAccountRegistryStore {
         // catches the error and waits for the next tick, which is the
         // correct "don't spam gh" behavior, not a hard failure.
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-        match self
-            .budget
-            .reserve(&owned, crate::gh::governor::now_seconds())
-        {
+        // Registry class: convergence traffic rides the reserved floor
+        // beacons can't drain (the 2026-08-01 starvation fix) — GitHub's
+        // own backoff still applies absolutely.
+        match self.budget.reserve_class(
+            &owned,
+            crate::gh::governor::now_seconds(),
+            crate::gh::governor::GhClass::Registry,
+        ) {
             Ok(crate::gh::governor::Reservation::Denied {
                 retry_after_secs,
                 reason,
