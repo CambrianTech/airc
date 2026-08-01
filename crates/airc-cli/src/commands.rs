@@ -1431,6 +1431,13 @@ pub async fn run_daemon(
     ));
     routed_forwarder.add_link(daemon_airc.clone()).await;
 
+    // #1306: end-to-end delivery truth. The forwarder's per-peer ack
+    // ledger feeds the shared daemon handle so route refresh can (a)
+    // force-drop + re-dial "connected" peers whose flushed frames go
+    // unacked (the half-open purge) and (b) stamp MEASURED lan-tcp
+    // health (rtt/success_ppm) instead of `healthy (not measured)`.
+    daemon_airc.set_delivery_ledger(routed_forwarder.delivery_ledger());
+
     // Self-healing join (refresh-on-failure): the ONE resolved rendezvous
     // store + gate, shared between the registry-refresh loop (its owner,
     // which fills this slot once resolution succeeds) and the

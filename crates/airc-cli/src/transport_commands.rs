@@ -161,6 +161,12 @@ pub async fn run_health(
     } else {
         println!("lan peers: {}", snapshot.connected_lan_peers.len());
     }
+    // #1306: half-open sessions the delivery ledger caught this refresh
+    // — a previously-silent failure class made visible. Each was dropped
+    // + re-dialed because flushed frames went unacked.
+    for peer in &snapshot.suspect_connections_dropped {
+        println!("suspect connection dropped (unacked frames, re-dialing): {peer}");
+    }
     // Card 625abe6d slice 1: every failed outbound dial to a stored
     // peer endpoint is visible here — an offline peer is normal mesh
     // weather, a silently-undialed endpoint is a bug.

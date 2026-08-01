@@ -113,6 +113,23 @@ impl LanTcpAdapter {
         }
     }
 
+    /// #1306: forcibly terminate `peer`'s live session — the SUSPECT
+    /// purge. A half-open TCP connection (peer force-killed, NAT state
+    /// dropped) keeps its map entry forever because removal otherwise
+    /// happens only when the read loop OBSERVES termination — which a
+    /// half-open socket never delivers. Route refresh calls this for a
+    /// peer whose flushed frames go unacked, so the peer stops looking
+    /// "connected" and gets re-dialed on the same refresh pass. Returns
+    /// whether a session existed. Fires the disconnect observer via the
+    /// same path as an observed termination.
+    pub async fn drop_connection(&self, peer: PeerId) -> bool {
+        if !self.inner.connections.lock().await.contains_key(&peer) {
+            return false;
+        }
+        connection::disconnect(&self.inner, peer).await;
+        true
+    }
+
     /// Snapshot of currently-connected peers. Useful for diagnostics
     /// (`airc-core peers`) + tests.
     pub async fn connected_peers(&self) -> Vec<PeerId> {

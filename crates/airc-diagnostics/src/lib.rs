@@ -123,6 +123,13 @@ pub enum DiagnosticCode {
     /// remote reports the channel unbound). The local transcript is
     /// intact; the remote machine did not confirm visibility.
     RoutedForwardFailed,
+    /// #1306: a live LAN session was force-dropped by route refresh
+    /// because frames flushed to it went unacked past the suspect
+    /// threshold — the half-open-socket purge. The peer is re-dialed
+    /// in the same refresh pass; this event is the visible trace of a
+    /// failure that was previously silent ("connected" forever, zero
+    /// delivery).
+    SuspectConnectionDropped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,7 +10,7 @@ use futures::stream::StreamExt;
 use crate::error::AircError;
 use crate::route::health::{TransportHealthSample, TransportHealthState};
 use crate::route::invite::RouteEndpoint;
-use crate::route::policy::TransportKind;
+use crate::route::policy::{TransportKind, TransportRole};
 use crate::Airc;
 
 /// Card 625abe6d slice 1 — per-dial deadline. LAN/tailnet targets
@@ -156,6 +156,41 @@ pub struct RouteDiscoverySnapshot {
     /// burn a `PEER_DIAL_TIMEOUT` and bury live peers in failure noise), and a
     /// single count is surfaced rather than one skip per ghost (anti-spam).
     pub ghost_peers_skipped: usize,
+    /// #1306: peers whose live connection was force-dropped this refresh
+    /// because their flushed frames went unacked (the half-open purge —
+    /// see [`crate::route::delivery_ledger::DeliveryLedger`]). Each is
+    /// immediately eligible for re-dial in the SAME refresh pass.
+    pub suspect_connections_dropped: Vec<PeerId>,
+}
+
+/// #1306: the lan-tcp health sample, derived from delivery accounting
+/// when any exists. Pure — the decision is unit-tested independent of
+/// forwarder/adapter machinery.
+///
+/// - `None` aggregate (no ledger, or no forward ever attempted): the
+///   honest pre-traffic fallback — `Healthy`, rtt/success unmeasured.
+/// - Some acks coming back: `Healthy`, with MEASURED rtt + success_ppm
+///   (this is what retires `state=healthy (not measured)`).
+/// - Every attempted peer currently suspect: `Degraded` — frames are
+///   being flushed and nothing acks; the transport must stop being
+///   advertised as usable-now even though sockets "exist".
+pub(crate) fn lan_health_sample(
+    aggregate: Option<super::delivery_ledger::DeliveryAggregate>,
+) -> TransportHealthSample {
+    let Some(aggregate) = aggregate else {
+        return TransportHealthSample::healthy_direct(TransportKind::LanTcp);
+    };
+    TransportHealthSample {
+        kind: TransportKind::LanTcp,
+        role: TransportRole::Direct,
+        state: if aggregate.all_suspect {
+            TransportHealthState::Degraded
+        } else {
+            TransportHealthState::Healthy
+        },
+        rtt_ms: aggregate.best_rtt_ms,
+        success_ppm: Some(aggregate.success_ppm),
+    }
 }
 
 impl RouteDiscoverySnapshot {
@@ -215,6 +250,13 @@ impl Airc {
         // verifier sees the newly-enrolled pubkeys.
         self.sync_account_peer_registry().await?;
 
+        // #1306: BEFORE trusting the connection map, drop sessions the
+        // delivery ledger has proven half-open (flushed frames, no acks).
+        // The dropped peers vanish from `connected`, so the dial pass
+        // below re-dials them THIS refresh instead of skipping them as
+        // "connected" forever — the half-open immortality bug.
+        let suspect_connections_dropped = self.purge_suspect_connections().await;
+
         let (peer_dial_failures, peer_dial_skips, ghost_peers_skipped) =
             self.dial_stored_peer_endpoints().await?;
 
@@ -224,8 +266,14 @@ impl Airc {
             .any(|endpoint| matches!(endpoint, RouteEndpoint::LanTcp { .. }));
         let connected_lan_peers = self.connected_lan_peers().await;
         if lan_has_endpoint || !connected_lan_peers.is_empty() {
-            self.upsert_transport_health(TransportHealthSample::healthy_direct(
-                TransportKind::LanTcp,
+            // #1306: MEASURED health when delivery accounting exists —
+            // real rtt/success_ppm and Degraded when every attempted
+            // peer is suspect. `healthy (not measured)` only as the
+            // honest no-traffic fallback.
+            self.upsert_transport_health(lan_health_sample(
+                self.delivery_ledger()
+                    .as_deref()
+                    .and_then(super::delivery_ledger::DeliveryLedger::aggregate),
             ))?;
         }
 
@@ -236,7 +284,44 @@ impl Airc {
             peer_dial_failures,
             peer_dial_skips,
             ghost_peers_skipped,
+            suspect_connections_dropped,
         })
+    }
+
+    /// #1306: force-drop every connected peer the delivery ledger marks
+    /// SUSPECT (≥ [`super::delivery_ledger::SUSPECT_UNACKED_ATTEMPTS`]
+    /// flushed-but-unacked frames). Emits one warn diagnostic per drop —
+    /// this is the moment a silent half-open socket becomes a visible,
+    /// self-healing event. No-op on handles without a ledger (non-daemon).
+    async fn purge_suspect_connections(&self) -> Vec<PeerId> {
+        let Some(ledger) = self.delivery_ledger() else {
+            return Vec::new();
+        };
+        let adapter = self.inner.lan_tcp.lock().await.clone();
+        let Some(adapter) = adapter else {
+            return Vec::new();
+        };
+        let mut dropped = Vec::new();
+        for peer in adapter.connected_peers().await {
+            if !ledger.is_suspect(peer) {
+                continue;
+            }
+            if adapter.drop_connection(peer).await {
+                ledger.note_purged(peer);
+                self.diag_sink().emit(
+                    airc_diagnostics::DiagnosticEvent::warn(
+                        airc_diagnostics::DiagnosticComponent::Transport,
+                        airc_diagnostics::DiagnosticCode::SuspectConnectionDropped,
+                        "live connection dropped: flushed frames went unacked — the \
+                         session was presumed half-open and the peer will be re-dialed \
+                         this refresh",
+                    )
+                    .with_field("peer", peer),
+                );
+                dropped.push(peer);
+            }
+        }
+        dropped
     }
 
     /// Card 625abe6d slice 1 — outbound-dial every enrolled peer with
@@ -891,6 +976,7 @@ impl Airc {
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
             ghost_peers_skipped: 0,
+            suspect_connections_dropped: Vec::new(),
         })
     }
 
@@ -1199,6 +1285,7 @@ mod tests {
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
             ghost_peers_skipped: 0,
+            suspect_connections_dropped: Vec::new(),
         }
     }
 
@@ -1231,5 +1318,42 @@ mod tests {
     #[test]
     fn grid_of_one_never_elects() {
         assert!(!snapshot(Vec::new(), Vec::new()).should_self_elect_as_relay(0));
+    }
+
+    /// what this catches (#1306): the health-sample decision. No
+    /// delivery accounting keeps today's honest unmeasured fallback;
+    /// any accounting yields MEASURED rtt/success (retiring
+    /// `state=healthy (not measured)`); an all-suspect ledger — frames
+    /// flushing, nothing acking — must degrade the transport even
+    /// though sockets "exist".
+    #[test]
+    fn lan_health_sample_measures_and_degrades_from_delivery_truth() {
+        use crate::route::delivery_ledger::DeliveryAggregate;
+
+        let unmeasured = lan_health_sample(None);
+        assert_eq!(unmeasured.state, TransportHealthState::Healthy);
+        assert_eq!(unmeasured.rtt_ms, None);
+        assert_eq!(unmeasured.success_ppm, None);
+
+        let measured = lan_health_sample(Some(DeliveryAggregate {
+            attempts: 4,
+            acked: 3,
+            success_ppm: 750_000,
+            best_rtt_ms: Some(12),
+            all_suspect: false,
+        }));
+        assert_eq!(measured.state, TransportHealthState::Healthy);
+        assert_eq!(measured.rtt_ms, Some(12));
+        assert_eq!(measured.success_ppm, Some(750_000));
+
+        let half_open = lan_health_sample(Some(DeliveryAggregate {
+            attempts: 3,
+            acked: 0,
+            success_ppm: 0,
+            best_rtt_ms: None,
+            all_suspect: true,
+        }));
+        assert_eq!(half_open.state, TransportHealthState::Degraded);
+        assert_eq!(half_open.success_ppm, Some(0));
     }
 }

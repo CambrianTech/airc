@@ -400,27 +400,13 @@ async fn remote_persist_failure_then_retry_is_exactly_once_visible() {
     );
 }
 
-/// Backpressure + failure loudness: a connected peer that NEVER acks
-/// (hollow listener — accepts TLS, persists nothing, answers nothing).
-/// With a 1-deep per-peer queue and a worker pinned on the ack wait,
-/// a burst must overflow the queue (typed `RoutedForwardQueueSaturated`)
-/// and every unconfirmed forward must end in a typed
-/// `RoutedForwardFailed`. Nothing is silent, and local delivery is
-/// untouched.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn saturated_forward_queue_and_unconfirmed_forwards_are_loud() {
-    let a = boot_linked(RoutedForwarderConfig {
-        peer_queue_capacity: 1,
-        ack_timeout: Duration::from_millis(800),
-        max_attempts: 1,
-        retry_backoff: Duration::from_millis(50),
-        ..RoutedForwarderConfig::default()
-    })
-    .await;
-    let diag = MemoryDiagnosticSink::default();
-    a.forwarder.set_diagnostic_sink(Arc::new(diag.clone()));
-
-    // Hollow peer: TLS-pinned listener with NO ingest behind it.
+/// A "hollow" peer: TLS-pinned listener that accepts the connection but
+/// has NO ingest behind it — persists nothing, acks nothing. The
+/// in-process stand-in for a half-open session (frames flush into the
+/// kernel buffer, nothing ever answers). Returns the adapter alongside
+/// the id — dropping it closes the listener, which would surface as an
+/// OBSERVED disconnect instead of the silent no-ack this simulates.
+async fn connect_hollow_peer(a: &LinkedMachine) -> (airc_core::PeerId, LanTcpAdapter) {
     let hollow_id = airc_core::PeerId::from_u128(0x710c_1998_f6cb);
     let hollow_kp = PeerKeypair::generate();
     let hollow_pubkey = hollow_kp.public_bytes();
@@ -449,6 +435,31 @@ async fn saturated_forward_queue_and_unconfirmed_forwards_are_loud() {
         .connect_lan(hollow_addr, hollow_id)
         .await
         .expect("gateway dials hollow");
+    (hollow_id, hollow)
+}
+
+/// Backpressure + failure loudness: a connected peer that NEVER acks
+/// (hollow listener — accepts TLS, persists nothing, answers nothing).
+/// With a 1-deep per-peer queue and a worker pinned on the ack wait,
+/// a burst must overflow the queue (typed `RoutedForwardQueueSaturated`)
+/// and every unconfirmed forward must end in a typed
+/// `RoutedForwardFailed`. Nothing is silent, and local delivery is
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_forward_queue_and_unconfirmed_forwards_are_loud() {
+    let a = boot_linked(RoutedForwarderConfig {
+        peer_queue_capacity: 1,
+        ack_timeout: Duration::from_millis(800),
+        max_attempts: 1,
+        retry_backoff: Duration::from_millis(50),
+        ..RoutedForwarderConfig::default()
+    })
+    .await;
+    let diag = MemoryDiagnosticSink::default();
+    a.forwarder.set_diagnostic_sink(Arc::new(diag.clone()));
+
+    // Hollow peer: TLS-pinned listener with NO ingest behind it.
+    let (_hollow_id, _hollow) = connect_hollow_peer(&a).await;
 
     let op_a = a.machine.attach("op-a").await;
     op_a.join(ROOM).await.expect("op-a joins");
@@ -503,6 +514,80 @@ async fn saturated_forward_queue_and_unconfirmed_forwards_are_loud() {
 
     // And nothing was ever confirmed: the ack vocabulary stayed truthful.
     assert_eq!(a.forwarder.confirmed_count(), 0);
+}
+
+/// what this catches (#1306): the delivery ledger's healthy leg — a
+/// real ack-confirmed forward must land in per-peer accounting with a
+/// MEASURED round trip and no suspect verdict. This is the signal that
+/// retires `state=healthy (not measured)` route health.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_ledger_records_measured_acks_for_a_live_peer() {
+    let a = boot_linked(RoutedForwarderConfig::default()).await;
+    let b = boot_linked(RoutedForwarderConfig::default()).await;
+    link(&a.gateway, &b.gateway).await;
+
+    let op_a = a.machine.attach("op-a").await;
+    op_a.join(ROOM).await.expect("op-a joins");
+    let op_b = b.machine.attach("op-b").await;
+    op_b.join(ROOM).await.expect("op-b joins");
+
+    let id = op_a.say("ledger proof").await.expect("op-a says");
+    assert_eq!(wait_for_copies(&op_b, id).await, 1);
+    assert!(wait_for_confirmed(&a.forwarder, 1).await >= 1);
+
+    let ledger = a.forwarder.delivery_ledger();
+    let stats = ledger
+        .stats(b.gateway.peer_id())
+        .expect("delivery stats recorded for the confirmed peer");
+    assert!(stats.attempts >= 1, "the flushed frame was an attempt");
+    assert!(stats.acked >= 1, "the delivered ack was recorded");
+    assert!(
+        stats.rtt_ema_ms.is_some(),
+        "the send→ack round trip was MEASURED"
+    );
+    assert!(!stats.suspect(), "an acking peer is never suspect");
+    let aggregate = ledger.aggregate().expect("aggregate after traffic");
+    assert!(
+        aggregate.success_ppm > 0 && !aggregate.all_suspect,
+        "aggregate must reflect the confirmed delivery"
+    );
+}
+
+/// what this catches (#1306): the half-open signature — a connected
+/// peer whose flushed frames go unacked must earn the SUSPECT verdict
+/// in the ledger. Route refresh reads exactly this to drop + re-dial
+/// the session instead of trusting the connection map forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hollow_peer_earns_suspect_after_unacked_attempts() {
+    let a = boot_linked(RoutedForwarderConfig {
+        ack_timeout: Duration::from_millis(400),
+        max_attempts: 2,
+        retry_backoff: Duration::from_millis(50),
+        ..RoutedForwarderConfig::default()
+    })
+    .await;
+    let (hollow_id, _hollow) = connect_hollow_peer(&a).await;
+
+    let op_a = a.machine.attach("op-a").await;
+    op_a.join(ROOM).await.expect("op-a joins");
+    op_a.say("into the void")
+        .await
+        .expect("local send keeps working while the peer is half-open");
+
+    // 2 attempts × 400ms unacked waits → suspect. Poll: the forward
+    // worker runs asynchronously to the send.
+    let ledger = a.forwarder.delivery_ledger();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ledger.is_suspect(hollow_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "hollow peer must be marked suspect after unacked attempts; stats: {:?}",
+            ledger.stats(hollow_id)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stats = ledger.stats(hollow_id).expect("stats for hollow peer");
+    assert!(stats.attempts >= 2 && stats.acked == 0);
 }
 
 /// #1247 slice 3 — a room send traverses a RELAY, not LAN. This is the

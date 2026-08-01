@@ -175,6 +175,7 @@ pub use registry_refresh::{
     RegistryRefreshConfig, RegistryRefreshGate, SyncOutcome, TickReport as RegistrySyncReport,
 };
 pub use room::Room;
+pub use route::delivery_ledger::{DeliveryAggregate, DeliveryLedger, PeerDeliveryStats};
 pub use route::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, PeerDialFailure,
     PeerDialSkip, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
