@@ -9,46 +9,18 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     let airc_exe = env::current_exe()?;
     let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
-    let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch == "HEAD" || branch.is_empty() {
-        return Err(format!(
-            "install source is detached at {}; check out a branch before updating",
-            source.display()
-        )
-        .into());
-    }
-
-    let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+    let channel = update_channel();
     if daemon_was_running {
         stop_daemon(&airc_exe, home, &socket)?;
     }
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .arg("fetch")
-            .arg("--quiet")
-            .arg("origin")
-            .arg(&branch),
-        "git fetch",
-    )?;
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .arg("pull")
-            .arg("--ff-only")
-            .arg("--quiet"),
-        "git pull --ff-only",
-    )?;
-    let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
-    run_installer(&source)?;
+    run_installer(&build_dir)?;
 
     if before == after {
-        println!("Already at {after}.");
+        println!("Already at {after} on channel {channel}.");
     } else {
-        println!("Updated: {before} -> {after}");
+        println!("Updated ({channel}): {before} -> {after}");
     }
     if daemon_was_running {
         restart_daemon(&airc_exe, home, &socket)?;
@@ -56,6 +28,134 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
         println!("daemon: restarted.");
     }
     Ok(())
+}
+
+/// The release channel this node's updates track — DURABLE per-machine config,
+/// never the install checkout's whim. Resolution: `AIRC_UPDATE_CHANNEL` env →
+/// `~/.airc/update-channel` file → `"canary"` (the rust-rewrite release branch).
+///
+/// Why this exists (task #288, incident 2026-08-01): the updater used to build
+/// whatever branch the install-source checkout happened to have checked out.
+/// On a dev checkout that branch can be a feature branch or a DELETED PR branch
+/// — updates then either brick ("couldn't find remote ref …") or silently
+/// strand the node off-channel, which is exactly how a peer's daemon misses a
+/// committed transport fix for a day. The channel is the node's contract; the
+/// checkout is just where the objects live.
+pub(crate) const DEFAULT_UPDATE_CHANNEL: &str = "canary";
+
+fn update_channel() -> String {
+    if let Some(ch) = env::var("AIRC_UPDATE_CHANNEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return ch;
+    }
+    machine_airc_home()
+        .and_then(|d| channel_from_file(&d.join("update-channel")))
+        .unwrap_or_else(|| DEFAULT_UPDATE_CHANNEL.to_string())
+}
+
+/// Read a channel name from the durable file; `None` on missing/empty/unreadable
+/// so the caller falls through to the default. Pure over the path — unit-tested.
+fn channel_from_file(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The per-user `~/.airc` dir (same resolution as the gh guard state) — home for
+/// the update channel file and the channel build worktree.
+fn machine_airc_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".airc"))
+}
+
+/// Prepare the directory the update BUILDS from, pinned to the release channel,
+/// WITHOUT ever mutating a dev checkout's working tree. Returns
+/// `(build_dir, before_short_sha, after_short_sha)`; `before == after` is the
+/// caller's no-op signal.
+///
+/// - Checkout already ON the channel branch → fetch + ff-pull in place (the
+///   pre-existing fast path, unchanged behavior for `~/.airc/src` installs).
+/// - Checkout on ANY other branch, or detached (including a deleted PR branch —
+///   the state that bricked `airc update` on 2026-08-01) → build from an
+///   airc-owned worktree at `~/.airc/update-worktree` hard-reset to
+///   `origin/<channel>`. The dev checkout is only ever `git fetch`ed; its
+///   branch, index, and working tree are never touched. The worktree shares the
+///   source repo's objects, so no re-clone.
+fn prepare_build_source(
+    source: &Path,
+    channel: &str,
+) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
+    run_checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["fetch", "--quiet", "origin", channel]),
+        "git fetch (channel)",
+    )?;
+    let branch = git_text(source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == channel {
+        let before = git_text(source, ["rev-parse", "--short", "HEAD"])?;
+        run_checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(source)
+                .args(["pull", "--ff-only", "--quiet"]),
+            "git pull --ff-only",
+        )?;
+        let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
+        return Ok((source.to_path_buf(), before, after));
+    }
+
+    let wt = machine_airc_home()
+        .ok_or("HOME is not set; cannot place the update worktree")?
+        .join("update-worktree");
+    let origin_ref = format!("origin/{channel}");
+    if wt.join(".git").exists() {
+        // Reuse: `before` is what this node last built from the channel, so the
+        // auto path's no-op compare stays meaningful across runs.
+        let before = git_text(&wt, ["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+        run_checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(["reset", "--hard", &origin_ref]),
+            "git reset --hard (update worktree)",
+        )?;
+        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
+        Ok((wt, before, after))
+    } else {
+        if wt.exists() {
+            // Half-created leftover (no .git link) — clear it and drop any stale
+            // registration so `worktree add` can't refuse.
+            std::fs::remove_dir_all(&wt)?;
+        }
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["worktree", "prune"])
+            .output();
+        let wt_str = wt
+            .to_str()
+            .ok_or("update worktree path is not valid UTF-8")?
+            .to_string();
+        run_checked(
+            Command::new("git").arg("-C").arg(source).args([
+                "worktree",
+                "add",
+                "--detach",
+                &wt_str,
+                &origin_ref,
+            ]),
+            "git worktree add (update worktree)",
+        )?;
+        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
+        // Empty `before` ≠ `after` → first channel build always proceeds.
+        Ok((wt, String::new(), after))
+    }
 }
 
 /// `airc update --auto` — self-update with a smoke-test and rollback.
@@ -90,37 +190,17 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     let airc_exe = env::current_exe()?;
     let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
-    let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch == "HEAD" || branch.is_empty() {
-        return Err(format!(
-            "install source is detached at {}; check out a branch before auto-updating",
-            source.display()
-        )
-        .into());
-    }
-    let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
-
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["fetch", "--quiet", "origin", &branch]),
-        "git fetch",
-    )?;
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["pull", "--ff-only", "--quiet"]),
-        "git pull --ff-only",
-    )?;
-    let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+    let channel = update_channel();
+    // Channel-pinned build source: fetch/reset only ever touch the channel
+    // worktree (or ff-pull a checkout that IS the channel) — never the running
+    // binary and never a dev checkout's working tree.
+    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
     if before == after {
         // Nothing pulled → nothing to rebuild → the daemon was never
         // stopped and MUST NOT be restarted. Restart-on-no-op is the bug
         // this ordering exists to prevent (hourly transport-owner death).
-        println!("Already at {after} — nothing to auto-update.");
+        println!("Already at {after} on channel {channel} — nothing to auto-update.");
         return Ok(());
     }
 
@@ -140,7 +220,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         )
     })?;
 
-    let installed = run_installer(&source);
+    let installed = run_installer(&build_dir);
 
     // Smoke-test: the new binary must RUN and report the SHA we pulled —
     // a build that compiled but is broken (or didn't actually replace the
@@ -476,6 +556,29 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (#288 pin-to-channel): the durable channel file wins over
+    // the default, and missing/empty files fall through to "canary" — the update
+    // must NEVER derive its ref from the checkout's current branch again (the
+    // deleted-PR-branch brick + off-channel-strand incident, 2026-08-01).
+    #[test]
+    fn channel_file_wins_missing_or_empty_falls_to_default() {
+        let dir = std::env::temp_dir().join(format!("airc-chan-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("update-channel");
+
+        std::fs::write(&file, "release-2\n").unwrap();
+        assert_eq!(channel_from_file(&file).as_deref(), Some("release-2"));
+
+        std::fs::write(&file, "   \n").unwrap();
+        assert_eq!(channel_from_file(&file), None, "blank file falls through");
+
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(channel_from_file(&file), None, "missing file falls through");
+        assert_eq!(DEFAULT_UPDATE_CHANNEL, "canary");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn install_source_prefers_airc_dir() {
