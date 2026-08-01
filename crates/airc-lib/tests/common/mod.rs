@@ -204,6 +204,18 @@ impl Machine {
         self.root.path()
     }
 
+    /// Pin this machine's mesh identity (Operator-source, never
+    /// re-resolved) into the shared coordinator store every attached
+    /// scope resolves against. Call BEFORE the first `attach`/`join`
+    /// so no scope ever falls through to the live gh/git resolver.
+    /// See [`pin_identity`] for the shared-state class this kills.
+    pub async fn pin_identity(&self, identity: &str) {
+        let store = SqliteEventStore::open_path(&self.root.path().join("events.sqlite"))
+            .await
+            .expect("open machine coordinator store for identity pin");
+        pin_identity(&store, identity).await;
+    }
+
     /// Attach a new scope ("tab"/agent) to this machine's daemon.
     pub async fn attach(&self, scope: &str) -> Airc {
         let home = self.root.path().join(scope);
@@ -233,6 +245,32 @@ impl Machine {
         bob.join(room).await.expect("bob joins room");
         (alice, bob)
     }
+}
+
+/// Pin a mesh identity into `store` with an `Operator`-source cache
+/// entry — trusted as-is, never expired, never re-resolved — so
+/// identity-sensitive tests are hermetic. Shared-state class this
+/// kills: the default mesh-identity resolver reads LIVE HOST STATE
+/// shared by every parallel test — `gh api user` (network + gh auth,
+/// 3s kill-deadline), `git config user.email`, and on total probe
+/// failure the REAL `~/.airc/machine-id` — so its outcome varies with
+/// suite load and box configuration, and a provisional (non-gh) result
+/// re-probes `gh` on every later resolve. An Operator pin short-circuits
+/// all of it: no shell-outs, no real-home writes, deterministic RoomId
+/// derivation on any box.
+pub async fn pin_identity(store: &dyn EventStore, identity: &str) {
+    airc_lib::mesh_identity::save(
+        store,
+        &airc_lib::CachedIdentity {
+            version: 1,
+            identity: identity.to_string(),
+            source: airc_lib::mesh_identity::Source::Operator,
+            resolved_at_ms: 1,
+            ttl_ms: airc_lib::mesh_identity::DEFAULT_TTL_MS,
+        },
+    )
+    .await
+    .expect("pin mesh identity");
 }
 
 /// Mutually trust two scopes (each enrols the other's pinned key) so

@@ -49,7 +49,7 @@ use airc_lib::{
 };
 use airc_protocol::{Envelope as ProtoEnvelope, Frame, FrameKind, Signature};
 use airc_store::{EventStore, SqliteEventStore};
-use common::Machine;
+use common::{pin_identity, Machine};
 use tempfile::TempDir;
 
 /// The store every scope on this simulated machine publishes presence
@@ -161,25 +161,6 @@ fn inbound_frame_with_headers(
             .insert((*key).to_string(), (*value).to_string());
     }
     frame
-}
-
-/// Pin a mesh identity into `store` with an `Operator`-source cache
-/// entry — trusted as-is, never re-resolved — so identity-sensitive
-/// tests are hermetic (no gh/git shell-outs, deterministic RoomId
-/// derivation on any CI box).
-async fn pin_identity(store: &dyn EventStore, identity: &str) {
-    airc_lib::mesh_identity::save(
-        store,
-        &airc_lib::CachedIdentity {
-            version: 1,
-            identity: identity.to_string(),
-            source: airc_lib::mesh_identity::Source::Operator,
-            resolved_at_ms: 1,
-            ttl_ms: airc_lib::mesh_identity::DEFAULT_TTL_MS,
-        },
-    )
-    .await
-    .expect("pin mesh identity");
 }
 
 /// THE test (the card): a cross-machine room message arrives over a

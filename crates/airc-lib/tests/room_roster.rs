@@ -30,6 +30,12 @@ async fn room_roster_joins_presence_and_agrees_with_canonical_name_resolver() {
     // One agent attached to a daemon + joined to a room (the route its
     // heartbeat frames need to land in the transcript).
     let machine = Machine::boot().await;
+    // Isolation: pin an Operator mesh identity BEFORE any scope
+    // attaches. Kills the shared-state class "live host identity
+    // resolution" — gh/git shell-outs + real ~/.airc fallback shared
+    // by every parallel test (see common::pin_identity). Unique per
+    // test so RoomId derivation never collides across tests either.
+    machine.pin_identity("roster-presence-join-test").await;
     let airc = machine.solo("general").await;
 
     // Presence: a heartbeat with a self-reported availability.
@@ -99,6 +105,10 @@ async fn peer_name_survives_identity_card_scrolling_past_the_recent_window() {
     // `room_roster` still resolve it — it FAILS against any
     // window-bounded scan.
     let machine = Machine::boot().await;
+    // Isolation: Operator-pinned mesh identity before first attach —
+    // kills the live gh/git/~/.airc shared-state class (see
+    // common::pin_identity); unique per test.
+    machine.pin_identity("roster-name-burial-test").await;
     let airc = machine.solo("general").await;
     let me = airc.peer_id();
 
@@ -174,6 +184,12 @@ async fn room_roster_cards_carries_the_full_identity_and_agrees_with_peer_alias(
     // that read the wrong index, dropped a field, or diverged the name
     // from `peer_alias` fails here before it reaches a rendered roster.
     let machine = Machine::boot().await;
+    // Isolation: Operator-pinned mesh identity before first attach —
+    // kills the live gh/git/~/.airc shared-state class (see
+    // common::pin_identity); unique per test.
+    machine
+        .pin_identity("roster-cards-full-identity-test")
+        .await;
     let airc = machine.solo("general").await;
     let me = airc.peer_id();
 
