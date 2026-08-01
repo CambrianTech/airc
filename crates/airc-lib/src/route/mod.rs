@@ -5,6 +5,7 @@
 //! routes. App and CLI layers consume this through `Airc`; they do
 //! not construct transport adapters or route frames themselves.
 
+pub mod delivery_ledger;
 pub mod dial_quarantine;
 pub mod discovery;
 pub mod health;

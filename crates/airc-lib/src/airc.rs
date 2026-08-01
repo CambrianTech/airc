@@ -297,6 +297,15 @@ pub(crate) struct AircInner {
     /// attached scope reads — not in this handle's private scope store.
     pub(crate) inbound_sink:
         std::sync::RwLock<Option<Arc<dyn crate::router_bridge::InboundFrameSink>>>,
+    /// #1306: the daemon's per-peer delivery ledger, set once at daemon
+    /// boot ([`Airc::set_delivery_ledger`]) from the routed forwarder's
+    /// accounting. Route refresh consults it to distrust "connected"
+    /// peers whose flushed frames go unacked (the half-open purge) and
+    /// to stamp MEASURED lan-tcp health. `None` on every non-daemon
+    /// handle — refresh then keeps its unmeasured fallback. Outer `Arc`
+    /// so daemon-derived handles share the one slot.
+    pub(crate) delivery_ledger:
+        Arc<std::sync::OnceLock<Arc<crate::route::delivery_ledger::DeliveryLedger>>>,
 }
 
 /// Capacity of the delivery-ack fan-out channel. Acks are tiny,
@@ -606,6 +615,7 @@ impl Airc {
                     airc_diagnostics::StderrJsonDiagnosticSink,
                 )),
                 inbound_sink: std::sync::RwLock::new(None),
+                delivery_ledger: Arc::new(std::sync::OnceLock::new()),
             }),
         })
     }
@@ -1417,10 +1427,27 @@ impl Airc {
             ack_tx: self.inner.ack_tx.clone(),
             diag_sink: std::sync::RwLock::new(self.diag_sink()),
             inbound_sink: std::sync::RwLock::new(self.inbound_frame_sink()),
+            // #1306: share the ledger slot so any daemon-derived handle's
+            // route refresh sees the forwarder's delivery accounting.
+            delivery_ledger: self.inner.delivery_ledger.clone(),
         };
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// #1306: install the daemon's delivery ledger on this handle (and
+    /// every handle derived from it). Set-once at daemon boot from
+    /// [`crate::RoutedForwarder::delivery_ledger`]; a second call is a
+    /// no-op (the first ledger stays authoritative — one accounting per
+    /// process).
+    pub fn set_delivery_ledger(&self, ledger: Arc<crate::route::delivery_ledger::DeliveryLedger>) {
+        let _ = self.inner.delivery_ledger.set(ledger);
+    }
+
+    /// #1306: the installed delivery ledger, `None` on non-daemon handles.
+    pub fn delivery_ledger(&self) -> Option<Arc<crate::route::delivery_ledger::DeliveryLedger>> {
+        self.inner.delivery_ledger.get().cloned()
     }
 
     /// Replace the route-health view consumed by the resolver.

@@ -83,6 +83,7 @@ use airc_transport::transport::Transport;
 use airc_transport::LanTcpAdapter;
 use tokio::sync::mpsc;
 
+use crate::route::delivery_ledger::DeliveryLedger;
 use crate::Airc;
 
 /// Tunables for a [`RoutedForwarder`]. Defaults fit the production
@@ -138,6 +139,11 @@ struct ForwarderInner {
     forwarded: AtomicU64,
     /// Forwards confirmed `delivered` by the remote's ack.
     confirmed: AtomicU64,
+    /// #1306: per-peer end-to-end delivery accounting — every flushed
+    /// frame and every ack lands here so route refresh can distrust
+    /// "connected" peers whose frames go unacked, and health can carry
+    /// measured rtt/success instead of `not measured`.
+    ledger: Arc<DeliveryLedger>,
     /// The drain task, aborted when the last forwarder handle drops
     /// (RAII — hermetic tests must not leak forward workers).
     drain_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -174,6 +180,7 @@ impl RoutedForwarder {
             diag: std::sync::RwLock::new(Arc::new(StderrJsonDiagnosticSink)),
             forwarded: AtomicU64::new(0),
             confirmed: AtomicU64::new(0),
+            ledger: Arc::new(DeliveryLedger::new()),
             drain_task: std::sync::Mutex::new(None),
         });
         // The task holds only a Weak — the forwarder handles own the
@@ -210,6 +217,13 @@ impl RoutedForwarder {
     /// Forwards the remote confirmed `delivered`.
     pub fn confirmed_count(&self) -> u64 {
         self.inner.confirmed.load(Ordering::SeqCst)
+    }
+
+    /// #1306: the per-peer delivery ledger. The daemon shares this with
+    /// its route-refresh handle ([`Airc::set_delivery_ledger`]) so
+    /// refresh can purge suspect connections and stamp measured health.
+    pub fn delivery_ledger(&self) -> Arc<DeliveryLedger> {
+        Arc::clone(&self.inner.ledger)
     }
 }
 
@@ -526,12 +540,22 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
             continue;
         }
         inner.forwarded.fetch_add(1, Ordering::SeqCst);
+        // #1306: the frame is in the kernel buffer — that's an attempt.
+        // Whether an ack comes back is the ONLY end-to-end truth about
+        // this peer; the ledger turns that into route-refresh distrust
+        // of half-open "connected" sessions. Wall stamp is recency-only
+        // (0 on a clock error is harmless accounting); RTT is monotonic.
+        let now_ms = crate::time::now_ms().unwrap_or(0);
+        let sent_at = tokio::time::Instant::now();
+        inner.ledger.record_attempt(peer, now_ms);
         match wait_for_ack(&mut ack_rx, env.event_id, peer, inner.config.ack_timeout).await {
             AckWait::Delivered => {
                 inner.confirmed.fetch_add(1, Ordering::SeqCst);
+                record_ack(inner, peer, sent_at);
                 return;
             }
             AckWait::Undeliverable(UndeliverableReason::UnknownChannel) => {
+                record_ack(inner, peer, sent_at);
                 // The remote holds the frame durably; no scope there
                 // binds the channel. Retrying cannot change that — a
                 // late-joining scope replays it (proven in #1156).
@@ -555,7 +579,10 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
                 // did NOT take the frame. Its recent-ids entry was
                 // unmarked (#1156 poisoning fix), so retrying the same
                 // event_id is a real publish there — never a false
-                // `Duplicate`/`delivered`.
+                // `Duplicate`/`delivered`. The PIPE is proven though —
+                // an undeliverable ack still came back — so the ledger
+                // records it (suspect measures transport, not outcome).
+                record_ack(inner, peer, sent_at);
                 last_failure = format!("remote undeliverable: {}", reason.as_str());
                 continue;
             }
@@ -582,6 +609,15 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
         .with_field("attempts", max_attempts)
         .with_field("last_failure", last_failure),
     );
+}
+
+/// #1306: an ack of ANY outcome proves the pipe end-to-end — stamp the
+/// ledger with the measured send→ack round trip.
+fn record_ack(inner: &ForwarderInner, peer: PeerId, sent_at: tokio::time::Instant) {
+    let rtt_ms = u32::try_from(sent_at.elapsed().as_millis()).ok();
+    inner
+        .ledger
+        .record_ack(peer, crate::time::now_ms().unwrap_or(0), rtt_ms);
 }
 
 async fn wait_for_ack(
