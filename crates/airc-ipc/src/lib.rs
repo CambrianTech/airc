@@ -47,9 +47,9 @@ pub use request::{
     RoomTipRequest, SendRequest,
 };
 pub use response::{
-    InboxResponse, IpcIdentityCard, IpcRoomInfo, IpcRouteEndpoint, PeerIdentityCardResponse,
-    PeersResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
-    RouteEndpointsResponse, StatusResponse,
+    DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcPeerDeliveryStats, IpcRoomInfo,
+    IpcRouteEndpoint, PeerIdentityCardResponse, PeersResponse, PublishResponse, Response,
+    RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
 };
 pub use sdk_conversions::{COUNTER_BITS, COUNTER_MASK};
 // IpcListener / IpcStream stay under `transport` because only the
