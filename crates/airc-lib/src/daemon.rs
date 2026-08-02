@@ -21,7 +21,7 @@ use airc_core::{
 };
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget,
+    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
     PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
@@ -75,6 +75,34 @@ fn kind_to_transcript(kind: Kind) -> TranscriptKind {
         | Kind::StreamChunk
         | Kind::Control => TranscriptKind::System,
     }
+}
+
+/// Continuum #297 — the inverse of [`kind_to_transcript`], for pushing
+/// a consumer's `EventFilter::kinds` down into the daemon's inbox read
+/// ("newest N events OF THESE KINDS", filtered before the limit).
+///
+/// The push-down must be a SUPERSET of the client-side `filter.matches`
+/// — never narrower, or the daemon would drop events the consumer asked
+/// for. `kind_to_transcript` is lossy (every non-chat bus kind projects
+/// to the coarse `System`), so `Message` maps exactly and ANY other
+/// transcript kind admits every non-`Message` bus kind; `filter.matches`
+/// still refines the decoded page afterwards.
+fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
+    let mut out = Vec::new();
+    if kinds.contains(&TranscriptKind::Message) {
+        out.push(IpcKind::Message);
+    }
+    if kinds.iter().any(|kind| *kind != TranscriptKind::Message) {
+        out.extend([
+            IpcKind::Event,
+            IpcKind::Command,
+            IpcKind::CommandResult,
+            IpcKind::Signal,
+            IpcKind::StreamChunk,
+            IpcKind::Control,
+        ]);
+    }
+    out
 }
 
 fn target_to_mention(target: &Target) -> MentionTarget {
@@ -238,6 +266,34 @@ impl Airc {
                 since: None,
                 channel: Some(room.channel),
                 limit: Some(limit),
+                kinds: None,
+            })
+            .await?;
+        response
+            .envelopes
+            .into_iter()
+            .map(decode_wire_event)
+            .collect()
+    }
+
+    /// Continuum #297: [`Airc::daemon_page_recent`] with the consumer's
+    /// kind filter pushed down into the daemon's inbox read (mapped via
+    /// [`transcript_kinds_to_ipc`]), so the daemon pages the newest
+    /// `limit` events OF THOSE KINDS instead of a raw newest-`limit`
+    /// that a StreamChunk flood fills with events the caller discards.
+    pub(crate) async fn daemon_page_recent_of_kinds(
+        &self,
+        channel: RoomId,
+        kinds: &std::collections::BTreeSet<TranscriptKind>,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .inbox(InboxRequest {
+                since: None,
+                channel: Some(channel),
+                limit: Some(limit),
+                kinds: Some(transcript_kinds_to_ipc(kinds)),
             })
             .await?;
         response
@@ -264,6 +320,7 @@ impl Airc {
                 }),
                 channel: Some(room.channel),
                 limit: Some(limit),
+                kinds: None,
             })
             .await?;
         response
@@ -345,6 +402,7 @@ impl Airc {
                     since,
                     channel: Some(channel),
                     limit: Some(page_size),
+                    kinds: None,
                 })
                 .await?;
             let count = response.envelopes.len();

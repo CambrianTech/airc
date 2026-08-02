@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 use airc_core::{PeerId, RoomId};
 
 use crate::clock::Clock;
-use crate::envelope::{Cursor, Envelope};
+use crate::envelope::{Cursor, Envelope, Kind};
 use crate::ephemeral::EphemeralCache;
 use crate::filter::Filter;
 use crate::ring::HotRing;
@@ -729,9 +729,47 @@ impl EventRouter {
         channel: RoomId,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, None, limit).await
+    }
+
+    /// **Continuum #297.** [`Self::durable_tail`] restricted to
+    /// envelopes whose [`Kind`] is in `kinds` — "the newest N durable
+    /// events OF THESE KINDS", with the kind predicate applied on both
+    /// legs (ring scan + [`DurableSink::page_tail_of_kinds`]) BEFORE the
+    /// limit. The inbox path that keeps a chunk-flooded room's page
+    /// from evicting every `Message`: newest-N-raw-then-filter yields
+    /// crumbs; this yields the newest N matching.
+    ///
+    /// `kinds` must be non-empty — filtering to nothing is never what a
+    /// caller means, and the IPC boundary normalizes empty to the
+    /// unfiltered [`Self::durable_tail`]. An empty slice here returns
+    /// an empty page (the vacuous filter, honestly answered).
+    pub async fn durable_tail_of_kinds(
+        &self,
+        channel: RoomId,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, Some(kinds), limit)
+            .await
+    }
+
+    /// The one merge implementation behind [`Self::durable_tail`] /
+    /// [`Self::durable_tail_of_kinds`] — `kinds: None` means no kind
+    /// predicate. See `durable_tail` for the merge contract; the kind
+    /// filter composes with it unchanged (ring durables of a kind are
+    /// exactly the channel's newest durables of that kind, everything
+    /// older is in the sink).
+    async fn durable_tail_filtered(
+        &self,
+        channel: RoomId,
+        kinds: Option<&[Kind]>,
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let matches_kind = |env: &Envelope| kinds.is_none_or(|kinds| kinds.contains(&env.kind));
         let (mut tail, ring_oldest) = {
             let shard = self.shard_for(channel);
             let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
@@ -741,7 +779,7 @@ impl EventRouter {
                         .ring
                         .replay_after(None)
                         .into_iter()
-                        .filter(|env| env.delivery.is_durable())
+                        .filter(|env| env.delivery.is_durable() && matches_kind(env))
                         .collect::<Vec<_>>(),
                     state.ring.oldest_cursor(),
                 ),
@@ -756,11 +794,21 @@ impl EventRouter {
         // than anything the ring still retains. Sink rows strictly
         // before `ring_oldest` cannot also be in the ring, so the two
         // legs concatenate with no dup and no gap.
-        let older = self
-            .inner
-            .sink
-            .page_tail(channel, ring_oldest, limit - tail.len())
-            .await?;
+        let remainder = limit - tail.len();
+        let older = match kinds {
+            None => {
+                self.inner
+                    .sink
+                    .page_tail(channel, ring_oldest, remainder)
+                    .await?
+            }
+            Some(kinds) => {
+                self.inner
+                    .sink
+                    .page_tail_of_kinds(channel, ring_oldest, kinds, remainder)
+                    .await?
+            }
+        };
         let mut out: Vec<Arc<Envelope>> = older.into_iter().map(Arc::new).collect();
         out.append(&mut tail);
         Ok(out)

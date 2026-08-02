@@ -179,6 +179,19 @@ pub struct InboxRequest {
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// **Continuum #297.** When set, the daemon filters to these kinds
+    /// BEFORE applying `limit` — the page is the newest N events *of
+    /// these kinds*, not the survivors of a raw newest-N. Post-filtering
+    /// client-side cannot express that: three personas streaming ~4
+    /// `StreamChunk` frames/sec evict every durable `Message` from a
+    /// 50-event page, deafening working personas to direction.
+    ///
+    /// `None` (and, on the daemon side, an empty vec — filtering to
+    /// nothing is never what a caller means) is exactly today's
+    /// unfiltered behavior. Wire-compat both directions: old daemons
+    /// ignore the field; old clients omit it (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<IpcKind>>,
 }
 
 /// Parameters for `RoomTip` (card a1562dbc). The channel is mandatory:
@@ -698,10 +711,41 @@ mod tests {
             }),
             channel: Some(airc_core::RoomId::from_u128(0x42)),
             limit: Some(64),
+            kinds: None,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Continuum #297: `kinds` wire contract, both halves.
+    // what this catches: a serde attribute regression that would leak
+    // `kinds: null` into every unfiltered inbox (breaking old daemons'
+    // strict decoders) or drop the kinds list on the daemon side —
+    // silently reverting the filter-before-limit fix to raw newest-N.
+    #[test]
+    fn inbox_kinds_omitted_when_none_and_roundtrips_when_set() {
+        let unfiltered = Request::Inbox(InboxRequest {
+            since: None,
+            channel: Some(airc_core::RoomId::from_u128(0x42)),
+            limit: Some(50),
+            kinds: None,
+        });
+        let encoded = serde_json::to_string(&unfiltered).unwrap();
+        assert!(
+            !encoded.contains("kinds"),
+            "unset kinds must be absent from the wire: {encoded}"
+        );
+
+        let filtered = Request::Inbox(InboxRequest {
+            since: None,
+            channel: Some(airc_core::RoomId::from_u128(0x42)),
+            limit: Some(50),
+            kinds: Some(vec![IpcKind::Message, IpcKind::Event]),
+        });
+        let decoded: Request =
+            serde_json::from_str(&serde_json::to_string(&filtered).unwrap()).unwrap();
+        assert_eq!(decoded, filtered);
     }
 
     /// Card a1562dbc: the EXACT wire bytes of `RoomTip` are the
@@ -753,6 +797,7 @@ mod tests {
                 since: None,
                 channel: Some(airc_core::RoomId::from_u128(0x42)),
                 limit: Some(1),
+                kinds: None,
             })
         );
     }

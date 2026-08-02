@@ -79,3 +79,65 @@ async fn attached_subscription_cursor_is_the_daemon_tip() {
         "unsubscribed channel stays None"
     );
 }
+
+/// Continuum #297: a daemon-attached `page_recent_filtered` with a
+/// kind filter pushes the kinds DOWN into the daemon's inbox read, so
+/// the page is the newest N events OF THOSE KINDS — not the survivors
+/// of a raw newest-N. The discriminating flood: three direction
+/// messages buried under 200 newer durable stream chunks. Newest-50
+/// raw is all chunks, so both failure modes answer wrong here: the old
+/// local-store read returns nothing (attached scopes have stale local
+/// stores — same class as the cursor reads above), and a
+/// newest-50-raw-then-filter returns crumbs.
+// what this catches: the kinds push-down regressing to client-side
+// post-filtering (or to the stale local store), which deafens working
+// personas to direction under persona-turn chunk floods.
+#[tokio::test]
+async fn attached_filtered_page_pushes_kinds_down_to_the_daemon() {
+    use airc_ipc::{DaemonClient, IpcDelivery, IpcKind, IpcTarget, PublishRequest};
+    use airc_lib::{EventFilter, TranscriptKind};
+
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("kinds-pushdown").await;
+
+    let mut direction_ids = Vec::new();
+    for text in ["direction one", "direction two", "direction three"] {
+        direction_ids.push(alice.say(text).await.expect("say direction"));
+    }
+
+    // Flood the room with newer DURABLE chunk-kind envelopes through
+    // the daemon's IPC surface (the persona-turn stream shape).
+    let channel = alice.current_room().await.expect("current room").channel;
+    let client = DaemonClient::new(machine.daemon.socket.clone());
+    for _ in 0..200 {
+        client
+            .publish(PublishRequest {
+                channel: channel.as_uuid(),
+                from_peer: alice.peer_id().as_uuid(),
+                from_client: alice.client_id().as_uuid(),
+                kind: IpcKind::StreamChunk,
+                delivery: IpcDelivery::Durable,
+                target: IpcTarget::All,
+                correlation_id: None,
+                coalesce_key: None,
+                payload: b"\x01\x02\x03".to_vec(),
+                headers: airc_core::Headers::new(),
+            })
+            .await
+            .expect("publish durable chunk");
+    }
+
+    // Bob never wrote to his local store; only the kinds push-down can
+    // find the buried messages.
+    let mut filter = EventFilter::current_room();
+    filter.kinds.insert(TranscriptKind::Message);
+    let page = bob
+        .page_recent_filtered(filter, 50)
+        .await
+        .expect("filtered page");
+    assert_eq!(
+        page.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+        direction_ids,
+        "the newest 50 OF KIND Message are the 3 buried direction messages, ascending"
+    );
+}

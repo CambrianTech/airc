@@ -234,26 +234,8 @@ impl DurableSink for SqliteDurableSink {
         let mut query =
             bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
 
-        // Strictly before the cursor in generational order — the exact
-        // mirror of `page`'s strictly-after predicate:
-        //   epoch < c.epoch
-        //   OR (epoch == c.epoch AND counter < c.counter)
-        //   OR (epoch == c.epoch AND counter == c.counter
-        //       AND event_id < c.event_id).
         if let Some(c) = before {
-            let epoch = c.seq.epoch as i64;
-            let counter = c.seq.counter as i64;
-            let event_id = c.event_id.as_uuid();
-            let strictly_before = Expr::col(bus_event::Column::Epoch)
-                .lt(epoch)
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).lt(counter)))
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).eq(counter))
-                    .and(Expr::col(bus_event::Column::EventId).lt(event_id)));
-            query = query.filter(strictly_before);
+            query = query.filter(strictly_before(c));
         }
 
         let rows = query
@@ -266,6 +248,43 @@ impl DurableSink for SqliteDurableSink {
             .map_err(|e| BusError::Sink(e.to_string()))?;
 
         // DESC off the index, ascending to the caller.
+        rows.into_iter().rev().map(from_model).collect()
+    }
+
+    /// Continuum #297: `page_tail` with the kind predicate applied by
+    /// the DATABASE, before `LIMIT` — the store leg of "newest N events
+    /// of these kinds". Same composite-index DESC scan as
+    /// [`Self::page_tail`] plus one indexed-column `IN` predicate; a
+    /// chunk-flooded room answers with the newest N matching rows
+    /// instead of N chunks the caller would throw away.
+    async fn page_tail_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        let bounded = u64::try_from(limit)
+            .unwrap_or(u64::MAX)
+            .min(i64::MAX as u64);
+
+        let mut query = bus_event::Entity::find()
+            .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
+            .filter(bus_event::Column::Kind.is_in(kinds.iter().map(|k| kind_to_text(*k))));
+
+        if let Some(c) = before {
+            query = query.filter(strictly_before(c));
+        }
+
+        let rows = query
+            .order_by_desc(bus_event::Column::Epoch)
+            .order_by_desc(bus_event::Column::Counter)
+            .order_by_desc(bus_event::Column::EventId)
+            .limit(bounded)
+            .all(&self.db)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+
         rows.into_iter().rev().map(from_model).collect()
     }
 
@@ -368,6 +387,30 @@ fn from_model(m: bus_event::Model) -> Result<Envelope, BusError> {
     })
 }
 
+/// Strictly-before-`c` in the generational total order — the exact
+/// mirror of `page`'s strictly-after predicate:
+///   epoch < c.epoch
+///   OR (epoch == c.epoch AND counter < c.counter)
+///   OR (epoch == c.epoch AND counter == c.counter
+///       AND event_id < c.event_id).
+/// Shared by both reverse-paging legs ([`DurableSink::page_tail`],
+/// [`DurableSink::page_tail_of_kinds`]) so the ordering contract has
+/// exactly one home.
+fn strictly_before(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
+    let epoch = c.seq.epoch as i64;
+    let counter = c.seq.counter as i64;
+    let event_id = c.event_id.as_uuid();
+    Expr::col(bus_event::Column::Epoch)
+        .lt(epoch)
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).lt(counter)))
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).eq(counter))
+            .and(Expr::col(bus_event::Column::EventId).lt(event_id)))
+}
+
 fn kind_to_text(kind: Kind) -> &'static str {
     match kind {
         Kind::Message => "message",
@@ -461,10 +504,16 @@ mod tests {
     /// real random UUIDs) it must be globally unique across channels —
     /// the channel is mixed into the high half.
     fn durable_at(channel: RoomId, epoch: u64, counter: u64) -> Envelope {
+        durable_kind_at(channel, Kind::Message, epoch, counter)
+    }
+
+    /// [`durable_at`] with an explicit [`Kind`] — for the kinds-filtered
+    /// reverse page (continuum #297).
+    fn durable_kind_at(channel: RoomId, kind: Kind, epoch: u64, counter: u64) -> Envelope {
         let mut e = Envelope::new(
             channel,
             (PeerId::from_u128(0xa1), ClientId::from_u128(0xc1)),
-            Kind::Message,
+            kind,
             DeliveryClass::Durable,
             Bytes::from(format!("payload-{epoch}-{counter}")),
         )
@@ -657,6 +706,67 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Continuum #297: the kind predicate runs in the DATABASE, before
+    /// `LIMIT` — the store leg of "newest N events OF THESE KINDS".
+    // what this catches: `page_tail_of_kinds` regressing to a raw DESC
+    // page truncated before the kind filter — under a StreamChunk flood
+    // the newest-N raw rows are all chunks, so the filtered page would
+    // come back empty ("crumbs") and personas go deaf to direction.
+    #[tokio::test]
+    async fn page_tail_of_kinds_filters_in_the_database_before_limit() {
+        let sink = SqliteDurableSink::in_memory().await.unwrap();
+        let ch = RoomId::from_u128(0x297);
+        // 3 messages, then 200 newer chunk-kind durable rows.
+        for c in 0..3u64 {
+            sink.append(&durable_at(ch, 1, c)).await.unwrap();
+        }
+        for c in 3..203u64 {
+            sink.append(&durable_kind_at(ch, Kind::StreamChunk, 1, c))
+                .await
+                .unwrap();
+        }
+
+        // Newest 50 of kind Message: exactly the 3 buried messages,
+        // ascending — a raw newest-50 contains zero of them.
+        let tail = sink
+            .page_tail_of_kinds(ch, None, &[Kind::Message], 50)
+            .await
+            .unwrap();
+        let counters: Vec<u64> = tail.iter().map(|e| e.seq.counter).collect();
+        assert_eq!(counters, vec![0, 1, 2], "newest N OF KIND, ascending");
+        assert!(tail.iter().all(|e| e.kind == Kind::Message));
+
+        // `limit` still caps the matches.
+        let capped = sink
+            .page_tail_of_kinds(ch, None, &[Kind::Message], 2)
+            .await
+            .unwrap();
+        let counters: Vec<u64> = capped.iter().map(|e| e.seq.counter).collect();
+        assert_eq!(counters, vec![1, 2], "newest 2 of the kind");
+
+        // `before` composes with the kind predicate (same
+        // strictly-before contract as `page_tail`).
+        let before = durable_at(ch, 1, 2).cursor();
+        let older = sink
+            .page_tail_of_kinds(ch, Some(before), &[Kind::Message], 50)
+            .await
+            .unwrap();
+        let counters: Vec<u64> = older.iter().map(|e| e.seq.counter).collect();
+        assert_eq!(counters, vec![0, 1], "strictly before the cursor");
+
+        // A filter admitting every stored kind == the raw reverse page.
+        let both = sink
+            .page_tail_of_kinds(ch, None, &[Kind::Message, Kind::StreamChunk], 5)
+            .await
+            .unwrap();
+        let raw = sink.page_tail(ch, None, 5).await.unwrap();
+        assert_eq!(
+            both.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            raw.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            "all-kinds filter behaves exactly like page_tail"
+        );
     }
 
     #[tokio::test]
