@@ -13,6 +13,7 @@
 //! the loop runs the transport's `cleanup` (unlinks the socket file
 //! on Unix; no-op on Windows) and returns.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use fs2::FileExt;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use airc_bus::envelope::{Cursor, DeliveryClass, Kind};
+use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind};
 use airc_bus::{Filter, Seq};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
@@ -545,7 +546,14 @@ where
             Some(c) => Some(c),
             None => state.router.sink_head_cursor(channel).await,
         };
-        Some(BacklogCatchup::new(edge))
+        // "One page back" (Discord analogy): `backlog_tail` asks for
+        // the N most-recent backlog events at the seam; everything
+        // older stays coalesced into the summary. 0/None = today's
+        // all-or-nothing coalesce.
+        Some(BacklogCatchup::new(
+            edge,
+            parts.backlog_tail.unwrap_or(0) as usize,
+        ))
     } else {
         None
     };
@@ -579,23 +587,50 @@ where
                     Some(env) => {
                         from = Some(env.cursor());
                         let suppressed = match catchup.as_mut() {
-                            Some(c) => c.observe(env.cursor()),
+                            Some(c) => c.observe(&env),
                             None => false,
                         };
                         if suppressed {
-                            // Inside catch-up window — count and skip,
-                            // a single AttachCursorAdvanced will flush
-                            // when we cross the live edge.
+                            // Inside catch-up window — count and skip
+                            // (buffering the tail_cap most recent),
+                            // the seam flush happens when we cross the
+                            // live edge.
                         } else {
-                            // Flush a pending summary BEFORE the first
-                            // live event so the client sees the seam.
-                            if let Some(summary) =
+                            // Flush the pending seam BEFORE the first
+                            // live event so the client sees the
+                            // catch-up boundary. Order: (a) buffered
+                            // tail envelopes as normal Event frames,
+                            // oldest first, (b) the summary carrying
+                            // the watermark, (c) the live event below.
+                            //
+                            // INVARIANT (continuum #261 discipline):
+                            // the summary's `advanced_to` is the LAST
+                            // suppressed cursor, which is ≥ every tail
+                            // cursor, and the tail is written BEFORE
+                            // the summary — so a consumer that
+                            // persists the watermark from the summary
+                            // never persists past an event it was not
+                            // delivered.
+                            //
+                            // Known limitation (same as the summary
+                            // since day one, not fixed here): the seam
+                            // only flushes when the first LIVE event
+                            // arrives — on an idle room the tail and
+                            // summary wait for live traffic.
+                            if let Some(seam) =
                                 catchup.as_mut().and_then(BacklogCatchup::take_summary)
                             {
-                                if summary.skipped > 0 {
-                                    write_response(&mut writer, &summary.into_response())
-                                        .await?;
+                                for buffered in &seam.tail {
+                                    write_response(
+                                        &mut writer,
+                                        &Response::Event {
+                                            envelope: airc_wire::encode(buffered).to_vec(),
+                                        },
+                                    )
+                                    .await?;
                                 }
+                                write_response(&mut writer, &seam.summary.into_response())
+                                    .await?;
                             }
                             write_response(
                                 &mut writer,
@@ -657,22 +692,33 @@ struct BacklogCatchup {
     /// Set once when we cross the live edge so subsequent events skip
     /// the per-cursor comparison and stream as live.
     crossed: bool,
+    /// "One page back" (card 7d5b6a65 extension): how many of the
+    /// most-recent suppressed envelopes to deliver as real Event
+    /// frames at the seam. 0 = classic all-or-nothing coalesce.
+    tail_cap: usize,
+    /// The `tail_cap` most-recent suppressed envelopes, oldest first.
+    /// `skipped` keeps counting ALL suppressed envelopes; the summary
+    /// subtracts what the tail actually delivers.
+    tail: VecDeque<Arc<Envelope>>,
 }
 
 impl BacklogCatchup {
-    fn new(live_edge: Option<Cursor>) -> Self {
+    fn new(live_edge: Option<Cursor>, tail_cap: usize) -> Self {
         Self {
             live_edge,
             skipped: 0,
             last_skipped_cursor: None,
             crossed: live_edge.is_some(),
+            tail_cap,
+            tail: VecDeque::new(),
         }
     }
 
-    /// Observe one envelope's cursor. Returns `true` when the envelope
-    /// is inside the catch-up window (caller should suppress it) and
+    /// Observe one envelope. Returns `true` when the envelope is
+    /// inside the catch-up window (caller should suppress it; the
+    /// `tail_cap` most recent are buffered for the seam flush) and
     /// `false` once we've crossed the live edge.
-    fn observe(&mut self, cursor: Cursor) -> bool {
+    fn observe(&mut self, env: &Arc<Envelope>) -> bool {
         if !self.crossed {
             // No live_edge means the channel was empty at subscribe,
             // so EVERYTHING that arrives is by definition live (no
@@ -680,35 +726,63 @@ impl BacklogCatchup {
             return false;
         }
         if let Some(edge) = self.live_edge {
+            let cursor = env.cursor();
             if cursor.is_after(&edge) {
                 self.crossed = false; // we've moved past catchup
                 return false;
             }
             self.skipped = self.skipped.saturating_add(1);
             self.last_skipped_cursor = Some(cursor);
+            if self.tail_cap > 0 {
+                if self.tail.len() == self.tail_cap {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(Arc::clone(env));
+            }
             return true;
         }
         false
     }
 
-    /// Pull the catch-up summary once we've crossed the live edge.
-    /// Returns `None` if there's nothing pending (already taken or
-    /// catch-up never had backlog).
-    fn take_summary(&mut self) -> Option<BacklogSummary> {
+    /// Pull the seam flush once we've crossed the live edge: the
+    /// buffered tail plus the coalesce summary. Returns `None` if
+    /// there's nothing pending (already taken or catch-up never had
+    /// backlog). The gate is TOTAL suppressed (> 0), not the
+    /// post-tail remainder: when the whole backlog fit in the tail
+    /// the summary's `skipped` is 0 but the client still needs the
+    /// watermark frame to persist its cursor.
+    fn take_summary(&mut self) -> Option<BacklogSeam> {
         if self.crossed {
             return None;
         }
         // crossed=false at this point means either (a) we observed
-        // something past the edge — pull the summary OR (b) we never
+        // something past the edge — pull the seam OR (b) we never
         // had a live_edge to begin with. Mark crossed so we don't
         // re-emit.
-        let skipped = self.skipped;
+        let delivered = self.tail.len() as u64;
+        let total_suppressed = self.skipped;
         let advanced_to = self.last_skipped_cursor;
+        let tail = std::mem::take(&mut self.tail);
         self.skipped = 0;
         self.last_skipped_cursor = None;
         self.crossed = true;
-        advanced_to.map(|cursor| BacklogSummary { skipped, cursor })
+        advanced_to.map(|cursor| BacklogSeam {
+            tail,
+            summary: BacklogSummary {
+                // Only events NOT delivered in the tail count as
+                // skipped in the summary the client renders.
+                skipped: total_suppressed.saturating_sub(delivered),
+                cursor,
+            },
+        })
     }
+}
+
+/// Everything the daemon writes at the catch-up→live seam: the "one
+/// page back" tail (possibly empty) followed by the summary watermark.
+struct BacklogSeam {
+    tail: VecDeque<Arc<Envelope>>,
+    summary: BacklogSummary,
 }
 
 struct BacklogSummary {
