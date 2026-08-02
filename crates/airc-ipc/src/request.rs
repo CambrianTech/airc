@@ -257,6 +257,17 @@ pub struct AttachRequest {
     /// (`Live`, or a cursor already at head).
     #[serde(default, skip_serializing_if = "is_false")]
     coalesce_backlog: bool,
+    /// Pairs with [`Self::with_coalesced_backlog`] (card 7d5b6a65
+    /// extension): the N most-recent backlog events are streamed as
+    /// normal `Event` frames at the catch-up seam, and only the OLDER
+    /// history is collapsed into the summary frame — the Discord "one
+    /// page back" shape instead of all-or-nothing. `coalesce_backlog`
+    /// remains the gate: without it this field is a no-op (legacy
+    /// replay already delivers everything). Wire-compat: omitted when
+    /// unset, so old daemons ignore the unknown field and old clients
+    /// simply never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backlog_tail: Option<u32>,
     /// If set, only these kinds are delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kinds: Option<Vec<IpcKind>>,
@@ -286,6 +297,7 @@ impl AttachRequest {
             from,
             from_now,
             coalesce_backlog: false,
+            backlog_tail: None,
             kinds: None,
             delivery: None,
             headers: HeaderFilter::default(),
@@ -321,6 +333,12 @@ impl AttachRequest {
         self.coalesce_backlog
     }
 
+    /// How many most-recent backlog events are streamed at the seam
+    /// (the rest are coalesced). `None` = coalesce everything.
+    pub fn backlog_tail(&self) -> Option<u32> {
+        self.backlog_tail
+    }
+
     /// Deliver only these event kinds.
     pub fn with_kinds(mut self, kinds: Vec<IpcKind>) -> Self {
         self.kinds = Some(kinds);
@@ -345,6 +363,15 @@ impl AttachRequest {
         self
     }
 
+    /// Pairs with [`Self::with_coalesced_backlog`]: stream the `n`
+    /// most-recent backlog events at the catch-up seam and summarize
+    /// only the older history ("one page back"). A no-op unless
+    /// coalescing is enabled.
+    pub fn with_backlog_tail(mut self, n: u32) -> Self {
+        self.backlog_tail = Some(n);
+        self
+    }
+
     /// Destructure for the daemon's attach handler: moves the filter
     /// vectors out (no clone) with the start already decoded. One-way —
     /// there is no path from parts back to a request, so the typed
@@ -355,6 +382,7 @@ impl AttachRequest {
             channel: self.channel,
             start,
             coalesce_backlog: self.coalesce_backlog,
+            backlog_tail: self.backlog_tail,
             kinds: self.kinds,
             delivery: self.delivery,
             headers: self.headers,
@@ -368,6 +396,7 @@ pub struct AttachParts {
     pub channel: Option<airc_core::RoomId>,
     pub start: AttachStart,
     pub coalesce_backlog: bool,
+    pub backlog_tail: Option<u32>,
     pub kinds: Option<Vec<IpcKind>>,
     pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
@@ -560,10 +589,36 @@ mod tests {
         )
         .with_kinds(vec![IpcKind::Command])
         .with_coalesced_backlog()
+        .with_backlog_tail(2)
         .into_parts();
         assert_eq!(parts.start, AttachStart::After(cursor(9)));
         assert!(parts.coalesce_backlog);
+        assert_eq!(parts.backlog_tail, Some(2));
         assert_eq!(parts.kinds.as_deref(), Some(&[IpcKind::Command][..]));
+    }
+
+    /// Card 7d5b6a65 extension wire-compat: `backlog_tail` never rides
+    /// the wire when unset (old daemons see the exact pre-extension
+    /// bytes — pinned above), and roundtrips intact when set.
+    // what this catches: a serde attribute regression that would leak
+    // `backlog_tail: null` into every attach and break old daemons'
+    // strict decoders, or drop the value on the daemon side.
+    #[test]
+    fn backlog_tail_is_omitted_when_unset_and_roundtrips_when_set() {
+        let channel = airc_core::RoomId(Uuid::nil());
+        let unset = serde_json::to_string(&AttachRequest::new(channel, AttachStart::Live)).unwrap();
+        assert!(
+            !unset.contains("backlog_tail"),
+            "unset backlog_tail must be absent from the wire: {unset}"
+        );
+
+        let set = AttachRequest::new(channel, AttachStart::FromTranscriptStart)
+            .with_coalesced_backlog()
+            .with_backlog_tail(25);
+        let decoded: AttachRequest =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(decoded.backlog_tail(), Some(25));
+        assert!(decoded.coalesces_backlog());
     }
 
     #[test]
