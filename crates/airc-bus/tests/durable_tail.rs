@@ -97,6 +97,22 @@ impl DurableSink for CountingSink {
         self.inner.page_tail(channel, before, limit).await
     }
 
+    async fn page_tail_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        // Counted into the same reverse-page ledger: the zero-scan
+        // structural proof covers the kinds-filtered leg too.
+        self.page_tail_calls.fetch_add(1, Ordering::SeqCst);
+        self.max_page_tail_limit.fetch_max(limit, Ordering::SeqCst);
+        self.inner
+            .page_tail_of_kinds(channel, before, kinds, limit)
+            .await
+    }
+
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
         self.inner.contains(event_id).await
     }
@@ -135,6 +151,16 @@ impl DurableSink for FailingTailSink {
         Err(BusError::Sink("reverse index unavailable".to_string()))
     }
 
+    async fn page_tail_of_kinds(
+        &self,
+        _channel: RoomId,
+        _before: Option<Cursor>,
+        _kinds: &[Kind],
+        _limit: usize,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".to_string()))
+    }
+
     async fn contains(&self, _event_id: airc_core::EventId) -> Result<bool, BusError> {
         Ok(false)
     }
@@ -161,10 +187,14 @@ fn counted_router(ring_capacity: usize) -> (EventRouter, Arc<CountingSink>) {
 }
 
 fn event(channel: RoomId, marker: u128, delivery: DeliveryClass) -> Envelope {
+    kinded_event(channel, marker, Kind::Message, delivery)
+}
+
+fn kinded_event(channel: RoomId, marker: u128, kind: Kind, delivery: DeliveryClass) -> Envelope {
     Envelope::new(
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
-        Kind::Message,
+        kind,
         delivery,
         Bytes::from_static(b"tail-page"),
     )
@@ -319,6 +349,97 @@ async fn non_durable_traffic_is_excluded_from_the_tail() {
         "stream chunks do not ride the durable tail"
     );
     assert_eq!(sink.page_calls(), 0);
+}
+
+/// Continuum #297 — the flood case across the sink→ring seam: three
+/// durable `Message`s buried under 200 newer durable `StreamChunk`s
+/// (ring capacity 64, so the messages genuinely live only in the sink).
+/// `durable_tail_of_kinds` must return exactly the messages — the kind
+/// predicate runs BEFORE the limit on both legs — with the same bounded
+/// store work as the unfiltered tail (zero forward scans, at most one
+/// reverse page, requested limit ≤ N).
+// what this catches: the kinds-filtered tail regressing to
+// newest-N-raw-then-filter (which returns crumbs: the raw newest-50
+// here is all chunks, so a persona paging Messages goes deaf to
+// direction) — or the filtered leg silently forward-scanning the room.
+#[tokio::test]
+async fn kinds_filtered_tail_pages_newest_n_of_kind_with_bounded_work() {
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0x297);
+
+    for n in 0..3u128 {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish message");
+    }
+    for n in 3..203u128 {
+        router
+            .publish(kinded_event(
+                channel,
+                n,
+                Kind::StreamChunk,
+                DeliveryClass::Durable,
+            ))
+            .await
+            .expect("publish durable chunk");
+        if n % 64 == 0 {
+            // Let the write-behind drain so the bounded queue never sheds.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // The flood shape this fixes: the raw newest-50 is all chunks.
+    let raw = router.durable_tail(channel, 50).await.expect("raw tail");
+    assert!(
+        raw.iter().all(|e| e.kind == Kind::StreamChunk),
+        "precondition: the raw newest-50 page is chunk-flooded"
+    );
+
+    sink.reset();
+    let tail = router
+        .durable_tail_of_kinds(channel, &[Kind::Message], 50)
+        .await
+        .expect("kinds tail");
+    let expected: Vec<u128> = (0..3).collect();
+    assert_eq!(
+        markers(&tail),
+        expected,
+        "the newest 50 OF KIND Message are exactly the 3 buried messages, ascending"
+    );
+    assert_eq!(
+        sink.page_calls(),
+        0,
+        "the filtered tail must not forward-scan the room"
+    );
+    assert!(
+        sink.page_tail_calls() <= 1,
+        "at most one reverse page, got {}",
+        sink.page_tail_calls()
+    );
+    assert!(
+        sink.max_page_tail_limit() <= 50,
+        "the reverse page is bounded by N, asked for {}",
+        sink.max_page_tail_limit()
+    );
+
+    // A limit below the match count still caps: newest 2 messages.
+    let capped = router
+        .durable_tail_of_kinds(channel, &[Kind::Message], 2)
+        .await
+        .expect("capped kinds tail");
+    assert_eq!(markers(&capped), vec![1, 2], "limit caps the matches");
+
+    // Multi-kind filter admitting every published kind == the raw tail.
+    let both = router
+        .durable_tail_of_kinds(channel, &[Kind::Message, Kind::StreamChunk], 50)
+        .await
+        .expect("multi-kind tail");
+    assert_eq!(
+        markers(&both),
+        markers(&raw),
+        "a filter admitting all kinds behaves exactly like the raw tail"
+    );
 }
 
 /// §3.8 write-behind lag: a durable still pending persistence (the

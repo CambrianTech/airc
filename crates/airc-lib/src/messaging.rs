@@ -8,6 +8,16 @@ use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
+/// Continuum #297: how many raw events the LOCAL-store filtered page
+/// reads per requested match. The local store has no kind-pushdown
+/// query (the daemon does — see [`Airc::daemon_page_recent_of_kinds`]),
+/// so [`Airc::page_recent_filtered`] pages `limit * 8` raw, filters,
+/// and keeps the newest `limit` matches — a bounded overscan instead of
+/// the old newest-`limit`-raw-then-filter, whose page a StreamChunk
+/// flood fills with events the filter discards. Exhausting the window
+/// before `limit` matches is logged (no silent caps).
+const STORE_FILTER_OVERSCAN: usize = 8;
+
 /// Event metadata returned by [`Airc::send_frame_to_room`]. Carries
 /// enough to build a typed receipt for the public publish API.
 #[derive(Debug, Clone, Copy)]
@@ -278,20 +288,61 @@ impl Airc {
 
     /// Fetch recent events matching `filter`. If the filter does not
     /// specify a channel, it is scoped to the current room.
+    ///
+    /// Continuum #297: the kind filter is applied BEFORE the limit, so
+    /// the page is the newest `limit` events OF THOSE KINDS — never the
+    /// survivors of a raw newest-`limit` (a persona-turn StreamChunk
+    /// flood fills a raw page and evicts every durable Message,
+    /// deafening working personas to direction). Daemon-attached, the
+    /// kinds are pushed down into the daemon's inbox read; the local
+    /// store path uses a bounded overscan. Either way `filter.matches`
+    /// still runs on the result (headers / self-echo are client-side).
     pub async fn page_recent_filtered(
         &self,
         filter: EventFilter,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        Ok(self
+        if self.is_daemon_attached() && !filter.kinds.is_empty() {
+            if let Some(channel) = filter.channel {
+                return Ok(self
+                    .daemon_page_recent_of_kinds(channel, &filter.kinds, limit)
+                    .await?
+                    .into_iter()
+                    .filter(|event| filter.matches(event))
+                    .collect());
+            }
+        }
+        // Local store path: bounded overscan — page a wider raw window,
+        // filter, keep the newest `limit` matches. With a pass-all
+        // filter this is exactly the newest `limit` (today's behavior).
+        let overscan = limit.saturating_mul(STORE_FILTER_OVERSCAN);
+        let raw = self
             .inner
             .store
-            .page_recent(filter.channel, limit)
-            .await?
+            .page_recent(filter.channel, overscan)
+            .await?;
+        let scanned = raw.len();
+        let mut matches: Vec<TranscriptEvent> = raw
             .into_iter()
             .filter(|event| filter.matches(event))
-            .collect())
+            .collect();
+        if matches.len() < limit && scanned == overscan {
+            // No silent caps: the overscan window filled before finding
+            // `limit` matches — older matching events may exist beyond it.
+            tracing::debug!(
+                target: "airc::messaging",
+                limit,
+                overscan,
+                found = matches.len(),
+                "page_recent_filtered: overscan window exhausted before \
+                 finding `limit` matching events"
+            );
+        }
+        if matches.len() > limit {
+            matches.drain(..matches.len() - limit);
+        }
+        Ok(matches)
     }
 
     /// Fetch recent events from the subscribed room set.

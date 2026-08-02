@@ -122,34 +122,44 @@ fn stream_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
     }
 }
 
+/// A DURABLE chunk-kind envelope — the continuum #297 flood shape:
+/// persona-turn stream chunks that persist to the transcript, so they
+/// genuinely occupy the durable newest-N page a raw inbox returns.
+fn durable_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
+    PublishRequest {
+        delivery: IpcDelivery::Durable,
+        ..stream_chunk(channel, bytes)
+    }
+}
+
+/// Publish one request, honouring §3.8 back-pressure: the write-behind
+/// queue is bounded, and on a slow runner a tight publish loop can
+/// outpace the SQLite drain — the daemon sheds with a LOUD typed error
+/// (the designed signal, never a silent drop). Back off and retry the
+/// same event, the way a real producer would. Any other error is a real
+/// failure.
+async fn publish_with_backoff(client: &DaemonClient, request: PublishRequest) -> PublishResponse {
+    for _ in 0..500 {
+        match client.publish(request.clone()).await {
+            Ok(receipt) => return receipt,
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("saturated"),
+                    "unexpected publish error: {message}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    panic!("publish kept saturating after 500 backoff retries");
+}
+
 async fn publish_n(client: &DaemonClient, channel: RoomId, n: usize) -> PublishResponse {
     let mut last = None;
     for i in 0..n {
         let request = durable_text(channel, &format!("event {i}"));
-        // The write-behind queue is bounded: on a slow runner a tight
-        // publish loop can outpace the SQLite drain, and the daemon
-        // sheds with a LOUD typed error (§3.8 — the designed
-        // back-pressure signal, never a silent drop). Honour the
-        // contract the way a real producer would: back off and retry
-        // the same event. Any other error is a real failure.
-        let mut receipt = None;
-        for _ in 0..500 {
-            match client.publish(request.clone()).await {
-                Ok(r) => {
-                    receipt = Some(r);
-                    break;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    assert!(
-                        message.contains("saturated"),
-                        "unexpected publish error: {message}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-        last = Some(receipt.expect("publish kept saturating after 500 backoff retries"));
+        last = Some(publish_with_backoff(client, request).await);
     }
     last.expect("n > 0")
 }
@@ -175,6 +185,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             since: None,
             channel: Some(channel),
             limit: Some(10),
+            kinds: None,
         })
         .await
         .expect("inbox on empty room");
@@ -197,6 +208,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             since: None,
             channel: Some(channel),
             limit: Some(10),
+            kinds: None,
         })
         .await
         .expect("inbox limit 10");
@@ -216,6 +228,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             since: None,
             channel: Some(channel),
             limit: Some(500),
+            kinds: None,
         })
         .await
         .expect("inbox limit 500");
@@ -253,6 +266,7 @@ async fn deep_room_most_recent_n_costs_by_n_not_room_depth() {
                 since: None,
                 channel: Some(channel),
                 limit: Some(N),
+                kinds: None,
             })
             .await
             .expect("inbox limit N");
@@ -272,6 +286,7 @@ async fn deep_room_most_recent_n_costs_by_n_not_room_depth() {
                 since: None,
                 channel: Some(channel),
                 limit: Some(DEEP),
+                kinds: None,
             })
             .await
             .expect("inbox limit DEEP");
@@ -316,6 +331,118 @@ async fn deep_room_most_recent_n_costs_by_n_not_room_depth() {
         "most-recent-{N} ({paged_us} µs/op) must be at least 10x cheaper than \
          materializing the {DEEP}-deep room ({full_us} µs/op) — a fall-back to \
          full-room replay sits ~6x under it and must fail here"
+    );
+
+    daemon.stop().await;
+}
+
+/// Continuum #297, against the LIVE daemon: three active personas
+/// stream ~4 durable StreamChunk frames/sec, so a room's raw newest-50
+/// page is all chunks and every durable Message is evicted — working
+/// personas go deaf to direction (a resident asked the same question 3×
+/// because four direction messages never entered her page). The daemon
+/// must filter kinds BEFORE the limit: "newest N events OF THESE
+/// KINDS", on both inbox legs (fresh page and cursor resume).
+// what this catches: `InboxRequest.kinds` regressing to a post-limit
+// filter (the page comes back empty under a chunk flood instead of
+// containing the buried messages), the empty-vec normalization drifting
+// from None (a vacuously empty page), or kinds=None diverging from
+// today's raw behavior.
+#[tokio::test]
+async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
+    use airc_bus::envelope::Kind;
+
+    let daemon = start_daemon().await;
+    let client = DaemonClient::new(daemon.socket.clone());
+    let channel = RoomId::from_u128(0x297);
+
+    // Three direction messages…
+    let mut message_cursors = Vec::new();
+    for i in 0..3 {
+        let receipt =
+            publish_with_backoff(&client, durable_text(channel, &format!("direction {i}"))).await;
+        message_cursors.push(airc_ipc::IpcCursor {
+            epoch: receipt.epoch,
+            counter: receipt.counter,
+            event_id: receipt.event_id,
+        });
+    }
+    // …buried under 200 newer durable stream chunks.
+    for _ in 0..200 {
+        publish_with_backoff(&client, durable_chunk(channel, b"\x01\x02\x03")).await;
+    }
+
+    // Precondition — the bug shape: the raw newest-50 page is ALL
+    // chunks; post-filtering it client-side would yield zero messages.
+    let raw = client
+        .inbox(InboxRequest {
+            since: None,
+            channel: Some(channel),
+            limit: Some(50),
+            kinds: None,
+        })
+        .await
+        .expect("raw inbox");
+    assert_eq!(raw.envelopes.len(), 50);
+    assert!(
+        raw.envelopes
+            .iter()
+            .map(|bytes| airc_wire::decode(bytes.clone().into()).expect("decode"))
+            .all(|env| env.kind == Kind::StreamChunk),
+        "precondition: the raw newest-50 page is chunk-flooded"
+    );
+
+    // The fix: kinds=[Message] filters BEFORE the limit — exactly the
+    // three buried messages, ascending.
+    let filtered = client
+        .inbox(InboxRequest {
+            since: None,
+            channel: Some(channel),
+            limit: Some(50),
+            kinds: Some(vec![IpcKind::Message]),
+        })
+        .await
+        .expect("filtered inbox");
+    let texts: Vec<String> = filtered.envelopes.into_iter().map(payload_text).collect();
+    assert_eq!(
+        texts,
+        vec!["direction 0", "direction 1", "direction 2"],
+        "newest 50 OF KIND Message are the 3 buried messages, ascending"
+    );
+
+    // Empty vec is normalized to None — filtering to nothing is never
+    // what a caller means, so it must be byte-identical to the raw page.
+    let empty_kinds = client
+        .inbox(InboxRequest {
+            since: None,
+            channel: Some(channel),
+            limit: Some(50),
+            kinds: Some(vec![]),
+        })
+        .await
+        .expect("empty-kinds inbox");
+    assert_eq!(
+        empty_kinds.envelopes, raw.envelopes,
+        "kinds: Some([]) behaves exactly like kinds: None"
+    );
+
+    // `since` + `kinds` compose: resuming after the first message with
+    // kinds=[Message] skips the chunk flood and returns the remaining
+    // two messages.
+    let resumed = client
+        .inbox(InboxRequest {
+            since: Some(message_cursors[0]),
+            channel: Some(channel),
+            limit: Some(50),
+            kinds: Some(vec![IpcKind::Message]),
+        })
+        .await
+        .expect("resumed filtered inbox");
+    let texts: Vec<String> = resumed.envelopes.into_iter().map(payload_text).collect();
+    assert_eq!(
+        texts,
+        vec!["direction 1", "direction 2"],
+        "cursor + kinds: the first N matching events after the cursor"
     );
 
     daemon.stop().await;
