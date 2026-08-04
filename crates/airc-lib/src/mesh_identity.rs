@@ -7,31 +7,42 @@
 //! which is fine for tests but collides every user's `#general` onto
 //! the same `RoomId` — a privacy bug.
 //!
-//! ## Resolution order
+//! ## THE OWNER'S GITHUB LOGIN IS THE KEY. There is no substitute.
 //!
-//! 1. **Cached value** in the `mesh_identity` ORM table, if fresh
-//!    (`resolved_at_ms` within [`DEFAULT_TTL_MS`]).
-//! 2. **`gh api user --jq .login`** — the canonical GitHub identity
-//!    when `gh` is installed and authenticated.
-//! 3. **`git config user.email`** fallback when `gh` isn't available.
-//! 4. **`local:<host>:<user>`** last-resort deterministic local
-//!    identity. Warned in a side-channel (callers can read it from
-//!    the persisted [`Source`] field) so the operator knows the
-//!    machine couldn't authenticate against GitHub.
+//! This identity is the **human owner's** — one login across every
+//! machine they own. It is NOT a persona identity and NOT an agent
+//! identity: those are separate identities that live *inside* the
+//! owner's grid (peer ids, persona ids) and never namespace a room.
 //!
-//! ## One identity per machine (provisional sources self-heal)
+//! A machine cannot know who its human is by looking at itself. So the
+//! resolution order is short, and it does not end in a guess:
 //!
-//! Only `gh_api_user` (and an explicit `operator` override) are
-//! *sticky*. `git_email` and `local_host_user` are **provisional** —
-//! they're used only because `gh` was unreachable at resolve time and
-//! they do NOT converge across a user's scopes/machines. So a
-//! provisional value never sticks: every resolve re-probes `gh` and
-//! overwrites it the instant `gh` answers. This self-heals a scope that
-//! forked onto `git config user.email` during a brief `gh` outage —
-//! e.g. one tab resolving `joelteply` via gh and another
-//! `joelteply@yahoo.com` via git, which silently splits the account
-//! into two `RoomId`s (two `#general`s) — instead of stranding it for
-//! `DEFAULT_TTL_MS`.
+//! 1. **`AIRC_MESH_IDENTITY`** — the owner stating their own login
+//!    explicitly (offline boxes, CI, containers). Persisted as
+//!    `operator`; sticky forever.
+//! 2. **Cached `gh_api_user`**, if fresh (within [`DEFAULT_TTL_MS`]).
+//! 3. **`gh api user --jq .login`**.
+//! 4. **A stale cached `gh_api_user`** when gh is unreachable — a stale
+//!    copy of the key is still the key; the owner's login does not
+//!    change because the network did.
+//! 5. Otherwise **[`MeshIdentityError::Unresolved`]**. Loud, no key, no
+//!    rooms.
+//!
+//! ## Why there is no fallback
+//!
+//! Room UUIDs are `UUIDv5(mesh_identity ‖ NUL ‖ channel_name)`. Any
+//! value that is not the owner's login therefore mints a PRIVATE
+//! namespace that only this machine can see: it publishes beacons the
+//! account never reads, reads a room nobody writes, and reports a
+//! healthy join throughout. That is how a node forms its own island.
+//!
+//! The old chain fell back to `git config user.email`, then to a
+//! fabricated `local:<host>:<user>`. Both are machine facts, not owner
+//! facts, and both did exactly that — bigmama's `#general` derived under
+//! `local:unknown-host:unknown-user` while the M5 derived under the gh
+//! login, so every frame between them died as `unknown_channel` with no
+//! error anywhere. Guessing the owner's identity is never better than
+//! saying "I don't know who my owner is yet".
 //!
 //! ## Caching
 //!
@@ -109,6 +120,11 @@ pub enum MeshIdentityError {
     Store(airc_store::StoreError),
     Clock(std::time::SystemTimeError),
     UnknownSource(String),
+    /// No owner identity, and none may be invented. `gh` cannot answer and
+    /// nothing usable is cached. Deriving rooms from a machine-local guess
+    /// would put this node on a private mesh only it can see, so the caller
+    /// gets an error instead of a silent island.
+    Unresolved,
 }
 
 impl std::fmt::Display for MeshIdentityError {
@@ -117,6 +133,13 @@ impl std::fmt::Display for MeshIdentityError {
             Self::Store(error) => write!(f, "mesh identity store: {error}"),
             Self::Clock(error) => write!(f, "mesh identity clock: {error}"),
             Self::UnknownSource(source) => write!(f, "unknown mesh identity source: {source}"),
+            Self::Unresolved => write!(
+                f,
+                "no owner identity: `gh api user` could not answer and no gh login is \
+                 cached. airc will not invent one — a guessed identity derives room UUIDs \
+                 only this machine can see. Fix with `gh auth login`, or state the owner \
+                 login explicitly via AIRC_MESH_IDENTITY=<github-login>"
+            ),
         }
     }
 }
@@ -126,7 +149,7 @@ impl std::error::Error for MeshIdentityError {
         match self {
             Self::Store(error) => Some(error),
             Self::Clock(error) => Some(error),
-            Self::UnknownSource(_) => None,
+            Self::UnknownSource(_) | Self::Unresolved => None,
         }
     }
 }
@@ -143,18 +166,19 @@ impl From<std::time::SystemTimeError> for MeshIdentityError {
     }
 }
 
-/// Resolve via the default fallback chain (gh → git email → local
-/// hostname/user) and persist. Most callers want this.
+/// Resolve the owner's identity (`AIRC_MESH_IDENTITY` → `gh api user`)
+/// and persist. Most callers want this. Errors rather than inventing an
+/// identity — see the module docs.
 pub async fn resolve(store: &dyn EventStore) -> Result<CachedIdentity, MeshIdentityError> {
     resolve_with(store, default_resolver, now_ms()?).await
 }
 
 /// Resolve with an injected resolver closure. The closure returns
-/// `Some((identity, source))` on success, `None` if it has nothing
-/// to contribute and the LocalHostUser fallback should be used.
+/// `Some((identity, source))` when it can name the OWNER, `None` when it
+/// cannot — and `None` is terminal unless a usable gh login is cached.
 ///
-/// Used by tests to bypass `gh` / `git` shell-outs and by production
-/// callers via [`resolve`].
+/// Used by tests to bypass the `gh` shell-out, and by production callers
+/// via [`resolve`].
 pub async fn resolve_with<F>(
     store: &dyn EventStore,
     resolver: F,
@@ -164,46 +188,52 @@ where
     F: FnOnce() -> Option<(String, Source)>,
 {
     if let Some(cached) = load_cached(store).await? {
-        // Operator caches are explicit overrides (env var, CLI override,
-        // test seed) — trusted as-is, never expire, never re-resolved.
-        // Treating them as TTL-bounded forces a fall-through to gh/git
-        // shell-outs the operator was trying to avoid (Windows CI runners
-        // hung on the gh shell-out when a tiny seeded `resolved_at_ms`
-        // made is_expired return true on every call).
+        // The owner stated their own login (`AIRC_MESH_IDENTITY`, test seed).
+        // Trusted as-is, never expires, never re-probed — treating it as
+        // TTL-bounded would force the gh shell-out the operator was avoiding
+        // (Windows CI runners hung on it when a tiny seeded `resolved_at_ms`
+        // made is_expired return true every call).
         if cached.source == Source::Operator {
             return Ok(cached);
         }
-        // `GhApiUser` is the canonical, machine-wide identity. Honor it
-        // while fresh; only re-probe once the TTL lapses.
+        // A fresh gh login is the key. Use it without re-probing.
         if cached.source == Source::GhApiUser && !cached.is_expired(now_ms) {
             return Ok(cached);
         }
-        // `GitEmail` / `LocalHostUser` are PROVISIONAL (or this is an
-        // expired `GhApiUser`): re-probe and, the instant `gh` answers,
-        // overwrite with the canonical login. This enforces one identity
-        // per machine — a scope that forked onto `git config user.email`
-        // during a brief `gh` outage self-heals instead of stranding the
-        // account in a second room. See the module docs.
         match resolver() {
-            Some((identity, Source::GhApiUser)) => {
-                let entry = persisted_entry(identity, Source::GhApiUser, now_ms);
+            Some((identity, source)) => {
+                let entry = persisted_entry(identity, source, now_ms);
                 save(store, &entry).await?;
-                return Ok(entry);
+                Ok(entry)
             }
-            // gh still unreachable — keep the existing value rather than
-            // churning it for an equally-non-canonical one (stability
-            // until gh returns; never downgrade a cached value to local).
-            _ => return Ok(cached),
+            None if cached.source == Source::GhApiUser => {
+                // Expired and gh is unreachable right now. A STALE COPY OF THE
+                // KEY IS STILL THE KEY — the owner's login did not change
+                // because the network did. Erroring here would take a
+                // converged machine off its own mesh over a transient outage.
+                Ok(cached)
+            }
+            None => {
+                // A legacy `git_email` / `local_host_user` row, minted before
+                // this machine could authenticate. That is a machine fact, not
+                // the owner's login: every room UUID derived from it belongs to
+                // a namespace only this machine can see. Refuse it.
+                Err(MeshIdentityError::Unresolved)
+            }
+        }
+    } else {
+        // No cache. The key comes from the owner or from gh — never from this
+        // box's hostname. A machine cannot know who its human is by looking at
+        // itself, and a guess is what mints the island.
+        match resolver() {
+            Some((identity, source)) => {
+                let entry = persisted_entry(identity, source, now_ms);
+                save(store, &entry).await?;
+                Ok(entry)
+            }
+            None => Err(MeshIdentityError::Unresolved),
         }
     }
-
-    // No cache yet: resolve fresh, falling back to a deterministic
-    // machine-local identity if neither gh nor git can answer.
-    let (identity, source) =
-        resolver().unwrap_or_else(|| (local_fallback_identity(), Source::LocalHostUser));
-    let entry = persisted_entry(identity, source, now_ms);
-    save(store, &entry).await?;
-    Ok(entry)
 }
 
 /// Build a cache entry with the standard version + TTL. Centralizes the
@@ -292,21 +322,29 @@ impl TryFrom<StoredMeshIdentity> for CachedIdentity {
 }
 
 /// Default resolver: `gh api user --jq .login` then `git config
-/// user.email`. Returns `None` if neither succeeds — caller falls
-/// back to `LocalHostUser`.
+/// login stated by the owner. Returns `None` when neither can name the
+/// owner — and `None` means unresolved, never a fabricated identity.
 fn default_resolver() -> Option<(String, Source)> {
+    // The owner naming their own login wins: the escape hatch for a box with
+    // no gh (offline, container, CI) that still belongs to a real account.
+    if let Ok(pinned) = std::env::var(OWNER_IDENTITY_ENV) {
+        let pinned = pinned.trim();
+        if !pinned.is_empty() {
+            return Some((pinned.to_string(), Source::Operator));
+        }
+    }
     if let Some(login) = run_command(&["gh", "api", "user", "--jq", ".login"]) {
         if !login.is_empty() {
             return Some((login, Source::GhApiUser));
         }
     }
-    if let Some(email) = run_command(&["git", "config", "user.email"]) {
-        if !email.is_empty() {
-            return Some((email, Source::GitEmail));
-        }
-    }
     None
 }
+
+/// Env var by which the owner states their own GitHub login when `gh` is not
+/// available on this box. The ONLY substitute for the gh probe, because it is
+/// the owner speaking rather than the machine guessing.
+pub const OWNER_IDENTITY_ENV: &str = "AIRC_MESH_IDENTITY";
 
 /// Default deadline for resolver shell-outs (gh, git). Bounds
 /// `gh api user` / `git config user.email` so a hung or slow
@@ -354,24 +392,6 @@ fn run_command(argv: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Last-resort identity: `local:<host>:<user>`. Deterministic per
-/// machine+user but does NOT converge across machines or with the
-/// operator's `gh` identity — the operator should know about this.
-///
-/// Cross-platform: on Windows the POSIX probes ALL fail (`HOSTNAME`
-/// and `USER`/`LOGNAME` env vars don't exist; `hostname -s` is
-/// rejected by Windows hostname.exe), which used to collapse every
-/// Windows machine onto the SAME degenerate
-/// `local:unknown-host:unknown-user` identity — the exact fingerprint
-/// of the M5↔bigmama blind-room bug (bigmama's `#general` derived to
-/// `eef18336-…` under that identity while M5 derived `5eedf7b1-…`
-/// under the gh login, so every room frame between them died as
-/// `unknown_channel`). `COMPUTERNAME`/`USERNAME` are the Windows
-/// equivalents; bare `hostname` (no flag) works on every platform.
-fn local_fallback_identity() -> String {
-    local_fallback_identity_with(&|name| std::env::var(name).ok(), &run_command, &machine_id)
-}
-
 /// The machine-account airc home (`~/.airc`) — shared by EVERY scope on
 /// this machine, so [`machine_id`] resolves to one value per machine
 /// rather than per project scope (which would re-fragment the mesh). Not
@@ -405,47 +425,6 @@ pub(crate) fn machine_id() -> String {
         return fresh;
     }
     Uuid::new_v4().simple().to_string()
-}
-
-/// Injectable core of [`local_fallback_identity`] — env, command, and
-/// machine-id lookups passed in so tests can pin the per-platform
-/// fallback chain without mutating process globals or the real home.
-fn local_fallback_identity_with(
-    env: &dyn Fn(&str) -> Option<String>,
-    run: &dyn Fn(&[&str]) -> Option<String>,
-    machine_id: &dyn Fn() -> String,
-) -> String {
-    let non_empty = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
-    let host = non_empty(env("HOSTNAME"))
-        .or_else(|| non_empty(env("COMPUTERNAME"))) // Windows
-        .or_else(|| non_empty(run(&["hostname", "-s"])))
-        .or_else(|| non_empty(run(&["hostname"]))); // Windows hostname.exe rejects -s
-    let user = non_empty(env("USER"))
-        .or_else(|| non_empty(env("LOGNAME")))
-        .or_else(|| non_empty(env("USERNAME"))); // Windows
-
-    match (host, user) {
-        (Some(host), Some(user)) => format!("local:{host}:{user}"),
-        (host, user) => {
-            // Total/partial probe failure: NEVER emit the colliding
-            // `local:unknown-host:unknown-user` fingerprint that collapses
-            // every such machine onto ONE identity (the M5<->bigmama
-            // blind-room root cause — divergent `#general` UUIDs, so every
-            // frame between them died as `unknown_channel`). Anchor the
-            // degraded identity to the stable machine-id so it stays
-            // DISTINCT across machines, and shout so it is never silent.
-            let mid = machine_id();
-            let short = &mid[..mid.len().min(12)];
-            let host = host.unwrap_or_else(|| format!("machine-{short}"));
-            let user = user.unwrap_or_else(|| format!("machine-{short}"));
-            eprintln!(
-                "airc: WARN mesh identity: host/user probe failed; using stable machine-id \
-                 fallback `local:{host}:{user}` (distinct per machine, self-heals to your gh \
-                 login once reachable). Fix gh auth / hostname resolution to converge rooms."
-            );
-            format!("local:{host}:{user}")
-        }
-    }
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
@@ -500,20 +479,23 @@ mod tests {
         assert_eq!(entry.identity, "bob");
     }
 
+    /// what this catches: the island generator. A machine that cannot name
+    /// its OWNER must not invent an identity — every room UUID derived from a
+    /// fabricated one lands in a namespace only this machine can see, which is
+    /// how a node silently forms its own mesh while reporting a healthy join.
+    /// Unresolved is loud and terminal; nothing is persisted.
     #[tokio::test]
-    async fn resolve_falls_back_to_local_when_resolver_yields_none() {
+    async fn resolve_errors_rather_than_inventing_an_owner_identity() {
         let store = InMemoryEventStore::new();
-        let entry = resolve_with(&store, mock_none, 1_000).await.unwrap();
-        assert_eq!(entry.source, Source::LocalHostUser);
-        assert!(entry.identity.starts_with("local:"));
-        // Fallback is the SAME on a given machine — second resolve
-        // (fresh cache) returns the cached fallback value too.
-        let entry2 = resolve_with(&store, mock_none, 1_100).await.unwrap();
-        assert_eq!(entry2.identity, entry.identity);
-    }
-
-    fn mock_git_email(value: &'static str) -> impl FnOnce() -> Option<(String, Source)> {
-        move || Some((value.to_string(), Source::GitEmail))
+        let error = resolve_with(&store, mock_none, 1_000)
+            .await
+            .expect_err("no owner identity must not resolve");
+        assert!(matches!(error, MeshIdentityError::Unresolved));
+        assert!(
+            load_cached(&store).await.unwrap().is_none(),
+            "a failed resolve must persist NOTHING — a stored guess would \
+             outlive the outage and keep deriving private rooms"
+        );
     }
 
     #[tokio::test]
@@ -545,8 +527,13 @@ mod tests {
         assert_eq!(reloaded.source, Source::GhApiUser);
     }
 
+    /// what this catches: a legacy row minted before this machine could
+    /// authenticate (`git_email` / `local_host_user`) is a MACHINE fact, not
+    /// the owner's login. Keeping it "for stability" is what stranded bigmama
+    /// on her own `#general`. With gh still unreachable it must be refused,
+    /// not reused.
     #[tokio::test]
-    async fn provisional_git_email_retained_when_gh_still_unavailable() {
+    async fn legacy_provisional_row_is_refused_when_gh_unavailable() {
         let store = InMemoryEventStore::new();
         save(
             &store,
@@ -560,16 +547,27 @@ mod tests {
         )
         .await
         .unwrap();
-        // gh still unreachable (resolver yields None): keep the provisional
-        // value — do NOT churn it down to a machine-local fallback.
-        let entry = resolve_with(&store, mock_none, 1_500).await.unwrap();
-        assert_eq!(entry.identity, "joelteply@yahoo.com");
-        assert_eq!(entry.source, Source::GitEmail);
-        // A non-canonical git resolver also must not displace the cache.
-        let entry2 = resolve_with(&store, mock_git_email("other@x.com"), 1_600)
+        let error = resolve_with(&store, mock_none, 1_500)
+            .await
+            .expect_err("a machine-fact identity is not the owner's key");
+        assert!(matches!(error, MeshIdentityError::Unresolved));
+    }
+
+    /// what this catches: the opposite mistake. A machine that HAS the key and
+    /// merely went offline must keep using it — a stale copy of the owner's
+    /// login is still the owner's login, and erroring here would drop a
+    /// converged machine off its own mesh over a transient gh outage.
+    #[tokio::test]
+    async fn expired_gh_login_survives_an_unreachable_gh() {
+        let store = InMemoryEventStore::new();
+        resolve_with(&store, mock_gh("joelteply"), 1_000)
             .await
             .unwrap();
-        assert_eq!(entry2.identity, "joelteply@yahoo.com");
+        let entry = resolve_with(&store, mock_none, 1_000 + DEFAULT_TTL_MS + 1)
+            .await
+            .expect("a cached gh login must survive an outage");
+        assert_eq!(entry.identity, "joelteply");
+        assert_eq!(entry.source, Source::GhApiUser);
     }
 
     #[tokio::test]
@@ -659,87 +657,5 @@ mod tests {
         save(&store, &entry).await.unwrap();
         let loaded = load_cached(&store).await.unwrap().unwrap();
         assert_eq!(loaded, entry);
-    }
-
-    /// what this catches (M5↔bigmama blind room, root cause): on
-    /// Windows the POSIX env probes all miss, and the old chain
-    /// collapsed to `local:unknown-host:unknown-user` — the SAME
-    /// degenerate identity on every Windows box, silently forking room
-    /// UUID derivation from the account identity. The fallback must
-    /// consult the Windows equivalents before giving up.
-    #[test]
-    fn local_fallback_uses_windows_env_names() {
-        let windows_env = |name: &str| match name {
-            "COMPUTERNAME" => Some("BigMama".to_string()),
-            "USERNAME" => Some("joelt".to_string()),
-            _ => None,
-        };
-        // Windows hostname.exe: `-s` fails (non-zero exit → None),
-        // bare `hostname` would answer — but env wins first.
-        let no_command = |_argv: &[&str]| None;
-        let mid = || "test-machine-id".to_string();
-        assert_eq!(
-            local_fallback_identity_with(&windows_env, &no_command, &mid),
-            "local:BigMama:joelt"
-        );
-    }
-
-    /// what this catches: `hostname -s` failing (Windows) must fall
-    /// through to bare `hostname`, and empty/whitespace probe output
-    /// must not be accepted as a host or user component.
-    #[test]
-    fn local_fallback_hostname_flag_fallthrough_and_empty_rejection() {
-        let empty_env = |name: &str| match name {
-            // Empty values are as bad as missing — never accept them.
-            "HOSTNAME" => Some("   ".to_string()),
-            "USERNAME" => Some("joelt".to_string()),
-            _ => None,
-        };
-        let windows_hostname = |argv: &[&str]| match argv {
-            ["hostname"] => Some("BigMama".to_string()),
-            _ => None, // `hostname -s` → non-zero exit on Windows
-        };
-        let mid = || "test-machine-id".to_string();
-        assert_eq!(
-            local_fallback_identity_with(&empty_env, &windows_hostname, &mid),
-            "local:BigMama:joelt"
-        );
-    }
-
-    /// what this catches (regression for the M5↔bigmama blind-room bug):
-    /// when EVERY host/user probe fails (bare daemon process — no env, no
-    /// hostname), the fallback must NOT emit the colliding
-    /// `local:unknown-host:unknown-user` fingerprint that collapses every
-    /// such machine onto one identity. It must anchor to the stable
-    /// machine-id so two probe-blind machines get DISTINCT identities.
-    #[test]
-    fn local_fallback_uses_machine_id_when_all_probes_fail() {
-        let no_env = |_name: &str| None;
-        let no_command = |_argv: &[&str]| None;
-        let id_a = || "aaaaaaaabbbbccccdddd".to_string();
-        let id_b = || "1111111122223333eeee".to_string();
-
-        let a = local_fallback_identity_with(&no_env, &no_command, &id_a);
-        let b = local_fallback_identity_with(&no_env, &no_command, &id_b);
-
-        assert!(
-            !a.contains("unknown-host") && !a.contains("unknown-user"),
-            "must never emit the colliding sentinel identity, got {a}"
-        );
-        assert_ne!(
-            a, b,
-            "two machines with distinct machine-ids must NOT collide"
-        );
-        assert_eq!(a, "local:machine-aaaaaaaabbbb:machine-aaaaaaaabbbb");
-    }
-
-    #[test]
-    fn local_fallback_is_deterministic_for_same_env() {
-        // Without setting env, fallback should at least be a stable
-        // string for the duration of the test process.
-        let a = local_fallback_identity();
-        let b = local_fallback_identity();
-        assert_eq!(a, b);
-        assert!(a.starts_with("local:"));
     }
 }
