@@ -142,3 +142,61 @@ mod tests {
         assert_ne!(before, after);
     }
 }
+
+/// What can go wrong resolving a member's identity from a home path.
+#[derive(Debug)]
+pub enum MemberIdentityError {
+    /// The machine-account store could not be opened.
+    Store(airc_store::StoreError),
+    /// No owner identity — see [`crate::mesh_identity::MeshIdentityError`].
+    /// A member CANNOT be minted without knowing whose it is: an identity
+    /// derived under a guessed owner is a member of nobody's account.
+    Owner(crate::mesh_identity::MeshIdentityError),
+}
+
+impl std::fmt::Display for MemberIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "member identity store: {error}"),
+            Self::Owner(error) => write!(f, "member identity owner: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MemberIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Owner(error) => Some(error),
+        }
+    }
+}
+
+/// Resolve the account that owns `home`'s machine and derive a member's
+/// peer identity from it.
+///
+/// This is the accessor a consumer (continuum's persona mint) calls BEFORE
+/// attaching, so it can hand the derived id to
+/// [`crate::Airc::attach_as_with_peer_id`]. The result is the same on every
+/// machine the account owns, so a persona named "asha" minted on any of them
+/// is one persona — not one per box.
+///
+/// Errors rather than falling back: a member minted under a guessed owner
+/// belongs to nobody's account and is invisible to every other machine.
+pub async fn resolve_member_peer_id(
+    home: &std::path::Path,
+    kind: MemberKind,
+    name: &str,
+) -> Result<airc_core::PeerId, MemberIdentityError> {
+    let coordinator_path = crate::airc::machine_account_home(home).join("events.sqlite");
+    let store = airc_store::SqliteEventStore::open_path(&coordinator_path)
+        .await
+        .map_err(MemberIdentityError::Store)?;
+    let owner = crate::mesh_identity::resolve(&store)
+        .await
+        .map_err(MemberIdentityError::Owner)?
+        .as_mesh_identity();
+    Ok(airc_core::PeerId::from_uuid(derive_member_id(
+        &owner, kind, name,
+    )))
+}
