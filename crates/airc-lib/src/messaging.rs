@@ -126,7 +126,6 @@ impl Airc {
         // rarely changes between sends; loading it from disk per outbound
         // message was ~95% of send latency (profiled). Sync at most once/sec.
         self.sync_account_peer_registry_debounced().await?;
-        let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
         let lamport = self.next_lamport(occurred_at_ms);
@@ -173,8 +172,59 @@ impl Airc {
         let __append = airc_diagnostics::timing::start();
         self.append_sent_frame(frame.clone()).await?;
         __append.stop("airc.append_sent");
+
+        // TRANSPORT IS NOT A PRECONDITION FOR MEMORY.
+        //
+        // Route resolution used to happen ABOVE, before the frame was even
+        // built, so `?` on a refusal returned early and the append never ran.
+        // Persist-then-transport was already the design (see the comment
+        // above); an accidental ordering made durability conditional on the
+        // network anyway.
+        //
+        // What that cost, measured on the M5 2026-08-04: a fresh scope could
+        // not say anything into its own room — `say` failed outright with
+        // "DataInteractive has no admissible live route" — and the live store
+        // held 504,013 events of which ZERO were messages (503,656 were
+        // `subscription_advanced` cursor rows). A room that only remembers
+        // what it successfully broadcast is not a transcript, and every
+        // read-side feature (persona wake-hydration, recall, repetition
+        // detection, the transcript UI) was compensating for a room with no
+        // history.
+        //
+        // Now: the event is durable and locally visible FIRST. A transport
+        // failure is reported loudly and does not erase what was said. It is
+        // deliberately not an `Err` — the send genuinely succeeded as an act
+        // of record, and whether a peer RECEIVED it is a different question
+        // with its own answer (the delivery-ack ledger, #280). Conflating
+        // "wrote it down" with "you heard it" is what made an offline node
+        // mute.
         let __route = airc_diagnostics::timing::start();
-        self.execute_send_route(route.kind, room, frame).await?;
+        match self.resolve_send_route(kind) {
+            Ok(route) => {
+                if let Err(error) = self.execute_send_route(route.kind, room, frame).await {
+                    tracing::warn!(
+                        target: "airc::messaging",
+                        %event_id,
+                        room = %room.name,
+                        %error,
+                        "message is durable and locally delivered, but the wire write \
+                         failed — remote peers have NOT received it; delivery receipts \
+                         are the authority on who actually got it"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "airc::messaging",
+                    %event_id,
+                    room = %room.name,
+                    %error,
+                    "message is durable and locally delivered, but NO transport route \
+                     is admissible right now — nothing was sent to remote peers. The \
+                     record stands; delivery is deferred to route recovery"
+                );
+            }
+        }
         __route.stop("airc.exec_route");
         Ok(SendFrameResult {
             event_id,
