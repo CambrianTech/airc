@@ -1799,6 +1799,42 @@ impl Airc {
         self.ensure_join_context(context).await
     }
 
+    /// Self-healing join — PERIODIC mesh-identity reconcile.
+    ///
+    /// [`SubscriptionSet::rebind_diverged`] is the correct heal for a
+    /// scope whose stored room UUIDs were derived under a mesh identity
+    /// that has since healed (the machine booted before `gh` could
+    /// answer, minted the provisional `local:<host>:<user>` identity,
+    /// derived every room UUID under it, and later re-resolved to the
+    /// canonical login). Until now that heal only ran on the JOIN path,
+    /// so the scope kept reading its diverged rooms until a human typed
+    /// `airc stop && airc join` — the manual ritual this substrate is
+    /// supposed to make unnecessary. The daemon calls this every
+    /// route-refresh tick so the reconvergence is autonomous.
+    ///
+    /// Idempotent and free in the steady state: the identity read is
+    /// cached, a converged set yields zero rebinds, and the store write
+    /// plus presence re-publish happen ONLY when something actually
+    /// moved — a tick on a healthy scope touches no durable state.
+    pub async fn reconcile_subscription_identity(
+        &self,
+    ) -> Result<Vec<subscriptions::SubscriptionRebind>, AircError> {
+        let identity = self.mesh_identity().await?;
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        let rebinds = set.rebind_diverged(&identity);
+        if rebinds.is_empty() {
+            return Ok(rebinds);
+        }
+        warn_subscription_rebinds(&rebinds);
+        subscriptions::save(self.event_store(), &set).await?;
+        // Re-beacon under the converged UUIDs: peers resolve routes from
+        // beacons, so a rebind that is not re-published leaves the scope
+        // reading the right room while the mesh still advertises the
+        // dead one.
+        self.publish_presence(&identity, &set).await?;
+        Ok(rebinds)
+    }
+
     /// Subscribe to every channel in `context`, set its default, and
     /// start local subscribers for the resulting wires.
     ///

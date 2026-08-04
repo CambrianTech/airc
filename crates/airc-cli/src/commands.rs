@@ -1820,6 +1820,35 @@ async fn refresh_routes_once(
     // changes IP keeps advertising a stale, undialable address until it is
     // manually restarted. Reused below for relay self-election so detection
     // happens exactly once per tick.
+    // Self-healing join — mesh-identity reconcile every tick. A machine
+    // that booted before `gh` could answer derived every room UUID under
+    // the provisional `local:<host>:<user>` identity; when the identity
+    // later heals, the stored subscriptions still point at the diverged
+    // rooms and this node is invisible to the rest of the account mesh.
+    // The heal itself already existed but only ran on `airc join`, which
+    // is why recovery has needed a human typing `airc stop && airc join`.
+    // Running it on the daemon clock makes it autonomous. No-op when
+    // converged; loud when it moves something.
+    match airc.reconcile_subscription_identity().await {
+        Ok(rebinds) if !rebinds.is_empty() => {
+            for rebind in &rebinds {
+                eprintln!(
+                    "airc daemon: mesh identity healed — subscription '{}' re-bound {} -> {}",
+                    rebind.name.as_str(),
+                    rebind.old_room_id,
+                    rebind.new_room_id
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "airc daemon: subscription identity reconcile failed ({error}); \
+                 retrying next tick"
+            );
+        }
+    }
+
     let lan_ip = crate::network_commands::advertise_lan_ip();
     let tailscale_ip = crate::network_commands::detect_tailscale_ip();
     match airc
