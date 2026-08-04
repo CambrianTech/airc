@@ -504,9 +504,19 @@ impl GhAccountRegistryStore {
                 retry_after_secs,
                 reason,
             }) => {
-                return Err(AccountRegistryError::Adapter(format!(
-                    "gh governor: {reason}; retry in {retry_after_secs}s"
-                )));
+                // Typed, not formatted — the caller must be able to HONOR
+                // the wait, which it cannot do with a message string.
+                tracing::debug!(
+                    target: "airc::gh",
+                    retry_after_secs,
+                    %reason,
+                    "gh governor denied a Registry request"
+                );
+                return Err(AccountRegistryError::RateLimited {
+                    // Governor reports i64; a negative wait is nonsense,
+                    // clamp rather than panic on a clock oddity.
+                    retry_after_secs: retry_after_secs.max(0) as u64,
+                });
             }
             // Allowed, or a governor I/O glitch: fail OPEN so a filesystem
             // hiccup can't brick the mesh — the 60s budget + GitHub's

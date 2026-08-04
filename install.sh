@@ -855,7 +855,28 @@ _install_airc_binary() {
       cp -f "$built" "$tmp"
       chmod +x "$tmp"
       mv -f "$tmp" "$BIN_DIR/airc"
-      ok "Installed airc: $BIN_DIR/airc"
+      # VERIFY THE DEPLOY. "Installed" is a claim about a file existing;
+      # it is not evidence the binary RUNS. On macOS an invalidly-signed
+      # executable is SIGKILLed before `main` — exit 137, no output, no
+      # error — so `airc --version`, `airc status`, `airc join` and the
+      # daemon all silently do nothing and the operator sees "airc is
+      # broken" with nothing to read. Lived it 2026-08-04: twenty minutes
+      # of a dead mesh that looked like a transport bug.
+      #
+      # Cause-agnostic on purpose: this catches a bad signature, a missing
+      # dylib, a wrong-arch build, anything. If the thing we just put on
+      # PATH cannot state its own version, we do NOT report success.
+      if ! "$BIN_DIR/airc" --version >/dev/null 2>&1; then
+        local rc=$?
+        if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+          codesign -s - -f "$BIN_DIR/airc" >/dev/null 2>&1 || true
+        fi
+        "$BIN_DIR/airc" --version >/dev/null 2>&1 || fail \
+          "airc was installed to $BIN_DIR/airc but will not run (exit $rc; 137 = killed by the OS, \
+typically an invalid code signature on macOS). Refusing to report success on a binary that \
+cannot execute — a silently-dead airc looks exactly like a broken mesh."
+      fi
+      ok "Installed airc: $BIN_DIR/airc ($("$BIN_DIR/airc" --version 2>/dev/null))"
       ;;
   esac
 

@@ -320,15 +320,29 @@ pub async fn run_loop<S>(
             // spam). `Notify` stores one permit if the nudge lands during
             // a tick, so the wakeup is never lost.
             _ = resync.notified() => {
-                if gated_tick(&gate, &airc, &store, &sink).await {
-                    route_wake.notify_one();
-                }
+                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
             _ = ticker.tick() => {
-                if gated_tick(&gate, &airc, &store, &sink).await {
-                    route_wake.notify_one();
-                }
+                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
+        }
+    }
+}
+
+/// Act on a tick's outcome: nudge route-refresh when something landed,
+/// and — the part that was missing — actually SLEEP OUT a governor denial.
+///
+/// The governor already computed "retry in N seconds" and the loop used to
+/// throw it away, coming back on its own cadence to be refused again. The
+/// account registry is how peers discover each other, so a permanently
+/// refused registry is a permanently blind node. Sleeping here is what
+/// turns the governor's advice into backpressure.
+async fn honor(outcome: TickOutcome, route_wake: &tokio::sync::Notify) {
+    match outcome {
+        TickOutcome::Imported => route_wake.notify_one(),
+        TickOutcome::NoChange => {}
+        TickOutcome::RateLimited { retry_after_secs } => {
+            tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
         }
     }
 }
@@ -344,12 +358,27 @@ pub async fn run_loop<S>(
 /// The loop uses that to nudge the route-refresh loop (#240 event-driven
 /// heal): a gate-skip or a failed import imported nothing, so there is
 /// nothing newly-dialable to wake for.
+/// What one gated tick did, for a caller that must react differently to
+/// "nothing changed" and "the door is shut for N seconds".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// Publish+refresh ran and succeeded — fresh beacons/endpoints landed
+    /// in the trust store, so there is something newly dialable.
+    Imported,
+    /// Skipped or failed without a governor denial. Next tick on cadence.
+    NoChange,
+    /// The gh governor refused: its window is full. The caller MUST wait
+    /// this long before the next attempt — retrying sooner is what kept
+    /// the budget permanently exhausted and discovery permanently starved.
+    RateLimited { retry_after_secs: u64 },
+}
+
 async fn gated_tick<S>(
     gate: &RegistryRefreshGate,
     airc: &Airc,
     store: &S,
     sink: &StderrJsonDiagnosticSink,
-) -> bool
+) -> TickOutcome
 where
     S: AccountRegistryStore,
 {
@@ -363,9 +392,15 @@ where
             code,
             format!("account registry tick skipped: {block}"),
         ));
-        return false;
+        return TickOutcome::NoChange;
     }
-    run_tick(airc, store, sink).await.is_ok()
+    match run_tick(airc, store, sink).await {
+        Ok(_) => TickOutcome::Imported,
+        Err(crate::AircError::AccountRegistry(
+            crate::account_registry::AccountRegistryError::RateLimited { retry_after_secs },
+        )) => TickOutcome::RateLimited { retry_after_secs },
+        Err(_) => TickOutcome::NoChange,
+    }
 }
 
 #[cfg(test)]
@@ -784,5 +819,41 @@ exit 1
             .await
             .expect("loop must exit promptly on shutdown")
             .unwrap();
+    }
+
+    /// what this catches: the starvation half of the 2026-08-04 M5 ghost —
+    /// 4,951 governor denials in one daemon log while the account registry
+    /// (how peers FIND each other) stayed permanently refused. The governor
+    /// had already computed "retry in N seconds"; the loop threw it away and
+    /// came back on its own cadence to be refused again. Advisory backoff is
+    /// not backoff. `honor` must actually SLEEP the requested window.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_tick_actually_waits_out_the_governors_window() {
+        let wake = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        honor(
+            TickOutcome::RateLimited {
+                retry_after_secs: 60,
+            },
+            &wake,
+        )
+        .await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(60),
+            "a governor denial must be waited out, not logged and retried"
+        );
+    }
+
+    /// what this catches: the backoff must not become a stall. A tick that
+    /// imported (or simply changed nothing) returns immediately — only a
+    /// denial costs wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_normal_tick_costs_no_wall_clock() {
+        let wake = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        honor(TickOutcome::Imported, &wake).await;
+        honor(TickOutcome::NoChange, &wake).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(0));
     }
 }

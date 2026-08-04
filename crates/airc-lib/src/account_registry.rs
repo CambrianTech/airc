@@ -387,6 +387,20 @@ pub enum AccountRegistryError {
         spec_peer_id: airc_core::PeerId,
     },
     Adapter(String),
+    /// The gh request governor refused this call: the 60s window is full
+    /// (or GitHub's own backoff is active). Carries the governor's own
+    /// answer to "when may I try again?" as DATA rather than prose, so
+    /// the refresh loop can actually WAIT it out.
+    ///
+    /// Before this existed the denial was formatted into `Adapter`'s
+    /// string, logged, and the loop came back on its normal cadence —
+    /// re-attempting inside a window it had just been told was closed.
+    /// Measured on the M5 2026-08-04: 4,951 denials in a single daemon
+    /// log while the account registry (how peers FIND each other) stayed
+    /// starved. Advisory backoff is not backoff.
+    RateLimited {
+        retry_after_secs: u64,
+    },
 }
 
 impl std::fmt::Display for AccountRegistryError {
@@ -406,6 +420,11 @@ impl std::fmt::Display for AccountRegistryError {
                 "account registry peer mismatch: presence {presence_peer_id} vs spec {spec_peer_id}"
             ),
             Self::Adapter(error) => write!(f, "account registry adapter: {error}"),
+            Self::RateLimited { retry_after_secs } => write!(
+                f,
+                "gh request budget exhausted; the governor asks for {retry_after_secs}s \
+                 before the next Registry call"
+            ),
         }
     }
 }
