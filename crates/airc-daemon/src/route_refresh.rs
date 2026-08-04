@@ -50,6 +50,22 @@ pub const FIRST_REFRESH_DELAY: Duration = Duration::ZERO;
 /// [`run_periodic_refresh`]), never start-to-start.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between refreshes, enforced on the WAKE path.
+///
+/// The wake nudge exists so a real reconnect doesn't wait out a full
+/// [`REFRESH_INTERVAL`]. But it is fired by the session-drop observer, and
+/// a refresh dials every stored peer — so on a node whose registry is
+/// mostly dead peers, refresh manufactures the drops that nudge the next
+/// refresh, forever. This floor is what makes that cycle terminate: at
+/// worst 4 refreshes/minute instead of ~13, and the gh budget the account
+/// registry needs is no longer spent by a spin.
+///
+/// 15s is chosen against the failure it bounds, not tuned: it keeps a
+/// genuine reconnect fast (well under the 60s interval it exists to beat)
+/// while capping the dial rate low enough that a poisoned registry cannot
+/// exhaust a 30-req/60s budget on discovery alone.
+pub const MIN_REFRESH_SPACING: Duration = Duration::from_secs(15);
+
 /// Pure scheduling rule: how long to wait before the next refresh,
 /// given how many refreshes have already completed.
 ///
@@ -97,6 +113,7 @@ where
     tokio::pin!(notified);
 
     let mut completed: u64 = 0;
+    let mut last_completed: Option<tokio::time::Instant> = None;
     loop {
         // Wait for the interval to elapse OR an external wake nudge, whichever
         // comes first. A fresh `notified()` per iteration so a permit stored
@@ -111,11 +128,36 @@ where
                 () = tokio::time::sleep(delay_before_refresh(completed)) => {}
             }
         }
+        // Floor the WAKE path. The nudge is edge-triggered on a session
+        // drop, and a refresh DIALS every stored peer — so on a node whose
+        // registry holds mostly-dead peers, each refresh manufactures the
+        // drops that nudge the next one. Measured live on the M5
+        // (2026-08-04): 44,704 relay self-elections and 4,951 exhausted-gh
+        // -budget errors in a single daemon log, refresh re-entering every
+        // ~4.5s against a 60s interval, 52 enrolled peers and zero
+        // reachable — the loop starved the account registry that discovery
+        // depends on, so it could never climb out.
+        //
+        // The nudge stays (a real reconnect must not wait out 60s); it just
+        // cannot re-enter faster than this floor, which bounds the cycle at
+        // 4/min instead of unbounded. The timer path is unaffected — it
+        // already waits far longer than the floor.
+        if let Some(last) = last_completed {
+            let since = last.elapsed();
+            if since < MIN_REFRESH_SPACING {
+                tokio::select! {
+                    biased;
+                    _ = &mut notified => return,
+                    () = tokio::time::sleep(MIN_REFRESH_SPACING - since) => {}
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = &mut notified => return,
             () = refresh() => {
                 completed = completed.saturating_add(1);
+                last_completed = Some(tokio::time::Instant::now());
             }
         }
     }
@@ -130,7 +172,8 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        delay_before_refresh, run_periodic_refresh, FIRST_REFRESH_DELAY, REFRESH_INTERVAL,
+        delay_before_refresh, run_periodic_refresh, FIRST_REFRESH_DELAY, MIN_REFRESH_SPACING,
+        REFRESH_INTERVAL,
     };
 
     /// Pin the scheduling rule: a restarted daemon dials IMMEDIATELY
@@ -365,5 +408,52 @@ mod tests {
             .await
             .expect("loop must exit on shutdown")
             .expect("loop task must not panic");
+    }
+
+    /// what this catches: the live ghost measured on the M5, 2026-08-04 —
+    /// 44,704 relay self-elections and 4,951 exhausted-gh-budget errors in
+    /// one daemon log, refresh re-entering every ~4.5s against a 60s
+    /// interval. The wake nudge is fired by the session-drop observer, and
+    /// a refresh dials every stored peer, so on a registry full of dead
+    /// peers each refresh manufactures the drops that nudge the next one.
+    /// A storm of nudges must be FLOORED, or discovery starves the gh
+    /// budget it depends on and the node never finds a peer again.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_storm_cannot_refresh_faster_than_the_floor() {
+        let shutdown = Arc::new(Notify::new());
+        let wake = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let loop_shutdown = shutdown.clone();
+        let loop_wake = wake.clone();
+        let loop_count = count.clone();
+        let handle = tokio::spawn(async move {
+            run_periodic_refresh(&loop_shutdown, &loop_wake, || {
+                let count = loop_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+
+        // 60 virtual seconds of continuous nudging — the drop-storm shape.
+        for _ in 0..600 {
+            wake.notify_one();
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        shutdown.notify_waiters();
+        let _ = handle.await;
+
+        // Immediate first refresh (FIRST_REFRESH_DELAY is ZERO) plus at most
+        // one per MIN_REFRESH_SPACING across the window.
+        let refreshes = count.load(Ordering::SeqCst);
+        let ceiling = 1 + (60 / MIN_REFRESH_SPACING.as_secs() as usize) + 1;
+        assert!(
+            refreshes <= ceiling,
+            "a wake storm must be floored: {refreshes} refreshes in 60s \
+             (ceiling {ceiling}). Unfloored, this re-enters as fast as the \
+             dial sweep — the 44,704-self-election ghost."
+        );
     }
 }
