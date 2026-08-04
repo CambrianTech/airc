@@ -50,6 +50,7 @@ pub mod error;
 pub mod external_identity;
 pub mod gh;
 pub mod grid_auth;
+pub mod grid_identity;
 pub mod join_context;
 mod lan;
 pub mod lane_coordination;
