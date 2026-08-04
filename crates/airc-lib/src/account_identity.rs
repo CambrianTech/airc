@@ -1,13 +1,16 @@
-//! Grid identities derive from the OWNER, never from the machine.
+//! Account members derive their identity from the ACCOUNT, never from the
+//! machine.
 //!
 //! Joel, 2026-08-04: *"All derive from my gh user. Not computer."*
 //!
-//! A citizen of a grid — a named persona, an agent session — is the same
-//! citizen on every machine that owner runs. So its identity must be a
-//! function of `(owner, kind, name)` and nothing else. The moment a
-//! machine fact enters the derivation, the "same" persona on two boxes
-//! becomes two beings that cannot recognise each other, and the grid is
-//! a set of islands wearing matching name tags.
+//! This is the ordinary account model every messaging system has used
+//! for a decade: ONE account, N machines, the same rooms and the same
+//! members on all of them. A member — a named persona, an agent session —
+//! is the same member on every machine the account owns, so its identity
+//! must be a function of `(owner, kind, name)` and nothing else. The
+//! moment a machine fact enters the derivation, the "same" persona on two
+//! boxes becomes two strangers, and adding a machine silently duplicates
+//! every member on it.
 //!
 //! This is the same primitive [`crate::subscriptions::derive_room_id`]
 //! uses for rooms, generalised: a UUIDv5 over
@@ -28,28 +31,28 @@ use uuid::Uuid;
 
 use crate::subscriptions::MeshIdentity;
 
-/// Namespace UUID for owner-derived grid identities. Distinct from the
-/// subscriptions namespace so a room and a citizen can never collide
+/// Namespace UUID for owner-derived member identities. Distinct from the
+/// subscriptions namespace so a room and a member can never collide
 /// even if every other input matched.
-const GRID_IDENTITY_NAMESPACE: Uuid = Uuid::from_bytes([
+const ACCOUNT_MEMBER_NAMESPACE: Uuid = Uuid::from_bytes([
     0xa1, 0xc2, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ]);
 
-/// What kind of citizen an identity names. The discriminant is part of
+/// What kind of member an identity names. The discriminant is part of
 /// the derivation, so a persona and an agent session that happen to
 /// share a name are still distinct identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CitizenKind {
-    /// A named persona — a continuing being of the owner's grid, the
-    /// same citizen on whichever machine currently hosts it.
+pub enum MemberKind {
+    /// A named persona — a continuing being of the account, the same
+    /// member on whichever machine currently hosts it.
     Persona,
     /// An agent working session (a Claude tab, a headless solver). Bound
-    /// to the owner like any citizen, but named per working context
+    /// to the account like any member, but named per working context
     /// rather than being a continuing self.
     Agent,
 }
 
-impl CitizenKind {
+impl MemberKind {
     /// Stable wire/derivation token. Changing one of these strings
     /// re-derives every identity of that kind — treat as frozen.
     pub fn as_str(self) -> &'static str {
@@ -60,13 +63,13 @@ impl CitizenKind {
     }
 }
 
-/// Derive a citizen's identity from `(owner, kind, name)`.
+/// Derive a member's identity from `(owner, kind, name)`.
 ///
-/// The ONLY inputs are owner facts and the citizen's own name. No
+/// The ONLY inputs are owner facts and the member's own name. No
 /// hostname, no username, no per-install id, no clock — so every machine
 /// the owner runs computes the same answer, offline, with no
 /// coordination.
-pub fn derive_citizen_id(owner: &MeshIdentity, kind: CitizenKind, name: &str) -> Uuid {
+pub fn derive_member_id(owner: &MeshIdentity, kind: MemberKind, name: &str) -> Uuid {
     let kind = kind.as_str();
     let owner = owner.as_str();
     let mut bytes = Vec::with_capacity(kind.len() + owner.len() + name.len() + 2);
@@ -77,7 +80,7 @@ pub fn derive_citizen_id(owner: &MeshIdentity, kind: CitizenKind, name: &str) ->
     bytes.extend_from_slice(owner.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(name.as_bytes());
-    Uuid::new_v5(&GRID_IDENTITY_NAMESPACE, &bytes)
+    Uuid::new_v5(&ACCOUNT_MEMBER_NAMESPACE, &bytes)
 }
 
 #[cfg(test)]
@@ -90,32 +93,32 @@ mod tests {
 
     /// what this catches: the whole point. A persona's identity must be
     /// reproducible from owner + name alone, so the M5 and the 5090
-    /// independently compute the SAME id for the same citizen with no
+    /// independently compute the SAME id for the same member with no
     /// coordination. Any machine input in the derivation breaks this and
     /// turns one persona into two strangers.
     #[test]
-    fn a_citizen_id_is_reproducible_from_owner_and_name_alone() {
-        let a = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "asha");
-        let b = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "asha");
-        assert_eq!(a, b, "same owner + name must derive the same citizen");
+    fn a_member_id_is_reproducible_from_owner_and_name_alone() {
+        let a = derive_member_id(&owner("joelteply"), MemberKind::Persona, "asha");
+        let b = derive_member_id(&owner("joelteply"), MemberKind::Persona, "asha");
+        assert_eq!(a, b, "same owner + name must derive the same member");
     }
 
     /// what this catches: cross-owner collision. Two different humans may
     /// each name a persona "asha"; they are different beings on different
     /// grids and must never share an id.
     #[test]
-    fn different_owners_never_share_a_citizen() {
-        let mine = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "asha");
-        let theirs = derive_citizen_id(&owner("someone-else"), CitizenKind::Persona, "asha");
+    fn different_owners_never_share_a_member() {
+        let mine = derive_member_id(&owner("joelteply"), MemberKind::Persona, "asha");
+        let theirs = derive_member_id(&owner("someone-else"), MemberKind::Persona, "asha");
         assert_ne!(mine, theirs);
     }
 
     /// what this catches: cross-kind collision. A persona named "benchy"
-    /// and an agent session named "benchy" are not the same citizen.
+    /// and an agent session named "benchy" are not the same member.
     #[test]
     fn kind_is_part_of_the_identity() {
-        let persona = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "benchy");
-        let agent = derive_citizen_id(&owner("joelteply"), CitizenKind::Agent, "benchy");
+        let persona = derive_member_id(&owner("joelteply"), MemberKind::Persona, "benchy");
+        let agent = derive_member_id(&owner("joelteply"), MemberKind::Agent, "benchy");
         assert_ne!(persona, agent);
     }
 
@@ -123,8 +126,8 @@ mod tests {
     /// concatenation lets one (owner, name) pair impersonate another.
     #[test]
     fn nul_separators_prevent_boundary_collisions() {
-        let a = derive_citizen_id(&owner("joel"), CitizenKind::Persona, "a-b");
-        let b = derive_citizen_id(&owner("joel-a"), CitizenKind::Persona, "b");
+        let a = derive_member_id(&owner("joel"), MemberKind::Persona, "a-b");
+        let b = derive_member_id(&owner("joel-a"), MemberKind::Persona, "b");
         assert_ne!(a, b);
     }
 
@@ -133,9 +136,9 @@ mod tests {
     /// rename must carry it explicitly rather than assume derivation
     /// preserves it.
     #[test]
-    fn renaming_a_citizen_derives_a_different_identity() {
-        let before = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "asha");
-        let after = derive_citizen_id(&owner("joelteply"), CitizenKind::Persona, "asha-2");
+    fn renaming_a_member_derives_a_different_identity() {
+        let before = derive_member_id(&owner("joelteply"), MemberKind::Persona, "asha");
+        let after = derive_member_id(&owner("joelteply"), MemberKind::Persona, "asha-2");
         assert_ne!(before, after);
     }
 }

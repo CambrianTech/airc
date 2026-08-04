@@ -34,6 +34,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod account_identity;
 pub mod account_registry;
 pub mod account_registry_fs;
 pub mod adapter;
@@ -50,7 +51,6 @@ pub mod error;
 pub mod external_identity;
 pub mod gh;
 pub mod grid_auth;
-pub mod grid_identity;
 pub mod join_context;
 mod lan;
 pub mod lane_coordination;
