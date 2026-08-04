@@ -75,4 +75,4 @@ ed25519-dalek = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tempfile = "3"
 temp-env = "0.3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
