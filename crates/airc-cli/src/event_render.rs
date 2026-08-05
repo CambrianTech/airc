@@ -16,6 +16,24 @@ use serde_json::Value;
 /// presence heartbeats, which are continuous churn (one per peer per
 /// minute) and carry nothing the reader acts on.
 pub(crate) fn render_feed_line(event: &TranscriptEvent) -> Option<String> {
+    // Live stream chunks are EPHEMERAL by the substrate's own contract —
+    // `Airc::publish_stream_chunk` documents them as "typing-indicator class
+    // traffic, NOT durable transcript content", and the settled utterance is
+    // published separately as a `Message`. Rendering them put one feed line on
+    // the wire per TOKEN (~4/sec per talking persona), so a single paragraph
+    // arrived as dozens of unattributable fragments ("I", " see that my",
+    // " recent messages have been") and then AGAIN in full as the Message —
+    // pure duplication that drowns real signal and rate-limits agent monitors
+    // into suppressing the channel entirely.
+    //
+    // Discriminated by the authoritative marker, not a heuristic: the
+    // `airc.stream.id` header is what `parse_stream_chunk` itself keys on, so
+    // this can never accidentally swallow a real System message (host eviction,
+    // error) — those carry no stream header. Same suppression `alive` already
+    // gets below, for the same reason: continuous churn the reader never acts on.
+    if event.headers.contains_key(airc_lib::HEADER_STREAM_ID) {
+        return None;
+    }
     let detail = body_detail(event.body.as_ref())?;
     // ONE event = ONE line, unconditionally. A multi-line message body used to
     // print raw, so every consumer that tails this feed line-by-line (agent
@@ -116,6 +134,57 @@ mod tests {
         assert_eq!(
             body_detail(Some(&Body::text("hello"))),
             Some("hello".into())
+        );
+    }
+
+    // what this catches: a live stream chunk must NEVER reach the feed. Chunks
+    // are ephemeral typing-indicator traffic (`publish_stream_chunk`'s own
+    // contract) emitted ~4/sec per talking persona, and the same text arrives
+    // again as a settled Message — so rendering them is pure duplication that
+    // rate-limited agent monitors into suppressing the whole channel
+    // (glass-boxed 2026-08-05). Regression for #275.
+    #[test]
+    fn live_stream_chunks_are_suppressed_but_real_system_messages_are_not() {
+        use airc_core::{
+            ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+        };
+
+        let base = |headers: Headers, text: &str| TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::System,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers,
+            body: Some(Body::text(text)),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+
+        let mut chunk_headers = Headers::new();
+        chunk_headers.insert(airc_lib::HEADER_STREAM_ID.into(), "stream-1".to_string());
+        chunk_headers.insert(airc_lib::HEADER_STREAM_SEQ.into(), "7".to_string());
+        chunk_headers.insert(
+            airc_lib::HEADER_STREAM_KIND.into(),
+            "text.token".to_string(),
+        );
+        assert!(
+            render_feed_line(&base(chunk_headers, " see that my")).is_none(),
+            "a chunk carrying airc.stream.id must be suppressed from the feed"
+        );
+
+        // The discriminator is the stream header, NOT the System kind — a real
+        // substrate System message carries no stream id and must still render,
+        // or suppressing chunk noise would also blind the reader to evictions.
+        let line = render_feed_line(&base(Headers::new(), "host evicted: quota exceeded"))
+            .expect("a real System message still renders");
+        assert!(
+            line.contains("host evicted"),
+            "system detail survives: {line}"
         );
     }
 
