@@ -1475,20 +1475,41 @@ pub async fn run_daemon(
     // peers that can't speak the current protocol). The dangerous half (fetch +
     // smoke-test + rollback-safe `airc update --auto`, spawned detached) lives
     // in `airc_daemon::auto_update`; the daemon supplies only the MESH-IDLE
-    // predicate so an update never restarts mid-work. Idle = zero live LAN peer
-    // connections: with no connection there is definitionally no in-flight mesh
-    // work to drop, and control-plane reconnect after a restart is cheap +
-    // self-healing. (Refinement TODO: once stream-plane sessions are tracked in
-    // daemon connection-state, gate on "no active TRANSFER" so a connected-but-
-    // quiet node can still update.) Exits on the shared shutdown notifier.
+    // predicate so an update never restarts mid-work.
+    //
+    // Idle = NO HEALTHY PEER HAS FRAMES OUTSTANDING (`mesh_is_quiet` over the
+    // delivery-truth stats, #280). This replaced `connected_lan_peers == 0`,
+    // which was inverted: a node connected to the mesh — i.e. one doing its job
+    // — was never "idle", so it could never self-update, and only an already-
+    // isolated node ever did. That is why two healthy nodes sat on a stale build
+    // for a day (2026-08-05) with a merged transport fix available, until a human
+    // ran the update by hand on both. Connection COUNT is not work.
+    //
+    // Note the resolved TODO this carries: a connected-but-quiet node CAN now
+    // update, which is the whole point. Exits on the shared shutdown notifier.
     let auto_update_task = {
         let daemon_state = state.clone();
         tokio::spawn(async move {
             airc_daemon::auto_update::run(&daemon_state.shutdown, || {
-                daemon_state
-                    .connected_lan_peers
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0
+                // try_read, NOT blocking_read: this predicate is called from
+                // inside the async tick, and tokio's RwLock::blocking_read
+                // panics in an async context — it would have taken the daemon
+                // down on the first tick.
+                match daemon_state.delivery_stats.try_read() {
+                    Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
+                        stats.iter().map(|s| (s.attempts_since_ack, s.suspect)),
+                    ),
+                    Err(_) => {
+                        // Contended write (stats being refreshed). Skip THIS
+                        // tick and retry next interval — never guess "quiet"
+                        // from a lock we couldn't read. Loud, because a
+                        // permanently-contended lock would silently become a
+                        // node that never self-updates again, which is the
+                        // exact failure class this whole path exists to kill.
+                        eprintln!("airc auto-update: delivery stats busy — skipping this check");
+                        false
+                    }
+                }
             })
             .await;
         })
