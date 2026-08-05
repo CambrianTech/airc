@@ -473,7 +473,6 @@ fn is_ancestor(source_dir: &Path, ancestor: &str, descendant: &str) -> Option<bo
 /// event sink, and surfaces error/warn counts so operators see
 /// substrate trouble without inspecting the wire by hand.
 async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
-    use airc_diagnostics::DiagnosticSeverity;
     use airc_lib::Airc;
 
     let airc = match Airc::open(home).await {
@@ -486,8 +485,9 @@ async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
         }
     };
 
-    let recent = match airc.recent_diagnostic_events(256).await {
-        Ok(recent) => recent,
+    const DIAG_SCAN_WINDOW: usize = 256;
+    let scan = match airc.recent_diagnostics(DIAG_SCAN_WINDOW).await {
+        Ok(scan) => scan,
         Err(_) => {
             return vec![Finding::info(
                 "diagnostics",
@@ -496,45 +496,72 @@ async fn check_recent_diagnostics(home: &Path) -> Vec<Finding> {
         }
     };
 
-    if recent.is_empty() {
-        return vec![Finding::ok(
-            "diagnostics",
-            "no recent diagnostic events on the wire",
-        )];
+    vec![render_diagnostic_scan(&scan)]
+}
+
+/// Turn a diagnostic scan into a verdict. Pure: no IO, fully testable.
+///
+/// The empty case is the load-bearing one. Diagnostics are published as
+/// `FrameKind::Event`, which maps to `TranscriptKind::System` — the SAME
+/// transcript kind as agent heartbeats, stream chunks and lane-coordination
+/// frames — so the scan cannot filter them out by kind and is a raw newest-N
+/// page. On a node carrying real traffic those N events are heartbeats, every
+/// diagnostic has been evicted, and the check used to answer `[ok] no recent
+/// diagnostic events on the wire`. That is an inverted absence gate: it goes
+/// blind exactly when the node is busy, which is exactly when you are reading
+/// it. Absence is only a clean bill of health when the window was NOT full.
+fn render_diagnostic_scan(scan: &airc_lib::RecentDiagnostics) -> Finding {
+    use airc_diagnostics::DiagnosticSeverity;
+
+    if scan.events.is_empty() {
+        return if scan.establishes_clean() {
+            Finding::ok(
+                "diagnostics",
+                format!(
+                    "no diagnostic events on the wire (scanned all {} event(s) in this room)",
+                    scan.scanned
+                ),
+            )
+        } else {
+            Finding::info(
+                "diagnostics",
+                format!(
+                    "no diagnostics in the newest {} event(s), but the scan window was FULL of \
+                     other traffic — older diagnostics lie beyond it, so this is 'not visible \
+                     from here', not 'clean'",
+                    scan.scanned
+                ),
+            )
+        };
     }
 
     let mut errors = 0usize;
     let mut warns = 0usize;
-    for diag in &recent {
+    for diag in &scan.events {
         match diag.severity {
             DiagnosticSeverity::Error => errors += 1,
             DiagnosticSeverity::Warn => warns += 1,
             DiagnosticSeverity::Info | DiagnosticSeverity::Debug => {}
         }
     }
+    let found = scan.events.len();
 
     if errors > 0 {
-        vec![Finding::warn(
+        Finding::warn(
             "diagnostics",
-            format!(
-                "{errors} error / {warns} warn diagnostic(s) in last {} events",
-                recent.len()
-            ),
+            format!("{errors} error / {warns} warn diagnostic(s) in last {found} events"),
             "review with `airc events list --header-prefix airc.diag.severity=`",
-        )]
+        )
     } else if warns > 0 {
-        vec![Finding::info(
+        Finding::info(
             "diagnostics",
-            format!(
-                "{warns} warn diagnostic(s) in last {} events; no errors",
-                recent.len()
-            ),
-        )]
+            format!("{warns} warn diagnostic(s) in last {found} events; no errors"),
+        )
     } else {
-        vec![Finding::ok(
+        Finding::ok(
             "diagnostics",
-            format!("{} diagnostic event(s); none at warn/error", recent.len()),
-        )]
+            format!("{found} diagnostic event(s); none at warn/error"),
+        )
     }
 }
 
@@ -1227,6 +1254,79 @@ mod tests {
             Ancestry::Unknowable,
             "a commit this tree has never seen is not evidence against the binary"
         );
+    }
+
+    fn scan(events: Vec<airc_diagnostics::DiagnosticEvent>, scanned: usize, full: bool) -> airc_lib::RecentDiagnostics {
+        airc_lib::RecentDiagnostics {
+            events,
+            scanned,
+            window_saturated: full,
+        }
+    }
+
+    fn diag(severity: airc_diagnostics::DiagnosticSeverity) -> airc_diagnostics::DiagnosticEvent {
+        use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
+        DiagnosticEvent {
+            severity,
+            component: DiagnosticComponent::Transport,
+            code: DiagnosticCode::ConnectionError,
+            message: "t".into(),
+            fields: Default::default(),
+            occurred_at_ms: 0,
+        }
+    }
+
+    /// what this catches: an INVERTED absence gate — the diagnostic check went
+    /// blind exactly when the node was busy. Diagnostics share
+    /// TranscriptKind::System with heartbeats and stream chunks, so the scan is
+    /// a raw newest-256 page; on a node carrying traffic every diagnostic is
+    /// evicted and the old code answered `[ok] no recent diagnostic events on
+    /// the wire` while errors were being emitted. Measured 2026-08-05 on
+    /// BIGMAMA: `airc events list --limit 80` returned 79 heartbeats and 1
+    /// message. A FULL window can never be reported as clean.
+    #[test]
+    fn a_full_scan_window_is_not_visible_from_here_never_clean() {
+        let full = render_diagnostic_scan(&scan(vec![], 256, true));
+        assert_eq!(
+            full.status,
+            Status::Info,
+            "a saturated window must not claim a clean diagnostic surface"
+        );
+        assert!(full.detail.contains("not visible"), "{}", full.detail);
+
+        // The genuinely-quiet node still gets its [ok] — the fix must not
+        // turn every healthy scope into a permanent info line.
+        let quiet = render_diagnostic_scan(&scan(vec![], 12, false));
+        assert_eq!(quiet.status, Status::Ok);
+        assert!(quiet.detail.contains("scanned all 12"), "{}", quiet.detail);
+    }
+
+    #[test]
+    fn diagnostics_found_still_rank_by_severity() {
+        // what this catches: the empty-case rework must leave the case the
+        // check exists for intact — errors warn, warns inform, clean is ok.
+        use airc_diagnostics::DiagnosticSeverity::{Error, Info as DInfo, Warn};
+        assert_eq!(
+            render_diagnostic_scan(&scan(vec![diag(Error), diag(Warn)], 256, true)).status,
+            Status::Warn
+        );
+        assert_eq!(
+            render_diagnostic_scan(&scan(vec![diag(Warn)], 256, true)).status,
+            Status::Info
+        );
+        assert_eq!(
+            render_diagnostic_scan(&scan(vec![diag(DInfo)], 256, true)).status,
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn establishes_clean_requires_both_empty_and_unsaturated() {
+        // what this catches: the whole disambiguation collapses if this
+        // predicate ever ignores saturation.
+        assert!(scan(vec![], 12, false).establishes_clean());
+        assert!(!scan(vec![], 256, true).establishes_clean());
+        assert!(!scan(vec![diag(airc_diagnostics::DiagnosticSeverity::Warn)], 12, false).establishes_clean());
     }
 
     #[test]
