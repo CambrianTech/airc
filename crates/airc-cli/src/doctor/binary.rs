@@ -56,6 +56,7 @@ fn check_binary_freshness() -> Vec<Finding> {
                 &source_head,
                 ancestry,
             )));
+            findings.push(check_channel_freshness(&source_dir));
         }
     } else {
         findings.push(Finding::info(
@@ -65,6 +66,90 @@ fn check_binary_freshness() -> Vec<Finding> {
     }
 
     findings
+}
+
+/// Is this node running the CHANNEL, or merely self-consistent?
+///
+/// [`classify_source_drift`] answers "binary vs its own checkout" — a purely
+/// LOCAL question. A node can pass it while being collectively stale, and that
+/// is not hypothetical: measured on BIGMAMA 2026-08-06, doctor reported
+/// `installed binary is CURRENT; the source checkout is behind it` while BOTH
+/// were sitting on a feature branch a commit off canary. Internally consistent,
+/// externally wrong, reported healthy — the same "green component, broken
+/// system" shape the directional fix was written to kill, one scope out.
+///
+/// Why it matters beyond tidiness (Joel, 2026-08-06): *"if you're not updating
+/// binaries you're not getting fixes and experiencing each other's code.
+/// Personas and you guys are our QA."* Two agents each running a private branch
+/// are not testing the shared system; they are each testing a fork and both
+/// reporting green. Every persona on the box inherits that binary.
+///
+/// Deliberately does NO NETWORK I/O. A diagnostic that silently fetches is slow
+/// and surprising, so this compares against the LAST-FETCHED channel ref and
+/// says so — "as of last fetch" is an honest qualifier, and claiming more would
+/// be the exact kind of over-stated receipt this module exists to prevent.
+fn check_channel_freshness(source_dir: &Path) -> Finding {
+    let channel = crate::update_commands::update_channel();
+    let Some(tip) = channel_tip(source_dir, &channel) else {
+        return Finding::info(
+            "channel",
+            format!(
+                "no local ref for channel `{channel}` (never fetched here) — can't tell whether \
+                 this node is current; `airc update` resolves it"
+            ),
+        );
+    };
+    let binary = crate::build_info::COMMIT;
+    if binary == tip {
+        return Finding::ok(
+            "channel",
+            format!("running channel `{channel}` ({})", short_sha(&tip)),
+        );
+    }
+    match is_ancestor(source_dir, binary, &tip) {
+        // Binary is an ancestor of the channel tip => strictly behind.
+        Some(true) => Finding::warn(
+            "channel",
+            format!(
+                "BEHIND channel `{channel}` as of last fetch (binary={} channel={}) — you are not \
+                 running peers' merged fixes, and every persona on this box inherits this binary",
+                short_sha(binary),
+                short_sha(&tip)
+            ),
+            "run `airc update`",
+        ),
+        // Not an ancestor: a local/feature build. Legitimate mid-work, but it is
+        // NOT the channel, and saying so is the whole point.
+        Some(false) => Finding::info(
+            "channel",
+            format!(
+                "running a build that is not on channel `{channel}` (binary={} channel={}) — fine \
+                 while working a branch, but this node is not exercising the shared build",
+                short_sha(binary),
+                short_sha(&tip)
+            ),
+        ),
+        None => Finding::info(
+            "channel",
+            format!("couldn't compare against channel `{channel}`; leaving it unjudged"),
+        ),
+    }
+}
+
+/// Last-fetched tip of `origin/<channel>`, or `None` when this checkout has no
+/// such ref. No fetch — see [`check_channel_freshness`].
+fn channel_tip(source_dir: &Path, channel: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_dir)
+        .args(["rev-parse", &format!("refs/remotes/origin/{channel}")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let tip = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!tip.is_empty()).then_some(tip)
 }
 
 fn source_tree_head() -> Option<(std::path::PathBuf, String)> {
