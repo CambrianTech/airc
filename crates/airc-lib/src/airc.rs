@@ -1957,6 +1957,31 @@ impl Airc {
             .map(|subscription| subscription.as_room()))
     }
 
+    /// Resolve a subscribed room by its channel id.
+    ///
+    /// The companion to [`Self::project_room_work_board`] for callers that carry
+    /// a room ID rather than a room: a consumer bound to one room (continuum's
+    /// persona board gate binds `RoomId`) can name the room it means instead of
+    /// falling through to [`Self::current_room`], which answers "whatever my
+    /// default subscription happens to be".
+    ///
+    /// `Ok(None)` is the honest answer for a channel this scope is not
+    /// subscribed to — the caller decides whether that is a degradation to
+    /// tolerate or a bug to shout about. Deliberately NOT falling back to the
+    /// default room: silently substituting a different room's board is the exact
+    /// failure this exists to make impossible.
+    pub async fn room_by_channel(
+        &self,
+        channel: airc_core::RoomId,
+    ) -> Result<Option<Room>, AircError> {
+        let set = self.subscription_set().await?;
+        let found = set
+            .all()
+            .map(|subscription| subscription.as_room())
+            .find(|room| room.channel == channel);
+        Ok(found)
+    }
+
     pub(crate) fn event_store(&self) -> &dyn EventStore {
         self.inner.store.as_ref()
     }
