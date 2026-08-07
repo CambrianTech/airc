@@ -750,13 +750,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 work_commands::run_cleanup(&home, dry_run, force).await
             }
             WorkAction::Board {
+                room,
                 limit,
                 available,
                 mine,
                 others,
             } => {
                 let filter = work_commands::BoardFilter::from_flags(available, mine, others);
-                work_commands::run_board(&home, limit, filter).await
+                work_commands::run_board(&home, room, limit, filter).await
             }
             WorkAction::Next {
                 repo,

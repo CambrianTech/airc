@@ -5,7 +5,7 @@ use crate::work_board_cache::{
     cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
     WORK_BOARD_CACHE_FORMAT_VERSION,
 };
-use crate::{Airc, AircError};
+use crate::{Airc, AircError, Room};
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
@@ -826,7 +826,22 @@ impl Airc {
     /// projection the scheduling/mutation paths use (cheap since card
     /// 1291173d: snapshot + incremental resume).
     pub async fn work_board(&self) -> Result<WorkBoardProjection, AircError> {
-        self.work_board_complete(WORK_BOARD_PROJECTION_PAGE_SIZE)
+        self.work_board_in(&self.current_room().await?).await
+    }
+
+    /// The complete work board of a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::work_board`] answers "the board of whatever room I happen to
+    /// point at"; this answers "the board of THIS room". Continuum #345: a
+    /// caller that means a specific room must be able to say so, because the
+    /// silent default produces a plausible board for the wrong room and nothing
+    /// in the result says which one it read.
+    ///
+    /// Same page size as `work_board` — the default lives in exactly one place,
+    /// so the two can never disagree about how much history a "complete" board
+    /// folds in.
+    pub async fn work_board_in(&self, room: &Room) -> Result<WorkBoardProjection, AircError> {
+        self.project_room_work_board(room, WORK_BOARD_PROJECTION_PAGE_SIZE)
             .await
     }
 

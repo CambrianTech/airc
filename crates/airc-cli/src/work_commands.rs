@@ -1973,16 +1973,36 @@ fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
     }
 }
 
+/// Print a room's work board.
+///
+/// `room` is the caller's explicit scope — a channel name or id — and `None`
+/// means "the current room". Continuum #345: whichever way the room is chosen,
+/// the output SAYS which room it read. The flag is the convenience; the label is
+/// the fix. A board read against the wrong room is not an error and does not look
+/// like one — it is a plausible list of somebody else's cards, and the only thing
+/// that distinguishes it from the right answer is a line naming the scope. (I hit
+/// this myself and nearly reported a card released while another peer still held
+/// it, having filed this very bug an hour earlier — knowing about a silent default
+/// does not protect you from it.)
 pub async fn run_board(
     home: &Path,
+    room: Option<String>,
     limit: usize,
     filter: BoardFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "read the work board of")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
     // Continuum #154: the board is always the COMPLETE projection —
     // the old recent-window read lost every durable card to chat
     // traffic in busy rooms. `limit` now caps displayed rows only.
-    let board = airc.work_board().await?;
+    let board = airc.work_board_in(&room).await?;
+    println!("work board — #{} [{}]", room.name, room.channel);
     let me = airc.peer_id();
 
     // Pre-fetch published aliases for every distinct non-self owner on
