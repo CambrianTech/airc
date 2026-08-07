@@ -919,11 +919,39 @@ fn format_send_receipt(
              Any scope tailing this channel on this machine still has it."
         )
     } else {
+        // Report REACH, not the address book. `enrolled_peers` is every peer this
+        // scope has ever enrolled — across every room, for all time — so printing
+        // it beside a live count invites the reader to divide, and that ratio is
+        // meaningless: the enrolled set is not this room's audience, and
+        // `connected_lan_peers` counts LAN links only.
+        //
+        // Live 2026-08-07 that arithmetic manufactured a false alarm. "addressed 52
+        // enrolled remote peer(s), 1 currently connected" reads as 2% reach; the
+        // ack ledger for the same period showed 767 of 771 delivered — 99.5%. A
+        // card was filed on the strength of the receipt (#340) and the receipt was
+        // the only thing wrong. An instrument that reads as a catastrophe during
+        // healthy operation is worse than no instrument: it burns the operator's
+        // trust in every future alarm.
+        //
+        // So: state the live count as a plain fact with no denominator to divide
+        // by, and point at `airc doctor --health`, which reads the ACK ledger
+        // (#280 — delivery is a returned ack, never a connection's existence).
+        let peers = if connected_lan_peers == 1 {
+            "1 peer"
+        } else {
+            "peers"
+        };
+        let count = if connected_lan_peers == 1 {
+            String::new()
+        } else {
+            format!("{connected_lan_peers} ")
+        };
         format!(
-            "queued to {channel_name} ({channel_id}) — addressed {enrolled_peers} enrolled \
-             remote peer(s), {connected_lan_peers} currently connected; delivery is \
-             asynchronous and not yet confirmed \
-             (run `airc doctor --health` to check route delivery). \
+            "queued to {channel_name} ({channel_id}) — live to {count}{peers} now; \
+             delivery is asynchronous and confirmed by ACK, not by this line \
+             (run `airc doctor --health` for the delivery ledger). \
+             {enrolled_peers} peer(s) are enrolled in this scope's address book, \
+             which is not this room's audience — do not read it as a reach ratio. \
              Any scope tailing this channel on this machine also receives it."
         )
     }
@@ -3016,16 +3044,58 @@ mod tests {
         // It IS honest about what happened and what is unconfirmed.
         assert!(line.contains("queued to general"), "honest verb: {line}");
         assert!(
-            line.contains("41 enrolled"),
-            "addressed-peer count framed as enrolled, not delivered: {line}"
+            line.contains("enrolled"),
+            "the address-book count is still disclosed, just not as reach: {line}"
         );
         assert!(
-            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            line.contains("asynchronous"),
             "must state delivery is unconfirmed: {line}"
         );
         assert!(
             line.contains("airc doctor --health"),
             "must tell operator how to confirm delivery: {line}"
+        );
+    }
+
+    /// what this catches (#351): the receipt inviting the reader to compute a
+    /// REACH RATIO out of two incommensurable numbers.
+    ///
+    /// It used to print "addressed 52 enrolled remote peer(s), 1 currently
+    /// connected". Enrolled is every peer this scope ever met, across every room,
+    /// for all time — not this room's audience — and the live count is LAN links
+    /// only. Read as a fraction it says 2%. The ack ledger for the same period
+    /// said 767 of 771 delivered: 99.5%. A card (#340) was filed on the strength
+    /// of that line, and the line was the only thing wrong.
+    ///
+    /// An instrument that reads as catastrophe during healthy operation is worse
+    /// than no instrument — it spends the trust that a REAL alarm will need.
+    #[test]
+    fn the_receipt_never_reads_as_a_reach_ratio() {
+        // The shape that caused the false alarm: a big address book, one live link.
+        let line = format_send_receipt("cambriantech", "cb2e21a1", 52, 1);
+
+        // The adjacency itself was the bug — "N enrolled …, M currently connected"
+        // sitting together is what the eye divides. Neither the old phrasing nor
+        // the old ordering may come back.
+        assert!(
+            !line.contains("currently connected"),
+            "a live-link count must not sit where it reads as the numerator: {line}"
+        );
+        assert!(
+            !line.contains("addressed 52"),
+            "the address book is not an audience and must not be 'addressed': {line}"
+        );
+        // It must say so outright, because a reader who has been burned once will
+        // keep dividing unless told the denominator is not a denominator.
+        assert!(
+            line.contains("not this room's audience"),
+            "must disclaim the address book explicitly: {line}"
+        );
+        // And it must point at the ACK ledger, which is what delivery actually
+        // means (#280: delivery is a returned ack, never a connection's existence).
+        assert!(
+            line.contains("ACK") || line.contains("ack"),
+            "delivery truth is the ack ledger, not this line: {line}"
         );
     }
 
@@ -3090,12 +3160,18 @@ mod tests {
     #[test]
     fn send_receipt_reports_connected_subset_when_routes_are_up() {
         let line = format_send_receipt("general", "cb2e21a1", 42, 3);
+        // Both facts are still disclosed — the fix was never about hiding a
+        // number, it was about not pairing them as numerator and denominator.
         assert!(
-            line.contains("42 enrolled") && line.contains("3 currently connected"),
-            "must report enrolled total and live-connected subset: {line}"
+            line.contains("3 peers"),
+            "the live-link count is still reported: {line}"
         );
         assert!(
-            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            line.contains("42 peer(s) are enrolled"),
+            "the address-book size is still reported, as its own fact: {line}"
+        );
+        assert!(
+            line.contains("asynchronous"),
             "still does not claim confirmed delivery: {line}"
         );
     }
