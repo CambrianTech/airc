@@ -37,6 +37,15 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     // entered on purpose by someone who can re-run it, and a rollback needs
     // its own backup anchor + failure modes. Verification is what was missing;
     // silently rolling back an operator's explicit action is a separate call.
+    //
+    // Nor does this SELF-HEAL, unlike the daemon check below — and the
+    // asymmetry is the point, not an oversight. Heal what has a known-safe
+    // idempotent remedy; report what needs a human decision. A stale daemon is
+    // the former: stop it, start it, done. A binary that did not land is
+    // usually the installer writing somewhere other than what the shell
+    // resolves, and re-running an installer that already did its job cannot fix
+    // a PATH. Retrying there would be theatre — it would burn minutes, change
+    // nothing, and teach the operator that the check is noise.
     if !smoke_test_new_binary(&airc_exe, &after) {
         return Err(format!(
             "update did NOT take: the source reached {after}, but the binary at \
@@ -56,7 +65,15 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     if daemon_was_running {
         restart_daemon(&airc_exe, home, &socket)?;
         wait_daemon_ready(&airc_exe, home, &socket)?;
-        println!("daemon: restarted.");
+        // The NEXT link in the chain. `wait_daemon_ready` proves a daemon
+        // answers; it does not prove it is the daemon we just built. A stale
+        // process that survived `stop_daemon` answers IPC perfectly, so
+        // "daemon: restarted." was true and useless — the exact shape
+        // `check_daemon_build` in doctor.rs was written for after it went
+        // undetected on a live node for hours. That check only runs under
+        // `doctor --health`; update restarts the daemon and never asked.
+        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+        println!("daemon: restarted (build verified).");
     }
     Ok(())
 }
@@ -482,6 +499,80 @@ fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Err
         .into());
     }
     Ok(())
+}
+
+/// Confirm the running daemon is the build we just installed — and if it is
+/// not, HEAL it rather than reporting a problem to a human.
+///
+/// `wait_daemon_ready` proves *a* daemon answers. It does not prove it is the
+/// daemon we just built. A process that survived `stop_daemon` answers IPC
+/// perfectly, so "daemon: restarted." was true and useless. That is the exact
+/// drift `doctor.rs::check_daemon_build` was written for — after it went
+/// undetected on a live node for hours — and it only runs under
+/// `doctor --health`, which update never invokes.
+///
+/// Fail-loud is not the goal here. Per the self-healing mandate (#288, "heal
+/// through flux and updates autonomously — no human ever runs the fix"), a
+/// deploy path that *detects* staleness and hands it back to an operator has
+/// only moved the work. The remedy for a stale daemon is known, safe, and
+/// idempotent — stop it and start it again — so we do that ourselves, once.
+///
+/// Only when the second attempt ALSO comes back stale do we stop and say so,
+/// naming both shas and what was already tried. One retry, not a loop: a
+/// daemon that ignores two clean restarts has something wrong that another
+/// restart will not fix, and hiding that behind retries is how a brittle
+/// system looks healthy right up until it doesn't.
+fn verify_daemon_build(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        return Ok(());
+    }
+
+    eprintln!(
+        "⚠ the daemon came back on a build that is not {expected} — restarting it \
+         once more before reporting anything (a process that survived the stop \
+         answers IPC just fine)."
+    );
+    restart_daemon(airc_exe, home, socket)?;
+    wait_daemon_ready(airc_exe, home, socket)?;
+
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        eprintln!("✓ self-healed: the daemon is now running {expected}.");
+        return Ok(());
+    }
+
+    Err(format!(
+        "the running daemon is NOT the build that was just installed ({expected}), \
+         and a second clean restart did not change that. The binary on disk is \
+         correct — something is holding an old daemon process alive. Check for a \
+         stray `airc` process that did not exit, then `airc stop` and `airc join` \
+         to re-establish the transport owner. Reporting rather than retrying \
+         further: two restarts that both fail is not a timing problem."
+    )
+    .into())
+}
+
+/// Whether the daemon reachable on `socket` reports `expected` as its build.
+///
+/// `false` when it cannot be asked or reports nothing — an unverifiable daemon
+/// is not a verified one, and this is the predicate a heal decision hangs off,
+/// so "I don't know" must never read as "fine".
+fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &str) -> bool {
+    let Ok(output) = daemon_command(airc_exe, home, "status", socket).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_build_sha(&stdout) {
+        Some(sha) => smoke_sha_matches(&sha, expected),
+        None => false,
+    }
 }
 
 fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
