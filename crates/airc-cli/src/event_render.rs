@@ -75,6 +75,22 @@ fn json_detail(value: &Value) -> Option<String> {
     // Deserializing through the domain type (not hand-poking JSON) keeps
     // the schema in one place — airc-work owns it.
     if let Ok(event) = serde_json::from_value::<WorkEvent>(value.clone()) {
+        // Lease KEEPALIVE is churn, exactly like `alive` above: it repeats every
+        // presence pulse for every held card and says nothing that changed. One
+        // citizen holding three cards emits three lines per pulse forever; an
+        // agent tailing this feed sees the same burst indefinitely and starts
+        // suppressing the whole channel, which is how real signal gets lost
+        // (lived through it across a full session on 2026-08-07 — every flood
+        // was this one line).
+        //
+        // The claim STATE is not lost by suppressing it: `card_claimed` and
+        // `claim_released` still render because those are the transitions, and
+        // the standing truth lives on `airc work board` where a lease shows as
+        // live or <STALE>. Render what CHANGED, never the keepalive proving
+        // nothing changed.
+        if matches!(event, WorkEvent::ClaimHeartbeat(_)) {
+            return None;
+        }
         return Some(work_summary(&event));
     }
     // Some other structured body — still beats "<non-text body>".
@@ -134,6 +150,56 @@ mod tests {
         assert_eq!(
             body_detail(Some(&Body::text("hello"))),
             Some("hello".into())
+        );
+    }
+
+    // what this catches: lease KEEPALIVE reaching the feed. `claim_heartbeat`
+    // repeats every presence pulse for every held card and reports nothing that
+    // changed — one citizen holding three cards emits three identical lines per
+    // pulse, forever. Measured live 2026-08-07: an agent monitoring this feed
+    // received ~30 such bursts in one session, several per minute, and the
+    // rational response to an unbroken stream of no-op lines is to stop reading
+    // the channel — which is exactly how real signal (a peer's question, a
+    // failure) gets missed.
+    //
+    // The transitions still render (asserted below), and standing truth lives on
+    // `airc work board`, so nothing is lost: this suppresses the proof that
+    // nothing happened, not the fact that something did.
+    #[test]
+    fn a_claim_heartbeat_never_reaches_the_feed() {
+        let heartbeat = json!({
+            "kind": "claim_heartbeat",
+            "card_id": "00000000-0000-0000-0000-0000000000ff",
+            "claim_id": "00000000-0000-0000-0000-0000000000aa",
+            "owner": "00000000-0000-0000-0000-0000000000bb",
+            "ttl_ms": 1_800_000_u64,
+            "heartbeat_at_ms": 1_800_000_000_000_u64,
+        });
+        assert_eq!(
+            json_detail(&heartbeat),
+            None,
+            "lease keepalive is churn and must be suppressed like `alive`"
+        );
+    }
+
+    // what this catches: over-suppression. The transitions a reader DOES act on
+    // must survive — if a future filter widened to all work events, the board
+    // would go silent and look dead rather than quiet.
+    #[test]
+    fn claim_transitions_still_render() {
+        let claimed = json!({
+            "kind": "card_claimed",
+            "card_id": "00000000-0000-0000-0000-0000000000ff",
+            "claim_id": "00000000-0000-0000-0000-0000000000aa",
+            "owner": "00000000-0000-0000-0000-0000000000bb",
+            "ttl_ms": 1_800_000_u64,
+            "claimed_at_ms": 1_800_000_000_000_u64,
+        });
+        let rendered = json_detail(&claimed).expect("a claim is a transition worth reading");
+        assert!(
+            rendered.starts_with("card_claimed [") && rendered.contains(" by "),
+            "expected the PARSED summary, not the generic kind fallthrough \
+             (which would also contain the word) — got: {rendered}"
         );
     }
 
