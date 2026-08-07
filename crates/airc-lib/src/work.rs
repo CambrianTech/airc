@@ -980,7 +980,7 @@ impl Airc {
     /// `cursor`, in transcript order — via the daemon when attached,
     /// the local store otherwise. Pass the zero cursor for the
     /// complete history.
-    async fn room_transcripts_since(
+    pub(crate) async fn room_transcripts_since(
         &self,
         room: &crate::Room,
         cursor: &airc_core::TranscriptCursor,
