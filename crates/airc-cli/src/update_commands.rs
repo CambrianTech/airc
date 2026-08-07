@@ -17,6 +17,37 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 
     run_installer(&build_dir)?;
 
+    // Prove the BINARY became `after` before claiming anything about it (#354).
+    //
+    // Everything above this line is a statement about a git checkout; the
+    // operator reads the lines below as statements about the tool they are
+    // holding. Those were allowed to disagree silently — and did, on a live
+    // peer node on 2026-08-07: `airc update` printed "Already at 1e2f424 …
+    // daemon: restarted." and `airc --version` on the very next line said
+    // *3 commits behind*. Both true, neither lying, describing different
+    // objects.
+    //
+    // The check itself was never missing. `run_auto_update` has smoke-tested
+    // since it was written (`smoke_test_new_binary`, with rollback). It was
+    // simply never wired into the MANUAL path — the one the staleness banner
+    // tells you to run, and therefore the one a human or an agent actually
+    // reaches for. Built, correct, and not called where it mattered.
+    //
+    // Deliberately NOT mirroring the auto path's rollback here: this path is
+    // entered on purpose by someone who can re-run it, and a rollback needs
+    // its own backup anchor + failure modes. Verification is what was missing;
+    // silently rolling back an operator's explicit action is a separate call.
+    if !smoke_test_new_binary(&airc_exe, &after) {
+        return Err(format!(
+            "update did NOT take: the source reached {after}, but the binary at \
+             {} does not report it. Nothing verified this before, so this printed \
+             a success line instead. Check `which -a airc` — the installer may be \
+             writing somewhere other than the path your shell resolves.",
+            airc_exe.display()
+        )
+        .into());
+    }
+
     if before == after {
         println!("Already at {after} on channel {channel}.");
     } else {
@@ -556,6 +587,24 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#354): the exact live shape that motivated wiring
+    /// the smoke-test into the MANUAL update path. On 2026-08-07 a peer's
+    /// source resolved to one commit while the binary on PATH still reported
+    /// an older one, and `airc update` printed a success line anyway.
+    ///
+    /// The existing `smoke_sha_matches` tests cover the tolerant-prefix
+    /// direction (a successful update must not read as a failure). This covers
+    /// the other one: a genuinely stale binary must NOT slip through on a
+    /// prefix coincidence, and an unparsed/empty value must never vacuously
+    /// satisfy the check — a verification that passes on missing evidence is
+    /// worse than none.
+    #[test]
+    fn a_stale_binary_does_not_satisfy_the_commit_the_source_reached() {
+        assert!(!smoke_sha_matches("1e2f424aaaaa", "35d40b1"));
+        assert!(!smoke_sha_matches("", "35d40b1"));
+        assert!(!smoke_sha_matches("35d40b1468ee", ""));
+    }
 
     // what this catches (#288 pin-to-channel): the durable channel file wins over
     // the default, and missing/empty files fall through to "canary" — the update
