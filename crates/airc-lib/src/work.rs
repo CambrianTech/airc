@@ -857,7 +857,19 @@ impl Airc {
     /// source mismatch, a cursor the log no longer agrees with) is
     /// logged loudly and recovered by a full from-scratch replay —
     /// the cache is an accelerator, never an authority.
-    async fn project_room_work_board(
+    ///
+    /// **Public because a caller that is already room-scoped must be able to say
+    /// WHICH room it means.** [`Self::work_board_complete`] resolves
+    /// `current_room()` — "whatever my default subscription happens to be" — which
+    /// is right for the CLI (the operator's current room IS the intent) and wrong
+    /// for any consumer that carries its own room. Continuum's persona gate binds
+    /// a room id and then checks it against a board this read never consulted; the
+    /// two agree only because both were seeded from the same `current_room()` at
+    /// bootstrap. Nothing prevented a gate that passed for room A while the read
+    /// returned room B, and no probe would have fired. Diagnosed 2026-08-07 while
+    /// tracing why a citizen's board and the operator's disagreed (they were two
+    /// different rooms, and neither surface named the one it read).
+    pub async fn project_room_work_board(
         &self,
         room: &crate::Room,
         page_size: usize,
