@@ -1187,12 +1187,9 @@ impl Airc {
         // personas kept re-claiming already-completed cards because this guard
         // only checked lease expiry — the board read as open work forever.
         // Reopening is an explicit `airc work state` transition, never a claim.
-        if matches!(
-            card.state,
-            airc_work::CardState::Review
-                | airc_work::CardState::Merged
-                | airc_work::CardState::Closed
-        ) {
+        // The predicate lives on CardState so the surfaces that ADVERTISE
+        // claimability answer with the same rule this gate enforces.
+        if card.state.is_settled() {
             return Err(AircError::WorkCardNotClaimable {
                 card_id,
                 state: card.state,
