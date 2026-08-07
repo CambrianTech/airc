@@ -108,21 +108,57 @@ impl Airc {
         match target {
             PublishTarget::CurrentRoom => self.current_room().await,
             PublishTarget::RoomByName(name) => {
-                let set = subscriptions::load_or_init(self.event_store()).await?;
-                let channel_name = subscriptions::ChannelName::new(name).map_err(|error| {
-                    AircError::Route(format!("publish target channel name {name:?}: {error}"))
-                })?;
-                set.subscribed
-                    .get(&channel_name)
-                    .map(|subscription| subscription.as_room())
-                    .ok_or_else(|| {
-                        AircError::Route(format!(
-                            "refusing to publish to {name:?}: this scope is not subscribed to that \
-                             channel. join the room first (publish does not auto-join)."
-                        ))
-                    })
+                self.room_by_name_or_channel(name, "publish to").await
             }
         }
+    }
+
+    /// Resolve a room the caller NAMED — by channel name, or by the channel id
+    /// it already holds — against this scope's subscription set.
+    ///
+    /// One resolver, every "this room or that one" surface. `publish` had this
+    /// logic privately; the work board needs exactly the same question answered
+    /// (continuum #345), and a second copy would be the kind of duplication that
+    /// drifts — the two would disagree about whether an id is acceptable, or about
+    /// what the refusal says.
+    ///
+    /// Accepts a channel ID as well as a name because callers legitimately hold
+    /// either: a human types `#general`, while an agent reading a board or a
+    /// receipt has the raw channel uuid and nothing else. Refusing the id would
+    /// force every such caller to invent its own id→name lookup.
+    ///
+    /// NEVER auto-joins. A room outside the subscription set is a loud refusal
+    /// naming the room and the remedy, because reading or publishing must not
+    /// silently change what this scope is part of.
+    pub async fn room_by_name_or_channel(
+        &self,
+        name_or_channel: &str,
+        verb: &str,
+    ) -> Result<crate::Room, AircError> {
+        // Id first: a uuid is unambiguous, and a channel name can never parse as one.
+        if let Ok(uuid) = uuid::Uuid::parse_str(name_or_channel) {
+            let channel = RoomId::from_uuid(uuid);
+            if let Some(room) = self.room_by_channel(channel).await? {
+                return Ok(room);
+            }
+            return Err(AircError::Route(format!(
+                "refusing to {verb} {name_or_channel:?}: this scope is not subscribed to that \
+                 channel id. join the room first (this does not auto-join)."
+            )));
+        }
+        let set = subscriptions::load_or_init(self.event_store()).await?;
+        let channel_name = subscriptions::ChannelName::new(name_or_channel).map_err(|error| {
+            AircError::Route(format!("channel name {name_or_channel:?}: {error}"))
+        })?;
+        set.subscribed
+            .get(&channel_name)
+            .map(|subscription| subscription.as_room())
+            .ok_or_else(|| {
+                AircError::Route(format!(
+                    "refusing to {verb} {name_or_channel:?}: this scope is not subscribed to that \
+                     channel. join the room first (this does not auto-join)."
+                ))
+            })
     }
 }
 

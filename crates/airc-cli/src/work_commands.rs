@@ -1938,8 +1938,14 @@ impl BoardFilter {
         match self {
             Self::All => true,
             Self::Available => {
-                use airc_work::model::CardState;
-                if matches!(card.state, CardState::Closed | CardState::Merged) {
+                // Ask the SAME predicate the claim gate enforces. This filter
+                // used to spell its own exclusion list (`Closed | Merged`) and
+                // fell behind when `Review` was added to the gate on
+                // 2026-07-24 — so the board advertised settled cards as
+                // available and the claim then refused them. "Available" has
+                // to mean "the claim will accept this", or it is a promise the
+                // substrate breaks at the moment someone acts on it.
+                if card.state.is_settled() {
                     return false;
                 }
                 match (card.claim_id, card.claim_expires_at_ms) {
@@ -1973,16 +1979,36 @@ fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
     }
 }
 
+/// Print a room's work board.
+///
+/// `room` is the caller's explicit scope — a channel name or id — and `None`
+/// means "the current room". Continuum #345: whichever way the room is chosen,
+/// the output SAYS which room it read. The flag is the convenience; the label is
+/// the fix. A board read against the wrong room is not an error and does not look
+/// like one — it is a plausible list of somebody else's cards, and the only thing
+/// that distinguishes it from the right answer is a line naming the scope. (I hit
+/// this myself and nearly reported a card released while another peer still held
+/// it, having filed this very bug an hour earlier — knowing about a silent default
+/// does not protect you from it.)
 pub async fn run_board(
     home: &Path,
+    room: Option<String>,
     limit: usize,
     filter: BoardFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "read the work board of")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
     // Continuum #154: the board is always the COMPLETE projection —
     // the old recent-window read lost every durable card to chat
     // traffic in busy rooms. `limit` now caps displayed rows only.
-    let board = airc.work_board().await?;
+    let board = airc.work_board_in(&room).await?;
+    println!("work board — #{} [{}]", room.name, room.channel);
     let me = airc.peer_id();
 
     // Pre-fetch published aliases for every distinct non-self owner on
@@ -3432,6 +3458,57 @@ mod tests {
         // Closed terminal → never available (even with no claim)
         let card = make_card(CardState::Closed, None, None, None);
         assert!(!BoardFilter::Available.matches(&card, me, 1_000));
+
+        // Review with a LAPSED claim → NOT available. This is the case that
+        // was live-wrong (continuum #345 follow-up, measured 2026-08-07): the
+        // lapsed lease made it look reclaimable, the claim gate refuses it as
+        // settled work, and one real board advertised 12 of 12 available with
+        // 4 of them in this exact state.
+        let card = make_card(CardState::Review, Some(other), Some(claim), Some(500));
+        assert!(!BoardFilter::Available.matches(&card, me, 1_000));
+    }
+
+    /// what this catches: the two-surface drift itself, not just one state.
+    /// `--available` is a PROMISE that the claim gate will accept the card, so
+    /// it must agree with `CardState::is_settled` for EVERY variant — including
+    /// ones added later. The original filter spelled its own exclusion list and
+    /// silently fell behind when `Review` joined the gate; enumerating every
+    /// state here means the next variant added to the enum cannot repeat it
+    /// without turning this red.
+    #[test]
+    fn available_never_advertises_a_state_the_claim_gate_refuses() {
+        let me = PeerId::from_u128(10);
+        let other = PeerId::from_u128(20);
+        let claim = ClaimId::from_u128(30);
+
+        for state in [
+            CardState::Open,
+            CardState::Claimed,
+            CardState::InProgress,
+            CardState::Blocked,
+            CardState::Review,
+            CardState::Merged,
+            CardState::Closed,
+        ] {
+            // A lapsed claim is the ONLY interesting case: it is what makes a
+            // card look takeable, so it is where an over-advertising filter
+            // shows up.
+            let card = make_card(state, Some(other), Some(claim), Some(500));
+            let advertised = BoardFilter::Available.matches(&card, me, 1_000);
+            assert!(
+                !(advertised && state.is_settled()),
+                "BUG: --available advertises {state:?}, which the claim gate refuses as settled \
+                 work — the board is promising work the substrate will not hand over"
+            );
+        }
+
+        // Positive control: without this, a filter that returned `false` for
+        // everything would pass the assertion above vacuously.
+        let live = make_card(CardState::Claimed, Some(other), Some(claim), Some(500));
+        assert!(
+            BoardFilter::Available.matches(&live, me, 1_000),
+            "a lapsed claim on unsettled work must still read as available"
+        );
     }
 
     #[test]

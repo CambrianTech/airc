@@ -146,7 +146,7 @@ pub struct RoomsResponse {
 
 /// One subscribed room, straight from the coordinator store's
 /// subscriptions table. `name` is the human channel name (`general`,
-/// `k3-serving`); `room_id` is the converged UUID clients address
+/// `project-x`); `room_id` is the converged UUID clients address
 /// events with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IpcRoomInfo {

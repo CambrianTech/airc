@@ -4,8 +4,8 @@
 //! Before this op, an attached client (continuum's nav, a TUI room
 //! list) could only learn rooms by watching traffic — a rebooted
 //! interface showed ONE room until each of the others happened to
-//! speak (live-found 2026-07-31: Joel's interface down to just
-//! k3-serving). These tests pin the membership read: every subscribed
+//! speak (live-found 2026-07-31: Joel's interface down to a
+//! single room). These tests pin the membership read: every subscribed
 //! room is returned with its name and default flag, parted rooms are
 //! excluded, and an empty registry is an empty list — never an error.
 //!
@@ -111,7 +111,7 @@ async fn list_rooms_serves_the_registry_and_excludes_parted() {
     coordinator
         .replace_subscriptions(vec![
             sub("general", 0x1, true, false),
-            sub("k3-serving", 0x2, false, false),
+            sub("project-x", 0x2, false, false),
             sub("old-experiment", 0x3, false, true), // explicitly left
         ])
         .await
@@ -127,7 +127,7 @@ async fn list_rooms_serves_the_registry_and_excludes_parted() {
     assert_eq!(rooms[0].name, "general");
     assert_eq!(rooms[0].room_id, RoomId::from_u128(0x1));
     assert!(rooms[0].is_default, "default flag survives the wire");
-    assert_eq!(rooms[1].name, "k3-serving");
+    assert_eq!(rooms[1].name, "project-x");
     assert!(!rooms[1].is_default);
     assert!(
         !rooms.iter().any(|r| r.name == "old-experiment"),
