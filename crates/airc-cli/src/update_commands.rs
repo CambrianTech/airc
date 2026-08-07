@@ -1113,18 +1113,27 @@ mod tests {
         // Source advanced but the binary was already built from the new tip —
         // distinct from a no-op for anyone debugging a stale node.
         let caught_up = update_summary(Some("a08f3d38145c"), "35d40b1", "a08f3d3", "canary");
-        assert!(caught_up.contains("source 35d40b1 -> a08f3d3"), "{caught_up}");
+        assert!(
+            caught_up.contains("source 35d40b1 -> a08f3d3"),
+            "{caught_up}"
+        );
 
         // Unreportable previous build is UNKNOWN, never "unchanged" — an old
         // binary with no `build:` banner is exactly the one needing an update.
         let unknown = update_summary(None, "35d40b1", "a08f3d3", "canary");
-        assert!(!unknown.contains("Already at"), "unknown != no-op: {unknown}");
+        assert!(
+            !unknown.contains("Already at"),
+            "unknown != no-op: {unknown}"
+        );
         assert!(unknown.contains("previous build unknown"), "{unknown}");
 
         // Short-vs-long SHA forms must still compare equal (same tolerance the
         // smoke test uses), or every update would report itself as a change.
         let mixed = update_summary(Some("a08f3d38145c"), "a08f3d3", "a08f3d3", "canary");
-        assert!(mixed.starts_with("Already at"), "prefix match holds: {mixed}");
+        assert!(
+            mixed.starts_with("Already at"),
+            "prefix match holds: {mixed}"
+        );
     }
 
     // what this catches: the SHA match tolerates the differing short-SHA
