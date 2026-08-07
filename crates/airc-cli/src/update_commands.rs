@@ -68,6 +68,13 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     if daemon_was_running {
         stop_daemon(&airc_exe, home, &socket)?;
     }
+    // What the OPERATOR is holding, read before we replace it. `before`/`after`
+    // above describe the git checkout; this describes the tool. They are
+    // independent, and the summary at the end has to speak about this one.
+    // (Canary's #1332 moved `prepare_build_source` before the no-op gate;
+    // this read only has to precede `run_installer`, which is what replaces
+    // the binary.)
+    let binary_before = installed_binary_sha(&airc_exe);
 
     run_installer(&build_dir)?;
 
@@ -111,11 +118,30 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
         .into());
     }
 
-    if before == after {
-        println!("Already at {after} on channel {channel}.");
-    } else {
-        println!("Updated ({channel}): {before} -> {after}");
-    }
+    // Report the BINARY's transition, not the checkout's (#354 follow-up).
+    //
+    // #354 made the update VERIFY the binary but left the summary branching on
+    // `before == after` — two git refs. Those describe the checkout, and the
+    // checkout can already be current while the binary is stale, so the two
+    // most different outcomes printed the SAME line:
+    //
+    //   nothing happened                     -> "Already at a08f3d3 on channel canary."
+    //   your binary was just replaced        -> "Already at a08f3d3 on channel canary."
+    //
+    // Measured on BigMama 2026-08-07, immediately after #354 landed: source was
+    // already at a08f3d3 (a manual pull had moved it), the installed binary was
+    // still 35d40b1, `airc update` rebuilt and installed a08f3d3 — and printed
+    // "Already at". The verification worked; the sentence describing it did not.
+    // An operator reading "Already at" reasonably concludes no work was done and
+    // does not restart anything that embeds the binary.
+    //
+    // Same defect as #354, one layer down: #354 fixed which object we CHECK,
+    // this fixes which object we TALK ABOUT. Both halves have to point at the
+    // tool the operator is holding.
+    println!(
+        "{}",
+        update_summary(binary_before.as_deref(), &before, &after, &channel)
+    );
     if daemon_was_running {
         restart_daemon(&airc_exe, home, &socket)?;
         wait_daemon_ready(&airc_exe, home, &socket)?;
@@ -422,6 +448,54 @@ fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
     match parse_build_sha(&stdout) {
         Some(sha) => smoke_sha_matches(&sha, expected_short),
         None => false,
+    }
+}
+
+/// The SHA the CURRENTLY INSTALLED binary reports, read by running it. `None`
+/// when it won't run or predates the `build:` banner — an old binary being
+/// exactly the case where an update matters most, so callers must treat `None`
+/// as "unknown", never as "unchanged".
+fn installed_binary_sha(airc_exe: &Path) -> Option<String> {
+    let output = Command::new(airc_exe).arg("version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_build_sha(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The one line the operator reads. Speaks about the BINARY; mentions the
+/// checkout only when it is the thing that did not move.
+///
+/// `binary_before` is `None` when the old binary could not report its SHA. That
+/// is NOT "unchanged" — an unreportable binary is precisely the stale one — so
+/// it renders as an installed-at statement rather than an "Already at" that
+/// would claim a no-op we cannot substantiate.
+///
+/// Pure — unit-tested.
+fn update_summary(
+    binary_before: Option<&str>,
+    source_before: &str,
+    after: &str,
+    channel: &str,
+) -> String {
+    match binary_before {
+        Some(b) if smoke_sha_matches(b, after) => {
+            // Binary already correct. Say whether the checkout moved under it,
+            // because "nothing to do" and "the source advanced but the binary
+            // was already built from it" are different facts to an operator
+            // debugging a stale node.
+            if source_before == after {
+                format!("Already at {after} on channel {channel} (binary and source current).")
+            } else {
+                format!(
+                    "Already at {after} on channel {channel} (binary current; source {source_before} -> {after})."
+                )
+            }
+        }
+        Some(b) => format!("Updated ({channel}): binary {b} -> {after}"),
+        None => format!(
+            "Installed ({channel}): binary now {after} (previous build unknown — it could not report one)"
+        ),
     }
 }
 
@@ -1012,6 +1086,45 @@ mod tests {
             "  airc 0.1.0\n  install: /home/u/.local/bin/airc\n  build:   9cc678fc0203 on canary\n";
         assert_eq!(parse_build_sha(out).as_deref(), Some("9cc678fc0203"));
         assert_eq!(parse_build_sha("no build line here"), None);
+    }
+
+    // what this catches: the summary must describe the BINARY, because the two
+    // most different outcomes used to print the identical line. Regression for
+    // the live BigMama case on 2026-08-07, immediately after #354: the checkout
+    // was ALREADY at a08f3d3 (a manual pull had moved it) while the installed
+    // binary was still 35d40b1, so `before == after` held, the binary was
+    // genuinely replaced, and update printed "Already at" — which an operator
+    // reads as "no work done" and acts on by not restarting anything.
+    #[test]
+    fn summary_reports_the_binary_transition_not_the_checkouts() {
+        // THE live case: source already current, binary stale → an UPDATE.
+        let s = update_summary(Some("35d40b1468ee"), "a08f3d3", "a08f3d3", "canary");
+        assert!(
+            s.starts_with("Updated (canary): binary 35d40b1468ee -> a08f3d3"),
+            "a replaced binary must not read as a no-op: {s}"
+        );
+        assert!(!s.contains("Already at"), "the old wording is the bug: {s}");
+
+        // Genuine no-op: binary already the pulled SHA and source did not move.
+        let noop = update_summary(Some("a08f3d38145c"), "a08f3d3", "a08f3d3", "canary");
+        assert!(noop.starts_with("Already at a08f3d3"), "{noop}");
+        assert!(noop.contains("binary and source current"), "{noop}");
+
+        // Source advanced but the binary was already built from the new tip —
+        // distinct from a no-op for anyone debugging a stale node.
+        let caught_up = update_summary(Some("a08f3d38145c"), "35d40b1", "a08f3d3", "canary");
+        assert!(caught_up.contains("source 35d40b1 -> a08f3d3"), "{caught_up}");
+
+        // Unreportable previous build is UNKNOWN, never "unchanged" — an old
+        // binary with no `build:` banner is exactly the one needing an update.
+        let unknown = update_summary(None, "35d40b1", "a08f3d3", "canary");
+        assert!(!unknown.contains("Already at"), "unknown != no-op: {unknown}");
+        assert!(unknown.contains("previous build unknown"), "{unknown}");
+
+        // Short-vs-long SHA forms must still compare equal (same tolerance the
+        // smoke test uses), or every update would report itself as a change.
+        let mixed = update_summary(Some("a08f3d38145c"), "a08f3d3", "a08f3d3", "canary");
+        assert!(mixed.starts_with("Already at"), "prefix match holds: {mixed}");
     }
 
     // what this catches: the SHA match tolerates the differing short-SHA
