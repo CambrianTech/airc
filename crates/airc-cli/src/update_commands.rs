@@ -17,6 +17,46 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 
     run_installer(&build_dir)?;
 
+    // Prove the BINARY became `after` before claiming anything about it (#354).
+    //
+    // Everything above this line is a statement about a git checkout; the
+    // operator reads the lines below as statements about the tool they are
+    // holding. Those were allowed to disagree silently — and did, on a live
+    // peer node on 2026-08-07: `airc update` printed "Already at 1e2f424 …
+    // daemon: restarted." and `airc --version` on the very next line said
+    // *3 commits behind*. Both true, neither lying, describing different
+    // objects.
+    //
+    // The check itself was never missing. `run_auto_update` has smoke-tested
+    // since it was written (`smoke_test_new_binary`, with rollback). It was
+    // simply never wired into the MANUAL path — the one the staleness banner
+    // tells you to run, and therefore the one a human or an agent actually
+    // reaches for. Built, correct, and not called where it mattered.
+    //
+    // Deliberately NOT mirroring the auto path's rollback here: this path is
+    // entered on purpose by someone who can re-run it, and a rollback needs
+    // its own backup anchor + failure modes. Verification is what was missing;
+    // silently rolling back an operator's explicit action is a separate call.
+    //
+    // Nor does this SELF-HEAL, unlike the daemon check below — and the
+    // asymmetry is the point, not an oversight. Heal what has a known-safe
+    // idempotent remedy; report what needs a human decision. A stale daemon is
+    // the former: stop it, start it, done. A binary that did not land is
+    // usually the installer writing somewhere other than what the shell
+    // resolves, and re-running an installer that already did its job cannot fix
+    // a PATH. Retrying there would be theatre — it would burn minutes, change
+    // nothing, and teach the operator that the check is noise.
+    if !smoke_test_new_binary(&airc_exe, &after) {
+        return Err(format!(
+            "update did NOT take: the source reached {after}, but the binary at \
+             {} does not report it. Nothing verified this before, so this printed \
+             a success line instead. Check `which -a airc` — the installer may be \
+             writing somewhere other than the path your shell resolves.",
+            airc_exe.display()
+        )
+        .into());
+    }
+
     if before == after {
         println!("Already at {after} on channel {channel}.");
     } else {
@@ -25,7 +65,15 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     if daemon_was_running {
         restart_daemon(&airc_exe, home, &socket)?;
         wait_daemon_ready(&airc_exe, home, &socket)?;
-        println!("daemon: restarted.");
+        // The NEXT link in the chain. `wait_daemon_ready` proves a daemon
+        // answers; it does not prove it is the daemon we just built. A stale
+        // process that survived `stop_daemon` answers IPC perfectly, so
+        // "daemon: restarted." was true and useless — the exact shape
+        // `check_daemon_build` in doctor.rs was written for after it went
+        // undetected on a live node for hours. That check only runs under
+        // `doctor --health`; update restarts the daemon and never asked.
+        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+        println!("daemon: restarted (build verified).");
     }
     Ok(())
 }
@@ -453,6 +501,80 @@ fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Confirm the running daemon is the build we just installed — and if it is
+/// not, HEAL it rather than reporting a problem to a human.
+///
+/// `wait_daemon_ready` proves *a* daemon answers. It does not prove it is the
+/// daemon we just built. A process that survived `stop_daemon` answers IPC
+/// perfectly, so "daemon: restarted." was true and useless. That is the exact
+/// drift `doctor.rs::check_daemon_build` was written for — after it went
+/// undetected on a live node for hours — and it only runs under
+/// `doctor --health`, which update never invokes.
+///
+/// Fail-loud is not the goal here. Per the self-healing mandate (#288, "heal
+/// through flux and updates autonomously — no human ever runs the fix"), a
+/// deploy path that *detects* staleness and hands it back to an operator has
+/// only moved the work. The remedy for a stale daemon is known, safe, and
+/// idempotent — stop it and start it again — so we do that ourselves, once.
+///
+/// Only when the second attempt ALSO comes back stale do we stop and say so,
+/// naming both shas and what was already tried. One retry, not a loop: a
+/// daemon that ignores two clean restarts has something wrong that another
+/// restart will not fix, and hiding that behind retries is how a brittle
+/// system looks healthy right up until it doesn't.
+fn verify_daemon_build(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        return Ok(());
+    }
+
+    eprintln!(
+        "⚠ the daemon came back on a build that is not {expected} — restarting it \
+         once more before reporting anything (a process that survived the stop \
+         answers IPC just fine)."
+    );
+    restart_daemon(airc_exe, home, socket)?;
+    wait_daemon_ready(airc_exe, home, socket)?;
+
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        eprintln!("✓ self-healed: the daemon is now running {expected}.");
+        return Ok(());
+    }
+
+    Err(format!(
+        "the running daemon is NOT the build that was just installed ({expected}), \
+         and a second clean restart did not change that. The binary on disk is \
+         correct — something is holding an old daemon process alive. Check for a \
+         stray `airc` process that did not exit, then `airc stop` and `airc join` \
+         to re-establish the transport owner. Reporting rather than retrying \
+         further: two restarts that both fail is not a timing problem."
+    )
+    .into())
+}
+
+/// Whether the daemon reachable on `socket` reports `expected` as its build.
+///
+/// `false` when it cannot be asked or reports nothing — an unverifiable daemon
+/// is not a verified one, and this is the predicate a heal decision hangs off,
+/// so "I don't know" must never read as "fine".
+fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &str) -> bool {
+    let Ok(output) = daemon_command(airc_exe, home, "status", socket).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_build_sha(&stdout) {
+        Some(sha) => smoke_sha_matches(&sha, expected),
+        None => false,
+    }
+}
+
 fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Stream the installer's output live instead of buffering it with
     // `Command::output()` (what run_checked does). install.sh does the
@@ -556,6 +678,24 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#354): the exact live shape that motivated wiring
+    /// the smoke-test into the MANUAL update path. On 2026-08-07 a peer's
+    /// source resolved to one commit while the binary on PATH still reported
+    /// an older one, and `airc update` printed a success line anyway.
+    ///
+    /// The existing `smoke_sha_matches` tests cover the tolerant-prefix
+    /// direction (a successful update must not read as a failure). This covers
+    /// the other one: a genuinely stale binary must NOT slip through on a
+    /// prefix coincidence, and an unparsed/empty value must never vacuously
+    /// satisfy the check — a verification that passes on missing evidence is
+    /// worse than none.
+    #[test]
+    fn a_stale_binary_does_not_satisfy_the_commit_the_source_reached() {
+        assert!(!smoke_sha_matches("1e2f424aaaaa", "35d40b1"));
+        assert!(!smoke_sha_matches("", "35d40b1"));
+        assert!(!smoke_sha_matches("35d40b1468ee", ""));
+    }
 
     // what this catches (#288 pin-to-channel): the durable channel file wins over
     // the default, and missing/empty files fall through to "canary" — the update
