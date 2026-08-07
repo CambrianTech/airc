@@ -1110,7 +1110,40 @@ impl Airc {
         &self,
         category_filter: Option<&str>,
     ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
-        let events = self.page_recent(500).await?;
+        self.wall_posts_in(&self.current_room().await?, category_filter)
+            .await
+    }
+
+    /// The wall of a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::wall_posts`] answers "the wall of whatever room I happen to
+    /// point at"; this answers "the wall of THIS room". Same split, and the
+    /// same reason, as [`Self::work_board`] vs `work_board_in`: a caller that
+    /// means a specific room must be able to say so, because the silent
+    /// default returns a plausible wall for the wrong room and nothing in the
+    /// result says which one it read.
+    ///
+    /// Continuum needs this to ask "is room X concluded?" about a room its
+    /// handle is not currently attached to — a persona reacts to traffic from
+    /// any subscribed room, not just its default one, so a current-room-only
+    /// read would answer about the wrong room precisely when the two differ.
+    ///
+    /// Reads through [`Self::room_transcripts_since`], the same room-scoped,
+    /// daemon-aware event path the work board projects from — wall and board
+    /// are two projections of one transcript and must never disagree about
+    /// which events they can see.
+    pub async fn wall_posts_in(
+        &self,
+        room: &crate::Room,
+        category_filter: Option<&str>,
+    ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
+        let events = self
+            .room_transcripts_since(
+                room,
+                &crate::work_board_cache::zero_transcript_cursor(),
+                WALL_PROJECTION_PAGE_SIZE,
+            )
+            .await?;
         // Discriminate on each event's self-describing body, NOT its
         // transcript `kind` — see [`wall_post_from_event`] for why the
         // kind is unreliable on the daemon-attached read path.
@@ -2173,6 +2206,14 @@ fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
         );
     }
 }
+
+/// How much room history a wall projection folds in.
+///
+/// Generous because a busy room accumulates pinned posts over time, and a
+/// wall post that scrolls out of the window silently stops being true —
+/// which is worse than a slow read. Declared once so `wall_posts` and
+/// `wall_posts_in` can never disagree about what "the wall" means.
+pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
 
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
