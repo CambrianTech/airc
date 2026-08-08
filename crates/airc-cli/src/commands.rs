@@ -2198,6 +2198,16 @@ pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std:
     if let Some(executable) = status.executable.as_deref() {
         println!("executable:     {executable}");
     }
+    // Joel's ruling 2026-08-08: the version must be visible on every
+    // health/query surface, in every repo, because stale binaries have
+    // repeatedly poisoned testing. `build:` above reports what the DAEMON says
+    // it is; this reports what the CLI asking the question is. Printing both is
+    // the point — when they disagree, the operator is talking to a daemon built
+    // from different source than the tool they are holding, which is precisely
+    // the confusion the #354 incident produced ("Already at 1e2f424" one line
+    // above `airc --version` saying three commits behind, both true, describing
+    // different objects).
+    println!("cli_version:    {}", crate::build_info::version_line());
     Ok(())
 }
 
