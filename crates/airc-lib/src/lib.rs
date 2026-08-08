@@ -39,6 +39,7 @@ pub mod account_registry_fs;
 pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
+pub mod backfill;
 mod broadcast_deduper;
 pub mod capability_registry;
 pub mod command_bus;
