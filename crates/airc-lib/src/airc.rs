@@ -892,7 +892,33 @@ impl Airc {
     pub async fn room_doctrine(
         &self,
     ) -> Result<Option<airc_core::doctrine::RoomDoctrinePublished>, AircError> {
-        let events = self.page_recent(200).await?;
+        self.room_doctrine_in(None).await
+    }
+
+    /// The operating doctrine of a NAMED room — the room-carrying half of
+    /// [`room_doctrine`](Self::room_doctrine), which resolves whatever this
+    /// scope's default subscription happens to be.
+    ///
+    /// `None` keeps the default-room behaviour exactly (`page_recent_filtered`
+    /// scopes an unset channel to the current room), so this is one
+    /// implementation rather than a forked copy.
+    ///
+    /// Exists because a consumer that CARRIES its own room must be able to say
+    /// which one it means. A citizen who belongs to several rooms answers a turn
+    /// in the room it arrived in; reading doctrine from her default instead
+    /// grounds that answer in another room's rules — the same
+    /// gate-says-A-read-says-B shape [`project_room_work_board`] was made public
+    /// to fix, where "the two agree only because both were seeded from the same
+    /// `current_room()` at bootstrap".
+    pub async fn room_doctrine_in(
+        &self,
+        room: Option<airc_core::RoomId>,
+    ) -> Result<Option<airc_core::doctrine::RoomDoctrinePublished>, AircError> {
+        let filter = crate::EventFilter {
+            channel: room,
+            ..Default::default()
+        };
+        let events = self.page_recent_filtered(filter, 200).await?;
         // True LWW by `published_at_ms` — NOT first-match. `page_recent`
         // is not guaranteed newest-first (proven by the channel_purpose
         // LWW test), so returning the first matching event surfaces a
