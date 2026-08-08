@@ -1519,13 +1519,29 @@ impl Airc {
     /// `#general` through the subscription set, using the resolved
     /// mesh identity so the `RoomId` is stable per Git/GitHub user.
     pub async fn current_room(&self) -> Result<Room, AircError> {
+        self.current_room_landing_in("general").await
+    }
+
+    /// [`current_room`](Self::current_room) with a caller-chosen
+    /// fresh-scope landing room.
+    ///
+    /// An established scope returns its durable default subscription
+    /// unchanged — `landing` only decides where a FRESH scope's first
+    /// subscription lands. airc's own lobby stays `#general`
+    /// (`current_room` delegates here with that), but a hosting
+    /// substrate whose commons is a different room (continuum's
+    /// citizens land in `#academy`, card daa01102) names it instead of
+    /// inheriting airc's lobby and then migrating — the lazy subscribe
+    /// is a real attach point (presence + identity card), so landing
+    /// in the wrong room first is visible noise, not a free move.
+    pub async fn current_room_landing_in(&self, landing: &str) -> Result<Room, AircError> {
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         if let Some(subscription) = set.default_subscription() {
             return Ok(subscription.as_room());
         }
 
         let identity = self.mesh_identity().await?;
-        let channel = ChannelName::new("general")?;
+        let channel = ChannelName::new(landing)?;
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         set.set_default(channel)?;
