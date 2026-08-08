@@ -800,15 +800,34 @@ mod tests {
             .await
             .expect("beat");
 
+        // Resolve both channel ids HERE, from the live subscription set, rather
+        // than reusing the ids `join`/`subscribe_room` returned earlier. A room's
+        // uuid derives from its name AND the mesh identity, and joins self-heal
+        // by re-deriving ids that no longer match (`rebind_diverged`); under the
+        // parallel harness that identity can re-resolve mid-test, which leaves a
+        // previously captured id pointing at a channel nobody writes to. Paging
+        // by a stale id then reads empty and the test blames the code under test.
+        // The NAME is the stable handle; the id is a derived value with a
+        // lifetime.
+        let set = airc.subscription_set().await.expect("subscription set");
+        let id_of = |name: &str| {
+            set.all()
+                .find(|s| s.name.as_str() == name)
+                .map(|s| s.as_room().channel)
+                .unwrap_or_else(|| panic!("{name} must be in the subscription set"))
+        };
+        let home_id = id_of(&home.name);
+        let other_id = id_of(&other.name);
+
         let within = Duration::from_secs(300);
         let here = airc
-            .room_roster_in(Some(home.channel), within, 200)
+            .room_roster_in(Some(home_id), within, 200)
             .await
             .expect("roster of the room she beats into");
         assert_eq!(here.len(), 1, "her own beat is visible in her home room");
 
         let there = airc
-            .room_roster_in(Some(other.channel), within, 200)
+            .room_roster_in(Some(other_id), within, 200)
             .await
             .expect("roster of the other room");
         assert!(

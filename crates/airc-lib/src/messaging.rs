@@ -353,14 +353,51 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        if self.is_daemon_attached() && !filter.kinds.is_empty() {
+        // Route to the DAEMON whenever one is attached — the kinds filter
+        // selects WHICH daemon read, it does not decide whether to use one.
+        //
+        // It used to: the daemon branch required `!filter.kinds.is_empty()`, so
+        // an attached caller passing a filter with no kind restriction fell
+        // through to `self.inner.store` — the CLIENT's local store, which for an
+        // attached client holds nothing, because the daemon owns the events.
+        // The call returned an empty page and looked like it had worked.
+        //
+        // Caught 2026-08-08 by `tests/room_roster.rs`, which went red the moment
+        // `active_agents` started paging through this function with a
+        // channel-only filter: "self must be present in its own room roster" —
+        // the roster was empty because the read had quietly consulted the wrong
+        // store. Nothing about the signature suggests that a kind-less filter is
+        // the unsupported case.
+        if self.is_daemon_attached() {
             if let Some(channel) = filter.channel {
-                return Ok(self
-                    .daemon_page_recent_of_kinds(channel, &filter.kinds, limit)
-                    .await?
-                    .into_iter()
-                    .filter(|event| filter.matches(event))
-                    .collect());
+                if !filter.kinds.is_empty() {
+                    return Ok(self
+                        .daemon_page_recent_of_kinds(channel, &filter.kinds, limit)
+                        .await?
+                        .into_iter()
+                        .filter(|event| filter.matches(event))
+                        .collect());
+                }
+                // No kind restriction: page the whole room from the daemon,
+                // exactly what `page_recent` fetches.
+                //
+                // Only when the channel is one this scope actually subscribes
+                // to. An UNSUBSCRIBED channel deliberately falls through to the
+                // local-store path below rather than returning empty — that is
+                // the pre-existing behaviour and two integration tests depend on
+                // it (`unknown_channel_auto_rebinds_from_account_registry_cache`,
+                // `delivered_ack_means_visible_to_subscribed_scopes_not_just_durable`),
+                // because a frame can land in the local transcript for a channel
+                // the subscription set has not converged on yet. Returning empty
+                // there would break the rebind path this crate heals with.
+                if let Some(room) = self.room_by_channel(channel).await? {
+                    return Ok(self
+                        .daemon_page_recent(&room, limit)
+                        .await?
+                        .into_iter()
+                        .filter(|event| filter.matches(event))
+                        .collect());
+                }
             }
         }
         // Local store path: bounded overscan — page a wider raw window,
