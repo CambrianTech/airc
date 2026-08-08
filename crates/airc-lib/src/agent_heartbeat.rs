@@ -24,7 +24,25 @@
 //! It does **not** ship:
 //! - Automatic stop when the process exits (caller owns the handle's
 //!   lifecycle; dropping aborts the task).
-//! - Cross-room scoping (heartbeats go to the current default room).
+//! - Cross-room scoping on the EMIT side. The READ side is now
+//!   room-carrying ([`Airc::active_agents_in`], [`Airc::room_roster_in`],
+//!   [`Airc::room_roster_cards_in`]), but beats still go to the current
+//!   default room only (`send_frame_to` → `current_room()`).
+//!
+//!   The consequence is worth stating plainly, because it decides what a
+//!   room-scoped roster MEANS today: a peer subscribed to five rooms beats
+//!   into one, so asking for the roster of any OTHER room returns empty.
+//!   That is honest-and-empty, not wrong — and it is strictly better than
+//!   what it replaces, which answered a question about room B with room A's
+//!   roster and looked confident doing it. It composes the moment emission
+//!   becomes per-room.
+//!
+//!   Per-room emission is a real design call, not an oversight: beating into
+//!   N rooms multiplies presence traffic by N, against a cadence chosen
+//!   specifically to keep that traffic bounded. There is likely a better
+//!   shape available — the coordinator beacon already carries this scope's
+//!   FULL channel list (`publish_presence`), so cross-room presence may be
+//!   derivable without multiplying beats at all.
 //! - A `"leaving"` event on graceful shutdown (caller can emit one
 //!   manually via [`Airc::emit_agent_heartbeat`] with a custom kind
 //!   if needed; the typed shape is reserved for it).
@@ -503,9 +521,34 @@ impl Airc {
         within: Duration,
         window: usize,
     ) -> Result<Vec<AgentLiveness>, AircError> {
+        self.active_agents_in(None, within, window).await
+    }
+
+    /// Live agents in a NAMED room — the room-carrying half of
+    /// [`active_agents`](Self::active_agents), which reads whatever this scope's
+    /// default subscription happens to be.
+    ///
+    /// `None` keeps the default-room behaviour exactly (`page_recent_filtered`
+    /// scopes an unset channel to the current room), so this is one
+    /// implementation, not a forked copy.
+    ///
+    /// A consumer that carries its own room needs to name it: presence is
+    /// per-room, so "who is live" answered from a citizen's default room while
+    /// she is acting in another tells her about the wrong company entirely — and
+    /// a roster is what she uses to decide who to address.
+    pub async fn active_agents_in(
+        &self,
+        room: Option<airc_core::RoomId>,
+        within: Duration,
+        window: usize,
+    ) -> Result<Vec<AgentLiveness>, AircError> {
         let now = now_ms()?;
         let cutoff = now.saturating_sub(within.as_millis() as u64);
-        let recent = self.page_recent(window).await?;
+        let filter = crate::EventFilter {
+            channel: room,
+            ..Default::default()
+        };
+        let recent = self.page_recent_filtered(filter, window).await?;
         let mut latest: std::collections::HashMap<AgentHeartbeatKey, AgentHeartbeat> =
             std::collections::HashMap::new();
         for event in &recent {
@@ -574,7 +617,19 @@ impl Airc {
         within: Duration,
         window: usize,
     ) -> Result<Vec<RoomMember>, AircError> {
-        let live = self.active_agents(within, window).await?;
+        self.room_roster_in(None, within, window).await
+    }
+
+    /// The roster of a NAMED room. Room-carrying half of
+    /// [`room_roster`](Self::room_roster); `None` is the default room, so this
+    /// is one implementation rather than a copy.
+    pub async fn room_roster_in(
+        &self,
+        room: Option<airc_core::RoomId>,
+        within: Duration,
+        window: usize,
+    ) -> Result<Vec<RoomMember>, AircError> {
+        let live = self.active_agents_in(room, within, window).await?;
         let mut members = Vec::with_capacity(live.len());
         for liveness in live {
             members.push(RoomMember {
@@ -618,7 +673,21 @@ impl Airc {
         within: Duration,
         window: usize,
     ) -> Result<Vec<RoomMemberCard>, AircError> {
-        let live = self.active_agents(within, window).await?;
+        self.room_roster_cards_in(None, within, window).await
+    }
+
+    /// The identity-joined roster of a NAMED room. Room-carrying half of
+    /// [`room_roster_cards`](Self::room_roster_cards); `None` is the default
+    /// room. This is the variant a room-scoped consumer wants — per #262 the
+    /// bare roster renders `peer-xxxx` rows, so a caller that reaches for the
+    /// room-correct read must not have to give up the identity join to get it.
+    pub async fn room_roster_cards_in(
+        &self,
+        room: Option<airc_core::RoomId>,
+        within: Duration,
+        window: usize,
+    ) -> Result<Vec<RoomMemberCard>, AircError> {
+        let live = self.active_agents_in(room, within, window).await?;
         let mut members = Vec::with_capacity(live.len());
         for liveness in live {
             let identity = self
@@ -698,6 +767,68 @@ async fn refresh_coordination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: a question about room B being answered with room A's
+    // roster. That is what every default-scoped presence read does today, and it
+    // is the exact gate-says-A-read-says-B shape `project_room_work_board` was
+    // made public to fix. A citizen who belongs to several rooms decides WHO TO
+    // ADDRESS from this read, so answering from her default room hands her the
+    // wrong company with full confidence.
+    //
+    // Also pins the honest half of the current limitation: heartbeats are still
+    // EMITTED only into the current room, so a room nobody beats into reads
+    // EMPTY. Empty is the correct answer to "who is live in a room with no
+    // beats" — the failure this replaces was a populated, plausible, wrong one.
+    // If per-room emission lands later, this test keeps holding.
+    #[tokio::test]
+    async fn a_rooms_roster_is_never_another_rooms_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let airc = crate::Airc::open_with_wire_root_for_test(
+            dir.path().join("citizen/.airc"),
+            dir.path().join("wire"),
+        )
+        .await
+        .expect("open scope");
+
+        let home = airc.join("academy").await.expect("join home room");
+        let other = airc
+            .subscribe_room("cambriantech")
+            .await
+            .expect("belong to a second room without moving focus");
+
+        airc.emit_agent_heartbeat(HeartbeatKind::Alive, "test", None)
+            .await
+            .expect("beat");
+
+        let within = Duration::from_secs(300);
+        let here = airc
+            .room_roster_in(Some(home.channel), within, 200)
+            .await
+            .expect("roster of the room she beats into");
+        assert_eq!(here.len(), 1, "her own beat is visible in her home room");
+
+        let there = airc
+            .room_roster_in(Some(other.channel), within, 200)
+            .await
+            .expect("roster of the other room");
+        assert!(
+            there.is_empty(),
+            "a room she has never beaten into must report NOBODY, never her home \
+             room's roster — got {there:?}"
+        );
+
+        // `None` must stay exactly the old default-room behaviour, or this is a
+        // breaking change dressed as an addition.
+        let default_scoped = airc
+            .room_roster_in(None, within, 200)
+            .await
+            .expect("default-scoped roster");
+        assert_eq!(
+            default_scoped.len(),
+            here.len(),
+            "None means the current room — unchanged for every existing caller"
+        );
+    }
 
     fn sample_alive() -> AgentHeartbeat {
         AgentHeartbeat {
