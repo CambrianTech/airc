@@ -318,6 +318,21 @@ pub(crate) const ACK_BROADCAST_CAPACITY: usize = 64;
 /// can't push valid events out of the set before they're delivered.
 pub(crate) const RECENTLY_BROADCAST_CAPACITY: usize = LIVE_BROADCAST_CAPACITY * 4;
 
+/// Whether joining a room also moves this scope's focus onto it.
+///
+/// Membership and focus are separable, and conflating them is only
+/// harmless for a caller that has exactly one room in view at a time.
+/// See [`Airc::join`] (both) and [`Airc::subscribe_room`] (membership
+/// only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// Promote the joined room to default — the operator's `airc join`.
+    MakeDefault,
+    /// Leave the existing default alone — a citizen gaining a room she
+    /// belongs to without being moved into it.
+    Keep,
+}
+
 impl Airc {
     /// Open or initialise an Airc handle at `<home>`. This call:
     ///   - Loads `<home>/identity.{key,json}` (generates if missing).
@@ -1658,8 +1673,50 @@ impl Airc {
     }
 
     /// Subscribe to `name` and make it the default channel for
-    /// short-shape commands.
+    /// short-shape commands — join AND focus.
+    ///
+    /// This is the operator's verb: `airc join foo` means "put me in
+    /// foo and point my next `airc msg` at it". For a citizen who
+    /// BELONGS to many rooms and is not "in" any one of them at a
+    /// time, see [`Self::subscribe_room`], which joins without moving
+    /// the focus.
     pub async fn join(&self, name: &str) -> Result<Room, AircError> {
+        self.join_channel(name, Focus::MakeDefault).await
+    }
+
+    /// Subscribe to `name` WITHOUT promoting it to default.
+    ///
+    /// Same durable effect as [`Self::join`] — the subscription is
+    /// saved, presence is re-beaconed with the new channel list, the
+    /// `RoomJoined` lifecycle event is emitted, and this peer's
+    /// identity card is published into the room so its roster sees a
+    /// named arrival. The single difference is that the focus does not
+    /// move.
+    ///
+    /// ### Why this exists as its own verb
+    ///
+    /// `join` conflates two things that are the same for a terminal
+    /// operator and different for anyone else: *membership* ("I am
+    /// part of this room") and *focus* ("my next short-shape command
+    /// means this room"). For a human at a prompt, joining a room is
+    /// exactly the act of turning attention to it, so folding them is
+    /// right. For a first-class citizen who belongs to five rooms at
+    /// once — a Continuum persona, an agent, anything that is
+    /// addressed rather than typing — every additional join would drag
+    /// the default along behind it, so her "current room" would mean
+    /// nothing more than whichever room she was added to most
+    /// recently. Every read still resolved against `current_room()`
+    /// would then follow that accident.
+    ///
+    /// A room still becomes the default when there is no default yet
+    /// (`SubscriptionSet::subscribe*` seeds it), so a scope's FIRST
+    /// room is its default either way. This only declines to move a
+    /// focus that already exists.
+    pub async fn subscribe_room(&self, name: &str) -> Result<Room, AircError> {
+        self.join_channel(name, Focus::Keep).await
+    }
+
+    async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
         // Card c409eaf5: refuse uuid-shaped names. `ChannelName::new`
         // hashes the name into a derived UUID; a uuid-shaped string
         // re-hashes into a DIFFERENT channel UUID, silently. The
@@ -1684,7 +1741,13 @@ impl Airc {
         warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
-        set.set_default(channel.clone())?;
+        if focus == Focus::MakeDefault {
+            set.set_default(channel.clone())?;
+        }
+        // Whether this room ended up default is now a FACT to read, not a
+        // constant to assert: `subscribe_with_wire_root` seeds the default when
+        // the scope had none, so a first room is default under either focus.
+        let is_default = set.default_subscription().map(|s| &s.name) == Some(&channel);
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
@@ -1698,7 +1761,7 @@ impl Airc {
             channel_name: channel.as_str().to_string(),
             room_id: room.channel,
             wire: room.wire.display().to_string(),
-            is_default: true,
+            is_default,
         })
         .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?;
         let body = airc_core::Body::Json(body_json);
@@ -2610,6 +2673,79 @@ mod publish_identity_tests {
     // published Identity (distinct concepts), so without the floor a
     // spawned persona/agent (continuum / Hermes / OpenClaw) stays
     // anonymous on the wire — the "Ivar" grounding bug (whois: 'not
+    // what this catches: membership and focus are separable. `subscribe_room`
+    // must add a room WITHOUT dragging the default onto it, because a
+    // first-class citizen belongs to many rooms at once and is not "in" any one
+    // of them the way an operator at a prompt is. If this ever collapses back
+    // into `join`, a citizen's default becomes whichever room she was added to
+    // most recently — and every read still resolved against `current_room()`
+    // (doctrine, wall, board, roster, transcript) silently follows that
+    // accident, grounding her turn in the wrong room while she is answering
+    // the right one.
+    #[tokio::test]
+    async fn subscribe_room_adds_membership_without_moving_focus() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("citizen/.airc");
+        // Wire root pinned EXPLICITLY rather than derived. `machine_account_home`
+        // reads `temp_dir()` / HOME / USERPROFILE, and sibling tests mutate the
+        // process environment (`temp-env`), which races across the parallel test
+        // harness — the same hazard that already makes `account_registry`'s
+        // import test flaky on a clean canary (verified by stashing this change
+        // and reproducing the failure without it). This test asserts a
+        // subscription-set invariant that has nothing to do with account
+        // resolution, so it should not be able to fail for that reason.
+        let airc = Airc::open_with_wire_root_for_test(&home, dir.path().join("wire"))
+            .await
+            .expect("open citizen scope with a pinned wire root");
+
+        // Focus is asserted by room NAME, not by derived channel id. A room's
+        // uuid is derived from its name AND the mesh identity, and `join`
+        // self-heals by re-deriving ids whose stored value no longer matches
+        // the current identity (`rebind_diverged`). Under the parallel test
+        // harness that identity can resolve differently between two calls in
+        // the same test, so an id captured earlier is not a stable handle to
+        // "the same room" — asserting on it made this test fail 2 runs in 3
+        // while the behaviour under test was correct every time. The name is
+        // what "which room has focus" actually means.
+        let first = airc.join("academy").await.expect("join first room");
+        assert_eq!(first.name, "academy");
+        assert_eq!(
+            airc.current_room().await.expect("current room").name,
+            "academy",
+            "a scope's first room is its default under either verb"
+        );
+
+        // Second room via the citizen verb: she gains it, focus stays put.
+        let second = airc
+            .subscribe_room("cambriantech")
+            .await
+            .expect("subscribe to a second room");
+        assert_eq!(second.name, "cambriantech");
+        assert_eq!(
+            airc.current_room().await.expect("current room").name,
+            "academy",
+            "subscribe_room must NOT promote — the focus is still the first room"
+        );
+
+        let set = airc.subscription_set().await.expect("subscription set");
+        let names: Vec<String> = set
+            .channel_names()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "academy") && names.iter().any(|n| n == "cambriantech"),
+            "she is a member of BOTH rooms, not just the focused one: {names:?}"
+        );
+
+        // And the operator verb still means join-and-focus, unchanged.
+        airc.join("k3-serving").await.expect("operator join");
+        assert_eq!(
+            airc.current_room().await.expect("current room").name,
+            "k3-serving",
+            "join still moves the focus — this split must not change the operator's verb"
+        );
+    }
+
     // published yet'). After publish_identity, the persisted identity
     // card carries the agent name. Daemon-independent read so it pins
     // the persistence guarantee, not the transcript path.
