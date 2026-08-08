@@ -10,10 +10,64 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
     let channel = update_channel();
+
+    // ── The blackout window is the product, not a side effect ──────────────
+    //
+    // Incident 2026-08-08: a peer's daemon was down ~4 minutes during an
+    // `airc update`, and every message sent to that node in the window was
+    // LOST — not queued, not replayed. Replay resumes from the RECEIVER's
+    // cursor against the RECEIVER's store, so a frame that never reached that
+    // store cannot be recovered; the receiver cannot even know it missed one.
+    // Generalized: every update costs the grid a coordination blackout on each
+    // node as it rolls, and the traffic most likely to be in flight during an
+    // update is the traffic coordinating it.
+    //
+    // Durable store-and-forward (#47) is the other half and is not this fix.
+    // This one shrinks the window that makes #47 fire on a SCHEDULE rather
+    // than by accident, by taking the daemon down only for what actually
+    // requires it — replacing the binary — instead of for the git fetch and
+    // the multi-minute rebuild that preceded it.
+    //
+    // Ordering below, in the order the reasons apply:
+    //   1. fetch/checkout — a git op on a separate worktree, no daemon involved
+    //   2. nothing-to-do  — return WITHOUT ever stopping the daemon
+    //   3. pre-warm build — compile while the node is still on the air
+    //   4. stop → install → restart — the genuinely exclusive part
+    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
+
+    // NOTHING TO DO → NO BLACKOUT.
+    //
+    // This condition already existed and decided only a println: the updater
+    // learned the source had not moved, then stopped the daemon, ran the full
+    // installer, and restarted anyway — so a node that was already current
+    // paid the entire outage for a no-op, on every check. Auto-update runs on
+    // a cadence, so those were recurring outages bought with nothing.
+    //
+    // Both halves are required. `before == after` says the SOURCE did not move
+    // this run; it does NOT say the installed binary matches it (#354: a prior
+    // install can have failed while the checkout stayed current). The smoke
+    // test is what makes skipping safe — unchanged source AND a binary that
+    // already reports it means there is genuinely nothing to do.
+    if before == after && smoke_test_new_binary(&airc_exe, &after) {
+        println!("Already at {after} on channel {channel} — daemon left running.");
+        return Ok(());
+    }
+
+    // Compile BEFORE the node goes off the air. `install.sh` runs
+    // `cargo build --release -p airc-cli` in this same directory, so this warms
+    // exactly the cache it will use and its rebuild becomes near-incremental —
+    // the outage shrinks from "fetch + full rebuild + install" to roughly
+    // "install + restart".
+    //
+    // Best-effort ON PURPOSE, and not a masking fallback: `run_installer` below
+    // performs the authoritative build moments later and fails loud if the code
+    // does not compile. Nothing is hidden by ignoring a failure here — a broken
+    // build still stops the update, it just stops it a few seconds later.
+    prewarm_build(&build_dir);
+
     if daemon_was_running {
         stop_daemon(&airc_exe, home, &socket)?;
     }
-    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
     run_installer(&build_dir)?;
 
@@ -572,6 +626,30 @@ fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &
     match parse_build_sha(&stdout) {
         Some(sha) => smoke_sha_matches(&sha, expected),
         None => false,
+    }
+}
+
+/// Compile the new build while the daemon is still serving, so the outage
+/// covers only the binary swap.
+///
+/// Mirrors `install.sh`'s own `cargo build --release -p airc-cli` in the same
+/// directory, so this populates precisely the cache the installer will hit.
+/// Silent on success, one line on failure — and deliberately infallible to the
+/// caller: `run_installer` does the authoritative build immediately after and
+/// surfaces any real compile error there. Treating a pre-warm failure as fatal
+/// would turn an optimization into a new way for `airc update` to refuse.
+fn prewarm_build(source: &Path) {
+    println!("Pre-building while the daemon stays up (keeps the node reachable)…");
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "airc-cli"])
+        .current_dir(source)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("pre-build exited {s} — the installer will build it properly."),
+        Err(e) => println!("pre-build could not run ({e}) — the installer will build it."),
     }
 }
 
